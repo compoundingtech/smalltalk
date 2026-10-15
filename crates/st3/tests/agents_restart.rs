@@ -163,6 +163,15 @@ impl Fixture {
         .await
     }
 
+    async fn with_launch(mission: bool, launch: &str) -> (Self, String) {
+        Self::launching(
+            if mission { Shape::Mission } else { Shape::TopLevel },
+            launch,
+            "never",
+        )
+        .await
+    }
+
     async fn launching(shape: Shape, launch: &str, restart: &str) -> (Self, String) {
         Self::launching_with_router(shape, launch, restart, st3::api::router).await
     }
@@ -201,7 +210,7 @@ impl Fixture {
             shutdown-timeout "1s"
             env {{ ORIGINAL "kept" }}
         }}"#,
-            root.path().to_str().unwrap()
+            root.path().to_str().unwrap(),
         );
         let source = match shape {
             // The same seat shape is materialized by a mission rather than a root declaration.
@@ -315,13 +324,26 @@ impl Fixture {
         self.request_as(subject, key, "person/avery").await
     }
     async fn request_as(&self, subject: &str, key: &str, actor: &str) -> ClaimRecord {
+        self.try_request_as(subject, key, actor).await.unwrap()
+    }
+    async fn try_request_as(
+        &self,
+        subject: &str,
+        key: &str,
+        actor: &str,
+    ) -> anyhow::Result<ClaimRecord> {
+        let actual = self.store.latest_actual_value(subject)?;
+        let incarnation = actual
+            .as_ref()
+            .and_then(|actual| actual["incarnation_id"].as_str())
+            .unwrap_or("");
         self.client()
             .post(
                 "/v1/agents/restart",
-                &json!({"subject": subject, "actor":actor, "idempotency_key":key}),
+                &json!({"subject": subject, "actor":actor, "idempotency_key":key,
+                    "incarnation_id": incarnation}),
             )
             .await
-            .unwrap()
     }
 }
 impl Drop for Fixture {
@@ -678,7 +700,8 @@ async fn restart_is_idempotent_and_cannot_revive_a_later_stop() {
         .client()
         .post(
             "/v1/agents/restart",
-            &json!({"subject":subject,"actor":"person/avery","idempotency_key":"after-stop"}),
+            &json!({"subject":subject,"actor":"person/avery","idempotency_key":"after-stop",
+                "incarnation_id":"fixture:1"}),
         )
         .await;
     assert!(
@@ -706,6 +729,220 @@ async fn a_delayed_restart_does_not_stop_a_newer_incarnation() {
     assert_eq!(request.id, fixture.request(&subject, "delayed").await.id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_incarnation_request_does_not_stop_the_current_seat() {
+    let (fixture, subject) = Fixture::new(false).await;
+    let rejected: Result<ClaimRecord, _> = fixture
+        .client()
+        .post(
+            "/v1/agents/restart",
+            &json!({
+                "subject": subject,
+                "actor": "person/avery",
+                "idempotency_key": "stale-incarnation",
+                "incarnation_id": "fixture:obsolete",
+            }),
+        )
+        .await;
+    assert!(rejected.is_err(), "a stale UI must not restart a replacement");
+    fixture.reconciler.reconcile_once().unwrap();
+    let actual = fixture.store.latest_actual_value(&subject).unwrap().unwrap();
+    assert_eq!(actual["incarnation_id"], "fixture:1");
+    assert_eq!(actual["status"], "running");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_reports_a_replacement_channel_refusal_without_waiting_for_recovery() {
+    let (fixture, subject) = Fixture::claude(Shape::TopLevel, "never").await;
+    let socket = fixture.root.path().join("st3.sock");
+    let target = subject.clone();
+    let command = tokio::spawn(async move {
+        cli(&socket, &target, "person/avery", "3s").await
+    });
+    let drive = fixture.drive();
+    wait_for_starts(&fixture, &subject, 2).await;
+    fixture.store.append_claim(&st3::model::ClaimInput {
+        subject: subject.clone(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.clone()),
+        fields: serde_json::from_value(json!({
+            "code": "claude-channel-unattached",
+            "status": "blocked",
+            "incarnation_id": "fixture:2",
+            "reason": "the replacement has no initialized channel",
+        })).unwrap(),
+        evidence: vec![],
+        expected_subject: None,
+        idempotency_key: Some("replacement-channel-refusal".into()),
+    }).unwrap();
+    fixture.store.append_claim(&st3::model::ClaimInput {
+        subject: subject.clone(),
+        kind: "harness.observed".into(),
+        actor: Some(subject),
+        fields: serde_json::from_value(json!({
+            "driver": "claude", "state": "idle", "incarnation_id": "fixture:2",
+        })).unwrap(),
+        evidence: vec![],
+        expected_subject: None,
+        idempotency_key: Some("replacement-idle-hook".into()),
+    }).unwrap();
+    let output = command.await.unwrap();
+    drive.abort();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("message channel is blocked"), "{stderr}");
+    assert!(!stderr.contains("timed out"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_incarnation_cannot_restart_a_running_seat() {
+    let (fixture, subject) = Fixture::new(false).await;
+    let body = json!({
+        "subject": subject, "actor": "person/avery", "idempotency_key": "empty",
+        "incarnation_id": "",
+    });
+    let error = fixture.client().post::<_, ClaimRecord>("/v1/agents/restart", &body)
+        .await.unwrap_err();
+    assert_eq!(st3::client::api_error_code(&error), Some("stale-incarnation"));
+    fixture.reconciler.reconcile_once().unwrap();
+    assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omitted_incarnation_restarts_the_current_seat_for_existing_callers() {
+    let (fixture, subject) = Fixture::new(false).await;
+    let request: ClaimRecord = fixture.client().post(
+        "/v1/agents/restart",
+        &json!({"subject": subject, "actor": "person/avery", "idempotency_key": "legacy"}),
+    ).await.unwrap();
+    assert_eq!(request.body["fields"]["incarnation_id"], "fixture:1");
+    reconcile_ready(&fixture, &fixture.reconciler, &subject);
+    assert_eq!(restart_result(&fixture, &request).kind, "runtime.action.succeeded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_or_omitted_incarnation_retries_a_seat_without_an_incarnation() {
+    for incarnation in [None, Some("")] {
+        let (fixture, subject) = Fixture::launching(
+            Shape::TopLevel,
+            r#"harness "omp" { model "example-model"; }"#,
+            "always",
+        ).await;
+        hang_up(&fixture);
+        park(&fixture, &subject, "omp");
+        *fixture.runtime.refuse_start.lock().unwrap() = true;
+        let failed = fixture.request(&subject, "failed").await;
+        reconcile_ready(&fixture, &fixture.reconciler, &subject);
+        assert_eq!(restart_result(&fixture, &failed).kind, "runtime.action.failed");
+        let actual = fixture.store.latest_actual_value(&subject).unwrap();
+        assert!(actual.as_ref().and_then(|value| value["incarnation_id"].as_str()).is_none());
+        let stale = fixture.client().post::<_, ClaimRecord>(
+            "/v1/agents/restart",
+            &json!({"subject": subject, "actor": "person/avery",
+                "idempotency_key": "stale", "incarnation_id": "fixture:1"}),
+        ).await.unwrap_err();
+        assert_eq!(st3::client::api_error_code(&stale), Some("stale-incarnation"));
+        *fixture.runtime.refuse_start.lock().unwrap() = false;
+        let mut body = json!({
+            "subject": subject, "actor": "person/avery", "idempotency_key": "recovery",
+        });
+        if let Some(incarnation) = incarnation {
+            body["incarnation_id"] = json!(incarnation);
+        }
+        let request: ClaimRecord = fixture.client().post("/v1/agents/restart", &body).await.unwrap();
+        reconcile_ready(&fixture, &fixture.reconciler, &subject);
+        assert_eq!(restart_result(&fixture, &request).kind, "runtime.action.succeeded");
+        assert_eq!(fixture.runtime.attempts.lock().unwrap().len(), 3);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_without_an_actual_value_returns_a_typed_refusal() {
+    let (fixture, _) = Fixture::new(false).await;
+    let error = fixture
+        .try_request_as("agent/example/missing", "missing", "person/avery")
+        .await
+        .unwrap_err();
+    assert_eq!(st3::client::api_error_code(&error), Some("missing-agent"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_refuses_an_unidentifiable_runtime_without_stopping_it() {
+    let (fixture, subject) = Fixture::new(false).await;
+    let request = fixture.request(&subject, "unidentifiable").await;
+    fixture.runtime.observations.lock().unwrap().values_mut()
+        .next().unwrap().incarnation_id = None;
+    fixture.reconciler.reconcile_once().unwrap();
+    let result = restart_result(&fixture, &request);
+    assert_eq!(result.kind, "runtime.action.failed");
+    assert_eq!(result.body["evidence"][0], request.id);
+    assert!(
+        result.body["fields"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be identified for a fenced stop")
+    );
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+    assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+}
+
+fn restart_environment(member: &MemberSpec) -> (Option<&str>, Option<&str>) {
+    (
+        member.environment.get(st3::suspension::RESUME_ENV).map(String::as_str),
+        member.environment.get(st3::suspension::CONTINUE_PATH_ENV).map(String::as_str),
+    )
+}
+
+async fn restart_with_context(
+    fixture: &Fixture,
+    subject: &str,
+    key: &str,
+    fresh_context: bool,
+) -> ClaimRecord {
+    let actual = fixture.store.latest_actual_value(subject).unwrap().unwrap();
+    let incarnation = actual["incarnation_id"].as_str().unwrap();
+    fixture
+        .client()
+        .post(
+            "/v1/agents/restart",
+            &json!({
+                "subject": subject,
+                "actor": "person/avery",
+                "idempotency_key": key,
+                "incarnation_id": incarnation,
+                "fresh_context": fresh_context,
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+async fn bind_native_session(fixture: &Fixture, subject: &str, session: &str, available: bool) {
+    let actual = fixture.store.latest_actual_value(subject).unwrap().unwrap();
+    let incarnation = actual["incarnation_id"].as_str().unwrap();
+    let _: ClaimRecord = fixture
+        .client()
+        .post(
+            "/v1/agents/native-session",
+            &json!({
+                "subject": subject,
+                "actor": subject,
+                "harness": "omp",
+                "session_id": session,
+                "resume_available": available,
+                "path": null,
+                "incarnation_id": incarnation,
+                "idempotency_key": format!("binding:{incarnation}:{session}:{available}"),
+            }),
+        )
+        .await
+        .unwrap();
+}
+
 #[test]
 fn restart_help_explains_seats_and_the_new_incarnation() {
     if st3::test_support::supervise_test() {
@@ -720,6 +957,53 @@ fn restart_help_explains_seats_and_the_new_incarnation() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(
         help.contains("restart") && help.contains("mission seat") && help.contains("incarnation")
+    );
+}
+
+async fn wait_for_starts(fixture: &Fixture, subject: &str, count: usize) {
+    for _ in 0..100 {
+        fixture.reconciler.reconcile_once().unwrap();
+        let actual = fixture.store.latest_actual_value(subject).unwrap();
+        if actual.is_some_and(|actual| {
+            actual["status"] == "running"
+                && actual["incarnation_id"] == format!("fixture:{count}")
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("restart did not launch start {count}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn person_restart_resumes_only_a_saved_conversation_and_fresh_overrides_it() {
+    let (fixture, subject) = Fixture::with_launch(false, "harness omp {}").await;
+
+    bind_native_session(&fixture, &subject, "saved-conversation", true).await;
+    let request = restart_with_context(&fixture, &subject, "resume", false).await;
+    assert_eq!(request.actor.as_deref(), Some("person/avery"));
+    assert_eq!(request.body["fields"]["native_session_id"], "saved-conversation");
+    wait_for_starts(&fixture, &subject, 2).await;
+    assert_eq!(
+        restart_environment(&fixture.runtime.starts.lock().unwrap()[1]),
+        (Some("saved-conversation"), None)
+    );
+
+    // A session replaced by an unsaved one must not revive the older saved conversation.
+    bind_native_session(&fixture, &subject, "older-saved", true).await;
+    bind_native_session(&fixture, &subject, "unsaved-new", false).await;
+    let request = restart_with_context(&fixture, &subject, "unsaved", false).await;
+    assert!(request.body["fields"]["native_session_id"].is_null());
+    wait_for_starts(&fixture, &subject, 3).await;
+    assert_eq!(restart_environment(&fixture.runtime.starts.lock().unwrap()[2]), (None, None));
+
+    bind_native_session(&fixture, &subject, "context-to-drop", true).await;
+    let request = restart_with_context(&fixture, &subject, "fresh", true).await;
+    assert!(request.body["fields"]["native_session_id"].is_null());
+    wait_for_starts(&fixture, &subject, 4).await;
+    assert_eq!(
+        restart_environment(&fixture.runtime.starts.lock().unwrap()[3]),
+        (Some(""), None)
     );
 }
 

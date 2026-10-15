@@ -264,6 +264,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_native_channels_prove_the_shared_resume_selector_before_opening() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = ensure_installed(root.path()).unwrap();
+        for file in ["pi-channel.ts", "omp-channel.ts"] {
+            let source = fs::read_to_string(installed.join(file)).unwrap();
+            let startup = source.split_once("\"session_start\"").unwrap().1;
+            let expected = startup.find("const expected = process.env.ST3_NATIVE_RESUME_SESSION;").unwrap();
+            let mismatch = startup.find("ctx.sessionManager.getSessionId() !== expected").unwrap();
+            let consumed = startup.find("delete process.env.ST3_NATIVE_RESUME_SESSION;").unwrap();
+            let opened = startup.find("await open(ctx)").unwrap();
+            assert!(expected < mismatch && mismatch < consumed && consumed < opened, "{file}");
+            assert!(!source.contains("ST_RESTART_EXPECTED_NATIVE_SESSION"), "{file}");
+        }
+    }
+
+    #[test]
     fn publishing_is_idempotent_and_a_changed_set_is_a_new_directory() {
         let root = tempfile::tempdir().unwrap();
         let first = ensure_installed(root.path()).unwrap();

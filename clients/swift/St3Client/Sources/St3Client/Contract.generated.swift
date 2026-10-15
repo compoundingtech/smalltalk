@@ -5,6 +5,7 @@ import Foundation
 public enum ActionType: String, Codable, CaseIterable, Sendable {
     case agentCreate = "agent.create"
     case agentQueueMove = "agent.queue-move"
+    case agentRestart = "agent.restart"
     case agentResume = "agent.resume"
     case agentRetire = "agent.retire"
     case agentStart = "agent.start"

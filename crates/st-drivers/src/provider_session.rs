@@ -652,6 +652,10 @@ fn apply_provider_environment(
     env: &[(String, String)],
     removed_env: &[&str],
 ) {
+    command
+        .env_remove("ST3_NATIVE_RESUME_SESSION")
+        .env_remove("ST3_NATIVE_CONTINUE_SESSION")
+        .env_remove("ST3_NATIVE_CONTINUE_PATH");
     // A fresh provider owns a new wrapper environment, even when launched below an old seat.
     // Never hand it another harness's legacy ownership or mandatory-resume fields.
     for (key, _) in std::env::vars_os() {

@@ -171,6 +171,9 @@ pub fn run_controlled_paths(
         ("ST_CLAUDE_IDENTITY".to_string(), identity.clone()),
     ];
     env.extend(paths.environment(&identity));
+    if let Ok(expected) = std::env::var("ST3_NATIVE_RESUME_SESSION") {
+        env.push(("ST3_NATIVE_RESUME_SESSION".into(), expected));
+    }
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
     run_provider_with_env_removals(
         "Claude",
@@ -180,6 +183,7 @@ pub fn run_controlled_paths(
         &[
             EXPECTED_NATIVE_SESSION_ENV,
             RESUME_GENERATION_ENV,
+            "ST3_NATIVE_RESUME_SESSION",
             "CATALOG",
             "ST_ROOT",
         ],
@@ -1342,6 +1346,14 @@ fn observe_payload(
         })
         .transpose()?;
     if event == "SessionStart" {
+        let expected_restart = var("ST3_NATIVE_RESUME_SESSION").filter(|id| !id.is_empty());
+        let already_bound = fs::read(agent_dir.join("claude-native-session")).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|binding| binding["incarnation"].as_str() == exported_session.as_deref());
+        if !already_bound && let Some(expected) = expected_restart.as_deref() {
+            let actual = payload.get("session_id").and_then(serde_json::Value::as_str).unwrap_or_default();
+            anyhow::ensure!(actual == expected, "native resume bound session {actual:?}, expected {expected:?}");
+        }
         let binding = match (runtime_id, exported_session.as_deref()) {
             (Some(runtime_id), Some(runtime_incarnation)) => Some(record_session_start_binding(
                 session_dir,
@@ -2258,6 +2270,32 @@ mod tests {
         )
         .unwrap();
         assert!(binding.get("transcript_path").is_none());
+    }
+
+    #[test]
+    fn restart_context_hook_proves_initial_identity_without_fencing_later_session_switches() {
+        let root = tempfile::tempdir().unwrap();
+        let seq = harness_state::claim(root.path(), "worker", "claude", "wrapper-current").unwrap();
+        let var = |key: &str| match key {
+            SESSION_ENV => Some("wrapper-current".into()),
+            SESSION_SEQ_ENV => Some(seq.to_string()),
+            "ST3_NATIVE_RESUME_SESSION" => Some("native-exact".into()),
+            _ => None,
+        };
+        let observe = |native: &str| observe_payload(
+            root.path(), root.path(), true, "worker", Some("run.worker"), "SessionStart",
+            &serde_json::json!({"session_id": native, "source": "resume", "transcript_path": "/transcript.jsonl"}).to_string(),
+            &var,
+        );
+        assert!(observe("native-wrong").is_err());
+        assert!(!root.path().join("claude-native-session").exists());
+        observe("native-exact").unwrap();
+        observe("human-selected-later").unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("claude-native-session")).unwrap(),
+        ).unwrap();
+        assert_eq!(binding["native_session_id"], "human-selected-later");
+        assert_eq!(binding["incarnation"], "wrapper-current");
     }
 
     #[test]

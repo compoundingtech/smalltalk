@@ -359,6 +359,11 @@ pub fn bound_session(
         .into_iter()
         .rev()
         .find(|claim| field(claim, "incarnation_id") == Some(incarnation))
+        // A newer unsaved binding supersedes the prior conversation; never resume an
+        // older session after a harness starts a fresh, not-yet-persisted context.
+        .filter(|claim| {
+            claim.body["fields"]["resume_available"].as_bool() != Some(false)
+        })
         .and_then(|claim| {
             Some((
                 field(&claim, "harness")?.to_owned(),
@@ -411,7 +416,10 @@ pub fn continue_session(
         .claims_for(subject, Some("runtime.action.requested"))?
         .iter()
         .any(|claim| {
-            claim.store_index > bound.store_index && field(claim, "action") == Some("fresh-context")
+            claim.store_index > bound.store_index
+                && (field(claim, "action") == Some("fresh-context")
+                    || (field(claim, "action") == Some("restart")
+                        && claim.body["fields"]["fresh_context"].as_bool() == Some(true)))
         });
     let legacy_refusal = store.operation_claim(&continue_unavailable_key(subject, &session))?;
     let refusals = store.claims_for(subject, Some("harness.diagnostic"))?;
@@ -698,6 +706,29 @@ mod tests {
     }
 
     #[test]
+    fn fresh_restart_drops_old_context_until_a_new_native_session_is_bound() {
+        for (action, fresh, clears) in [
+            ("restart", true, true),
+            ("restart", false, false),
+            ("start", true, false),
+        ] {
+            let store = Store::open_memory("node").unwrap();
+            continuation_claim(&store, "harness.session-file",
+                json!({"harness":"omp","session_id":"old-native"}), None);
+            continuation_claim(&store, "runtime.action.requested",
+                json!({"action":action,"fresh_context":fresh}), None);
+            // A crash or login prompt before any new binding must not resurrect the old context.
+            let selected = continue_session(&store, "agent/example", "omp", None, None).unwrap();
+            assert_eq!(selected.as_ref().map(|(id, _)| id.as_str()),
+                if clears { None } else { Some("old-native") });
+            continuation_claim(&store, "harness.session-file",
+                json!({"harness":"omp","session_id":"new-native"}), None);
+            assert_eq!(continue_session(&store, "agent/example", "omp", None, None)
+                .unwrap().unwrap().0, "new-native");
+        }
+    }
+
+    #[test]
     fn continuation_concurrent_permanent_receipts_are_one_durable_refusal() {
         let store = std::sync::Arc::new(Store::open_memory("node").unwrap());
         continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native"}), None);
@@ -711,6 +742,53 @@ mod tests {
         });
         assert_eq!(store.claims_for("agent/example", Some("harness.diagnostic")).unwrap().len(), 1);
         assert!(continue_session(&store, "agent/example", "omp", None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn unsaved_native_context_cannot_suspend_or_revive_an_older_session() {
+        let store = Store::open_memory("suspension-native-binding").unwrap();
+        let subject = "agent/example/worker";
+        let incarnation = "worker:i1";
+        let bind = |session: &str, availability: Option<bool>| {
+            let mut fields = std::collections::BTreeMap::from([
+                ("harness".into(), Value::from("omp")),
+                ("session_id".into(), Value::from(session)),
+                ("incarnation_id".into(), Value::from(incarnation)),
+            ]);
+            if let Some(available) = availability {
+                fields.insert("resume_available".into(), Value::from(available));
+            }
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.session-file".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        bind("saved", None);
+        assert_eq!(
+            bound_session(&store, subject, incarnation).unwrap(),
+            Some(("omp".into(), "saved".into()))
+        );
+        bind("new-context", Some(false));
+        assert_eq!(bound_session(&store, subject, incarnation).unwrap(), None);
+        assert!(
+            blockers(&store, subject, incarnation)
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker == "native-session-unbound")
+        );
+        bind("new-context", Some(true));
+        assert_eq!(
+            bound_session(&store, subject, incarnation).unwrap(),
+            Some(("omp".into(), "new-context".into()))
+        );
+        assert_eq!(bound_session(&store, subject, "worker:i2").unwrap(), None);
     }
 
     #[test]

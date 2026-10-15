@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Restart seats with captured native context and optional incarnation fencing",
+  "replay": {"status": "none", "detail": "No new replay trigger; accepted restart retries keep their original durable request and captured context."},
+  "schema": {"status": "changed", "detail": "Restart requests capture native session identity, path and fresh-context intent. POST /v1/agents/restart keeps incarnation_id optional. Native bindings use the existing /v1/agents/native-session endpoint with optional availability and idempotency fields, not a duplicate endpoint. No storage migration is added by these restart repairs."},
+  "rules": {"status": "changed", "detail": "The daemon enforces incarnation_id when supplied and refuses a mismatch. An empty id matches only a seat with no incarnation. Omission keeps existing callers working; the accepted request captures the current incarnation for reconciliation."},
+  "compatibility": {"status": "changed", "detail": "Existing callers may omit incarnation_id in the schema and CLI. Supplied stale or empty ids cannot restart a running incarnation. Typed actions apply the same optional fence semantics. Restart uses the existing native resume selector to preserve the saved conversation by default. fresh_context starts a new conversation and prevents later ordinary relaunches from reviving the old one before a new binding is reported."},
+  "downtime": {"status": "unknown", "detail": "Normal binary deployment; interruption timing has not been measured."},
+  "manual": {"status": "changed", "detail": "Correct an unidentified runtime before retrying a refused fenced restart. The CLI promptly reports a replacement's blocked channel so attachment can be corrected while mail stays held."},
+  "recovery": {"status": "none", "detail": "No new data conversion; restart attempts and completion receipts remain durable and idempotent."}
+}

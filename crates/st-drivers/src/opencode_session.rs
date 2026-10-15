@@ -58,6 +58,7 @@ const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(2);
 const DELIVERY_RETRY: Duration = Duration::from_secs(2);
 const SEED_RETRY: Duration = Duration::from_millis(250);
 const SSE_RECONNECT: Duration = Duration::from_secs(2);
+const NATIVE_SESSION_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Every API arm the wrapper depends on, as it appears in the served OpenAPI document. A missing
@@ -127,6 +128,7 @@ pub fn run_with_paths(
         !opencode_argv.is_empty(),
         "opencode driver '{runtime_id}' has no provider argv"
     );
+    // The st3 launcher has already applied native argv selection.
     let admission =
         crate::harness_admission::admit(&opencode_argv[0], DiagnosticDriver::OpenCode, None);
     let version_ok = admission.passed();
@@ -203,6 +205,8 @@ pub fn run_with_paths(
                 delivery.pinned_session = selected_session(&argv);
                 // A predecessor's record names the predecessor's session, never this one's.
                 let _ = std::fs::remove_file(&delivery.binding_path);
+                delivery.fresh_session = matches!(&delivery.control, SessionControl::Graph(_))
+                    && std::env::var_os("ST3_NATIVE_RESUME_SESSION").is_some_and(|id| id.is_empty());
                 delivery
             },
             diagnostics,
@@ -418,6 +422,9 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
     // separate one keeps its pull from borrowing the session while the producer is borrowed
     // mutably.
     let context_client = session.client.clone();
+    // The bound native session and whether the server's persisted store returned it.
+    let mut published_native_session: Option<(String, bool)> = None;
+    let mut next_native_session_probe = Instant::now();
 
     let outcome = loop {
         if STOP.load(Ordering::SeqCst) {
@@ -502,6 +509,14 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         if api_ok && !sse_started {
             spawn_sse_reader(session.client.clone(), event_tx.clone(), sse_stop.clone());
             sse_started = true;
+        }
+        if api_ok
+            && session.delivery.fresh_session
+            && let Err(error) = session.delivery.select_fresh_session(&session.client)
+        {
+            let _ = session.writer.ended("fresh-session-error");
+            let _ = stop_provider_group(child);
+            break Err(error);
         }
 
         // Accumulated across the whole drain and published once at its end: `message.updated` and
@@ -609,6 +624,34 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
             }
             next_inbox = Instant::now() + INBOX_REFRESH_FALLBACK;
         }
+        if api_ok && let Some(native_id) = session.delivery.observed_session.clone() {
+            let changed = published_native_session.as_ref().is_none_or(|(id, _)| *id != native_id);
+            let unsaved = published_native_session.as_ref().is_some_and(|(_, saved)| !saved);
+            if changed || (unsaved && Instant::now() >= next_native_session_probe) {
+                next_native_session_probe = Instant::now() + NATIVE_SESSION_PROBE_INTERVAL;
+                // Positive persisted evidence: the server's session store returns this exact ID.
+                let saved = session.client.get_json(&format!("/session/{native_id}")).ok()
+                    .is_some_and(|native| native.get("id").and_then(Value::as_str) == Some(native_id.as_str()));
+                if changed || saved {
+                    // Observation is best effort; a record failure must not stop a healthy seat.
+                    if let Err(error) = harness_state::write_json_atomic(
+                        &session.delivery.binding_path,
+                        &json!({
+                            "sessionId": native_id,
+                            "incarnation": session.adoption.session,
+                            "native_session_id": native_id,
+                            "resume_available": saved,
+                        }),
+                        agent_dir,
+                        ".opencode-native-session",
+                    ) {
+                        tracing::warn!("st opencode-session: native session record write failed: {error:#}");
+                    } else {
+                        published_native_session = Some((native_id, saved));
+                    }
+                }
+            }
+        }
 
         thread::sleep(PROVIDER_POLL);
     };
@@ -622,6 +665,7 @@ fn spawn_provider(argv: &[String], password: &str) -> Result<Child> {
         .split_first()
         .context("opencode provider argv is empty")?;
     let mut command = std::process::Command::new(program);
+    command.env_remove("ST3_NATIVE_RESUME_SESSION").env_remove("ST3_NATIVE_CONTINUE_SESSION").env_remove("ST3_NATIVE_CONTINUE_PATH");
     command
         .args(args)
         .env("OPENCODE_SERVER_PASSWORD", password)
@@ -1694,8 +1738,12 @@ struct Delivery {
     pinned_session: Option<String>,
     /// Where the bound session is recorded for the st3 driver.
     binding_path: PathBuf,
+    /// Positive server selection, native event, or persisted message evidence. A listing alone
+    /// can choose a delivery candidate, but cannot claim this wrapper owns that conversation.
+    observed_session: Option<String>,
     next_attempt: Instant,
     next_pin_check: Instant,
+    fresh_session: bool,
 }
 
 impl Delivery {
@@ -1728,8 +1776,10 @@ impl Delivery {
             target_session: None,
             pinned_session: None,
             binding_path: agent_dir.join(NATIVE_SESSION_FILE),
+            observed_session: None,
             next_attempt: Instant::now(),
             next_pin_check: Instant::now(),
+            fresh_session: false,
         }
     }
 
@@ -1741,22 +1791,18 @@ impl Delivery {
         {
             return;
         }
-        if self.target_session.as_deref() == Some(session_id) {
+        if self.target_session.as_deref() == Some(session_id)
+            && self.observed_session.as_deref() == Some(session_id)
+        {
             return;
         }
         self.target_session = Some(session_id.to_string());
-        // Best effort: a lost record delays only the report, never delivery.
-        if let Err(error) = harness_state::write_json_atomic(
-            &self.binding_path,
-            &json!({ "sessionId": session_id }),
-            self.binding_path.parent().unwrap_or(Path::new(".")),
-            ".opencode-native-session",
-        ) {
-            tracing::warn!("st opencode-session: native session record write failed: {error:#}");
-        }
+        self.observed_session = Some(session_id.to_owned());
+        // The run loop records this positive binding with the wrapper's incarnation and verifies
+        // persistence. Keep one writer so a later event cannot erase that resume evidence.
     }
 
-    /// Bind the pinned session once the server confirms it exists. Nothing else proves a
+    /// Bind the pinned session once the server confirms its exact identity. Nothing else proves a
     /// resumed session that stays idle: an idle session emits no event.
     fn confirm_pinned(&mut self, client: &Client) {
         let Some(pinned) = self.pinned_session.clone() else {
@@ -1766,9 +1812,24 @@ impl Delivery {
             return;
         }
         self.next_pin_check = Instant::now() + Duration::from_secs(1);
-        if client.get_json(&format!("/session/{pinned}")).is_ok() {
+        if client.get_json(&format!("/session/{pinned}")).ok().is_some_and(|native| {
+            native.get("id").and_then(Value::as_str) == Some(pinned.as_str())
+        }) {
             self.saw_session(&pinned);
         }
+    }
+
+    fn select_fresh_session(&mut self, client: &Client) -> Result<()> {
+        let (status, body) = client.request("POST", "/session", Some(&json!({})))?;
+        anyhow::ensure!((200..300).contains(&status), "OpenCode fresh session returned HTTP {status}");
+        let native_id = serde_json::from_slice::<Value>(&body)?.get("id").and_then(Value::as_str)
+            .filter(|id| !id.is_empty()).context("OpenCode fresh session has no native id")?.to_owned();
+        let status = client.post_json("/tui/select-session", &json!({"sessionID": native_id}))?;
+        anyhow::ensure!((200..300).contains(&status), "OpenCode session selection returned HTTP {status}");
+        self.pinned_session = Some(native_id.clone());
+        self.saw_session(&native_id);
+        self.fresh_session = false;
+        Ok(())
     }
 
     /// An assistant message whose `parentID` is our exact stable client message is the first
@@ -1863,6 +1924,11 @@ impl Delivery {
         let target = match self.target_session.clone() {
             Some(target) => target,
             None => {
+                // A named seat must wait for confirmation of that exact session. Falling back to
+                // the listing here would silently deliver a suspended seat's mail elsewhere.
+                if self.pinned_session.is_some() {
+                    return Ok(());
+                }
                 // A session that settled before this observer connected is invisible to both the
                 // event stream and `/session/status` (idle sessions are omitted), so a pending
                 // delivery would otherwise stall forever. With work waiting, recover the binding
@@ -1871,7 +1937,7 @@ impl Delivery {
                 let Some(recovered) = delivery_session(client) else {
                     return Ok(());
                 };
-                self.saw_session(&recovered);
+                self.target_session = Some(recovered.clone());
                 recovered
             }
         };
@@ -1940,6 +2006,7 @@ impl Delivery {
             ReadBack::Durable => {
                 self.ledger
                     .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
+                self.saw_session(&entry.binding);
                 return Ok(());
             }
             // Measured on 1.18.19: a second POST with the same messageID appends its parts again
@@ -2031,6 +2098,7 @@ impl Delivery {
         if matches!(read_back, ReadBack::Durable) {
             self.ledger
                 .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
+            self.saw_session(&entry.binding);
         }
         Ok(())
     }
@@ -2146,7 +2214,8 @@ mod tests {
     /// Pins the admitted set itself: widening opencode has to be a deliberate edit here, beside
     /// the verification the minor was admitted on.
     use std::collections::BTreeSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -2476,9 +2545,9 @@ mod tests {
                             });
                     match message_id {
                         Some(message_id) => {
-                            posts_t.lock().unwrap().push(message_id.clone());
+                            posts_t.lock().push(message_id.clone());
                             if accept_t.load(Ordering::SeqCst) {
-                                durable_t.lock().unwrap().insert(message_id);
+                                durable_t.lock().insert(message_id);
                                 200
                             } else {
                                 500
@@ -2490,7 +2559,7 @@ mod tests {
                     let message_id = path.rsplit('/').next().unwrap_or("");
                     if read_back_t.load(Ordering::SeqCst) {
                         500
-                    } else if durable_t.lock().unwrap().contains(message_id) {
+                    } else if durable_t.lock().contains(message_id) {
                         200
                     } else {
                         404
@@ -2498,14 +2567,14 @@ mod tests {
                 } else if method == "GET" && (path == "/session" || path == "/config/providers") {
                     200
                 } else if method == "POST" && path == "/session" {
-                    listed_t.lock().unwrap().push("ses_created".to_string());
+                    listed_t.lock().push("ses_created".to_string());
                     200
                 } else if method == "POST" && path == "/tui/select-session" {
                     if let Some(id) = serde_json::from_slice::<Value>(&body)
                         .ok()
                         .and_then(|value| value.get("sessionID")?.as_str().map(str::to_string))
                     {
-                        selected_t.lock().unwrap().push(id);
+                        selected_t.lock().push(id);
                     }
                     200
                 } else if method == "GET" && path == "/session/status" {
@@ -2520,30 +2589,36 @@ mod tests {
                     } else {
                         200
                     }
+                } else if method == "GET" && path.starts_with("/session/")
+                    && path.strip_prefix("/session/").is_some_and(|id| listed_t.lock().iter().any(|native| native == id)) {
+                    200
                 } else {
                     404
                 };
                 let body = if method == "POST" && path == "/session" {
                     r#"{"id":"ses_created"}"#.to_string()
                 } else if method == "GET" && path == "/session" {
-                    let ids = listed_t.lock().unwrap();
+                    let ids = listed_t.lock();
                     serde_json::to_string(
                         &ids.iter()
                             .map(|id| serde_json::json!({ "id": id }))
                             .collect::<Vec<_>>(),
                     )
                     .unwrap()
+                } else if method == "GET" && path.strip_prefix("/session/")
+                    .is_some_and(|id| !id.contains('/') && id != "status") {
+                    serde_json::json!({"id": path.trim_start_matches("/session/")}).to_string()
                 } else if method == "GET" && path == "/config/providers" {
                     OC_PROVIDERS.to_string()
                 } else if method == "GET" && path == "/session/status" {
-                    if let Some(body) = status_body_t.lock().unwrap().clone() {
+                    if let Some(body) = status_body_t.lock().clone() {
                         body
                     } else {
                         "{}".to_string()
                     }
                 } else if method == "GET" && (path == "/permission" || path == "/question") {
                     if path == "/permission"
-                        && let Some(body) = ask_body_t.lock().unwrap().clone()
+                        && let Some(body) = ask_body_t.lock().clone()
                     {
                         let mut stream = reader.into_inner();
                         let _ = write!(
@@ -2554,9 +2629,9 @@ mod tests {
                         continue;
                     }
                     let ids = if path == "/permission" {
-                        pending_t.lock().unwrap()
+                        pending_t.lock()
                     } else {
-                        questions_t.lock().unwrap()
+                        questions_t.lock()
                     };
                     serde_json::to_string(
                         &ids.iter()
@@ -2603,7 +2678,7 @@ mod tests {
 
         server.read_back_error.store(true, Ordering::SeqCst);
         delivery.pump(&client);
-        assert_eq!(server.posts.lock().unwrap().len(), 1, "one POST, attempted");
+        assert_eq!(server.posts.lock().len(), 1, "one POST, attempted");
         assert_eq!(
             ledger_phase(&state_path, &filename),
             Some(delivery_ledger::Phase::TransportAccepted),
@@ -2613,7 +2688,7 @@ mod tests {
         // While the read-back stays indeterminate, no pass may re-POST.
         delivery.pump(&client);
         delivery.pump(&client);
-        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(server.posts.lock().len(), 1);
 
         // The read-back recovering flips the same attempt to Accepted with no second POST.
         server.read_back_error.store(false, Ordering::SeqCst);
@@ -2623,7 +2698,7 @@ mod tests {
             Some(delivery_ledger::Phase::Persisted),
             "a recovered read-back proves storage, not consumption"
         );
-        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(server.posts.lock().len(), 1);
     }
 
     #[test]
@@ -2689,7 +2764,7 @@ mod tests {
             crate::driver_diagnostic::Observed::Absent,
             "read-back recovery clears without a second POST"
         );
-        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(server.posts.lock().len(), 1);
     }
 
     /// An ask opened before the SSE connection must survive the reconnect seed with its id, so
@@ -2715,9 +2790,7 @@ mod tests {
         // A successful seed recovers the pending ask under its own id.
         server.status_error.store(false, Ordering::SeqCst);
         server
-            .pending_permissions
-            .lock()
-            .unwrap()
+            .pending_permissions.lock()
             .push("per_pending".to_string());
         let mut machine = EventMachine::default();
         assert!(seed_from_server(&client, &mut machine).is_ok());
@@ -2735,11 +2808,9 @@ mod tests {
 
         // Pending questions are recovered from their own listing endpoint (measured on 1.18.19),
         // classified as question asks, and released by the question's id-matched reply.
-        server.pending_permissions.lock().unwrap().clear();
+        server.pending_permissions.lock().clear();
         server
-            .pending_questions
-            .lock()
-            .unwrap()
+            .pending_questions.lock()
             .push("que_pending".to_string());
         let mut machine = EventMachine::default();
         assert!(seed_from_server(&client, &mut machine).is_ok());
@@ -2778,7 +2849,7 @@ mod tests {
         delivery.pump(&client);
         delivery.pump(&client);
         assert_eq!(
-            server.posts.lock().unwrap().len(),
+            server.posts.lock().len(),
             1,
             "uncertain storage never resends"
         );
@@ -2847,7 +2918,7 @@ mod tests {
         delivery.pump(&client);
         let expected_id = stable_message_id("h.worker", "ses_target", &filename);
         assert_eq!(
-            server.posts.lock().unwrap().as_slice(),
+            server.posts.lock().as_slice(),
             std::slice::from_ref(&expected_id)
         );
         // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
@@ -2873,7 +2944,7 @@ mod tests {
         // Persistence is terminal for the POST loop: further pumps send nothing.
         delivery.pump(&client);
         delivery.pump(&client);
-        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(server.posts.lock().len(), 1);
     }
 
     #[test]
@@ -2933,7 +3004,7 @@ mod tests {
 
         let expected_id = stable_message_id("h.worker", "ses_target", &filename);
         assert_eq!(
-            server.posts.lock().unwrap().as_slice(),
+            server.posts.lock().as_slice(),
             [expected_id.clone(), expected_id]
         );
         assert_eq!(
@@ -2965,7 +3036,7 @@ mod tests {
             ledger_phase(&state_path, &filename),
             Some(delivery_ledger::Phase::Persisted)
         );
-        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(server.posts.lock().len(), 1);
     }
 
     #[test]
@@ -2978,16 +3049,16 @@ mod tests {
         let gate = crate::session_control::DeliveryGate::default();
         delivery.control = SessionControl::Graph(gate.clone());
         delivery.pump(&client);
-        assert!(server.posts.lock().unwrap().is_empty());
+        assert!(server.posts.lock().is_empty());
         assert!(!delivery.status_path.exists());
         status::set_state(&delivery.status_path, status::State::Dnd).unwrap();
         let bytes = std::fs::read(&delivery.status_path).unwrap();
         gate.update(true, Duration::from_secs(30));
         delivery.pump(&client);
-        assert!(server.posts.lock().unwrap().is_empty());
+        assert!(server.posts.lock().is_empty());
         gate.update(false, Duration::from_secs(30));
         delivery.pump(&client);
-        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(server.posts.lock().len(), 1);
         assert_eq!(std::fs::read(&delivery.status_path).unwrap(), bytes);
     }
 
@@ -3002,7 +3073,7 @@ mod tests {
         let agent_dir = tmp.path().join("agents/h/worker");
         status::set_state(&status::status_path(&agent_dir), status::State::Dnd).unwrap();
         delivery.pump(&client);
-        assert!(server.posts.lock().unwrap().is_empty());
+        assert!(server.posts.lock().is_empty());
 
         // A seat starts with no prompt, so no session exists yet. Waiting mail creates the first
         // one, shows it in the TUI, and goes into it.
@@ -3011,12 +3082,12 @@ mod tests {
         delivery.pump(&client);
         assert_eq!(delivery.target_session.as_deref(), Some("ses_created"));
         assert_eq!(
-            server.selected_sessions.lock().unwrap().as_slice(),
+            server.selected_sessions.lock().as_slice(),
             ["ses_created"]
         );
-        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(server.posts.lock().len(), 1);
         assert_eq!(
-            server.listed_sessions.lock().unwrap().as_slice(),
+            server.listed_sessions.lock().as_slice(),
             ["ses_created"],
             "exactly one session is created"
         );
@@ -3048,6 +3119,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restart_context_opencode_fresh_never_delivers_into_a_stale_listed_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        server.listed_sessions.lock().push("ses_old".into());
+        let client = Client::new(server.port, "pw");
+        let (mut delivery, _) = delivery_fixture(tmp.path(), tmp.path().join("ledger.json"));
+        delivery.target_session = Some("ses_old".into());
+        delivery.fresh_session = true;
+        delivery.select_fresh_session(&client).unwrap();
+        delivery.saw_session("ses_old");
+        delivery.pump(&client);
+        assert_eq!(delivery.ledger.binding(), Some("ses_created"));
+        assert_eq!(delivery.observed_session.as_deref(), Some("ses_created"));
+        assert_eq!(server.selected_sessions.lock().as_slice(), ["ses_created"]);
+        assert_eq!(server.listed_sessions.lock().as_slice(), ["ses_old", "ses_created"]);
+    }
+
+    #[test]
+    fn restart_context_opencode_resume_uses_exact_capture_not_newest_listed_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        server.listed_sessions.lock().extend(["ses_exact".into(), "ses_other".into()]);
+        let client = Client::new(server.port, "pw");
+        let (mut delivery, _) = delivery_fixture(tmp.path(), tmp.path().join("ledger.json"));
+        delivery.pinned_session = Some("ses_exact".into());
+        delivery.confirm_pinned(&client);
+        delivery.saw_session("ses_other");
+        delivery.pump(&client);
+        assert_eq!(delivery.ledger.binding(), Some("ses_exact"));
+        assert_eq!(delivery.observed_session.as_deref(), Some("ses_exact"));
+        assert!(server.selected_sessions.lock().is_empty());
+        assert_eq!(server.listed_sessions.lock().as_slice(), ["ses_exact", "ses_other"]);
+    }
+
+    #[test]
+    fn restart_context_opencode_missing_capture_does_not_bind_another_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        server.listed_sessions.lock().push("ses_other".into());
+        let client = Client::new(server.port, "pw");
+        let (mut delivery, _) = delivery_fixture(tmp.path(), tmp.path().join("ledger.json"));
+        delivery.observed_session = None;
+        delivery.pinned_session = Some("ses_missing".into());
+        delivery.confirm_pinned(&client);
+        assert!(delivery.observed_session.is_none());
+        assert!(server.selected_sessions.lock().is_empty());
+    }
+
+    #[test]
+    fn a_missing_pinned_session_does_not_deliver_into_a_listed_neighbor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        server.listed_sessions.lock().push("ses_other".into());
+        let client = Client::new(server.port, "pw");
+        let (mut delivery, _) = delivery_fixture(tmp.path(), tmp.path().join("ledger.json"));
+        delivery.target_session = None;
+        delivery.observed_session = None;
+        delivery.pinned_session = Some("ses_missing".into());
+        delivery.confirm_pinned(&client);
+        delivery.saw_session("ses_other");
+        delivery.pump(&client);
+        assert!(delivery.target_session.is_none());
+        assert!(delivery.observed_session.is_none());
+        assert!(server.posts.lock().is_empty());
+        assert!(server.selected_sessions.lock().is_empty());
+    }
+
     /// O1: a seat whose session settled before the observer connected is invisible to the event
     /// stream and to /session/status — with work pending, the delivery binding is recovered from
     /// the session listing rather than stalling forever.
@@ -3063,19 +3202,17 @@ mod tests {
         // The idle session exists only in the listing; the pass binds it and delivers, and
         // creates no second session.
         server
-            .listed_sessions
-            .lock()
-            .unwrap()
+            .listed_sessions.lock()
             .push("ses_settled".to_string());
         delivery.pump(&client);
         assert_eq!(delivery.target_session.as_deref(), Some("ses_settled"));
-        let posts = server.posts.lock().unwrap();
+        let posts = server.posts.lock();
         assert_eq!(posts.len(), 1, "delivery bound to the recovered session");
         assert_eq!(
-            server.listed_sessions.lock().unwrap().as_slice(),
+            server.listed_sessions.lock().as_slice(),
             ["ses_settled"]
         );
-        assert!(server.selected_sessions.lock().unwrap().is_empty());
+        assert!(server.selected_sessions.lock().is_empty());
     }
 
     /// W8-4: the seed is atomic against the LIVE machine — a mid-seed failure leaves no
@@ -3096,9 +3233,7 @@ mod tests {
         // /permission succeeds, /question fails mid-seed: the live machine is untouched —
         // the stale ask is still held (not half-cleared) and no new ask leaked in.
         server
-            .pending_permissions
-            .lock()
-            .unwrap()
+            .pending_permissions.lock()
             .push("per_new".to_string());
         server.ask_error.store(true, Ordering::SeqCst);
         // ask_error fails BOTH listings; simulate the split by failing only after /permission:
@@ -3184,18 +3319,16 @@ mod tests {
         let client = Client::new(server.port, "pw");
         let _keep = tmp;
 
-        *server.ask_body.lock().unwrap() = Some(r#"[{"id":"per_ok"},{"token":42}]"#.to_string());
+        *server.ask_body.lock() = Some(r#"[{"id":"per_ok"},{"token":42}]"#.to_string());
         let mut machine = EventMachine::default();
         assert!(
             seed_from_server(&client, &mut machine).is_err(),
             "an entry without a readable id must fail the seed, not be skipped"
         );
 
-        *server.ask_body.lock().unwrap() = None;
+        *server.ask_body.lock() = None;
         server
-            .pending_permissions
-            .lock()
-            .unwrap()
+            .pending_permissions.lock()
             .push("per_ok".to_string());
         let mut machine = EventMachine::default();
         assert!(seed_from_server(&client, &mut machine).is_ok());
@@ -3211,7 +3344,7 @@ mod tests {
         let client = Client::new(server.port, "pw");
         let _keep = tmp;
         for shape in ["null", "[]", "[\"ses_a\"]", "3"] {
-            *server.status_body.lock().unwrap() = Some(shape.to_string());
+            *server.status_body.lock() = Some(shape.to_string());
             let mut machine = EventMachine::default();
             assert!(
                 seed_from_server(&client, &mut machine).is_err(),
@@ -3223,7 +3356,7 @@ mod tests {
                 "no level evidence from {shape}"
             );
         }
-        *server.status_body.lock().unwrap() = None;
+        *server.status_body.lock() = None;
         let mut machine = EventMachine::default();
         assert!(seed_from_server(&client, &mut machine).is_ok());
     }

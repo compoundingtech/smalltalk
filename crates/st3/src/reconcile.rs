@@ -120,6 +120,12 @@ const STOP_DEFERRAL_FAULT_MS: u128 = 15 * 60 * 1000;
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
 
+/// Context selection applies only to a person-requested launch, never daemon adoption.
+enum RestartContext<'a> {
+    Resume { session: &'a str, path: Option<&'a str> },
+    Fresh,
+}
+
 /// `local` is the declaration's origin, not the member interpreting a replicated declaration.
 fn owned_schedule_spec(
     store: &Store,
@@ -6847,8 +6853,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .environment
                 .remove(crate::suspension::RESUME_ENV);
         }
-        // Every other relaunch of a seat continues the native session its harness last bound,
-        // so a restart, a hangup or a changed declaration never loses the conversation.
+        // Ordinary relaunches continue the last native session. An explicit restart
+        // instead uses its captured session or deliberately selects fresh context.
         launch_member
             .environment
             .remove(crate::suspension::CONTINUE_ENV);
@@ -6864,7 +6870,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .environment
                 .insert(crate::suspension::SELECTOR_SCOPE_ENV.into(), scope.clone());
         }
-        let continued = if subject.kind == "agent"
+        // Without captured evidence the declared launch runs unchanged, including any authored
+        // resume arguments; only an explicit fresh request strips them.
+        let restart_context = request.and_then(|request| {
+            if request.body["fields"]["fresh_context"].as_bool() == Some(true) {
+                Some(RestartContext::Fresh)
+            } else {
+                request.body["fields"]["native_session_id"]
+                    .as_str()
+                    .filter(|session| !session.is_empty())
+                    .map(|session| RestartContext::Resume {
+                        session,
+                        path: request.body["fields"]["native_session_path"].as_str(),
+                    })
+            }
+        });
+        let continued = if restart_context.is_none()
+            && subject.kind == "agent"
             && !member
                 .environment
                 .contains_key(crate::suspension::RESUME_ENV)
@@ -6892,6 +6914,32 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .environment
                     .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path);
             }
+        }
+        if restart_context.is_some()
+            && let crate::model::LaunchSpec::Argv(argv) = &mut launch_member.launch
+            && let Some(driver) = member.driver.as_deref()
+        {
+            let boundary = argv.iter().position(|arg| arg == "--").map_or(0, |index| index + 1);
+            let provider = argv.split_off(boundary);
+            argv.extend(crate::native_resume::strip_selection(driver, provider));
+        }
+        match restart_context {
+            Some(RestartContext::Resume { session, path }) => {
+                launch_member
+                    .environment
+                    .insert(crate::suspension::RESUME_ENV.into(), session.into());
+                if let Some(path) = path {
+                    launch_member
+                        .environment
+                        .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path.into());
+                }
+            }
+            Some(RestartContext::Fresh) => {
+                launch_member
+                    .environment
+                    .insert(crate::suspension::RESUME_ENV.into(), String::new());
+            }
+            None => {}
         }
         crate::native_seed::omit_seed_for_native_resume(&mut launch_member);
         launch_member
@@ -7767,6 +7815,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         if let Some(observation) = observation.filter(|item| item.status == "running") {
+            if observation.incarnation_id.as_deref() != Some(previous) {
+                // An unidentifiable process is not permission to issue an unfenced stop.
+                return self.fail_requested_restart(
+                    subject,
+                    member,
+                    &request,
+                    "the running runtime cannot be identified for a fenced stop",
+                );
+            }
             // Rendering must succeed before we shut down a still-running seat.
             if let Some(error) = blocked {
                 return self.fail_requested_restart(

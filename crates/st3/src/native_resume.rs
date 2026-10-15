@@ -34,10 +34,146 @@ pub fn requested() -> Option<String> {
         .filter(|id| !id.trim().is_empty())
 }
 
+/// An explicitly empty resume selector means fresh context, not ordinary continuation.
+/// This uses the same launch-only selector as strict resume; no third selection channel exists.
+pub fn fresh() -> bool {
+    std::env::var_os(crate::suspension::RESUME_ENV).is_some_and(|value| value.is_empty())
+}
+
+/// Remove authored native selectors for an explicit restart, preserving literal arguments.
+pub fn strip_selection(harness: &str, mut argv: Vec<String>) -> Vec<String> {
+        let mut program = true;
+        let mut literal = false;
+        let mut selection_value = false;
+        let mut preserve_value = false;
+        let mut image_values = false;
+        argv.retain(|arg| {
+            if program {
+                program = false;
+                return true;
+            }
+            if literal {
+                return true;
+            }
+            if preserve_value {
+                preserve_value = false;
+                return true;
+            }
+            if image_values {
+                if !arg.starts_with('-') {
+                    return true;
+                }
+                image_values = false;
+            }
+            if selection_value {
+                selection_value = false;
+                if !arg.starts_with('-') {
+                    return false;
+                }
+            }
+            if arg == "--" {
+                literal = true;
+                return true;
+            }
+            let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+            // Codex's image option is variadic. Its launch parser requires a `--` prompt
+            // boundary for automatic resume, so image paths must remain opaque up to it.
+            if harness == "codex" && matches!(name, "--image" | "-i") {
+                image_values = true;
+                return true;
+            }
+            // Keep values opaque, even when prompt text or a model name happens to spell a
+            // session selector. Provider-specific short flags have different meanings.
+            let takes_unrelated_value = matches!(
+                name,
+                "--model"
+                    | "--system-prompt"
+                    | "--append-system-prompt"
+                    | "--system-prompt-file"
+                    | "--append-system-prompt-file"
+                    | "--mcp-config"
+                    | "--settings"
+                    | "--permission-mode"
+                    | "--session-dir"
+                    | "--provider"
+                    | "--thinking"
+                    | "--extension"
+                    | "-e"
+                    | "--config"
+                    | "--profile"
+                    | "--cd"
+                    | "--sandbox"
+                    | "--ask-for-approval"
+                    | "--enable"
+                    | "--disable"
+                    | "--add-dir"
+                    | "--remote"
+                    | "--remote-auth"
+                    | "--image"
+                    | "-i"
+                    | "-m"
+                    | "--agent"
+                    | "--prompt"
+                    | "--port"
+                    | "--hostname"
+            ) || (harness == "codex"
+                && matches!(
+                    name,
+                    "-c" | "-p"
+                        | "-C"
+                        | "-s"
+                        | "-a"
+                        | "--local-provider"
+                        | "--remote-auth-token-env"
+                ));
+            if takes_unrelated_value {
+                preserve_value = !arg.contains('=');
+                return true;
+            }
+            let selection = match harness {
+                "claude" => match name {
+                    "-c" | "--continue" | "--fork-session" => Some(false),
+                    "-r" | "--resume" | "--from-pr" | "--session-id" | "--teleport" => Some(true),
+                    _ => None,
+                },
+                "omp" => match name {
+                    "-c" | "--continue" | "--no-session" | "--fork" | "--from-claude"
+                    | "--from-codex" => Some(false),
+                    "-r" | "--resume" | "--session" | "--session-id" => Some(true),
+                    _ => None,
+                },
+                "pi" => match name {
+                    "-c" | "--continue" | "--no-session" | "--fork" => Some(false),
+                    "-r" | "--resume" | "--session" | "--session-id" => Some(true),
+                    _ => None,
+                },
+                "opencode" => match name {
+                    "-c" | "--continue" | "--fork" => Some(false),
+                    "-s" | "--session" => Some(true),
+                    _ => None,
+                },
+                "codex" => match name {
+                    "--last" | "--all" => Some(false),
+                    "resume" | "fork" => Some(true),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(takes_value) = selection {
+                selection_value = takes_value && !arg.contains('=');
+                false
+            } else {
+                true
+            }
+        });
+    argv
+}
+
+
 /// The native session this launch continues when it can, with where the harness kept it: every
 /// relaunch of a seat other than a resume. A refusal here starts a new session instead.
 pub fn continued() -> Option<(String, Option<PathBuf>)> {
-    if requested().is_some() {
+    if std::env::var_os(crate::suspension::RESUME_ENV).is_some() {
         return None;
     }
     let session = std::env::var(crate::suspension::CONTINUE_ENV)
@@ -521,16 +657,22 @@ pub fn pi_family_argv(
     argv: Vec<String>,
     sessions: &Path,
     id: &str,
+    path: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
     refuse_authored(&argv, selection_flags("pi"))?;
-    let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
-        Refusal::new(
-            "transcript-missing",
-            format!("{driver} session {id} has no transcript in {}", sessions.display()),
-        )
-    })?;
+    let transcript = if let Some(path) = path {
+        if !path.is_file() || pi_family_header_id(path).as_deref() != Some(id) {
+            return Err(Refusal::new("transcript-missing", format!("{driver} captured transcript does not name session {id}: {}", path.display())));
+        }
+        path.to_path_buf()
+    } else {
+        pi_family_transcript(sessions, id).ok_or_else(|| {
+            Refusal::new("transcript-missing", format!("{driver} session {id} has no transcript in {}", sessions.display()))
+        })?
+    };
     Ok(match driver {
+        "omp" if path.is_some() => insert_after_program(argv, &["--resume", &transcript.to_string_lossy()]),
         "omp" => insert_after_program(argv, &["--resume", id]),
         _ => insert_after_program(argv, &["--session", &transcript.to_string_lossy()]),
     })
@@ -961,6 +1103,10 @@ mod tests {
             claude_argv(argv(&["claude", "--model", "x"]), "abc", workspace, home).unwrap(),
             argv(&["claude", "--resume", "abc", "--model", "x"])
         );
+        let explicit = strip_selection("claude", argv(&["claude", "--resume", "authored", "--fork-session", "--model", "x"]));
+        assert_eq!(claude_argv(explicit.clone(), "abc", workspace, home).unwrap(),
+            argv(&["claude", "--resume", "abc", "--model", "x"]));
+        assert_eq!(claude_argv(explicit, "missing", workspace, home).unwrap_err().code, "transcript-missing");
         assert_eq!(
             claude_argv(argv(&["claude", "--continue"]), "abc", workspace, home)
                 .unwrap_err()
@@ -1017,7 +1163,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi"]), &sessions, "one")
+            pi_family_argv("pi", argv(&["pi"]), &sessions, "one", None)
                 .unwrap_err()
                 .code,
             "transcript-missing"
@@ -1029,15 +1175,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two").unwrap(),
+            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two", None).unwrap(),
             argv(&["pi", "--session", &path.to_string_lossy(), "-e", "x"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), &sessions, "two").unwrap(),
+            pi_family_argv("omp", argv(&["omp"]), &sessions, "two", None).unwrap(),
             argv(&["omp", "--resume", "two"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two")
+            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two", None)
                 .unwrap_err()
                 .code,
             "authored-session-selection"
@@ -1075,4 +1221,138 @@ mod tests {
             "authored-session-selection"
         );
     }
+
+    #[test]
+    fn explicit_selection_strips_authored_selectors_before_strict_resume() {
+        for (harness, selection) in [
+            (
+                "claude",
+                argv(&["--resume=old", "--fork-session", "--session-id", "other"]),
+            ),
+            ("omp", argv(&["-r", "old", "--continue", "--from-codex"])),
+            ("pi", argv(&["--session", "old", "-r", "--continue"])),
+            ("codex", argv(&["resume", "old", "--last"])),
+            ("opencode", argv(&["-s", "old", "--continue", "--fork"])),
+        ] {
+            let mut input = argv(&[harness, "--model", "keep"]);
+            input.extend(selection);
+            input.extend(argv(&["--", "--resume", "literal prompt"]));
+            assert_eq!(
+                strip_selection(harness, input),
+                argv(&[
+                    harness,
+                    "--model",
+                    "keep",
+                    "--",
+                    "--resume",
+                    "literal prompt"
+                ])
+            );
+        }
+    }
+    #[test]
+    fn explicit_selection_keeps_unrelated_option_values_opaque() {
+        for (harness, input) in [
+            (
+                "claude",
+                argv(&[
+                    "claude",
+                    "--system-prompt",
+                    "--resume",
+                    "--resume",
+                    "old",
+                    "--mcp-config",
+                    "keep",
+                ]),
+            ),
+            (
+                "codex",
+                argv(&[
+                    "codex",
+                    "--model",
+                    "resume",
+                    "-c",
+                    "fork",
+                    "resume",
+                    "old",
+                    "--sandbox",
+                    "keep",
+                ]),
+            ),
+            (
+                "pi",
+                argv(&[
+                    "pi",
+                    "--session-dir",
+                    "/keep",
+                    "--session",
+                    "old",
+                    "--model",
+                    "keep",
+                ]),
+            ),
+            (
+                "omp",
+                argv(&["omp", "--from-codex", "unrelated prompt", "--model", "keep"]),
+            ),
+        ] {
+            let expected = match harness {
+                "claude" => argv(&[
+                    "claude",
+                    "--system-prompt",
+                    "--resume",
+                    "--mcp-config",
+                    "keep",
+                ]),
+                "codex" => argv(&[
+                    "codex",
+                    "--model",
+                    "resume",
+                    "-c",
+                    "fork",
+                    "--sandbox",
+                    "keep",
+                ]),
+                "omp" => argv(&["omp", "unrelated prompt", "--model", "keep"]),
+                _ => argv(&["pi", "--session-dir", "/keep", "--model", "keep"]),
+            };
+            assert_eq!(strip_selection(harness, input), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_selection_keeps_codex_provider_auth_and_variadic_images_opaque() {
+        let input = argv(&[
+            "codex",
+            "--local-provider",
+            "resume",
+            "--remote-auth-token-env",
+            "fork",
+            "--image",
+            "resume",
+            "fork",
+            "--",
+            "literal prompt",
+        ]);
+        assert_eq!(
+            strip_selection("codex", input.clone()),
+            input,
+        );
+    }
+
+    #[test]
+    fn captured_pi_path_is_authoritative_and_must_name_the_requested_session() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("captured.jsonl");
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"captured\"}\n").unwrap();
+        let sessions = root.path().join("not-the-captured-directory");
+        assert_eq!(pi_family_argv("pi", argv(&["pi"]), &sessions, "captured", Some(&path)).unwrap(),
+            argv(&["pi", "--session", &path.to_string_lossy()]));
+        assert_eq!(pi_family_argv("omp", argv(&["omp"]), &sessions, "captured", Some(&path)).unwrap(),
+            argv(&["omp", "--resume", &path.to_string_lossy()]));
+        assert_eq!(pi_family_argv("pi", argv(&["pi"]), &sessions, "foreign", Some(&path)).unwrap_err().code, "transcript-missing");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(pi_family_argv("pi", argv(&["pi"]), &sessions, "captured", Some(&path)).unwrap_err().code, "transcript-missing");
+    }
+
 }

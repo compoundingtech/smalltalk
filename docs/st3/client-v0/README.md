@@ -975,6 +975,7 @@ The v0 action discriminators are:
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
+| Agent restart | `agent.restart` | snapshot; optional `runtime_incarnation` and `runtime_desired_revision` are enforced when supplied |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; resize and a line of input (`mode` `line`) also require the screen sequence; raw and key input do not |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
@@ -1012,6 +1013,51 @@ Rust exposes `agent_stop`/`agent_start`; TypeScript and Swift expose `agentStop`
 All generated clients' `Fence` models also carry the desired revision required by
 `runtime.stop` and `runtime.restart`.
 
+`agent.restart` takes `{ "agent": "agent/NAME", "fresh_context": false }`. It uses the same
+authority as agent creation, preserves the person audit actor, and appends a durable
+`runtime.action.requested` restart without changing the declaration. It works for standing
+and mission seats under every restart policy, including `never`. The incarnation fence is
+optional for existing callers; when supplied, a mismatch refuses the restart. An empty
+incarnation matches only a seat with no incarnation, never a running incarnation. An optional
+desired revision fence also guards declaration changes. Exact retries retain the original
+accepted request and captured session. The legacy `POST /v1/agents/restart` schema likewise
+accepts an omitted `incarnation_id`, enforces a supplied value, and rejects an empty value
+unless the seat has no incarnation.
+By default it captures the native session ID bound to this exact incarnation before stopping,
+then resumes that conversation. `fresh_context: true` explicitly starts a new conversation.
+The Agent resource's `restart_will_resume` is true only for a supported driver with a current
+native binding whose latest `resume_available` flag is true; false honestly indicates a restart
+without preserved native context. An assigned but unsaved session is not resumable. A newer
+unavailable binding, including `/new` within one incarnation, never revives an older saved session;
+missing availability is conservatively false.
+Pi and OMP refresh their transcript binding at turn boundaries, so an initially unsaved session
+becomes resumable after its first persisted turn. A captured resume fails if the provider first
+binds a different session; the CLI waits for the replacement's matching native binding.
+Supported native launches are Claude and OMP (`--resume` with the exact native session),
+OpenCode (`--session` with the exact native session), pi (`--session` with its captured
+transcript path, not its session ID), and Codex's controlled app-server launch (the exact native
+thread). A pi binding without a saved transcript path is not resumable; a captured transcript
+that disappears before launch fails closed rather than creating a file named after its ID.
+Explicit fresh context overrides authored continuation, fork, and session selectors, and
+discards Codex's stale binding; ordinary daemon adoption and residency do not acquire either
+restart override. Missing current native evidence makes `restart_will_resume` false.
+A fresh-context restart also invalidates the old session for later ordinary relaunches,
+even if its replacement crashes or waits at login before publishing a new native binding.
+Other providers may publish a null `harness.session-file.path` when they can resume by exact ID.
+Rust exposes `ActionRequest::agent_restart`; Swift and TypeScript expose `agentRestart`.
+The CLI equivalent is `st agents restart NAME --as person/NAME [--fresh-context]`; it obtains
+the current incarnation and declaration fences before submitting `/v1/agents/restart`,
+using an empty incarnation when none exists. No caller is required to supply an incarnation.
+
+Managed wrappers publish that evidence through the existing `POST /v1/agents/native-session`,
+with fields `subject`, `actor` (the seat itself), `harness`, `session_id`, `incarnation_id`,
+optional `account_ref`, nullable `path`, optional boolean `resume_available`, and optional
+`idempotency_key`. Reports without the new optional fields retain their existing contract.
+The daemon rejects another bound harness's agent,
+and requires the local current runtime incarnation and the declared supported native driver.
+It accepts no import metadata or arbitrary claim fields. The generic `/v1/claims` endpoint
+still rejects requester-owned `harness.session-file` claims; authorized native-session imports
+continue to use `session.import`.
 `agent.suspend` takes `{agent, reason?}` and requires the running incarnation and selected desired
 revision in its fence. `agent.resume` takes `{agent, host?}` and requires the selected desired
 revision. An absent `host` preserves single-host behavior. A different host requests portable

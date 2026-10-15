@@ -2618,6 +2618,7 @@ const ACTIONS: &[&str] = &[
     "agent.stop",
     "agent.retire",
     "agent.start",
+    "agent.restart",
     "agent.suspend",
     "agent.resume",
     "terminal.create",
@@ -2673,6 +2674,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "agent.stop",
     "agent.retire",
     "agent.start",
+    "agent.restart",
     "agent.suspend",
     "agent.resume",
     "terminal.create",
@@ -2841,7 +2843,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         } else if session.allows(scope)
             && (!matches!(
                 *action,
-                "agent.create" | "agent.stop" | "agent.start" | "terminal.create" | "terminal.end"
+                "agent.create" | "agent.stop" | "agent.start" | "agent.restart" | "terminal.create" | "terminal.end"
             ) || require_creation_actor(session).is_ok())
         {
             "granted"
@@ -9863,6 +9865,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
             | "agent.stop"
             | "agent.retire"
             | "agent.start"
+            | "agent.restart"
             | "agent.suspend"
             | "agent.resume"
     ) {
@@ -11271,6 +11274,24 @@ async fn dispatch_action(
             )])
         }
         "terminal.detach" => Ok(vec![detach_terminal_attachment(state, session, request)?]),
+        "agent.restart" => {
+            require_creation_actor(session)?;
+            let parameters: st3_client::AgentRestartParameters =
+                serde_json::from_value(p.clone())
+                    .map_err(|error| validation(error.to_string()))?;
+            let incarnation_id = request.fence.runtime_incarnation.clone();
+            let agent = client_detail_id("agent", &parameters.agent);
+            request_agent_restart(state, AgentRestartRequest {
+                subject: agent.clone(),
+                actor: authority_actor.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+                incarnation_id,
+                fresh_context: parameters.fresh_context,
+                desired_revision: request.fence.runtime_desired_revision.clone(),
+                now: false,
+            })?;
+            Ok(vec![agent])
+        }
         "agent.retire" => {
             require_creation_actor(session)?;
             let parameters = serde_json::from_value::<st3_client::AgentRetireParameters>(p.clone())
@@ -15342,6 +15363,122 @@ subscription "watch/source" {
             .0;
             assert_eq!(retry["affected_ids"], result["affected_ids"]);
         }
+    }
+
+    #[tokio::test]
+    async fn typed_restart_without_an_incarnation_accepts_a_keyless_seat() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let source = "version 2\nagent \"example/restart\" { workspace \"/tmp\"; harness \"codex\"; restart \"never\" }\n";
+        let intent = crate::graph::parse_intent(source, &state.node).unwrap();
+        let preview = state.store.mission(&intent, IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        state.store.apply(&intent, &preview.subject_tokens, "keyless-fixture").unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let request = st3_client::ActionRequest::agent_restart(
+            "action/keyless-restart", "keyless-restart-key",
+            st3_client::Fence { snapshot_id: snapshot.id.clone(), ..Default::default() },
+            st3_client::AgentRestartParameters {
+                agent: "agent/example/restart".into(), fresh_context: false,
+            },
+        ).unwrap();
+        let request: ActionRequest = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+        let result = action(State(state.clone()), Extension(snapshot),
+            Extension(ClientSession::local(Some("person/alex")).unwrap()), Json(request)).await.unwrap().0;
+        assert_eq!(result["status"], "completed");
+        let claim = state.store.latest_claim("agent/example/restart", Some("runtime.action.requested")).unwrap().unwrap();
+        assert_eq!(claim.body["fields"]["incarnation_id"], "");
+    }
+
+    #[tokio::test]
+    async fn typed_restart_captures_current_session_and_preserves_person_under_never_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let source = "version 2\nagent \"example/restart\" { workspace \"/tmp\"; harness \"codex\" { effort \"high\"; }; restart \"never\" }\n";
+        let intent = crate::graph::parse_intent(source, &state.node).unwrap();
+        let preview = state.store.mission(&intent, IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        state.store.apply(&intent, &preview.subject_tokens, "restart-fixture").unwrap();
+        let agent = "agent/example/restart";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: agent.into(), kind: kind.into(), actor: Some(agent.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({
+            "runtime_id": "restart-runtime", "incarnation_id": "current", "status": "running"
+        }));
+        append("harness.session-file", json!({
+            "harness": "codex", "session_id": "current-thread", "incarnation_id": "current", "resume_available": true,
+            "path": "/tmp/current-transcript.jsonl",
+        }));
+        // A newer record for an old incarnation cannot replace the current binding.
+        append("harness.session-file", json!({
+            "harness": "codex", "session_id": "old-thread", "incarnation_id": "old", "resume_available": true
+        }));
+        let snapshot = new_client_snapshot(&state);
+        let agents = client_agent_resources(&state.store, false, &snapshot.created_at, snapshot.store_index).unwrap();
+        assert_eq!(agents.iter().find(|item| item["id"] == agent).unwrap()["restart_will_resume"], true);
+        let person = ClientSession::local(Some("person/alex")).unwrap();
+        for (incarnation, fresh, key) in [
+            ("old", false, "restart-stale-key-0001"),
+            ("current", false, "restart-resume-key-0001"),
+            ("current", true, "restart-fresh-key-0001"),
+        ] {
+            let snapshot = new_client_snapshot(&state);
+            let request = st3_client::ActionRequest::agent_restart(
+                format!("action/{key}"), key,
+                st3_client::Fence {
+                    snapshot_id: snapshot.id.clone(),
+                    runtime_incarnation: Some(incarnation.into()),
+                    ..Default::default()
+                },
+                st3_client::AgentRestartParameters { agent: agent.into(), fresh_context: fresh },
+            ).unwrap();
+            let request: ActionRequest = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+            let result = action(State(state.clone()), Extension(snapshot),
+                Extension(person.clone()), Json(request)).await;
+            if incarnation == "old" {
+                assert!(result.is_err());
+                assert!(state.store.latest_claim(agent, Some("runtime.action.requested")).unwrap().is_none());
+            } else {
+                let result = result.unwrap().0;
+                assert_eq!(result["status"], "completed");
+                let claim = state.store.latest_claim(agent, Some("runtime.action.requested")).unwrap().unwrap();
+                assert_eq!(claim.actor.as_deref(), Some("person/alex"));
+                assert_eq!(claim.body["fields"]["incarnation_id"], "current");
+                assert_eq!(claim.body["fields"]["fresh_context"], fresh);
+                assert_eq!(claim.body["fields"]["native_session_id"],
+                    if fresh { Value::Null } else { json!("current-thread") });
+                assert_eq!(claim.body["fields"]["native_session_path"],
+                    if fresh { Value::Null } else { json!("/tmp/current-transcript.jsonl") });
+            }
+        }
+        // /new can bind an unsaved conversation inside the same runtime incarnation.
+        // It must not fall back to the previous saved thread.
+        append("harness.session-file", json!({
+            "harness": "codex", "session_id": "new-unsaved-thread",
+            "incarnation_id": "current", "resume_available": false,
+        }));
+        let snapshot = new_client_snapshot(&state);
+        let agents = client_agent_resources(&state.store, false, &snapshot.created_at, snapshot.store_index).unwrap();
+        assert_eq!(agents.iter().find(|item| item["id"] == agent).unwrap()["restart_will_resume"], false);
+        let claim = request_agent_restart(&state, AgentRestartRequest {
+            subject: agent.into(), actor: "person/alex".into(),
+            idempotency_key: "restart-new-unsaved-key".into(),
+            incarnation_id: Some("current".into()), fresh_context: false, desired_revision: None, now: false,
+        }).unwrap();
+        assert_eq!(claim.body["fields"]["native_session_id"], Value::Null);
+        append("runtime.observed", json!({
+            "runtime_id": "restart-runtime", "incarnation_id": "unbound", "status": "running"
+        }));
+        let snapshot = new_client_snapshot(&state);
+        let agents = client_agent_resources(&state.store, false, &snapshot.created_at, snapshot.store_index).unwrap();
+        assert_eq!(agents.iter().find(|item| item["id"] == agent).unwrap()["restart_will_resume"], false);
     }
 
     #[tokio::test]
