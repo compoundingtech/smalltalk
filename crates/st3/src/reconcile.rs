@@ -25205,7 +25205,7 @@ agent "worker" {
 
     #[test]
     fn a_top_level_checkout_leaves_after_stop_and_workspace_observations_do_not_repeat() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::canonical_tempdir();
         let repository = crate::checkout::test_support::repository(root.path());
         let workspace = root.path().join("worker");
         let store = Arc::new(Store::open_memory("node").unwrap());

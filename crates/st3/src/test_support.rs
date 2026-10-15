@@ -11,6 +11,26 @@ pub(crate) fn login_shell() -> Option<&'static Path> {
     LOGIN_SHELL.get().map(PathBuf::as_path)
 }
 
+/// A temporary directory whose path is already canonical. macOS puts temporary directories
+/// below the `/var` and `/tmp` symlinks, and st3 records the canonical path it resolves, so a
+/// test that compares paths needs the same spelling the code under test returns. The macOS
+/// per-user temporary directory is long even before canonicalizing adds `/private`, and a Unix
+/// socket path may not pass 103 bytes, so macOS tests root below `/tmp` instead.
+pub fn canonical_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(canonical_temp_base())
+        .expect("temporary directory")
+}
+
+fn canonical_temp_base() -> PathBuf {
+    let base = if cfg!(target_os = "macos") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    std::fs::canonicalize(base).expect("canonical temporary directory")
+}
+
 /// Called once, before threads start, exclusively by the fixture executable.
 #[cfg(feature = "test-support")]
 pub fn initialize_fixture() -> tempfile::TempDir {
@@ -124,7 +144,7 @@ pub fn evidence_tempdir() -> tempfile::TempDir {
 
     let mut root = tempfile::Builder::new()
         .prefix("restart-")
-        .tempdir()
+        .tempdir_in(canonical_temp_base())
         .unwrap();
     let Some(manifest) = std::env::var_os("SMALLTALK_TEST_EVIDENCE_MANIFEST") else {
         return root;

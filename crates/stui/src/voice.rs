@@ -32,7 +32,9 @@ pub fn helper() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ST_LISTEN").filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    if !cfg!(target_os = "macos") {
+    // A Mac that has the speech helper installed (the try-out copy under HOME) must not change
+    // what the unit tests see: they reach for a stand-in through ST_LISTEN instead.
+    if !cfg!(target_os = "macos") || cfg!(test) {
         return None;
     }
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;

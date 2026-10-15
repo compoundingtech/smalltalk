@@ -1949,7 +1949,7 @@ fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes(
 
 #[test]
 fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
-    let catalog = tempfile::tempdir().unwrap();
+    let catalog = crate::canonical_tempdir();
     let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
     write_resync_agent(catalog.path(), "second");
     crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
@@ -2236,7 +2236,7 @@ fn reconcile_pass_completes_while_a_resync_publication_is_blocked() {
 
 #[test]
 fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
-    let catalog = tempfile::tempdir().unwrap();
+    let catalog = crate::canonical_tempdir();
     let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
     crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let specs = crate::discover_strict(catalog.path()).specs;

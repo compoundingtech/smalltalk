@@ -4543,7 +4543,7 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
     if st3::test_support::supervise_test() {
         return;
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = st3::test_support::canonical_tempdir();
     struct SeatCleanup {
         pty: PathBuf,
         roots: Vec<PathBuf>,

@@ -192,6 +192,9 @@ mod tests {
         );
     }
 
+    // Linux only: a process's cgroup and start time come from /proc, and the gateway that reads
+    // them refuses to run on any other system.
+    #[cfg(target_os = "linux")]
     #[test]
     fn this_process_has_a_cgroup_and_a_start_time() {
         let pid = std::process::id() as i32;

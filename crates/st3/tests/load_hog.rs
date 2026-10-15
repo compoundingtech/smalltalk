@@ -200,7 +200,13 @@ fn the_hog_runs_at_seat_priority_and_stops_with_its_drop() {
             *errno_location() = 0;
             libc::getpriority(libc::PRIO_PROCESS, pid)
         };
-        assert_eq!(nice, hog.nice, "pid {pid} should run at the hog's nice");
+        // macOS runs the hog under `taskpolicy -b`, whose background state can read back as a
+        // nice above the one set (its limit is 20, not 19) when the test itself runs niced.
+        if cfg!(target_os = "macos") {
+            assert!(nice >= hog.nice, "pid {pid} should run at or below the hog's nice {}", hog.nice);
+        } else {
+            assert_eq!(nice, hog.nice, "pid {pid} should run at the hog's nice");
+        }
         #[cfg(target_os = "linux")]
         {
             // SAFETY: ioprio_get reads another process's IO priority.

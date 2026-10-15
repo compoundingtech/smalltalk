@@ -78,6 +78,10 @@ fn every_replay_input_change_invalidates_equality_and_retention() {
     }
 }
 
+// Linux only: a process's start token comes from /proc there and fails for a process that is not
+// there. Elsewhere `st_runtime::process_start_token` is the pid by design (a fast exit must not
+// fail a spawn), so no lookup is ever unavailable.
+#[cfg(target_os = "linux")]
 #[test]
 fn unavailable_process_input_clears_consumed_proof() {
     let root = tempfile::tempdir().unwrap();
