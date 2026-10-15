@@ -422,3 +422,42 @@ previous controls, helpers, strict/growth/crash bodies, limits and nextest
 settings remain unchanged. The original strict page has zero statement
 headroom and eight characterized growth pages remain over 128; no old work or
 crash receipt qualifies this new two-consumer path.
+
+## Two-consumer journal refused COMMIT (fixture only)
+
+One appended normal control uses the same fixed A=32/B=16 installed prefix
+roots, actual production journal prune and copied-reference oracle as the
+outer-rollback control. It records an owned changed journal/payload/counter
+witness before COMMIT and requires both consumer states unchanged. Separate
+checked physical readers see the original committed state while the write
+transaction is open. Only the private Plain/no-observer fixture installs a
+refusing SQLite commit hook: an external marker records invocation, the hook
+returns true, and the error must downcast to SQLITE_CONSTRAINT_COMMITHOOK.
+An arbitrary error, a no-op prune, delete-only or decrement-only maintenance,
+or unexpected successful COMMIT cannot satisfy those combined assertions.
+
+All fallible work is inside catch_unwind after installing the hook. The hook
+is removed before the idle check and any result/panic classification; an
+unexpected panic resumes after cleanup. The physical writer loan ends before
+fresh reads require full source/native/image/journal/counter conservation and
+both complete root/job/coverage/output states. An owned changed witness must
+survive the refused commit. This fault is restricted to the fixture's ordinary
+writer with no existing hook/observer owner; it adds no production hook API or
+quarantine contract. Post-copy payload length checks remain oracle bounds.
+
+A predetermined committing arm then removes 16 references and must remove
+zero on the next call while B is still at 16. It also detects a refusing hook
+left installed. B consumes the original remaining references and reaches the
+native-derived output at 32 before the final 16+0 prune. All 32 images stay
+unchanged. The second zero rejects a fast-root-only cutoff, but this fixed
+ordering cannot distinguish an implementation that only considers slow B;
+complete minimum selection for arbitrary consumer orderings is not claimed.
+
+The new control is UNRUN at source authoring. It is a discriminating fixture
+fault, not a production mechanism, storage change or GLOBAL-VIEW qualification.
+Crash/reopen with two consumers, image reclamation, whole-prune accounting,
+failed-cleanup containment, source authority/lifetime/restore and production
+adoption remain deferred. All earlier prefixes, helpers, strict/growth/crash
+controls, limits and nextest settings are unchanged. The strict 128-statement
+ceiling still has zero headroom and eight growth pages remain over it; no
+old work/crash result qualifies this new path.
