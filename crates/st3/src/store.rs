@@ -8907,7 +8907,7 @@ impl Store {
             .query_row(
                 "SELECT mission_runs.status, mission_runs.current_generation_id,
                         mission_runs.mode, run_generations.status,
-                        root_runs.status, root_runs.phase
+                        root_runs.status, root_runs.phase, mission_runs.phase
                  FROM mission_runs
                  JOIN run_generations ON run_generations.id=?2
                  JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
@@ -8924,6 +8924,7 @@ impl Store {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
@@ -8944,7 +8945,7 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT mission_runs.id, run_generations.id, mission_runs.status,
                     mission_runs.current_generation_id, mission_runs.mode,
-                    run_generations.status, root_runs.status, root_runs.phase
+                    run_generations.status, root_runs.status, root_runs.phase, mission_runs.phase
              FROM mission_runs
              JOIN run_generations ON run_generations.run_id=mission_runs.id
              JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
@@ -8961,6 +8962,7 @@ impl Store {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ),
                 ))
             })?
@@ -8983,7 +8985,7 @@ impl Store {
 
     fn work_annotation_with_owner(
         work: &StepRunView,
-        owner: Option<(String, String, String, String, String, String)>,
+        owner: Option<(String, String, String, String, String, String, String)>,
     ) -> OperationalAnnotation {
         let mut reasons: Vec<String> = Vec::new();
         if let Some((
@@ -8993,6 +8995,7 @@ impl Store {
             generation_status,
             root_status,
             root_phase,
+            run_phase,
         )) = owner
         {
             if is_terminal_run_state(&run_status) {
@@ -9008,6 +9011,16 @@ impl Store {
             }
             if is_terminal_run_state(&root_status) || root_phase == "terminal" {
                 reasons.push("terminal-root-owner".into());
+            }
+            if work.status == "pending"
+                && reasons.is_empty()
+                && run_phase != "terminal"
+                && !run_phase.starts_with("cleanup-")
+                && !root_phase.starts_with("cleanup-")
+            {
+                // Pending work belongs to the runtime's readiness evaluator. This names
+                // that owner without claiming its dependency predicates have been checked.
+                reasons.push("waiting for daemon/runtime to evaluate readiness".into());
             }
         }
         if work

@@ -338,6 +338,164 @@ fn first_readiness_fault_is_once_visible_and_recovers() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partially_progressed_run_exposes_its_scheduler_wait_without_a_writer() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+    let source = SOURCE.replace("${ST_WORKSPACE}", &root.path().display().to_string())
+        + r#"
+mission "progressed" state="ready" {
+  goal "Explain readiness after some work completes."
+  step "start" { agentless }
+  step "next" {
+    assigned-to "agent/orchid/worker"
+    depends-on { step "start" completed }
+  }
+  step "finish" {
+    agentless
+    depends-on { step "next" completed }
+  }
+}
+"#;
+    apply_source(&store, &source, "partial-scheduler-wait");
+    let run = start(&store, "progressed", "progressed", root.path());
+    let first = run.steps.iter().find(|step| step.step == "start").unwrap();
+    let next = run
+        .steps
+        .iter()
+        .find(|step| step.step == "next")
+        .unwrap()
+        .subject
+        .clone();
+    store
+        .set_step_state(&first.subject, "completed", None)
+        .unwrap();
+    assert_eq!(
+        store.step_run(&first.subject).unwrap().unwrap().status,
+        "completed"
+    );
+    assert_eq!(store.step_run(&next).unwrap().unwrap().readiness_epoch, 0);
+    assert!(
+        store
+            .reconcile_fault(&run.subject, FIRST_READINESS_FAULT_SCOPE)
+            .unwrap()
+            .is_none()
+    );
+
+    let notify = Arc::new(Notify::new());
+    let state = AppState {
+        store: store.clone(),
+        notify: notify.clone(),
+        event_notify: tokio::sync::watch::channel(0).0,
+        node: "node".into(),
+        state_dir: root.path().into(),
+        pty_root: root.path().join("pty"),
+        pty_binary: "unused-pty".into(),
+        fleet_id: None,
+        configured_peers: Vec::new(),
+        client_relay: None,
+        native_session_home: None,
+        planner_default: Default::default(),
+    };
+    let socket = root.path().join("st3.sock");
+    let server_socket = socket.clone();
+    let (listening, ready) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_unix_with_ready(&server_socket, router(state), || {
+            let _ = listening.send(());
+        })
+        .await
+        .unwrap();
+    });
+    ready.await.unwrap();
+    let client = Client::new(Endpoint::Unix(socket));
+
+    // Saturation can hold the writer needed for promotion. The read must still explain
+    // the scheduler's ownership without waiting for that writer or inventing readiness.
+    let (entered, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let writer_store = store.clone();
+    let writer = std::thread::spawn(move || {
+        writer_store.hold_writer_for_test(|| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        });
+    });
+    holding.recv_timeout(Duration::from_secs(5)).unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get::<Value>(&format!("/v1/client/work/{next}")),
+    )
+    .await;
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    let response = response.unwrap().unwrap();
+    let waiting = &response;
+    assert_eq!(waiting["state"], "waiting", "{response}");
+    assert_eq!(waiting["readiness_epoch"], 0);
+    assert_eq!(waiting["operational"]["actionable"], false);
+    assert!(
+        waiting["operational"]["reasons"]
+            .as_array()
+            .is_some_and(|reasons| {
+                reasons.iter().any(|reason| {
+                    reason
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("daemon/runtime"))
+                })
+            }),
+        "Satisfied dependent step has no named scheduler waiter: {waiting}"
+    );
+    let step = store.step_run(&next).unwrap().unwrap();
+    let single = store.work_annotation(&step).unwrap();
+    let batch = store.work_annotations(std::slice::from_ref(&step)).unwrap();
+    assert_eq!(
+        serde_json::to_value(single).unwrap(),
+        serde_json::to_value(&batch[&next]).unwrap()
+    );
+
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        notify,
+    );
+    for _ in 0..3 {
+        reconciler.evaluate_mission_runs().unwrap();
+    }
+    let promoted: Value = client
+        .get(&format!("/v1/client/work/{next}"))
+        .await
+        .unwrap();
+    assert_eq!(promoted["state"], "ready");
+    assert_eq!(promoted["operational"]["actionable"], true);
+    assert!(
+        promoted["operational"]["reasons"]
+            .as_array()
+            .is_none_or(|reasons| reasons.is_empty())
+    );
+    store
+        .request_mission_run_cancellation(&run.id, "test completed")
+        .unwrap();
+    let cancelled: Value = client
+        .get(&format!("/v1/client/work/{next}"))
+        .await
+        .unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+    assert!(
+        !cancelled["operational"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| {
+                reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("daemon/runtime"))
+            })
+    );
+    server.abort();
+}
+
 #[test]
 fn first_readiness_fault_uses_real_readiness_predicates() {
     let root = tempfile::tempdir().unwrap();

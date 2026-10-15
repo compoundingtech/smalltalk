@@ -2233,3 +2233,10 @@ active-deadline read fails with `Invalid column type Null`. Recover forward, or 
 Operations plan that accounts for claims accepted after the pre-upgrade backup.
 
 An admitted run whose retained after-run completion history is unavailable keeps its admission time unknown and raises a `Run admission time unavailable` fault: its timeout is not armed. Restore its original admission history and rebuild the projection, or cancel the run; duplicate completions and retries cannot restart that budget. Corrupt accepted timestamps stop opening with run-specific context and leave the previous deadline table intact.
+
+Current pending work names `daemon/runtime` as the owner of readiness evaluation in its
+operational reasons, including runs that have already completed other steps. This waiter
+is visible from read-only work detail and history reads even while the store writer is busy.
+It does not claim dependency predicates have been evaluated. Existing blockers remain
+visible. The waiter disappears on promotion and is excluded for terminal, superseded and
+cleanup owners. Readiness priority is unchanged.
