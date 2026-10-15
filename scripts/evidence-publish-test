@@ -57,10 +57,10 @@ with tempfile.TemporaryDirectory() as directory:
     job = tmp / 'job'
     subprocess.run(['git', 'clone', '-q', '--depth=1', f'file://{upstream}', str(job)], check=True, env=ENV)
 
-    def note(check, who='good', cwd=job, out=None, exit_code=0):
-        facts = tmp / f'facts-{check}-{who}.json'
+    def note(check, who='good', cwd=job, out=None, exit_code=0, more=None, tag=''):
+        facts = tmp / f'facts-{check}-{who}{tag}.json'
         facts.write_text(json.dumps({'command': ['bash', 'scripts/ci-linux', 'tests'], 'exit_code': exit_code,
-                                     'output_sha256': '3' * 64, 'inputs': {'stage': check}}))
+                                     'output_sha256': '3' * 64, 'inputs': {'stage': check, **(more or {})}}))
         out = out or tmp / 'notes' / who
         done = subprocess.run([sys.executable, str(WRAP), '--check', check, '--toolchain-sha256', '1' * 64, '--signer',
                                json.dumps([sys.executable, str(SIGN)]), '--aggregate', str(facts), '--out', str(out)],
@@ -131,3 +131,38 @@ with tempfile.TemporaryDirectory() as directory:
     done, out = publish('--remote', 'sink', cwd=job)
     assert done.returncode == 1 and 'shallow' in out['refused'][0]['reason']
     print('passed: a shallow checkout is refused before any push')
+
+    # An input key: a record that carries source_inputs is also indexed under its check and key, one ref per record.
+    key = git(upstream, 'rev-parse', 'HEAD~1^{tree}')  # any tree id stands for the projection
+    keyed = tmp / 'keyed'
+    for tag, code in (('pass', 0), ('fail', 1)):
+        note('linux-tests', out=keyed, exit_code=code, more={'source_inputs': key, 'attempt_tag': tag}, tag=tag)
+    plain = tmp / 'plain-only'
+    note('linux-tests', out=plain, exit_code=0, tag='plain')
+    publisher2 = tmp / 'publisher2'
+    # a publisher on the commit the keyed notes were made for is the first one; `three` moved upstream since
+    subprocess.run(['git', 'clone', '-q', f'file://{upstream}', str(publisher2)], check=True, env=ENV)
+    remote2 = tmp / 'remote2.git'
+    subprocess.run(['git', 'init', '-q', '--bare', str(remote2)], check=True, env=ENV)
+    git(publisher2, 'remote', 'add', 'sink', str(remote2))
+    keyed_notes = tmp / 'keyed-notes'
+    keyed_notes.mkdir()
+    # the keyed notes were signed in `job`, whose commit is `two`; publish them from a checkout of `two`
+    git(publisher2, 'checkout', '-q', commit)
+    done, out = publish('--remote', 'sink', cwd=publisher2, notes=keyed)
+    assert done.returncode == 0 and len(out['accepted']) == 2, out
+    refs = git(remote2, 'for-each-ref', '--format=%(refname)', 'refs/notes/evidence-input/').splitlines()
+    records = [a['record'] for a in out['accepted']]
+    assert sorted(refs) == sorted(f'refs/notes/evidence-input/linux-tests/{key}/{r}' for r in records), refs
+    for ref in refs:
+        assert git(remote2, 'rev-parse', ref) == ref.rsplit('/', 1)[1], 'each index ref points at the record it is named for'
+    print('passed: a record with source_inputs is indexed under its check and key, one ref per record, pass and fail alike')
+    done, out = publish('--remote', 'sink', cwd=publisher2, notes=plain)
+    assert done.returncode == 0 and 'input_ref' not in out['accepted'][0]
+    assert len(git(remote2, 'for-each-ref', 'refs/notes/evidence-input/').splitlines()) == 2, 'a record without a key adds no index ref'
+    print('passed: a record without source_inputs is published under refs/notes/evidence only')
+    bad = tmp / 'badkey'
+    note('linux-tests', out=bad, more={'source_inputs': 'not-a-tree-id'}, tag='bad')
+    done, out = publish('--remote', 'sink', cwd=publisher2, notes=bad)
+    assert done.returncode == 1 and 'git tree id' in out['refused'][0]['reason'] and not out['accepted'], out
+    print('passed: a malformed source_inputs is refused, nothing is indexed')

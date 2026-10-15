@@ -358,6 +358,14 @@ catch a stray commit by someone else; a fork never signs); `configure` writes th
 directory and masks every key line; `once CHECK` refuses a second signature for a check in one job;
 `cleanup` overwrites and removes the key, and runs even when earlier steps failed. The wrapper and
 signer scripts must come from the base commit of the change, never from the tree under test.
+Input keys: when the skip policy at the base commit declares `inputs` for a check, the signing job asks the base commit's
+`scripts/evidence-verify --project` for the git tree of the tested tree reduced to those paths and signs it as
+`observed.inputs.source_inputs`; a base without `--project`, a check without inputs, or any error means an exact-tree
+record as before. `scripts/evidence-publish` then also writes `refs/notes/evidence-input/<check>/<source_inputs>/<record>`
+for every accepted record (pass or fail, one ref per record, never replaced) so a gate can find the records of
+another tree with the same inputs by one prefix fetch. The ref is only an index; a record is still accepted only
+by its signature, exact command, required inputs and tier.
+
 Accepted gap: code under test in a job that holds the key can read it. That now includes every pull
 request from this repository: its author controls the workflow file the run executes, so a person or agent with
 write access can read the key and sign any note; the author list narrows who gets a note, it does not
