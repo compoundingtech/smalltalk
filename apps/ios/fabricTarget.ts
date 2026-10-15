@@ -205,3 +205,13 @@ export function credentialFor(overFabric: boolean, member: FabricMember | null, 
   if (!member) return null;
   return member.device ? deviceCredential : ownCredential ?? null;
 }
+
+/**
+ * The list a build opens with when nothing is saved: its default target as the member that uses this
+ * device's own pairing. A phone paired through its form has only that pairing, so the built target
+ * must use it; as a member of its own it would wait for a pairing it can never have, and the carrier
+ * would never dial it.
+ */
+export function builtFabricMembers(built: FabricTarget | null): FabricMember[] {
+  return built ? [{ ...built, name: defaultMemberName(0), device: true }] : [];
+}
