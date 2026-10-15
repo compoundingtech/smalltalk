@@ -59,7 +59,7 @@ relaunches its harness on exactly that session:
 | Claude | `claude --resume ID` | the transcript is in the workspace's Claude project directory |
 | Codex | `codex --remote … resume THREAD`, then the control connection's `thread/resume` | the app-server accepts the thread |
 | pi | `pi --session TRANSCRIPT` | the seat's transcript has the session's header |
-| omp | `omp --resume ID` | the seat's transcript has the session's header |
+| omp | `omp --resume TRANSCRIPT` | the seat's transcript has the session's header |
 | OpenCode | `opencode --session ID`, with delivery held to that session | the session is in `opencode.db`, and the server returns it |
 
 A driver that cannot resume ends the launch before the harness picks another session. It records

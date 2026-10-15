@@ -429,6 +429,22 @@ def native_sessions(node, letter):
     return found
 
 
+def stage_symlinked_inventory(node, harness, session):
+    """Make the suspended seat's omp transcript what st stages for an authored one: an
+    individual-file symlink in the inventory, the file itself kept elsewhere (st2#3021)."""
+    if harness != "omp":
+        return None
+    found = list((node.root / "state").rglob(f"provider-sessions/*_{session}.jsonl"))
+    if len(found) != 1 or found[0].is_symlink():
+        fail(f"expected one regular omp transcript for {session}, found {found}")
+    authored = node.root / "authored-transcripts"
+    authored.mkdir(exist_ok=True)
+    kept = authored / found[0].name
+    os.replace(found[0], kept)
+    found[0].symlink_to(kept)
+    return found[0]
+
+
 def forget_native_session(node, harness, session):
     """Remove what the harness resumes `session` from, as a lost transcript would."""
     home = node.root / "home"
@@ -516,6 +532,9 @@ def suspend_and_resume(node, seats, harness):
     until(lambda: not node.seat_processes(), 60, "a suspended seat still has processes: "
           + json.dumps(node.seat_processes()))
 
+    staged = stage_symlinked_inventory(node, harness, native)
+    starts_before = len([row for row in receipts(node, "a") if row.get("event") == "started"])
+
     # Mail to a suspended seat waits, and its restart policy does not wake it.
     sent = node.json("conversations", "send", subject, "--from", "person/eval",
                      "--subject", "while suspended", "--body", "boot canary suspended")["subject"]
@@ -538,6 +557,17 @@ def suspend_and_resume(node, seats, harness):
     latest = native_sessions(node, "a")[-1]
     if latest != (native, True):
         fail(f"the resumed harness ran {latest}, not session {native} resumed")
+    if staged is not None:
+        # omp's session-ID lookup does not follow symlinks, so only the path st checked finds it.
+        started = [row for row in receipts(node, "a") if row.get("event") == "started"]
+        if len(started) <= starts_before:
+            fail("the resumed omp launch left no start receipt")
+        argv = started[-1].get("argv") or []
+        selected = argv[argv.index("--resume") + 1] if "--resume" in argv[:-1] else None
+        if not selected or Path(selected).name != staged.name or Path(selected).parent.name != "provider-sessions":
+            fail(f"the resumed omp was not given the staged transcript path {staged}: {argv}")
+        if not Path(selected).is_symlink():
+            fail(f"the staged transcript {selected} is no longer the symlink the control installed")
     # Recent never-offered mail survives the boot, while hour-old mail stays listable.
     until(lambda: (node.api("/v1/messages/read/" + recent) or {}).get("status") in ("read", "closed"),
           seats.bound, "the resumed seat did not recover recent unoffered mail")
