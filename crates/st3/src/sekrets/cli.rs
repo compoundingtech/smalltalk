@@ -157,7 +157,7 @@ enum ProfileCommand {
 #[derive(Args, Debug)]
 struct GrantArgs {
     profile: String,
-    /// The agent or person, or a pattern such as agent/web/**.
+    /// An agent, person, node, or exact root-enrolled program/HOST/NAME.
     #[arg(long)]
     to: String,
     #[command(flatten)]
@@ -383,6 +383,9 @@ fn describe(caller: &CallerView) -> String {
         CallerView::Person { person } => format!("{person}, from a login session"),
         CallerView::Agent { agent, person } => format!("{agent}, working for {person}"),
         CallerView::Host { node, person } => format!("{node}'s st, working for {person}"),
+        CallerView::Program { program, person } => {
+            format!("{program}, a run-only system service for {person}")
+        }
         CallerView::Unidentified { person, reason } => {
             format!("unidentified process of {person}: {reason}")
         }

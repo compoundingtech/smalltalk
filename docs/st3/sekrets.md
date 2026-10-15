@@ -8,6 +8,10 @@ the command's output and exit status.
 Sekrets is opt-in and Linux-first. On a host without a gateway, `st sekrets profiles` reports
 that sekrets is not set up. This document describes the installed gateway and its commands.
 
+Root-enrolled Linux system services can use an exact command grant without a daemon or a
+person login. See [run-only programs](sekrets-programs.md) for CI caller identity, private
+checkout mounts and signer key isolation; enrollment and installation require operator setup.
+
 ## Model
 
 - **Gateway.** `st sekrets serve`, run by systemd as the Unix user `sekrets`. It owns the store
