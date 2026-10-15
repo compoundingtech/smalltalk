@@ -393,7 +393,7 @@ impl Publisher {
     async fn held_step(&self, client: &Client) -> Option<String> {
         let work: Vec<StepRunView> = client
             .get(&format!(
-                "/v1/work?actor={}",
+                "/v1/work?actor={}&caller=subagent-attribution",
                 urlencoding::encode(&self.subject)
             ))
             .await

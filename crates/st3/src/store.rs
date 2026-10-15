@@ -8086,6 +8086,32 @@ impl Store {
         )
     }
 
+    /// Native lease polling needs only current held claims, never list presentation or timing.
+    pub fn work_for_renewal(&self, actor: &str) -> Result<Vec<StepRunView>> {
+        let actor = normalize_actor(actor, "agent");
+        let snapshot = now_ms();
+        let connection = self.readers.get();
+        let views = connection
+            .prepare_cached(
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+                 FROM step_runs INDEXED BY step_runs_lease_index
+                 WHERE lease_owner=?1 AND agentless=0
+                   AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+                 ORDER BY subject",
+            )?
+            .query_map([&actor], step_run_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut held = Vec::with_capacity(views.len());
+        for mut view in views {
+            apply_effective_step_state(&connection, &mut view, snapshot)?;
+            if view.work_claim_is_held_by(&actor) {
+                held.push(view);
+            }
+        }
+        Ok(held)
+    }
+
     /// The steps of the client work list, or with `history` of the work history, that a
     /// claimant holds at the snapshot, with the status and claimant those lists show. Only a
     /// step whose lease names an owner can have a claimant, so this reads the leased steps by
@@ -33845,11 +33871,18 @@ pub(crate) fn step_timing_lease_at(
     Ok(started.and(lease))
 }
 
+#[cfg(test)]
+thread_local! {
+    static STEP_TIMING_FOLD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A step's step and work events in canonical order, as its execution timing folds them.
 fn step_timing_events(
     connection: &Connection,
     subject: &str,
 ) -> rusqlite::Result<Vec<(String, Value, u128)>> {
+    #[cfg(test)]
+    STEP_TIMING_FOLD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut statement = connection.prepare(&canonical_sql(
         "SELECT claims.kind, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id

@@ -2627,6 +2627,14 @@ pub struct StepRunView {
     pub updated_at_unix_ms: u128,
 }
 
+impl StepRunView {
+    /// The held states whose leases native drivers renew, including verification and blocking.
+    pub fn work_claim_is_held_by(&self, subject: &str) -> bool {
+        matches!(self.status.as_str(), "claimed" | "working" | "verifying" | "blocked")
+            && self.claimant.as_deref() == Some(subject)
+    }
+}
+
 /// Compare an immutable submission receipt with the expected author and result.
 /// Unknown incarnations (including legacy receipts) never establish a match.
 pub fn work_submission_matches(

@@ -28,6 +28,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[test]
+    fn renewal_view_and_native_callers_have_bounded_labels() {
+        let default: WorkQuery = serde_json::from_value(json!({})).unwrap();
+        assert!(matches!(default.view, WorkView::Full));
+        assert_eq!(default.caller.label(), "work/list");
+        let renewal: WorkQuery = serde_json::from_value(json!({
+            "actor": "agent/node.worker", "view": "renewal"
+        })).unwrap();
+        assert!(matches!(renewal.view, WorkView::Renewal));
+        for (caller, label) in [
+            ("capacity-diagnostics", "work/capacity-diagnostics"),
+            ("timeline-binding", "work/timeline-binding"),
+            ("wait-interruption", "work/wait-interruption"),
+            ("subagent-attribution", "work/subagent-attribution"),
+        ] {
+            let query: WorkQuery = serde_json::from_value(json!({"caller": caller})).unwrap();
+            assert_eq!(query.caller.label(), label);
+        }
+        assert!(serde_json::from_value::<WorkQuery>(json!({"caller": "unbounded-actor"})).is_err());
+    }
+
     fn response() -> StepRunView {
         serde_json::from_value(json!({
             "subject":"step-run/run/work", "run":"mission-run/run",
