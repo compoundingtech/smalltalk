@@ -23,17 +23,19 @@ pub fn phase_spans_enabled() -> bool {
     EXPORT_ENABLED.load(Ordering::Relaxed)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Origin(OriginLabel);
 
-static TASK_ORIGINS: [&str; 11] = [
+static TASK_ORIGINS: [&str; 15] = [
     "other", "task checkpoint", "task migrate-event-payloads", "task expire-completed-responses",
     "task coordination-counts-catch-up", "task account-limits-catch-up",
     "task enforce-account-limits", "task trim-local-observations", "task mailbox-wake-dispatch",
     "task reconcile-pass", "task reconcile-deadline",
+    "task replication-projection-retry", "startup validate-replication-backlog",
+    "startup apply-replication-repairs", "startup project-replication-backlog",
 ];
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum OriginLabel {
     // One pointer into the bounded table keeps queued jobs compact without allocating task labels.
     Static(&'static &'static str),
@@ -53,7 +55,6 @@ impl Origin {
 
 /// `route` must come from the router's normalized MatchedPath, never the request URI.
 pub fn route_origin(method: &str, route: &str) -> Option<Origin> {
-    if !phase_spans_enabled() { return None; }
     if !matches!(method, "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "TRACE") {
         return Some(Origin::other());
     }
@@ -72,12 +73,11 @@ thread_local! {
 pub struct OriginScope(Option<Origin>);
 
 pub fn enter_origin(origin: Option<Origin>) -> Option<OriginScope> {
-    if !phase_spans_enabled() { return None; }
     Some(OriginScope(ORIGIN.with(|slot| slot.replace(origin))))
 }
 
 pub(crate) fn enter_task_origin(label: &'static str) -> Option<OriginScope> {
-    if !phase_spans_enabled() || ORIGIN.with(|slot| slot.borrow().is_some())
+    if ORIGIN.with(|slot| slot.borrow().is_some())
         || REQUEST.with(|slot| slot.borrow().as_ref().is_some_and(|request| request.origin.is_some())) {
         return None;
     }
@@ -85,7 +85,6 @@ pub(crate) fn enter_task_origin(label: &'static str) -> Option<OriginScope> {
 }
 
 pub(crate) fn current_origin() -> Option<Origin> {
-    if !phase_spans_enabled() { return None; }
     Some(ORIGIN.with(|slot| slot.borrow().clone())
         .or_else(|| REQUEST.with(|slot| slot.borrow().as_ref().and_then(|request| request.origin.clone())))
         .unwrap_or_else(Origin::other))
@@ -99,6 +98,7 @@ impl Drop for OriginScope {
 
 pub(super) struct Writer {
     holder: std::sync::Mutex<Option<Origin>>,
+    current_hold: std::sync::Mutex<Option<(Origin, std::time::Instant)>>,
     checkpoint: std::sync::Mutex<Checkpoint>,
 }
 
@@ -123,11 +123,16 @@ impl Checkpoint {
 static WRITERS: LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Writer>>>> =
     LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+static WRITER_OBSERVATIONS: std::sync::Mutex<Vec<std::sync::Weak<Writer>>> =
+    std::sync::Mutex::new(Vec::new());
+static HOLD_ORIGINS: LazyLock<std::sync::Mutex<std::collections::HashSet<Origin>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::from([Origin::other()])));
+
 impl Writer {
     pub(super) fn new(connection: &rusqlite::Connection) -> Option<Arc<Self>> {
-        if !phase_spans_enabled() { return None; }
         let writer = Arc::new(Self {
             holder: std::sync::Mutex::new(None),
+            current_hold: std::sync::Mutex::new(None),
             checkpoint: std::sync::Mutex::new(Checkpoint::default()),
         });
         if let Some(path) = connection.path().filter(|path| !path.is_empty()) {
@@ -135,6 +140,9 @@ impl Writer {
             writers.retain(|_, writer| writer.strong_count() > 0);
             writers.insert(path.to_owned(), Arc::downgrade(&writer));
         }
+        let mut observations = WRITER_OBSERVATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        observations.retain(|writer| writer.strong_count() > 0);
+        observations.push(Arc::downgrade(&writer));
         Some(writer)
     }
 
@@ -143,7 +151,11 @@ impl Writer {
     }
 
     pub(super) fn holding(&self, origin: Option<Origin>) -> Holding<'_> {
-        self.set_holder(origin);
+        let origin = origin.unwrap_or_else(Origin::other);
+        HOLD_ORIGINS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(origin.clone());
+        *self.current_hold.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((origin.clone(), std::time::Instant::now()));
+        self.set_holder(Some(origin));
         Holding(self)
     }
 
@@ -161,6 +173,10 @@ pub(super) struct Holding<'a>(&'a Writer);
 impl Drop for Holding<'_> {
     fn drop(&mut self) {
         *self.0.holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if let Some((origin, started)) = self.0.current_hold.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            METRICS.hold.record(started.elapsed().as_secs_f64(), &writer_attributes(&origin));
+        }
     }
 }
 
@@ -279,6 +295,7 @@ static CHECKPOINT: LazyLock<[KeyValue; 2]> = LazyLock::new(|| {
 pub(super) struct Instruments {
     operation: Histogram<f64>,
     pub queue: Histogram<f64>,
+    hold: Histogram<f64>,
     pub batch_size: Histogram<u64>,
     pub commit: Histogram<f64>,
     pub batch: Histogram<f64>,
@@ -297,12 +314,28 @@ fn duration(meter: &Meter, name: &'static str) -> Histogram<f64> {
         .build()
 }
 
+fn writer_duration(meter: &Meter, name: &'static str) -> Histogram<f64> {
+    meter.f64_histogram(name).with_unit("s").with_boundaries(vec![
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 15., 30.,
+        60., 120., 300., 600.,
+    ]).build()
+}
+
+fn writer_attributes(origin: &Origin) -> [KeyValue; 2] {
+    [KeyValue::new("db.system.name", "sqlite"), origin.attribute("st.db.writer.origin")]
+}
+
+pub(super) fn queued(wait: Duration, origin: Option<&Origin>) {
+    METRICS.queue.record(wait.as_secs_f64(), &writer_attributes(&origin.cloned().unwrap_or_else(Origin::other)));
+}
+
 impl Instruments {
     fn new(meter: &Meter) -> Self {
         register_gauges(meter);
         Self {
             operation: duration(meter, "db.client.operation.duration"),
-            queue: duration(meter, "st.db.writer.queue.duration"),
+            queue: writer_duration(meter, "st.db.writer.queue.duration"),
+            hold: writer_duration(meter, "st.db.writer.hold"),
             batch_size: meter
                 .u64_histogram("st.db.writer.batch.size")
                 .with_unit("{job}")
@@ -418,6 +451,24 @@ pub(super) fn register_pool(pool: &super::ReadPool) {
 }
 
 fn register_gauges(meter: &Meter) {
+    meter.f64_observable_gauge("st.db.writer.current_hold")
+        .with_unit("s")
+        .with_callback(|observer| {
+            let origins = HOLD_ORIGINS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let writers = WRITER_OBSERVATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Emit zero for previously seen origins too, so a finished hold cannot leave a stale gauge.
+            for origin in origins.iter() {
+                let mut elapsed: f64 = 0.;
+                for writer in writers.iter().filter_map(std::sync::Weak::upgrade) {
+                    let hold = writer.current_hold.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some((held_origin, started)) = &*hold && held_origin == origin {
+                        elapsed = elapsed.max(started.elapsed().as_secs_f64());
+                    }
+                }
+                observer.observe(elapsed, &writer_attributes(origin));
+            }
+        })
+        .build();
     meter
         .u64_observable_gauge("st.db.readers.open")
         .with_unit("{connection}")
@@ -506,8 +557,14 @@ mod tests {
             "task coordination-counts-catch-up", "task account-limits-catch-up",
             "task enforce-account-limits", "task trim-local-observations",
             "task mailbox-wake-dispatch", "task reconcile-pass", "task reconcile-deadline",
+            "task replication-projection-retry", "startup validate-replication-backlog",
+            "startup apply-replication-repairs", "startup project-replication-backlog",
         ] {
             assert_eq!(task_origin(label).attribute("origin").value, opentelemetry::Value::from(label));
+            crate::profile::task(label, || {
+                assert_eq!(current_origin().unwrap().attribute("origin").value,
+                    opentelemetry::Value::from(label));
+            });
         }
         assert_eq!(task_origin("unknown").attribute("origin").value, opentelemetry::Value::from("other"));
     }
@@ -564,6 +621,7 @@ mod tests {
             "st.db.writer.batch.size",
             "st.db.writer.commit.duration",
             "st.db.writer.batch.duration",
+            "st.db.writer.hold",
         ] {
             let metric = finished
                 .iter()
@@ -574,7 +632,7 @@ mod tests {
             let check_attributes = |attributes: Vec<&KeyValue>| {
                 assert_eq!(
                     attributes.len(),
-                    if name == "db.client.operation.duration" {
+                    if matches!(name, "db.client.operation.duration" | "st.db.writer.queue.duration" | "st.db.writer.hold") {
                         2
                     } else {
                         1
@@ -586,6 +644,11 @@ mod tests {
                         .any(|attribute| attribute.key.as_str() == "db.system.name"
                             && attribute.value == opentelemetry::Value::from("sqlite"))
                 );
+                if matches!(name, "st.db.writer.queue.duration" | "st.db.writer.hold") {
+                    assert!(attributes.iter().any(|attribute|
+                        attribute.key.as_str() == "st.db.writer.origin"
+                            && attribute.value == opentelemetry::Value::from("other")));
+                }
                 if name == "db.client.operation.duration" {
                     assert!(
                         attributes
@@ -618,6 +681,57 @@ mod tests {
                 }
                 _ => panic!("wrong histogram type for {name}"),
             }
+        }
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn loan_hold_exports_origin_and_current_hold_without_phase_spans() {
+        if isolated("loan_hold_exports_origin_and_current_hold_without_phase_spans") { return; }
+        init(false);
+        assert!(!phase_spans_enabled());
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build()).build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+        let writer = super::super::WriterConnection::new(
+            rusqlite::Connection::open_in_memory().unwrap(), Arc::new(AtomicU64::new(0)));
+        let guard = crate::profile::task("task replication-projection-retry", || writer.write());
+        std::thread::sleep(Duration::from_millis(2));
+        provider.force_flush().unwrap();
+        let origin_matches = |attributes: Vec<&KeyValue>| attributes.iter().any(|attribute|
+            attribute.key.as_str() == "st.db.writer.origin"
+                && attribute.value == opentelemetry::Value::from("task replication-projection-retry"));
+        let current = |expected_held: bool| {
+            let finished = exporter.get_finished_metrics().unwrap();
+            let metric = finished.iter().rev().flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .find(|metric| metric.name() == "st.db.writer.current_hold").unwrap();
+            assert_eq!(metric.unit(), "s");
+            let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = metric.data() else {
+                panic!("current hold must be an f64 gauge");
+            };
+            let point = gauge.data_points().find(|point| origin_matches(point.attributes().collect())).unwrap();
+            if expected_held { assert!(point.value() > 0.); } else { assert_eq!(point.value(), 0.); }
+        };
+        current(true);
+        drop(guard);
+        // The next completed batch fences the asynchronous connection return and hold recording.
+        writer.batched(|_| Ok::<(), rusqlite::Error>(())).unwrap().unwrap();
+        provider.force_flush().unwrap();
+        current(false);
+        let finished = exporter.get_finished_metrics().unwrap();
+        for name in ["st.db.writer.hold", "st.db.writer.queue.duration"] {
+            let metric = finished.iter().rev().flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics()).find(|metric| metric.name() == name).unwrap();
+            assert_eq!(metric.unit(), "s");
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                panic!("{name} must be an f64 histogram");
+            };
+            let point = histogram.data_points().find(|point| origin_matches(point.attributes().collect())).unwrap();
+            assert_eq!(point.count(), 1);
+            assert_eq!(point.bounds().last(), Some(600.));
+            if name == "st.db.writer.hold" { assert!(point.sum() > 0.); }
         }
         provider.shutdown().unwrap();
     }

@@ -25888,8 +25888,10 @@ fn retry_projection_contention_observed(
             // Only this task schedules these attempts. The existing projection mutex also
             // serializes them with receive/wake passes. Store ownership ends at attempt return.
             let result = store.connection.write_workers().spawn_blocking(move || {
-                let result = store.project_replication_backlog_unless_catching_up();
-                (result, store.projection_contention_generation(), store.replication_projection_deferred())
+                st3::profile::task("task replication-projection-retry", || {
+                    let result = store.project_replication_backlog_unless_catching_up();
+                    (result, store.projection_contention_generation(), store.replication_projection_deferred())
+                })
             })
             .await;
             let still_deferred = match &result {

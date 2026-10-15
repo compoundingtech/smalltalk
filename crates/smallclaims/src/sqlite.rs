@@ -792,7 +792,7 @@ fn write_queue(
             WriterJob::Lend { lent, returned, holder, enqueued, origin }
             | WriterJob::FenceLend { lent, returned, holder, enqueued, origin, .. } => {
                 fifo.dequeued_at(enqueued);
-                telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
+                telemetry::queued(enqueued.elapsed(), origin.as_ref());
                 let _hold = crate::windows::holds::WriterHold::start(crate::windows::holds::HoldKind::Lend, &holder);
                 let _holder = callbacks.3.map(|writer| writer.holding(origin));
                 if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
@@ -847,10 +847,10 @@ fn run_write_batch(
     let _holder = writer_telemetry.map(|writer| writer.holding(first_origin.cloned()));
     if let WriterJob::Batched { enqueued, .. } = &first {
         fifo.dequeued_at(*enqueued);
-        telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
+        telemetry::queued(enqueued.elapsed(), first_origin);
     }
     let started = std::time::Instant::now();
-    let mut attribution = writer_telemetry.map(telemetry::Batch::start);
+    let mut attribution = writer_telemetry.filter(|_| telemetry::phase_spans_enabled()).map(telemetry::Batch::start);
     // The writer starts a batch only from a batched write.
     let first_holder = match &first {
         WriterJob::Batched { holder, .. } => holder.clone(),
@@ -902,7 +902,7 @@ fn run_write_batch(
         }
         if !answers.is_empty() {
             fifo.dequeued_at(enqueued);
-            telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
+            telemetry::queued(enqueued.elapsed(), origin.as_ref());
         }
         match (&transaction, &failure) {
             (Some(transaction), None) => {

@@ -528,8 +528,8 @@ const DURATION_BUCKET_BOUNDARIES: [f64; 14] = [
 fn duration_view(instrument: &Instrument) -> Option<Stream> {
     if instrument.unit() != "s"
         || instrument.kind() != opentelemetry_sdk::metrics::InstrumentKind::Histogram
-        // Startup owns longer, explicit boundaries rather than the request-duration view.
-        || instrument.name() == "st.startup.duration"
+        // Startup and writer contention own longer explicit boundaries.
+        || matches!(instrument.name(), "st.startup.duration" | "st.db.writer.queue.duration" | "st.db.writer.hold")
     {
         return None;
     }
@@ -742,10 +742,36 @@ pub(crate) fn linux_rss_bytes() -> Option<u64> {
     pages.checked_mul(page_size)
 }
 
+/// In a Tokio runtime, one sleep per second measures wakeup lateness, including a pending overdue wake.
+fn register_runtime_lag(provider: &SdkMeterProvider) -> Option<tokio::task::JoinHandle<()>> {
+    use opentelemetry::metrics::MeterProvider as _;
+    // Synchronous storage-only telemetry has no scheduler to measure.
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let period = Duration::from_secs(1);
+    let sample = std::sync::Arc::new(std::sync::Mutex::new((Instant::now() + period, Duration::ZERO)));
+    let observed = sample.clone();
+    provider.meter("st3").f64_observable_gauge("st.runtime.lag")
+        .with_unit("s")
+        .with_callback(move |observer| {
+            let (expected, lag) = *observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            observer.observe(lag.max(Instant::now().saturating_duration_since(expected)).as_secs_f64(), &[]);
+        }).build();
+    Some(runtime.spawn(async move {
+        loop {
+            let expected = sample.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(expected)).await;
+            let actual = Instant::now();
+            *sample.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                (actual + period, actual.saturating_duration_since(expected));
+        }
+    }))
+}
+
 pub struct Telemetry {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,
     logger_provider: Option<SdkLoggerProvider>,
+    runtime_lag: Option<tokio::task::JoinHandle<()>>,
     shutdown_timeout: Duration,
     cli: bool,
     cli_backoff: Option<PathBuf>,
@@ -757,6 +783,7 @@ impl Telemetry {
             tracer_provider: None,
             meter_provider: None,
             logger_provider: None,
+            runtime_lag: None,
             shutdown_timeout: unit.shutdown_timeout(),
             cli: matches!(unit, Unit::Cli),
             cli_backoff: None,
@@ -836,6 +863,7 @@ impl Telemetry {
                         .build();
                     if matches!(unit, Unit::Daemon) {
                         register_daemon_memory_metrics(&provider);
+                        telemetry.runtime_lag = register_runtime_lag(&provider);
                     }
                     opentelemetry::global::set_meter_provider(provider.clone());
                     METRICS_ENABLED.store(true, Ordering::Relaxed);
@@ -925,6 +953,7 @@ impl Telemetry {
     pub fn shutdown(&mut self) {
         EXPORT_ENABLED.store(false, Ordering::Relaxed);
         METRICS_ENABLED.store(false, Ordering::Relaxed);
+        if let Some(task) = self.runtime_lag.take() { task.abort(); }
         smallclaims::sync::telemetry::init(false, false);
         let tracer = self.tracer_provider.take();
         let meter = self.meter_provider.take();
@@ -1314,6 +1343,65 @@ mod tests {
         assert!(telemetry.meter_provider.is_none(), "disabled metrics create no provider");
         assert!(!super::metrics_enabled(), "daemon metrics stay disabled");
         telemetry.shutdown();
+    }
+
+    #[test]
+    fn writer_duration_view_preserves_long_buckets() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .with_view(super::duration_view).build();
+        for name in ["st.db.writer.hold", "st.db.writer.queue.duration"] {
+            provider.meter("smallclaims.sqlite").f64_histogram(name).with_unit("s")
+                .with_boundaries(vec![60., 120., 300., 600.]).build().record(234., &[]);
+        }
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        for metric in finished.iter().flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics()) {
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                panic!("writer duration must be an f64 histogram");
+            };
+            let point = histogram.data_points().next().unwrap();
+            assert_eq!(point.bounds().collect::<Vec<_>>(), vec![60., 120., 300., 600.]);
+            assert_eq!(point.count(), 1);
+        }
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn runtime_lag_without_a_scheduler_does_not_register() {
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder().build();
+        assert!(super::register_runtime_lag(&provider).is_none());
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_lag_reports_pending_scheduler_delay() {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build()).build();
+        let task = super::register_runtime_lag(&provider).expect("this test runs inside Tokio");
+        // Block this single-thread runtime beyond its expected wake; collection runs independently.
+        std::thread::sleep(std::time::Duration::from_millis(1020));
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        let metric = finished.iter().flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics()).find(|metric| metric.name() == "st.runtime.lag").unwrap();
+        assert_eq!(metric.unit(), "s");
+        let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = metric.data() else {
+            panic!("runtime lag must be an f64 gauge");
+        };
+        let point = gauge.data_points().next().unwrap();
+        assert!(point.value() >= 0.02);
+        assert_eq!(point.attributes().count(), 0);
+        task.abort();
+        provider.shutdown().unwrap();
     }
 
     #[test]

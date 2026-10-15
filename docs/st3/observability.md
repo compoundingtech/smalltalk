@@ -369,10 +369,12 @@ Duration buckets are
 | Instrument | Type | Unit | Additional attributes / meaning |
 | --- | --- | --- | --- |
 | `db.client.operation.duration` | Histogram | `s` | `db.operation.name=write.batched` or `write.lend`; writer enqueue through ACK |
-| `st.db.writer.queue.duration` | Histogram | `s` | —; enqueue through writer dequeue |
+| `st.db.writer.queue.duration` | Histogram | `s` | `st.db.writer.origin`; enqueue through writer dequeue |
 | `st.db.writer.batch.size` | Histogram | `{job}` | —; jobs in a writer batch |
 | `st.db.writer.commit.duration` | Histogram | `s` | —; writer commit duration |
 | `st.db.writer.batch.duration` | Histogram | `s` | —; whole writer batch duration |
+| `st.db.writer.hold` | Histogram | `s` | `st.db.writer.origin`; acquisition through release, including loans and batched writes |
+| `st.db.writer.current_hold` | Observable gauge | `s` | `st.db.writer.origin`; current hold age, zero when idle |
 | `db.client.connection.wait_time` | Histogram | `s` | `db.operation.name=read`; reader checkout wait |
 | `st.db.readers.open` | Observable gauge | `{connection}` | —; current open readers |
 | `st.db.readers.idle` | Observable gauge | `{connection}` | —; current idle readers |
@@ -380,11 +382,30 @@ Duration buckets are
 | `st.db.wal.size` | Observable gauge | `By` | —; stat the main database's `-wal` file |
 | `st.db.wal.checkpoint.duration` | Histogram | `s` | `db.operation.name=checkpoint.truncate`; truncate checkpoint duration |
 
-Every storage metric carries `db.system.name=sqlite`. These are the complete attribute
-sets: at most two combinations per instrument, with no paths, SQL, ids, or other
-unbounded attributes. Duration histograms use the seconds buckets above; batch size uses
-explicit boundaries `1`, `2`, `4`, `8`, `16`, `32`, `64`, `128`, `256`.
-Storage metrics are not sampled.
+Every storage metric carries `db.system.name=sqlite`. Writer hold and queue origins reuse
+the bounded writer-span vocabulary: normalized router `MatchedPath` templates prefixed
+by one of nine HTTP methods, the fourteen fixed task names in the storage origin table,
+and `other` for unknown origins. No paths, SQL, ids, or raw request URIs are attributes.
+Each batch's hold uses its first queued operation's origin for its entire lifetime;
+loans use the borrowing caller's origin. When multiple stores share an origin, the
+current-hold gauge reports their maximum age, and reports zero for previously seen
+origins after release. Collection does not require storage phase spans to be enabled.
+Receive, admission, repair, and replay retain `POST /v1/internal/replication/receive`
+through the blocking request scope; deferred wake passes retain `POST /v1/internal/replication-wake`.
+The independent contention retry uses `task replication-projection-retry`. Startup uses
+the existing `startup validate-replication-backlog`, `startup apply-replication-repairs`,
+and `startup project-replication-backlog` labels. These are four additional closed values,
+not dynamic task labels or new origin sources.
+Wait and hold histogram boundaries are `0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`,
+`0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `15`, `30`, `60`, `120`, `300`, `600` seconds.
+Other duration histograms use the seconds buckets above; batch size uses explicit
+boundaries `1`, `2`, `4`, `8`, `16`, `32`, `64`, `128`, `256`. Storage metrics are not sampled.
+
+The daemon exports `st.runtime.lag` as an observable gauge in seconds with no instrument
+attributes. One Tokio sleep per second measures expected-versus-actual wakeup delay;
+the SDK samples the maximum of the last delay and an overdue pending wakeup, so a
+stalled runtime remains visible before the sampling task resumes.
+Synchronous storage-only telemetry registers no lag instrument when no Tokio runtime exists.
 
 A scoped thread-local `Option<Arc<WriterWait>>` shares a request accumulator across
 handler, store, action, and API blocking sections. Two relaxed atomics sum writer ACK
