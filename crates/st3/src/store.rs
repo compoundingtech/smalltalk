@@ -2074,14 +2074,7 @@ fn stale_pull_request_request_tx(
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0
-        || version == 13
-        || version == 14
-        || version == 15
-        || version == 16
-        || version == 17
-        || version == 18
-        || version == smallclaims::store::CURRENT_SCHEMA_VERSION
+    if version == 0 || (13..=st3_schema::STORAGE_VERSION).contains(&version)
     {
         return Ok(());
     }
@@ -15062,6 +15055,7 @@ impl Store {
                 .filter(|item| !item.person.starts_with("person/")),
         );
         items.extend(self.checkpoint_attention_items(None, as_of)?);
+        items.extend(self.signature_attention_items()?);
         let fallback = self.fleet_fault_agent()?;
         self.current_attention(items, as_of)?
             .into_iter()
@@ -15072,6 +15066,36 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    fn signature_attention_items(&self) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
+        for fault in self.signature_state_faults()? {
+            items.push(AttentionItemView {
+                episode: format!("{}:{}", fault.code, fault.subject),
+                priority: "high".into(),
+                kind: "fault".into(),
+                review_mode: None,
+                subject: fault.subject,
+                person: String::new(),
+                requester_id: None,
+                launch_id: None,
+                variant_id: None,
+                message_id: None,
+                conversation: None,
+                answers: Vec::new(),
+                title: fault.code,
+                detail: fault.detail,
+                request: None,
+                mission: None,
+                mission_run: None,
+                step: None,
+                targets: vec![format!("host/{}", self.origin)],
+                requested_at_unix_ms: 0,
+                actions: vec![attention_action("inspect signature state", &["st", "doctor"])],
+            });
+        }
+        Ok(items)
     }
 
     fn subscription_fault_items(&self, as_of: u128) -> Result<Vec<AttentionItemView>> {

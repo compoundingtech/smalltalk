@@ -228,18 +228,25 @@ impl PreparedPage {
 
     fn capture_table_image(&self, db: &Connection, names: &[&str]) -> Result<TableImage> {
         let tables = self.capture_table_shapes(db, names)?;
-        // The materialized inventory preserves the old 256-table refusal. A LEFT JOIN
-        // emits a row even for a table with no foreign keys. Stream counts per table to
+        // Every SQLite foreign-key declaration contains the ASCII REFERENCES keyword.
+        // Skip the per-table PRAGMA only when that keyword is absent from its schema SQL;
+        // comments/strings and missing SQL conservatively take the authoritative PRAGMA
+        // path. Keep every table in the inventory, including those without foreign keys.
+        // The materialized inventory preserves the old 256-table refusal. Stream counts to
         // preserve the old 128 FK-column-row cap, including unrelated tables. The extra
         // global row detects truncation instead of treating an incomplete walk as safe.
         const SCHEMA_TABLES: usize = 256;
         const FK_ROWS: usize = 128;
         let mut statement = db.prepare(
             "WITH inventory AS MATERIALIZED (
-               SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name LIMIT 257
+               SELECT name,sql IS NULL OR instr(upper(sql),'REFERENCES')>0 AS possible_fk
+               FROM main.sqlite_schema WHERE type='table' ORDER BY name LIMIT 257
              )
+             SELECT inventory.name,NULL,NULL FROM inventory WHERE NOT possible_fk
+             UNION ALL
              SELECT inventory.name,f.id,f.\"table\"
              FROM inventory LEFT JOIN pragma_foreign_key_list(inventory.name,'main') AS f ON 1
+             WHERE possible_fk
              LIMIT ?1",
         )?;
         let mut rows = statement.query([(SCHEMA_TABLES * FK_ROWS + 1) as i64])?;

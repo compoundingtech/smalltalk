@@ -509,6 +509,8 @@ fn grouped_metadata_rejects_incoming_outgoing_and_case_variant_foreign_keys() {
          CREATE TABLE coverage(namespace TEXT PRIMARY KEY REFERENCES parent(k),complete INTEGER)",
         // An incoming edge touching the second requested output cannot be missed.
         "CREATE TABLE child(namespace TEXT REFERENCES coverage(namespace))",
+        // Keyword screening must retain mixed-case declarations and quoted targets.
+        "CREATE TABLE child(namespace TEXT /* unrelated comment */ reFeReNcEs \"cards\"(\"namespace\"))",
     ] {
         let (mut db, i, job) = fixture();
         ready(&mut db, &i, &job);
@@ -531,7 +533,7 @@ fn grouped_metadata_rejects_incoming_outgoing_and_case_variant_foreign_keys() {
         let mut single = i
             .prepare_live(&db, "cards", PublicationLimits::default())
             .unwrap();
-        let affected = if ddl.contains("REFERENCES CaRdS") {
+        let affected = if ddl.contains("REFERENCES CaRdS") || ddl.contains("reFeReNcEs") {
             "cards"
         } else {
             "coverage"
@@ -541,6 +543,38 @@ fn grouped_metadata_rejects_incoming_outgoing_and_case_variant_foreign_keys() {
             "single-table wrapper retains fanout refusal"
         );
     }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_tables_without_reference_keywords_do_not_add_pragma_statements() {
+    let (mut db, i, job) = fixture();
+    smallclaims::sqlite::observe(&mut db);
+    ready(&mut db, &i, &job);
+    // False-positive keywords still reach the real PRAGMA and remain harmless.
+    db.execute_batch(
+        "CREATE TABLE unrelated_keyword(\"references\" TEXT,
+           note TEXT DEFAULT 'REFERENCES')",
+    )
+    .unwrap();
+    let capture = |db: &Connection| {
+        let mut page = i
+            .prepare_live(db, "cards", PublicationLimits::default())
+            .unwrap();
+        let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
+        page.capture_tables(db, &["cards", "coverage"]).unwrap();
+        scope.finish()
+    };
+    let before = capture(&db);
+    for n in 0..128 {
+        db.execute_batch(&format!("CREATE TABLE unrelated_{n}(k INTEGER,body TEXT)"))
+            .unwrap();
+    }
+    let after = capture(&db);
+    eprintln!("foreign-key inventory before={before:?} after={after:?}");
+    assert!(before.statements > 0);
+    assert_eq!(before.statements, after.statements);
+    assert_eq!(after.autoindex_rows, 0);
 }
 
 #[test]

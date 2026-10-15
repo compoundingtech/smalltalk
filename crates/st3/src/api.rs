@@ -8187,6 +8187,13 @@ fn doctor_report_with_operation_drift(
             message: error.to_string(),
         }),
     }
+    for fault in state.store.signature_state_faults().map_err(ApiError::internal)? {
+        checks.push(DoctorCheck {
+            name: fault.code.clone(),
+            status: if fault.code == "signature-state-corrupt" { "fail" } else { "warn" }.into(),
+            message: format!("{}: {}", fault.subject, fault.detail),
+        });
+    }
     match state.store.claim_verdict_counts() {
         Ok(counts) => checks.push(claim_signatures_check(&counts)),
         Err(error) => checks.push(DoctorCheck {
