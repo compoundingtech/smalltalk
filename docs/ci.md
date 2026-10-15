@@ -1229,3 +1229,22 @@ shards run every one of them, as do the wrapper path's runs, so nothing is dropp
 The check fails if an entry no longer names exactly one test (the list has gone stale) and if any
 unlisted test fails. Do not add an entry to hide a failing test; add it only when the sandbox cannot
 provide what the test needs, and say what.
+
+
+CI test-build artifact consumers retain a private partial ZIP between the existing
+two bounded transfer attempts. Each attempt gets at most 600 seconds, within a
+shared 1200-second transfer budget. Storage receives no GitHub token: the job
+token authenticates only the artifact redirect request to GitHub. A resumed
+response must be HTTP 206 with the exact requested offset, final byte and total
+matching the authenticated artifact size. HTTP 200 replaces the partial rather
+than appending. Range or integrity mismatches discard the partial; extraction
+still requires the whole ZIP digest, member CRCs and successful producer's
+manifest/file hashes, followed by the existing source/tool identity check.
+
+The step logs the authenticated artifact size, requested offset, bytes received,
+retained bytes, response status and elapsed seconds per attempt, with progress
+every 30 seconds while bytes arrive. A stalled read is bounded by the attempt
+deadline. Signed storage URLs, credentials and raw HTTP errors are excluded.
+Final failure removes the private partial and starts no tests. These diagnostics
+distinguish a zero-byte stall from an interrupted transfer; transport recovery
+does not waive a failed gate or authorize a workflow rerun.
