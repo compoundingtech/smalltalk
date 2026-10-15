@@ -86,6 +86,11 @@ def _strings(value, what):
     return [item.lower() for item in value]
 
 
+def email_known(email, emails, noreply):
+    """Exact address (any case), or [ID+]LOGIN@users.noreply.github.com with a numeric ID, matched whole."""
+    return email.lower() in emails or any(pattern.fullmatch(email) for pattern in noreply)
+
+
 def check_authors(base, head, opener, *actors):
     """A pull request run signs only when its authors are the repository's own. The list is read from the BASE
     commit, so the pull request cannot widen it. Two kinds of check. GitHub authenticates the account that
@@ -107,9 +112,9 @@ def check_authors(base, head, opener, *actors):
         raise Refused(f'no usable author list at the base commit ({AUTHORS_FILE}): {error}')
 
     def known(email):
-        return email.lower() in emails or any(pattern.fullmatch(email) for pattern in noreply)
+        return email_known(email, emails, noreply)
 
-    for role, login in (('opened the pull request', opener), *(('started or re-ran this run', actor) for actor in actors if actor)):
+    for role, login in (('opened the pull request', opener), *(('started or re-ran this run', actor) for actor in actors)):
         if not login or login.lower() not in logins:
             raise Refused(f'refusing: {login or "an unknown account"!r}, who {role}, is not in the author list')
     for line in _git('log', '--no-merges', '--format=%H %ae %ce', f'{base}..{head}').splitlines():

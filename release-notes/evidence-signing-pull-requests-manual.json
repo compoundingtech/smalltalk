@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Correction to evidence-signing-pull-requests: the operator step and the key-exposure caveat are manual items, not none",
+  "replay": {"status": "none", "detail": "No graph, claim or storage change."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change. A pull-request run now refuses when either run-actor variable is unset or unlisted."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change; a refusal only means no note is made."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "changed", "detail": "Operations must let the evidence-signing environment accept pull_request refs (refs/pull/*/merge) and must not add reviewers or a wait timer. Anyone with write access to this repository can read the signing key through their own pull request's workflow file; the author list narrows who gets a note, not who can read the key. Recorded as known defect 20."},
+  "recovery": {"status": "none", "detail": "Narrow the evidence-signing environment to the merge queue and main, or revert; notes already signed stay valid only through the base-commit key list."}
+}

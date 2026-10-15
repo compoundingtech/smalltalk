@@ -111,8 +111,10 @@ with tempfile.TemporaryDirectory() as directory:
     def pr(base_sha, head_sha, opener='myobie', actor='myobie', head_repo='example/repo', rerun=None):
         env = dict(GITHUB_EVENT_NAME='pull_request', GITHUB_REF='refs/pull/9/merge', GITHUB_REPOSITORY='example/repo',
                    PR_HEAD_REPOSITORY=head_repo, PR_BASE_SHA=base_sha, PR_HEAD_SHA=head_sha, PR_USER=opener, GITHUB_ACTOR=actor)
-        if rerun:
-            env['GITHUB_TRIGGERING_ACTOR'] = rerun
+        # GitHub always sets both; a run without the re-run actor is refused, not waved through
+        env['GITHUB_TRIGGERING_ACTOR'] = rerun if rerun is not None else actor
+        if rerun == '':
+            del env['GITHUB_TRIGGERING_ACTOR']
         return helper('guard', cwd=repo, env=env)
 
     assert pr(base, ours).returncode == 0, pr(base, ours).stdout + pr(base, ours).stderr
@@ -125,6 +127,8 @@ with tempfile.TemporaryDirectory() as directory:
     assert pr(base, ours, actor='mallory').returncode == 1, 'an original actor outside the list is refused'
     assert pr(base, ours, rerun='myobie').returncode == 0
     assert pr(base, ours, rerun='mallory').returncode == 1, 'someone outside the list re-running a listed account\'s run is refused (GITHUB_TRIGGERING_ACTOR)'
+    unset = pr(base, ours, rerun='')
+    assert unset.returncode == 1 and 'unknown account' in unset.stdout, 'an unset re-run actor is refused, not skipped'
     assert pr(base, noreply_ok).returncode == 0, 'a numbered noreply address of a listed login, committed by GitHub itself, signs'
     for label, head_sha in (('a look-alike noreply builder', noreply_evil), ('any invented .invalid address', invalid_any)):
         refused = pr(base, head_sha)
@@ -143,6 +147,18 @@ with tempfile.TemporaryDirectory() as directory:
     badlist_head = commit('on top', 'me@nathanherald.com', {'z.txt': 'z'})
     refused = pr(badlist_base, badlist_head)
     assert refused.returncode == 1 and 'Traceback' not in refused.stderr + refused.stdout and 'nonempty strings' in refused.stdout, refused.stdout + refused.stderr
+# the address matcher itself, on forms a commit cannot carry or that look close to a listed one
+import importlib.machinery  # noqa: E402
+signing = importlib.machinery.SourceFileLoader('ci_evidence_signing', str(HELPER)).load_module()
+import re as _re  # noqa: E402
+_noreply = [_re.compile(r'(?:[0-9]+\+)?myobie@users\.noreply\.github\.com', _re.IGNORECASE)]
+_emails = {'me@nathanherald.com'}
+for address, expected in (('179+myobie@users.noreply.github.com', True), ('myobie@users.noreply.github.com', True), ('ME@NATHANHERALD.COM', True),
+                          ('x+myobie@users.noreply.github.com', False), ('179+myobie@users.noreply.github.com.evil', False),
+                          ('179+myobie@users.noreply.github.com\n', False), ('179+evil-myobie@users.noreply.github.com', False),
+                          ('1+9+myobie@users.noreply.github.com', False), ('me@nathanherald.com.evil', False), ('', False)):
+    assert signing.email_known(address, _emails, _noreply) is expected, address
+print('passed: noreply addresses need a numeric ID and match whole; look-alikes, suffixes and a trailing newline are refused')
 print('passed: a same-repository pull request signs only when its opener, the accounts that started and re-ran the run, and every commit author and committer are on the list at the base commit; an outsider\'s commit on a same-repository branch gets no note')
 
 with tempfile.TemporaryDirectory() as directory:
