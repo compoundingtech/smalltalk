@@ -55,7 +55,7 @@ class CleanupTests(unittest.TestCase):
     def test_evidence_failure_still_cleans_both_nodes_and_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
-            args = SimpleNamespace(scratch=parent, keep=False)
+            args = SimpleNamespace(scratch=parent, keep=False, ready_seconds=60)
             nodes = [SimpleNamespace(cleanup=AsyncMock(), name=name, root=parent / name) for name in ('amber', 'cobalt')]
             with patch.dict(os.environ, ST3_MESSAGING_ROOT=directory), \
                  patch.object(runner, 'Node', side_effect=nodes), \
