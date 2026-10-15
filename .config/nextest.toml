@@ -45,6 +45,11 @@ not (
 filter = 'package(=st3) and test(/^store::actual_state_sorter_tests::actual_identity_stream_bounds_native_reader_and_writer_temp_bytes$/)'
 success-output = "immediate"
 
+# Signature purity and authority regressions must remain visible on their first failure.
+[[profile.ci.overrides]]
+filter = 'package(=smallclaims) and binary(=principals)'
+retries = 0
+
 # The fleet reconnect test also includes a real two-minute outage. The ci profile inherits the
 # default profile's messaging-fault priority above.
 [[profile.ci.overrides]]

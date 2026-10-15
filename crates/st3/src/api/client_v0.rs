@@ -5569,14 +5569,15 @@ pub(super) fn message_provenance(state: &AppState, claim: &ClaimRecord) -> Optio
     {
         return None;
     }
-    let verdict = state.store.claim_verdict(&claim.id).ok()?;
-    let mut provenance = json!({"verdict": verdict.name()});
+    let authorization = state.store.claim_authorization(&claim.id).ok()?;
+    let verdict = authorization.verdict;
+    let mut provenance = json!({"verdict": verdict.name(), "authorization_model": authorization.model});
     if let smallclaims::principal::Verdict::Held(reason)
     | smallclaims::principal::Verdict::Invalid(reason) = &verdict
     {
         provenance["reason"] = json!(reason);
     }
-    if let Some(signature) = state.store.claim_signature(&claim.id).ok().flatten() {
+    if let Some(signature) = authorization.signature {
         provenance["signer"] = json!(signature.signer);
         provenance["key"] = json!(signature.key);
         let label = signature
@@ -8342,6 +8343,25 @@ pub(super) struct PairingComplete {
     key_storage: Option<String>,
 }
 
+/// Proof bytes and their authorization model come from one pinned snapshot. The model
+/// label does not make legacy proofs evidence for the corrected candidate semantics.
+fn signature_grant_proofs(state: &AppState, ids: &[String]) -> Result<Option<Vec<Value>>, ApiError> {
+    state.store.read_snapshot(|_| {
+        let mut proofs=Vec::new();
+        for id in ids {
+            let Some(grant)=state.store.claim_by_id(id)? else { return Ok(None); };
+            let authorization=state.store.claim_authorization(id)?;
+            let Some(signature)=authorization.signature else { return Ok(None); };
+            proofs.push(json!({
+                "id":grant.id,"batch_id":grant.batch_id,"subject":grant.subject,"kind":grant.kind,
+                "origin":grant.origin,"actor":grant.actor,"body":grant.body,"predecessors":grant.predecessors,
+                "signature":signature,"authorization_model":authorization.model,
+            }));
+        }
+        Ok(Some(proofs))
+    }).map_err(ApiError::internal)
+}
+
 fn pairing_root_proof(state: &AppState, person: &str) -> Result<Option<Value>, ApiError> {
     let Some((_, id)) = state
         .store
@@ -8359,21 +8379,8 @@ fn pairing_root_proof(state: &AppState, person: &str) -> Result<Option<Value>, A
             "the member cannot produce a verifiable person-root grant; the pairing code was not consumed. Inspect the member's signing history",
         )
     };
-    let grant = state
-        .store
-        .claim_by_id(&id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(cannot_prove)?;
-    let signature = state
-        .store
-        .claim_signature(&id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(cannot_prove)?;
-    let proof = json!({
-        "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
-        "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
-        "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
-    });
+    let proof=signature_grant_proofs(state, &[id])?.ok_or_else(cannot_prove)?
+        .into_iter().next().ok_or_else(cannot_prove)?;
     st3_client::device::verify_person_root_key_proof(person, &proof, None)
         .map_err(|_| cannot_prove())?;
     Ok(Some(proof))
@@ -8552,24 +8559,7 @@ pub(super) async fn pairing_complete(
                     "the member cannot produce verifiable enrollment grants; the pairing code was not consumed. Inspect the member's signing history",
                 )
             };
-            let mut proofs = Vec::new();
-            for id in &chain {
-                let grant = state
-                    .store
-                    .claim_by_id(id)
-                    .map_err(ApiError::internal)?
-                    .ok_or_else(cannot_prove)?;
-                let signature = state
-                    .store
-                    .claim_signature(id)
-                    .map_err(ApiError::internal)?
-                    .ok_or_else(cannot_prove)?;
-                proofs.push(json!({
-                    "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
-                    "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
-                    "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
-                }));
-            }
+            let proofs=signature_grant_proofs(&state, &chain)?.ok_or_else(cannot_prove)?;
             st3_client::device::verify_device_key_proofs(&person_id, &chain, &proofs, key)
                 .map_err(|_| cannot_prove())?;
             Some((chain, proofs))
@@ -14775,6 +14765,112 @@ mission "queue-parity" state="ready" {
         let mut huge = vec![entry(2_000_000), entry(10)];
         assert!(bound_page_bytes(&mut huge, 768 * 1024));
         assert_eq!(huge.len(), 1);
+    }
+
+    #[test]
+    fn signature_state_faults_are_visible_in_doctor_and_fault_snapshot() {
+        use smallclaims::{
+            fleet::MemberKey,
+            principal::{ClaimSignature, content_digest},
+            store::{append_claim_record_tx, principals::store_claim_signature_tx},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let key = Arc::new(MemberKey::generate().unwrap().0);
+        state.store.set_node_key(key.clone()).unwrap();
+        let claim = {
+            let mut connection = state.store.connection.write();
+            let tx = connection.transaction().unwrap();
+            let claim = append_claim_record_tx(
+                &tx,
+                &state.store.origin,
+                "note/signature-state",
+                "example.note",
+                None,
+                &json!({"fields":{"text":"Diagnostic fault visibility"}}),
+                &[],
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            claim
+        };
+        state.store.replication_snapshot().unwrap();
+        let genuine = state.store.claim_signature(&claim.id).unwrap().unwrap();
+        let content = content_digest(
+            &claim.subject,
+            &claim.kind,
+            claim.actor.as_deref(),
+            &claim.body,
+        );
+        {
+            let mut connection = state.store.connection.write();
+            let tx = connection.transaction().unwrap();
+            for _ in 1..65 {
+                let signature = ClaimSignature::sign(
+                    &key,
+                    &content,
+                    &genuine.signer,
+                    None,
+                    vec![],
+                    genuine.signed_at_unix_ms,
+                );
+                store_claim_signature_tx(&tx, &claim.id, &signature).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        state.store.judge_claims(true).unwrap();
+        let codes = || {
+            doctor_report(&state)
+                .unwrap()
+                .0
+                .checks
+                .into_iter()
+                .map(|check| check.name)
+                .collect::<Vec<_>>()
+        };
+        assert!(codes().contains(&"signature-candidate-count".into()));
+        assert!(
+            state
+                .store
+                .fault_snapshot(u128::MAX)
+                .unwrap()
+                .iter()
+                .any(|fault| fault.item.title == "signature-candidate-count"
+                    && fault.item.detail.contains(&state.store.origin))
+        );
+        state
+            .store
+            .connection
+            .write()
+            .execute(
+                "UPDATE claim_signature_migration SET phase='envelopes',cursor=0 WHERE id=1",
+                [],
+            )
+            .unwrap();
+        assert!(codes().contains(&"signature-migration-incomplete".into()));
+        assert!(
+            state
+                .store
+                .fault_snapshot(u128::MAX)
+                .unwrap()
+                .iter()
+                .any(|fault| fault.item.title == "signature-migration-incomplete")
+        );
+        state
+            .store
+            .fail_signature_migration("fixture corrupt local payload")
+            .unwrap();
+        assert!(codes().contains(&"signature-state-corrupt".into()));
+        assert!(
+            state
+                .store
+                .fault_snapshot(u128::MAX)
+                .unwrap()
+                .iter()
+                .any(|fault| fault.item.title == "signature-state-corrupt")
+        );
+        assert!(state.store.claim_by_id(&claim.id).unwrap().is_some());
     }
 
     #[test]

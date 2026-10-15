@@ -498,7 +498,7 @@ fn tail_verdict_busy_remains_typed_and_pending_after_projection_commit() {
     let path = dir.path().join("claims.sqlite3");
     let store = Store::open(&path, "node", Arc::new(FaultRuntime::new())).unwrap();
     store.project_replication_backlog().unwrap();
-    store.connection.write().execute("DELETE FROM meta WHERE key='claim_verdict_roots'", []).unwrap();
+    store.connection.write().execute("DELETE FROM meta WHERE key='claim_candidate_verdict_roots'", []).unwrap();
     store.connection.write().busy_timeout(std::time::Duration::ZERO).unwrap();
     store.verdicts_due.store(true, Ordering::Release);
     let holder = Connection::open(&path).unwrap();
