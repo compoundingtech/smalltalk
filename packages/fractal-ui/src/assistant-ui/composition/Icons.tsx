@@ -8,6 +8,7 @@ export type IconName =
   | 'attach' | 'copy' | 'send' | 'stop' | 'check' | 'x' | 'alert'
   | 'spinner' | 'folder' | 'message' | 'dot'
   | 'wrap' | 'whitespace' | 'pull-request' | 'stop-circle' | 'thought'
+  | 'person' | 'checklist' | 'gauge' | 'filter' | 'sort' | 'bell'
 
 const PATHS: Record<IconName, React.ReactNode> = {
   search: <><circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5 14 14" /></>,
@@ -37,6 +38,12 @@ const PATHS: Record<IconName, React.ReactNode> = {
   'pull-request': <><circle cx="4" cy="3" r="1.5" /><circle cx="4" cy="13" r="1.5" /><circle cx="12" cy="13" r="1.5" /><path d="M4 4.5v7M12 11.5V6a3 3 0 0 0-3-3H7M9 1 7 3l2 2" /></>,
   'stop-circle': <><circle cx="8" cy="8" r="6" /><rect x="5" y="5" width="6" height="6" rx=".5" fill="currentColor" stroke="none" /></>,
   thought: <path d="M8 2.5c.45 2.75 1.75 4.05 4.5 4.5-2.75.45-4.05 1.75-4.5 4.5-.45-2.75-1.75-4.05-4.5-4.5 2.75-.45 4.05-1.75 4.5-4.5z" />,
+  person: <><circle cx="8" cy="5" r="2.5" /><path d="M2.5 14v-1a5.5 5.5 0 0 1 11 0v1" /></>,
+  checklist: <><path d="m2 4 1 1 2-2M7 4h7m-12 6 1 1 2-2M7 10h7" /></>,
+  gauge: <><path d="M2.5 11.5a5.5 5.5 0 1 1 11 0" /><path d="m8 11.5 2.5-3" /></>,
+  filter: <path d="M2 4h12M4 8h8M6 12h4" />,
+  sort: <path d="M4 3v10l-2-2m2 2 2-2M8 4h6M8 8h4M8 12h2" />,
+  bell: <><path d="M4 11V7a4 4 0 0 1 8 0v4l1 1.5H3z" /><path d="M6.75 14a1.4 1.4 0 0 0 2.5 0" /></>,
 }
 
 /** One 16px stroke icon set; stroke inherits currentColor, fill none. */

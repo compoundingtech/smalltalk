@@ -20,7 +20,11 @@ const styles = stylex.create({
   sm: { minWidth: g.controlSm, height: g.controlSm }, md: { minWidth: g.controlMd, height: g.controlMd }, lg: { minWidth: g.controlLg, height: g.controlLg },
   outline: { borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, backgroundColor: surface.controlFill, color: text.fg },
 })
-/** Shared tooltip surface; portal ownership and trigger behavior stay with each caller. */
+/**
+ * Shared tooltip surface; portal ownership and trigger behavior stay with each caller. It sizes to its text
+ * (up to the cap) rather than to the room left of the viewport edge, so a long reason near the edge shifts
+ * inward instead of wrapping word by word.
+ */
 export const tooltipStyles = stylex.create({
-  tooltip: { zIndex: 50, borderRadius: r.control, backgroundColor: text.fg, paddingInline: s.row, paddingBlock: s.sm, fontSize: t.denseSize, fontFamily: t.fontSans, color: surface.raised, boxShadow: elevation.popover, maxWidth: g.tooltipMax },
+  tooltip: { zIndex: 50, borderRadius: r.control, backgroundColor: text.fg, paddingInline: s.row, paddingBlock: s.sm, fontSize: t.denseSize, fontFamily: t.fontSans, color: surface.raised, boxShadow: elevation.popover, boxSizing: 'border-box', width: 'max-content', maxWidth: `min(${g.tooltipMax}, calc(100vw - ${s.lg}))` },
 })
