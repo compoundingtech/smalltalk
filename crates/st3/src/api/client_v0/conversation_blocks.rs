@@ -1151,6 +1151,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn omp_event_wire_keeps_bounded_typed_view_and_complete_raw_continuation() {
+        for negotiated in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let native = fixture(root.path(), json!([]));
+            let record = json!({
+                "type":"custom_message", "customType":"notice", "display":true,
+                "timestamp":"2026-10-06T12:00:01Z", "attribution":"agent",
+                "content":"λ".repeat(VALUE_BYTES / 2 + 1),
+                "details":{"from":"worker", "message":"x".repeat(VALUE_BYTES)},
+            });
+            // Use the real owner transcript read and preparation, not a fabricated block.
+            let header = std::fs::read_to_string(&native.transcript).unwrap();
+            let header = header.lines().next().unwrap();
+            std::fs::write(&native.transcript, format!("{header}\n{record}\n")).unwrap();
+            let mut session = ClientSession::local(Some("person/example")).unwrap();
+            session.conversation_blocks = negotiated;
+            let page = read(&native, &session, &native.id).unwrap();
+            let event = page
+                .iter()
+                .find(|item| item["body"]["blocks"][0]["view"]["type"] == "omp_event" || !negotiated)
+                .unwrap();
+            if negotiated {
+                let block = &event["body"]["blocks"][0];
+                assert_eq!(block["kind"], "text");
+                let view = &block["view"];
+                assert_eq!(view["kind"], "notice");
+                assert_eq!(view["attribution"], "agent");
+                // Each value is clipped to the native-value bound with a visible marker.
+                let marker = "[st truncated this native timeline value";
+                assert!(view["content"].as_str().unwrap().contains(marker));
+                assert!(view["details"].as_str().unwrap().contains(marker));
+                let location =
+                    locator(block["continuation"]["ref"].as_str().unwrap(), &native.id).unwrap();
+                // The continuation of a body-backed text block covers the owner's whole body,
+                // which holds the complete native record beside the display text.
+                let located = located_value(&native, &location).unwrap();
+                assert_eq!(located.pointer("/blocks/0/payload/raw"), Some(&record));
+                let changed = record.to_string().replace("worker", "edited");
+                std::fs::write(&native.transcript, format!("{header}\n{changed}\n")).unwrap();
+                assert!(located_value(&native, &location).is_err());
+            } else {
+                // A client that did not negotiate blocks reads the plain text content.
+                assert!(event["body"].get("blocks").is_none());
+                assert_eq!(event["body"]["media_type"], "text/plain");
+            }
+        }
+    }
+
+    #[test]
+    fn omp_admin_event_wire_text_carries_the_record_for_clients_without_the_view() {
+        for negotiated in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let native = fixture(root.path(), json!([]));
+            let record = json!({
+                "type":"session_init", "timestamp":"2026-10-06T12:00:01Z", "task":"visible-detail",
+            });
+            let header = std::fs::read_to_string(&native.transcript).unwrap();
+            let header = header.lines().next().unwrap();
+            std::fs::write(&native.transcript, format!("{header}\n{record}\n")).unwrap();
+            let mut session = ClientSession::local(Some("person/example")).unwrap();
+            session.conversation_blocks = negotiated;
+            let page = read(&native, &session, &native.id).unwrap();
+            let event = page
+                .iter()
+                .find(|item| {
+                    item["body"]["text"].as_str().is_some_and(|text| text.starts_with("[omp session_init]"))
+                })
+                .unwrap_or_else(|| panic!("no session_init text in {page:?}"));
+            let text = event["body"]["text"].as_str().unwrap();
+            assert!(text.contains("visible-detail"), "negotiated {negotiated}: {text}");
+        }
+    }
+
+    #[test]
+    fn omp_event_wide_identities_keep_normal_events_and_cached_pages_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let native = fixture(root.path(), json!([]));
+        let normal = json!({"type":"custom_message", "customType":"notice", "content":"normal"});
+        let record = json!({
+            "type":"custom_message", "customType":"λ".repeat(CLIENT_MAX_RESPONSE_BYTES),
+            "attribution":"a".repeat(CLIENT_MAX_RESPONSE_BYTES), "content":"wide identity",
+            "details":{"large":"x".repeat(CLIENT_MAX_RESPONSE_BYTES)},
+        });
+        std::fs::write(
+            &native.transcript,
+            format!("{normal}\n{record}\n{normal}\n"),
+        )
+        .unwrap();
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let items = read(&native, &session, &native.id).unwrap();
+        assert_eq!(items.len(), 3);
+        for index in [0, 2] {
+            assert_eq!(items[index]["body"]["blocks"][0]["view"]["kind"], "notice");
+            assert_eq!(items[index]["body"]["text"], "normal");
+        }
+        assert!(items.iter().all(|item| item.get("_source").is_none()));
+        assert!(serde_json::to_vec(&items).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+        let state = super::super::tests::test_state_named(root.path(), "omp-cached-raw");
+        let snapshot = new_client_snapshot(&state);
+        // Cached timeline paging receives wire-prepared items, not complete raw records.
+        let page = client_page(
+            &state,
+            &snapshot,
+            &format!("timeline/{}", native.id),
+            items,
+            &ClientListQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+    }
+
     async fn fetch_json_chunks(state: &AppState, native: &ExternalSession, token: &str) -> Value {
         use axum::body::{Body, to_bytes};
         use axum::http::Request;

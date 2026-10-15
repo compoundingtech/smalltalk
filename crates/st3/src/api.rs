@@ -1878,6 +1878,46 @@ fn client_page(
     client_page_read(state, snapshot, collection, items, query, false)
 }
 
+/// Preserve complete timeline entries while reserving the existing page-envelope budget.
+fn client_timeline_page_end(
+    items: &[Value],
+    offset: usize,
+    limit: usize,
+) -> Result<usize, ApiError> {
+    struct EncodedSize(usize);
+    impl std::io::Write for EncodedSize {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Match mission-card paging's reserve for the response, cursor and fleet notice.
+    let budget = client_v0::TIMELINE_PAGE_BYTE_BUDGET;
+    let mut used = 2usize; // JSON array delimiters.
+    let mut end = offset.min(items.len());
+    for item in items.iter().skip(offset).take(limit) {
+        let mut encoded = EncodedSize(0);
+        serde_json::to_writer(&mut encoded, item).map_err(ApiError::internal)?;
+        let bytes = encoded.0.saturating_add(usize::from(end > offset));
+        if used.saturating_add(bytes) > budget {
+            if end == offset {
+                // A lone entry above the target is served alone; one above the hard ceiling
+                // is cut visibly when the page is cut from the items.
+                end += 1;
+            }
+            break;
+        }
+        used += bytes;
+        end += 1;
+    }
+    Ok(end)
+}
+
 /// A page of `items`, or of the cached first page a cursor continues. `pinned` says the items
 /// were read in `snapshot` itself, so a commit since then cannot have torn them; otherwise a
 /// first page is refused once the store has moved past the snapshot.
@@ -1968,13 +2008,25 @@ fn client_page_read(
         });
         (items, items_digest, 0, requested_limit, expires_at_unix_ms)
     };
-    let end = offset.saturating_add(limit).min(items.len());
+    let end = if collection.starts_with("timeline/") {
+        client_timeline_page_end(&items, offset, limit)?
+    } else {
+        offset.saturating_add(limit).min(items.len())
+    };
     let end = if collection == "arrangements" {
         client_v0::arrangements::window_end(&items, offset, end)?
     } else {
         end
     };
-    let page_items = items.get(offset..end).unwrap_or_default().to_vec();
+    let mut page_items = items.get(offset..end).unwrap_or_default().to_vec();
+    if collection.starts_with("timeline/")
+        && let [only] = page_items.as_mut_slice()
+    {
+        let size = serde_json::to_vec(&*only).map_err(ApiError::internal)?.len();
+        if size.saturating_add(2) > CLIENT_MAX_RESPONSE_BYTES - 128_000 {
+            client_v0::cut_oversized_timeline_entry(only, size);
+        }
+    }
     let has_more = end < items.len();
     if query.cursor.is_none() && has_more {
         let mut cache = client_page_cache()
@@ -19863,6 +19915,131 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
                 .unwrap_err()
                 .code,
             "page-cursor-expired"
+        );
+    }
+
+    #[test]
+    fn timeline_pages_preserve_large_typed_events_and_advance_by_returned_count() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        let expected_ids: Vec<_> = (0..100).map(|id| format!("native/{id}")).collect();
+        // Typed native blocks: an `omp_event` view whose content and details are each at the
+        // native-value bound, beside the owner-fetchable raw record.
+        let items = expected_ids.iter().map(|id| {
+            let view = json!({
+                "type":"omp_event", "kind":"irc:incoming", "attribution":"agent",
+                "content":"x".repeat(8000),
+                "details":{"from":"worker","message":"x".repeat(8000)}
+            });
+            json!({"id":id,"body":{"blocks":[{
+                "id":format!("{id}/0"), "kind":"status", "source_type":"custom_message",
+                "payload":{"raw":{"type":"custom_message","customType":"irc:incoming"}}, "view":view
+            }]}})
+        }).collect();
+        let mut query = ClientListQuery {
+            limit: Some(100),
+            ..ClientListQuery::default()
+        };
+        let mut page =
+            client_page(&state, &snapshot, "timeline/session/smoke", items, &query).unwrap();
+        let mut received_ids = Vec::new();
+        loop {
+            assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES - 1024);
+            for item in &page.items {
+                received_ids.push(item["id"].as_str().unwrap().to_owned());
+                let view = &item["body"]["blocks"][0]["view"];
+                assert_eq!(view["content"], "x".repeat(8000));
+                assert_eq!(view["details"]["message"], "x".repeat(8000));
+            }
+            let Some(cursor) = page.page.next_cursor else {
+                assert!(!page.page.has_more);
+                break;
+            };
+            assert!(page.page.has_more);
+            query.cursor = Some(cursor);
+            page = client_page(
+                &state,
+                &snapshot,
+                "timeline/session/smoke",
+                Vec::new(),
+                &query,
+            )
+            .unwrap();
+        }
+        assert_eq!(received_ids, expected_ids);
+    }
+
+    #[test]
+    fn timeline_cached_page_serves_lone_entry_above_target_below_hard_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        let large = json!({"id":"large", "body":{"text":"x".repeat(896 * 1024)}});
+        let small = json!({"id":"small"});
+        let mut query = ClientListQuery {
+            limit: Some(100),
+            ..Default::default()
+        };
+        let page = client_page(
+            &state,
+            &snapshot,
+            "timeline/session/lone",
+            vec![large.clone(), small.clone()],
+            &query,
+        )
+        .unwrap();
+        assert_eq!(page.items, vec![large]);
+        assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+        query.cursor = page.page.next_cursor;
+        assert!(query.cursor.is_some());
+        let page = client_page(
+            &state,
+            &snapshot,
+            "timeline/session/lone",
+            Vec::new(),
+            &query,
+        )
+        .unwrap();
+        assert_eq!(page.items, vec![small]);
+        assert!(!page.page.has_more);
+    }
+
+    #[test]
+    fn timeline_cached_page_cuts_one_oversized_entry_visibly_without_skipping_it() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        let large = json!({"id":"large", "body":{"text":"x".repeat(CLIENT_MAX_RESPONSE_BYTES)}});
+        let mut query = ClientListQuery::default();
+        let page = client_page(
+            &state,
+            &snapshot,
+            "timeline/session/oversized",
+            vec![large, json!({"id":"small"})],
+            &query,
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0]["id"], "large");
+        assert_eq!(page.items[0]["type"], "error");
+        assert_eq!(page.items[0]["body"]["code"], "timeline-entry-too-large");
+        assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+        query.cursor = page.page.next_cursor;
+        assert!(query.cursor.is_some(), "the entry after it is not skipped");
+        let page = client_page(
+            &state,
+            &snapshot,
+            "timeline/session/oversized",
+            Vec::new(),
+            &query,
+        )
+        .unwrap();
+        assert_eq!(page.items, vec![json!({"id":"small"})]);
+        assert_eq!(client_timeline_page_end(&[], 9, 10).unwrap(), 0);
+        assert_eq!(
+            client_timeline_page_end(&[json!({"id":"small"})], 9, 10).unwrap(),
+            1
         );
     }
 
