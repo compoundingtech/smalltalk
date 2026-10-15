@@ -45430,6 +45430,181 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     }
 
     #[test]
+    fn review_reader_old_peer_quarantines_and_retries_original_bytes() {
+        for kind in std::iter::once("gate.requested").chain(st3_schema::review::KINDS) {
+            let current = Store::open_memory("ada").unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("review.sqlite");
+            let older = Store::open(&path, "tester").unwrap();
+            let mut registry = st3_schema::registry().clone();
+            for new_kind in st3_schema::review::KINDS {
+                registry.claims.remove(new_kind);
+            }
+            for name in st3_schema::review::REQUEST_FIELDS {
+                registry
+                    .claims
+                    .get_mut("gate.requested")
+                    .unwrap()
+                    .fields
+                    .remove(name);
+            }
+            assert_ne!(registry.digest(), st3_schema::registry().digest());
+            older.set_claim_registry(registry);
+            let observe = |store: &Store, subject: &str, status: &str| {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: "transport.observed".into(),
+                        actor: None,
+                        fields: BTreeMap::from([("status".into(), json!(status))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap()
+            };
+            let bootstrap = observe(&current, "host/ada", "up");
+            receive_and_project(
+                &older,
+                "ada",
+                &exchange_from(&current, &ReplicationInventory::default()),
+            );
+            current.project_replication_backlog().unwrap();
+            assert!(!current.replication_projection_needs_recovery().unwrap());
+            // An empty store's initial replay is legitimate. Everything after this
+            // healthy baseline, including reopening with the new registry, must be incremental.
+            assert!(!older.replication_projection_needs_recovery().unwrap());
+            FULL_REPLAYS.with(|count| count.set(0));
+            const DAY_MS: u128 = 24 * 60 * 60 * 1_000;
+            current
+                .set_write_clock_at(bootstrap.accepted_at_unix_ms + DAY_MS)
+                .unwrap();
+            let spec = st3_schema::registry().claim(kind).unwrap();
+            let mut fields = BTreeMap::new();
+            for (name, field) in &spec.fields {
+                if !field.required { continue; }
+                let value = match field.value_type {
+                    st3_schema::ValueType::Integer => json!(1),
+                    st3_schema::ValueType::Array => json!([]),
+                    st3_schema::ValueType::Object => json!({}),
+                    st3_schema::ValueType::SubjectReference => json!(format!("{}/tester", field.reference_families.first().map_or("mission-run", String::as_str))),
+                    _ => json!(field.values.first().map_or("receipt", String::as_str)),
+                };
+                fields.insert(name.clone(), value);
+            }
+            if matches!(kind, "gate.head-bound" | "gate.review-verdict" | "gate.requested") {
+                fields.insert("change".into(), json!({"kind":"github.pull-request","subject":"resource/project/review"}));
+            }
+            if matches!(kind, "gate.head-bound" | "gate.requested") {
+                fields.insert("head".into(), json!({"kind":"git.commit","sha":"a".repeat(40)}));
+            }
+            if matches!(kind, "gate.review-verdict" | "gate.remediation-attached") {
+                fields.insert("reviewed_head".into(), json!({"kind":"git.commit","sha":"a".repeat(40)}));
+            }
+            if kind == "gate.requested" {
+                fields.extend(BTreeMap::from([
+                    ("gate_subject".into(),json!("gate-operation/tester")),
+                    ("generation".into(),json!("run-generation/tester")), ("episode".into(),json!(1)),
+                    ("scope".into(),json!({"coverage":["implementation"]})),
+                    ("author".into(),json!("agent/alex")), ("binding_claim".into(),json!("binding")),
+                    ("delta_ref".into(),json!("doc/project/delta")),
+                ]));
+            }
+            let claim = current.append_claim(&ClaimInput {
+                subject:"gate-operation/tester".into(), kind:kind.into(), actor:None,
+                fields, evidence:Vec::new(), expected_subject:None, idempotency_key:None,
+            }).unwrap();
+            let exchange = exchange_from(&current, &older.replication_inventory().unwrap());
+            assert_eq!(exchange.envelopes.len(), 1);
+            let original_envelope = &exchange.envelopes[0];
+            // Hold the old review envelope while the old peer makes ninety days of
+            // unrelated progress. No sleeps or wall-clock timing can weaken this lag.
+            for day in 2..=90 {
+                older
+                    .set_write_clock_at(bootstrap.accepted_at_unix_ms + day * DAY_MS)
+                    .unwrap();
+                observe(&older, "host/tester", "up");
+            }
+            older.project_replication_backlog().unwrap();
+            let admission = receive_and_project(&older, "ada", &exchange);
+            assert_eq!((admission.valid, admission.unknown, admission.invalid), (0,1,0), "{kind}");
+            let records = older.replica_records(true).unwrap();
+            assert_eq!(records.len(),1);
+            assert_eq!(records[0].state,"unknown");
+            assert_eq!(records[0].error_code.as_deref(),Some(if kind == "gate.requested" { "unknown-claim-field" } else { "unknown-claim-kind" }));
+            let raw: Vec<u8> = older.readers.get().query_row(
+                "SELECT raw FROM replica_records WHERE claim_id=?1",[&claim.id],|row|row.get(0),
+            ).unwrap();
+            assert!(!raw.is_empty());
+            assert!(older.claims_for(&claim.subject,Some(kind)).unwrap().is_empty());
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0, "{kind}: lagged receipt");
+            assert!(!older.replication_projection_needs_recovery().unwrap());
+            // Known remote work after the unknown record must still cross the same
+            // writer chain and advance the projection over several inventory pages.
+            for day in 2..=25 {
+                current
+                    .set_write_clock_at(bootstrap.accepted_at_unix_ms + day * DAY_MS)
+                    .unwrap();
+                observe(&current, "host/ada", if day == 25 { "down" } else { "up" });
+            }
+            let mut pages = 0;
+            loop {
+                let mut inventory = older.replication_inventory().unwrap();
+                inventory.accepts = Some(4);
+                let page = exchange_from(&current, &inventory);
+                if page.envelopes.is_empty() {
+                    break;
+                }
+                assert!(pages < 6, "{kind}: catch-up inventory must advance");
+                pages += 1;
+                let admission = receive_and_project(&older, "ada", &page);
+                assert_eq!(admission.invalid, 0, "{kind}");
+                assert!(admission.valid > 0, "{kind}");
+                assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0, "{kind}: catch-up page");
+                assert!(!older.replication_projection_needs_recovery().unwrap());
+            }
+            assert_eq!(pages, 6, "{kind}: exercise paginated catch-up");
+            let latest = older.latest_claim("host/ada", Some("transport.observed")).unwrap().unwrap();
+            assert_eq!(latest.body["fields"]["status"], "down", "{kind}: unrelated work progressed");
+            assert_eq!(older.replica_records(true).unwrap().len(), 1, "{kind}");
+            assert!(older.claims_for(&claim.subject, Some(kind)).unwrap().is_empty());
+            drop(older);
+            let upgraded = Store::open(&path,"tester").unwrap();
+            assert!(!upgraded.replication_projection_needs_recovery().unwrap());
+            let admitted = upgraded.validate_replication_backlog().unwrap();
+            assert_eq!((admitted.valid,admitted.unknown,admitted.invalid),(1,0,0));
+            upgraded.project_replication_backlog().unwrap();
+            let retained = upgraded.claims_for(&claim.subject,Some(kind)).unwrap();
+            assert_eq!(retained.len(),1);
+            assert_eq!(retained[0].id,claim.id);
+            assert_eq!(retained[0].body,claim.body);
+            let retried_raw: Vec<u8> = upgraded.readers.get().query_row(
+                "SELECT raw FROM replica_records WHERE claim_id=?1",[&claim.id],|row|row.get(0),
+            ).unwrap();
+            assert_eq!(raw,retried_raw);
+            assert!(upgraded.replica_records(true).unwrap().is_empty(), "{kind}");
+            assert_eq!(
+                upgraded.latest_claim("host/ada", Some("transport.observed")).unwrap().unwrap().id,
+                latest.id,
+                "{kind}: retry preserves unrelated projection"
+            );
+            let relayed = exchange_from(&upgraded, &ReplicationInventory::default());
+            let retained_envelope = relayed.envelopes.iter().find(|envelope| {
+                envelope.writer == original_envelope.writer
+                    && envelope.sequence == original_envelope.sequence
+            }).unwrap();
+            assert_eq!(retained_envelope.hash, original_envelope.hash, "{kind}");
+            assert_eq!(
+                retained_envelope.payload.bytes().unwrap(),
+                original_envelope.payload.bytes().unwrap(),
+                "{kind}: retry and relay retain the original hash-authenticated envelope bytes"
+            );
+            assert!(!upgraded.replication_projection_needs_recovery().unwrap());
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0, "{kind}: upgrade retry");
+        }
+    }
+
+    #[test]
     fn an_unknown_field_is_retryable_and_an_old_schema_rejection_is_readmitted() {
         let source = Store::open_memory("source").unwrap();
         let claim = source
