@@ -51,7 +51,8 @@ LOCK = 'fake flake.lock contents\n'
 # Written out here, not read from the script, so removing a path from the script cannot hide it.
 EXPECTED_PROTECTED = (
     'scripts/ci-evidence-gate', 'scripts/evidence-verify', '.st/evidence-skip-policy.json', '.st/evidence-keys',
-    '.github/workflows/fleet.yml', '.github/workflows/fleet.yml.genie.ts',
+    '.github/workflows/fleet.yml', '.github/workflows/fleet.yml.genie.ts', '.github/workflows/workspace-ci.ts',
+    'scripts/ci-evidence-gate-test', 'scripts/evidence-verify-test',
 )
 
 
@@ -76,6 +77,8 @@ def enforcing(path):
     doc = json.loads(Path(path).read_text())
     for entry in doc['checks'].values():
         entry['enforce'] = True
+        entry['sample_one_in'] = 1  # sampling is tested on its own; here a matching note must always skip
+        entry.pop('inputs', None)  # these tests use exact-tree notes
     return json.dumps(doc)
 
 
@@ -115,12 +118,20 @@ class Decide(unittest.TestCase):
         now = gate.datetime.now(gate.timezone.utc).isoformat()
         context = {'check': 'linux-gate', 'fork': 'false', 'event': 'merge_group', 'protected_changed': []}
         result = {'satisfied': True, 'policy': True, 'enforce': True, 'tier': 'full', 'kind': 'observed', 'trust_level': 'fleet',
-                  'tree': 'b' * 40, 'check': 'linux-gate', 'record': record, 'signer': 'fleet/ci', 'observed_at': now}
+                  'tree': 'b' * 40, 'check': 'linux-gate', 'record': record, 'signer': 'fleet/ci', 'observed_at': now,
+                  'sample_one_in': 1}
         return context, result, 'b' * 40
 
     def test_all_conditions_together_skip(self):
         context, result, tree = self.good()
         self.assertEqual(gate.decide(context, 'satisfied', result, tree)[0], 'skip')
+
+    def test_a_result_without_the_sampling_rule_runs(self):
+        context, result, tree = self.good()
+        del result['sample_one_in']
+        decision, reason = gate.decide(context, 'satisfied', result, tree)
+        self.assertEqual(decision, 'run')
+        self.assertTrue(reason.startswith('sampled:'), reason)
 
     def test_removing_any_one_condition_runs(self):
         context, result, tree = self.good()
@@ -482,6 +493,64 @@ class EndToEnd(unittest.TestCase):
         for check, entry in policy['checks'].items():
             self.assertIn(entry.get('enforce', False), (True, False), check)
 
+    def input_scenario(self, **per_check):
+        """A base whose policy declares `inputs.txt` as the only input of every check; head 1 has a note."""
+        doc = json.loads(skip_policy())
+        for entry in doc['checks'].values():
+            entry['inputs'] = ['inputs.txt']
+            entry.update(per_check)
+        self.f = fixtures.Fixture()
+        self.addCleanup(self.f.tmp.cleanup)
+        self.ci = self.f.key('ci', 'fleet/ci')
+        (self.f.repo / 'inputs.txt').write_text('declared')
+        base = self.commit_base(policy=json.dumps(doc))
+        commit, tree = self.head()
+        key = fixtures.evidence_verify.project(str(self.f.repo), tree, ('inputs.txt',))
+        record = self.note(commit, tree, inputs={'source_inputs': key})
+        self.f.git('update-ref', f'refs/notes/evidence-input/linux-gate/{key}/{record}', record)
+        return base, key, record
+
+    def test_a_record_of_another_tree_with_the_same_input_key_skips_and_says_so(self):
+        base, key, record = self.input_scenario()
+        self.f.commit('an undeclared file changed')
+        fields, outputs = self.run_gate(base)
+        self.assertEqual((fields['decision'], fields['outcome'], fields['match'], fields['source_inputs'], outputs['record']),
+                         ('skip', 'satisfied', 'inputs', key, record))
+        (self.f.repo / 'inputs.txt').write_text('a declared file changed')
+        self.f.git('add', '-A')
+        self.f.git('commit', '-q', '-m', 'declared')
+        self.assertEqual(self.assertRuns(base)['outcome'], 'no_note')  # nothing matches the new key, so the check runs
+
+    def test_sampling_keeps_running_a_deterministic_share_of_matching_runs(self):
+        base, key, record = self.input_scenario(sample_one_in=1)
+        self.f.commit('two')
+        self.assertEqual(self.run_gate(base)[0]['decision'], 'skip')
+        decisions = set()
+        for n in range(12):  # twelve different heads: with one in 3 some are sampled and some are not
+            base, key, record = self.input_scenario(sample_one_in=3)
+            self.f.commit(f'head {n}')
+            first = self.run_gate(base)[0]
+            decisions.add(first['decision'])
+            self.assertEqual(first['decision'], self.run_gate(base)[0]['decision'])  # a retry behaves the same
+            if first['decision'] == 'run':
+                self.assertEqual(first['outcome'], 'satisfied')
+                self.assertTrue(first['reason'].startswith('satisfied_but_not_skipped:_sampled:'), first['reason'])
+        self.assertEqual(decisions, {'skip', 'run'})
+        self.assertTrue(gate.sampled({'check': 'c', 'head': 'h'}, {'sample_one_in': 'x'}, 't'))  # unreadable: sample
+        self.assertFalse(gate.sampled({'check': 'c', 'head': 'h'}, {'sample_one_in': 1}, 't'))
+        # A result without the rule at all (an older or faulty verifier) samples: it must never skip.
+        for result in ({}, {'sample_one_in': None}, {'sample_one_in': True}, {'sample_one_in': 0}, {'sample_one_in': 2.0}):
+            self.assertTrue(gate.sampled({'check': 'c', 'head': 'h'}, result, 't'), result)
+
+    def test_the_index_ref_alone_proves_nothing_in_the_gate(self):
+        base, key, record = self.input_scenario()
+        self.f.commit('two')
+        wrong = fixtures.evidence_verify.project(str(self.f.repo), self.f.git('rev-parse', 'HEAD^{tree}'), ('file.txt',))
+        self.f.git('update-ref', '-d', f'refs/notes/evidence-input/linux-gate/{key}/{record}')
+        self.f.git('update-ref', f'refs/notes/evidence-input/linux-gate/{key}/{"2" * len(record)}', record)  # wrong suffix
+        self.f.git('update-ref', f'refs/notes/evidence-input/linux-gate/{wrong}/{record}', record)  # another key
+        self.assertEqual(self.assertRuns(base)['outcome'], 'no_note')
+
     def test_adding_a_required_input_tightens_future_notes_without_breaking_anything(self):
         entry = {'trust_levels': ['fleet'], 'enforce': True, 'kinds': {'observed': {
             'command': ['github-actions', '{repository}', '.github/workflows/fleet.yml', '{check}'],
@@ -773,6 +842,9 @@ class EndToEnd(unittest.TestCase):
                 (self.f.repo / '.github/workflows').mkdir(parents=True, exist_ok=True)
                 (self.f.repo / '.github/workflows/fleet.yml').write_text('name: x\n')
                 (self.f.repo / '.github/workflows/fleet.yml.genie.ts').write_text('export default 1\n')
+                for name in ('.github/workflows/workspace-ci.ts', 'scripts/ci-evidence-gate-test', 'scripts/evidence-verify-test'):
+                    (self.f.repo / name).parent.mkdir(parents=True, exist_ok=True)
+                    (self.f.repo / name).write_text('placeholder\n')
                 base = self.commit_base()
                 (self.f.repo / 'moved-away').mkdir(exist_ok=True)
                 self.f.git('mv', path, 'moved-away/' + path.replace('/', '_'))
@@ -797,7 +869,7 @@ class EndToEnd(unittest.TestCase):
         fields, outputs = self.run_gate(base, PR_NUMBER='123', EVENT_NAME='pull_request')
         self.assertEqual(list(fields), [
             'check', 'decision', 'outcome', 'reason', 'record', 'signer', 'trust_level', 'kind', 'tier',
-            'observed_at', 'age_s', 'max_age_s', 'attempts', 'enforce', 'tree', 'head', 'base', 'event', 'pr', 'repo', 'run',
+            'observed_at', 'age_s', 'max_age_s', 'attempts', 'enforce', 'match', 'source_inputs', 'tree', 'head', 'base', 'event', 'pr', 'repo', 'run',
             'attempt', 'fork', 'verifier_sha256', 'gate_sha256'])
         self.assertEqual((fields['pr'], fields['repo'], fields['run'], fields['attempt'], fields['fork']),
                          ('123', REPOSITORY, '42', '1', 'false'))
@@ -934,9 +1006,18 @@ class WorkflowStructure(unittest.TestCase):
         stage_names = re.findall(r'needs\.([a-z0-9-]+)\.result', re.search(r'^          RESULTS: (.*)$', aggregate, re.M).group(1))
         self.assertEqual(len(stage_names), 7)
 
-        def accepts(event, results, skip):
+        flags_line = re.search(r'^          STAGE_SKIPS: (.*)$', aggregate, re.M).group(1)
+
+        def stage_flags(gates):
+            """The per-stage skip flags the workflow would compute for these gate decisions."""
+            tokens = re.findall(r'\$\{\{.*?\}\}|\S+', json.loads(flags_line))
+            return [str(self.truth(t, gates, 'merge_group')).lower() if t.startswith('${{') else t for t in tokens]
+
+        def accepts(event, results, skip, gates=None, flags=None):
+            flags = flags if flags is not None else stage_flags(gates or {})
             env = {**os.environ, 'EVENT': event, 'RESULTS': ' '.join(results[n] for n in stage_names),
-                   'MERGE_RESULTS': f"{results['linux-tests-shard-3']} {results['linux-tests-shard-4']}"}
+                   'MERGE_RESULTS': f"{results['linux-tests-shard-3']} {results['linux-tests-shard-4']}",
+                   'STAGE_SKIPS': ' '.join(flags)}
             env.pop('GATE_SKIP', None)
             if skip is not None:
                 env['GATE_SKIP'] = skip
@@ -966,22 +1047,91 @@ class WorkflowStructure(unittest.TestCase):
             # The real aggregate accepts the consistent outcome...
             results = {n: ('success' if runs.get(n, True) else 'skipped') for n in stage_names + ['linux-tests-shard-3', 'linux-tests-shard-4']}
             skip = 'true' if lg else None
-            self.assertTrue(accepts(event, results, skip), label)
+            self.assertTrue(accepts(event, results, skip, gates), label)
             # ...and rejects a failure in ANY job that ran, even under a skip.
             for victim in stage_names + ['linux-tests-shard-3', 'linux-tests-shard-4']:
                 if results[victim] == 'success':
                     broken = {**results, victim: 'failure'}
-                    self.assertFalse(accepts(event, broken, skip), label + (victim,))
+                    self.assertFalse(accepts(event, broken, skip, gates), label + (victim,))
             # ...and rejects a skipped upgrade-impact or canaries even under a skip: they are never covered by it.
             if lg:
                 for never in ('upgrade-impact', 'mail-redelivery-canaries'):
-                    self.assertFalse(accepts(event, {**results, never: 'skipped'}, 'true'), label + (never,))
+                    self.assertFalse(accepts(event, {**results, never: 'skipped'}, 'true', gates), label + (never,))
             # ...and rejects skipped stages if its own gate had not said skip.
             if any(v == 'skipped' for n, v in results.items() if n not in ('linux-tests-shard-3', 'linux-tests-shard-4')):
                 self.assertTrue(lg, label)  # a stage can only be skipped when the aggregate's gate decided skip
-                self.assertFalse(accepts(event, results, None), label)
+                self.assertFalse(accepts(event, results, None, gates), label)
             checked += 1
         self.assertEqual(checked, 16)
+
+    def test_a_stage_skipped_for_an_unrelated_reason_fails_even_when_the_aggregate_gate_said_skip(self):
+        aggregate = self.blocks()['linux-gate']
+        script = __import__('textwrap').dedent(aggregate.split('run: |\n', 1)[1].split('\n      - ', 1)[0])
+        stage_names = re.findall(r'needs\.([a-z0-9-]+)\.result', re.search(r'^          RESULTS: (.*)$', aggregate, re.M).group(1))
+        flags = re.search(r'^          STAGE_SKIPS: (.*)$', aggregate, re.M).group(1)
+        positions = len(re.findall(r'\$\{\{.*?\}\}|\S+', json.loads(flags)))
+        self.assertEqual(positions, 9)  # the seven base stages and the two merge-only shards, in the aggregate's order
+
+        def accepts(event, results, flags):
+            env = {**os.environ, 'EVENT': event, 'GATE_SKIP': 'true', 'RESULTS': ' '.join(results[n] for n in stage_names),
+                   'MERGE_RESULTS': f"{results['linux-tests-shard-3']} {results['linux-tests-shard-4']}", 'STAGE_SKIPS': ' '.join(flags)}
+            return subprocess.run(['bash', '-c', script], env=env, capture_output=True).returncode == 0
+
+        covered = {n: 'skipped' for n in stage_names + ['linux-tests-shard-3', 'linux-tests-shard-4']}
+        covered.update({'upgrade-impact': 'success', 'mail-redelivery-canaries': 'success'})
+        all_true = ['true', 'false', 'true', 'true', 'true', 'true', 'false', 'true', 'true']
+        self.assertTrue(accepts('merge_group', covered, all_true), 'everything covered by its own rule')
+        for index, stage in enumerate(stage_names + ['linux-tests-shard-3', 'linux-tests-shard-4']):
+            if all_true[index] == 'true':
+                with self.subTest(stage):
+                    # The gate said skip but this stage's own rule does not: its skip has another cause.
+                    flags_off = list(all_true)
+                    flags_off[index] = 'false'
+                    self.assertFalse(accepts('merge_group', covered, flags_off), stage)
+        # Without the flags at all nothing is accepted as skipped.
+        self.assertFalse(accepts('merge_group', covered, []))
+
+    def test_no_condition_in_the_workflow_has_markers_inside_it(self):
+        """A condition is either bare or one whole `${{ ... }}`. Combining two conditions as text would leave markers
+        inside the other (GitHub then reads the string as a literal that is always true), so none may exist; the
+        genie helper that combines them refuses such a condition when it generates (proved by the test after this one)."""
+        workflow = (ROOT / '.github/workflows/fleet.yml').read_text()
+        source = (ROOT / '.github/workflows/fleet.yml.genie.ts').read_text()
+        conditions = re.findall(r'^\s*(?:-\s+)?if:\s*(.+)$', workflow, re.M)
+        self.assertGreater(len(conditions), 50)
+        for condition in conditions:
+            value = condition.strip().strip('"\'')
+            inner = value[3:-2] if value.startswith('${{') and value.endswith('}}') else value
+            self.assertNotIn('${{', inner, condition)
+            self.assertNotIn('}}', inner, condition)
+
+    def test_the_genie_helper_that_combines_conditions_refuses_markers_inside_one_when_it_runs(self):
+        """Executes the helper through genie itself on a copy of the workflow source: a step condition made of two
+        separate `${{ }}` markers makes generation fail, and a whole one is accepted (so the failure is the rule's)."""
+        genie = shutil.which('genie')
+        self.assertIsNotNone(genie, 'genie must be on PATH: the genie-freshness check runs this test with it')
+        source = (ROOT / '.github/workflows/fleet.yml.genie.ts').read_text()
+        anchor = "const gateSkip = "
+        self.assertEqual(source.count(anchor), 1)
+
+        def generate(probe):
+            with tempfile.TemporaryDirectory() as scratch:
+                work = Path(scratch)
+                (work / '.github/workflows').mkdir(parents=True)
+                for name in ('queue-watch.ts', 'ready-pr.ts', 'build-snapshot.ts', 'cache-audit.ts', 'workspace-ci.ts'):
+                    shutil.copy(ROOT / '.github/workflows' / name, work / '.github/workflows' / name)
+                (work / '.github/workflows/fleet.yml.genie.ts').write_text(source.replace(anchor, f'{probe}\n{anchor}', 1))
+                for name in ('repos', 'scripts'):
+                    (work / name).symlink_to(ROOT / name)
+                done = subprocess.run([genie, '--dry-run', '--json'], cwd=work, capture_output=True, text=True, timeout=300,
+                                      env=dict(os.environ, HOME=scratch))
+                return done.returncode, done.stdout + done.stderr
+
+        code, output = generate("bareCondition('${{ always() }}')")
+        self.assertEqual(code, 0, output)
+        code, output = generate("bareCondition('${{ always() }} && ${{ true }}')")
+        self.assertNotEqual(code, 0, output)
+        self.assertIn('markers inside it', output)
 
     def test_the_required_checks_that_are_jobs_keep_running_and_skip_only_their_steps(self):
         blocks = self.blocks()

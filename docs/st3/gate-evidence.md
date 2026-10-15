@@ -574,6 +574,20 @@ writes the record id to the job summary. The wiring is deliberately conservative
 - A skip of `genie-freshness` skips the tests of this machinery too (`ci-evidence-gate-test`,
   `evidence-verify-test`, `genie --check`) for that tree. That is accepted because the note is for the same tree and
   a change to those files is a protected path that always runs in full; a reader must not assume they ran.
+- What is protected and what is bound otherwise. The protected paths are the gate, the verifier, both of their
+  tests, the policy, the evidence keys, the workflow source (`fleet.yml.genie.ts`), the helper module it imports
+  (`workspace-ci.ts`) and the generated `fleet.yml`. The signing and publishing wrapper scripts are not on that list:
+  they are bound by the note itself, which carries their `wrapper_sha256`, so a changed wrapper cannot produce a note
+  the policy accepts.
+- A required check that is a job, `isolation-vm` and `mail-redelivery-canaries`, never reports `skipped`; under an
+  enforced skip it reports success with its steps skipped, so once a check is enforced the name means "covered by
+  a trusted note", not "ran". Whoever reads a result (including the observer) must treat such a run as covered, not
+  freshly run; the job's summary says so (`evidence covered by a trusted note`).
+- The aggregate `linux-gate` accepts `skipped` for a stage only in the stage's position and only when that stage's
+  own skip rule evaluates true (the workflow passes one flag per stage), so a stage skipped for any other reason
+  fails the gate even when the aggregate's gate also decided to skip.
+- Step conditions are combined as text only when none contains a marker inside it; the helper that combines them
+  refuses otherwise and a test checks every condition of the generated workflow. Keep actionlint in the required path.
 - The skip rests on a note of kind `observed`, which the central observer records only for a `merge_group`
   run, so a pull request can skip only a tree an earlier queue run already passed. Do not expect a saving at
   pull-request time from these two checks.
@@ -626,6 +640,28 @@ note would have covered the check accumulates while the check keeps running as t
 on is the one-line change `"enforce": false` to `"enforce": true` in this file, reviewed and queued
 like any change (the file is read from the accepted base, so the change takes effect for the runs
 after it merges).
+
+`inputs` (optional, per check) lists the repository paths the check's result depends on. With it, a record
+of ANOTHER tree counts when it carries the same input key: `source_inputs`, the git tree id of the tested
+tree reduced to exactly those paths (`git write-tree` of only their files; `.` means everything, whose key is
+the tree itself). `scripts/evidence-verify --project --check C --paths-from BASE ...` prints it, so a producer,
+the observer and the gate compute the same key. The producer signs it as `observed.inputs.source_inputs` and
+publishes the record under `refs/notes/evidence-input/<check>/<source_inputs>/<record id>`; the gate fetches only
+that prefix, and the ref is just an index: whatever it finds must still verify and carry the same signed key.
+Every other rule applies unchanged, and the latest record for the key decides, so a newer failure with the same
+key stops the skip by itself. Paths are literal and relative; an under-declared list is the dangerous direction
+(a stale pass), so each list is reviewed against a trace of what the check opens. `sample_one_in` (default 1)
+keeps running the real job for one run in N even when a note matches, chosen by a hash of the check, the key and
+the head, so a retry behaves the same; the gate prints `decision=run` with a reason starting `sampled`.
+
+The projection reads names as bytes and passes them NUL-terminated both ways (`ls-tree -z`, `update-index -z`),
+so a newline in a name cannot split one file into two entries; symlinks and gitlinks keep their modes. When none
+of the declared paths exists the projection would be the empty tree that every such tree shares, so there is no
+key and nothing matches by it. Two limits are deliberate. The verifier does not recompute the projection of the
+record's own tree: it trusts the key the producer signed, so the producer is trusted exactly as far as for the
+tree rule. And sampling is a comparison sample, not a security control: the head is in the seed, so on a pull
+request an author can re-push to change whether a run is sampled (about five tries at one in five), while in a
+merge group the head is fixed. A result that does not carry the sampling rule at all is treated as sampled.
 
 Each kind has its own rule: the exact `command` the record must have run, an optional
 `runner_prefix`, optional per-kind `trust_levels`, the `required_inputs` it must carry (every one a nonempty string) and
@@ -711,7 +747,7 @@ values and `-` for none:
 
 ```
 evidence-decision v1 check=… decision=skip|run outcome=satisfied|degraded|no_note|rejected|unavailable
-reason=… record=… signer=… trust_level=… kind=… tier=… observed_at=… age_s=… max_age_s=… attempts=… enforce=true|false
+reason=… record=… signer=… trust_level=… kind=… tier=… observed_at=… age_s=… max_age_s=… attempts=… enforce=true|false match=tree|inputs source_inputs=…
 tree=… head=… base=… event=… pr=… repo=… run=… attempt=… fork=true|false verifier_sha256=… gate_sha256=…
 ```
 
