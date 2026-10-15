@@ -9,7 +9,7 @@ use crate::peer::{ClientReadOperation, ClientReadRequest};
 /// The whole text of a message: its own content when it has no separate body, else the body
 /// read from its owner. This member's own file is read directly; another member's is asked for
 /// over the peer route, chunk by chunk, and kept nowhere.
-async fn whole_text(
+pub(super) async fn whole_text(
     state: &AppState,
     session: &ClientSession,
     message: &MessageView,

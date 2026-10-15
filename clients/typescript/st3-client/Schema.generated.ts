@@ -2867,10 +2867,56 @@ export type DirectiveNotesEncoded = typeof DirectiveNotes.Encoded
 
 export const DocumentContent = /*#__PURE__*/ (() => Schema.Struct({
   "bytes": Schema.Array(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(255))),
-  "reference": Schema.String
+  "changed_at_unix_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "latest": optionalKey(Schema.Boolean),
+  "name": optionalKey(Schema.String),
+  "owner": optionalKey(Schema.String),
+  "reference": Schema.String,
+  "size": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "version": optionalKey(Schema.String)
 }).annotate({ identifier: "DocumentContent" }))()
 export type DocumentContent = typeof DocumentContent.Type
 export type DocumentContentEncoded = typeof DocumentContent.Encoded
+
+export const DocumentItem = /*#__PURE__*/ (() => Schema.Struct({
+  "changed_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "latest": Schema.Boolean,
+  "name": Schema.String,
+  "owner": optionalKey(Schema.String),
+  "reference": Schema.String,
+  "size": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "version": Schema.String
+}).annotate({ identifier: "DocumentItem" }))()
+export type DocumentItem = typeof DocumentItem.Type
+export type DocumentItemEncoded = typeof DocumentItem.Encoded
+
+export const DocumentReference = /*#__PURE__*/ (() => Schema.Struct({
+  "name": Schema.String,
+  "reference": Schema.String,
+  "source": Schema.Literals(["content","body","step"]),
+  "step": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "version": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+}).annotate({ identifier: "DocumentReference" }))()
+export type DocumentReference = typeof DocumentReference.Type
+export type DocumentReferenceEncoded = typeof DocumentReference.Encoded
+
+export const DocumentReferences = /*#__PURE__*/ (() => Schema.Struct({
+  "complete": Schema.Boolean,
+  "references": Schema.Array(DocumentReference),
+  "subject": Schema.String
+}).annotate({ identifier: "DocumentReferences" }))()
+export type DocumentReferences = typeof DocumentReferences.Type
+export type DocumentReferencesEncoded = typeof DocumentReferences.Encoded
+
+export const DocumentsPage = /*#__PURE__*/ (() => Schema.Struct({
+  "has_more": Schema.Boolean,
+  "history": Schema.Boolean,
+  "items": Schema.Array(DocumentItem),
+  "limit": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+  "next_cursor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+}).annotate({ identifier: "DocumentsPage" }))()
+export type DocumentsPage = typeof DocumentsPage.Type
+export type DocumentsPageEncoded = typeof DocumentsPage.Encoded
 
 export const TimelineDelta = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "entry": TimelineEntry, "entry_id": Id, /** Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of */
@@ -3033,13 +3079,13 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([DirectiveNotes, Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([DirectiveNotes, Capabilities, DocumentContent, DocumentsPage, DocumentReferences, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
 
 /** Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. suspend-authored-session-selection is a non-retryable HTTP 422 refusal before any suspend write; details.selector names the declared native session selector. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer. */
-export const ErrorCode = /*#__PURE__*/ (() => openEnum(["recipient-retired","lifecycle-unavailable","retirement-upgrade-required","attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","issuer-required","suspend-authored-session-selection","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","projection-detail-too-large","projection-detail-invalid-source","conversation-content-invalidated","transcript-unavailable","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","message-too-large","message-store-full","long-message-signature-unsupported","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. suspend-authored-session-selection is a non-retryable HTTP 422 refusal before any suspend write; details.selector names the declared native session selector. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer." }))()
+export const ErrorCode = /*#__PURE__*/ (() => openEnum(["recipient-retired","lifecycle-unavailable","retirement-upgrade-required","attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","issuer-required","suspend-authored-session-selection","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","projection-detail-too-large","projection-detail-invalid-source","conversation-content-invalidated","transcript-unavailable","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","message-too-large","message-store-full","long-message-signature-unsupported","invalid-document-reference","document-not-synced","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. suspend-authored-session-selection is a non-retryable HTTP 422 refusal before any suspend write; details.selector names the declared native session selector. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer." }))()
 export type ErrorCode = typeof ErrorCode.Type
 export type ErrorCodeEncoded = typeof ErrorCode.Encoded
 

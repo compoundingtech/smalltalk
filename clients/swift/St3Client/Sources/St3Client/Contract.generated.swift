@@ -70,6 +70,8 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case setsGet = "sets.get"
     case capabilitiesGet = "capabilities.get"
     case documentGet = "document.get"
+    case documentsList = "documents.list"
+    case documentReferencesGet = "document-references.get"
     case publicationDefinition = "publication.definition"
     case subjectDefinition = "subject.definition"
     case mailBacklogSummary = "mail-backlog.summary"
@@ -135,6 +137,8 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .setsGet: "/v1/client/sets/{id}",
     .capabilitiesGet: "/v1/client/capabilities",
     .documentGet: "/v1/client/documents/content",
+    .documentsList: "/v1/client/documents",
+    .documentReferencesGet: "/v1/client/document-references",
     .publicationDefinition: "/v1/client/publication-definition",
     .subjectDefinition: "/v1/client/subject-definition",
     .mailBacklogSummary: "/v1/client/mail-backlog",

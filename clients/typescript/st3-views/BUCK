@@ -13,6 +13,7 @@ package_view(
         "conversationSimple.ts": "conversationSimple.ts",
         "conversationView.ts": "conversationView.ts",
         "deviceSigning.ts": "deviceSigning.ts",
+        "documentView.ts": "documentView.ts",
         "homeView.ts": "homeView.ts",
         "index.ts": "index.ts",
         "inventoryView.ts": "inventoryView.ts",

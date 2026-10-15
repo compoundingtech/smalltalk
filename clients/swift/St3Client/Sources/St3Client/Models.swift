@@ -66,6 +66,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge, messageStoreFull, longMessageSignatureUnsupported
+    case invalidDocumentReference, documentNotSynced
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -94,7 +95,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
-        case "message-too-large": .messageTooLarge; case "message-store-full": .messageStoreFull; case "long-message-signature-unsupported": .longMessageSignatureUnsupported
+        case "message-too-large": .messageTooLarge; case "message-store-full": .messageStoreFull; case "long-message-signature-unsupported": .longMessageSignatureUnsupported; case "invalid-document-reference": .invalidDocumentReference; case "document-not-synced": .documentNotSynced
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
         }
@@ -124,7 +125,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
-        case .messageTooLarge: "message-too-large"; case .messageStoreFull: "message-store-full"; case .longMessageSignatureUnsupported: "long-message-signature-unsupported"
+        case .messageTooLarge: "message-too-large"; case .messageStoreFull: "message-store-full"; case .longMessageSignatureUnsupported: "long-message-signature-unsupported"; case .invalidDocumentReference: "invalid-document-reference"; case .documentNotSynced: "document-not-synced"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value
         }
@@ -193,7 +194,11 @@ public struct UsageSummary: Codable, Sendable {
 public struct AttentionResource: Codable, Sendable { public let customForm: JSONValue?; public let id, kind, revision, updatedAt, attentionKind, sourceID, personID, title, detail, priority, state, requestedAt: String; public let alert: Bool?; public let conversationIDs: [String]?; public let conversationID, requesterID, launchID, variantID, messageID, previewToken, what, because, reviewMode, missionID, missionRunID, stepRunID, episode, sourceKind: String?; public let actionParameters: JSONValue?; public let request: StructuredRequest?; public let update: PersonUpdate?; public let blocked: AttentionBlocked?; public let preview: LaunchPreview?; public let fix: JSONValue?; public let targets, actions: [String]; public let targetStates: [AttentionTargetState]?; public let operational: Operational?; enum CodingKeys: String, CodingKey { case customForm = "custom_form", id, kind, revision, updatedAt = "updated_at", attentionKind = "attention_kind", episode, sourceKind = "source_kind", actionParameters = "action_parameters", request, update, blocked, sourceID = "source_id", personID = "person_id", alert, conversationID = "conversation_id", conversationIDs = "conversation_ids", requesterID = "requester_id", launchID = "launch_id", variantID = "variant_id", messageID = "message_id", previewToken = "preview_token", preview, what, because, fix, reviewMode = "review_mode", missionID = "mission_id", missionRunID = "mission_run_id", stepRunID = "step_run_id", title, detail, priority, state, requestedAt = "requested_at", targets, targetStates = "target_states", actions, operational } }
 public struct AttentionBlocked: Codable, Sendable { public let stepRunID, step, goal: String; public let attempt: Int; enum CodingKeys: String, CodingKey { case stepRunID = "step_run_id", step, goal, attempt } }
 public struct AttentionTargetState: Codable, Sendable { public let id, state: String; public let since: String? }
-public struct DocumentContent: Codable, Sendable { public let reference: String; public let bytes: [UInt8] }
+public struct DocumentContent: Codable, Sendable { public let reference: String; public let bytes: [UInt8]; public let name, version, owner: String?; public let size, changedAtUnixMS: UInt64?; public let latest: Bool?; enum CodingKeys: String, CodingKey { case reference, bytes, name, version, owner, size, latest, changedAtUnixMS = "changed_at_unix_ms" } }
+public struct DocumentItem: Codable, Sendable, Equatable { public let reference, name, version: String; public let size, changedAtUnixMS: UInt64; public let latest: Bool; public let owner: String?; enum CodingKeys: String, CodingKey { case reference, name, version, size, latest, owner, changedAtUnixMS = "changed_at_unix_ms" } }
+public struct DocumentsPage: Codable, Sendable { public let items: [DocumentItem]; public let hasMore, history: Bool; public let limit: UInt64; public let nextCursor: String?; enum CodingKeys: String, CodingKey { case items, history, limit, hasMore = "has_more", nextCursor = "next_cursor" } }
+public struct DocumentReference: Codable, Sendable, Equatable { public let reference, name, source: String; public let version, step: String? }
+public struct DocumentReferences: Codable, Sendable { public let subject: String; public let references: [DocumentReference]; public let complete: Bool }
 /// The whole text of a message, of which a long message's `content` is only the start.
 public struct MessageBody: Codable, Sendable, Equatable { public let message, text: String; public let bytes: UInt64; /// False when the owner could not be reached: `text` is then the preview and a note.
     public let complete: Bool? }

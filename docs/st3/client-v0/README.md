@@ -557,6 +557,35 @@ retention decision for native per-request records remain later work.
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 
+### Documents
+
+Clients read documents through three reads under `read.projections`; the `documents`
+capability (version 1) says a daemon serves all three. Documents are read-only here.
+
+- `document.get` (`GET /v1/client/documents/content?name=`) reads `doc/NAME@HASH`, or the
+  latest version of `doc/NAME`. The answer keeps `reference` and `bytes` and adds `name`,
+  `version` (the hash), `size`, `changed_at_unix_ms` (when that version was bound to its name),
+  `latest` and `owner`; `reference` is always the exact version read. A pinned version this host
+  does not hold answers 404 `document-not-synced` (retryable: it shows once it syncs); an unknown
+  name answers 404 `not-found`. Older daemons answer only `reference` and `bytes`, and refuse a
+  bare name with `invalid-document-reference`.
+- `documents.list` (`GET /v1/client/documents`) is `/v1/documents` for clients: `prefix`, `name`,
+  `history`, `cursor` and `limit` (1–200, default 100), in name order with each name's newest
+  version first. Each `DocumentItem` carries `reference`, `name`, `version`, `size`,
+  `changed_at_unix_ms`, `latest` and `owner`; `next_cursor` continues with the same filters.
+- `document-references.get` (`GET /v1/client/document-references?subject=`) names the
+  documents of a `message/…` (the document that is its content, `source: content`, then each
+  `doc/…` link in its whole text, `source: body`), a `step-run/RUN/STEP` (its pinned
+  documents, `source: step`), or a `mission/…` or `mission-run/…` (its steps' pinned documents,
+  each once, with `step`). `complete` is false when a message's text lives on a machine that
+  did not answer; its references then come from the preview. Links are found as
+  `st3_ui_model::documents::document_links` finds them.
+
+Rust has `document_get`, `documents_list(prefix, history, cursor, limit)` and
+`document_references_get(subject)`; Swift `documentGet(name:)`, `documentsList(prefix:history:cursor:limit:)`
+and `documentReferencesGet(subject:)`; TypeScript `documentGet(name)`,
+`documentsList({ prefix, history, cursor, limit })` and `documentReferencesGet(subject)`.
+
 ### Clients connected now
 
 A client may name itself and its build in an `x-st3-client` header on every request and stream,

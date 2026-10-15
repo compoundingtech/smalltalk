@@ -62,6 +62,7 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+mod client_documents;
 #[cfg(test)]
 mod terminal_gate_evidence;
 mod message_bodies;
@@ -545,7 +546,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/observations", post(client_observations::report)
             .layer(DefaultBodyLimit::max(client_observations::MAX_BODY_BYTES)))
-        .route("/v1/client/documents/content", get(client_v0::document_get))
+        .route("/v1/client/documents/content", get(client_documents::document_get))
+        .route("/v1/client/documents", get(client_documents::documents_list))
+        .route("/v1/client/document-references", get(client_documents::document_references))
         .route("/v1/client/usage", get(client_v0::usage_period))
         .route("/v1/client/mail-backlog", get(mail_backlog::get))
         .route("/v1/client/clients", get(client_v0::clients_list))
@@ -1694,6 +1697,7 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
         code,
         Some(
             "remote-unavailable"
+                | "document-not-synced"
                 | "terminal-unavailable"
                 | "cursor-gap"
                 | "conversation-content-invalidated"
@@ -29834,3 +29838,5 @@ agent "seat" { workspace "/tmp"; command "true" }
 mod work_incarnation_tests;
 #[cfg(test)]
 mod message_bodies_tests;
+#[cfg(test)]
+mod client_documents_tests;

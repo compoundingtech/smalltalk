@@ -2404,38 +2404,6 @@ pub(super) async fn agent_declaration(
 }
 
 #[derive(Deserialize)]
-pub(super) struct ClientDocumentQuery {
-    name: String,
-}
-
-pub(super) async fn document_get(
-    State(state): State<AppState>,
-    Extension(session): Extension<ClientSession>,
-    Query(query): Query<ClientDocumentQuery>,
-) -> Result<Json<Value>, ApiError> {
-    require_scope(&session, "read.projections")?;
-    let (name, hash) = query.name.rsplit_once('@').ok_or_else(|| {
-        ApiError::bad(St3Error::new(
-            "invalid-document-reference",
-            "a document name needs `@HASH`",
-        ))
-    })?;
-    if name.is_empty() || hash.is_empty() {
-        return Err(ApiError::bad(St3Error::new(
-            "invalid-document-reference",
-            "a document name needs `@HASH`",
-        )));
-    }
-    let store = state.store.clone();
-    let name = name.to_owned();
-    let hash = hash.to_owned();
-    let bytes = blocking_store(move || store.get_document(&name, &hash))
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("document `{}` is not stored", query.name)))?;
-    Ok(Json(json!({ "reference": query.name, "bytes": bytes })))
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ClientUsageQuery {
     since_ms: Option<u64>,
@@ -2868,6 +2836,9 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     capabilities.push(json!({"id":"inventory-collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    // `documents.list`, `document-references.get`, and `document.get` by bare name with its
+    // version and changed time.
+    capabilities.push(json!({"id":"documents", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.push(json!({"id":"arrangements", "version":1, "state":if session.allows("read.arrangements") && acting_party(session) { "granted" } else { "ungranted" }}));

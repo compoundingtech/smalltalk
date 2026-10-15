@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Clients list documents, read a document's version and changed time, and read the documents a message, mission or step names",
+  "replay": {
+    "status": "none",
+    "detail": "No claim or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, version or stored data changes; one indexed read of a document version by name and hash."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive client reads: documents.list (GET /v1/client/documents) and document-references.get (GET /v1/client/document-references), advertised by the documents capability. document.get also reads a bare doc/NAME as its latest version and adds name, version, size, changed_at_unix_ms, latest and owner; a pinned version the host does not hold answers 404 document-not-synced instead of not-found. Older clients ignore the new fields; older daemons lack the capability. Rust, Swift and TypeScript clients are regenerated, and the shared document view model lives in st3-ui-model and @smalltalk/st3-views. A pinned miss used to answer 404 not-found and now answers 404 document-not-synced, so a client that matched code == \"not-found\" for a pinned miss sees a different code; the HTTP status is unchanged. Authorization: every read.projections session may list every document and read any version, the model the CLI already has (st documents ls, st documents get doc/NAME); only a message subject in document-references.get is gated by who may read the message. Per-agent document privacy would gate these routes and the CLI together."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or startup migration is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes."
+  }
+}
