@@ -5,8 +5,8 @@
   "loading": false,
   "slice": "terminal",
   "source": {
-    "_tag": "synthetic",
-    "seed": 1
+    "_tag": "recorded",
+    "recording": "fleet-mid-refactor"
   },
   "state": {
     "terminals": [
@@ -16,65 +16,40 @@
             [
               0,
               "o",
-              "\u001b[32matlas\u001b[0m:builder $ pnpm -r typecheck\r\n"
-            ],
-            [
-              0.767,
-              "o",
-              "packages/api typecheck: Done\r\n"
-            ],
-            [
-              1.372,
-              "o",
-              "packages/web typecheck: Done\r\n"
-            ],
-            [
-              2.134,
-              "o",
-              "\u001b[31mpackages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but got 1.\u001b[0m\r\n"
-            ],
-            [
-              2.62,
-              "o",
-              "\u001b[31mpackages/worker typecheck: Failed\u001b[0m\r\n"
-            ],
-            [
-              2.67,
-              "o",
-              "\u001b[32matlas\u001b[0m:builder $ "
+              "$ pnpm -r typecheck\n\u001b[31mpackages/api typecheck: Done\npackages/web typecheck: Done\npackages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but got 1.\npackages/worker typecheck: Failed\u001b[0m\n"
             ]
           ],
           "header": {
-            "height": 12,
-            "title": "pnpm -r typecheck",
+            "height": 24,
+            "title": "example.atlas.builder",
             "version": 2,
-            "width": 100
+            "width": 80
           },
-          "started_at_ms": -150000
+          "started_at_ms": -1772
         },
-        "incarnation": "pty-57:1",
+        "incarnation": "incarnation#1",
         "owner": "agent/example/atlas/builder",
         "runtime": {
-          "desired_revision": "desired-1",
+          "desired_revision": null,
           "id": "runtime/example-atlas-builder-shell",
-          "incarnation_id": "pty-57:1",
+          "incarnation_id": "incarnation#1",
           "kind": "runtime",
           "owner_host_id": "host/meadow",
           "owner_id": "agent/example/atlas/builder",
-          "revision": "rt-shell-1",
+          "revision": "d4aedd5f18fc1a51bf07ad8d",
           "runtime_id": "example-atlas-builder-shell",
           "runtime_kind": "terminal",
           "state": "running",
           "terminal_id": "terminal/example-atlas-builder",
-          "updated_at": "2030-01-01T11:57:30.000Z"
+          "updated_at": "2030-01-01T12:00:00.092Z"
         },
         "screens": [
           {
-            "at_ms": -150000,
+            "at_ms": -8119,
             "screen": {
-              "columns": 100,
+              "columns": 80,
               "cursor": {
-                "blinking": true,
+                "blinking": false,
                 "column": 0,
                 "row": 1,
                 "style": "block",
@@ -87,16 +62,11 @@
                   "row": 0,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 28,
-                      "text": ":builder $ pnpm -r typecheck"
+                      "cells": 22,
+                      "text": "scenario harness ready"
                     }
                   ],
-                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "text": "scenario harness ready",
                   "truncated": false,
                   "wrapped": false
                 },
@@ -107,151 +77,12 @@
                   "text": "",
                   "truncated": false,
                   "wrapped": false
-                }
-              ],
-              "modes": {
-                "alternate_screen": false,
-                "application_cursor": false,
-                "application_keypad": false,
-                "bracketed_paste": false,
-                "focus_events": false,
-                "mouse_encoding": "default",
-                "mouse_tracking": "none"
-              },
-              "next_sequence": 1,
-              "revision": "cast-1",
-              "rows": 12,
-              "runtime_incarnation": "pty-57:1",
-              "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm -r typecheck",
-              "truncated": false
-            }
-          },
-          {
-            "at_ms": -149233,
-            "screen": {
-              "columns": 100,
-              "cursor": {
-                "blinking": true,
-                "column": 0,
-                "row": 2,
-                "style": "block",
-                "visible": true
-              },
-              "kind": "terminal-screen",
-              "lines": [
-                {
-                  "redacted": false,
-                  "row": 0,
-                  "runs": [
-                    {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 28,
-                      "text": ":builder $ pnpm -r typecheck"
-                    }
-                  ],
-                  "text": "atlas:builder $ pnpm -r typecheck",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 1,
-                  "runs": [
-                    {
-                      "cells": 28,
-                      "text": "packages/api typecheck: Done"
-                    }
-                  ],
-                  "text": "packages/api typecheck: Done",
-                  "truncated": false,
-                  "wrapped": false
                 },
                 {
                   "redacted": false,
                   "row": 2,
                   "runs": [],
                   "text": "",
-                  "truncated": false,
-                  "wrapped": false
-                }
-              ],
-              "modes": {
-                "alternate_screen": false,
-                "application_cursor": false,
-                "application_keypad": false,
-                "bracketed_paste": false,
-                "focus_events": false,
-                "mouse_encoding": "default",
-                "mouse_tracking": "none"
-              },
-              "next_sequence": 2,
-              "revision": "cast-2",
-              "rows": 12,
-              "runtime_incarnation": "pty-57:1",
-              "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm -r typecheck",
-              "truncated": false
-            }
-          },
-          {
-            "at_ms": -148628,
-            "screen": {
-              "columns": 100,
-              "cursor": {
-                "blinking": true,
-                "column": 0,
-                "row": 3,
-                "style": "block",
-                "visible": true
-              },
-              "kind": "terminal-screen",
-              "lines": [
-                {
-                  "redacted": false,
-                  "row": 0,
-                  "runs": [
-                    {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 28,
-                      "text": ":builder $ pnpm -r typecheck"
-                    }
-                  ],
-                  "text": "atlas:builder $ pnpm -r typecheck",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 1,
-                  "runs": [
-                    {
-                      "cells": 28,
-                      "text": "packages/api typecheck: Done"
-                    }
-                  ],
-                  "text": "packages/api typecheck: Done",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 2,
-                  "runs": [
-                    {
-                      "cells": 28,
-                      "text": "packages/web typecheck: Done"
-                    }
-                  ],
-                  "text": "packages/web typecheck: Done",
                   "truncated": false,
                   "wrapped": false
                 },
@@ -262,108 +93,12 @@
                   "text": "",
                   "truncated": false,
                   "wrapped": false
-                }
-              ],
-              "modes": {
-                "alternate_screen": false,
-                "application_cursor": false,
-                "application_keypad": false,
-                "bracketed_paste": false,
-                "focus_events": false,
-                "mouse_encoding": "default",
-                "mouse_tracking": "none"
-              },
-              "next_sequence": 3,
-              "revision": "cast-3",
-              "rows": 12,
-              "runtime_incarnation": "pty-57:1",
-              "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm -r typecheck",
-              "truncated": false
-            }
-          },
-          {
-            "at_ms": -147866,
-            "screen": {
-              "columns": 100,
-              "cursor": {
-                "blinking": true,
-                "column": 0,
-                "row": 5,
-                "style": "block",
-                "visible": true
-              },
-              "kind": "terminal-screen",
-              "lines": [
-                {
-                  "redacted": false,
-                  "row": 0,
-                  "runs": [
-                    {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 28,
-                      "text": ":builder $ pnpm -r typecheck"
-                    }
-                  ],
-                  "text": "atlas:builder $ pnpm -r typecheck",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 1,
-                  "runs": [
-                    {
-                      "cells": 28,
-                      "text": "packages/api typecheck: Done"
-                    }
-                  ],
-                  "text": "packages/api typecheck: Done",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 2,
-                  "runs": [
-                    {
-                      "cells": 28,
-                      "text": "packages/web typecheck: Done"
-                    }
-                  ],
-                  "text": "packages/web typecheck: Done",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 3,
-                  "runs": [
-                    {
-                      "cells": 100,
-                      "fg": 1,
-                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g"
-                    }
-                  ],
-                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
-                  "truncated": false,
-                  "wrapped": true
                 },
                 {
                   "redacted": false,
                   "row": 4,
-                  "runs": [
-                    {
-                      "cells": 5,
-                      "fg": 1,
-                      "text": "ot 1."
-                    }
-                  ],
-                  "text": "ot 1.",
+                  "runs": [],
+                  "text": "",
                   "truncated": false,
                   "wrapped": false
                 },
@@ -374,6 +109,150 @@
                   "text": "",
                   "truncated": false,
                   "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
                 }
               ],
               "modes": {
@@ -382,26 +261,27 @@
                 "application_keypad": false,
                 "bracketed_paste": false,
                 "focus_events": false,
+                "kitty_keyboard": 0,
                 "mouse_encoding": "default",
                 "mouse_tracking": "none"
               },
-              "next_sequence": 4,
-              "revision": "cast-4",
-              "rows": 12,
-              "runtime_incarnation": "pty-57:1",
+              "next_sequence": 3135423856816036,
+              "revision": "b23a6c134afa461ebab56720",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
               "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm -r typecheck",
+              "title": "example.atlas.builder",
               "truncated": false
             }
           },
           {
-            "at_ms": -147380,
+            "at_ms": -5665,
             "screen": {
-              "columns": 100,
+              "columns": 80,
               "cursor": {
-                "blinking": true,
+                "blinking": false,
                 "column": 0,
-                "row": 6,
+                "row": 1,
                 "style": "block",
                 "visible": true
               },
@@ -412,16 +292,241 @@
                   "row": 0,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 28,
-                      "text": ":builder $ pnpm -r typecheck"
+                      "cells": 22,
+                      "text": "scenario harness ready"
                     }
                   ],
-                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "text": "scenario harness ready",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "kitty_keyboard": 0,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 3135423856816036,
+              "revision": "b23a6c134afa461ebab56720",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "example.atlas.builder",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -1766,
+            "screen": {
+              "columns": 80,
+              "cursor": {
+                "blinking": false,
+                "column": 0,
+                "row": 9,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 22,
+                      "text": "scenario harness ready"
+                    }
+                  ],
+                  "text": "scenario harness ready",
                   "truncated": false,
                   "wrapped": false
                 },
@@ -430,11 +535,11 @@
                   "row": 1,
                   "runs": [
                     {
-                      "cells": 28,
-                      "text": "packages/api typecheck: Done"
+                      "cells": 19,
+                      "text": "$ pnpm -r typecheck"
                     }
                   ],
-                  "text": "packages/api typecheck: Done",
+                  "text": "$ pnpm -r typecheck",
                   "truncated": false,
                   "wrapped": false
                 },
@@ -444,6 +549,21 @@
                   "runs": [
                     {
                       "cells": 28,
+                      "fg": 1,
+                      "text": "packages/api typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/api typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "fg": 1,
                       "text": "packages/web typecheck: Done"
                     }
                   ],
@@ -453,35 +573,35 @@
                 },
                 {
                   "redacted": false,
-                  "row": 3,
-                  "runs": [
-                    {
-                      "cells": 100,
-                      "fg": 1,
-                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g"
-                    }
-                  ],
-                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
-                  "truncated": false,
-                  "wrapped": true
-                },
-                {
-                  "redacted": false,
                   "row": 4,
                   "runs": [
                     {
-                      "cells": 5,
+                      "cells": 80,
                       "fg": 1,
-                      "text": "ot 1."
+                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expecte"
                     }
                   ],
-                  "text": "ot 1.",
+                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expecte",
                   "truncated": false,
                   "wrapped": false
                 },
                 {
                   "redacted": false,
                   "row": 5,
+                  "runs": [
+                    {
+                      "cells": 25,
+                      "fg": 1,
+                      "text": "d 2 arguments, but got 1."
+                    }
+                  ],
+                  "text": "d 2 arguments, but got 1.",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
                   "runs": [
                     {
                       "cells": 33,
@@ -495,7 +615,140 @@
                 },
                 {
                   "redacted": false,
-                  "row": 6,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 31,
+                      "text": "scenario turn 3 output complete"
+                    }
+                  ],
+                  "text": "scenario turn 3 output complete",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
                   "runs": [],
                   "text": "",
                   "truncated": false,
@@ -508,26 +761,27 @@
                 "application_keypad": false,
                 "bracketed_paste": false,
                 "focus_events": false,
+                "kitty_keyboard": 0,
                 "mouse_encoding": "default",
                 "mouse_tracking": "none"
               },
-              "next_sequence": 5,
-              "revision": "cast-5",
-              "rows": 12,
-              "runtime_incarnation": "pty-57:1",
+              "next_sequence": 3741560054321089,
+              "revision": "d4aedd5f18fc1a51bf07ad8d",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
               "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm -r typecheck",
+              "title": "example.atlas.builder",
               "truncated": false
             }
           },
           {
-            "at_ms": -147330,
+            "at_ms": 0,
             "screen": {
-              "columns": 100,
+              "columns": 80,
               "cursor": {
-                "blinking": true,
-                "column": 16,
-                "row": 6,
+                "blinking": false,
+                "column": 0,
+                "row": 9,
                 "style": "block",
                 "visible": true
               },
@@ -538,16 +792,11 @@
                   "row": 0,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 28,
-                      "text": ":builder $ pnpm -r typecheck"
+                      "cells": 22,
+                      "text": "scenario harness ready"
                     }
                   ],
-                  "text": "atlas:builder $ pnpm -r typecheck",
+                  "text": "scenario harness ready",
                   "truncated": false,
                   "wrapped": false
                 },
@@ -556,11 +805,11 @@
                   "row": 1,
                   "runs": [
                     {
-                      "cells": 28,
-                      "text": "packages/api typecheck: Done"
+                      "cells": 19,
+                      "text": "$ pnpm -r typecheck"
                     }
                   ],
-                  "text": "packages/api typecheck: Done",
+                  "text": "$ pnpm -r typecheck",
                   "truncated": false,
                   "wrapped": false
                 },
@@ -570,6 +819,21 @@
                   "runs": [
                     {
                       "cells": 28,
+                      "fg": 1,
+                      "text": "packages/api typecheck: Done"
+                    }
+                  ],
+                  "text": "packages/api typecheck: Done",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "fg": 1,
                       "text": "packages/web typecheck: Done"
                     }
                   ],
@@ -579,35 +843,35 @@
                 },
                 {
                   "redacted": false,
-                  "row": 3,
-                  "runs": [
-                    {
-                      "cells": 100,
-                      "fg": 1,
-                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g"
-                    }
-                  ],
-                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but g",
-                  "truncated": false,
-                  "wrapped": true
-                },
-                {
-                  "redacted": false,
                   "row": 4,
                   "runs": [
                     {
-                      "cells": 5,
+                      "cells": 80,
                       "fg": 1,
-                      "text": "ot 1."
+                      "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expecte"
                     }
                   ],
-                  "text": "ot 1.",
+                  "text": "packages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expecte",
                   "truncated": false,
                   "wrapped": false
                 },
                 {
                   "redacted": false,
                   "row": 5,
+                  "runs": [
+                    {
+                      "cells": 25,
+                      "fg": 1,
+                      "text": "d 2 arguments, but got 1."
+                    }
+                  ],
+                  "text": "d 2 arguments, but got 1.",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
                   "runs": [
                     {
                       "cells": 33,
@@ -621,19 +885,142 @@
                 },
                 {
                   "redacted": false,
-                  "row": 6,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 11,
-                      "text": ":builder $ "
+                      "cells": 31,
+                      "text": "scenario turn 3 output complete"
                     }
                   ],
-                  "text": "atlas:builder $ ",
+                  "text": "scenario turn 3 output complete",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
+                  "runs": [],
+                  "text": "",
                   "truncated": false,
                   "wrapped": false
                 }
@@ -644,15 +1031,16 @@
                 "application_keypad": false,
                 "bracketed_paste": false,
                 "focus_events": false,
+                "kitty_keyboard": 0,
                 "mouse_encoding": "default",
                 "mouse_tracking": "none"
               },
-              "next_sequence": 6,
-              "revision": "cast-6",
-              "rows": 12,
-              "runtime_incarnation": "pty-57:1",
+              "next_sequence": 3741560054321089,
+              "revision": "d4aedd5f18fc1a51bf07ad8d",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
               "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm -r typecheck",
+              "title": "example.atlas.builder",
               "truncated": false
             }
           }

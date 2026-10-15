@@ -206,7 +206,7 @@
       "_tag": "changes",
       "at_ms": 18000,
       "removes": [],
-      "store": 14,
+      "store": 11,
       "upserts": [
         {
           "attempt": 1,
@@ -268,7 +268,7 @@
       "_tag": "changes",
       "at_ms": 30000,
       "removes": [],
-      "store": 21,
+      "store": 13,
       "upserts": [
         {
           "attempt": 2,

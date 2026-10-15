@@ -1,14 +1,14 @@
 import type { WorldDefinition } from '../kit/world.ts'
-import { fleetMidRefactor } from './fleetMidRefactor.ts'
+import { syntheticFleetMidRefactor } from './fleetMidRefactor.ts'
 
 /** Replication divergence is a notice, not a transport failure. */
 export const replicationDiverged: WorldDefinition = {
-  ...fleetMidRefactor,
+  ...syntheticFleetMidRefactor,
   id: 'replication-diverged',
   title: 'Replication diverged',
   narrative: 'One peer has claims on both sides of a divergence. Reads remain live while the peer is repaired.',
   slices: (ctx) => {
-    const base = fleetMidRefactor.slices(ctx)
+    const base = syntheticFleetMidRefactor.slices(ctx)
     return {
       ...base,
       sync: {

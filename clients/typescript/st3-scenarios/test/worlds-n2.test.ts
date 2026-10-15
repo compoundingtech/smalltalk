@@ -71,8 +71,11 @@ it('onboarding has no hidden resources at zero and becomes a green first run', (
   expect(JSON.stringify(conversation)).toContain('3 tests passed')
   expect(JSON.stringify(terminal)).toContain('3 tests passed')
   expect(foldSlice(world.slices.details, Infinity).state.work[0]?.state).toBe('completed')
-  // Planted negative witness: folding before creation cannot masquerade as the final state.
-  expect(foldSlice(world.slices.conversation, 4_999).state.threads).not.toEqual(conversation.threads)
+  // Recorded creation offsets include actual capture latency, not the synthetic roster clock.
+  const creation = world.slices.conversation.timeline.find((event) => event._tag === 'thread-create')!
+  expect(creation.at_ms).toBeGreaterThan(0)
+  expect(foldSlice(world.slices.conversation, creation.at_ms - 1).state.threads).toEqual([])
+  expect(foldSlice(world.slices.conversation, creation.at_ms).state.threads).toHaveLength(1)
 })
 
 it('both agents expose the same three-way conflict and the approved combined patch lands', () => {

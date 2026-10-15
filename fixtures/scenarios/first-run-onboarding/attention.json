@@ -48,7 +48,7 @@
       "removes": [
         "attention/scenario-first-run-onboarding-first-launch"
       ],
-      "store": 7,
+      "store": 9,
       "upserts": [
         {
           "content": "Launch the smoke check.",
@@ -70,7 +70,7 @@
       "_tag": "changes",
       "at_ms": 16000,
       "removes": [],
-      "store": 20,
+      "store": 13,
       "upserts": [
         {
           "content": "The smoke check passed: 3 tests, 0 failures.",

@@ -41,7 +41,7 @@
       "_tag": "changes",
       "at_ms": 30000,
       "removes": [],
-      "store": 22,
+      "store": 14,
       "upserts": [
         {
           "actions": [

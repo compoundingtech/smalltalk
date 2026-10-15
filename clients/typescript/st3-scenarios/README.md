@@ -6,6 +6,31 @@ replays them. [spec.md](spec.md) is the contract.
 The registered catalog contains 24 worlds: seven narratives, empty/loading/forward-compatibility
 edges, eleven failed-sync causes, replication divergence, `huge` and Unicode.
 
+## Recorded narratives
+
+The seven narrative ids now consume real client-v0 conversation/terminal captures from
+recorder-owned scratch daemons. Every terminal is recorded; five conversations are wholly
+recorded. `fleet-mid-refactor` keeps the builder's recorded conversation alongside the
+synthetic migrator revision/diff thread, and `offline-reconnect-storm` keeps a recorded
+historical prefix followed by its synthetic readiness-report revision chain. Those composed
+conversation slices are marked synthetic, never falsely recorded.
+
+Roster, details, attention and sync remain authored synthetic slices, including activity of
+cast members on other hosts and product timing milestones. Recorded receipt offsets are not
+scaled to those milestones. The long-debug story uses the recorded 22-turn selection: all
+three wrong hypotheses, their rejections, forty-minute history and causal fix remain; repetitive
+middle batches are not inserted. The 17 edge worlds retain their original synthetic data.
+See [D3's per-world provenance table](spec.md#catalog-cutover-provenance-and-splice-points)
+for exact splice boundaries and reasons.
+
+Each recording also has an all-recorded, test-only fidelity world outside the catalog. Tests
+drive recorded commands/HTTP inputs and reconstruct output from typed slice history and
+boundary metadata, checking frames, older-page cursors, reconnect windows and multiple sockets
+against the separately emitted oracle. Drop/reorder/alter mutations must fail that comparison.
+The displayed fictional pnpm/git commands are painted by actual `printf` PTY runs; they are
+not claims that fictional project checkouts or tests executed. Terminal runtime descriptions
+are screen-derived adapters, and the captured stdout is not a full native PTY-server stream.
+
 ```ts
 import { loadWorld } from '@smalltalk/st3-scenarios'
 import { createReplay, realClock } from '@smalltalk/st3-scenarios/replay'

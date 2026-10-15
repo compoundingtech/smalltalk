@@ -8,9 +8,10 @@ import * as resources from '../kit/resources.ts'
 import type { Slice } from '../kit/slice.ts'
 import { liveSync } from '../kit/variants.ts'
 import type { WorldDefinition } from '../kit/world.ts'
+import { adoptNarrativeRecording } from './narrativeAdoption.ts'
 
 /** A genuinely empty daemon acquires its first resources and completes its first run. */
-export const firstRunOnboarding: WorldDefinition = {
+export const syntheticFirstRunOnboarding: WorldDefinition = {
   id: 'first-run-onboarding', title: 'First run onboarding', seed: 4,
   narrative: 'An empty daemon joins its first machine, launches its first agent and mission, and finishes a green smoke run.',
   cast: { project: 'sprout', roles: ['builder'], hosts: 1, people: 1, missions: [{ slug: 'first-smoke', title: 'Prove the first run works', steps: ['Run the project smoke check'] }] },
@@ -58,3 +59,5 @@ export const firstRunOnboarding: WorldDefinition = {
     return { roster, details, attention, conversation, terminal, sync: liveSync(ctx, { conversation }) }
   },
 }
+
+export const firstRunOnboarding: WorldDefinition = adoptNarrativeRecording(syntheticFirstRunOnboarding)

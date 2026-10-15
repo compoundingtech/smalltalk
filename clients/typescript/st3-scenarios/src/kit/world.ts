@@ -120,7 +120,9 @@ export const buildWorld = (definition: WorldDefinition, generic: VariantTable, n
       const builder = table(kind)[name]
       if (builder === undefined) throw new UnknownVariantError(`${definition.id}: no ${kind} variant ${name}`)
       const built = builder({ ...ctx, rng: fork(ctx.rng, `variant/${kind}/${name}`) }, own)
-      const source = built.source._tag === 'synthetic' ? { _tag: 'synthetic' as const, seed: definition.seed } : built.source
+      // Generic regeneration is synthetic; loading alone retains the backing source.
+      const generated = name !== 'loading' && generic[kind][name] === builder
+      const source = built.source._tag === 'synthetic' || generated ? { _tag: 'synthetic' as const, seed: definition.seed } : built.source
       slices[kind] = { ...built, variant: name, source } as AnySlice
       variants[kind] = choice === 'default' ? 'default' : name
     }

@@ -71,7 +71,7 @@
         "attention/scenario-merge-conflict-standoff-review-builder",
         "attention/scenario-merge-conflict-standoff-review-reviewer"
       ],
-      "store": 2,
+      "store": 7,
       "upserts": [
         {
           "content": "Keep the 300-second TTL from builder and stale reads from reviewer. Combine both changes, run the cache tests, then land the patch.",

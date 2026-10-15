@@ -8,9 +8,10 @@ import * as resources from '../kit/resources.ts'
 import type { Slice } from '../kit/slice.ts'
 import { liveSync } from '../kit/variants.ts'
 import type { WorldDefinition } from '../kit/world.ts'
+import { adoptNarrativeRecording } from './narrativeAdoption.ts'
 
 /** A finished release candidate: no blocked work and no manufactured urgent review cards. */
-export const releaseCandidatePolish: WorldDefinition = {
+export const syntheticReleaseCandidatePolish: WorldDefinition = {
   id: 'release-candidate-polish', title: 'Release candidate polish', seed: 7,
   narrative: 'The release candidate is ready: a patch version and changelog are committed, the verification matrix is green, and the team has gone idle.',
   cast: { project: 'meadow', roles: ['builder', 'reviewer', 'docs'], hosts: 2, people: 1,
@@ -52,3 +53,5 @@ export const releaseCandidatePolish: WorldDefinition = {
     }
   },
 }
+
+export const releaseCandidatePolish: WorldDefinition = adoptNarrativeRecording(syntheticReleaseCandidatePolish)

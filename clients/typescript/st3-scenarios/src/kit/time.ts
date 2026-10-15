@@ -96,7 +96,8 @@ export const rebase = <A>(doc: A, times: readonly TimePointer[], anchor: string,
   const delta = nowMs(now) - parseTimestamp(anchor)
   const out = structuredClone(doc)
   for (const { pointer, codec } of times) {
-    const value = getPointer(out, pointer)
+    // structuredClone preserves aliases: always shift the original leaf, never an earlier write.
+    const value = getPointer(doc, pointer)
     if (value === null) continue
     if (codec === 'timestamp') {
       if (typeof value !== 'string') throw new Error(`instant at ${pointer} is not a string`)
