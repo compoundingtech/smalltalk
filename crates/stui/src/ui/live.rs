@@ -509,6 +509,7 @@ pub fn run(context: Context) -> Result<()> {
     terminal.hide_cursor()?;
     let started = Instant::now();
     let mut changed = true;
+    let mut offline_drawn = false;
     // When st is next asked how long a message it takes: on connecting, then now and then, since
     // a daemon that is upgraded changes it.
     let mut limit_next = Instant::now();
@@ -737,6 +738,7 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     extras.live = true;
                     extras.offline = None;
+                    extras.offline_since = None;
                     extras.degraded = None;
                     model.last_connected =
                         Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
@@ -848,6 +850,7 @@ pub fn run(context: Context) -> Result<()> {
                     // nothing on screen is cleared.
                     extras.live = false;
                     extras.offline = None;
+                    extras.offline_since = None;
                     ui.flash(format!(
                         "Live stream lost ({reason}); st answers, reconnecting"
                     ));
@@ -860,6 +863,7 @@ pub fn run(context: Context) -> Result<()> {
                     extras.live = false;
                     extras.degraded = None;
                     extras.offline = Some(error);
+                    extras.offline_since.get_or_insert_with(Instant::now);
                     attached = None;
                     save_cache(cache_path.as_deref(), &person, &model);
                     changed = true;
@@ -1733,6 +1737,15 @@ pub fn run(context: Context) -> Result<()> {
             });
         }
 
+        // The grace for a restart of st ends on its own clock: draw the link as offline then.
+        match extras.offline_since {
+            Some(since) if !offline_drawn && since.elapsed() >= adapt::offline_grace() => {
+                offline_drawn = true;
+                changed = true;
+            }
+            None => offline_drawn = false,
+            Some(_) => {}
+        }
         if changed {
             ui.content.index(&timelines);
             extras.conversations = conversations(&model, &person, &timelines, &failed, &conversing);

@@ -51,6 +51,11 @@ pub struct World {
     /// contract while empty: the phone shows this on its own.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale: Vec<String>,
+    /// Peers whose newer records this host has not received yet, each as st words it: what shows
+    /// here is that much behind and can be out of date until it has caught up. Left out of the
+    /// shared contract while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behind: Vec<String>,
     /// Whether the missions window is followed now. Not part of the shared contract.
     #[serde(skip)]
     pub missions_followed: bool,

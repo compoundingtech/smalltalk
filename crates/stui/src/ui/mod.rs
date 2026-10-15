@@ -1472,9 +1472,18 @@ impl Ui {
                         self.world.stale.join("; ")
                     ));
                 }
+                if !self.world.behind.is_empty() {
+                    self.flash(format!(
+                        "Catching up: {}. What shows here can be out of date until then",
+                        self.world.behind.join("; ")
+                    ));
+                }
                 if known {
                     self.open(&machine);
-                } else if self.world.diverged.is_empty() && self.world.stale.is_empty() {
+                } else if self.world.diverged.is_empty()
+                    && self.world.stale.is_empty()
+                    && self.world.behind.is_empty()
+                {
                     self.flash(format!(
                         "Connected to {} as {}",
                         self.world.host, self.world.person
@@ -1902,6 +1911,7 @@ impl Ui {
             // Live, but showing a graph that exchanges cannot correct.
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
             Link::Live if !self.world.stale.is_empty() => ("◐", "stale", theme::YELLOW),
+            Link::Live if !self.world.behind.is_empty() => ("◐", "behind", theme::YELLOW),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
@@ -8395,6 +8405,44 @@ mod tests {
         ui.show_connection();
         assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("collection source is unavailable")));
         assert!(!ui.world.agents.items().is_empty());
+    }
+
+    #[test]
+    fn a_host_catching_up_says_behind_and_never_reads_as_no_alerts() {
+        let mut world = demo::world();
+        world.attention = Load::Ready(Vec::new());
+        let mut quiet = Ui::new(world.clone());
+        quiet.live = true;
+        let text = frame(&quiet, 140, 50).join("\n");
+        assert!(text.contains(screens::HOME_IDLE_TEXT) && !text.contains(screens::HOME_UNKNOWN_TEXT), "{text}");
+
+        world.behind = vec!["harbor has 26,820 envelopes this host lacks · caught up in about 14m".into()];
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        let rows = frame(&ui, 140, 50);
+        let text = rows.join("\n");
+        assert!(rows[0].contains("behind") && !rows[0].contains("live"), "{}", rows[0]);
+        assert!(text.contains(screens::HOME_UNKNOWN_TEXT) && text.contains("26,820 envelopes"), "{text}");
+        assert!(!text.contains(screens::HOME_IDLE_TEXT), "{text}");
+        ui.show_connection();
+        assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("Catching up: harbor has 26,820")));
+    }
+
+    #[test]
+    fn an_alerts_list_st_stopped_serving_never_reads_as_no_alerts() {
+        let mut world = demo::world();
+        world.attention = Load::Ready(Vec::new());
+        // Another list going stale does not make the alerts unknown.
+        world.stale = vec!["Agents: collection source is unavailable".into()];
+        let mut ui = Ui::new(world.clone());
+        ui.live = true;
+        let text = frame(&ui, 140, 50).join("\n");
+        assert!(text.contains(screens::HOME_IDLE_TEXT), "{text}");
+        world.stale = vec!["Attention: collection source is unavailable".into()];
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        let text = frame(&ui, 140, 50).join("\n");
+        assert!(text.contains(screens::HOME_UNKNOWN_TEXT) && text.contains("Attention: collection source"), "{text}");
     }
 
     #[test]
