@@ -8,6 +8,7 @@ pub mod glasses;
 pub mod owned_terminals;
 pub mod provenance;
 pub mod retention;
+pub mod review;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -505,6 +506,7 @@ impl Registry {
                 self.validate_reference(kind, name, value, field)?;
             }
         }
+        review::validate_claim(self, kind, fields)?;
         if kind == directive_notes::KIND {
             directive_notes::validate_fields(fields)?;
         }
@@ -1571,6 +1573,10 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             false,
             &[],
         ),
+        ("gate.head-bound", &["gate-operation"], WritePolicy::SystemOnly, Cardinality::Append, Some("gates"), true, &["gate"]),
+        ("gate.review-verdict", &["gate-operation"], WritePolicy::CapabilityHolder, Cardinality::Append, Some("gates"), true, &["gate"]),
+        ("gate.review-withdrawn", &["gate-operation"], WritePolicy::SystemOnly, Cardinality::Append, Some("gates"), true, &["gate"]),
+        ("gate.remediation-attached", &["gate-operation"], WritePolicy::SystemOnly, Cardinality::Append, Some("gates"), true, &["gate"]),
         (
             "gate.requested",
             &["gate-operation"],
@@ -2843,6 +2849,82 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("capability_expires_at", string()),
             ("gate", string()),
             ("baseline", boolean()),
+            ("gate_subject", reference_to(&["gate-operation"])),
+            ("generation", reference_to(&["run-generation"])),
+            ("episode", integer()),
+            ("change", object()),
+            ("head", object()),
+            ("scope", object()),
+            ("author", reference_to(&["agent", "person"])),
+            ("binding_claim", string()),
+            ("delta_ref", string()),
+        ],
+        "gate.head-bound" => &[
+            ("owner", required_reference()),
+            ("boundary", required_reference()),
+            ("generation", required_reference_to(&["run-generation"])),
+            ("mission_revision", required_string()),
+            ("step_definition", required_string()),
+            ("attempt", required_integer()),
+            ("change", required_object()),
+            ("head", required_object()),
+            ("observation", required_string()),
+            ("reviewer", required_reference_to(&["agent", "person"])),
+            ("author", required_reference_to(&["agent", "person"])),
+            ("scope", required_object()),
+            ("review_targets", required_array()),
+            ("episode", required_integer()),
+            ("previous_binding", string()),
+            ("request_operation", required_reference_to(&["gate-operation"])),
+            ("reason", required_string()),
+        ],
+        "gate.review-verdict" => &[
+            ("request", required_string()),
+            ("gate_subject", required_reference_to(&["gate-operation"])),
+            ("binding_claim", required_string()),
+            ("generation", required_reference_to(&["run-generation"])),
+            ("attempt", required_integer()),
+            ("episode", required_integer()),
+            ("reviewer", required_reference_to(&["agent", "person"])),
+            ("verdict", required_enum(&["approved", "changes-requested", "abstained"])),
+            ("change", required_object()),
+            ("reviewed_head", required_object()),
+            ("scope", required_object()),
+            ("review_targets", required_array()),
+            ("finding_refs", required_array()),
+            ("evidence", required_array()),
+            ("source", required_object()),
+            ("carry_forward_from", string()),
+        ],
+        "gate.review-withdrawn" => &[
+            ("gate_subject", required_reference_to(&["gate-operation"])),
+            ("binding_claim", required_string()),
+            ("request", required_string()),
+            ("verdict", required_string()),
+            ("generation", required_reference_to(&["run-generation"])),
+            ("attempt", required_integer()),
+            ("episode", required_integer()),
+            ("reviewer", required_reference_to(&["agent", "person"])),
+            ("withdrawing_actor", required_reference_to(&["agent", "person"])),
+            ("authorization_evidence", required_array()),
+            ("reason", required_string()),
+            ("previous_binding", required_string()),
+        ],
+        "gate.remediation-attached" => &[
+            ("gate_subject", required_reference_to(&["gate-operation"])),
+            ("binding_claim", required_string()),
+            ("request", required_string()),
+            ("verdict", required_string()),
+            ("generation", required_reference_to(&["run-generation"])),
+            ("boundary_attempt", required_integer()),
+            ("episode", required_integer()),
+            ("reviewed_head", required_object()),
+            ("author_step", required_reference_to(&["step-run"])),
+            ("author_attempt", required_integer()),
+            ("author_generation", required_reference_to(&["run-generation"])),
+            ("attempt_receipt", required_string()),
+            ("finding_refs", required_array()),
+            ("evidence", required_array()),
         ],
         "gate.result" => &[
             (
@@ -4217,8 +4299,12 @@ mod tests {
                 "fleet.member-endpoints",
                 "fleet.member-left",
                 "fleet.member-removed",
+                "gate.head-bound",
+                "gate.remediation-attached",
                 "gate.requested",
                 "gate.result",
+                "gate.review-verdict",
+                "gate.review-withdrawn",
                 "github.posted",
                 "glass.deleted",
                 "glass.upserted",

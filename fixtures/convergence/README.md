@@ -1,10 +1,21 @@
 # Versioned convergence inputs
 
-`claims-v1.json` is the pretty-printed JSON serialization of
+`claims-v1.json` is the fixed pretty-printed JSON serialization of
 `st3_schema::registry().claims` from the retirement candidate based on
 `92c17ce0fe163cacbe907179cbafd7a98782f78d`. It includes `agent.retired` and its
-reserved fields. The seeded generator draws kinds and fields from this snapshot;
-each tested revision still admits them through its own native registry and store.
+reserved fields and remains unchanged for reproducible comparisons.
+
+`claims-v2.json` is generated from the review-reader registry at
+`5e9b1014226fca3aded0321eccc08279cf9ffded` (schema digest
+`c84c80daf817aef1c390282883197a79c10604ce76094a7ac5da84998cae7270`).
+Its generation expression is
+`serde_json::to_string_pretty(&st3_schema::registry().claims)`, followed by a
+newline. It adds the four durable review claim kinds and captures the complete
+review request field schema. The simulation includes this version and records
+its filename in audit reports.
+
+The seeded generator draws kinds and fields from its selected snapshot; each
+tested revision still admits them through its own native registry and store.
 The corpus conformance test requires every live registry kind to be represented.
 
 Keep the snapshot fixed when comparing revisions. For a future schema change,
