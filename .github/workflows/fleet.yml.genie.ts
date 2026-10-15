@@ -123,7 +123,12 @@ const linuxStageJob = ({
 // An existing step condition may be written as a whole `${{ ... }}`. Combining it with another term as text would
 // leave extra characters around the markers, which GitHub reads as a literal and always-true string (actionlint
 // reports it). Strip the markers first, then combine.
-const bareCondition = (condition: unknown) => String(condition).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '')
+const bareCondition = (condition: unknown) => {
+  const bare = String(condition).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '')
+  // Two separate markers joined by an operator would leave markers inside; refuse to guess how to combine them.
+  if (bare.includes('${{') || bare.includes('}}')) throw new Error(`step condition has markers inside it: ${String(condition)}`)
+  return bare
+}
 const gateSkip = (gate: string) => `needs.evidence-gate-${gate}.outputs.skip == 'true'`
 const gateRecord = (gate: string) => `\${{ needs.evidence-gate-${gate}.outputs.record }}`
 const jobSkips: Record<string, { gates: string[]; skip: string }> = Object.fromEntries(
@@ -143,6 +148,14 @@ const stepSkips: Record<string, { gates: string[]; skip: string }> = {
 const aggregateStages = ['linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries']
 const mergeShards = ['linux-tests-shard-3', 'linux-tests-shard-4']
 const skippablePositions = [...aggregateStages, ...mergeShards].flatMap((id, index) => (id === 'linux-test-build' || jobSkips[id] ? [index + 1] : []))
+// Each skippable position carries the stage's OWN skip rule, evaluated by the workflow: a stage may report `skipped`
+// under an evidence skip only when its own rule says skip, so a stage skipped for any other reason (a job-level
+// predicate, an upstream problem) fails the gate even when the aggregate's gate also decided to skip. Positions
+// that can never be covered carry a literal false.
+const stageSkipFlags = (buildSkip: string) =>
+  [...aggregateStages, ...mergeShards]
+    .map((id) => (id === 'linux-test-build' ? `\${{ ${buildSkip} }}` : jobSkips[id] ? `\${{ ${jobSkips[id].skip} }}` : 'false'))
+    .join(' ')
 const skipStepsWhen = (steps: readonly any[], rule: { gates: string[]; skip: string }) => [
   ...steps.map((step) =>
     String(step.uses ?? '').startsWith('actions/checkout') ? step : { ...step, if: step.if == null ? `!(${rule.skip})` : `(${bareCondition(step.if)}) && !(${rule.skip})` },
@@ -164,12 +177,18 @@ const wireEvidenceSkips = (jobs: Record<string, any>) => {
     skip: [...new Set(rules.map((rule) => `(${rule.skip})`))].join(' && '),
   }
   const withGates = (job: any, gates: string[]) => ({ ...job, needs: [...job.needs, ...gates.map((gate) => `evidence-gate-${gate}`)] })
+  // The aggregate reads the build's rule too, so it needs every gate that rule reads.
+  const withStageSkips = (job: any, rule: { gates: string[]; skip: string }) => ({
+    ...withGates(job, rule.gates.filter((gate) => !job.needs.includes(`evidence-gate-${gate}`))),
+    steps: job.steps.map((step: any) => (step.env?.GATE_SKIP ? { ...step, env: { ...step.env, STAGE_SKIPS: stageSkipFlags(rule.skip) } } : step)),
+  })
   const jobLevel = (job: any, rule: { gates: string[]; skip: string }) => {
     const predicate = String(job.if).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '')
     return { ...withGates(job, rule.gates), if: `\${{ (${predicate}) && !(${rule.skip}) }}` }
   }
   return Object.fromEntries(
     Object.entries(jobs).map(([id, job]) => {
+      if (id === 'linux-gate') return [id, withStageSkips(job, build)]
       if (id === 'linux-test-build') return [id, jobLevel(job, build)]
       if (jobSkips[id]) return [id, jobLevel(job, jobSkips[id])]
       if (stepSkips[id]) return [id, { ...withGates(job, stepSkips[id].gates), steps: skipStepsWhen(job.steps, stepSkips[id]) }]
@@ -571,8 +590,10 @@ for result in $RESULTS; do
   position=$((position + 1))
   [ "$result" = success ] && continue
   # A stage the evidence gate skipped reports \`skipped\`: accepted only when this gate decided to skip, only
-  # in the positions of stages skipped at job level, and never for a failure or a cancellation.
-  if [ "\${GATE_SKIP:-}" = true ] && [ "$result" = skipped ]; then
+  # in the positions of stages skipped at job level, only when that stage's own skip rule says skip, and never
+  # for a failure or a cancellation.
+  flag=$(printf '%s\\n' "\${STAGE_SKIPS:-}" | cut -d' ' -f"$position")
+  if [ "\${GATE_SKIP:-}" = true ] && [ "$flag" = true ] && [ "$result" = skipped ]; then
     case "$position" in ${skippablePositions.join('|')}) continue ;; esac
   fi
   exit 1

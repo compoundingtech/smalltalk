@@ -25,9 +25,10 @@ from datetime import datetime, timedelta, timezone
 
 sys.dont_write_bytecode = True
 
-OID = re.compile(r'^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
-SHA256 = re.compile(r'^[0-9a-f]{64}$')
+OID = re.compile(r'^(?:[0-9a-f]{40}|[0-9a-f]{64})\Z')
+SHA256 = re.compile(r'^[0-9a-f]{64}\Z')
 NOTES = 'refs/notes/evidence/'
+INPUT_NOTES = 'refs/notes/evidence-input/'
 STATEMENT_TYPE = 'https://in-toto.io/Statement/v1'
 PREDICATE_TYPE = 'https://smalltalk.dev/evidence/gate/v1'
 KEYS_PATH = '.st/evidence-keys'
@@ -44,15 +45,15 @@ class Failure(Exception):
         self.extra = extra
 
 
-def git(repo, *args, stdin=None, config=()):
+def git(repo, *args, stdin=None, config=(), env=None):
     command = ['git', '-C', repo, '-c', 'gpg.format=ssh', '-c', 'gpg.ssh.program=ssh-keygen',
                '-c', 'commit.gpgSign=false']
     for item in config:
         command += ['-c', item]
     command += list(args)
-    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS='1', LC_ALL='C')
+    environment = dict(os.environ, GIT_NO_REPLACE_OBJECTS='1', LC_ALL='C', **(env or {}))
     try:
-        done = subprocess.run(command, input=stdin, capture_output=True, env=env, timeout=60)
+        done = subprocess.run(command, input=stdin, capture_output=True, env=environment, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise Failure('error', f'git {args[0]}: {error}')
     if done.returncode != 0:
@@ -61,8 +62,25 @@ def git(repo, *args, stdin=None, config=()):
 
 
 POLICY_KEYS = {'version', 'checks'}
-CHECK_KEYS = {'kinds', 'trust_levels', 'max_age_s', 'enforce'}
-KIND_KEYS = {'command', 'runner_prefix', 'required_inputs', 'bind_inputs', 'trust_levels'}
+CHECK_KEYS = {'kinds', 'trust_levels', 'max_age_s', 'enforce', 'inputs', 'sample_one_in'}
+CHECK_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
+PATH_PART = re.compile(r'[A-Za-z0-9._@+=,~#-]+')
+MAX_INPUTS = 300
+KIND_KEYS = {'command', 'runner_prefix', 'required_inputs', 'bind_inputs', 'trust_levels', 'by_level'}
+LEVEL_KEYS = {'command', 'required_inputs', 'bind_inputs', 'events'}
+EVENTS = ('pull_request', 'merge_group')
+
+
+def checked_command_inputs(rule, where):
+    command = rule['command']
+    if not (isinstance(command, list) and command and all(isinstance(v, str) and v for v in command)):
+        raise Failure('error', f'skip policy for {where}: command must be a nonempty list of strings')
+    required = rule.get('required_inputs', [])
+    bind = rule.get('bind_inputs', {})
+    if not (isinstance(required, list) and all(isinstance(v, str) and v for v in required)
+            and isinstance(bind, dict) and all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in bind.items())):
+        raise Failure('error', f'skip policy for {where}: malformed required_inputs or bind_inputs')
+    return command, required, bind
 
 
 def policy_rules(text, check, repository):
@@ -91,6 +109,12 @@ def policy_rules(text, check, repository):
     enforce = entry.get('enforce', False)
     if not isinstance(enforce, bool):
         raise Failure('error', f'skip policy for {check}: enforce must be true or false')
+    inputs = entry.get('inputs')
+    if inputs is not None:
+        inputs = declared_paths(inputs, f'skip policy for {check}')
+    sample = entry.get('sample_one_in', 1)
+    if isinstance(sample, bool) or not isinstance(sample, int) or not 1 <= sample <= 1000:
+        raise Failure('error', f'skip policy for {check}: sample_one_in must be an integer from 1 to 1000')
     if not (isinstance(entry['kinds'], dict) and entry['kinds']):
         raise Failure('error', f'skip policy for {check}: kinds must name at least one kind')
 
@@ -101,21 +125,28 @@ def policy_rules(text, check, repository):
     for kind, rule in entry['kinds'].items():
         if kind not in KINDS or not isinstance(rule, dict) or set(rule) - KIND_KEYS or 'command' not in rule:
             raise Failure('error', f'skip policy for {check}: kind {kind!r} is not valid')
-        command = rule['command']
-        if not (isinstance(command, list) and command and all(isinstance(v, str) and v for v in command)):
-            raise Failure('error', f'skip policy for {check}/{kind}: command must be a nonempty list of strings')
-        required = rule.get('required_inputs', [])
-        bind = rule.get('bind_inputs', {})
+        command, required, bind = checked_command_inputs(rule, f'{check}/{kind}')
         prefix = rule.get('runner_prefix')
         kind_levels = rule.get('trust_levels')
         if kind_levels is not None and not (isinstance(kind_levels, list) and kind_levels
                                             and all(isinstance(v, str) and v for v in kind_levels)):
             raise Failure('error', f'skip policy for {check}/{kind}: trust_levels must be a nonempty list of names')
-        if not (isinstance(required, list) and all(isinstance(v, str) and v for v in required)
-                and isinstance(bind, dict) and all(isinstance(k, str) and k and isinstance(v, str) and v
-                                                   for k, v in bind.items())
-                and (prefix is None or (isinstance(prefix, str) and prefix))):
-            raise Failure('error', f'skip policy for {check}/{kind}: malformed inputs or runner_prefix')
+        if not (prefix is None or (isinstance(prefix, str) and prefix)):
+            raise Failure('error', f'skip policy for {check}/{kind}: malformed runner_prefix')
+        by_level = {}
+        for level, override in (rule.get('by_level') or {}).items():
+            # `events` is required: an override that left it out would cover every event, the merge queue included.
+            if not isinstance(level, str) or not level or not isinstance(override, dict) or set(override) - LEVEL_KEYS \
+                    or not {'command', 'events'} <= set(override):
+                raise Failure('error', f'skip policy for {check}/{kind}: by_level {level!r} is not valid')
+            if level not in (kind_levels or levels):
+                raise Failure('error', f'skip policy for {check}/{kind}: by_level {level!r} is not among the trust levels this kind accepts')
+            events = override['events']
+            if not (isinstance(events, list) and events and len(set(events)) == len(events) and all(e in EVENTS for e in events)):
+                raise Failure('error', f'skip policy for {check}/{kind}: events must be a nonempty list of {", ".join(EVENTS)}')
+            lcommand, lrequired, lbind = checked_command_inputs(override, f'{check}/{kind}/{level}')
+            by_level[level] = {'command': [fill(v) for v in lcommand], 'required_inputs': sorted(set(lrequired) | set(lbind)),
+                               'bind_inputs': dict(lbind), 'events': list(events)}
         kinds[kind] = {'command': [fill(v) for v in command],
                        'runner_prefix': fill(prefix) if prefix else None,
                        # Binding an input also requires it, so the list can never be shorter than the binding.
@@ -123,8 +154,56 @@ def policy_rules(text, check, repository):
                        'bind_inputs': dict(bind),
                        # A kind may name its own signer levels; otherwise it uses the check's. Naming them
                        # per kind is what lets a weaker signer satisfy `wrapper` without ever satisfying `observed`.
-                       'trust_levels': tuple(kind_levels) if kind_levels else None}
-    return {'kinds': kinds, 'trust_levels': tuple(levels), 'max_age_s': max_age, 'enforce': enforce}
+                       'trust_levels': tuple(kind_levels) if kind_levels else None,
+                       # A signer level may be held to its own command, inputs and events (a host key may sign a different command and
+                       # may cover pull requests only), whatever the rest of the kind says.
+                       'by_level': by_level}
+    return {'kinds': kinds, 'trust_levels': tuple(levels), 'max_age_s': max_age, 'enforce': enforce,
+            'inputs': inputs, 'sample_one_in': sample}
+
+
+def declared_paths(value, where):
+    """The declared input paths of a check: relative, literal, no `..`, at most MAX_INPUTS. `.` means everything."""
+    if not (isinstance(value, list) and value and len(value) <= MAX_INPUTS):
+        raise Failure('error', f'{where}: inputs must be a nonempty list of at most {MAX_INPUTS} paths')
+    paths = set()
+    for item in value:
+        if not isinstance(item, str) or len(item) > 300:
+            raise Failure('error', f'{where}: an input path is not a short string')
+        if item != '.':
+            parts = item.split('/')
+            if not all(PATH_PART.fullmatch(part) and part not in ('.', '..') for part in parts):
+                raise Failure('error', f'{where}: input path {item!r} must be relative, literal and without . or .. parts')
+        paths.add(item)
+    return tuple(sorted(paths))
+
+
+def project(repo, tree, paths):
+    """The git tree id of `tree` reduced to the declared paths: only those files (mode, blob id, name) remain.
+
+    It needs only git, so a producer, the observer and a verifier compute the same key from the same paths.
+    A declared path the tree lacks simply contributes nothing. `.` declares the whole tree, whose key is the tree.
+    When none of the declared paths exists the projection is the empty tree, which every such tree shares, so
+    there is no key (None) and nothing can match by it. Names travel as bytes and NUL-terminated both ways, so a
+    newline or any other byte in a name cannot turn one entry into two; symlinks and gitlinks keep their mode."""
+    if '.' in paths:
+        return tree
+    listing = git(repo, 'ls-tree', '-r', '-z', '--full-tree', tree, '--', *paths)
+    entries = []
+    for entry in listing.split(b'\0'):
+        if not entry:
+            continue
+        meta, tab, name = entry.partition(b'\t')
+        parts = meta.decode().split()
+        if not tab or len(parts) != 3 or not OID.match(parts[2]):
+            raise Failure('error', 'unexpected git ls-tree output')
+        entries.append(f'{parts[0]} {parts[2]} 0\t'.encode() + name + b'\0')
+    if not entries:
+        return None
+    with tempfile.TemporaryDirectory() as scratch:
+        env = {'GIT_INDEX_FILE': os.path.join(scratch, 'index')}
+        git(repo, 'update-index', '-z', '--index-info', stdin=b''.join(entries), env=env)
+        return git(repo, 'write-tree', env=env).decode().strip()
 
 
 def kind_of(runner):
@@ -189,6 +268,22 @@ def note_refs(repo):
     return found
 
 
+def input_refs(repo, check, key):
+    """Records indexed under this check and input key: refs/notes/evidence-input/<check>/<key>/<record id>.
+    The ref is only an index. A ref that names another object than its suffix, or a malformed name, finds nothing,
+    and whatever it finds must still carry this key in its signed statement."""
+    if not CHECK_NAME.fullmatch(check) or not OID.fullmatch(key):
+        return []
+    prefix = f'{INPUT_NOTES}{check}/{key}/'
+    out = git(repo, 'for-each-ref', '--format=%(objectname) %(refname)', prefix.rstrip('/')).decode()
+    found = []
+    for line in out.splitlines():
+        oid, _, name = line.partition(' ')
+        if OID.match(oid) and name == prefix + oid:
+            found.append(oid)
+    return found
+
+
 def with_note_for(repo, commits, tree):
     """One git process: which of these commits carry a note named by the tree."""
     if not commits:
@@ -198,14 +293,17 @@ def with_note_for(repo, commits, tree):
     return [commit for commit, answer in zip(commits, answers) if not answer.endswith(' missing')]
 
 
-def load(repo, commit, tree):
+def load(repo, commit, tree=None):
+    """The record's statement. With `tree` the record must be for that tree; without it, the tree is the one
+    the record names (used when a record is found by its input key, not by the tree)."""
     entries = [e for e in git(repo, 'ls-tree', '-r', '-z', commit).split(b'\0') if e]
     if len(entries) != 1:
         return None
     meta, _, path = entries[0].decode().partition('\t')
     parts = meta.split()
-    if len(parts) != 3 or parts[0] != '100644' or parts[1] != 'blob' or path != tree:
+    if len(parts) != 3 or parts[0] != '100644' or parts[1] != 'blob' or not OID.match(path) or (tree is not None and path != tree):
         return None
+    tree = path
     statement = statement_of(git(repo, 'cat-file', 'blob', parts[2]), tree)
     if statement is None:
         return None
@@ -245,6 +343,19 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
             statement = load(repo, commit, tree)
             if statement is not None:
                 mine.append((commit, statement))
+        # A check that declares inputs also accepts a record of ANOTHER tree whose signed key equals this tree's
+        # projection onto the declared paths. Every other rule applies to it exactly as to a record of this tree.
+        input_key = None
+        if rules is not None and rules.get('inputs') is not None:
+            input_key = project(repo, tree, rules['inputs'])
+        if input_key is not None:
+            have = {commit for commit, _ in mine}
+            for commit in input_refs(repo, check, input_key):
+                if commit in have:
+                    continue
+                statement = load(repo, commit)
+                if statement is not None and statement['predicate']['observed'].get('inputs', {}).get('source_inputs') == input_key:
+                    mine.append((commit, statement))
         trusted, untrusted, degraded = [], [], []
         for commit, statement in mine:
             predicate = statement['predicate']
@@ -284,6 +395,7 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
         raise Failure('untrusted_tier', f'latest record has tier {predicate["tier"]}, not full', attempts=attempts)
     kind = kind_of(observed['runner'])
     required_inputs = ()
+    rule, events = None, None
     if rules is not None:
         # The repository's skip policy decides everything about this record, by its kind.
         rule = rules['kinds'].get(kind) if kind else None
@@ -300,6 +412,10 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
     if trust_levels is not None and level not in trust_levels:
         raise Failure('untrusted_level', f'signer trust level {level!r} is not accepted for this check',
                       attempts=attempts)
+    # A signer level may be held to its own command, required inputs and events (by_level in the kind's rule).
+    override = rule['by_level'].get(level) if rule else None
+    if override:
+        command, bind, required_inputs, events = override['command'], list(override['bind_inputs'].items()), override['required_inputs'], override['events']
     if runner_prefix is not None and not observed['runner'].startswith(runner_prefix):
         raise Failure('wrong_runner', 'record is for a different repository or producer', attempts=attempts)
     # A future-dated record is refused whether or not an age limit is set: otherwise a trusted
@@ -336,6 +452,10 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
         'command': result['command'], 'inputs': inputs, 'attempts': attempts, 'policy': rules is not None,
         'max_age_s': rules['max_age_s'] if rules is not None else max_age,
         'enforce': rules['enforce'] if rules is not None else False,
+        'match': 'tree' if statement['subject'][0]['digest']['gitTree'] == tree else 'inputs',
+        'matched_tree': statement['subject'][0]['digest']['gitTree'], 'source_inputs': input_key,
+        'sample_one_in': rules['sample_one_in'] if rules is not None else 1,
+        'events': events,
     }
 
 
@@ -396,7 +516,10 @@ def main(argv):
     target.add_argument('--tree')
     target.add_argument('--revision')
     parser.add_argument('--check', required=True)
-    source = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument('--project', action='store_true',
+                        help='print the input key of the tree for the check\'s declared paths and exit (needs no keys)')
+    parser.add_argument('--paths', metavar='PATH[,PATH...]', help='with --project: declared paths instead of the policy\'s')
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument('--keys', help='allowed-signers file')
     source.add_argument('--keys-from', help=f'read {KEYS_PATH} from this commit (the accepted base)')
     parser.add_argument('--command', help='JSON argument vector the record must have run')
@@ -414,6 +537,12 @@ def main(argv):
         args = parser.parse_args(argv)
     except SystemExit as error:
         return 2 if error.code else 0
+    if not args.project and not (args.keys or args.keys_from):
+        print('one of --keys or --keys-from is required', file=sys.stderr)
+        return 2
+    if args.paths is not None and not args.project:
+        print('--paths is only used with --project', file=sys.stderr)
+        return 2
     command = None
     if args.command is not None:
         try:
@@ -462,6 +591,21 @@ def main(argv):
             tree = git(args.repo, 'rev-parse', '--verify', '--end-of-options', args.revision + '^{tree}').decode().strip()
         if not OID.match(tree):
             raise Failure('error', 'expected a full lowercase Git tree ID')
+        if args.project:
+            rules = None
+            if args.policy_from:
+                try:
+                    text = git(args.repo, 'show', '--end-of-options', f'{args.policy_from}:{POLICY_PATH}').decode()
+                except (Failure, UnicodeDecodeError):
+                    raise Failure('no_policy', f'no readable skip policy at {args.policy_from}:{POLICY_PATH}')
+                rules = policy_rules(text, args.check, args.repository)
+            if args.paths is not None:
+                paths = declared_paths([p for p in args.paths.split(',') if p], '--paths')
+            else:
+                paths = rules['inputs'] if rules is not None else None
+            print(json.dumps({'source_inputs': project(args.repo, tree, paths) if paths else None,
+                              'paths': list(paths) if paths else None, 'tree': tree, 'check': args.check}, indent=2))
+            return 0
         if args.keys_from:
             keyfile = tempfile.NamedTemporaryFile(suffix='.keys')
             keyfile.write(git(args.repo, 'show', '--end-of-options', f'{args.keys_from}:{KEYS_PATH}'))

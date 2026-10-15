@@ -620,7 +620,6 @@ for (const newerBoundary of ["batch", "ask"]) {
   fs.rmSync(outboxPath, { force: true });
 }
 
-
 // A channel that dies during a hold must be replaced. The successor re-sends the unacknowledged
 // message; the retired channel's held copy must never be handed off or acknowledged.
 await handlers.get("session_start")({}, holdCtx);

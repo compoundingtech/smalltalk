@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Hold ordinary mail outside Claude native human decisions until authoritative prompt resolution",
+  "replay": {"status": "none", "detail": "No historical claim replay change. Unacknowledged mail remains durable and is re-offered by successor channels."},
+  "schema": {"status": "changed", "detail": "Adds the partial expression index claims_harness_episode_index on retained harness.observed claims. Existing stores build it when opened; persisted claim and wire formats are unchanged."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Uses existing human-blocked observations and delivery reason fields. No new wire fields or message lifecycle states."},
+  "downtime": {"status": "unknown", "detail": "Existing stores build claims_harness_episode_index during startup. The interruption depends on retained claim volume and SQLite index-build time; Claude channels follow the replacement st binary."},
+  "manual": {"status": "none", "detail": "No operator steps. Native questions still require native answers; ordinary mail cannot answer them."},
+  "recovery": {"status": "none", "detail": "Applied native answers, dismissal, native resolution and session restart release the human hold. A freshly captured native idle input box and shortcuts footer re-derive dismissal after daemon restart or missed screen polls; working input boxes, unreadable screens and changed incarnations never prove closure. A Claude permission hook's polling timeout does not close its dialog, and a later Smalltalk answer request alone cannot release mail or reopen an authoritatively closed episode. Receipt recovery for previously offered Claude mail continues while new notifications wait; episode-fenced releases survive blocked-file heartbeats. Failed preparation holds the FIFO head and later mail with a sender-visible reason until preparation succeeds."}
+}

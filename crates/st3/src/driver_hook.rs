@@ -1115,6 +1115,50 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_after_permission_hook_expiry_does_not_release_native_human_hold() {
+        use crate::store::{NativePromptState, Store};
+        let store = Store::open_memory("node").unwrap();
+        let seat = "agent/node.worker";
+        let append = |kind: &str, fields: Value, key: Option<String>| {
+            store.append_claim(&crate::model::ClaimInput {
+                subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                expected_subject: None, idempotency_key: key,
+            }).unwrap()
+        };
+        append("runtime.observed", serde_json::json!({
+            "status":"running", "incarnation_id":"current"
+        }), None);
+        let asked = append("harness.observed", serde_json::json!({
+            "state":"working", "driver":"claude", "incarnation_id":"current",
+            "blocked_on":"human", "ask":"permission", "reason":"Bash",
+            "ownership_sequence":1, "transition_sequence":3
+        }), None);
+        assert_eq!(super::wait_for_prompt_answer(
+            || Some(store.native_prompt_state(seat, 1, 3).unwrap()),
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+        ), None);
+        // The polling hook has returned without a decision. An answer can still
+        // arrive in Smalltalk, but there is no hook left to apply it to Claude.
+        append("harness.diagnostic", serde_json::json!({
+            "code":"native-prompt-answered", "status":"allow",
+            "driver":"claude", "incarnation_id":"current"
+        }), Some(format!("native-prompt-answer:{}", asked.id)));
+        assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Answered { answer: "allow".into() });
+        assert_eq!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.as_deref(),
+            Some("human"));
+        // Only positive native closure releases mail and sender status.
+        append("harness.diagnostic", serde_json::json!({
+            "code":"native-prompt-gone", "status":"resolved",
+            "driver":"claude", "incarnation_id":"current"
+        }), Some(crate::store::native_prompt_gone_key(&asked.id)));
+        assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone);
+        assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
+    }
+
+    #[test]
     fn every_hook_has_a_script_in_the_set() {
         for name in HOOKS {
             let script = format!("{name}.sh");

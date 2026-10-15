@@ -24,6 +24,8 @@ mod message_send_tests;
 mod message_thread_legacy_rank_dependency_tests;
 #[cfg(test)]
 mod actual_state_sorter_tests;
+#[cfg(test)]
+mod writer_bound_tests;
 pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
@@ -713,6 +715,14 @@ ON claims(
 WHERE kind='harness.observed'
     AND json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
         THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
+
+-- Native decision releases stay attached to the exact driver episode across
+-- arbitrarily many heartbeats; looking one up must not scan the seat's history.
+CREATE INDEX IF NOT EXISTS claims_harness_episode_index
+ON claims(subject, json_extract(body, '$.fields.ownership_sequence'),
+    json_extract(body, '$.fields.transition_sequence'),
+    length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind='harness.observed';
 
 -- A legacy observation without a text incarnation remains eligible for the current
 -- runtime's optional-field fold. Keep those rare rows separate: checking their JSON
@@ -7743,6 +7753,30 @@ impl Store {
                     .to_owned()
             }),
         )
+    }
+
+    /// Latest preparation outcome for one message and the recipient's current incarnation.
+    /// A delayed report from a retired channel cannot mask a current failure or recovery.
+    pub fn claude_preparation_diagnostic(
+        &self,
+        seat: &str,
+        message: &str,
+        incarnation: &str,
+    ) -> Result<Option<(Value, u128)>> {
+        let connection = self.readers.get();
+        let row = connection.prepare_cached(&canonical_sql(
+            "SELECT body, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND actor=?1 AND kind='harness.diagnostic'
+               AND json_extract(body, '$.fields.code')='claude-message-unforwarded'
+               AND json_extract(body, '$.fields.incarnation_id')=?3
+               AND EXISTS (SELECT 1 FROM claims AS message_claim
+                 WHERE message_claim.id=json_extract(claims.body, '$.evidence[0]')
+                   AND message_claim.subject=?2)
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        ))?.query_row(params![seat, message, incarnation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).optional()?;
+        row.map(|(body, at)| Ok((serde_json::from_str(&body)?, at.parse()?))).transpose()
     }
 
     pub fn next_active_mission_deadline(&self, origin: &str) -> Result<Option<u128>> {
@@ -29169,12 +29203,14 @@ fn replay_projects_kind(kind: &str) -> bool {
 }
 
 /// A part of the graph that the incremental projection rebuilds on its own when a claim reaches
-/// it out of the replay's order: a mission run tree, named by its root run's id, or the desired
-/// subject, document or mission one claim is about. Rebuilding one costs what its own history
-/// costs, not what the store's does.
+/// it out of the replay's order: a mission run tree, named by its root run's id, one part of a
+/// tree whose root never ended (see `run_part_of_tx`), or the desired subject, document or
+/// mission one claim is about. Rebuilding one costs what its own history costs, not what the
+/// store's does.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Aggregate {
     RunTree(String),
+    RunPart(String),
     Desired(String),
     Document(String),
     Mission(String),
@@ -29184,7 +29220,7 @@ enum Aggregate {
 /// on a busy node decides which of them is worth fixing. The reason is one of a fixed list of
 /// strings, so the profile gains at most that many counters; nothing is read to decide it.
 fn mark_dirty(dirty: &mut BTreeSet<Aggregate>, aggregate: Aggregate, reason: &str) {
-    if matches!(aggregate, Aggregate::RunTree(_)) && crate::profile::enabled() {
+    if matches!(aggregate, Aggregate::RunTree(_) | Aggregate::RunPart(_)) && crate::profile::enabled() {
         crate::profile::note(&format!("projection: run tree dirty: {reason}"));
     }
     dirty.insert(aggregate);
@@ -29207,7 +29243,7 @@ fn aggregate_of_tx(
         "intent.desired" | "agent.retired" => Some(Aggregate::Desired(claim.subject.clone())),
         "doc.bound" => Some(Aggregate::Document(claim.subject.clone())),
         "mission.published" => Some(Aggregate::Mission(claim.subject.clone())),
-        _ => run_tree_of_tx(transaction, &claim.subject)?.map(Aggregate::RunTree),
+        _ => run_part_of_tx(transaction, &claim.subject)?,
     })
 }
 
@@ -29278,7 +29314,19 @@ fn run_tree_of_tx(
     transaction: &Transaction<'_>,
     subject: &str,
 ) -> Result<Option<String>, St3Error> {
-    let run = if let Some(run) = subject.strip_prefix("mission-run/") {
+    match run_of_subject_tx(transaction, subject)? {
+        Some(run) => run_root_tx(transaction, &run).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The run a run-tree subject belongs to: the run itself, a generation's or step's run, or a
+/// proposal's run.
+fn run_of_subject_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+) -> Result<Option<String>, St3Error> {
+    Ok(if let Some(run) = subject.strip_prefix("mission-run/") {
         Some(run.to_owned())
     } else if let Some(generation) = subject.strip_prefix("run-generation/") {
         generation_run_tx(transaction, generation)?
@@ -29312,20 +29360,21 @@ fn run_tree_of_tx(
         }
     } else {
         None
-    };
-    let Some(run) = run else {
-        return Ok(None);
-    };
+    })
+}
+
+/// The root a run names, or the owner of an ask run, or the run itself.
+fn run_root_tx(transaction: &Transaction<'_>, run: &str) -> Result<String, St3Error> {
     if let Some(root) = transaction
         .query_row(
             "SELECT root_run_id FROM mission_runs WHERE id=?1",
-            [&run],
+            [run],
             |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(internal)?
     {
-        return Ok(Some(root));
+        return Ok(root);
     }
     let root = transaction
         .query_row(
@@ -29351,10 +29400,304 @@ fn run_tree_of_tx(
             .map_err(internal)?
             .flatten(),
     };
-    Ok(Some(
-        root.map(|root| root.trim_start_matches("mission-run/").to_owned())
-            .unwrap_or(run),
-    ))
+    Ok(root
+        .map(|root| root.trim_start_matches("mission-run/").to_owned())
+        .unwrap_or_else(|| run.to_owned()))
+}
+
+/// Every value of the first column `sql` returns for `value`, without nulls.
+fn string_column_tx(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    value: &str,
+) -> Result<Vec<String>, St3Error> {
+    let mut statement = transaction.prepare_cached(sql).map_err(internal)?;
+    let values = statement
+        .query_map([value], |row| row.get::<_, Option<String>>(0))
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    Ok(values.into_iter().flatten().collect())
+}
+
+/// The step a run was started from, from the graph or from the claim that creates it. A
+/// schedule or subscription that delivers a run is named the same way, as `step-run/` and its
+/// subject.
+fn parent_step_of_run_tx(
+    transaction: &Transaction<'_>,
+    run: &str,
+) -> Result<Option<String>, St3Error> {
+    if let Some(parent) = transaction
+        .query_row(
+            "SELECT parent_step_run FROM mission_runs WHERE id=?1",
+            [run],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(internal)?
+    {
+        return Ok(parent);
+    }
+    Ok(transaction
+        .query_row(
+            &canonical_sql("SELECT json_extract(body, '$.fields.parent_step_run') FROM claims
+             WHERE subject=?1 AND kind='mission-run.created' ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+            [format!("mission-run/{run}")],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .flatten())
+}
+
+/// The generation a step run belongs to, or `None` when `parent` names a delivering schedule or
+/// subscription rather than a step.
+fn step_generation(parent: &str) -> Option<&str> {
+    let generation = parent.strip_prefix("step-run/")?.split('/').next()?;
+    (generation.len() == 32 && generation.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(generation)
+}
+
+/// Whether a root run has ended, or any claim ends it: projected so, or claimed so in any order.
+fn run_ever_ended_tx(transaction: &Transaction<'_>, run: &str) -> Result<bool, St3Error> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mission_runs WHERE id=?1
+                 AND (status IN ('completed','failed','cancelled') OR phase='terminal'))
+             OR EXISTS(SELECT 1 FROM claims WHERE subject=?2 AND kind='mission-run.state'
+                 AND (COALESCE(json_extract(body, '$.fields.status'), json_extract(body, '$.status'))
+                        IN ('completed','failed','cancelled')
+                      OR COALESCE(json_extract(body, '$.fields.phase'), json_extract(body, '$.phase'))
+                        ='terminal'))",
+            params![run, format!("mission-run/{run}")],
+            |row| row.get(0),
+        )
+        .map_err(internal)
+}
+
+/// The part of a mission run tree that a claim about `subject` rebuilds with when it arrives out
+/// of the replay's order.
+///
+/// Runs in one tree touch each other only from the root down: a run that ends cancels the runs
+/// started from its steps, and every step claim reads whether the root has ended. No run reads
+/// or writes a sibling, and no child changes its parent. So while the root has never ended, the
+/// tree splits into parts that each rebuild alone to what a replay of the whole tree gives: the
+/// root with the person asks it owns, and each run started from the root (by one of its steps,
+/// a schedule or a subscription) with every run below it and the asks those runs own. The intake
+/// and CI standing roots hold thousands of runs, and one late claim about one of them rebuilt
+/// them all in one writer hold of up to 10 s.
+///
+/// A tree whose root has ended, or whose links have not all arrived, rebuilds whole.
+fn run_part_of_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+) -> Result<Option<Aggregate>, St3Error> {
+    let Some(tree) = run_tree_of_tx(transaction, subject)? else {
+        return Ok(None);
+    };
+    let whole = Ok(Some(Aggregate::RunTree(tree.clone())));
+    let Some(mut run) = run_of_subject_tx(transaction, subject)? else {
+        return whole;
+    };
+    // Walk up to the root, remembering the run just below it. An ask run names its owner as its
+    // root, and the owner may itself be a child.
+    let mut below_root: Option<String> = None;
+    for _ in 0..64 {
+        let parent = match parent_step_of_run_tx(transaction, &run)? {
+            Some(step) => match step_generation(&step) {
+                Some(generation) => match generation_run_tx(transaction, generation)? {
+                    Some(parent) => parent,
+                    None => return whole,
+                },
+                // A schedule or subscription delivers runs straight under the root.
+                None => run_root_tx(transaction, &run)?,
+            },
+            None => {
+                let owner = run_root_tx(transaction, &run)?;
+                if owner == run {
+                    let root = run;
+                    if run_ever_ended_tx(transaction, &root)? {
+                        return whole;
+                    }
+                    return Ok(Some(Aggregate::RunPart(match below_root {
+                        // An ask the root owns rebuilds with the root.
+                        Some(top) if parent_step_of_run_tx(transaction, &top)?.is_some() => top,
+                        _ => root,
+                    })));
+                }
+                owner
+            }
+        };
+        if parent == run {
+            return whole;
+        }
+        below_root = Some(run);
+        run = parent;
+    }
+    whole
+}
+
+/// Rebuild one part of a run tree whose root never ended (see `run_part_of_tx`): the root with
+/// the asks it owns, or a run started from the root, each with every run started from their steps
+/// and every ask they own, all the way down.
+fn rebuild_run_part_tx(transaction: &Transaction<'_>, top: &str) -> Result<(), St3Error> {
+    #[cfg(test)]
+    RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
+    let _span = crate::profile::span("projection/run-tree");
+    crate::profile::note("projection: run tree part rebuilt");
+    // The tree's root: up through parent steps, deliveries and ask owners.
+    let mut root = top.to_owned();
+    for _ in 0..64 {
+        let parent = match parent_step_of_run_tx(transaction, &root)? {
+            Some(step) => match step_generation(&step) {
+                Some(generation) => generation_run_tx(transaction, generation)?,
+                None => Some(run_root_tx(transaction, &root)?),
+            },
+            None => Some(run_root_tx(transaction, &root)?),
+        };
+        match parent {
+            Some(parent) if parent != root => root = parent,
+            _ => break,
+        }
+    }
+    // Runs not projected yet are found by the claims that create them, which name the root.
+    let mut created = transaction
+        .prepare_cached(
+            "SELECT subject, json_extract(body, '$.fields.parent_step_run') FROM claims
+             WHERE kind='mission-run.created'
+               AND json_extract(body, '$.fields.root_mission_run')=?1",
+        )
+        .map_err(internal)?
+        .query_map([format!("mission-run/{root}")], |row| {
+            Ok((
+                row.get::<_, String>(0)?
+                    .trim_start_matches("mission-run/")
+                    .to_owned(),
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    created.sort();
+    let asks_of = |run: &str| -> Result<Vec<String>, St3Error> {
+        let mut asks = string_column_tx(
+            transaction,
+            "SELECT id FROM mission_runs WHERE root_run_id=?1 AND id<>?1 AND parent_step_run IS NULL",
+            run,
+        )?;
+        asks.extend(
+            string_column_tx(
+                transaction,
+                "SELECT json_extract(body, '$.fields.run') FROM claims
+                 WHERE kind='work.person-asked' AND json_extract(body, '$.fields.owner_run')=?1",
+                &format!("mission-run/{run}"),
+            )?
+            .into_iter()
+            .map(|run| run.trim_start_matches("mission-run/").to_owned()),
+        );
+        if run == root {
+            asks.extend(
+                created
+                    .iter()
+                    .filter(|(child, parent)| parent.is_none() && *child != root)
+                    .map(|(child, _)| child.clone()),
+            );
+        }
+        Ok(asks)
+    };
+    let mut runs = BTreeSet::from([top.to_owned()]);
+    // The root's part holds the root and its asks; the runs started from the root's steps, by a
+    // schedule or by a subscription are parts of their own.
+    let mut pending = if top == root {
+        let asks = asks_of(top)?;
+        runs.extend(asks.iter().cloned());
+        asks
+    } else {
+        vec![top.to_owned()]
+    };
+    while let Some(run) = pending.pop() {
+        let mut found = asks_of(&run)?;
+        if run != root {
+            // An ask run names its owner as its root, so the runs that name this run are its asks.
+            found.extend(string_column_tx(
+                transaction,
+                "SELECT id FROM mission_runs WHERE root_run_id=?1 AND id<>?1",
+                &run,
+            )?);
+        }
+        for generation in run_generation_ids_tx(transaction, &run)? {
+            let start = format!("step-run/{generation}/");
+            let end = format!("step-run/{generation}0");
+            let mut statement = transaction
+                .prepare_cached(
+                    "SELECT id FROM mission_runs WHERE parent_step_run>=?1 AND parent_step_run<?2",
+                )
+                .map_err(internal)?;
+            found.extend(
+                statement
+                    .query_map(params![start, end], |row| row.get::<_, String>(0))
+                    .map_err(internal)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(internal)?,
+            );
+            found.extend(
+                created
+                    .iter()
+                    .filter(|(_, parent)| {
+                        parent
+                            .as_deref()
+                            .is_some_and(|parent| parent.starts_with(&start))
+                    })
+                    .map(|(child, _)| child.clone()),
+            );
+        }
+        for run in found {
+            if runs.insert(run.clone()) {
+                pending.push(run);
+            }
+        }
+    }
+    #[cfg(test)]
+    RUN_PART_RUNS.with(|count| count.set(count.get() + runs.len()));
+    rebuild_runs_tx(transaction, &runs)
+}
+
+/// The generations of one run: projected, created by claims, or named by its asks.
+fn run_generation_ids_tx(
+    transaction: &Transaction<'_>,
+    run: &str,
+) -> Result<BTreeSet<String>, St3Error> {
+    let subject = format!("mission-run/{run}");
+    let mut generations = string_column_tx(
+        transaction,
+        "SELECT id FROM run_generations WHERE run_id=?1",
+        run,
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for generation in string_column_tx(
+        transaction,
+        "SELECT subject FROM claims WHERE kind='run-generation.created'
+           AND json_extract(body, '$.fields.run')=?1",
+        &subject,
+    )?
+    .into_iter()
+    .chain(string_column_tx(
+        transaction,
+        "SELECT json_extract(body, '$.fields.current_generation') FROM claims
+         WHERE subject=?1 AND kind='mission-run.created'",
+        &subject,
+    )?)
+    .chain(string_column_tx(
+        transaction,
+        "SELECT json_extract(body, '$.fields.generation') FROM claims
+         WHERE kind='work.person-asked' AND json_extract(body, '$.fields.run')=?1",
+        &subject,
+    )?) {
+        generations.insert(generation.trim_start_matches("run-generation/").to_owned());
+    }
+    Ok(generations)
 }
 
 /// The claims of `subjects`, and of every step run under `generations`, in the replay's order,
@@ -29430,15 +29773,7 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
     RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
     let _span = crate::profile::span("projection/run-tree");
     crate::profile::note("projection: run tree rebuilt");
-    let strings = |sql: &str, value: &str| -> Result<Vec<String>, St3Error> {
-        let mut statement = transaction.prepare_cached(sql).map_err(internal)?;
-        let values = statement
-            .query_map([value], |row| row.get::<_, Option<String>>(0))
-            .map_err(internal)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(internal)?;
-        Ok(values.into_iter().flatten().collect())
-    };
+    let strings = |sql: &str, value: &str| string_column_tx(transaction, sql, value);
     let mut runs = BTreeSet::from([root.to_owned()]);
     runs.extend(strings(
         "SELECT id FROM mission_runs WHERE root_run_id=?1",
@@ -29462,32 +29797,18 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
         .into_iter()
         .map(|run| run.trim_start_matches("mission-run/").to_owned()),
     );
+    rebuild_runs_tx(transaction, &runs)
+}
+
+/// Forget `runs` and their generations, steps and proposals, then project their claims again in
+/// the replay's order and passes.
+fn rebuild_runs_tx(transaction: &Transaction<'_>, runs: &BTreeSet<String>) -> Result<(), St3Error> {
+    let strings = |sql: &str, value: &str| string_column_tx(transaction, sql, value);
     let mut generations = BTreeSet::new();
     let mut proposals = BTreeSet::new();
-    for run in &runs {
+    for run in runs {
         let subject = format!("mission-run/{run}");
-        generations.extend(strings(
-            "SELECT id FROM run_generations WHERE run_id=?1",
-            run,
-        )?);
-        for generation in strings(
-            "SELECT subject FROM claims WHERE kind='run-generation.created'
-               AND json_extract(body, '$.fields.run')=?1",
-            &subject,
-        )?
-        .into_iter()
-        .chain(strings(
-            "SELECT json_extract(body, '$.fields.current_generation') FROM claims
-             WHERE subject=?1 AND kind='mission-run.created'",
-            &subject,
-        )?)
-        .chain(strings(
-            "SELECT json_extract(body, '$.fields.generation') FROM claims
-             WHERE kind='work.person-asked' AND json_extract(body, '$.fields.run')=?1",
-            &subject,
-        )?) {
-            generations.insert(generation.trim_start_matches("run-generation/").to_owned());
-        }
+        generations.extend(run_generation_ids_tx(transaction, run)?);
         proposals.extend(strings(
             "SELECT id FROM revision_proposals WHERE run_id=?1",
             run,
@@ -29517,7 +29838,7 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
         )
         .collect::<BTreeSet<_>>();
     let claims = claims_in_replay_order_tx(transaction, &subjects, &generations, None)?;
-    for run in &runs {
+    for run in runs {
         for table in [
             "step_runs",
             "revision_proposals",
@@ -29585,6 +29906,12 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    /// Runs this thread rebuilt as parts of run trees whose root never ended.
+    static RUN_PART_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Desired subjects, documents and missions this thread rebuilt from their own claims.
     static BASE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -29598,7 +29925,7 @@ fn rebuild_base_aggregate_tx(
         Aggregate::Desired(subject) => (subject, "intent.desired"),
         Aggregate::Document(subject) => (subject, "doc.bound"),
         Aggregate::Mission(subject) => (subject, "mission.published"),
-        Aggregate::RunTree(_) => return Ok(()),
+        Aggregate::RunTree(_) | Aggregate::RunPart(_) => return Ok(()),
     };
     crate::profile::note(&format!("projection: {kind} subject rebuilt"));
     #[cfg(test)]
@@ -29764,36 +30091,50 @@ fn try_project_simple_replication_tx(
     // applied when written, and projecting them again, or rebuilding the tree to do so, changes
     // nothing. Rebuilding every such tree on every pass cost 15 s of writer time, 130,000
     // statements, for one large tree on a busy node.
-    let foreign_roots = {
-        let mut roots = BTreeSet::new();
-        for claim in claims
-            .iter()
-            .filter(|claim| claim.origin != origin && run_tree_kind(&claim.kind))
+    // A tree whose root never ended splits into parts that rebuild alone (`run_part_of_tx`), so
+    // a local claim is rebuilt only when another writer's claims reached its own part, or reached
+    // its tree where that tree cannot split.
+    let mut foreign_parts = BTreeSet::new();
+    let mut foreign_whole = BTreeSet::new();
+    for claim in claims
+        .iter()
+        .filter(|claim| claim.origin != origin && run_tree_kind(&claim.kind))
+    {
+        let part = run_part_of_tx(transaction, &claim.subject)
+            .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?;
+        if let Some(root) = run_tree_of_tx(transaction, &claim.subject)
+            .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
+            && matches!(part, Some(Aggregate::RunTree(_)))
         {
-            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)
-                .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
-            {
-                roots.insert(root);
-            }
+            foreign_whole.insert(root);
         }
-        roots
-    };
+        foreign_parts.extend(part);
+    }
     for claim in claims
         .iter()
         .filter(|claim| claim.origin == origin && run_tree_kind(&claim.kind))
     {
         // A local extension is the exception: the write path does not set the step's blocked
         // reason the way a replay does, so its tree is still rebuilt (extensions are rare).
-        if foreign_roots.is_empty() && claim.kind != "work.extended" {
+        if foreign_parts.is_empty() && claim.kind != "work.extended" {
             continue;
         }
-        if let Some(root) = run_tree_of_tx(transaction, &claim.subject)
+        let Some(root) = run_tree_of_tx(transaction, &claim.subject)
             .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
-            && (claim.kind == "work.extended" || foreign_roots.contains(&root))
-        {
-            // The label means a local claim that forces a rebuild: a work extension, or a local
-            // claim in a tree that another writer's claims reached in the same range.
+        else {
+            continue;
+        };
+        let Some(part) = run_part_of_tx(transaction, &claim.subject)
+            .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
+        else {
+            continue;
+        };
+        // The label means a local claim that forces a rebuild: a work extension, or a local
+        // claim in a part of a tree that another writer's claims reached in the same range.
+        if foreign_whole.contains(&root) {
             mark_dirty(&mut dirty, Aggregate::RunTree(root), "local claim");
+        } else if claim.kind == "work.extended" || foreign_parts.contains(&part) {
+            mark_dirty(&mut dirty, part, "local claim");
         }
     }
     for claim in &claims {
@@ -29986,10 +30327,10 @@ fn try_project_simple_replication_tx(
                     );
                 }
                 for run in waiting {
-                    if let Some(root) = run_tree_of_tx(transaction, &run)? {
+                    if let Some(part) = run_part_of_tx(transaction, &run)? {
                         mark_dirty(
                             &mut dirty,
-                            Aggregate::RunTree(root),
+                            part,
                             "mission published after runs waiting for its revision",
                         );
                     }
@@ -30054,12 +30395,12 @@ fn try_project_simple_replication_tx(
         if previous.is_none_or(|value| claim.accepted_at_unix_ms <= value) {
             // A work claim for a step that is not projected yet waits in the claim log; the
             // generation that creates the step rebuilds its tree and applies it.
-            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)
+            if let Some(part) = run_part_of_tx(transaction, &claim.subject)
                 .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
             {
                 mark_dirty(
                     &mut dirty,
-                    Aggregate::RunTree(root),
+                    part,
                     "another writer's work claim not newer than the step",
                 );
             }
@@ -30172,14 +30513,14 @@ fn try_project_simple_replication_tx(
     // Missions first, since a rebuilt run reads the revision it runs.
     let (trees, bases): (Vec<_>, Vec<_>) = dirty
         .iter()
-        .partition(|aggregate| matches!(aggregate, Aggregate::RunTree(_)));
+        .partition(|aggregate| matches!(aggregate, Aggregate::RunTree(_) | Aggregate::RunPart(_)));
     for aggregate in bases {
         rebuild_base_aggregate_tx(transaction, aggregate).map_err(|error| {
             let subject = match aggregate {
                 Aggregate::Desired(subject)
                 | Aggregate::Document(subject)
                 | Aggregate::Mission(subject) => subject.clone(),
-                Aggregate::RunTree(root) => format!("mission-run/{root}"),
+                Aggregate::RunTree(root) | Aggregate::RunPart(root) => format!("mission-run/{root}"),
             };
             error
                 .with_detail("projection_stage", "base-aggregate-rebuild")
@@ -30187,13 +30528,16 @@ fn try_project_simple_replication_tx(
         })?;
     }
     for aggregate in trees {
-        if let Aggregate::RunTree(root) = aggregate {
-            rebuild_run_tree_tx(transaction, root).map_err(|error| {
-                error
-                    .with_detail("projection_stage", "run-tree-rebuild")
-                    .with_detail("projection_subject", format!("mission-run/{root}"))
-            })?;
-        }
+        let (rebuilt, root) = match aggregate {
+            Aggregate::RunTree(root) => (rebuild_run_tree_tx(transaction, root), root),
+            Aggregate::RunPart(top) => (rebuild_run_part_tx(transaction, top), top),
+            _ => continue,
+        };
+        rebuilt.map_err(|error| {
+            error
+                .with_detail("projection_stage", "run-tree-rebuild")
+                .with_detail("projection_subject", format!("mission-run/{root}"))
+        })?;
     }
     if rebuild_planning {
         rebuild_planning_tx(transaction)
@@ -43805,6 +44149,363 @@ version 2
         );
     }
 
+    /// A standing root with `count` child runs started from its step, replicated from a
+    /// controller to a worker. Returns the stores, the root and the children.
+    pub(super) fn replicated_run_tree(
+        count: usize,
+    ) -> (Store, Store, MissionRunView, Vec<MissionRunView>) {
+        let controller = Store::open_memory("controller").unwrap();
+        let kdl = r#"
+version 2
+
+  mission "front-desk" state="ready" {
+    goal "Take requests."
+    step "take" { assigned-to "agent/desk.one" }
+  }
+
+  mission "request" state="ready" {
+    goal "Answer one request."
+    concurrent-runs
+    step "answer" { assigned-to "agent/worker.one" }
+  }
+
+"#;
+        let intent = parse_intent(kdl, "controller").unwrap();
+        let planned = controller
+            .mission(&intent, IntentInput { kdl: kdl.into(), source_name: None })
+            .unwrap();
+        controller
+            .apply(&intent, &planned.subject_tokens, "run-tree-missions")
+            .unwrap();
+        let request = |mission: &str, key: String| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/test".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: key,
+        };
+        let root = controller
+            .create_mission_run(&request("front-desk", "front-desk-run".into()))
+            .unwrap();
+        let take = root.steps[0].subject.clone();
+        let children = (0..count)
+            .map(|index| {
+                controller
+                    .create_child_mission_run(
+                        &request("request", format!("request-{index}")),
+                        &root,
+                        &take,
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for child in &children {
+            controller.set_step_state(&child.steps[0].subject, "ready", None).unwrap();
+        }
+        let worker = Store::open_memory("worker").unwrap();
+        replicate_fully(&controller, &worker);
+        (controller, worker, root, children)
+    }
+
+    /// Exchange from `controller` to `worker` until the worker holds every claim: an export
+    /// sends one bounded page, so a large tree takes several.
+    fn replicate_fully(controller: &Store, worker: &Store) {
+        for _ in 0..64 {
+            let exchange = exchange_from(controller, &worker.replication_inventory().unwrap());
+            if exchange.envelopes.is_empty() {
+                break;
+            }
+            receive_and_project(worker, "controller", &exchange);
+        }
+        assert_eq!(
+            worker.replication_inventory().unwrap().digest,
+            controller.replication_inventory().unwrap().digest,
+            "the worker caught up"
+        );
+    }
+
+    /// One late claim about one child of a standing root rebuilds that child alone, not the
+    /// root's thousands of other children, and ends where a replay of the whole graph ends.
+    #[test]
+    fn a_late_claim_in_a_standing_tree_rebuilds_only_its_own_child() {
+        let (controller, worker, _root, children) = replicated_run_tree(8);
+        let late = children[3].steps[0].subject.clone();
+        let earlier = worker
+            .claims_for(&children[0].subject, None)
+            .unwrap()
+            .iter()
+            .map(|claim| claim.accepted_at_unix_ms)
+            .min()
+            .unwrap();
+        // The worker projects a later claim about another child first.
+        worker
+            .set_step_state(&children[7].steps[0].subject, "blocked", Some("waits on a person"))
+            .unwrap();
+        controller.set_write_clock_at(earlier).unwrap();
+        controller
+            .set_step_state(&late, "blocked", Some("the controller blocks it early"))
+            .unwrap();
+        RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(0));
+        RUN_PART_RUNS.with(|runs| runs.set(0));
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        assert!(RUN_TREE_REBUILDS.with(std::cell::Cell::get) >= 1, "the late claim rebuilds");
+        assert_eq!(
+            RUN_PART_RUNS.with(std::cell::Cell::get),
+            RUN_TREE_REBUILDS.with(std::cell::Cell::get),
+            "each rebuild holds the one child the late claim is about"
+        );
+        let incremental = graph_digest_of(&worker);
+        let projected = worker.step_run(&late).unwrap().unwrap();
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&worker));
+        let replayed = worker.step_run(&late).unwrap().unwrap();
+        assert_eq!(
+            (&projected.status, &projected.blocked_reason),
+            (&replayed.status, &replayed.blocked_reason)
+        );
+    }
+
+    /// Once a claim ends the root, its children are no longer independent of it: a late claim
+    /// rebuilds the whole tree, as a replay orders the root's end among them.
+    #[test]
+    fn a_late_claim_in_a_tree_whose_root_ended_rebuilds_the_whole_tree() {
+        let (controller, worker, root, children) = replicated_run_tree(8);
+        let earlier = worker
+            .claims_for(&children[0].subject, None)
+            .unwrap()
+            .iter()
+            .map(|claim| claim.accepted_at_unix_ms)
+            .min()
+            .unwrap();
+        worker
+            .set_mission_run_state(&root.id, "cancelled", "terminal", Some("the desk closes"))
+            .unwrap();
+        controller.set_write_clock_at(earlier).unwrap();
+        controller
+            .set_step_state(&children[3].steps[0].subject, "blocked", Some("blocked early"))
+            .unwrap();
+        RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(0));
+        RUN_PART_RUNS.with(|runs| runs.set(0));
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        assert!(RUN_TREE_REBUILDS.with(std::cell::Cell::get) >= 1);
+        assert_eq!(RUN_PART_RUNS.with(std::cell::Cell::get), 0, "no part rebuilds alone");
+        let incremental = graph_digest_of(&worker);
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&worker));
+    }
+
+    /// Every part of a standing tree, rebuilt alone, leaves the graph a replay leaves.
+    #[test]
+    fn each_part_of_a_standing_tree_rebuilt_alone_matches_a_replay() {
+        let (_controller, worker, root, children) = replicated_run_tree(8);
+        worker_work(&worker, &children[0].steps[0].subject, "claim", None, "part-claim");
+        worker
+            .set_step_state(&children[1].steps[0].subject, "blocked", Some("waits on a person"))
+            .unwrap();
+        worker.replay_replication_graph().unwrap();
+        let replayed = graph_digest_of(&worker);
+        let mut connection = worker.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let mut parts = BTreeSet::new();
+        for subject in std::iter::once(root.subject.clone())
+            .chain(children.iter().map(|child| child.steps[0].subject.clone()))
+        {
+            parts.insert(run_part_of_tx(&transaction, &subject).unwrap().unwrap());
+        }
+        assert_eq!(parts.len(), 1 + children.len(), "{parts:?}");
+        assert!(parts.contains(&Aggregate::RunPart(root.id.clone())));
+        RUN_PART_RUNS.with(|runs| runs.set(0));
+        for part in &parts {
+            let Aggregate::RunPart(top) = part else { panic!("{part:?}") };
+            rebuild_run_part_tx(&transaction, top).unwrap();
+        }
+        assert_eq!(RUN_PART_RUNS.with(std::cell::Cell::get), 1 + children.len());
+        assert_eq!(graph_digest(&transaction).unwrap(), replayed);
+        transaction.rollback().unwrap();
+    }
+
+    /// The shapes a standing tree holds besides children started from the root's steps, made on
+    /// the controller and replicated to the worker: a grandchild started from a child's step, a
+    /// run a subscription delivers straight under the root, and a person ask owned by the root
+    /// and one owned by a child.
+    struct TreeShapes {
+        controller: Store,
+        worker: Store,
+        root: MissionRunView,
+        children: Vec<MissionRunView>,
+        grandchild: MissionRunView,
+        delivered: MissionRunView,
+        root_ask: StepRunView,
+        child_ask: StepRunView,
+    }
+
+    fn tree_shapes() -> TreeShapes {
+        let (controller, worker, root, children) = replicated_run_tree(4);
+        // Only a declared agent's live work can ask a person.
+        let agents = crate::graph::parse_internal_intent(
+            r#"version 2
+agent "desk.one" { workspace "/tmp"; command "true"; restart always; }
+agent "worker.one" { workspace "/tmp"; command "true"; restart always; }
+"#,
+            "controller",
+        )
+        .unwrap();
+        controller.apply_internal(&agents, "tree-shape-agents").unwrap();
+        let request = |key: &str| MissionRunRequest {
+            mission: "request".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/test".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: key.into(),
+        };
+        let grandchild = controller
+            .create_child_mission_run(
+                &request("grandchild"),
+                &children[1],
+                &children[1].steps[0].subject,
+                None,
+            )
+            .unwrap();
+        let delivered = controller
+            .create_child_mission_run(
+                &request("delivered"),
+                &root,
+                "subscription/front-desk-intake",
+                None,
+            )
+            .unwrap();
+        for run in [&root, &grandchild, &delivered] {
+            controller.set_step_state(&run.steps[0].subject, "ready", None).unwrap();
+        }
+        let ask = |step: &str, actor: &str, key: &str| {
+            controller
+                .work_action(
+                    step,
+                    "claim",
+                    &WorkRequest {
+                        wait_ms: None,
+                        actor: Some(actor.into()),
+                        incarnation: Some(format!("{key}-incarnation")),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("{key}-claim"),
+                    },
+                )
+                .unwrap();
+            controller
+                .ask_person(&crate::model::PersonAskRequest {
+                    legacy_request: None,
+                    person: "person/test".into(),
+                    title: "Choose a date".into(),
+                    reason: "Reply with a date.".into(),
+                    actor: actor.into(),
+                    step: Some(step.into()),
+                    new_run: None,
+                    incarnation: Some(format!("{key}-incarnation")),
+                    request: None,
+                    idempotency_key: key.into(),
+                })
+                .unwrap()
+        };
+        let root_ask = ask(&root.steps[0].subject, "agent/desk.one", "root-ask");
+        // The worker's seat queue takes its oldest ready step first.
+        let child_ask = ask(&children[0].steps[0].subject, "agent/worker.one", "child-ask");
+        replicate_fully(&controller, &worker);
+        TreeShapes {
+            controller,
+            worker,
+            root,
+            children,
+            grandchild,
+            delivered,
+            root_ask,
+            child_ask,
+        }
+    }
+
+    /// The worker projects a later claim about one child; `late` then writes claims on the
+    /// controller dated before it. Returns how many runs the projection rebuilt as parts, after
+    /// checking the graph against a full replay.
+    fn late_claim_matches_a_replay(shapes: &TreeShapes, late: impl FnOnce(&Store)) -> usize {
+        let now = now_ms();
+        shapes.worker.set_write_clock_at(now + 2_000).unwrap();
+        shapes
+            .worker
+            .set_step_state(
+                &shapes.children[3].steps[0].subject,
+                "blocked",
+                Some("waits on a person"),
+            )
+            .unwrap();
+        shapes.controller.set_write_clock_at(now + 1_000).unwrap();
+        late(&shapes.controller);
+        RUN_PART_RUNS.with(|runs| runs.set(0));
+        assert!(!projection_replayed(&shapes.worker, "controller", &shapes.controller));
+        let parts = RUN_PART_RUNS.with(std::cell::Cell::get);
+        let incremental = graph_digest_of(&shapes.worker);
+        shapes.worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&shapes.worker), "the projection matches a replay");
+        parts
+    }
+
+    /// The tree's runs: the root, its children, the grandchild, the delivered run and two asks.
+    const TREE_SHAPE_RUNS: usize = 1 + 4 + 1 + 1 + 2;
+
+    #[test]
+    fn a_late_claim_about_a_grandchild_rebuilds_its_child_part_and_matches_a_replay() {
+        let shapes = tree_shapes();
+        let step = shapes.grandchild.steps[0].subject.clone();
+        let parts = late_claim_matches_a_replay(&shapes, |controller| {
+            controller.set_step_state(&step, "blocked", Some("blocked early")).unwrap();
+        });
+        assert!((1..TREE_SHAPE_RUNS).contains(&parts), "{parts} runs rebuilt as parts");
+    }
+
+    #[test]
+    fn a_late_claim_about_a_delivered_run_rebuilds_its_part_and_matches_a_replay() {
+        let shapes = tree_shapes();
+        let step = shapes.delivered.steps[0].subject.clone();
+        let parts = late_claim_matches_a_replay(&shapes, |controller| {
+            controller.set_step_state(&step, "blocked", Some("blocked early")).unwrap();
+        });
+        assert!((1..TREE_SHAPE_RUNS).contains(&parts), "{parts} runs rebuilt as parts");
+    }
+
+    #[test]
+    fn late_claims_about_asks_owned_by_the_root_and_by_a_child_match_a_replay() {
+        for owned_by_root in [true, false] {
+            let shapes = tree_shapes();
+            let ask = if owned_by_root { &shapes.root_ask } else { &shapes.child_ask };
+            let ask = ask.subject.clone();
+            let parts = late_claim_matches_a_replay(&shapes, |controller| {
+                controller.set_step_state(&ask, "blocked", Some("blocked early")).unwrap();
+            });
+            assert!(
+                (1..TREE_SHAPE_RUNS).contains(&parts),
+                "{parts} runs rebuilt as parts (owned by the root: {owned_by_root})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_claim_in_the_batch_that_ends_the_root_matches_a_replay() {
+        let shapes = tree_shapes();
+        let step = shapes.children[2].steps[0].subject.clone();
+        let root = shapes.root.id.clone();
+        late_claim_matches_a_replay(&shapes, |controller| {
+            controller.set_step_state(&step, "blocked", Some("blocked early")).unwrap();
+            controller
+                .set_mission_run_state(&root, "cancelled", "terminal", Some("the desk closes"))
+                .unwrap();
+        });
+    }
+
     #[test]
     fn lanes_runtime_actions_and_intake_extend_the_graph_incrementally() {
         for kind in [
@@ -57195,6 +57896,129 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         assert!(prompts().is_empty());
     }
 
+    #[test]
+    fn claude_native_prompt_lookup_window_never_infers_missing_episode_closure() {
+        let store = Store::open_memory("node").unwrap();
+        let seat = "agent/node.worker";
+        let observe = |ownership: u64, transition: u64, state: &str, blocked: &str, ask: &str| {
+            store.append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.observed".into(),
+                actor: Some(seat.into()),
+                fields: serde_json::from_value(json!({
+                    "driver":"claude", "state":state, "incarnation_id":"one",
+                    "blocked_on":blocked, "ask":ask,
+                    "ownership_sequence":ownership, "transition_sequence":transition,
+                })).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap()
+        };
+        for _ in 0..20 {
+            observe(1, 1, "idle", "none", "none");
+        }
+        // The new writer can precede its publication even with a full retained window.
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        for _ in 0..20 {
+            observe(1, 2, "indeterminate", "unknown", "unknown");
+        }
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        observe(1, 2, "working", "human", "permission");
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        for _ in 0..20 {
+            observe(1, 2, "working", "human", "permission");
+        }
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        // Only positive successor evidence releases a record outside the bounded window.
+        for _ in 0..20 {
+            observe(1, 3, "idle", "none", "none");
+        }
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Gone);
+        assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open);
+    }
+
+    #[test]
+    fn claude_native_human_release_is_episode_fenced_durable_and_shared_with_sender_status() {
+        for ask in ["permission", "question", "review"] {
+            let store = Store::open_memory("node").unwrap();
+            let seat = "agent/node.worker";
+            let append = |kind: &str, fields: Value, key: Option<String>| {
+                store.append_claim(&ClaimInput {
+                    subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                    expected_subject: None, idempotency_key: key,
+                }).unwrap()
+            };
+            append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}), None);
+            let blocked = |transition| json!({
+                "state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":ask, "reason":"native prompt",
+                "ownership_sequence":1, "transition_sequence":transition
+            });
+            let asked = append("harness.observed", blocked(3), None);
+            let before = store.index().unwrap();
+            assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Open, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, before).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            append("harness.diagnostic", json!({
+                "code":"native-prompt-gone", "status":"resolved",
+                "driver":"claude", "incarnation_id":"one"
+            }), Some(native_prompt_gone_key(&asked.id)));
+            assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, before).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            if ask == "permission" {
+                // A replicated answer request can arrive after native closure.
+                // It must not resurrect the sender's held projection.
+                append("harness.diagnostic", json!({
+                    "code":"native-prompt-answered", "status":"allow",
+                    "driver":"claude", "incarnation_id":"one"
+                }), Some(format!("native-prompt-answer:{}", asked.id)));
+                assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone);
+                assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
+            }
+            for _ in 0..20 {
+                append("harness.observed", blocked(3), None);
+            }
+            // Esc/No emits no hook event; the blocked driver file can heartbeat
+            // for longer than the bounded recent-observation lookup window.
+            assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone, "{ask}");
+            let released = store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap();
+            assert!(released.blocked_on.is_none(), "{ask}");
+            assert!(released.ask.is_none(), "{ask}");
+            assert_eq!(released.state, "idle", "{ask}");
+            // A full history window cannot release a not-yet-published new prompt.
+            assert_eq!(store.native_prompt_state(seat, 1, 999).unwrap(), NativePromptState::Open);
+            append("harness.observed", blocked(4), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            // Staleness is uncertainty, not prompt dismissal. Its derived
+            // snapshot retains the driver's ownership/transition counters.
+            append("harness.observed", json!({
+                "state":"indeterminate", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"unknown", "ask":"unknown", "reason":"stale",
+                "ownership_sequence":1, "transition_sequence":4
+            }), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open, "{ask}");
+            append("harness.observed", blocked(4), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            // A native timeout that ends the turn, unlike the hook's polling
+            // timeout while a dialog stays open, retires the hold.
+            append("harness.observed", json!({
+                "state":"ended", "driver":"claude", "incarnation_id":"one",
+                "ownership_sequence":1, "transition_sequence":5, "exit":"timeout"
+            }), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Gone);
+            assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
+            append("runtime.observed", json!({"status":"running", "incarnation_id":"two"}), None);
+            append("harness.observed", json!({
+                "state":"ready", "driver":"claude", "incarnation_id":"two",
+                "ownership_sequence":2, "transition_sequence":1
+            }), None);
+            assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
+        }
+    }
+
     /// A Claude permission prompt can be answered from a client: only by the seat's person, only
     /// while it waits, and once. The hook sees the answer; the alert goes once it is answered.
     #[test]
@@ -57283,6 +58107,10 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 answer: "deny".into()
             }
         );
+        let answered = store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap();
+        assert_eq!(answered.blocked_on.as_deref(), Some("human"));
+        assert_eq!(answered.ask.as_deref(), Some("permission"));
+        // Recording the answer does not prove the native polling hook applied it.
         assert!(prompt().is_none(), "an answered prompt is no longer an alert");
         assert!(
             store
@@ -57414,8 +58242,8 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         // Within the hook's wait, the prompt is answered here.
         asked(now - window + 60_000, 3);
         assert_eq!(prompt().unwrap().answers, vec!["allow".to_owned(), "deny".to_owned()]);
-        // The next prompt opened before the hook's wait: still an alert, answered in the terminal,
-        // and so is each restatement of it, which keeps when it opened.
+        // Expiring the hook only disables answering through st. The native dialog
+        // stays open, and each restatement keeps its original opening time.
         append(
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
@@ -57438,7 +58266,20 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 .code,
             "stale-fence"
         );
+        assert_eq!(store.native_prompt_state(seat, 1, 5).unwrap(), NativePromptState::Open);
+        let index = store.index().unwrap();
+        let held = store.observed_harness_at(seat, index).unwrap().unwrap();
+        assert_eq!(held.blocked_on.as_deref(), Some("human"),
+            "hook expiry must retain the native human mail hold");
+        assert_eq!(store.seat_observation_at(seat, Some(&held), index, now_ms()).unwrap(), "current");
+        append(
+            "harness.observed",
+            json!({"state":"idle", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":6}),
+        );
         assert_eq!(store.native_prompt_state(seat, 1, 5).unwrap(), NativePromptState::Gone);
+        assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none(),
+            "authoritative native closure releases the mail hold");
     }
 
     /// A driver writes each prompt as its own transition, so a later prompt for the same tool is

@@ -367,7 +367,11 @@ python3 ${evidenceHelper} configure | tee "$RUNNER_TEMP/evidence-signer-home"`,
       ...soft,
       name: `Sign this ${facts.helper === 'stage-facts' ? 'stage' : 'job'} result`,
       if: "${{ always() && steps.evidence-configure.outcome == 'success' }}",
-      env: { ...facts.env, GATE_SKIP: gateSkipExpression(name) },
+      env: {
+        ...facts.env,
+        GATE_SKIP: gateSkipExpression(name),
+        PROJECT_BASE_SHA: '${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.sha }}',
+      },
       run: `helper=${evidenceHelper}
 python3 "$helper" once ${facts.helper === 'stage-facts' ? '"$STAGE_JOB"' : '"$STEP_CHECK"'}
 python3 "$helper" ${facts.helper} "$RUNNER_TEMP/job-facts.json"

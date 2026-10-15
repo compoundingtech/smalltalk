@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "List the public evidence signing keys of two trusted build hosts under invented host names",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this lists two public keys in a trust file."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes. No skip policy admits the host trust level yet and every check stays enforce false, so the keys vouch for nothing today."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No command, frame, scope or stored-format change in the product."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is required by this change. The host owners keep their signer configuration matching the listed names."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent product state changes or new swap-back restrictions."
+  }
+}

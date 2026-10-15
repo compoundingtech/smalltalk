@@ -541,6 +541,15 @@ Admission commits once per pass over the pending envelopes, so one disk flush co
 
 A node catching up with a peer, one more than one exchange behind it, projects at most every 30 seconds and again as soon as it has caught up. History arrives older than the node's own claims, so the node cannot extend its projection incrementally; projecting after every exchange would replay the whole graph each time. Meanwhile `st now`, `st missions ls` and the terminal UI say the node is syncing.
 
+A claim that reaches a mission run tree out of the replay's order rebuilds that tree from its own
+claims. Runs in one tree affect each other only from the root down: a run that ends cancels the
+runs started from its steps, and step claims read whether the root has ended. While the root has
+never ended, a claim rebuilds only its part of the tree: the run started from the root that it
+is about, with every run below that run and the asks those runs own, or the root with the asks
+it owns. A standing root with thousands of child runs, such as an intake, is not rebuilt for a
+late claim about one request; the 2,085-run intake tree took one 10.5 s writer hold to rebuild.
+A tree whose root has ended, or whose links have not all arrived, rebuilds whole.
+
 Person-work asks, completions and cancellations rebuild only their owning mission run tree.
 Standalone asks embed their run and generation in the asking claim; indexed lookups recover
 that ownership even before the ask is projected. A response received before its ask is replayed

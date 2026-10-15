@@ -38,10 +38,20 @@ impl Daemon {
             .with_env_filter("st3=debug")
             .with_writer(std::sync::Mutex::new(log))
             .try_init();
+        let store = Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap();
+        // `st up` copies WAL pages on its own checkpoint thread every five seconds, so its
+        // writer stays under SQLite's 1000-page automatic checkpoint. This daemon has no such
+        // thread: without this, a commit past 1000 pages copies the WAL on the writer and every
+        // queued receipt waits for that copy and its fsync. The WAL grows for the test instead.
+        store
+            .connection
+            .write()
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
         Self {
             root: root.to_path_buf(),
             socket: root.join("st3.sock"),
-            store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
+            store: Arc::new(store),
             event_notify: watch::channel(0_u64).0,
             server: None,
             isolated_server: None,

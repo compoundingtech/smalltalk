@@ -33,10 +33,12 @@ VERIFIER_TIMEOUT = int(os.environ.get('GATE_VERIFIER_TIMEOUT', '30'))
 # a forged skip would have to edit. Compared between the accepted base and this run's tree.
 PROTECTED = (
     'scripts/ci-evidence-gate', 'scripts/evidence-verify', '.st/evidence-skip-policy.json', '.st/evidence-keys',
-    '.github/workflows/fleet.yml', '.github/workflows/fleet.yml.genie.ts',
+    '.github/workflows/fleet.yml', '.github/workflows/fleet.yml.genie.ts', '.github/workflows/workspace-ci.ts',
+    'scripts/ci-evidence-gate-test', 'scripts/evidence-verify-test',
 )
 
 NOTES = 'refs/notes/evidence/*:refs/notes/evidence/*'
+CHECK_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 VERIFIER = 'scripts/evidence-verify'
 KEYS = '.st/evidence-keys'
 MISSING = ('no_record', 'stale_tree', 'wrong_check')
@@ -76,7 +78,10 @@ def decide(context, outcome, result, tree):
     if context.get('protected_changed') != []:
         return 'run', 'a file that decides skipping changed, or could not be compared'
     checks = [
+        (not sampled(context, result, tree), 'sampled: the real job runs anyway, to compare it with the note'),
         (result.get('enforce') is True, 'shadow: the note would cover this check, but the skip policy has not turned skipping on for it'),
+        (result.get('events') is None or context['event'] in result['events'],
+         'the policy does not let this signer level cover this event (a host key covers pull requests only)'),
         (result.get('satisfied') is True, 'verifier did not report satisfied'),
         (result.get('policy') is True, 'the skip policy was not applied'),
         (result.get('tier') == 'full', 'tier is not full'),
@@ -93,6 +98,20 @@ def decide(context, outcome, result, tree):
         if not ok:
             return 'run', why
     return 'skip', 'covered by a trusted full-tier note'
+
+
+def sampled(context, result, tree):
+    """True when this run is one the policy keeps running for real although a note matches (one in `sample_one_in`).
+    Deterministic in (check, input key, head), so a retry of the same run behaves the same.
+    The head is in the seed, so on a pull request an author can re-push to change whether a run is sampled
+    (about five tries at one in five); in a merge group the head is fixed. It is a comparison sample, not a security control."""
+    every = result.get('sample_one_in')
+    if isinstance(every, bool) or not isinstance(every, int) or every < 1:
+        return True  # a missing or unreadable sampling rule samples: the verifier always reports it, so its absence is a fault
+    if every == 1:
+        return False
+    seed = f"{context['check']}:{result.get('source_inputs') or tree}:{context.get('head', '')}"
+    return int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % every == 0
 
 
 def age_of(result):
@@ -141,6 +160,7 @@ def observe(context):
             empty = os.path.join(scratch, 'empty-keys')
             open(empty, 'w').close()
             keys = ['--keys', empty]
+        fetch_input_notes(path, base, check, repository)
         done = run(sys.executable, path, '--repo', '.', '--revision', 'HEAD', '--check', check,
                    '--policy-from', base, '--repository', repository, *keys, timeout=VERIFIER_TIMEOUT)
     try:
@@ -148,6 +168,22 @@ def observe(context):
     except ValueError:  # includes output that is not valid UTF-8
         return 'unavailable', None, f'verifier exit {done.returncode} without a JSON result', digest
     return classify(done.returncode, result), result, result.get('reason') or 'satisfied', digest
+
+
+def fetch_input_notes(verifier, base, check, repository):
+    """For a check that declares inputs: fetch only the records indexed under this tree's input key.
+    Best effort: a failure here just means no input-keyed record is seen, and the check runs."""
+    if not CHECK_NAME.fullmatch(check):
+        return
+    try:
+        done = run(sys.executable, verifier, '--repo', '.', '--revision', 'HEAD', '--check', check, '--project',
+                   '--policy-from', base, '--repository', repository, timeout=VERIFIER_TIMEOUT)
+        key = json.loads(done.stdout).get('source_inputs') if done.returncode == 0 else None
+    except (ValueError, AttributeError, subprocess.TimeoutExpired, OSError):
+        return
+    if isinstance(key, str) and OID.match(key):
+        prefix = f'refs/notes/evidence-input/{check}/{key}'
+        run('git', 'fetch', '--no-tags', '--depth=1', '-q', 'origin', f'{prefix}/*:{prefix}/*')
 
 
 def field(value):
@@ -164,7 +200,8 @@ def line(context, decision, outcome, result, detail, tree, verifier_sha, gate_sh
         ('record', result.get('record')), ('signer', result.get('signer')),
         ('trust_level', result.get('trust_level')), ('kind', result.get('kind')), ('tier', result.get('tier')),
         ('observed_at', result.get('observed_at')), ('age_s', age), ('max_age_s', result.get('max_age_s')),
-        ('attempts', result.get('attempts')), ('enforce', result.get('enforce')), ('tree', tree), ('head', context['head']),
+        ('attempts', result.get('attempts')), ('enforce', result.get('enforce')), ('match', result.get('match')),
+        ('source_inputs', result.get('source_inputs')), ('tree', tree), ('head', context['head']),
         ('base', context['base']), ('event', context['event']), ('pr', context['pr']),
         ('repo', context['repository']), ('run', context['run']), ('attempt', context['attempt']),
         ('fork', context['fork']), ('verifier_sha256', verifier_sha), ('gate_sha256', gate_sha),

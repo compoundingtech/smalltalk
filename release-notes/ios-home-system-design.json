@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "System typography and appearance for iPhone Home and alert detail",
+  "replay": {"status": "none", "detail": "Presentation-only iOS change; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or fleet coordination change."},
+  "compatibility": {"status": "none", "detail": "Alert IDs, open counts, detail destinations, advertised actions and wire contracts are unchanged."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No manual upgrade steps or state migration."},
+  "recovery": {"status": "none", "detail": "No recovery procedure change."}
+}

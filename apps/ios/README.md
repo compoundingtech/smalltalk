@@ -14,7 +14,7 @@ Observation reporting holds one send slot during both batch preparation and tran
 
 ## Layout
 
-The chrome is native and keeps the system look and fonts. The content is React and is drawn like stui: IBM Plex Mono, stui's Catppuccin Mocha palette (`theme.ts`, from `crates/stui/src/ui/theme.rs`), dense rows, dim section rules with counts, and state glyphs.
+The chrome uses native tabs and stacks. Now and alert detail use system typography, device light/dark appearance and wrapping, inset grouped rows. Alert rows label kind, requester and waiting context; opening an alert never acknowledges it. Updates require explicit Mark read, and closed alerts remain until cleared. Other tabs retain the stui-style IBM Plex Mono and Mocha presentation. Terminal cells, code and identifiers remain monospace.
 
 | Piece | Native component | Package |
 | --- | --- | --- |
@@ -75,10 +75,12 @@ Daily uses the `com.compoundingtech.smalltalk` URL scheme, separate from the dev
 The Debug app accepts a short-lived pairing deep link for headless simulator checks: `com.compoundingtech.smalltalk.starter://pair?gateway=...&id=...&code=...`. The link opens the pairing form with the code prefilled; it does not submit the code until a separately supplied fingerprint or explicit unpinned override is chosen. The handler is disabled in Release. Treat the link as a temporary credential and do not commit or log its populated form.
 
 For connected Debug smoke tests, `com.compoundingtech.smalltalk.starter://tab/Fleet` opens a tab (only Now, Resources, Fleet and Spaces are accepted), `com.compoundingtech.smalltalk.starter://mission?id=mission/...` opens a mission, `com.compoundingtech.smalltalk.starter://agent?id=agent/...` opens an agent's conversation, and `com.compoundingtech.smalltalk.starter://session?id=session/...` opens an exact conversation. Add `&terminal=terminal/...` to the session link to inspect its live terminal screen. `com.compoundingtech.smalltalk.starter://scroll?y=800` scrolls the visible list for screenshots. These links are disabled in Release and carry no authorization: the already-paired client still has to pass the gateway's normal checks.
+`com.compoundingtech.smalltalk.starter://attention?id=attention/...` opens one attention item's detail from Now.
 
 The simulator asks before it opens each link it is handed, so a headless run can instead put links in `apps/ios/.env` for Metro to inline into the Debug bundle: `EXPO_PUBLIC_ST3_TEST_PAIR_LINK` opens the pairing form at launch, `EXPO_PUBLIC_ST3_TEST_TAB` picks the first tab, and `EXPO_PUBLIC_ST3_TEST_LINKS` (space-separated) follows each link six seconds apart. Restart Metro with `--clear` after changing them.
 
 For screenshots without a real st, `node demoGateway.mjs 8791` serves invented data: attention, missions, agents, one conversation, and one terminal. Pair a Debug simulator with `com.compoundingtech.smalltalk.starter://pair?gateway=http://<the Mac's LAN or Tailscale IPv4>:8791&id=demo&code=demo`. It is not authenticated; never point a Release build or a device at it.
+It completes the phone's real device-key verification read-only: the unauthenticated capabilities preflight is the raw advertisement, and pairing answers with an invented host-signed person-root proof and no signing grant, so the phone still runs its own checks.
 
 Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.
 

@@ -31,6 +31,7 @@ sys.dont_write_bytecode = True
 
 OID = re.compile(r'^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
 NOTES = 'refs/notes/evidence/'
+INPUT_NOTES = 'refs/notes/evidence-input/'
 
 
 class Refused(Exception):
@@ -78,7 +79,11 @@ def accept(summary_path, keys, allowed_checks, commit, tree):
         raise Refused('the signature does not verify against the accepted key list for the claimed signer')
     if git('show', '-s', '--format=%P', record).stdout.decode().strip() != commit:
         raise Refused('the note must have the tested commit as its only parent')
-    return record, check
+    inputs = predicate['observed'].get('inputs') or {}
+    key = inputs.get('source_inputs')
+    if key is not None and not (isinstance(key, str) and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', key)):
+        raise Refused('source_inputs must be a git tree id')
+    return record, check, key
 
 
 def main(argv):
@@ -103,14 +108,21 @@ def main(argv):
             result['refused'].append({'record': summary_path.stem, 'reason': f'more than {args.limit} notes in one run'})
             continue
         try:
-            record, check = accept(summary_path, args.keys, allowed, commit, tree)
+            record, check, key = accept(summary_path, args.keys, allowed, commit, tree)
             ref = NOTES + record
             existing = git('for-each-ref', '--format=%(objectname)', ref).stdout.decode().strip()
             if existing and existing != record:
                 raise Refused(f'{ref} already names {existing}; evidence refs are never replaced')
             if not existing:
                 git('update-ref', ref, record, '0' * len(record))
-            result['accepted'].append({'record': record, 'check': check})
+            entry = {'record': record, 'check': check}
+            if key:
+                # An index by input key, one ref per record: a newer record never replaces an older one, so a newer
+                # failure with the same key can be found next to an older pass. The ref name repeats the record.
+                entry['input_ref'] = f'{INPUT_NOTES}{check}/{key}/{record}'
+                if not git('for-each-ref', '--format=%(objectname)', entry['input_ref']).stdout.decode().strip():
+                    git('update-ref', entry['input_ref'], record, '0' * len(record))
+            result['accepted'].append(entry)
         except (Refused, KeyError, ValueError, IndexError) as error:
             result['refused'].append({'record': summary_path.stem, 'reason': str(error)})
     if args.remote and result['accepted']:
@@ -118,7 +130,9 @@ def main(argv):
         header = None
         if token:
             header = 'Authorization: Basic ' + base64.b64encode(f'x-access-token:{token}'.encode()).decode()
-        pushed = git('push', '--quiet', args.remote, *[f'{NOTES}{a["record"]}:{NOTES}{a["record"]}' for a in result['accepted']],
+        refspecs = [f'{NOTES}{a["record"]}:{NOTES}{a["record"]}' for a in result['accepted']]
+        refspecs += [f'{a["input_ref"]}:{a["input_ref"]}' for a in result['accepted'] if a.get('input_ref')]
+        pushed = git('push', '--quiet', args.remote, *refspecs,
                      check=False, header=header)
         if pushed.returncode != 0:
             text = pushed.stderr.decode(errors='replace')

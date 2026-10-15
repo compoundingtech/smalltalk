@@ -4108,7 +4108,7 @@ fn client_message_resources(
             "title": message.title,
             "content": message.content,
             "state": message.status,
-            "delivery": message_delivery_value(store, &message.to, &message.status, sent_at, client_now_ms())?,
+            "delivery": message_delivery_for(store, &message, sent_at, client_now_ms())?,
             "sent_at": client_timestamp(sent_at),
             "session_id": session_id,
             "in_reply_to": message.in_reply_to,
@@ -4172,6 +4172,33 @@ fn message_delivery_value(store: &Store, to: &str, status: &str, sent_at: u128, 
     }))
 }
 
+fn message_delivery_for(store: &Store, message: &MessageView, sent_at: u128, now: u128) -> anyhow::Result<Value> {
+    let mut delivery = message_delivery_value(store, &message.to, &message.status, sent_at, now)?;
+    if !matches!(message.status.as_str(), "sent" | "staged") { return Ok(delivery); }
+    let Some(runtime) = store.latest_claim(&message.to, Some("runtime.observed"))? else {
+        return Ok(delivery);
+    };
+    let runtime = runtime.body.get("fields").unwrap_or(&runtime.body);
+    if runtime.get("status").and_then(Value::as_str) != Some("running") { return Ok(delivery); }
+    let Some(incarnation) = runtime.get("incarnation_id").and_then(Value::as_str) else {
+        return Ok(delivery);
+    };
+    // Evidence scopes this seat diagnostic to one mail item. Query only the
+    // running incarnation: late old failures and clears cannot mask its state.
+    let diagnostic = store.claude_preparation_diagnostic(&message.to, &message.subject, incarnation)?
+        .filter(|(_, accepted)| *accepted >= sent_at);
+    if let Some((body, _)) = diagnostic {
+        let fields = body.get("fields").unwrap_or(&body);
+        if fields.get("status").and_then(Value::as_str) == Some("waiting") {
+            delivery["state"] = json!("waiting");
+            // Diagnostics retain operator detail; delivery exposes only the safe
+            // preparation/FIFO condition, never error strings or filesystem paths.
+            delivery["reason"] = json!(crate::claude_channel::PREPARATION_WAIT_REASON);
+        }
+    }
+    Ok(delivery)
+}
+
 async fn message_delivery(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -4187,7 +4214,7 @@ async fn message_delivery(
         let claims = state.store.claims_for(&subject, Some("message.sent")).map_err(ApiError::internal)?;
         let sent_at = claims.first().map(|claim| claim.accepted_at_unix_ms).unwrap_or_default();
         Ok(Json(json!({ "id": subject, "from": message.from, "to": message.to,
-            "delivery": message_delivery_value(&state.store, &message.to, &message.status, sent_at, client_now_ms()).map_err(ApiError::internal)? })))
+            "delivery": message_delivery_for(&state.store, &message, sent_at, client_now_ms()).map_err(ApiError::internal)? })))
     }).await
 }
 
@@ -18419,6 +18446,81 @@ mission "expiring-work" state="ready" {
     }
 
     #[test]
+    fn message_delivery_exposes_preparation_fifo_blockers_and_clears_only_current_mail() {
+        let store = Store::open_memory("claude-preparation-delivery").unwrap();
+        let seat = "agent/claude-preparation-worker";
+        let append = |subject: &str, kind: &str, actor: &str, fields: Value, evidence: Vec<String>| {
+            store.append_client_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(actor.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence,
+                expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append(seat, "runtime.observed", seat, json!({
+            "status":"running", "runtime_id":"claude-runtime", "incarnation_id":"first"
+        }), Vec::new());
+        let messages: Vec<_> = ["head", "later", "last"].into_iter().map(|name| {
+            let subject = format!("message/claude-preparation-{name}");
+            let sent = append(&subject, "message.sent", "person/sender", json!({
+                "from":"person/sender", "to":seat, "content":name, "status":"sent"
+            }), Vec::new());
+            (store.message(&subject).unwrap().unwrap(), sent.accepted_at_unix_ms)
+        }).collect();
+        let diagnostic = |message: &MessageView, incarnation: &str, status: &str, reason: &str| {
+            append(seat, "harness.diagnostic", seat, json!({
+                "severity":"warning", "code":"claude-message-unforwarded",
+                "status":status, "reason":reason, "incarnation_id":incarnation
+            }), vec![store.claims_for(&message.subject, Some("message.sent")).unwrap()[0].id.clone()])
+        };
+        diagnostic(&messages[0].0, "first", "waiting",
+            "FIFO head preparation failed: /private/internal/body.txt unavailable; token=private-detail");
+        for (message, _) in &messages[1..] {
+            diagnostic(message, "first", "waiting",
+                "queued behind FIFO head message/claude-preparation-head: body unavailable; later mail cannot overtake it");
+        }
+        for (message, sent_at) in &messages {
+            let delivery = message_delivery_for(&store, message, *sent_at, *sent_at).unwrap();
+            assert_eq!(delivery["state"], "waiting");
+            assert_eq!(delivery["phase"], "sent");
+            assert_eq!(delivery["reason"], crate::claude_channel::PREPARATION_WAIT_REASON);
+            assert!(!delivery["reason"].as_str().unwrap().contains("/private/"));
+            assert!(!delivery["reason"].as_str().unwrap().contains("private-detail"));
+            let mut accepted = message.clone();
+            accepted.status = "delivered".into();
+            assert!(!message_delivery_for(&store, &accepted, *sent_at, *sent_at).unwrap()["reason"]
+                .as_str().unwrap().contains("FIFO"));
+        }
+        // Match an operator's actor-scoped list: a person filter selects that person's
+        // incoming mailbox, not the messages they sent to this seat.
+        let resources = client_message_resources(&store, None, false, Some(seat)).unwrap();
+        assert_eq!(resources.len(), 3);
+        assert!(resources.iter().all(|resource| resource["delivery"]["state"] == "waiting"));
+        // A different message's clear cannot release the head or its queued successors.
+        diagnostic(&messages[2].0, "first", "ready", "preparation succeeded; FIFO blocker cleared");
+        assert!(message_delivery_for(&store, &messages[0].0, messages[0].1, messages[0].1)
+            .unwrap()["reason"].as_str().unwrap().contains("preparation is unavailable"));
+        // Recovery clears each message. Late previous-incarnation reports cannot undo it.
+        for (message, sent_at) in &messages {
+            diagnostic(message, "first", "ready", "preparation succeeded; FIFO blocker cleared");
+            diagnostic(message, "old", "waiting", "stale incarnation failure");
+            let delivery = message_delivery_for(&store, message, *sent_at, *sent_at).unwrap();
+            assert_eq!(delivery["state"], "pending");
+            assert!(!delivery["reason"].as_str().unwrap().contains("failure"));
+        }
+        append(seat, "runtime.observed", seat, json!({
+            "status":"running", "runtime_id":"claude-runtime", "incarnation_id":"second"
+        }), Vec::new());
+        diagnostic(&messages[0].0, "second", "waiting", "current attachment preparation failed");
+        diagnostic(&messages[0].0, "first", "ready", "old incarnation clear");
+        assert_eq!(message_delivery_for(&store, &messages[0].0, messages[0].1, messages[0].1)
+            .unwrap()["reason"], crate::claude_channel::PREPARATION_WAIT_REASON);
+        let stale = message_delivery_for(&store, &messages[0].0, messages[0].1, messages[0].1 + 90_001).unwrap();
+        assert_eq!(stale["reason"], crate::claude_channel::PREPARATION_WAIT_REASON);
+        assert_eq!(messages.iter().map(|(message, _)| store.message(&message.subject).unwrap().unwrap().content)
+            .collect::<Vec<_>>(), ["head", "later", "last"]);
+    }
+
+    #[test]
     fn message_delivery_distinguishes_pending_acceptance_and_recipient_read() {
         let store = Store::open_memory("message-delivery-test").unwrap();
         let to = "agent/remote/message-delivery-test";
@@ -18442,6 +18544,47 @@ mission "expiring-work" state="ready" {
             message_delivery_value(&store, to, "read", 1_000, 12_000).unwrap()["state"],
             "read"
         );
+    }
+
+    #[test]
+    fn message_delivery_keeps_expired_claude_hook_mail_held_until_native_closure() {
+        let store = Store::open_memory("expired-claude-hook-mail-hold").unwrap();
+        let seat = "agent/expired-claude-hook-mail-hold";
+        let append = |kind: &str, fields: Value| {
+            store.append_claim(&ClaimInput {
+                subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+        let now = client_now_ms();
+        let expired = now - crate::store::CLAUDE_PROMPT_ANSWER_WAIT_MS - 1_000;
+        append("harness.observed", json!({
+            "state":"working", "driver":"claude", "incarnation_id":"one",
+            "blocked_on":"human", "ask":"permission", "reason":"Read",
+            "observed_at_ms":expired, "ownership_sequence":1, "transition_sequence":5
+        }));
+        let heartbeat = append("harness.observed", json!({
+            "state":"working", "driver":"claude", "incarnation_id":"one",
+            "blocked_on":"human", "ask":"permission", "reason":"Read",
+            "observed_at_ms":now, "ownership_sequence":1, "transition_sequence":5
+        }));
+        assert_eq!(store.native_prompt_state(seat, 1, 5).unwrap(), crate::store::NativePromptState::Open);
+        for phase in ["sent", "staged"] {
+            let delivery = message_delivery_value(&store, seat, phase, now, heartbeat.accepted_at_unix_ms).unwrap();
+            assert_eq!(delivery["state"], "waiting");
+            assert!(delivery["reason"].as_str().unwrap().contains("held outside"));
+        }
+        let closed = append("harness.observed", json!({
+            "state":"idle", "driver":"claude", "incarnation_id":"one",
+            "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":6
+        }));
+        assert_eq!(store.native_prompt_state(seat, 1, 5).unwrap(), crate::store::NativePromptState::Gone);
+        for phase in ["sent", "staged"] {
+            assert!(!message_delivery_value(&store, seat, phase, now, closed.accepted_at_unix_ms).unwrap()["reason"]
+                .as_str().unwrap().contains("held outside"));
+        }
     }
 
     #[test]

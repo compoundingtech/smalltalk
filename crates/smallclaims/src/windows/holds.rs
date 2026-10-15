@@ -8,9 +8,10 @@
 //! writer holds and 64 read transactions over their target. A read under its target costs one
 //! clock read and is not attributed.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::panic::Location;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,6 +41,8 @@ struct Asked {
     /// The client that sent the request, when known.
     client: Option<Arc<str>>,
     at: &'static Location<'static>,
+    /// The `longest_during` scope this thread was in when it asked.
+    observer: Option<Arc<AtomicU64>>,
 }
 
 impl Holder {
@@ -57,7 +60,13 @@ impl Holder {
                 None,
             ),
         };
-        Self(Arc::new(Asked { label, client, at }))
+        let observer = OBSERVER.with(|observer| observer.borrow().clone());
+        Self(Arc::new(Asked {
+            label,
+            client,
+            at,
+            observer,
+        }))
     }
 
     fn json(&self) -> Value {
@@ -330,6 +339,9 @@ impl WriterHold {
 impl Drop for WriterHold {
     fn drop(&mut self) {
         let held = self.started.elapsed();
+        if let Some(observer) = &self.holder().0.observer {
+            observer.fetch_max(us(held), Ordering::Relaxed);
+        }
         let over = super::record_store(StoreWork::WriterHold, held);
         let now = Instant::now();
         let wall = unix_ms();
@@ -367,6 +379,25 @@ impl Drop for ReadHold {
             with_record(|record| record.read(now, wall, holder, held));
         }
     }
+}
+
+thread_local! {static OBSERVER: RefCell<Option<Arc<AtomicU64>>> = const {RefCell::new(None)};}
+
+/// Run `work`, and return with its result the longest writer hold charged to work this thread
+/// asked for during it. Unlike the report, it does not depend on how many other holders the
+/// process has, so a test can bound one path while others run beside it.
+pub fn longest_during<T>(work: impl FnOnce() -> T) -> (T, Duration) {
+    struct Restore(Option<Arc<AtomicU64>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            OBSERVER.with(|observer| *observer.borrow_mut() = previous);
+        }
+    }
+    let observed = Arc::new(AtomicU64::new(0));
+    let _restore = Restore(OBSERVER.with(|observer| observer.borrow_mut().replace(observed.clone())));
+    let result = work();
+    (result, Duration::from_micros(observed.load(Ordering::Relaxed)))
 }
 
 static WRITER_WAITING: AtomicUsize = AtomicUsize::new(0);
@@ -412,6 +443,7 @@ mod tests {
             label: label.into(),
             client: Some("member-b".into()),
             at: Location::caller(),
+            observer: None,
         }))
     }
 
@@ -457,6 +489,21 @@ mod tests {
         assert_eq!(long[0]["started_unix_ms"], 1_000_000 - 190);
         assert_eq!(long[0]["client"], "member-b");
         assert!(long[0]["at"].as_str().unwrap().contains("holds.rs"));
+    }
+
+    #[test]
+    fn a_scope_sees_the_longest_hold_its_thread_asked_for_and_nothing_after_it() {
+        let ((), longest) = longest_during(|| {
+            for held in [5, 25, 10] {
+                let hold = WriterHold::start(HoldKind::Lend, &Holder::current());
+                std::thread::sleep(Duration::from_millis(held));
+                drop(hold);
+            }
+        });
+        assert!(longest >= Duration::from_millis(25), "{longest:?}");
+        assert!(Holder::current().0.observer.is_none());
+        let ((), unasked) = longest_during(|| {});
+        assert_eq!(unasked, Duration::ZERO);
     }
 
     #[test]

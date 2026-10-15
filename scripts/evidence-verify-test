@@ -546,6 +546,60 @@ class SkipPolicy(unittest.TestCase):
                                          'wrapper_sha256': 'e' * 64})
         self.assertEqual(self.f.verify(self.tree, rules=self.rules(json.dumps(doc)))[0], 0)
 
+    def host_policy(self, **level):
+        doc = json.loads(policy_text(trust_levels=['machine', 'host']))
+        wrapper = doc['checks']['unit']['kinds']['wrapper']
+        wrapper['by_level'] = {'host': dict({'command': ['local', 'run'], 'required_inputs': ['flake_lock_sha256'],
+                                              'bind_inputs': {'flake_lock_sha256': 'file.txt'}, 'events': ['pull_request']}, **level)}
+        return json.dumps(doc)
+
+    def host_note(self, **kwargs):
+        defaults = dict(runner='wrapper', command=('local', 'run'), inputs={'flake_lock_sha256': self.good})
+        defaults.update(kwargs)
+        if not hasattr(self, 'host_key'):
+            self.host_key = self.f.key('hostkey', 'host/box')
+        return self.f.note(self.commit, self.tree, self.host_key, 'host/box', **defaults)
+
+    def test_a_signer_level_can_have_its_own_command_inputs_and_events(self):
+        # Without by_level the host level is not even accepted for the check; with it, only its own rule applies.
+        self.host_note()
+        self.assertEqual(self.reason(rules=self.rules(policy_text(trust_levels=['machine']))), 'untrusted_level')
+        code, result = self.f.verify(self.tree, rules=self.rules(self.host_policy()))
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result['kind'], result['events'], result['trust_level']), ('wrapper', ['pull_request'], 'host'))
+        # The ordinary signer is still held to the ordinary wrapper rule (its command and required inputs), with no events limit.
+        self.wrapper(seconds=5)
+        code, result = self.f.verify(self.tree, rules=self.rules(self.host_policy()))
+        self.assertEqual((code, result['trust_level'], result['events']), (0, 'machine', None))
+
+    def test_a_host_note_with_the_ordinary_command_or_missing_its_inputs_is_refused(self):
+        self.host_note(command=('make', 'test'))
+        self.assertEqual(self.reason(rules=self.rules(self.host_policy())), 'wrong_command')
+        self.host_note(seconds=1, inputs={})
+        self.assertEqual(self.reason(rules=self.rules(self.host_policy())), 'missing_input')
+        self.host_note(seconds=2, inputs={'flake_lock_sha256': hashlib.sha256(b'other').hexdigest()})
+        self.assertEqual(self.reason(rules=self.rules(self.host_policy())), 'wrong_input')
+
+    def test_by_level_is_validated_strictly(self):
+        def reason(edit):
+            doc = json.loads(self.host_policy())
+            edit(doc['checks']['unit']['kinds']['wrapper']['by_level'])
+            try:
+                self.rules(json.dumps(doc))
+            except evidence_verify.Failure as error:
+                return error.reason
+            return 'accepted'
+        self.assertEqual(reason(lambda b: None), 'accepted')
+        self.assertEqual(reason(lambda b: b['host'].update(typo=1)), 'error')
+        self.assertEqual(reason(lambda b: b['host'].pop('command')), 'error')
+        self.assertEqual(reason(lambda b: b['host'].update(command=[])), 'error')
+        self.assertEqual(reason(lambda b: b['host'].pop('events')), 'error')  # required: no events would mean every event
+        self.assertEqual(reason(lambda b: b['host'].update(events=[])), 'error')
+        self.assertEqual(reason(lambda b: b['host'].update(events=['pull_request', 'pull_request'])), 'error')
+        self.assertEqual(reason(lambda b: b['host'].update(events=['push'])), 'error')
+        self.assertEqual(reason(lambda b: b.update(unlisted={'command': ['x']})), 'error')  # a level the kind does not accept
+        self.assertEqual(reason(lambda b: b.update({'': {'command': ['x']}})), 'error')
+
     def test_a_bound_input_must_equal_the_file_in_the_verified_tree(self):
         self.wrapper(inputs={'flake_lock_sha256': hashlib.sha256(b'other').hexdigest(), 'toolchain_sha256': 'f' * 64})
         self.assertEqual(self.reason(), 'wrong_input')
@@ -645,6 +699,50 @@ class CommittedPolicy(unittest.TestCase):
         text = (ROOT / '.st/evidence-skip-policy.json').read_text()
         return evidence_verify.policy_rules(text, check, 'compoundingtech/smalltalk')
 
+    def test_declared_inputs_are_exactly_the_reviewed_list_and_all_exist(self):
+        # Written out here: changing what a check depends on is a reviewed change to the policy AND to this list.
+        declared = {'typescript-client': sorted([
+            'apps/fractal-web/package.json', 'apps/fractal-web/packages/st3-sdk/package.json', 'apps/ios',
+            'clients/typescript', 'crates/stui/tests/fixtures/quality-hour.json', 'docs/st3/client-v0/fixtures',
+            'fixtures/clients', 'flake.lock', 'flake.nix', 'package.json', 'packages/fractal-ui/package.json',
+            'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'scripts/ci-typescript-client'])}
+        for check in ('linux-gate', 'typescript-client', 'isolation-vm', 'genie-freshness', 'mail-redelivery-canaries'):
+            rules = self.rules(check)
+            self.assertEqual(sorted(rules['inputs']) if rules['inputs'] else None, declared.get(check), check)
+            for path in rules['inputs'] or ():
+                self.assertTrue((ROOT / path).exists(), f'{check} declares {path}, which does not exist')
+        self.assertEqual(self.rules('typescript-client')['sample_one_in'], 5)
+
+    def test_the_host_level_is_admitted_for_exactly_two_checks_wrapper_kind_and_covers_pull_requests_only(self):
+        policy = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
+        # Nothing enforces anywhere: every check, not only the host ones, keeps enforce false until the flip PR.
+        self.assertEqual({check: entry.get('enforce', False) for check, entry in policy['checks'].items()},
+                         {check: False for check in policy['checks']})
+        with_host = {}
+        for check, entry in policy['checks'].items():
+            for kind, rule in entry['kinds'].items():
+                if 'host' in (rule.get('trust_levels') or []) or 'host' in (rule.get('by_level') or {}):
+                    with_host[(check, kind)] = rule
+            self.assertNotIn('host', entry['trust_levels'], check)  # never the check's own list, so never `observed`
+        self.assertEqual(sorted(with_host), [('genie-freshness', 'wrapper'), ('typescript-client', 'wrapper')])
+        for (check, kind), rule in with_host.items():
+            self.assertEqual(rule['trust_levels'], ['fleet', 'host'], check)
+            override = rule['by_level']['host']
+            self.assertEqual(override['events'], ['pull_request'], check)
+            self.assertEqual(override['bind_inputs'], {'flake_lock_sha256': 'flake.lock'}, check)
+            self.assertEqual(policy['checks'][check].get('enforce', False), False, check)
+            rules = self.rules(check)
+            self.assertEqual(rules['kinds']['wrapper']['by_level']['host']['events'], ['pull_request'])
+        # The commands are the ones scripts/st-test records, so a local note can match.
+        script = ROOT / 'scripts/st-test'
+        if script.exists():
+            loader = importlib.machinery.SourceFileLoader('st_test_policy', str(script))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            st_test = importlib.util.module_from_spec(spec)
+            loader.exec_module(st_test)
+            for (check, kind), rule in with_host.items():
+                self.assertEqual(rule['by_level']['host']['command'], st_test.LOCAL[check], check)
+
     def test_every_required_check_has_a_valid_entry_that_accepts_only_the_fleet_signer(self):
         for check in ('linux-gate', 'typescript-client', 'isolation-vm', 'genie-freshness', 'mail-redelivery-canaries'):
             rules = self.rules(check)
@@ -690,7 +788,246 @@ class CommittedPolicy(unittest.TestCase):
             rules = self.rules(check)
             self.assertEqual(sorted(rules['kinds']), ['observed', 'wrapper'], check)
             self.assertEqual(rules['trust_levels'], ('fleet',), check)  # the wrapper signs as fleet/ci
-            self.assertIsNone(rules['kinds']['wrapper']['trust_levels'], check)  # no weaker signer is admitted
+            # No weaker signer is admitted, except the host level for exactly two checks (see the test for the host level).
+            host_checks = ('genie-freshness', 'typescript-client')
+            self.assertEqual(rules['kinds']['wrapper']['trust_levels'], ('fleet', 'host') if check in host_checks else None, check)
+            self.assertIsNone(rules['kinds']['observed']['trust_levels'], check)
+
+
+class InputKeyed(unittest.TestCase):
+    """A note of another tree counts when it carries the same key for the check's declared input paths."""
+
+    PATHS = ['src', 'lock.txt']
+
+    def setUp(self):
+        self.f = Fixture()
+        self.addCleanup(self.f.tmp.cleanup)
+        self.ci = self.f.key('ci', 'machine/ci1')
+        self.commit, self.tree = self.commit_files({'src/a.txt': 'a', 'lock.txt': 'L', 'docs/readme.txt': 'r'})
+        self.rules = evidence_verify.policy_rules(policy_text(inputs=self.PATHS), 'unit', 'org/repo')
+
+    def commit_files(self, files):
+        for name, content in files.items():
+            path = self.f.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if content is None:
+                path.unlink()
+            else:
+                path.write_text(content)
+        self.f.git('add', '-A')
+        self.f.git('commit', '-q', '-m', 'change ' + ','.join(sorted(files)))
+        return self.f.git('rev-parse', 'HEAD'), self.f.git('rev-parse', 'HEAD^{tree}')
+
+    def key(self, tree, paths=None):
+        return evidence_verify.project(str(self.f.repo), tree, tuple(paths or self.PATHS))
+
+    def observed(self, commit, tree, key, index=True, **kwargs):
+        defaults = dict(runner=OBSERVED, command=('github-actions', 'org/repo', '.github/workflows/fleet.yml', 'unit'),
+                        inputs={'source_inputs': key})
+        defaults.update(kwargs)
+        record = self.f.note(commit, tree, self.ci, 'machine/ci1', **defaults)
+        if index:
+            self.f.git('update-ref', f'refs/notes/evidence-input/unit/{key}/{record}', record)
+        return record
+
+    def check(self, tree):
+        return self.f.verify(tree, rules=self.rules)
+
+    def test_the_key_changes_with_a_declared_file_and_not_with_any_other(self):
+        before = self.key(self.tree)
+        _, undeclared = self.commit_files({'docs/readme.txt': 'edited', 'other/new.txt': 'n'})
+        self.assertNotEqual(undeclared, self.tree)
+        self.assertEqual(self.key(undeclared), before)
+        _, declared = self.commit_files({'src/a.txt': 'changed'})
+        self.assertNotEqual(self.key(declared), before)
+        _, added = self.commit_files({'src/b.txt': 'new file'})
+        self.assertNotEqual(self.key(added), self.key(declared))
+        _, removed = self.commit_files({'src/b.txt': None})
+        self.assertEqual(self.key(removed), self.key(declared))  # back to the same declared content
+        _, locked = self.commit_files({'lock.txt': 'L2'})
+        self.assertNotEqual(self.key(locked), self.key(removed))
+
+    def listing(self, tree, *paths):
+        return subprocess.run(['git', '-C', str(self.f.repo), 'ls-tree', '-r', '-z', '--full-tree', tree, '--', *paths],
+                              capture_output=True, check=True).stdout
+
+    def test_a_name_with_a_newline_cannot_project_one_file_as_two_entries(self):
+        blob = self.f.git('rev-parse', 'HEAD:lock.txt')
+        sneaky = f'src/x\n100644 {blob} 0\tsrc/injected'
+        self.commit_files({sneaky: 'content'})
+        tree = self.f.git('rev-parse', 'HEAD^{tree}')
+        key = self.key(tree)
+        # The projection holds exactly the entries the tree holds under the declared paths: the sneaky name is one file.
+        self.assertEqual(self.listing(key), self.listing(tree, 'src', 'lock.txt'))
+        names = [entry.partition(b'\t')[2] for entry in self.listing(key).split(b'\0') if entry]
+        self.assertIn(sneaky.encode(), names)
+        self.assertNotIn(b'src/injected', names)
+
+    def test_a_symlink_and_a_gitlink_keep_their_modes_in_the_projection(self):
+        link = self.f.repo / 'src/link'
+        link.symlink_to('a.txt')
+        gitlink = '1' * 40
+        self.f.git('add', '-A')
+        self.f.git('update-index', '--add', '--cacheinfo', f'160000,{gitlink},src/vendored')
+        self.f.git('commit', '-q', '-m', 'link and gitlink')
+        tree = self.f.git('rev-parse', 'HEAD^{tree}')
+        key = self.key(tree)
+        projected = self.listing(key)
+        self.assertEqual(projected, self.listing(tree, 'src', 'lock.txt'))
+        self.assertIn(b'120000 blob', projected)
+        self.assertIn(f'160000 commit {gitlink}'.encode(), projected)
+        # Retargeting the link or moving the gitlink changes the key.
+        link.unlink()
+        link.symlink_to('b.txt')
+        self.f.git('add', '-A')
+        self.f.git('update-index', '--add', '--cacheinfo', f'160000,{"2" * 40},src/vendored')
+        self.f.git('commit', '-q', '-m', 'retarget')
+        self.assertNotEqual(self.key(self.f.git('rev-parse', 'HEAD^{tree}')), key)
+
+    def test_declared_paths_that_all_miss_give_no_key_and_match_nothing(self):
+        self.assertIsNone(self.key(self.tree, ['nowhere', 'nothing/here']))
+        empty = self.f.git('hash-object', '-t', 'tree', '/dev/null')
+        # Even a record that claims the empty tree as its key and is indexed under it cannot be found by it.
+        self.observed(self.commit, self.tree, empty)
+        _, other = self.commit_files({'docs/readme.txt': 'edited'})
+        rules = evidence_verify.policy_rules(policy_text(inputs=['nowhere']), 'unit', 'org/repo')
+        code, result = self.f.verify(other, rules=rules)
+        self.assertEqual((code, result['reason']), (1, 'stale_tree'))
+        code, out, _ = self.f.cli('--project', '--check', 'unit', '--revision', 'HEAD', '--paths', 'nowhere')
+        self.assertEqual((code, json.loads(out)['source_inputs']), (0, None))
+
+    def test_the_reported_key_is_the_tree_key_even_when_the_rule_checks_required_inputs(self):
+        self.commit_files({'file.txt': 'one'})
+        commit, tree = self.f.git('rev-parse', 'HEAD'), self.f.git('rev-parse', 'HEAD^{tree}')
+        key = self.key(tree)
+        self.f.note(commit, tree, self.ci, 'machine/ci1', runner='wrapper', command=('make', 'test'),
+                    inputs={'flake_lock_sha256': hashlib.sha256(b'one').hexdigest(), 'toolchain_sha256': 'x'})
+        rules = evidence_verify.policy_rules(policy_text(inputs=self.PATHS), 'unit', 'org/repo')
+        code, result = self.f.verify(tree, rules=rules)
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result['kind'], result['match'], result['source_inputs']), ('wrapper', 'tree', key))
+
+    def test_the_key_depends_on_exactly_the_declared_paths(self):
+        whole = self.key(self.tree, ['.'])
+        self.assertEqual(whole, self.tree)  # declaring everything is the exact-tree rule
+        self.assertNotEqual(self.key(self.tree), whole)
+        self.assertNotEqual(self.key(self.tree, ['src']), self.key(self.tree, ['src', 'lock.txt']))
+        self.assertEqual(self.key(self.tree, ['lock.txt', 'src']), self.key(self.tree, ['src', 'lock.txt']))
+        self.assertEqual(self.key(self.tree, ['src', 'nowhere']), self.key(self.tree, ['src']))  # a missing path adds nothing
+
+    def test_a_note_for_an_earlier_tree_satisfies_a_later_tree_with_the_same_key(self):
+        key = self.key(self.tree)
+        record = self.observed(self.commit, self.tree, key)
+        _, later = self.commit_files({'docs/readme.txt': 'edited'})
+        code, result = self.check(later)
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result['match'], result['matched_tree'], result['source_inputs'], result['record'], result['tree']),
+                         ('inputs', self.tree, key, record, later))
+        # The exact tree is still found as before, and says so.
+        code, result = self.check(self.tree)
+        self.assertEqual((code, result['match']), (0, 'tree'))
+
+    def test_a_changed_declared_file_finds_nothing(self):
+        self.observed(self.commit, self.tree, self.key(self.tree))
+        _, changed = self.commit_files({'src/a.txt': 'edited'})
+        code, result = self.check(changed)
+        self.assertEqual((code, result['reason']), (1, 'stale_tree'))
+
+    def test_a_check_without_declared_inputs_never_matches_by_key(self):
+        self.observed(self.commit, self.tree, self.key(self.tree))
+        _, later = self.commit_files({'docs/readme.txt': 'edited'})
+        plain = evidence_verify.policy_rules(policy_text(), 'unit', 'org/repo')
+        code, result = self.f.verify(later, rules=plain)
+        self.assertEqual((code, result['reason']), (1, 'stale_tree'))
+
+    def test_the_index_ref_is_only_a_pointer_everything_must_still_verify(self):
+        key = self.key(self.tree)
+        _, later = self.commit_files({'docs/readme.txt': 'edited'})
+        # Not indexed: found nothing.
+        record = self.observed(self.commit, self.tree, key, index=False)
+        self.assertEqual(self.check(later)[1]['reason'], 'stale_tree')
+        # Indexed under a key the signed statement does not carry: ignored.
+        other = '0' * len(key)
+        self.f.git('update-ref', f'refs/notes/evidence-input/unit/{other}/{record}', record)
+        self.assertEqual(self.check(later)[1]['reason'], 'stale_tree')
+        # A ref whose suffix is not the record it points at: ignored.
+        forged = self.observed(self.commit, self.tree, 'f' * len(key), index=False)
+        self.f.git('update-ref', f'refs/notes/evidence-input/unit/{key}/{forged}', forged)  # the record says another key
+        self.assertEqual(self.check(later)[1]['reason'], 'stale_tree')
+        self.f.git('update-ref', f'refs/notes/evidence-input/unit/{key}/{"1" * len(key)}', record)
+        self.assertEqual(self.check(later)[1]['reason'], 'stale_tree')
+        # Properly indexed: found.
+        self.f.git('update-ref', f'refs/notes/evidence-input/unit/{key}/{record}', record)
+        self.assertEqual(self.check(later)[0], 0)
+
+    def test_every_other_rule_applies_to_a_record_found_by_key(self):
+        key = self.key(self.tree)
+        _, later = self.commit_files({'docs/readme.txt': 'edited'})
+        for label, kwargs, reason in (
+                ('failed', dict(exit_code=1), 'check_failed'),
+                ('degraded', dict(tier='degraded', sign=False), 'degraded'),
+                ('wrong command', dict(command=('other',)), 'wrong_command'),
+                ('wrong runner', dict(runner='github:elsewhere/repo/actions/runs/1'), 'wrong_runner'),
+                ('unsigned', dict(sign=False), 'bad_signature'),
+                ('future', dict(seconds=3600), 'future_dated')):
+            with self.subTest(label):
+                f = self.__class__('test_the_key_changes_with_a_declared_file_and_not_with_any_other')
+                f.setUp()
+                self.addCleanup(f.f.tmp.cleanup)
+                k = f.key(f.tree)
+                f.observed(f.commit, f.tree, k, **kwargs)
+                _, newer = f.commit_files({'docs/readme.txt': 'edited'})
+                code, result = f.check(newer)
+                self.assertEqual((code, result['reason']), (1, reason), label)
+
+    def test_a_newer_failure_with_the_same_key_stops_the_skip_by_itself(self):
+        key = self.key(self.tree)
+        self.observed(self.commit, self.tree, key)
+        _, second = self.commit_files({'docs/readme.txt': 'edited'})
+        self.assertEqual(self.check(second)[0], 0)
+        self.observed(self.f.git('rev-parse', 'HEAD'), second, key, exit_code=1, seconds=60)  # same key, run for real, failed
+        _, third = self.commit_files({'docs/readme.txt': 'edited again'})
+        code, result = self.check(third)
+        self.assertEqual((code, result['reason']), (1, 'check_failed'))
+        self.observed(self.f.git('rev-parse', 'HEAD'), third, key, seconds=120)  # a newer pass lifts it
+        _, fourth = self.commit_files({'docs/readme.txt': 'and again'})
+        self.assertEqual(self.check(fourth)[0], 0)
+
+    def test_the_policy_validates_inputs_and_sampling(self):
+        def reason(**overrides):
+            try:
+                evidence_verify.policy_rules(policy_text(**overrides), 'unit', 'org/repo')
+            except evidence_verify.Failure as failure:
+                return failure.reason
+            return 'accepted'
+        self.assertEqual(reason(inputs=['src', 'lock.txt'], sample_one_in=5), 'accepted')
+        for bad in ([], '', 'src', ['/etc'], ['../x'], ['a/../b'], ['a//b'], ['a/./b'], ['src*'], ['a b'], [1], ['x\n'],
+                    ['a\\b'], [''], ['src', None]):
+            self.assertEqual(reason(inputs=bad), 'error', repr(bad))
+        self.assertEqual(reason(inputs=[f'p{i}' for i in range(301)]), 'error')
+        for bad in (0, -1, 1001, True, 'five', 2.5, None):
+            self.assertEqual(reason(sample_one_in=bad), 'error', repr(bad))
+        rules = evidence_verify.policy_rules(policy_text(), 'unit', 'org/repo')
+        self.assertEqual((rules['inputs'], rules['sample_one_in']), (None, 1))
+
+    def test_project_on_the_command_line_prints_the_key_for_the_declared_paths(self):
+        key = self.key(self.tree)
+        code, out, _ = self.f.cli('--project', '--check', 'unit', '--revision', 'HEAD', '--paths', 'src,lock.txt')
+        self.assertEqual((code, json.loads(out)['source_inputs']), (0, key))
+        code, out, _ = self.f.cli('--project', '--check', 'unit', '--revision', 'HEAD', '--paths', '../x')
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)['reason'], 'error')
+        self.f.git('add', '-A')
+        (self.f.repo / '.st').mkdir(exist_ok=True)
+        (self.f.repo / '.st/evidence-skip-policy.json').write_text(policy_text(inputs=self.PATHS))
+        self.f.git('add', '-A')
+        self.f.git('commit', '-q', '-m', 'policy')
+        base = self.f.git('rev-parse', 'HEAD')
+        code, out, _ = self.f.cli('--project', '--check', 'unit', '--revision', 'HEAD', '--policy-from', base,
+                                  '--repository', 'org/repo')
+        document = json.loads(out)
+        self.assertEqual((code, document['paths']), (0, sorted(self.PATHS)))
+        self.assertEqual(document['source_inputs'], self.key(self.f.git('rev-parse', 'HEAD^{tree}')))
 
 
 class Sha256Repository(unittest.TestCase):

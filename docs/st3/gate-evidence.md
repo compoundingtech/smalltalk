@@ -358,6 +358,14 @@ catch a stray commit by someone else; a fork never signs); `configure` writes th
 directory and masks every key line; `once CHECK` refuses a second signature for a check in one job;
 `cleanup` overwrites and removes the key, and runs even when earlier steps failed. The wrapper and
 signer scripts must come from the base commit of the change, never from the tree under test.
+Input keys: when the skip policy at the base commit declares `inputs` for a check, the signing job asks the base commit's
+`scripts/evidence-verify --project` for the git tree of the tested tree reduced to those paths and signs it as
+`observed.inputs.source_inputs`; a base without `--project`, a check without inputs, or any error means an exact-tree
+record as before. `scripts/evidence-publish` then also writes `refs/notes/evidence-input/<check>/<source_inputs>/<record>`
+for every accepted record (pass or fail, one ref per record, never replaced) so a gate can find the records of
+another tree with the same inputs by one prefix fetch. The ref is only an index; a record is still accepted only
+by its signature, exact command, required inputs and tier.
+
 Accepted gap: code under test in a job that holds the key can read it. That now includes every pull
 request from this repository: its author controls the workflow file the run executes, so a person or agent with
 write access can read the key and sign any note; the author list narrows who gets a note, it does not
@@ -574,6 +582,20 @@ writes the record id to the job summary. The wiring is deliberately conservative
 - A skip of `genie-freshness` skips the tests of this machinery too (`ci-evidence-gate-test`,
   `evidence-verify-test`, `genie --check`) for that tree. That is accepted because the note is for the same tree and
   a change to those files is a protected path that always runs in full; a reader must not assume they ran.
+- What is protected and what is bound otherwise. The protected paths are the gate, the verifier, both of their
+  tests, the policy, the evidence keys, the workflow source (`fleet.yml.genie.ts`), the helper module it imports
+  (`workspace-ci.ts`) and the generated `fleet.yml`. The signing and publishing wrapper scripts are not on that list:
+  they are bound by the note itself, which carries their `wrapper_sha256`, so a changed wrapper cannot produce a note
+  the policy accepts.
+- A required check that is a job, `isolation-vm` and `mail-redelivery-canaries`, never reports `skipped`; under an
+  enforced skip it reports success with its steps skipped, so once a check is enforced the name means "covered by
+  a trusted note", not "ran". Whoever reads a result (including the observer) must treat such a run as covered, not
+  freshly run; the job's summary says so (`evidence covered by a trusted note`).
+- The aggregate `linux-gate` accepts `skipped` for a stage only in the stage's position and only when that stage's
+  own skip rule evaluates true (the workflow passes one flag per stage), so a stage skipped for any other reason
+  fails the gate even when the aggregate's gate also decided to skip.
+- Step conditions are combined as text only when none contains a marker inside it; the helper that combines them
+  refuses otherwise and a test checks every condition of the generated workflow. Keep actionlint in the required path.
 - The skip rests on a note of kind `observed`, which the central observer records only for a `merge_group`
   run, so a pull request can skip only a tree an earlier queue run already passed. Do not expect a saving at
   pull-request time from these two checks.
@@ -627,6 +649,28 @@ on is the one-line change `"enforce": false` to `"enforce": true` in this file, 
 like any change (the file is read from the accepted base, so the change takes effect for the runs
 after it merges).
 
+`inputs` (optional, per check) lists the repository paths the check's result depends on. With it, a record
+of ANOTHER tree counts when it carries the same input key: `source_inputs`, the git tree id of the tested
+tree reduced to exactly those paths (`git write-tree` of only their files; `.` means everything, whose key is
+the tree itself). `scripts/evidence-verify --project --check C --paths-from BASE ...` prints it, so a producer,
+the observer and the gate compute the same key. The producer signs it as `observed.inputs.source_inputs` and
+publishes the record under `refs/notes/evidence-input/<check>/<source_inputs>/<record id>`; the gate fetches only
+that prefix, and the ref is just an index: whatever it finds must still verify and carry the same signed key.
+Every other rule applies unchanged, and the latest record for the key decides, so a newer failure with the same
+key stops the skip by itself. Paths are literal and relative; an under-declared list is the dangerous direction
+(a stale pass), so each list is reviewed against a trace of what the check opens. `sample_one_in` (default 1)
+keeps running the real job for one run in N even when a note matches, chosen by a hash of the check, the key and
+the head, so a retry behaves the same; the gate prints `decision=run` with a reason starting `sampled`.
+
+The projection reads names as bytes and passes them NUL-terminated both ways (`ls-tree -z`, `update-index -z`),
+so a newline in a name cannot split one file into two entries; symlinks and gitlinks keep their modes. When none
+of the declared paths exists the projection would be the empty tree that every such tree shares, so there is no
+key and nothing matches by it. Two limits are deliberate. The verifier does not recompute the projection of the
+record's own tree: it trusts the key the producer signed, so the producer is trusted exactly as far as for the
+tree rule. And sampling is a comparison sample, not a security control: the head is in the seed, so on a pull
+request an author can re-push to change whether a run is sampled (about five tries at one in five), while in a
+merge group the head is fixed. A result that does not carry the sampling rule at all is treated as sampled.
+
 Each kind has its own rule: the exact `command` the record must have run, an optional
 `runner_prefix`, optional per-kind `trust_levels`, the `required_inputs` it must carry (every one a nonempty string) and
 `bind_inputs`, which must equal the sha256 of a file as it is in the tree being verified. A kind's own
@@ -655,6 +699,47 @@ added to the aggregate, a step renamed), the policy must change with it; until i
 matching and the check runs.
 Write `scripts/evidence-verify --policy-from BASE
 --repository OWNER/NAME` to apply it by hand.
+
+A kind's rule may also name `by_level`: for one signer level (the first part of the principal), its own `command`, `required_inputs`,
+`bind_inputs` and `events` (`pull_request` and/or `merge_group`; `events` is required, so an override can never silently cover every event) replace the kind's. The level must be one the kind accepts. It is how a
+host-signed local note (its command is the `nix develop ...` line `scripts/st-test` runs) can satisfy a check whose CI step wrapper records a
+different command and extra inputs, while each signer is still held to exactly its own rule. The verifier reports the `events` that apply
+and the gate skips only on those events: a note whose signer level lists `pull_request` only never covers a `merge_group` run. Today the
+`host` level is admitted for the `wrapper` kind of `genie-freshness` and `typescript-client`, for pull requests only, with `enforce` false.
+
+### Running the checks locally (`scripts/st-test`)
+
+`scripts/st-test` runs each required check that has a local command (today `genie-freshness` and
+`typescript-client`; `--list` prints them) once, through `evidence-wrap`, on the commit you are pushing (HEAD), and the host's signer
+records the exit code and output digest. The CI gate looks up the note for the pull request head's own tree (see "Which tree a pull
+request run asks about"), so the tree you built and signed is the tree that counts even when main has moved since; the script tells you how
+many commits behind the base the branch is. It no longer signs the merge tree (the merge of the branch into the base): the merge queue still tests
+the integrated tree, and a pass of the merge tree is not made here. The command always runs in a fresh
+throwaway worktree of that commit, so untracked or ignored files in your checkout cannot change the result. A failing run is
+recorded too. `evidence-wrap`, `evidence-sign` and `evidence-verify` come from the accepted base. It prints one
+line per check: result, seconds, and whether the verifier, from the base, now counts the tree as covered
+(`untrusted_signer` until the host's key line is on main). `--push REMOTE` pushes the notes after they verify, with the identity git uses for REMOTE (or
+`EVIDENCE_PUSH_TOKEN`); whether that identity may create `refs/notes/evidence/*` is a repository rule not yet confirmed for agent seats.
+`scripts/st-test --status` runs nothing and says whether the tree is already covered (exit 0 if all, 3 if not).
+
+A pre-push hook does this without anyone remembering. `scripts/install-git-hooks` (run by the default `nix develop` shell outside CI; it prints
+one line the first time and does nothing when `GITHUB_ACTIONS` or `CI` is set) installs a stub in the repository's hooks directory, never replacing
+a hook it did not write and leaving a configured `core.hooksPath` alone. **The hook and the runner are not the pushed branch's:** the stub takes
+`scripts/evidence-prepush` and `scripts/st-test` from `<remote>/main` into a temporary directory and runs those copies (when the base has none it
+does nothing). The checks they run are the tree's code (`nix develop`, `pnpm install`, the tests), on this machine as you with the host's signing key
+within reach: that is cooperative trust (known defect 22), not something the base-pinned hook protects against. When you push the branch
+you have checked out, the hook asks `st-test --status`; if every check is covered the push goes, silently. Otherwise it runs `st-test --push REMOTE`
+(an interactive push waits for it up to `ST_EVIDENCE_TIME_LIMIT`, default 1200 seconds, then stops it with TERM and KILL of its whole process
+group) and the push goes. A push from an agent (`ST_AGENT` set, or no terminal on stderr) runs inside a tool call with a short timeout, so there the hook
+waits at most `ST_EVIDENCE_AGENT_LIMIT` seconds (default 120), prints that signing continues in the background with its log path, and lets the push go;
+the notes are pushed when the run finishes, and agents should run `scripts/st-test --push origin` before pushing so the first CI run already sees them.
+It never blocks a push: a failing check is recorded and printed, a timeout is printed, and so is every other failure (an exception, a missing `python3`,
+a slow fetch, a signer that `.st/evidence-keys` on main does not list, a missing signing key). `ST_SKIP_EVIDENCE=1` skips it and says so. Tags, deletes,
+other branches and the base branch are pushed untouched, and the notes push inside the run does not run the hook again. A new tree always takes the slow
+path (the checks run once); so does every fixup that changes the tree; a tree that already has notes is instant.
+
+It runs `nix develop` and `pnpm install` from the tree under test, on the signing host as its user: code in that tree runs
+there with the key within reach (cooperative trust, see Host keys). It changes no policy: a check skips only where `enforce` is true.
 
 ### When the gate says skip
 
@@ -711,7 +796,7 @@ values and `-` for none:
 
 ```
 evidence-decision v1 check=… decision=skip|run outcome=satisfied|degraded|no_note|rejected|unavailable
-reason=… record=… signer=… trust_level=… kind=… tier=… observed_at=… age_s=… max_age_s=… attempts=… enforce=true|false
+reason=… record=… signer=… trust_level=… kind=… tier=… observed_at=… age_s=… max_age_s=… attempts=… enforce=true|false match=tree|inputs source_inputs=…
 tree=… head=… base=… event=… pr=… repo=… run=… attempt=… fork=true|false verifier_sha256=… gate_sha256=…
 ```
 

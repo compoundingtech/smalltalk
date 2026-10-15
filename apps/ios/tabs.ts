@@ -18,6 +18,7 @@ export type DevLink =
   | { kind: 'session'; id: string; terminal?: string }
   | { kind: 'agent'; id: string }
   | { kind: 'terminal'; id: string }
+  | { kind: 'attention'; id: string }
   | { kind: 'pair'; gateway: string; id: string; code: string };
 
 /** A Debug-only deep link, e.g. `com.compoundingtech.smalltalk.starter://tab/Resources`. */
@@ -36,6 +37,7 @@ export function parseDevLink(link: string): DevLink | null {
     }
     case 'agent': { const id = params.get('id'); return id?.startsWith('agent/') ? { kind: 'agent', id } : null; }
     case 'terminal': { const id = params.get('id'); return id?.startsWith('terminal/') ? { kind: 'terminal', id } : null; }
+    case 'attention': { const id = params.get('id'); return id?.startsWith('attention/') ? { kind: 'attention', id } : null; }
     case 'pair': {
       const gateway = params.get('gateway'), id = params.get('id'), code = params.get('code');
       return gateway && id && code ? { kind: 'pair', gateway, id, code } : null;

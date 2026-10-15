@@ -6,6 +6,10 @@
 //   com.compoundingtech.smalltalk.starter://pair?gateway=http://<LAN or Tailscale IP>:<port>&id=demo&code=demo
 //
 // Never point a Release build or a real device at it: nothing here is real or authenticated.
+// The phone verifies device-key proofs before it saves any credential, so the demo mints real
+// (invented-key) grants: an ed25519 host authority grants an ed25519 person root, and pairing
+// answers with that root proof for read-only verification. Nothing here is a real identity.
+import { createHash, generateKeyPairSync, randomBytes, sign as ed25519Sign } from 'node:crypto';
 import http from 'node:http';
 // `ws` arrives with Expo's tooling; version 7's CommonJS export names the server `Server`.
 import ws from 'ws';
@@ -18,6 +22,60 @@ const now = Date.now();
 const ago = (minutes) => new Date(now - minutes * 60_000).toISOString();
 const snapshot = { id: 'snapshot/demo/1', host_id: 'host/harbor', store_index: 1, projection_version: 'client-projection.v0', created_at: ago(0) };
 const envelope = (value) => ({ api_version: API_VERSION, request_id: `request/${Math.random().toString(16).slice(2)}`, snapshot, value });
+const b64url = bytes => Buffer.from(bytes).toString('base64url');
+const rawPublic = pair => b64url(pair.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32));
+const hostPair = generateKeyPairSync('ed25519');
+const personRootPair = generateKeyPairSync('ed25519');
+const hostKey = rawPublic(hostPair), personRootKey = rawPublic(personRootPair);
+const sha256hex = bytes => createHash('sha256').update(bytes).digest('hex');
+// Canonical CBOR maps in Rust's lexical key order with shortest integer lengths, matching the
+// app's pairingProof.ts encoder, so the phone's content hashes match these grant ids.
+const cbor = value => {
+  const out = [];
+  const head = (major, count) => {
+    if (count < 24) out.push(major * 32 + count);
+    else {
+      const size = count <= 0xff ? 1 : count <= 0xffff ? 2 : count <= 0xffffffff ? 4 : 8;
+      out.push(major * 32 + ({ 1: 24, 2: 25, 4: 26, 8: 27 })[size]);
+      let n = BigInt(count);
+      const bytes = Array(size);
+      for (let at = size - 1; at >= 0; at--) { bytes[at] = Number(n & 255n); n >>= 8n; }
+      out.push(...bytes);
+    }
+  };
+  const write = item => {
+    if (item === null) out.push(0xf6);
+    else if (typeof item === 'boolean') out.push(item ? 0xf5 : 0xf4);
+    else if (typeof item === 'number') head(item < 0 ? 1 : 0, item < 0 ? -1 - item : item);
+    else if (typeof item === 'string') { const bytes = Buffer.from(item, 'utf8'); head(3, bytes.length); out.push(...bytes); }
+    else if (Array.isArray(item)) { head(4, item.length); for (const entry of item) write(entry); }
+    else {
+      const fields = Object.entries(item).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+      head(5, fields.length);
+      for (const [key, entry] of fields) { write(key); write(entry); }
+    }
+  };
+  write(value);
+  return Buffer.from(out);
+};
+const grantId = grant => sha256hex(cbor([grant.batch_id, grant.subject, grant.kind, grant.origin, grant.actor ?? null, grant.body, grant.predecessors]));
+const signGrant = (grant, privateKey) => {
+  const content = sha256hex(cbor(['smallclaims.claim-content.v1', grant.subject, grant.kind, grant.actor ?? null, grant.body]));
+  const text = `smallclaims-claim-v1\n${content}\n${grant.signature.signer}\n\n${grant.signature.key}\n${grant.signature.chain.join(',')}\n${grant.signature.nonce}\n${grant.signature.signed_at_unix_ms}`;
+  grant.signature.signature = b64url(ed25519Sign(null, Buffer.from(text, 'utf8'), privateKey));
+};
+// The read-only demo person root, granted by the invented host authority and signed with its key.
+const rootProof = () => {
+  const grant = {
+    id: '', batch_id: `batch/demo/${randomBytes(16).toString('hex')}`, subject: 'person/demo', kind: 'principal.key-granted', origin: 'demo-gateway', actor: 'host/demo',
+    body: { evidence: [], fields: { issuer: 'host/demo', issuer_key: hostKey, key: personRootKey, role: 'root' } },
+    predecessors: [],
+    signature: { signer: 'host/demo', key: hostKey, chain: [], nonce: randomBytes(16).toString('hex'), signed_at_unix_ms: Date.now(), signature: '' },
+  };
+  grant.id = grantId(grant);
+  signGrant(grant, hostPair.privateKey);
+  return grant;
+};
 const page = (collection, items) => ({ kind: 'page', collection, filters: {}, items, page: { has_more: false, limit: 30 } });
 
 const agent = (name, extra = {}) => ({
@@ -116,8 +174,13 @@ const server = http.createServer((request, response) => {
   request.on('end', () => {
     const path = url.pathname;
     console.log(request.method, path);
-    if (path === '/v1/client/capabilities') return send(capabilities);
-    if (/^\/v1\/client\/pairings\/[^/]+\/complete$/.test(path)) return send({ kind: 'paired-session', credential: 'demo-credential', device_id: 'device/demo-phone', expires_at: '2026-12-31T00:00:00Z', person_id: 'person/demo', scopes: [], session_actor: 'person/demo' });
+    if (path === '/v1/client/capabilities') {
+      // The unauthenticated preflight is the raw advertisement the phone verifies before it
+      // submits the code; the paired client's bearer still gets the enveloped capabilities.
+      if (!request.headers.authorization) { response.writeHead(200, { 'content-type': 'application/json' }); return response.end(JSON.stringify({ api_version: API_VERSION, capabilities: [{ id: 'device-key-proofs', state: 'granted', version: 1 }] })); }
+      return send(capabilities);
+    }
+    if (/^\/v1\/client\/pairings\/[^/]+\/complete$/.test(path)) return send({ kind: 'paired-session', credential: 'demo-credential-0123456789abcdef0123456789abcdef', device_id: `device/${'0'.repeat(23)}1`, expires_at: '2026-12-31T00:00:00Z', person_id: 'person/demo', scopes: ['read.projections', 'attention', 'message.send', 'terminal.input'], session_actor: 'person/demo', device_key_chain: [], device_key_proofs: [], person_root_key_proof: rootProof() });
     if (path === '/v1/client/sessions') return send(page('sessions', url.searchParams.get('history') === 'true' ? [] : sessions));
     if (path === '/v1/client/machines') return send(page('machines', machines));
     if (path === '/v1/client/devices') return send(page('devices', devices));
@@ -128,6 +191,9 @@ const server = http.createServer((request, response) => {
     const runtimeMatch = /^\/v1\/client\/runtimes\/(.+)$/.exec(path);
     if (runtimeMatch) return send({ kind: 'runtime', id: decodeURIComponent(runtimeMatch[1]), revision: 'r1', updated_at: ago(1), desired_revision: null, incarnation_id: 'inc-1', owner_host_id: 'host/harbor', owner_id: 'agent/example/beacon', runtime_id: 'demo', runtime_kind: 'agent', state: 'running', terminal_id: 'terminal/demo' });
     if (/^\/v1\/client\/terminals\/[^/]+\/screen$/.test(path)) return send(screen);
+    // The phone's own measurements (observations.ts): accepted, so a reported batch is done. The
+    // response is the flat observation envelope with no snapshot, as the client accepts there.
+    if (path === '/v1/client/observations') { response.writeHead(200, { 'content-type': 'application/json' }); return response.end(JSON.stringify({ api_version: API_VERSION, request_id: `request/${Math.random().toString(16).slice(2)}`, value: { accepted: true } })); }
     if (path === '/v1/client/actions') {
       let action = {};
       try { action = JSON.parse(body); } catch { /* keep empty */ }

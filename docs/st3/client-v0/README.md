@@ -14,7 +14,8 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 [`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
-The contract digest is written once, in `crates/st3-client/src/contract.rs`. When generated
+No digest of the contract is committed: a line every schema change rewrites made any two of them
+conflict, and `--check` already fails when any generated file differs from its source. When generated
 client files conflict in a merge, resolve the schema and template files, take either side of every
 generated file (`git checkout --theirs -- clients crates/st3-client/src/contract.rs
 crates/st3-client/src/generated.rs`), and run the generator again; never edit generated files by
@@ -1955,6 +1956,9 @@ Assistant session errors add `TimelineViewAssistantError` with `status`,
 `superseded_by` with epoch-ms `timestamp`, `response_id`, `provider`, `model`).
 Recovery markers do not invent live retry state. Recovered errors start compact,
 retain original errors on expansion, and superseded errors are not drawn.
+The optional open `native` object preserves exact `stopReason`, `errorMessage`,
+`errorStatus`, `errorId` and `retryRecovery` values, including structured/null
+diagnostics and future fields, without changing the presentation projection.
 
 
 `read.projections` authorizes **raw native conversation content**, including full

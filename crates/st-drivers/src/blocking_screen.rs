@@ -334,7 +334,7 @@ pub fn screen_prompt(driver: &str, screen: &str) -> Option<ScreenPrompt> {
 /// another rule. Claude replaces the box with its dialog while a permission, question or plan
 /// prompt is up, and shows it again once the prompt is answered or dismissed (measured on Claude
 /// Code 2.1.296: Esc or "No" ends the turn without any hook event). The box is also on screen
-/// while Claude works, so it says a prompt is gone only after the prompt's dialog was seen.
+/// while Claude works; use `claude_input_idle` when its absence of a dialog must prove closure.
 pub fn claude_input_ready(screen: &str) -> bool {
     let rule = |line: &str| line.chars().count() >= 20 && line.chars().all(|c| c == '─');
     // A dialog's selected choice (`❯ 1. Yes`) is not the input prompt.
@@ -353,6 +353,16 @@ pub fn claude_input_ready(screen: &str) -> bool {
     lines
         .windows(3)
         .any(|window| rule(window[0]) && prompt(window[1]) && rule(window[2]))
+}
+
+/// Positive native idle evidence, not merely a box that can remain visible while a tool runs
+/// or before its permission dialog is drawn. The current footer must offer shortcuts rather
+/// than interruption. This can be re-derived after a missed dismissal or daemon restart.
+pub fn claude_input_idle(screen: &str) -> bool {
+    claude_input_ready(screen)
+        && screen.lines().rev().find(|line| !line.trim().is_empty()).is_some_and(|footer| {
+            footer.contains("? for shortcuts") && !footer.contains("esc to interrupt")
+        })
 }
 
 #[cfg(test)]
@@ -380,9 +390,9 @@ mod tests {
             "claude-trust.txt",
         ] {
             assert!(!super::claude_input_ready(screen(dialog)), "{dialog}");
+            assert!(!super::claude_input_idle(screen(dialog)), "{dialog}");
         }
-        // The box is back after a refusal, and also while Claude works: only a dialog seen
-        // first makes its return mean the prompt is gone.
+        // The working box is not closure; the current native idle footer is.
         for input in [
             "claude-permission-refused.txt",
             "claude-edit-refused.txt",
@@ -390,6 +400,13 @@ mod tests {
         ] {
             assert!(super::claude_input_ready(screen(input)), "{input}");
         }
+        for idle in ["claude-permission-refused.txt", "claude-edit-refused.txt"] {
+            assert!(super::claude_input_idle(screen(idle)), "{idle}");
+        }
+        assert!(!super::claude_input_idle(screen("claude-working.txt")));
+        assert!(!super::claude_input_idle(
+            "────────────────────────────────────────\n❯\n────────────────────────────────────────\n"));
+        assert!(!super::claude_input_idle(""));
         assert!(!super::claude_input_ready(""));
         // A dialog's selected choice between two rules is not the input prompt.
         assert!(!super::claude_input_ready(

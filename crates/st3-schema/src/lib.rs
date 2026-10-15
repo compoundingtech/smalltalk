@@ -299,9 +299,8 @@ impl Registry {
 
     pub fn markdown(&self) -> String {
         let mut output = format!(
-            "# st3 schema registry\n\nThis file is generated from `st3-schema`.\n\nSchema: `{}`\nDigest: `{}`\nStorage version: `{}`\nStorage digest: `{}`\n\n",
+            "# st3 schema registry\n\nThis file is generated from `st3-schema`.\n\nSchema: `{}`\nStorage version: `{}`\nStorage digest: `{}`\n\n",
             self.name,
-            self.digest(),
             STORAGE_VERSION,
             storage_digest()
         );

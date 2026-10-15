@@ -9,7 +9,7 @@ import type { RootParams } from '../navigation';
 import { attentionKindLabel } from '../presentation';
 import { useStore } from '../store';
 import { theme } from '../theme';
-import { Button, Markdown, Note, T } from '../ui';
+import { Button, Markdown, Note, T, useTextAppearance } from '../ui';
 
 // Alerts in an agent's conversation: everything that waits on the person and belongs to this
 // agent, above the conversation, answerable there. Each is a line that opens to its question and
@@ -84,6 +84,7 @@ export function AlertBody({ item, from, calls, seats }: { item: KeptAttention; f
 // are listed and only Deny is offered, and the terminal shows which one Claude asks about.
 function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: PendingCall[] }) {
   const { busy, status, actions } = useStore();
+  const appearance = useTextAppearance();
   const prompt = promptAnswers(item)!;
   const disabled = busy || status !== 'online';
   const offered = offeredAnswers(prompt, calls);
@@ -97,7 +98,7 @@ function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: Pending
   };
   return <View style={{ gap: 8 }}>
     {item.detail ? <T selectable>{cleanMessageText(item.detail)}</T> : null}
-    {calls.map(each => <View key={each.id} style={{ backgroundColor: theme.crust, borderRadius: 4, padding: 8, gap: 2 }}>
+    {calls.map(each => <View key={each.id} style={{ backgroundColor: appearance.system ? appearance.colors.grouped : theme.crust, borderRadius: 4, padding: 8, gap: 2 }}>
       <T bold color={theme.person}>{each.tool}</T>
       {each.lines.map((line, index) => <T key={index} selectable>{line}</T>)}
     </View>)}
@@ -118,6 +119,7 @@ function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: Pending
 type Structured = NonNullable<Parameters<ReturnType<typeof useStore>['actions']['done']>[0]['request']>;
 export function StructuredRequestView({ item, request, from, onAnswered }: { item: Parameters<ReturnType<typeof useStore>['actions']['done']>[0]; request: Structured; from: string; onAnswered: () => void }) {
   const { busy, status, actions } = useStore();
+  const appearance = useTextAppearance();
   const disabled = busy || status !== 'online';
   const label = (id: string) => request.answers?.find(answer => answer.id === id)?.label ?? id;
   const send = (answer: { id: string; label: string; outcome?: string | null }) => answer.outcome === 'request_changes'
@@ -137,8 +139,8 @@ export function StructuredRequestView({ item, request, from, onAnswered }: { ite
       ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
       : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
     <T bold color={theme.person}>{from} is waiting on you.</T>
-    {request.answers?.map(answer => <Pressable key={answer.id} disabled={disabled} onPress={() => send(answer)}
-      style={{ borderLeftWidth: 2, borderLeftColor: request.recommendation?.answer === answer.id ? theme.green : theme.surface1, paddingLeft: 8, paddingVertical: 4, opacity: disabled ? 0.5 : 1 }}>
+    {request.answers?.map(answer => <Pressable key={answer.id} accessibilityRole="button" accessibilityLabel={`${answer.label}. ${answer.consequence ?? ''}`} accessibilityState={{ disabled }} disabled={disabled} onPress={() => send(answer)}
+      style={{ borderLeftWidth: 2, borderLeftColor: appearance.color(request.recommendation?.answer === answer.id ? theme.green : theme.surface1), paddingLeft: appearance.system ? 12 : 8, paddingVertical: appearance.system ? 12 : 4, minHeight: appearance.system ? 44 : undefined, opacity: disabled ? 0.5 : 1 }}>
       <T bold color={theme.accent}>{answer.label}{request.recommendation?.answer === answer.id ? <T color={theme.green}>  recommended</T> : null}{answer.outcome === 'request_changes' ? <T color={theme.yellow}>  needs your words</T> : null}</T>
       <T dim>{answer.consequence}</T>
     </Pressable>)}
@@ -149,12 +151,13 @@ export function StructuredRequestView({ item, request, from, onAnswered }: { ite
 
 // A request's question: a JSON report as its telling fields, anything else as Markdown.
 export function RequestQuestion({ text }: { text: string }) {
+  const appearance = useTextAppearance();
   const shown = report(text);
   if (!shown) return <Markdown text={spaced(text)} color={theme.text} />;
   const tone = { fault: theme.red, text: theme.text, soft: theme.subtext0 } as const;
   return <View style={{ gap: 2 }}>
     {shown.before ? <Markdown text={shown.before} color={theme.text} /> : null}
-    {shown.rows.map(row => <T key={row.key} numberOfLines={1}><T dim>{row.key}  </T><T color={tone[row.tone]}>{row.value}</T></T>)}
+    {shown.rows.map(row => <T key={row.key} numberOfLines={appearance.system ? undefined : 1}><T dim>{row.key}  </T><T color={tone[row.tone]}>{row.value}</T></T>)}
     {shown.more ? <T dim>… {shown.more} more fields</T> : null}
   </View>;
 }
