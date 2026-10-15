@@ -569,6 +569,87 @@ export type ClientConnections = {
   member: string;
 };
 
+export type ClientDiagnosticBreadcrumb = "native-start" | "js-start" | "root-mounted" | "foreground" | "background" | "previous-launch-unclean";
+
+export type ClientDiagnosticCaptureSource = "js" | "native-marker" | "metrickit";
+
+export type ClientDiagnosticEvent = {
+  app_version: string;
+  capture_source: ClientDiagnosticCaptureSource;
+  captured_at_unix_ms: ClientDiagnosticMilliseconds;
+  event_id: ClientDiagnosticUuid;
+  launch_id: ClientDiagnosticUuid;
+  launch_id_basis: ClientDiagnosticLaunchIdBasis;
+  native_build: string;
+  occurred_at_unix_ms: ClientDiagnosticMilliseconds;
+  occurrence_time_basis: ClientDiagnosticOccurrenceTimeBasis;
+  os_version: string;
+  payload: ClientDiagnosticPayload;
+  platform: ClientDiagnosticPlatform;
+  runtime_version: string;
+  sequence: number;
+  severity: ClientDiagnosticSeverity;
+  update_id: ("embedded" | ClientDiagnosticUuid);
+};
+
+export type ClientDiagnosticJsErrorName = "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError" | "UnknownError";
+
+export type ClientDiagnosticJsFrame = {
+  column: number;
+  line: number;
+  module: ClientDiagnosticJsModule;
+};
+
+export type ClientDiagnosticJsModule = "app" | "react-native" | "unknown";
+
+export type ClientDiagnosticLaunchIdBasis = "process" | "metric-interval";
+
+export type ClientDiagnosticMilliseconds = number;
+
+export type ClientDiagnosticNativeBinary = "app" | "system" | "unknown";
+
+export type ClientDiagnosticNativeFrame = {
+  binary: ClientDiagnosticNativeBinary;
+  offset: string;
+};
+
+export type ClientDiagnosticOccurrenceTimeBasis = "exact" | "metric-interval-end";
+
+export type ClientDiagnosticPayload = ({
+  breadcrumb: ClientDiagnosticBreadcrumb;
+  inferred: boolean;
+  kind: "launch";
+} | {
+  fatal: boolean;
+  frames: Array<ClientDiagnosticJsFrame>;
+  kind: "js-error";
+  name: ClientDiagnosticJsErrorName;
+} | {
+  exception_type: number | null;
+  frames: Array<ClientDiagnosticNativeFrame>;
+  kind: "native-crash";
+  signal: number | null;
+} | {
+  duration_ms: ClientDiagnosticMilliseconds;
+  frames: Array<ClientDiagnosticNativeFrame>;
+  kind: "hang";
+});
+
+export type ClientDiagnosticPlatform = "ios";
+
+export type ClientDiagnosticSeverity = "info" | "warning" | "error" | "fatal";
+
+export type ClientDiagnosticUuid = string;
+
+export type ClientDiagnosticsAck = {
+  acknowledged_event_ids: Array<ClientDiagnosticUuid>;
+};
+
+export type ClientDiagnosticsBatch = {
+  events: Array<ClientDiagnosticEvent>;
+  version: 1;
+};
+
 export type CollectionCommand = ({
   actor?: null;
   collection: "clients" | "usage" | "machines" | "devices" | "sessions" | "terminals";
@@ -820,7 +901,7 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (DirectiveNotes | Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
+  value: (DirectiveNotes | Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | ClientDiagnosticsAck | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
 export type ErrorCode = ("recipient-retired" | "lifecycle-unavailable" | "retirement-upgrade-required" | "attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "suspend-authored-session-selection" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "message-too-large" | "message-store-full" | "long-message-signature-unsupported" | "internal" | string);
@@ -1416,7 +1497,7 @@ export type PairingBegin = {
   device_name: string;
   full_control?: boolean;
   person_id: string;
-  scopes?: Array<"read.projections" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches">;
+  scopes?: Array<"read.projections" | "write.client-diagnostics" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches">;
 };
 
 export type PairingChallenge = {

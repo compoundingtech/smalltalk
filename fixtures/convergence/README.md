@@ -7,6 +7,12 @@ reserved fields. The seeded generator draws kinds and fields from this snapshot;
 each tested revision still admits them through its own native registry and store.
 The corpus conformance test requires every live registry kind to be represented.
 
+`claims-v2.json` is the current registry snapshot, including the four node-local
+`client.*` diagnostic kinds. The simulation includes v2 because its coverage test
+requires those kinds; v1 remains unchanged for comparisons pinned to that corpus.
+Generate a new version with
+`cargo run --locked -p st3-schema --example claim_corpus -- fixtures/convergence/claims-vN.json`.
+
 Keep the snapshot fixed when comparing revisions. For a future schema change,
 create a new version with `serde_json::to_string_pretty(&st3_schema::registry().claims)`
 and deliberately update the simulation's include. Apply identical simulation

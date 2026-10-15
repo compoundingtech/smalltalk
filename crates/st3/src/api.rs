@@ -67,6 +67,7 @@ mod terminal_gate_evidence;
 mod message_bodies;
 mod client_adapters;
 mod client_presence;
+mod client_diagnostics;
 mod client_v0;
 mod custom;
 mod delivery_presence;
@@ -383,6 +384,14 @@ mod storage_contention_response_tests {
         }
         assert_eq!(super::ApiError::bad(super::St3Error::new("internal", "other fault")).status, super::StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    #[test]
+    fn diagnostic_rate_limit_keeps_its_public_retryable_code() {
+        let response = super::ApiError::bad(super::St3Error::new("client-diagnostics-rate-limit", "slow down"));
+        assert_eq!(response.status, super::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(super::client_error_code(Some(&response.code)), "rate-limited");
+        assert!(super::client_error_retryable(response.status, Some("rate-limited")));
+    }
 }
 
 #[derive(Debug)]
@@ -416,6 +425,7 @@ impl ApiError {
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
             "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
+            "client-diagnostics-rate-limit" => StatusCode::TOO_MANY_REQUESTS,
             "read-deadline" => StatusCode::GATEWAY_TIMEOUT,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -523,6 +533,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/health", get(health))
         .route("/v1/harnesses", get(available_harnesses))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route(
+            "/v1/client/diagnostics",
+            post(client_diagnostics::ingest)
+                .layer(DefaultBodyLimit::max(client_diagnostics::MAX_REQUEST_BYTES)),
+        )
         .route("/v1/client/notes", get(directive_notes::read))
         .route("/v1/notes", axum::routing::put(directive_notes::write))
         .route("/v1/client/sets", get(owned_sets::list))
@@ -1713,6 +1728,7 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
 
 fn client_error_code(code: Option<&str>) -> String {
     match code.unwrap_or("internal") {
+        "client-diagnostics-rate-limit" => "rate-limited".into(),
         "recipient-retired"
         | "lifecycle-unavailable"
         | "retirement-upgrade-required"

@@ -29,6 +29,7 @@ import { FabricProofScreen } from './screens/FabricProof';
 import { quality } from './qualityNative';
 import { qualityVisibility } from './qualityView';
 import { parseFabricProofLink, type FabricProofInput } from './fabricProof';
+import { DiagnosticsBoundary } from './DiagnosticsBoundary';
 
 // The chrome is native: one UITabBarController (react-native-screens' tabs, through
 // @react-navigation/bottom-tabs' native navigator) holding a UINavigationController per tab
@@ -181,7 +182,7 @@ function Main({ proofSession = false }: { proofSession?: boolean }) {
 
 const qualityLayout = () => quality.commit();
 
-export default function App() {
+function AppContent() {
   const [fabricProof, setFabricProof] = useState<FabricProofInput | null>(null);
   useEffect(() => {
     if (!__DEV__) return;
@@ -205,4 +206,8 @@ export default function App() {
       <NavigationContainer ref={navigationRef} theme={navigationTheme}><Main /></NavigationContainer>
     </StoreProvider>}
   </SafeAreaProvider>;
+}
+
+export default function App() {
+  return <DiagnosticsBoundary><AppContent /></DiagnosticsBoundary>;
 }

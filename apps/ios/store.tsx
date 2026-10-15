@@ -32,6 +32,8 @@ import { readSidebarResources } from './sidebarResources';
 import { SIDEBAR_RETIRED, sidebarArrangement, sidebarRetired, sidebarSubject } from './sidebarEdits';
 import { fetch as expoFetch } from 'expo/fetch';
 import { decodeBase64, encodeBase64, type Picked } from './images';
+import { DiagnosticsConnection } from './DiagnosticsConnection';
+import { recordDiagnosticCapabilities } from './diagnostics';
 
 // Everything the screens share: the paired gateway, the one collections socket, the lists it keeps
 // current, the lists a screen loads when it opens, and the actions. Screens follow a conversation
@@ -385,6 +387,7 @@ function useAppStore(proof?: FabricProfile) {
     try {
       const capability = await client.capabilities();
       if (!current()) return;
+      recordDiagnosticCapabilities(client, capability.value);
       if (cachedActor.current && cachedActor.current !== capability.value.session_actor) { clearCaches(); if (!proofRef.current) void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
       cachedActor.current = capability.value.session_actor;
       setCaps(capability.value);
@@ -1061,7 +1064,10 @@ export type Store = ReturnType<typeof useAppStore>;
 const StoreContext = createContext<Store | null>(null);
 export function StoreProvider({ children, proof }: { children: ReactNode; proof?: FabricProfile }) {
   const store = useAppStore(proof);
-  return <StoreContext.Provider value={store}>{children}</StoreContext.Provider>;
+  return <StoreContext.Provider value={store}>
+    <DiagnosticsConnection client={store.client} url={store.url} credential={store.credential} enabled={!proof} />
+    {children}
+  </StoreContext.Provider>;
 }
 export function useStore(): Store {
   const store = useContext(StoreContext);

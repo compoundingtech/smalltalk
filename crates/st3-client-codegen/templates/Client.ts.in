@@ -2,6 +2,7 @@
 import { API_VERSION } from './Models.generated.ts';
 import type {
     ObservationReport, ObservationResponse, AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, MessageBody, EnvelopeOf,
+    ClientDiagnosticsBatch, ClientDiagnosticsAck,
     ResourcesFilter, ResourcesPage, DirectiveNotes,
     Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
@@ -105,11 +106,17 @@ function defaultTerminalSocket(url: string, protocols: string[], headers: Record
 export class ClientError extends Error {
     public readonly response: ErrorEnvelope;
     public readonly status: number;
+    public readonly retryAfterMs?: number;
 
-    constructor(response: ErrorEnvelope, status: number) {
+    constructor(response: ErrorEnvelope, status: number, retryAfter?: string | null) {
         super(response.message);
         this.response = response;
         this.status = status;
+        if (retryAfter) {
+            const seconds = /^\d+(?:\.\d+)?$/.test(retryAfter) ? Number(retryAfter) : undefined;
+            const delay = seconds === undefined ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
+            if (Number.isFinite(delay)) this.retryAfterMs = Math.max(0, delay);
+        }
         this.name = 'ClientError';
     }
 }
@@ -217,7 +224,7 @@ export class St3Client {
             throw new Error('Unexpected st client API response');
         }
         if (!response.ok || 'error_version' in payload) {
-            throw new ClientError(payload as ErrorEnvelope, response.status);
+            throw new ClientError(payload as ErrorEnvelope, response.status, response.headers.get('Retry-After'));
         }
         if ((path !== '/v1/client/observations' && !('snapshot' in payload)) || !('value' in payload)) {
             throw new Error('Incomplete st client API response');
@@ -272,6 +279,11 @@ export class St3Client {
     async submitAction(request: ActionRequest): Promise<EnvelopeOf<ActionResult>> {
         await this.discover();
         return this.request<ActionResult>('POST', '/v1/client/actions', request);
+    }
+
+    /** Upload 1–32 bounded events (at most 128 KiB). Acknowledged IDs are durable, including duplicates. Requires write.client-diagnostics. */
+    diagnosticsSubmit(batch: ClientDiagnosticsBatch): Promise<EnvelopeOf<ClientDiagnosticsAck>> {
+        return this.request<ClientDiagnosticsAck>('POST', '/v1/client/diagnostics', batch);
     }
 
     /** Local diagnostic acceptance, without a snapshot fence or durable action receipt. */

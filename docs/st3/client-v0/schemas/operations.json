@@ -75,6 +75,7 @@
     {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
   ],
   "commands": [
+    { "id": "diagnostics.submit", "method": "POST", "path": "/v1/client/diagnostics", "request": "ClientDiagnosticsBatch", "response": "ClientDiagnosticsAck", "scope": "write.client-diagnostics", "max_request_bytes": 131072 },
     {"id": "observations.report", "method": "POST", "path": "/v1/client/observations", "request": "ObservationReport", "response": "ObservationResponse", "authentication": "paired-session", "max_request_bytes": 65536, "durable_receipt": false, "replicated": false, "snapshot_fence": false},
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },

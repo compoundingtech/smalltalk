@@ -2743,6 +2743,14 @@ impl Client {
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
+    /// Upload 1–32 bounded events (at most 128 KiB). Acknowledged IDs are durable,
+    /// including duplicates. Requires `write.client-diagnostics`.
+    pub async fn diagnostics_submit(
+        &self,
+        batch: &ClientDiagnosticsBatch,
+    ) -> Result<Envelope<ClientDiagnosticsAck>, ClientError> {
+        self.post("/v1/client/diagnostics", batch).await
+    }
     /// Local diagnostic acceptance; retry the identical disjoint intervals and report ID.
     pub async fn observations_report(
         &self,
@@ -2750,7 +2758,6 @@ impl Client {
     ) -> Result<ObservationResponse, ClientError> {
         self.post("/v1/client/observations", report).await
     }
-
     pub async fn pairing_begin(
         &self,
         request: &PairingBegin,

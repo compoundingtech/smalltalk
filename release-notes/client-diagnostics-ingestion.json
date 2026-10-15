@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add paired iOS diagnostics capture and a durable gateway ingestion route (POST /v1/client/diagnostics) with node-local, seven-day client observations.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection recovery is triggered. The new client.* observations are node-local and are not replicated; the API does not wait for recovery."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Opening the store creates the table client_diagnostic_receipts (device, event_id, accepted_at_unix_ms; primary key device and event_id) and two time indexes with CREATE ... IF NOT EXISTS, for retry de-duplication. The storage version stays 19 and the storage digest is unchanged, so a table is added without a version bump. The claim vocabulary gains the subject kind client/DEVICE and the local claim kinds client.launch, client.js-error, client.native-crash and client.hang (7-day transition retention), which changes the registry digest in docs/st3/schema.md."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule change and no coordinated member upgrade is required; the new claim kinds are local and are not sealed or replicated."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Public client contract addition: POST /v1/client/diagnostics (batches of 1 to 32 events within 128 KiB, refused with 429 client-diagnostics-rate-limit above 256 new events per device per minute), the pairing scope write.client-diagnostics (capability version 1, in default limited and full-control pairings), the diagnostics.submit operation and about 16 ClientDiagnostic* schema entries, with regenerated Rust, TypeScript and Swift client methods and a new client contract hash. The generated schema digest differs from the previous release. A daemon on the previous build has no diagnostics route, so a client on this build cannot deliver diagnostics to it. Whether older clients see any change on a new daemon beyond the added scope has not been verified."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon restart; creating the receipts table and indexes on an empty table is expected to be negligible but was not measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Existing paired devices keep their granted scopes and must be re-paired to acquire write.client-diagnostics; only new default limited and full-control pairings include it. Until then the iOS app cannot submit diagnostics. Verify with the device capabilities listing, which shows write.client-diagnostics as granted."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Swapping back to the previous binary leaves client_diagnostic_receipts unused and loses the route; no migration is applied. Whether the previous build reads node-local client.* observations already written without error has not been verified, so confirm that before relying on a swap-back after diagnostics have been ingested."
+  }
+}

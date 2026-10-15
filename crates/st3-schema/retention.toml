@@ -35,6 +35,11 @@
 "checkpoint.excused" = { class = "durable" }
 "checkpoint.sealed" = { class = "durable" }
 "checkpoint.verified" = { class = "durable" }
+# Paired client diagnostics are accepted durably by their gateway into its local observation log.
+"client.hang" = { class = "transition", window = "7d", log = "local" }
+"client.js-error" = { class = "transition", window = "7d", log = "local" }
+"client.launch" = { class = "transition", window = "7d", log = "local" }
+"client.native-crash" = { class = "transition", window = "7d", log = "local" }
 "daemon.diagnostic" = { class = "current" }
 "daemon.started" = { class = "transition", window = "7d", pending = "restart windows read every start" }
 "delivery.hold" = { class = "durable" }

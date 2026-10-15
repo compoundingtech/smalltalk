@@ -75,6 +75,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_publication_bootstrap",
         "local_publication_launch_epoch",
         "local_observations",
+        "client_diagnostic_receipts",
         "local_runtime_starts",
         "local_runtime_start_evidence",
         "local_runtime_start_observation_generation",
