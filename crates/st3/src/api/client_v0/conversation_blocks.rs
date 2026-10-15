@@ -388,9 +388,49 @@ fn image(value: &Value) -> bool {
         )
 }
 
-fn image_media(_value: &Value) -> &str {
-    // Native MIME labels are untrusted. Fetch reports the detected passive image format.
-    "application/octet-stream"
+/// What a reader can say about an inline image before fetching it: the format its own first
+/// bytes show and its decoded size. Native MIME labels are untrusted, so a source whose bytes are
+/// not inline (a path, a URL) or not a known image keeps `application/octet-stream` and no size.
+fn image_facts(value: &Value) -> (&'static str, Option<usize>) {
+    let unknown = ("application/octet-stream", None);
+    let Some(source) = image_source(value) else {
+        return unknown;
+    };
+    // A preview keeps the head of a long value and names the whole value's length; the head
+    // still shows the format, and the length gives the size to within the two padding bytes.
+    let (source, clipped) = match source.split_once("\n[st truncated this native timeline value: size limit; ") {
+        Some((head, marker)) => match marker.split_once(' ').and_then(|(bytes, _)| bytes.parse::<usize>().ok()) {
+            Some(bytes) => (head, Some(bytes)),
+            None => return unknown,
+        },
+        None => (source, None),
+    };
+    let data = match source.strip_prefix("data:") {
+        Some(url) => match url.split_once(";base64,") {
+            Some((_, data)) => data,
+            None => return unknown,
+        },
+        None => source,
+    };
+    let prefix = source.len() - data.len();
+    let data = data.trim_end();
+    if data.len() < 16 || data.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return unknown;
+    }
+    let Ok(head) = STANDARD.decode(&data[..16]) else {
+        return unknown;
+    };
+    let Some(media) = crate::blobs::sniff_media_type(&head) else {
+        return unknown;
+    };
+    let size = match clipped {
+        Some(bytes) => bytes.saturating_sub(prefix) / 4 * 3,
+        None => {
+            let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count();
+            data.len() / 4 * 3 - padding.min(2)
+        }
+    };
+    (media, Some(size))
 }
 
 fn external_image(value: &Value) -> bool {
@@ -429,7 +469,8 @@ fn image_refs(
         if external_image(value) {
             return false;
         }
-        *value = json!({"type":"image","content":continuation(reference(source,basis,session,item,pointer),image_media(value),None,"on-demand")});
+        let (media, size) = image_facts(value);
+        *value = json!({"type":"image","content":continuation(reference(source,basis,session,item,pointer),media,size,"on-demand")});
         return true;
     }
     let mut changed = false;
@@ -586,10 +627,11 @@ pub(super) fn prepare_one(
             if block["kind"] == "image" && external_image(&block["payload"]) {
                 block["kind"] = json!("image_link");
             } else if block["kind"] == "image" {
+                let (media, size) = image_facts(&block["payload"]);
                 block["continuation"] = continuation(
                     reference(source, basis, session_id, &original, &pointer),
-                    image_media(&block["payload"]),
-                    None,
+                    media,
+                    size,
                     "on-demand",
                 );
                 block["payload"] = json!({});
@@ -1124,6 +1166,37 @@ fn detected_media(bytes: &[u8]) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_inline_image_names_its_sniffed_format_and_decoded_size_and_nothing_else_does() {
+        let png = b"\x89PNG\r\n\x1a\n0123456789abcdef-pixels";
+        let encoded = STANDARD.encode(png);
+        for value in [
+            json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":encoded}}),
+            json!({"type":"input_image","image_url":format!("data:image/gif;base64,{encoded}")}),
+            json!({"type":"image","mimeType":"image/png","data":encoded}),
+        ] {
+            // The label says jpeg or gif; the bytes say png, and the bytes win.
+            assert_eq!(image_facts(&value), ("image/png", Some(png.len())), "{value}");
+        }
+        // A preview's head and the whole value's length, as the fold clips a long image.
+        let long = STANDARD.encode([&png[..], &[0u8; 3002][..]].concat());
+        let clipped = format!("{}\n[st truncated this native timeline value: size limit; {} bytes]", &long[..64], long.len());
+        assert_eq!(image_facts(&json!({"type":"image","source":{"type":"base64","data":clipped}})), ("image/png", Some(png.len() + 3002)));
+        let url = format!("data:image/png;base64,{long}");
+        let clipped = format!("{}\n[st truncated this native timeline value: size limit; {} bytes]", &url[..80], url.len());
+        assert_eq!(image_facts(&json!({"type":"input_image","image_url":clipped})), ("image/png", Some(png.len() + 3002)));
+        for value in [
+            json!({"type":"image","data":format!("{}\n[st truncated this native timeline value: size limit; many bytes]", &long[..64])}),
+            json!({"type":"image","data":STANDARD.encode(b"<svg><script>alert(1)</script></svg>")}),
+            json!({"type":"image","data":"file:///etc/passwd"}),
+            json!({"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}),
+            json!({"type":"input_image","image_url":"data:image/png,not-base64"}),
+            json!({"type":"image","data":"AAAA"}),
+        ] {
+            assert_eq!(image_facts(&value), ("application/octet-stream", None), "{value}");
+        }
+    }
     use super::*;
     use crate::external_sessions::ExternalDriver;
 
@@ -1432,8 +1505,10 @@ mod tests {
                 .find(|block| block["kind"] == "image")
                 .unwrap();
             let reference = &image["continuation"];
-            // Inline data is not decoded until fetch; the chunk reports the detected MIME.
-            assert_eq!(reference["media_type"], "application/octet-stream");
+            // Only the first bytes are decoded before fetch: enough to name the format the bytes
+            // show and the size, so a reader sees both before loading.
+            assert_eq!(reference["media_type"], "image/png");
+            assert_eq!(reference["size"], pixels.len());
             assert_eq!(reference["reason"], "on-demand");
             let token = reference["ref"].as_str().unwrap();
             assert!(locator(token, &native.id).unwrap().image);

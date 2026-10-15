@@ -4514,6 +4514,10 @@ struct WorkAskArgs {
     /// feedback, with named answers the person picks and you read back as data.
     #[arg(long, value_name = "FILE", long_help = STRUCTURED_REQUEST_HELP)]
     request: Option<PathBuf>,
+    /// Show the person an image with the request (PNG, JPEG, GIF or WebP, at most 10 MiB, up
+    /// to 4). It is uploaded to this member and read by the person through the ask.
+    #[arg(long = "attach", value_name = "FILE", requires = "request")]
+    attach: Vec<PathBuf>,
     #[arg(long, conflicts_with = "new_run")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     step: Option<String>,
@@ -16994,7 +16998,8 @@ and `"custom": true` also takes the person's own words. `feedback` asks for text
 answers. `why_person` says why no runtime fact or standing instruction settles it. Omit
 `recommendation` to make none. An `update` asks nothing: it names `about`, the person's own
 run or step or their message to you, and clears once read (`st work update` builds one). Subject kinds: pull_request, issue, document, mission, run,
-step, agent, host, commit, link; `revision` pins what was reviewed.
+step, agent, host, commit, link; `revision` pins what was reviewed. `--attach FILE` shows the
+person an image with the request (up to 4), as `st conversations send --attach` does.
 
   {"version": 1, "type": "decision",
    "question": "Land #11 then #12?",
@@ -17119,11 +17124,17 @@ async fn run_work(
         }
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
-            let request = args
+            let mut request = args
                 .request
                 .as_deref()
                 .map(read_structured_request)
                 .transpose()?;
+            if let Some(request) = request.as_mut().filter(|_| !args.attach.is_empty()) {
+                let uploaded = upload_attachments(endpoint, &args.actor, &args.attach).await?;
+                let mut attachments = request["attachments"].as_array().cloned().unwrap_or_default();
+                attachments.extend(uploaded.iter().map(|attachment| serde_json::json!(attachment)));
+                request["attachments"] = serde_json::Value::Array(attachments);
+            }
             let reason = match (args.reason, &request) {
                 (Some(reason), _) => reason,
                 (None, Some(request)) => request["question"]

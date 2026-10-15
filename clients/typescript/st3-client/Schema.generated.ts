@@ -314,6 +314,17 @@ export const DeviceSignature = /*#__PURE__*/ (() => Schema.Struct({
 export type DeviceSignature = typeof DeviceSignature.Type
 export type DeviceSignatureEncoded = typeof DeviceSignature.Encoded
 
+export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
+  "blob": Schema.String.check(Schema.isPattern(new RegExp("^blob/[0-9a-f]{64}$", "u"))),
+  "media_type": Schema.Literals(["image/png","image/jpeg","image/gif","image/webp"]),
+  "name": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "origin": Id,
+  "sha256": Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{64}$", "u"))),
+  "size": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "Attachment" }))()
+export type Attachment = typeof Attachment.Type
+export type AttachmentEncoded = typeof Attachment.Encoded
+
 export const RequestAnswerOption = /*#__PURE__*/ (() => Schema.Struct({
   "conditions": optionalKey(Schema.Array(Schema.String)),
   /** What happens next when the person gives this answer. */
@@ -341,6 +352,8 @@ export type RequestSubjectEncoded = typeof RequestSubject.Encoded
 /** A typed question with named answers. A decision names one accept, one decline and at most one request_changes answer; a choice names 2 to 5 options; feedback asks for text. */
 export const StructuredRequest = /*#__PURE__*/ (() => Schema.Struct({
   "answers": optionalKey(Schema.Array(RequestAnswerOption).check(Schema.isMaxLength(5))),
+  /** Images to look at, read with the blob route and the ask's step as the carrier (message=step-run/…). */
+  "attachments": optionalKey(Schema.Array(Attachment).check(Schema.isMaxLength(4))).annotate({ description: "Images to look at, read with the blob route and the ask's step as the carrier (message=step-run/…)." }),
   /** A choice also takes an answer in the person's own words. */
   "custom": optionalKey(Schema.Boolean).annotate({ description: "A choice also takes an answer in the person's own words." }),
   "question": Schema.String.check(Schema.isMinLength(1)),
@@ -1045,17 +1058,6 @@ export const ArrangementPage = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "ArrangementPage" }))()
 export type ArrangementPage = typeof ArrangementPage.Type
 export type ArrangementPageEncoded = typeof ArrangementPage.Encoded
-
-export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
-  "blob": Schema.String.check(Schema.isPattern(new RegExp("^blob/[0-9a-f]{64}$", "u"))),
-  "media_type": Schema.Literals(["image/png","image/jpeg","image/gif","image/webp"]),
-  "name": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
-  "origin": Id,
-  "sha256": Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{64}$", "u"))),
-  "size": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
-}).annotate({ identifier: "Attachment" }))()
-export type Attachment = typeof Attachment.Type
-export type AttachmentEncoded = typeof Attachment.Encoded
 
 export const AttentionBlocked = /*#__PURE__*/ (() => Schema.Struct({
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),

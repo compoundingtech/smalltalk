@@ -140,6 +140,8 @@ st work ask --for person/ada --title 'Review the garden README' \
   --idempotency-key garden-readme-decision --as "$ST_AGENT"
 ```
 
+To show the person an image with the question, add `--attach FILE` (up to four PNG, JPEG, GIF or WebP images of at most 10 MiB each): the person sees each on the card.
+
 Use `--step` for a currently claimed step instead of `--new-run`, as [missions in practice](missions-in-practice.md#ask-for-a-decision-that-comes-up-during-work) shows. Name why the person is needed and the exact subject/revision they are reviewing. The agent finishes all work it can do independently before asking.
 
 For feedback, the agent can instead write:

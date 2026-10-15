@@ -1647,3 +1647,29 @@ fn a_waiting_or_running_status_with_a_real_reason_is_never_hidden() {
     assert_eq!(shown(status("failed", None)), 1);
     assert_eq!(shown(status("cancelled", None)), 1);
 }
+
+#[test]
+fn a_delivered_image_is_the_messages_image_and_never_its_seat_path() {
+    let sha = "ab".repeat(32);
+    let delivery = format!(
+        "<smalltalk-message id=\"d1\" from=\"person/ada\" to=\"agent/example/gardener\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/d1\">\nthe pond again\n<attachment path=\"/home/example/.local/state/st3/drivers/gardener/attachments/{sha}.png\" media_type=\"image/png\" bytes=\"1269\" name=\"pond.png\"/>\n<attachment media_type=\"image/png\" bytes=\"70\" name=\"seed.png\" unavailable=\"expired\"/>\n</smalltalk-message>"
+    );
+    let mut prompt = item("delivered", 1, 1, &delivery);
+    prompt.role = st3_client::TimelineRole::User;
+    let entries = adapt::conversation(&[prompt], &Default::default());
+    let Some(Body::Mail { body, images, .. }) = entries.iter().map(|entry| &entry.body).find(|body| matches!(body, Body::Mail { .. })) else {
+        panic!("{entries:#?}");
+    };
+    assert_eq!(body, "the pond again\n\n[seed.png · expired]");
+    assert_eq!(
+        images,
+        &[MailImage {
+            sha256: sha,
+            message: "message/d1".into(),
+            media_type: "image/png".into(),
+            name: Some("pond.png".into()),
+            size: 1269,
+        }]
+    );
+    assert!(!serde_json::to_string(&entries).unwrap().contains("/home/example"));
+}
