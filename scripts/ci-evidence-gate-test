@@ -133,6 +133,18 @@ class Decide(unittest.TestCase):
         self.assertEqual(decision, 'run')
         self.assertTrue(reason.startswith('sampled:'), reason)
 
+    def test_a_note_valid_only_for_some_events_does_not_skip_another_event(self):
+        context, result, tree = self.good()
+        result['events'] = ['pull_request']
+        context['event'] = 'pull_request'
+        self.assertEqual(gate.decide(context, 'satisfied', result, tree)[0], 'skip')
+        context['event'] = 'merge_group'
+        decision, reason = gate.decide(context, 'satisfied', result, tree)
+        self.assertEqual(decision, 'run')
+        self.assertIn('covers pull requests only', reason)
+        result['events'] = None
+        self.assertEqual(gate.decide(context, 'satisfied', result, tree)[0], 'skip')
+
     def test_removing_any_one_condition_runs(self):
         context, result, tree = self.good()
         cases = {

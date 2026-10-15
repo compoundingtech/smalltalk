@@ -66,7 +66,21 @@ CHECK_KEYS = {'kinds', 'trust_levels', 'max_age_s', 'enforce', 'inputs', 'sample
 CHECK_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 PATH_PART = re.compile(r'[A-Za-z0-9._@+=,~#-]+')
 MAX_INPUTS = 300
-KIND_KEYS = {'command', 'runner_prefix', 'required_inputs', 'bind_inputs', 'trust_levels'}
+KIND_KEYS = {'command', 'runner_prefix', 'required_inputs', 'bind_inputs', 'trust_levels', 'by_level'}
+LEVEL_KEYS = {'command', 'required_inputs', 'bind_inputs', 'events'}
+EVENTS = ('pull_request', 'merge_group')
+
+
+def checked_command_inputs(rule, where):
+    command = rule['command']
+    if not (isinstance(command, list) and command and all(isinstance(v, str) and v for v in command)):
+        raise Failure('error', f'skip policy for {where}: command must be a nonempty list of strings')
+    required = rule.get('required_inputs', [])
+    bind = rule.get('bind_inputs', {})
+    if not (isinstance(required, list) and all(isinstance(v, str) and v for v in required)
+            and isinstance(bind, dict) and all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in bind.items())):
+        raise Failure('error', f'skip policy for {where}: malformed required_inputs or bind_inputs')
+    return command, required, bind
 
 
 def policy_rules(text, check, repository):
@@ -111,21 +125,28 @@ def policy_rules(text, check, repository):
     for kind, rule in entry['kinds'].items():
         if kind not in KINDS or not isinstance(rule, dict) or set(rule) - KIND_KEYS or 'command' not in rule:
             raise Failure('error', f'skip policy for {check}: kind {kind!r} is not valid')
-        command = rule['command']
-        if not (isinstance(command, list) and command and all(isinstance(v, str) and v for v in command)):
-            raise Failure('error', f'skip policy for {check}/{kind}: command must be a nonempty list of strings')
-        required = rule.get('required_inputs', [])
-        bind = rule.get('bind_inputs', {})
+        command, required, bind = checked_command_inputs(rule, f'{check}/{kind}')
         prefix = rule.get('runner_prefix')
         kind_levels = rule.get('trust_levels')
         if kind_levels is not None and not (isinstance(kind_levels, list) and kind_levels
                                             and all(isinstance(v, str) and v for v in kind_levels)):
             raise Failure('error', f'skip policy for {check}/{kind}: trust_levels must be a nonempty list of names')
-        if not (isinstance(required, list) and all(isinstance(v, str) and v for v in required)
-                and isinstance(bind, dict) and all(isinstance(k, str) and k and isinstance(v, str) and v
-                                                   for k, v in bind.items())
-                and (prefix is None or (isinstance(prefix, str) and prefix))):
-            raise Failure('error', f'skip policy for {check}/{kind}: malformed inputs or runner_prefix')
+        if not (prefix is None or (isinstance(prefix, str) and prefix)):
+            raise Failure('error', f'skip policy for {check}/{kind}: malformed runner_prefix')
+        by_level = {}
+        for level, override in (rule.get('by_level') or {}).items():
+            # `events` is required: an override that left it out would cover every event, the merge queue included.
+            if not isinstance(level, str) or not level or not isinstance(override, dict) or set(override) - LEVEL_KEYS \
+                    or not {'command', 'events'} <= set(override):
+                raise Failure('error', f'skip policy for {check}/{kind}: by_level {level!r} is not valid')
+            if level not in (kind_levels or levels):
+                raise Failure('error', f'skip policy for {check}/{kind}: by_level {level!r} is not among the trust levels this kind accepts')
+            events = override['events']
+            if not (isinstance(events, list) and events and len(set(events)) == len(events) and all(e in EVENTS for e in events)):
+                raise Failure('error', f'skip policy for {check}/{kind}: events must be a nonempty list of {", ".join(EVENTS)}')
+            lcommand, lrequired, lbind = checked_command_inputs(override, f'{check}/{kind}/{level}')
+            by_level[level] = {'command': [fill(v) for v in lcommand], 'required_inputs': sorted(set(lrequired) | set(lbind)),
+                               'bind_inputs': dict(lbind), 'events': list(events)}
         kinds[kind] = {'command': [fill(v) for v in command],
                        'runner_prefix': fill(prefix) if prefix else None,
                        # Binding an input also requires it, so the list can never be shorter than the binding.
@@ -133,7 +154,10 @@ def policy_rules(text, check, repository):
                        'bind_inputs': dict(bind),
                        # A kind may name its own signer levels; otherwise it uses the check's. Naming them
                        # per kind is what lets a weaker signer satisfy `wrapper` without ever satisfying `observed`.
-                       'trust_levels': tuple(kind_levels) if kind_levels else None}
+                       'trust_levels': tuple(kind_levels) if kind_levels else None,
+                       # A signer level may be held to its own command, inputs and events (a host key may sign a different command and
+                       # may cover pull requests only), whatever the rest of the kind says.
+                       'by_level': by_level}
     return {'kinds': kinds, 'trust_levels': tuple(levels), 'max_age_s': max_age, 'enforce': enforce,
             'inputs': inputs, 'sample_one_in': sample}
 
@@ -371,6 +395,7 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
         raise Failure('untrusted_tier', f'latest record has tier {predicate["tier"]}, not full', attempts=attempts)
     kind = kind_of(observed['runner'])
     required_inputs = ()
+    rule, events = None, None
     if rules is not None:
         # The repository's skip policy decides everything about this record, by its kind.
         rule = rules['kinds'].get(kind) if kind else None
@@ -387,6 +412,10 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
     if trust_levels is not None and level not in trust_levels:
         raise Failure('untrusted_level', f'signer trust level {level!r} is not accepted for this check',
                       attempts=attempts)
+    # A signer level may be held to its own command, required inputs and events (by_level in the kind's rule).
+    override = rule['by_level'].get(level) if rule else None
+    if override:
+        command, bind, required_inputs, events = override['command'], list(override['bind_inputs'].items()), override['required_inputs'], override['events']
     if runner_prefix is not None and not observed['runner'].startswith(runner_prefix):
         raise Failure('wrong_runner', 'record is for a different repository or producer', attempts=attempts)
     # A future-dated record is refused whether or not an age limit is set: otherwise a trusted
@@ -426,6 +455,7 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
         'match': 'tree' if statement['subject'][0]['digest']['gitTree'] == tree else 'inputs',
         'matched_tree': statement['subject'][0]['digest']['gitTree'], 'source_inputs': input_key,
         'sample_one_in': rules['sample_one_in'] if rules is not None else 1,
+        'events': events,
     }
 
 

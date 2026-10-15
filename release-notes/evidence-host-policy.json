@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Teach the evidence skip policy per-signer-level rules and event limits, and admit the host signer level for two checks on pull requests, without enforcing anything",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this changes the CI evidence verifier, gate and policy files only."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes. Every check stays enforce false, so nothing skips because of this change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No command, frame, scope or stored-format change in the product; the skip policy gains an optional by_level key that older verifiers reject, which fails closed."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is required by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent product state changes or new swap-back restrictions."
+  }
+}

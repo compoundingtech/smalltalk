@@ -546,6 +546,60 @@ class SkipPolicy(unittest.TestCase):
                                          'wrapper_sha256': 'e' * 64})
         self.assertEqual(self.f.verify(self.tree, rules=self.rules(json.dumps(doc)))[0], 0)
 
+    def host_policy(self, **level):
+        doc = json.loads(policy_text(trust_levels=['machine', 'host']))
+        wrapper = doc['checks']['unit']['kinds']['wrapper']
+        wrapper['by_level'] = {'host': dict({'command': ['local', 'run'], 'required_inputs': ['flake_lock_sha256'],
+                                              'bind_inputs': {'flake_lock_sha256': 'file.txt'}, 'events': ['pull_request']}, **level)}
+        return json.dumps(doc)
+
+    def host_note(self, **kwargs):
+        defaults = dict(runner='wrapper', command=('local', 'run'), inputs={'flake_lock_sha256': self.good})
+        defaults.update(kwargs)
+        if not hasattr(self, 'host_key'):
+            self.host_key = self.f.key('hostkey', 'host/box')
+        return self.f.note(self.commit, self.tree, self.host_key, 'host/box', **defaults)
+
+    def test_a_signer_level_can_have_its_own_command_inputs_and_events(self):
+        # Without by_level the host level is not even accepted for the check; with it, only its own rule applies.
+        self.host_note()
+        self.assertEqual(self.reason(rules=self.rules(policy_text(trust_levels=['machine']))), 'untrusted_level')
+        code, result = self.f.verify(self.tree, rules=self.rules(self.host_policy()))
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result['kind'], result['events'], result['trust_level']), ('wrapper', ['pull_request'], 'host'))
+        # The ordinary signer is still held to the ordinary wrapper rule (its command and required inputs), with no events limit.
+        self.wrapper(seconds=5)
+        code, result = self.f.verify(self.tree, rules=self.rules(self.host_policy()))
+        self.assertEqual((code, result['trust_level'], result['events']), (0, 'machine', None))
+
+    def test_a_host_note_with_the_ordinary_command_or_missing_its_inputs_is_refused(self):
+        self.host_note(command=('make', 'test'))
+        self.assertEqual(self.reason(rules=self.rules(self.host_policy())), 'wrong_command')
+        self.host_note(seconds=1, inputs={})
+        self.assertEqual(self.reason(rules=self.rules(self.host_policy())), 'missing_input')
+        self.host_note(seconds=2, inputs={'flake_lock_sha256': hashlib.sha256(b'other').hexdigest()})
+        self.assertEqual(self.reason(rules=self.rules(self.host_policy())), 'wrong_input')
+
+    def test_by_level_is_validated_strictly(self):
+        def reason(edit):
+            doc = json.loads(self.host_policy())
+            edit(doc['checks']['unit']['kinds']['wrapper']['by_level'])
+            try:
+                self.rules(json.dumps(doc))
+            except evidence_verify.Failure as error:
+                return error.reason
+            return 'accepted'
+        self.assertEqual(reason(lambda b: None), 'accepted')
+        self.assertEqual(reason(lambda b: b['host'].update(typo=1)), 'error')
+        self.assertEqual(reason(lambda b: b['host'].pop('command')), 'error')
+        self.assertEqual(reason(lambda b: b['host'].update(command=[])), 'error')
+        self.assertEqual(reason(lambda b: b['host'].pop('events')), 'error')  # required: no events would mean every event
+        self.assertEqual(reason(lambda b: b['host'].update(events=[])), 'error')
+        self.assertEqual(reason(lambda b: b['host'].update(events=['pull_request', 'pull_request'])), 'error')
+        self.assertEqual(reason(lambda b: b['host'].update(events=['push'])), 'error')
+        self.assertEqual(reason(lambda b: b.update(unlisted={'command': ['x']})), 'error')  # a level the kind does not accept
+        self.assertEqual(reason(lambda b: b.update({'': {'command': ['x']}})), 'error')
+
     def test_a_bound_input_must_equal_the_file_in_the_verified_tree(self):
         self.wrapper(inputs={'flake_lock_sha256': hashlib.sha256(b'other').hexdigest(), 'toolchain_sha256': 'f' * 64})
         self.assertEqual(self.reason(), 'wrong_input')
@@ -659,6 +713,36 @@ class CommittedPolicy(unittest.TestCase):
                 self.assertTrue((ROOT / path).exists(), f'{check} declares {path}, which does not exist')
         self.assertEqual(self.rules('typescript-client')['sample_one_in'], 5)
 
+    def test_the_host_level_is_admitted_for_exactly_two_checks_wrapper_kind_and_covers_pull_requests_only(self):
+        policy = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
+        # Nothing enforces anywhere: every check, not only the host ones, keeps enforce false until the flip PR.
+        self.assertEqual({check: entry.get('enforce', False) for check, entry in policy['checks'].items()},
+                         {check: False for check in policy['checks']})
+        with_host = {}
+        for check, entry in policy['checks'].items():
+            for kind, rule in entry['kinds'].items():
+                if 'host' in (rule.get('trust_levels') or []) or 'host' in (rule.get('by_level') or {}):
+                    with_host[(check, kind)] = rule
+            self.assertNotIn('host', entry['trust_levels'], check)  # never the check's own list, so never `observed`
+        self.assertEqual(sorted(with_host), [('genie-freshness', 'wrapper'), ('typescript-client', 'wrapper')])
+        for (check, kind), rule in with_host.items():
+            self.assertEqual(rule['trust_levels'], ['fleet', 'host'], check)
+            override = rule['by_level']['host']
+            self.assertEqual(override['events'], ['pull_request'], check)
+            self.assertEqual(override['bind_inputs'], {'flake_lock_sha256': 'flake.lock'}, check)
+            self.assertEqual(policy['checks'][check].get('enforce', False), False, check)
+            rules = self.rules(check)
+            self.assertEqual(rules['kinds']['wrapper']['by_level']['host']['events'], ['pull_request'])
+        # The commands are the ones scripts/st-test records, so a local note can match.
+        script = ROOT / 'scripts/st-test'
+        if script.exists():
+            loader = importlib.machinery.SourceFileLoader('st_test_policy', str(script))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            st_test = importlib.util.module_from_spec(spec)
+            loader.exec_module(st_test)
+            for (check, kind), rule in with_host.items():
+                self.assertEqual(rule['by_level']['host']['command'], st_test.LOCAL[check], check)
+
     def test_every_required_check_has_a_valid_entry_that_accepts_only_the_fleet_signer(self):
         for check in ('linux-gate', 'typescript-client', 'isolation-vm', 'genie-freshness', 'mail-redelivery-canaries'):
             rules = self.rules(check)
@@ -704,7 +788,10 @@ class CommittedPolicy(unittest.TestCase):
             rules = self.rules(check)
             self.assertEqual(sorted(rules['kinds']), ['observed', 'wrapper'], check)
             self.assertEqual(rules['trust_levels'], ('fleet',), check)  # the wrapper signs as fleet/ci
-            self.assertIsNone(rules['kinds']['wrapper']['trust_levels'], check)  # no weaker signer is admitted
+            # No weaker signer is admitted, except the host level for exactly two checks (see the test for the host level).
+            host_checks = ('genie-freshness', 'typescript-client')
+            self.assertEqual(rules['kinds']['wrapper']['trust_levels'], ('fleet', 'host') if check in host_checks else None, check)
+            self.assertIsNone(rules['kinds']['observed']['trust_levels'], check)
 
 
 class InputKeyed(unittest.TestCase):

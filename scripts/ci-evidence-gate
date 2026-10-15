@@ -80,6 +80,8 @@ def decide(context, outcome, result, tree):
     checks = [
         (not sampled(context, result, tree), 'sampled: the real job runs anyway, to compare it with the note'),
         (result.get('enforce') is True, 'shadow: the note would cover this check, but the skip policy has not turned skipping on for it'),
+        (result.get('events') is None or context['event'] in result['events'],
+         'the policy does not let this signer level cover this event (a host key covers pull requests only)'),
         (result.get('satisfied') is True, 'verifier did not report satisfied'),
         (result.get('policy') is True, 'the skip policy was not applied'),
         (result.get('tier') == 'full', 'tier is not full'),
