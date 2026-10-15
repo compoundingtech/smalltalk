@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Attribute daemon background CPU and poll counts to static task names, buffer hot-task metrics, and label writer batch phases without losing individual submitters' accounting",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "CPU counters and task scopes are in memory only."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "OTel gains st.task.cpu_time in seconds and st.task.polls, both labeled by the bounded static st.task attribute. HTTP route instrumentation is unchanged."},
+  "downtime": {"status": "none", "detail": "Only the usual daemon restart to install the build."},
+  "manual": {"status": "none", "detail": "The counters use the existing OTel meter provider; no new configuration or dependency."},
+  "recovery": {"status": "none", "detail": "The previous binary can be restored; no state is persisted."}
+}

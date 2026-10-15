@@ -134,7 +134,7 @@ pub fn start_published_lists(state: &AppState) {
         state.store.clone(),
         |store| store.published_missions_list(),
         "missions",
-        "missions/refresh",
+        "published_list.missions",
         fold_missions,
         false,
     );
@@ -142,7 +142,7 @@ pub fn start_published_lists(state: &AppState) {
         state.store.clone(),
         |store| store.published_work_list(),
         "work",
-        "work/refresh",
+        "published_list.work",
         fold_work,
         true,
     );
@@ -152,7 +152,7 @@ pub fn start_published_lists(state: &AppState) {
 /// directly.
 #[cfg(test)]
 pub(crate) fn start_published_work(state: &AppState) {
-    spawn(state.store.clone(), |store| store.published_work_list(), "work", "work/refresh", fold_work, true);
+    spawn(state.store.clone(), |store| store.published_work_list(), "work", "published_list.work", fold_work, true);
 }
 
 /// Fold and publish the work list once, as its refresher does, for tests that drive it.
@@ -202,7 +202,7 @@ fn spawn<R: Send + Sync + 'static>(
     let Some(wake) = list(&store).start() else {
         return;
     };
-    tokio::spawn(async move {
+    tokio::spawn(crate::task_cpu::account(label, async move {
         // The writer's callback only wakes this task; it never reads.
         let commits = Arc::clone(&wake);
         let _observer = store.observe_commits(move |_| commits.notify_one());
@@ -219,7 +219,7 @@ fn spawn<R: Send + Sync + 'static>(
             list(&store).note_fold();
             let reader = store.clone();
             let folded = tokio::task::spawn_blocking(move || {
-                crate::profile::task(label, || {
+                crate::task_cpu::blocking(label, || {
                     let list = list(&reader);
                     let (base, generation) = list.base();
                     let folded = fold(&reader, base.as_deref());
@@ -297,7 +297,7 @@ fn spawn<R: Send + Sync + 'static>(
                 None => wake.notified().await,
             }
         }
-    });
+    }));
 }
 
 enum Advance<R, P> {

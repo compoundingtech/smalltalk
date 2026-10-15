@@ -46,6 +46,49 @@ subtract writer wait or report only a hierarchy component. This is server comple
 network delivery time. Abandoned and still-running requests have no sample. Existing long-poll
 route durations include deliberate waiting.
 
+## Background task CPU
+
+The daemon exports `st.task.cpu_time`, a monotonic counter in seconds, and
+`st.task.polls`, a counter of future polls and blocking invocations, through its
+existing OTel meter provider. Both carry the bounded static attribute `st.task`.
+Two thread-CPU clock reads bracket each future poll, on the thread executing
+that poll; time asleep, queued, or waiting between polls is not CPU. Blocking
+callbacks are measured on their executing thread, not the awaiting Tokio worker.
+These counters do not require file profiling. An unavailable thread CPU clock
+omits that CPU sample rather than recording wall time; polls still count.
+Each future keeps CPU and poll totals locally, flushing to OTel at most once a
+second while polling and once when it completes or is dropped. A parked task's
+remaining sample is flushed when it next polls or is dropped; there is no timer
+task per wrapper. Nested wrappers on the same thread count their polls but leave
+CPU to the outermost wrapper, so adding their rates does not count that CPU twice.
+
+For a Prometheus translation that replaces dots with underscores and appends the
+counter suffix, CPU usage in cores is:
+
+```promql
+sum by (st_task) (rate(st_task_cpu_time_total[5m]))
+```
+
+Collectors that add unit suffixes may expose this as
+`st_task_cpu_time_seconds_total`; use the collector's translated name. In Grafana
+dashboards use `$__rate_interval` instead of a fixed range.
+
+Names distinguish `reconcile` and its timers, `published_list.agents`,
+`published_list.missions`, `published_list.work`, replication transport and
+export/receive work, startup warmup, checkpoints/WAL, retention and other
+maintenance. They contain no seat IDs, peer names, collection values from
+requests, or request paths. HTTP handlers and serving tasks remain under their
+existing HTTP instrumentation, not these background-task wrappers. Work done by
+child processes is not included in the parent's thread CPU.
+
+The same static task scopes label background writer submissions when file
+profiling is enabled. Each batched savepoint runs under its own submitter's
+operation. Shared transaction setup and finalizers/commit run under dedicated
+`writer.batch.setup` and `writer.batch.commit` scopes rather than charging other
+submitters to the first job. All accounting scopes finish before completed jobs
+are acknowledged, so their caller cannot finish profiling before samples arrive.
+
+
 ## Targets and live windows
 
 [`slo/targets.toml`](../../slo/targets.toml) holds the daemon's targets: reads a person waits on,

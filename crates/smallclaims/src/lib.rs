@@ -20,6 +20,7 @@ pub mod fifo;
 pub mod principal;
 /// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
 pub mod profile;
+pub mod task_cpu;
 pub mod read_budget;
 pub mod replication;
 pub mod rules;
