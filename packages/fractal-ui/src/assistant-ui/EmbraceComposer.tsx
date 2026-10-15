@@ -8,6 +8,7 @@ import {
 import { surfaceVars as surface, textVars as text, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from './composition-tokens.stylex'
 import { readingColumnStyles } from './reading-column.stylex'
 import { Icon } from './composition/Icons'
+import { StopRunButton } from './composition/StopRunButton'
 import { EffortPicker } from './embrace-composer/EffortPicker'
 import {
   activeTrigger, defaultCommands, draftFromText, insertToken, serializeDraft,
@@ -58,6 +59,8 @@ export interface EmbraceComposerProps {
   readonly sendDisabled?: boolean
   /** Overrides the empty-field guidance; keyboard instructions stay in the footer, never here. */
   readonly placeholder?: string
+  /** Why the host could not stop the active run; shown beside Stop, which becomes pressable again. Clear it when the next Stop starts. */
+  readonly stopRefusal?: string
 }
 
 const styles = stylex.create({
@@ -99,6 +102,7 @@ const styles = stylex.create({
   coldFooter: { flexShrink: 0 },
   cancelVisibility: { display: { default: 'inline-flex', ':disabled': 'none' } },
   warning: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: status.attention },
+  stopRefusal: { flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: t.metaSize, lineHeight: t.metaLeading, color: status.attention },
   button: {
     minHeight: g.controlMd, flexShrink: 0, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.controlBorder,
     borderRadius: r.control, backgroundColor: surface.controlFill, color: text.fg,
@@ -301,7 +305,7 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
   </>
 }
 
-function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
+function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, stopRefusal, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
   const isDisabled = useAuiState((s) => s.thread.isDisabled)
   const readOnly = disabledReason !== undefined || isDisabled
   const helpId = React.useId()
@@ -313,6 +317,17 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
   const cold = readOnly && runtimeText === ''
   const composing = React.useRef(false)
   const { compact } = React.useContext(CompactComposerContext)
+  // Stop sits beside Send for the whole run; Escape in the composer stops too. Hosts with their own `actions`
+  // own their stop. A pressed Stop reads "Stopping…" until the runtime reports the run ended or the host
+  // says why it could not stop it.
+  const aui = useAui()
+  const canCancel = useAuiState(s => s.composer.canCancel)
+  const canStop = actions === undefined && canCancel
+  const [stopping, setStopping] = React.useState(false)
+  const [seenRefusal, setSeenRefusal] = React.useState(stopRefusal)
+  if (seenRefusal !== stopRefusal) { setSeenRefusal(stopRefusal); if (stopRefusal !== undefined) setStopping(false) }
+  if (!canCancel && stopping) setStopping(false)
+  const stop = () => { if (stopping) return; setStopping(true); aui.composer.cancel() }
   return (
     <ComposerPrimitive.Root
       {...stylex.props(styles.root, style, cold && styles.cold)}
@@ -320,10 +335,13 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
       onCompositionStartCapture={() => { composing.current = true }}
       onCompositionEndCapture={() => { composing.current = false }}
       onKeyDownCapture={event => {
+        const imeKey = event.nativeEvent.isComposing || composing.current || event.nativeEvent.keyCode === 229
+        // An Escape that dismisses an IME composition belongs to the IME, never to the run.
+        if (event.key === 'Escape' && canStop && !imeKey) { event.preventDefault(); stop(); return }
         if (event.key !== 'Enter') return
         const target = event.target
         if (!(target instanceof HTMLElement && (target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'INPUT'))) return
-        if (event.nativeEvent.isComposing || composing.current || event.nativeEvent.keyCode === 229) { event.stopPropagation(); return }
+        if (imeKey) { event.stopPropagation(); return }
         if (event.repeat) { event.preventDefault(); event.stopPropagation(); return }
         if (onRequestSubmit !== undefined && !event.shiftKey && !(window.matchMedia('(pointer: coarse) and (not (any-pointer: fine))').matches && !event.metaKey && !event.ctrlKey)) {
           event.preventDefault(); event.stopPropagation(); if (!readOnly) onRequestSubmit(event.metaKey || event.ctrlKey)
@@ -336,6 +354,8 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
         aria-label={targetLabel === undefined ? 'Message' : `Message to ${targetLabel}`}
         aria-describedby={[helpId, runtimeText === '' && reason === undefined ? guidanceId : undefined].filter(Boolean).join(' ')}
         placeholder=""
+        // Without host `actions`, Escape-to-stop is handled once above (with its IME guard); the primitive's own Escape would cancel a second time.
+        cancelOnEscape={actions !== undefined}
         disabled={readOnly}
         {...stylex.props(styles.input, inputStyle, cold && styles.coldInput)}
       />}
@@ -346,6 +366,8 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
         </div>
         {toolbar}
         <div {...stylex.props(styles.grow)} />
+        {canStop && stopRefusal !== undefined && !stopping ? <span role="status" title={stopRefusal} {...stylex.props(styles.stopRefusal)}>{stopRefusal}</span> : null}
+        {canStop ? <StopRunButton onStop={stop} pending={stopping} /> : null}
         {actions !== undefined ? actions(compact) : onRequestSubmit === undefined ? <ComposerPrimitive.Send disabled={readOnly} aria-label={submitIcon === undefined ? undefined : 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? 'Send'}</ComposerPrimitive.Send> : <Button isDisabled={readOnly || !canSend} onPress={() => onRequestSubmit(false)} aria-label={submitIcon === undefined ? undefined : submitLabel ?? 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? submitLabel ?? 'Send'}</Button>}
       </div>
     </ComposerPrimitive.Root>

@@ -66,7 +66,7 @@ export const composerSendBinding = ({ source, agentRef, grants, readable, items,
         if (disabledReason !== undefined) return
         await dispatch(message.content.filter(part => part.type === 'text').map(part => part.text).join('\n'), [])
       },
-      // Deliberately no onCancel: runtime.signal is not a send-cancel contract.
+      // Deliberately no onCancel: runtime.signal is not a send-cancel contract. The pane wires Stop to the agent's interrupt.
     },
     retry: async (item) => {
       if (item._tag !== 'Text' || (item.sendState?._tag !== 'Failed' && item.sendState?._tag !== 'Unconfirmed')

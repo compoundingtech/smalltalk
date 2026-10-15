@@ -32,6 +32,7 @@ const source = vi.hoisted(() => ({
   transcriptTurns: [] as (readonly TranscriptTurn[])[],
   scrollToBottomKeys: [] as (string | undefined)[],
   composerProps: [] as React.ComponentProps<typeof Kit.EmbraceComposer>[],
+  agentControls: undefined as { readonly control: () => Promise<never>; readonly interrupt: (agent: string) => Promise<{ readonly _tag: 'Sent' } | { readonly _tag: 'Refused'; readonly detail: string }> } | undefined,
 }))
 
 vi.mock('../data/react.tsx', async () => {
@@ -41,7 +42,7 @@ vi.mock('../data/react.tsx', async () => {
   return ({
   useConversation: () => source.feed,
   useConversationSync: () => source.sync,
-  useDataSource: () => ({ agents, conversationInterest: undefined }),
+  useDataSource: () => ({ agents, conversationInterest: undefined, agentControls: source.agentControls }),
   useFeedInterest: () => {},
   useNow: () => source.now,
   useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted' }),
@@ -104,6 +105,7 @@ beforeEach(() => {
   source.transcriptTurns = []
   source.scrollToBottomKeys = []
   source.composerProps = []
+  source.agentControls = undefined
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
   // jsdom has no layout observers; the kit instantiates one while attaching scroll.
   // Test-environment sizing (react-aria renders every row) needs no measured entries.
@@ -669,5 +671,84 @@ describe('ConversationPane composition activation', () => {
     await mount()
     expect(container.querySelector('[data-testid="agent-message"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="user-message"]')).toBeNull()
+  })
+
+  it('stops the running turn from the composer through the agent interrupt, and shows a refusal beside Stop', async () => {
+    let answer: (result: { readonly _tag: 'Sent' } | { readonly _tag: 'Refused'; readonly detail: string }) => void = () => {}
+    const interrupt = vi.fn((_agent: string) => new Promise<{ readonly _tag: 'Sent' } | { readonly _tag: 'Refused'; readonly detail: string }>(resolve => { answer = resolve }))
+    source.agentControls = { control: () => Promise.reject(new Error('not used')), interrupt }
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, { _tag: 'Status', id: 'run', status: 'running', at: at(2) }], hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const stop = () => container.querySelector<HTMLButtonElement>('[data-testid="run-stop"]')
+    expect(stop()?.getAttribute('aria-label')).toBe('Stop run')
+    expect(stop()?.getAttribute('aria-keyshortcuts')).toBe('Escape')
+    await act(async () => { stop()!.click() })
+    expect(interrupt).toHaveBeenCalledExactlyOnceWith('agent/selected')
+    expect(stop()?.getAttribute('aria-label')).toBe('Stopping run')
+    expect(stop()?.disabled).toBe(true)
+    await act(async () => { answer({ _tag: 'Refused', detail: 'That agent has no terminal to stop its turn through.' }) })
+    expect(stop()?.getAttribute('aria-label')).toBe('Stop run')
+    expect(container.querySelector('[data-testid="composer-footer"] [role="status"]')?.textContent).toBe('That agent has no terminal to stop its turn through.')
+    // The run ends: Stop and the refusal leave with it.
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, { _tag: 'Status', id: 'run', status: 'cancelled', at: at(3) }], hasOlder: false, observation: { empty: false } } }
+    await mount()
+    expect(stop()).toBeNull()
+    expect(container.querySelector('[data-testid="composer-footer"] [role="status"]')).toBeNull()
+  })
+
+  it('keeps a stop refusal to the run it answered and drops a late answer for an older run', async () => {
+    type Answer = { readonly _tag: 'Sent' } | { readonly _tag: 'Refused'; readonly detail: string }
+    const answers: ((result: Answer) => void)[] = []
+    const interrupt = vi.fn((_agent: string) => { const pending = Promise.withResolvers<Answer>(); answers.push(pending.resolve); return pending.promise })
+    source.agentControls = { control: () => Promise.reject(new Error('not used')), interrupt }
+    const prompt = (id: string): ConversationItem => ({ _tag: 'Text', id, role: 'user', text: `Run ${id}.`, attachments: [], streaming: false, at: at(0) })
+    const firstRun = [prompt('p1'), { _tag: 'Status', id: 'run-1', status: 'running', at: at(2) }] as const satisfies readonly ConversationItem[]
+    const firstEnded = [prompt('p1'), { _tag: 'Status', id: 'run-1', status: 'completed', at: at(3) }] as const satisfies readonly ConversationItem[]
+    const secondRun = [...firstEnded, prompt('p2'), { _tag: 'Status', id: 'run-2', status: 'running', at: at(5) }] as const satisfies readonly ConversationItem[]
+    const show = async (items: readonly ConversationItem[]) => {
+      source.feed = { _tag: 'Observed', freshness: 'live', value: { items, hasOlder: false, observation: { empty: false } } }
+      await mount()
+    }
+    const stop = () => container.querySelector<HTMLButtonElement>('[data-testid="run-stop"]')
+    const refusal = () => container.querySelector('[data-testid="composer-footer"] [role="status"]')
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await show(firstRun)
+    await act(async () => { stop()!.click() })
+    await act(async () => { answers[0]!({ _tag: 'Refused', detail: 'First run refused.' }) })
+    expect(refusal()?.textContent).toBe('First run refused.')
+    // That run ends and the next starts: the old refusal does not carry over.
+    await show(firstEnded)
+    await show(secondRun)
+    expect(stop()?.getAttribute('aria-label')).toBe('Stop run')
+    expect(refusal()).toBeNull()
+    // A Stop pressed in a run whose answer only arrives after the next run started belongs to that older run and is dropped.
+    await show(firstRun)
+    await act(async () => { stop()!.click() })
+    await show(firstEnded)
+    await show(secondRun)
+    await act(async () => { answers[1]!({ _tag: 'Refused', detail: 'Late answer for the first run.' }) })
+    expect(refusal()).toBeNull()
+    expect(stop()?.getAttribute('aria-label')).toBe('Stop run')
+    // Overlap: run A's Stop is still pending when run B starts; B's Stop is refused, then A's answer lands. B's reason stays.
+    const thirdRun = [prompt('p3'), { _tag: 'Status', id: 'run-3', status: 'running', at: at(7) }] as const satisfies readonly ConversationItem[]
+    const thirdEnded = [prompt('p3'), { _tag: 'Status', id: 'run-3', status: 'completed', at: at(8) }] as const satisfies readonly ConversationItem[]
+    const fourthRun = [...thirdEnded, prompt('p4'), { _tag: 'Status', id: 'run-4', status: 'running', at: at(9) }] as const satisfies readonly ConversationItem[]
+    await show(thirdRun)
+    await act(async () => { stop()!.click() })
+    await show(thirdEnded)
+    await show(fourthRun)
+    await act(async () => { stop()!.click() })
+    await act(async () => { answers[3]!({ _tag: 'Refused', detail: 'Run B refused.' }) })
+    expect(refusal()?.textContent).toBe('Run B refused.')
+    await act(async () => { answers[2]!({ _tag: 'Refused', detail: 'Late answer for run A.' }) })
+    expect(refusal()?.textContent).toBe('Run B refused.')
+    expect(interrupt).toHaveBeenCalledTimes(4)
+  })
+
+  it('offers no Stop when the connection cannot interrupt agents', async () => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, { _tag: 'Status', id: 'run', status: 'running', at: at(2) }], hasOlder: false, observation: { empty: false } } }
+    await mount()
+    expect(container.querySelector('[data-testid="run-stop"]')).toBeNull()
   })
 })
