@@ -87,7 +87,10 @@ mod owned_sets;
 mod published_attention;
 pub use published_attention::start_attention_list;
 #[cfg(test)]
-pub(crate) use published_attention::{published_attention_rows, refresh_attention_list};
+pub(crate) use published_attention::{
+    attention_fleet, present_attention, published_attention_rows, refresh_attention_list,
+    refresh_attention_list_with,
+};
 mod directive_notes;
 mod request_latency;
 mod client_observations;
@@ -4032,6 +4035,7 @@ fn client_attention_resources_with_previews(
     history: bool,
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = client_attention_resources(&state.store, person, history)?;
+    published_attention::published_attention_presentations(&state.store, &mut items);
     for item in &mut items {
         if item["attention_kind"] != "launch-approval" {
             continue;

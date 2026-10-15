@@ -169,45 +169,7 @@ fn watch_terminal_hangup() {
     });
 }
 fn agent_label(agent: &st3_client::Agent) -> String {
-    let slug = agent.name.rsplit('/').next().unwrap_or(&agent.name);
-    // `st agents new NAME` names a seat HOST.NAME; the host shows beside it, so the label is
-    // NAME ("harbor.image-sorter" reads as Image Sorter).
-    let host = agent
-        .host_id
-        .as_deref()
-        .map(|host| host.trim_start_matches("host/"));
-    let slug = host
-        .and_then(|host| {
-            slug.split_once('.')
-                .filter(|(prefix, rest)| prefix.eq_ignore_ascii_case(host) && !rest.is_empty())
-        })
-        .map_or(slug, |(_, rest)| rest);
-    let label = |slug: &str| {
-        slug.split('-')
-            .map(|word| match word.to_ascii_lowercase().as_str() {
-                "st3" => "ST".to_string(),
-                "cos" => "COS".to_string(),
-                "ios" => "iOS".to_string(),
-                "tui" => "TUI".to_string(),
-                "pty" => "PTY".to_string(),
-                "omp" => "OMP".to_string(),
-                _ => {
-                    let mut chars = word.chars();
-                    chars
-                        .next()
-                        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                        .unwrap_or_default()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    if slug.eq_ignore_ascii_case("omp") {
-        if let Some(parent) = agent.name.rsplit('/').nth(1) {
-            return format!("{} · OMP", label(parent));
-        }
-    }
-    label(slug)
+    st3_ui_model::agents::label(&agent.name, agent.host_id.as_deref())
 }
 fn key_input(key: KeyEvent) -> Option<String> {
     match key.code {

@@ -207,6 +207,12 @@ word, list group, why the agent needs someone, and what it holds and has queued 
 [the UI contract](../../clients/ui-contract.md#agent)). Older daemons omit both. A row that
 lacks it shows the state st reports, marked as coming from an older st; clients derive nothing.
 
+The same capability says attention rows carry `presentation`: the Now group and card, who
+**Chat about this** reaches, who raised it, and the step it holds (see
+[the UI contract](../../clients/ui-contract.md#attention-row)). The attention refresher computes
+it; every attention route copies it from the published list, and a row the list has not
+published yet has none until it does.
+
 ## Screen inventories
 
 Optional capability `inventory-collections` version 1 advertises six additional

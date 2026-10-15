@@ -4,7 +4,10 @@
 //! custom requests, replication in either order, rollback, reopen, checkpoint and projection
 //! changes; and claims attention never reads publish the same rows without a fold.
 use super::*;
-use crate::api::{client_attention_resources_at, published_attention_rows, refresh_attention_list};
+use crate::api::{
+    attention_fleet, client_attention_resources_at, present_attention, published_attention_rows,
+    refresh_attention_list, refresh_attention_list_with,
+};
 use crate::model::PersonStepResponse;
 use crate::store::person_work::tests::fixture;
 
@@ -59,12 +62,13 @@ fn refresh_and_check(store: &Store) -> Arc<AttentionPublication> {
         .read_snapshot(|index| {
             assert_eq!(index, publication.cut, "published at the current cut");
             for person in PEOPLE.iter().copied().map(Some).chain([None]) {
-                let full = client_attention_resources_at(
+                let mut full = client_attention_resources_at(
                     store,
                     person,
                     false,
                     publication.evaluated_at_unix_ms,
                 )?;
+                present_attention(store, &mut full, publication.fleet.as_deref())?;
                 let (cut, _, rows) =
                     published_attention_rows(store, index, person, usize::MAX).expect("published");
                 assert_eq!(cut, publication.cut);
@@ -310,6 +314,7 @@ fn a_checkpoint_forgets_the_list_and_a_refresh_from_before_it_cannot_publish() {
             future_after: None,
             published_at_unix_ms: now_ms(),
             rows: Arc::clone(&before.rows),
+            fleet: None,
         },
         false,
     );
@@ -383,6 +388,7 @@ fn rows_older_than_the_clock_period_fold_again() {
             future_after: None,
             published_at_unix_ms: before.published_at_unix_ms,
             rows: Arc::clone(&before.rows),
+            fleet: None,
         },
         false,
     );
@@ -501,6 +507,7 @@ fn a_claim_from_any_seat_a_shared_login_item_covers_folds() {
             future_after: None,
             published_at_unix_ms: now_ms(),
             rows: Arc::new(rows),
+            fleet: None,
         }
     };
     let without_at = |publication: &AttentionPublication, cut: u64| AttentionPublication {
@@ -511,6 +518,7 @@ fn a_claim_from_any_seat_a_shared_login_item_covers_folds() {
         future_after: None,
         published_at_unix_ms: now_ms(),
         rows: Arc::clone(&publication.rows),
+        fleet: None,
     };
     let delta = |publication: &AttentionPublication| {
         store
@@ -566,6 +574,7 @@ fn a_prompt_blocked_on_a_person_and_its_clearing_fold() {
         future_after: None,
         published_at_unix_ms: now_ms(),
         rows: Arc::new(rows),
+        fleet: None,
     };
     // A seat blocked on a person is a new prompt: its observation folds.
     store
@@ -656,4 +665,143 @@ fn an_answered_native_prompt_folds_away() {
     let answered = refresh_and_check(&store);
     assert_eq!(folds(&store), before + 1, "the answer folds");
     assert_eq!(prompts(&answered), 0);
+}
+
+/// The fleet the attention presentation reads: each agent's label, the step each holds, and the
+/// first agent in roster order holding a step of each mission. Fleets from different roster
+/// revisions with the same content are equal, so a roster that changed nothing they read
+/// presents nothing again.
+#[test]
+fn an_attention_fleet_reads_labels_claims_and_missions_from_roster_cards() {
+    let cards = [
+        json!({"id": "agent/example/auditor", "name": "example/auditor", "host_id": "host/harbor",
+            "current_work": [{"id": "step-run/example/audit/1/review", "mission_id": "mission/example/audit"}]}),
+        json!({"id": "agent/example/builder", "name": "harbor.builder", "host_id": "host/harbor",
+            "current_work": [{"id": "step-run/example/audit/1/build", "mission_id": "mission/example/audit"}]}),
+        json!({"id": "agent/example/idle"}),
+    ];
+    let fleet = AttentionFleet::from_cards(1, &cards);
+    assert_eq!(
+        fleet.agent_label("agent/example/auditor").as_deref(),
+        Some("Auditor")
+    );
+    assert_eq!(
+        fleet.agent_label("agent/example/builder").as_deref(),
+        Some("Builder")
+    );
+    assert_eq!(
+        fleet.agent_label("agent/example/idle").as_deref(),
+        Some("Idle")
+    );
+    assert_eq!(fleet.agent_label("agent/example/unknown"), None);
+    assert_eq!(
+        fleet.claimant("step-run/example/audit/1/build").as_deref(),
+        Some("agent/example/builder")
+    );
+    assert_eq!(
+        fleet.working_in("mission/example/audit").as_deref(),
+        Some("agent/example/auditor")
+    );
+    assert_eq!(fleet, AttentionFleet::from_cards(2, &cards));
+    assert_ne!(fleet, AttentionFleet::from_cards(2, &cards[1..]));
+}
+
+/// A row is presented from the fleet and the step paths st has.
+#[test]
+fn rows_are_presented_from_the_fleet() {
+    let (store, _, _) = fixture();
+    let fleet = AttentionFleet::from_cards(
+        1,
+        &[json!({"id": "agent/example/auditor",
+        "name": "example/auditor", "current_work": [{"id": "step-run/example/gone",
+        "mission_id": "mission/example/audit"}]})],
+    );
+    let mut rows = vec![
+        json!({"id": "attention/one", "attention_kind": "human-gate", "source_id": "step-run/example/gone",
+            "mission_id": "mission/example/audit", "step_run_id": "step-run/example/gone"}),
+        json!({"id": "attention/two", "attention_kind": "unread-message", "source_id": "message/one"}),
+    ];
+    store
+        .read_snapshot(|_| present_attention(&store, &mut rows, Some(&fleet)))
+        .unwrap();
+    assert_eq!(
+        rows[0]["presentation"],
+        json!({"tier": "stopped", "kind": "review",
+        "agent": {"id": "agent/example/auditor", "label": "Auditor"},
+        "raised_by": {"id": "agent/example/auditor", "label": "Auditor"},
+        // st has no such step, so the card names none.
+        "waiting": null})
+    );
+    assert_eq!(
+        rows[1]["presentation"],
+        json!({"tier": null, "kind": null, "agent": null,
+        "raised_by": null, "waiting": null})
+    );
+}
+
+/// The refresher presents every row with the fleet it reads, names a step st has by its path,
+/// presents nothing again for a newer roster with the same content, and presents the published
+/// rows again without folding them when a roster changes something they read.
+#[test]
+fn the_refresher_presents_with_its_fleet_and_again_only_when_the_fleet_changes() {
+    let (store, _, request) = fixture();
+    store.start_attention_list_refresher().unwrap();
+    let ask = store.ask_person(&request).unwrap();
+    let asker = "agent/alder.asker";
+    let fleet = |revision: u64, name: &str| {
+        Some(Arc::new(AttentionFleet::from_cards(
+            revision,
+            &[json!({"id": asker, "name": name})],
+        )))
+    };
+    let card = |publication: &AttentionPublication| {
+        publication
+            .rows
+            .iter()
+            .find(|row| row["source_id"] == ask.subject)
+            .expect("the ask's row")["presentation"]
+            .clone()
+    };
+    refresh_attention_list_with(&store, |_| fleet(1, "release-captain")).unwrap();
+    let first = newest(&store);
+    let presented = card(&first);
+    assert_eq!(
+        presented["agent"],
+        json!({"id": asker, "label": "Release Captain"})
+    );
+    // The ask holds a step st has, so the card names its path.
+    let step = presented["waiting"]["step"]
+        .as_str()
+        .expect("a waiting step");
+    let path = store.step_path(step).unwrap().expect("st has the step");
+    assert_eq!(presented["waiting"]["path"], path);
+    let folded = folds(&store);
+    // A newer roster that changes nothing the rows read publishes nothing new.
+    refresh_attention_list_with(&store, |_| fleet(2, "release-captain")).unwrap();
+    assert!(Arc::ptr_eq(&first.rows, &newest(&store).rows));
+    // One that renames the agent presents the same rows again, without folding them.
+    refresh_attention_list_with(&store, |_| fleet(3, "harbor-pilot")).unwrap();
+    let renamed = newest(&store);
+    assert_eq!(
+        folds(&store),
+        folded,
+        "a roster change presents again without folding"
+    );
+    assert_eq!(renamed.cut, first.cut);
+    assert_eq!(card(&renamed)["agent"]["label"], "Harbor Pilot");
+    assert_eq!(card(&renamed)["waiting"], presented["waiting"]);
+}
+
+/// While no roster is available (its cache cleared, or no roster refresher) the refresher
+/// keeps the fleet it last read, so rows keep their agents until the next roster.
+#[test]
+fn without_a_roster_the_previous_fleet_stays() {
+    let (store, _, _) = fixture();
+    let previous = Arc::new(AttentionFleet::from_cards(
+        store.agent_roster_revision() + 1,
+        &[json!({"id": "agent/alder.asker", "name": "release-captain"})],
+    ));
+    let kept = attention_fleet(&store, Some(&previous)).expect("the previous fleet");
+    assert!(Arc::ptr_eq(&kept, &previous));
+    assert!(attention_fleet(&store, None).is_none());
 }

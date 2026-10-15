@@ -76,8 +76,63 @@ pub(crate) struct AttentionPublication {
     pub(crate) future_after: Option<u64>,
     /// When these rows were published, in Unix ms: the list's "as of".
     pub(crate) published_at_unix_ms: u128,
-    /// Every person's rows, most urgent first, as `client_attention_resources_at` orders them.
+    /// Every person's rows, most urgent first, as `client_attention_resources_at` orders them,
+    /// each with the presentation `fleet` gives it.
     pub(crate) rows: Arc<Vec<Value>>,
+    /// The agents the rows' presentations read, from the newest published roster; `None`
+    /// before the first.
+    pub(crate) fleet: Option<Arc<AttentionFleet>>,
+}
+
+/// What the attention presentation reads from an agents roster: each agent's label, the step
+/// each holds, and an agent holding a step of each mission. Equal fleets present every row the
+/// same, whatever roster revision they came from.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AttentionFleet {
+    pub(crate) revision: u64,
+    labels: HashMap<String, String>,
+    claimants: HashMap<String, String>,
+    working: HashMap<String, String>,
+}
+
+impl PartialEq for AttentionFleet {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.labels, &self.claimants, &self.working) == (&other.labels, &other.claimants, &other.working)
+    }
+}
+
+impl AttentionFleet {
+    /// The fleet of a roster's cards, in roster order: the first agent holding a step of a
+    /// mission is the one a card about that mission reaches.
+    pub(crate) fn from_cards(revision: u64, cards: &[Value]) -> Self {
+        let mut fleet = AttentionFleet { revision, ..Default::default() };
+        for card in cards {
+            let Some(id) = card["id"].as_str() else { continue };
+            let name = card["name"].as_str().unwrap_or(id.trim_start_matches("agent/"));
+            fleet.labels.insert(id.to_owned(), st3_ui_model::agents::label(name, card["host_id"].as_str()));
+            for work in card["current_work"].as_array().into_iter().flatten() {
+                if let Some(step) = work["id"].as_str() {
+                    fleet.claimants.entry(step.to_owned()).or_insert_with(|| id.to_owned());
+                }
+                if let Some(mission) = work["mission_id"].as_str() {
+                    fleet.working.entry(mission.to_owned()).or_insert_with(|| id.to_owned());
+                }
+            }
+        }
+        fleet
+    }
+
+    pub(crate) fn agent_label(&self, agent: &str) -> Option<String> {
+        self.labels.get(agent).cloned()
+    }
+
+    pub(crate) fn claimant(&self, step: &str) -> Option<String> {
+        self.claimants.get(step).cloned()
+    }
+
+    pub(crate) fn working_in(&self, mission: &str) -> Option<String> {
+        self.working.get(mission).cloned()
+    }
 }
 
 /// The refresher's registration, its requests and the newest publication.
