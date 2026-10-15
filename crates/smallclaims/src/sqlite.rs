@@ -870,7 +870,7 @@ fn run_write_batch(
     }
     if let Some(transaction) = &transaction {
         let prepare_started = attribution.as_ref().map(|_| std::time::Instant::now());
-        failure = finalizers.prepare(transaction).err();
+        failure = finalizers.prepare(/* sqlite-large-value: allow-for-now lv-hc1b4b7df7d60 owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ transaction).err();
         if let (Some(batch), Some(prepare_started)) = (&mut attribution, prepare_started) {
             batch.finalizers += prepare_started.elapsed();
         }
@@ -914,12 +914,12 @@ fn run_write_batch(
                 let running = std::time::Instant::now();
                 hold.running(&holder);
                 let savepoint = (|| {
-                    transaction.execute_batch("SAVEPOINT batched_write")?;
+                    transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h0699ddd36c05 owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ "SAVEPOINT batched_write")?;
                     if run(transaction) {
-                        transaction.execute_batch("RELEASE batched_write")
+                        transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h883bdee42fa8 owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ "RELEASE batched_write")
                     } else {
                         transaction
-                            .execute_batch("ROLLBACK TO batched_write; RELEASE batched_write")
+                            .execute_batch(/* sqlite-large-value: allow-for-now lv-h2013f7d4439f owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ "ROLLBACK TO batched_write; RELEASE batched_write")
                     }
                 })();
                 crate::profile::writer_released(acquired);
@@ -1007,7 +1007,7 @@ impl WriterGuard<'_> {
     pub fn transaction(&mut self) -> Result<WriterTransaction<'_>> {
         let finalizers = self.finalizers.clone();
         let transaction = self.deref_mut().transaction()?;
-        finalizers.prepare(&transaction)?;
+        finalizers.prepare(/* sqlite-large-value: allow-for-now lv-hb58bf0cf3d7c owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ &transaction)?;
         Ok(WriterTransaction::new(transaction, finalizers))
     }
 
@@ -1017,7 +1017,7 @@ impl WriterGuard<'_> {
     ) -> Result<WriterTransaction<'_>> {
         let finalizers = self.finalizers.clone();
         let transaction = self.deref_mut().transaction_with_behavior(behavior)?;
-        finalizers.prepare(&transaction)?;
+        finalizers.prepare(/* sqlite-large-value: allow-for-now lv-h9852919f257c owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ &transaction)?;
         Ok(WriterTransaction::new(transaction, finalizers))
     }
 }
@@ -1266,8 +1266,8 @@ impl Drop for PinnedRead<'_> {
             return;
         };
         connection.progress_handler(0, None::<fn() -> bool>);
-        if connection.execute_batch("COMMIT").is_err() && !connection.is_autocommit() {
-            let _ = connection.execute_batch("ROLLBACK");
+        if connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h0a744b38f746 owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ "COMMIT").is_err() && !connection.is_autocommit() {
+            let _ = connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h986492ca6e90 owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ "ROLLBACK");
         }
         drop(self.transaction.take());
         configure_read_cancellation(&connection);
@@ -1492,7 +1492,7 @@ impl ReadPool {
                 // A cancelled read must not retain its snapshot in the pool. The connection
                 // is query_only; ending a leftover read transaction cannot commit writes.
                 if !connection.is_autocommit() {
-                    let _ = connection.execute_batch("ROLLBACK");
+                    let _ = connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h3e88c31014e3 owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ "ROLLBACK");
                 }
                 if let Ok(connection) = Rc::try_unwrap(connection)
                     && connection.is_autocommit()
@@ -1593,7 +1593,7 @@ impl ReadPool {
         // it can pin WAL after its live-read entry is gone. Cleanup happens only at physical
         // return, after every legitimate pinned/outer owner has released the connection.
         if !connection.is_autocommit()
-            && (connection.execute_batch("ROLLBACK").is_err() || !connection.is_autocommit())
+            && (connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h2143307ac389 owner=smallclaims::sqlite TODO=trace-statement-and-value-representation */ "ROLLBACK").is_err() || !connection.is_autocommit())
         {
             return; // Closing a failed-cleanup connection is safer than reusing it.
         }

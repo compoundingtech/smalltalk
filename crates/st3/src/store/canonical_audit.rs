@@ -181,16 +181,16 @@ fn native_mailbox_ownership_changes_no_shared_projection_digest() {
     let mut connection = store.connection.write();
     let tx = connection.transaction().unwrap();
     // Scope-only raw row control, not an authenticated argv admission fixture.
-    tx.execute("INSERT INTO local_mailbox_argv_bindings SELECT token,subject,component,incarnation,epoch,'{}' FROM local_mailbox_bindings WHERE token=?1",[&bound.token]).unwrap();
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h33be5234f228 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_mailbox_argv_bindings SELECT token,subject,component,incarnation,epoch,'{}' FROM local_mailbox_bindings WHERE token=?1",[&bound.token]).unwrap();
     assert_eq!(before, graph_digest(&tx).unwrap());
     assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
-    tx.execute("DELETE FROM local_mailbox_argv_bindings WHERE token=?1",[&bound.token]).unwrap();
+    tx.execute(/* sqlite-large-value: allow-for-now lv-hbcef94137c83 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_mailbox_argv_bindings WHERE token=?1",[&bound.token]).unwrap();
     assert_eq!(before, graph_digest(&tx).unwrap());
     assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
-    tx.execute("UPDATE local_mailbox_leases SET revoked=1 WHERE subject=?1", [&bound.subject]).unwrap();
+    tx.execute(/* sqlite-large-value: allow-for-now lv-hc68bc874e436 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_mailbox_leases SET revoked=1 WHERE subject=?1", [&bound.subject]).unwrap();
     assert_eq!(before, graph_digest(&tx).unwrap());
     assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
-    tx.execute("DELETE FROM local_mailbox_leases WHERE subject=?1", [&bound.subject]).unwrap();
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h748f8015c076 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_mailbox_leases WHERE subject=?1", [&bound.subject]).unwrap();
     assert_eq!(before, graph_digest(&tx).unwrap());
     assert_eq!(before_tables, projection_digest::tables(&tx).unwrap());
     tx.commit().unwrap();
@@ -202,7 +202,7 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
         .iter()
         .map(|(table, local_columns)| {
             let columns = connection
-                .prepare(&format!("PRAGMA table_info({table})"))
+                .prepare(/* sqlite-large-value: allow-for-now lv-h910ce7fbe102 owner=st3::store::canonical_audit TODO=trace-statement-and-value-representation */ &format!("PRAGMA table_info({table})"))
                 .unwrap()
                 .query_map([], |row| row.get::<_, String>(1))
                 .unwrap()
@@ -238,7 +238,7 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                 )
             };
             let rows = connection
-                .prepare(&query)
+                .prepare(/* sqlite-large-value: allow-for-now lv-hc06dd739d298 owner=st3::store::canonical_audit TODO=trace-statement-and-value-representation */ &query)
                 .unwrap()
                 .query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
@@ -459,7 +459,7 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
 
 fn write_audit_history(source: &Store) {
     source.register_custom_kind(&custom::RegistrationRequest {
-        manifest: serde_json::from_str(include_str!("../../../../examples/st3/custom-review.json")).unwrap(),
+        manifest: serde_json::from_str(/* sqlite-large-value: allow-for-now lv-h166b92d7a270 owner=st3::store::canonical_audit TODO=trace-statement-and-value-representation */ include_str!("../../../../examples/st3/custom-review.json")).unwrap(),
         actor: "agent/garden/seed".into(),
     }).unwrap();
     source.put_document("doc/garden/audit", b"Immutable audit context", &None, "garden-audit-context").unwrap();
@@ -575,7 +575,7 @@ message "audit-declared" {
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO temp.write_clock(offset_ms, at_ms) VALUES (0, ?1)",
+            /* sqlite-large-value: allow-for-now lv-h124aaaeb99a3 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO temp.write_clock(offset_ms, at_ms) VALUES (0, ?1)",
             [now_ms() as i64],
         )
         .unwrap();
@@ -1020,12 +1020,12 @@ fn fresh_and_additively_migrated_column_orders_have_identical_full_digests() {
         .connection
         .lock()
         .unwrap()
-        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .execute(/* sqlite-large-value: allow-for-now lv-h3af8ae14fb52 owner=st3::store::canonical_audit TODO=trace-statement-and-value-representation */ "VACUUM INTO ?1", [path.to_str().unwrap()])
         .unwrap();
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
-            "DROP TRIGGER projection_digest_planning_sessions_insert;
+            /* sqlite-large-value: allow-for-now lv-h78660ef76f92 owner=st3::store::canonical_audit TODO=chunk-or-reference-variable-columns */ "DROP TRIGGER projection_digest_planning_sessions_insert;
         DROP TRIGGER projection_digest_planning_sessions_update;
         DROP TRIGGER projection_digest_planning_sessions_delete;
         CREATE TABLE saved_planner_specs AS SELECT id,planner_spec_json FROM planning_sessions;
@@ -1037,7 +1037,7 @@ fn fresh_and_additively_migrated_column_orders_have_identical_full_digests() {
     let upgraded = Store::open(&path, "alder").unwrap();
     {
         let connection = upgraded.connection.lock().unwrap();
-        connection.execute_batch("UPDATE planning_sessions SET planner_spec_json=(
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h00e9cd00e213 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "UPDATE planning_sessions SET planner_spec_json=(
             SELECT planner_spec_json FROM saved_planner_specs WHERE saved_planner_specs.id=planning_sessions.id);
             DROP TABLE saved_planner_specs;").unwrap();
     }
@@ -1089,7 +1089,7 @@ fn reopening_a_legacy_json_subtype_digest_reseeds_and_replaces_its_triggers() {
         // although SQLite persists exactly the same member bytes as ordinary TEXT.
         connection
             .execute_batch(&format!(
-                "DROP TRIGGER projection_digest_desired_update;
+                /* sqlite-large-value: allow-for-now lv-hb04bb77cfdff owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER projection_digest_desired_update;
              CREATE TRIGGER projection_digest_desired_update AFTER UPDATE ON desired BEGIN {} END;",
                 projection_digest::change_sql(
                     "desired",
@@ -1100,7 +1100,7 @@ fn reopening_a_legacy_json_subtype_digest_reseeds_and_replaces_its_triggers() {
             ))
             .unwrap();
         assert_eq!(connection.execute(
-            "UPDATE desired SET member=json_set(COALESCE(member,'{}'), '$.host', 'birch') WHERE subject='agent/alder.worker'",
+            /* sqlite-large-value: allow-for-now lv-hdb1d49294dc9 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET member=json_set(COALESCE(member,'{}'), '$.host', 'birch') WHERE subject='agent/alder.worker'",
             [],
         ).unwrap(), 1);
         let expected = projection_digest::oracle(&connection).unwrap();
@@ -1116,7 +1116,7 @@ fn reopening_a_legacy_json_subtype_digest_reseeds_and_replaces_its_triggers() {
         signature[0] = json!(6);
         connection
             .execute(
-                "UPDATE meta SET value=?1 WHERE key='projection_digest_registry'",
+                /* sqlite-large-value: allow-for-now lv-h6cef3e144d10 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "UPDATE meta SET value=?1 WHERE key='projection_digest_registry'",
                 [serde_json::to_string(&signature).unwrap()],
             )
             .unwrap();
@@ -1128,7 +1128,7 @@ fn reopening_a_legacy_json_subtype_digest_reseeds_and_replaces_its_triggers() {
     assert_eq!(projection_digest::tables(&connection).unwrap(), expected);
     assert_eq!(projection_digest::oracle(&connection).unwrap(), expected);
     assert_eq!(connection.execute(
-        "UPDATE desired SET member=json_set(member, '$.host', 'elm') WHERE subject='agent/alder.worker'",
+        /* sqlite-large-value: allow-for-now lv-h48b59079452d owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET member=json_set(member, '$.host', 'elm') WHERE subject='agent/alder.worker'",
         [],
     ).unwrap(), 1);
     assert_ne!(projection_digest::tables(&connection).unwrap(), expected);
@@ -1150,7 +1150,7 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
     assert_eq!(baseline, projection_digest::oracle(&connection).unwrap());
     for (table, excluded) in SHARED_TABLES {
         let columns = connection
-            .prepare(&format!("PRAGMA table_info({table})"))
+            .prepare(/* sqlite-large-value: allow-for-now lv-h7d98cb4e622f owner=st3::store::canonical_audit TODO=trace-statement-and-value-representation */ &format!("PRAGMA table_info({table})"))
             .unwrap()
             .query_map([], |row| {
                 Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
@@ -1160,7 +1160,7 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             .unwrap();
         assert!(
             connection
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                .query_row(/* sqlite-large-value: allow-for-now lv-haaa156530b09 owner=st3::store::canonical_audit TODO=trace-statement-and-value-representation */ &format!("SELECT COUNT(*) FROM {table}"), [], |row| row
                     .get::<_, u64>(0))
                 .unwrap()
                 > 0,
@@ -1195,7 +1195,7 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             };
             let changed = transaction
                 .execute(
-                    &format!("UPDATE {table} SET {column}={expression} WHERE rowid=({selected_row})"),
+                    &format!(/* sqlite-large-value: allow-for-now lv-hb7111ec328cf owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "UPDATE {table} SET {column}={expression} WHERE rowid=({selected_row})"),
                     [],
                 )
                 .unwrap_or_else(|error| panic!("mutating {table}.{column}: {error}"));
@@ -1233,7 +1233,7 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
     // REPLACE has a delete followed by an insert, including when the primary key is unchanged.
     connection
         .execute(
-            "INSERT OR REPLACE INTO message_index VALUES('message/audit',123,0)",
+            /* sqlite-large-value: allow-for-now lv-he6f00d1c9c96 owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO message_index VALUES('message/audit',123,0)",
             [],
         )
         .unwrap();
@@ -1243,7 +1243,7 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
     );
     let generation = projection_digest::generation(&connection).unwrap();
     connection
-        .execute("UPDATE message_index SET closed=closed", [])
+        .execute(/* sqlite-large-value: allow-for-now lv-hf44f633a40db owner=st3::store::canonical_audit TODO=bound-or-reference-values-and-reclamation */ "UPDATE message_index SET closed=closed", [])
         .unwrap();
     assert_eq!(
         projection_digest::generation(&connection).unwrap(),

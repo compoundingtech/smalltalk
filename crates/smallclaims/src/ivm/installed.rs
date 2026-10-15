@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
 pub(super) const LAYOUT: &str = "smallclaims.ivm.installed-binding.v1";
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h2781af6fd5cb owner=smallclaims::ivm::installed TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS ivm_installed_bindings(
  view TEXT PRIMARY KEY, operator_fingerprint TEXT NOT NULL,
  source TEXT NOT NULL, source_fingerprint TEXT NOT NULL, source_epoch INTEGER NOT NULL,
@@ -97,14 +97,14 @@ pub(super) fn readiness(
 }
 
 fn atomic<T>(tx: &Transaction<'_>, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    tx.execute_batch("SAVEPOINT ivm_installed_bridge")?;
+    tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h4dd7232fa4b5 owner=smallclaims::ivm::installed TODO=trace-statement-and-value-representation */ "SAVEPOINT ivm_installed_bridge")?;
     match f() {
         Ok(value) => {
-            tx.execute_batch("RELEASE ivm_installed_bridge")?;
+            tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h365c0ca698ad owner=smallclaims::ivm::installed TODO=trace-statement-and-value-representation */ "RELEASE ivm_installed_bridge")?;
             Ok(value)
         }
         Err(error) => {
-            tx.execute_batch("ROLLBACK TO ivm_installed_bridge; RELEASE ivm_installed_bridge")?;
+            tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h2f8c434ea374 owner=smallclaims::ivm::installed TODO=trace-statement-and-value-representation */ "ROLLBACK TO ivm_installed_bridge; RELEASE ivm_installed_bridge")?;
             Err(error)
         }
     }
@@ -158,7 +158,7 @@ impl Views {
             "registered view version mismatch"
         );
         atomic(tx, || {
-            tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h2674a34ea2b3 owner=smallclaims::ivm::installed TODO=trace-statement-and-value-representation */ SCHEMA)?;
             let previous=tx.query_row("SELECT operator_fingerprint,source,source_fingerprint,source_epoch FROM ivm_installed_bindings WHERE view=?1",[view],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u64>(3)?))).optional()?;
             if let Some(previous) = previous {
                 ensure!(
@@ -180,7 +180,7 @@ impl Views {
                 "installed view registry exceeds 256"
             );
             tx.execute(
-                "INSERT INTO ivm_installed_bindings VALUES(?1,?2,?3,?4,?5,NULL,0,0)",
+                /* sqlite-large-value: allow-for-now lv-hb82329232837 owner=smallclaims::ivm::installed TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_installed_bindings VALUES(?1,?2,?3,?4,?5,NULL,0,0)",
                 params![
                     view,
                     fingerprint,
@@ -435,10 +435,10 @@ impl Views {
             .filter(|n| *n <= i64::MAX as u64)
             .context("installed semantic generation overflow")?;
         self.publish_cut(tx, cut)?;
-        tx.execute("UPDATE ivm_installed_bindings SET namespace=?2,revision=?3,generation=?4 WHERE view=?1",params![view,root.namespace.as_str(),root.revision,root.generation])?;
-        tx.execute("UPDATE ivm_views SET ready=1,generation=?2,applied_claim_index=?3,applied_local_generation=?4,deferred_claim_index=0,deferred_local_generation=0 WHERE name=?1",params![view,next,cut.projected,cut.local_generation])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-hde0f145e528d owner=smallclaims::ivm::installed TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_installed_bindings SET namespace=?2,revision=?3,generation=?4 WHERE view=?1",params![view,root.namespace.as_str(),root.revision,root.generation])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h331fe87c50f9 owner=smallclaims::ivm::installed TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET ready=1,generation=?2,applied_claim_index=?3,applied_local_generation=?4,deferred_claim_index=0,deferred_local_generation=0 WHERE name=?1",params![view,next,cut.projected,cut.local_generation])?;
         if publication {
-            tx.execute("DELETE FROM ivm_view_errors WHERE view=?1", [view])?;
+            tx.execute(/* sqlite-large-value: allow-for-now lv-h85140ee457fa owner=smallclaims::ivm::installed TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM ivm_view_errors WHERE view=?1", [view])?;
         }
         for key in keys {
             note_key_change(tx, view, key)?;
@@ -448,10 +448,10 @@ impl Views {
             || (delta > 0 && matches!(changed, Changed::Refresh))
         {
             tx.execute(
-                "UPDATE ivm_status_frontier SET sequence=sequence+1 WHERE singleton=1",
+                /* sqlite-large-value: allow-for-now lv-hb473c16aae78 owner=smallclaims::ivm::installed TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_status_frontier SET sequence=sequence+1 WHERE singleton=1",
                 [],
             )?;
-            tx.execute("INSERT INTO ivm_view_status(view,sequence) SELECT ?1,sequence FROM ivm_status_frontier WHERE singleton=1 ON CONFLICT(view) DO UPDATE SET sequence=excluded.sequence",[view])?;
+            tx.execute(/* sqlite-large-value: allow-for-now lv-h7e8da8efe76d owner=smallclaims::ivm::installed TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_view_status(view,sequence) SELECT ?1,sequence FROM ivm_status_frontier WHERE singleton=1 ON CONFLICT(view) DO UPDATE SET sequence=excluded.sequence",[view])?;
         }
         Ok(())
     }

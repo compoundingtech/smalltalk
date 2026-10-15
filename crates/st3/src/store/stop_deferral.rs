@@ -65,7 +65,7 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
     // The trigger and the ceiling commit together: every claim above the ceiling was copied
     // by the trigger, and every claim at or below it is the backfill's.
     connection.execute_batch(&format!(
-        "SAVEPOINT stop_deferral_schema;
+        /* sqlite-large-value: allow-for-now lv-h77ec392fd407 owner=st3::store::stop_deferral TODO=chunk-or-reference-variable-columns */ "SAVEPOINT stop_deferral_schema;
          DROP INDEX IF EXISTS claims_stop_deferral_diagnostic_index;
          DROP INDEX IF EXISTS claims_stop_deferral_failure_index;
          DROP INDEX IF EXISTS claims_stop_deferral_recovery_index;
@@ -128,12 +128,12 @@ impl Store {
     pub(crate) fn latest_stop_deferral(&self, subject: &str) -> Result<Option<ClaimRecord>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
-        connection.prepare_cached(&canonical_sql(&format!(
+        connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hef8c4faf1b12 owner=st3::store::stop_deferral TODO=trace-statement-and-value-representation */ &canonical_sql(&format!(
             "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.id IN ({})
              ORDER BY CANONICAL_DESC(claims) LIMIT 1",
             family_sql("diagnostic", "?1", None),
-        )))?.query_row([subject], claim_from_row).optional().map_err(Into::into)
+        )))?.query_row(/* sqlite-large-value: allow-for-now lv-h450cd44a4030 owner=st3::store::stop_deferral TODO=trace-statement-and-value-representation */ [subject], claim_from_row).optional().map_err(Into::into)
     }
 
     pub(crate) fn pending_stop_deferral_failure(
@@ -143,7 +143,7 @@ impl Store {
         smallclaims::touched::note_read(|| diagnostic.subject.clone());
         let connection = self.readers.get();
         connection
-            .prepare_cached(&canonical_sql(&format!(
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h2c64e927baa7 owner=st3::store::stop_deferral TODO=trace-statement-and-value-representation */ &canonical_sql(&format!(
                 "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.id IN ({})
                AND json_extract(claims.body,'$.fields.episode')=?2
@@ -153,7 +153,7 @@ impl Store {
                 family_sql("recovered", "?1", Some("claims.id")),
             )))?
             .query_row(
-                params![
+                /* sqlite-large-value: allow-for-now lv-h49a00d947ee9 owner=st3::store::stop_deferral TODO=trace-statement-and-value-representation */ params![
                     diagnostic.subject,
                     format!("stop-deferred:{}", diagnostic.id)
                 ],
@@ -172,7 +172,7 @@ impl Store {
         at_index: u64,
     ) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(&canonical_sql(&format!(
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h92fb007cecbd owner=st3::store::stop_deferral TODO=trace-statement-and-value-representation */ &canonical_sql(&format!(
             "WITH seats AS MATERIALIZED (
                SELECT desired.subject,desired.claim_id,
                  (SELECT claims.id FROM claims JOIN batches ON batches.id=claims.batch_id
@@ -240,7 +240,7 @@ impl Store {
             {
                 let connection = self.readers.get();
                 for (name, kind, predicate, reference) in FAMILIES {
-                    let mut page = connection.prepare_cached(&format!(
+                    let mut page = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hb11f41bbb0f2 owner=st3::store::stop_deferral TODO=trace-statement-and-value-representation */ &format!(
                         "SELECT subject,{reference},id FROM claims INDEXED BY claims_kind_index
                          WHERE kind='{kind}' AND store_index>?1 AND store_index<=?2 AND {predicate}"
                     ))?;
@@ -259,15 +259,15 @@ impl Store {
         let transaction = connection.transaction()?;
         {
             let mut insert = transaction.prepare_cached(
-                "INSERT OR IGNORE INTO stop_deferral_claims(subject,family,reference,claim_id)
+                /* sqlite-large-value: allow-for-now lv-he9ba5d624510 owner=st3::store::stop_deferral TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO stop_deferral_claims(subject,family,reference,claim_id)
                  VALUES (?1,?2,?3,?4)",
             )?;
             for (subject, name, reference, id) in &rows {
-                insert.execute(params![subject, name, reference, id])?;
+                insert.execute(/* sqlite-large-value: allow-for-now lv-h2d5c8c274c36 owner=st3::store::stop_deferral TODO=trace-statement-and-value-representation */ params![subject, name, reference, id])?;
             }
         }
         transaction.execute(
-            "UPDATE local_stop_deferral_backfill SET complete=1 WHERE singleton=1",
+            /* sqlite-large-value: allow-for-now lv-h99ccb32baa5b owner=st3::store::stop_deferral TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_stop_deferral_backfill SET complete=1 WHERE singleton=1",
             [],
         )?;
         transaction.commit()?;

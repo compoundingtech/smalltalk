@@ -6,7 +6,7 @@
 use super::*;
 use rusqlite::{params_from_iter, types::Value as SqlValue};
 
-pub(super) const SCHEMA: &str = r#"
+pub(super) const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h73fef5e24de5 owner=smallclaims::ivm::install::prepared TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS ivm_install_deferred (
  source TEXT PRIMARY KEY, row_limit INTEGER NOT NULL, byte_limit INTEGER NOT NULL,
  reference_limit INTEGER NOT NULL, capturing INTEGER NOT NULL DEFAULT 0
@@ -235,7 +235,7 @@ impl PreparedPage {
         const SCHEMA_TABLES: usize = 256;
         const FK_ROWS: usize = 128;
         let mut statement = db.prepare(
-            "WITH inventory AS MATERIALIZED (
+            /* sqlite-large-value: allow-for-now lv-h4faf1f3ee80c owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ "WITH inventory AS MATERIALIZED (
                SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name LIMIT 257
              )
              SELECT inventory.name,f.id,f.\"table\"
@@ -305,7 +305,7 @@ impl PreparedPage {
              LIMIT {}",
             names.len() * 128 + 1
         );
-        let mut statement = db.prepare(&sql)?;
+        let mut statement = db.prepare(/* sqlite-large-value: allow-for-now lv-h76f4e8e28808 owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ &sql)?;
         let mut rows = statement.query(params_from_iter(names.iter()))?;
         let mut fields = BTreeMap::<String, Vec<(String, u32)>>::new();
         let mut count = 0;
@@ -434,7 +434,7 @@ impl PreparedPage {
             format!("DO UPDATE SET {update}")
         };
         let sql = format!(
-            "INSERT INTO {}({fields}) VALUES({}) ON CONFLICT({conflict}) {action}",
+            /* sqlite-large-value: allow-for-now lv-hd4f075349e61 owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO {}({fields}) VALUES({}) ON CONFLICT({conflict}) {action}",
             quote(&metadata.name),
             vec!["?"; columns.len()].join(",")
         );
@@ -474,7 +474,7 @@ impl PreparedPage {
             .map(|c| format!("{}=?", quote(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let sql = format!("DELETE FROM {} WHERE {predicate}", quote(&metadata.name));
+        let sql = format!(/* sqlite-large-value: allow-for-now lv-h30bed07ef8c8 owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM {} WHERE {predicate}", quote(&metadata.name));
         let mut args = vec![SqlValue::Text(self.namespace.0.clone())];
         args.extend(keys);
         ensure!(
@@ -610,7 +610,7 @@ impl PreparedPage {
         let mut args = vec![SqlValue::Text(self.namespace.0.clone())];
         args.extend(keys);
         let expected: Option<Vec<SqlValue>> = db
-            .query_row(&sql, params_from_iter(&args), |r| {
+            .query_row(/* sqlite-large-value: allow-for-now lv-h9086b54616bf owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ &sql, params_from_iter(&args), |r| {
                 bounded_values(r, columns.len())
             })
             .optional()?;
@@ -675,7 +675,7 @@ impl Installer {
             )?,
             "enable deferred mode before starting jobs"
         );
-        tx.execute("INSERT INTO ivm_install_deferred(source,row_limit,byte_limit,reference_limit) VALUES(?1,?2,?3,?4)",params![expected.source,limits.rows,limits.bytes,limits.reference_bytes])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h559613f164ef owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_install_deferred(source,row_limit,byte_limit,reference_limit) VALUES(?1,?2,?3,?4)",params![expected.source,limits.rows,limits.bytes,limits.reference_bytes])?;
         Ok(())
     }
     /// Only queue/reference work in source admission. Never calls an Operator. Quota/invalid
@@ -704,7 +704,7 @@ impl Installer {
             .filter(|r| *r <= i64::MAX as u64)
             .context("deferred revision overflow")?;
         tx.execute(
-            "UPDATE ivm_install_sources SET revision=?2 WHERE name=?1",
+            /* sqlite-large-value: allow-for-now lv-h97d89b759ce0 owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_sources SET revision=?2 WHERE name=?1",
             params![source, position.revision],
         )?;
         if !available {
@@ -739,19 +739,19 @@ impl Installer {
             return Ok(Capture::Fenced(position));
         }
         tx.execute(
-            "UPDATE ivm_install_deferred SET capturing=1 WHERE source=?1",
+            /* sqlite-large-value: allow-for-now lv-h93bee458435b owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_deferred SET capturing=1 WHERE source=?1",
             [source],
         )?;
         tx.execute(
-            "INSERT INTO ivm_install_journal VALUES(?1,?2,?3,?4)",
+            /* sqlite-large-value: allow-for-now lv-he7688b88909d owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_install_journal VALUES(?1,?2,?3,?4)",
             params![source, position.revision, payload, bytes],
         )?;
         tx.execute(
-            "UPDATE ivm_install_deferred SET capturing=0 WHERE source=?1",
+            /* sqlite-large-value: allow-for-now lv-h63d654ae8618 owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_deferred SET capturing=0 WHERE source=?1",
             [source],
         )?;
-        tx.execute("UPDATE ivm_install_sources SET journal_rows=journal_rows+1,journal_bytes=journal_bytes+?2 WHERE name=?1",params![source,bytes])?;
-        tx.execute("UPDATE ivm_install_jobs SET queued_rows=queued_rows+1,queued_bytes=queued_bytes+?2 WHERE source=?1 AND phase IN ('scan','catchup')",params![source,bytes])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h45b32b8bb45b owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_sources SET journal_rows=journal_rows+1,journal_bytes=journal_bytes+?2 WHERE name=?1",params![source,bytes])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h331aa1892adb owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_jobs SET queued_rows=queued_rows+1,queued_bytes=queued_bytes+?2 WHERE source=?1 AND phase IN ('scan','catchup')",params![source,bytes])?;
         Ok(Capture::Queued(position))
     }
     fn prepared_page(
@@ -949,15 +949,15 @@ impl Installer {
         page: &PreparedPage,
         now_ms: u64,
     ) -> Result<Outcome> {
-        tx.execute_batch("SAVEPOINT ivm_prepared_page")?;
+        tx.execute_batch(/* sqlite-large-value: allow-for-now lv-hb314496e1bb9 owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ "SAVEPOINT ivm_prepared_page")?;
         let result = self.publish_prepared_inner(tx, page, now_ms);
         match result {
             Ok(outcome) => {
-                tx.execute_batch("RELEASE ivm_prepared_page")?;
+                tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h554a3f319a10 owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ "RELEASE ivm_prepared_page")?;
                 Ok(outcome)
             }
             Err(error) => {
-                tx.execute_batch("ROLLBACK TO ivm_prepared_page; RELEASE ivm_prepared_page")?;
+                tx.execute_batch(/* sqlite-large-value: allow-for-now lv-hd93d6e4e7551 owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ "ROLLBACK TO ivm_prepared_page; RELEASE ivm_prepared_page")?;
                 Err(error)
             }
         }
@@ -1035,11 +1035,11 @@ impl Installer {
             Target::Scan {
                 id, next, finished, ..
             } => {
-                tx.execute("UPDATE ivm_install_jobs SET cursor=?2,phase=?3,pages=pages+1,extracted_rows=extracted_rows+?4 WHERE id=?1",params![id,next,if *finished {"catchup"}else{"scan"},page.rows.len()])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h440dad9d5ee8 owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_jobs SET cursor=?2,phase=?3,pages=pages+1,extracted_rows=extracted_rows+?4 WHERE id=?1",params![id,next,if *finished {"catchup"}else{"scan"},page.rows.len()])?;
                 Ok(Outcome::Progress)
             }
             Target::CatchUp { id, .. } => {
-                tx.execute("UPDATE ivm_install_jobs SET applied_revision=?2,queued_rows=queued_rows-?3,queued_bytes=queued_bytes-?4,pages=pages+1,applied_rows=applied_rows+?3 WHERE id=?1",params![id,page.position.revision,page.rows.len(),page.consumed_bytes])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h3debf1a7a7fa owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_jobs SET applied_revision=?2,queued_rows=queued_rows-?3,queued_bytes=queued_bytes-?4,pages=pages+1,applied_rows=applied_rows+?3 WHERE id=?1",params![id,page.position.revision,page.rows.len(),page.consumed_bytes])?;
                 if page.position.revision != current.revision {
                     return Ok(Outcome::Progress);
                 }
@@ -1052,12 +1052,12 @@ impl Installer {
                     job.progress.queued_rows == 0 && job.progress.queued_bytes == 0,
                     "prepared journal counters disagree"
                 );
-                tx.execute("UPDATE ivm_install_roots SET namespace=?2,revision=?3,ready=1,generation=generation+1,status_revision=status_revision+1,error=NULL WHERE view=?1",params![job.progress.view,id,current.revision])?;
-                tx.execute("UPDATE ivm_install_jobs SET phase='done' WHERE id=?1", [id])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-hd0b9489032ad owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_roots SET namespace=?2,revision=?3,ready=1,generation=generation+1,status_revision=status_revision+1,error=NULL WHERE view=?1",params![job.progress.view,id,current.revision])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h297b886fc6d9 owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_jobs SET phase='done' WHERE id=?1", [id])?;
                 Ok(Outcome::Published)
             }
             Target::Live { view, .. } => {
-                tx.execute("UPDATE ivm_install_roots SET revision=?2,generation=generation+?3 WHERE view=?1",params![view,page.position.revision,page.changed])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h5e75fd4c4579 owner=smallclaims::ivm::install::prepared TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_roots SET revision=?2,generation=generation+?3 WHERE view=?1",params![view,page.position.revision,page.changed])?;
                 Ok(Outcome::Progress)
             }
         }
@@ -1108,12 +1108,12 @@ impl PreparedPage {
         Ok(())
     }
     fn execute_write(&self, tx: &Transaction<'_>, write: &Write) -> Result<()> {
-        tx.execute(&write.sql, params_from_iter(&write.args))?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h67e884873bac owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ &write.sql, params_from_iter(&write.args))?;
         Ok(())
     }
     fn check_row(&self, tx: &Transaction<'_>, check: &Check) -> Result<()> {
         let actual: Option<Vec<SqlValue>> = tx
-            .query_row(&check.sql, params_from_iter(&check.args), |r| {
+            .query_row(/* sqlite-large-value: allow-for-now lv-hf702016170fa owner=smallclaims::ivm::install::prepared TODO=trace-statement-and-value-representation */ &check.sql, params_from_iter(&check.args), |r| {
                 bounded_values(r, check.columns)
             })
             .optional()?;

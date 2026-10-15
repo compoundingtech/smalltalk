@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) const PAGE: usize = 64;
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h726646fd4e13 owner=st3::store::publication_facts TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS local_publication_claims (
     claim_id TEXT PRIMARY KEY,
     subject TEXT NOT NULL,
@@ -125,7 +125,7 @@ END;
 
 "#;
 
-const REPAIR_SCHEMA: &str = r#"
+const REPAIR_SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-hb1dd3b8508b5 owner=st3::store::publication_facts TODO=prepare-body-and-predecessor-values */ r#"
 CREATE TRIGGER IF NOT EXISTS publication_repair_insert AFTER INSERT ON projection_digest_repaired_claims BEGIN
     DELETE FROM local_publication_claims WHERE claim_id=NEW.id;
     DELETE FROM local_publication_pending WHERE claim_id=NEW.id;
@@ -141,10 +141,10 @@ END;
 "#;
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(SCHEMA)?;
+    connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h04ec01a3639a owner=st3::store::publication_facts TODO=trace-statement-and-value-representation */ SCHEMA)?;
     let repairs:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='projection_digest_repaired_claims' AND type='table')",[],|row|row.get(0))?;
     if repairs {
-        connection.execute_batch(REPAIR_SCHEMA)?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h7fb4b786f8d2 owner=st3::store::publication_facts TODO=trace-statement-and-value-representation */ REPAIR_SCHEMA)?;
     }
     Ok(())
 }
@@ -180,13 +180,13 @@ fn cache_epoch(connection: &Connection) -> Result<(i64, bool)> {
             AND NOT EXISTS(SELECT 1 FROM local_publication_pending)
             AND NOT EXISTS(SELECT 1 FROM local_publication_batches)
          FROM local_publication_launch_epoch WHERE singleton=1"
-    )?.query_row([], |row| Ok((row.get(0)?,row.get(1)?)))?)
+    )?.query_row(/* sqlite-large-value: allow-for-now lv-hbaec8dddb449 owner=st3::store::publication_facts TODO=trace-statement-and-value-representation */ [], |row| Ok((row.get(0)?,row.get(1)?)))?)
 }
 
 /// Indexed ceilings only. Never reads historical bodies or advances a bootstrap page in open.
 pub(super) fn initialize(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute(
-        "INSERT OR IGNORE INTO local_publication_bootstrap(singleton,phase,cursor,ceiling,local_ceiling,progress_ms)
+        /* sqlite-large-value: allow-for-now lv-h74c78a597d23 owner=st3::store::publication_facts TODO=prepare-body-and-predecessor-values */ "INSERT OR IGNORE INTO local_publication_bootstrap(singleton,phase,cursor,ceiling,local_ceiling,progress_ms)
          SELECT 1,CASE WHEN shared=0 AND local=0 THEN 3 ELSE 0 END,0,shared,local,?1 FROM
          (SELECT COALESCE((SELECT MAX(store_index) FROM claims),0) AS shared,
                  COALESCE((SELECT MAX(id) FROM local_observations),0) AS local)",
@@ -205,14 +205,14 @@ fn sync_from_source(transaction: &Transaction<'_>, source: &Connection, id: &str
          WHERE id=?1 AND kind IN ('runtime.observed','runtime.action.succeeded') AND {UNREPAIRED_CLAIM}"
     );
     let row: Option<(String, String, String, String)> = source
-        .prepare_cached(&query)?
-        .query_row([id], |row| {
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-hb433b071870b owner=st3::store::publication_facts TODO=trace-statement-and-value-representation */ &query)?
+        .query_row(/* sqlite-large-value: allow-for-now lv-h9cbafbbade36 owner=st3::store::publication_facts TODO=trace-statement-and-value-representation */ [id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })
         .optional()?;
     let Some((subject, origin, kind, body)) = row else {
         transaction.execute(
-            "DELETE FROM local_publication_claims WHERE claim_id=?1",
+            /* sqlite-large-value: allow-for-now lv-hc6faaaabea85 owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_publication_claims WHERE claim_id=?1",
             [id],
         )?;
         return Ok(());
@@ -221,14 +221,14 @@ fn sync_from_source(transaction: &Transaction<'_>, source: &Connection, id: &str
     let fields = body.get("fields").unwrap_or(&body);
     if kind == "runtime.action.succeeded" && fields["action"] != "start" {
         transaction.execute(
-            "DELETE FROM local_publication_claims WHERE claim_id=?1",
+            /* sqlite-large-value: allow-for-now lv-hdac0e5833540 owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_publication_claims WHERE claim_id=?1",
             [id],
         )?;
         return Ok(());
     }
     let key = canonical::sortable_key(&canonical::claim_key(source, id)?);
     transaction.execute(
-        "INSERT INTO local_publication_claims VALUES(?1,?2,?3,?4,?5,?6)
+        /* sqlite-large-value: allow-for-now lv-h599864f4fa5a owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_publication_claims VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(claim_id) DO UPDATE SET subject=excluded.subject,origin=excluded.origin,
              kind=excluded.kind,incarnation=excluded.incarnation,sort_key=excluded.sort_key
          WHERE local_publication_claims.subject<>excluded.subject
@@ -257,7 +257,7 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
     // Never rescan the remaining batch in each row's delete trigger.
     let batch: Option<(String, i64)> = transaction.prepare_cached(
         "SELECT batch_id,cursor FROM local_publication_batches WHERE batch_id>='' ORDER BY batch_id LIMIT 1"
-    )?.query_row([], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+    )?.query_row(/* sqlite-large-value: allow-for-now lv-hab410bd7a501 owner=st3::store::publication_facts TODO=trace-statement-and-value-representation */ [], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
     if let Some((batch_id, cursor)) = batch {
         let rows = transaction
             .prepare_cached(
@@ -289,12 +289,12 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
         }
         if processed == rows.len() && rows.len() < PAGE {
             transaction.execute(
-                "DELETE FROM local_publication_batches WHERE batch_id=?1",
+                /* sqlite-large-value: allow-for-now lv-h1f41cac33bdc owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_publication_batches WHERE batch_id=?1",
                 [&batch_id],
             )?;
         } else {
             transaction.execute(
-                "UPDATE local_publication_batches SET cursor=?2 WHERE batch_id=?1",
+                /* sqlite-large-value: allow-for-now lv-he144126109cb owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_publication_batches SET cursor=?2 WHERE batch_id=?1",
                 params![batch_id, through],
             )?;
         }
@@ -310,7 +310,7 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
         }
         sync(transaction, id)?;
         transaction.execute(
-            "DELETE FROM local_publication_pending WHERE claim_id=?1",
+            /* sqlite-large-value: allow-for-now lv-h7e50b2a721fc owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_publication_pending WHERE claim_id=?1",
             [id],
         )?;
     }
@@ -324,7 +324,7 @@ pub(super) fn ready(connection: &Connection) -> Result<bool> {
             AND NOT EXISTS(SELECT 1 FROM local_publication_pending)
             AND NOT EXISTS(SELECT 1 FROM local_publication_batches)",
         )?
-        .query_row([], |row| row.get(0))?)
+        .query_row(/* sqlite-large-value: allow-for-now lv-hd3277aad18a2 owner=st3::store::publication_facts TODO=trace-statement-and-value-representation */ [], |row| row.get(0))?)
 }
 
 fn backfill(transaction: &Transaction<'_>) -> Result<()> {
@@ -379,7 +379,7 @@ fn backfill(transaction: &Transaction<'_>) -> Result<()> {
             processed += 1;
         }
         let next = processed == batch.len() && batch.len() < PAGE;
-        transaction.execute("UPDATE local_publication_bootstrap SET phase=?1,cursor=?2,progress_ms=?3 WHERE singleton=1",
+        transaction.execute(/* sqlite-large-value: allow-for-now lv-h0dfd36d92c4a owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_publication_bootstrap SET phase=?1,cursor=?2,progress_ms=?3 WHERE singleton=1",
             params![phase+u8::from(next),if next {0}else{through},now_ms().to_string()])?;
     } else if phase == 2 {
         // There is no kind-leading local index. Walk its existing covering index in
@@ -397,14 +397,14 @@ fn backfill(transaction: &Transaction<'_>) -> Result<()> {
             }
             if kind == "runtime.action.succeeded" && *id <= local_ceiling {
                 transaction.execute(
-                    "INSERT OR REPLACE INTO local_publication_starts
+                    /* sqlite-large-value: allow-for-now lv-hd1dd4381fda6 owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO local_publication_starts
                      SELECT id,subject,COALESCE(json_extract(body,'$.fields.incarnation_id'),'')
                      FROM local_observations WHERE id=?1 AND json_extract(body,'$.fields.action')='start'",[id])?;
             }
             through = (subject.clone(), kind.clone(), *id);
             processed += 1;
         }
-        transaction.execute("UPDATE local_publication_bootstrap SET phase=?1,local_subject=?2,local_kind=?3,local_id=?4,progress_ms=?5 WHERE singleton=1",
+        transaction.execute(/* sqlite-large-value: allow-for-now lv-hc0c8ac179561 owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_publication_bootstrap SET phase=?1,local_subject=?2,local_kind=?3,local_id=?4,progress_ms=?5 WHERE singleton=1",
             params![if processed==batch.len() && batch.len()<PAGE {3}else{2},through.0,through.1,through.2,now_ms().to_string()])?;
     }
     Ok(())
@@ -437,7 +437,7 @@ impl Store {
 
 pub(super) fn reset(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
-        "DELETE FROM local_publication_claims;
+        /* sqlite-large-value: allow-for-now lv-h2ffd4be6ffa0 owner=st3::store::publication_facts TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_publication_claims;
         DELETE FROM local_publication_starts; DELETE FROM local_publication_pending; DELETE FROM local_publication_batches;
         DELETE FROM local_publication_bootstrap;",
     )?;

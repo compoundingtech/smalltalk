@@ -12,13 +12,13 @@ fn insert_retained_ask(
     // These rows model retained reader history, not admission or replication qualification.
     connection
         .execute(
-            "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+            /* sqlite-large-value: allow-for-now lv-h9dc72c10c440 owner=st3::store::person_work::reconcile_candidates_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
          VALUES(?1,'alder',1,?1,?2)",
             params![id, time.to_string()],
         )
         .unwrap();
     connection.execute(
-        "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+        /* sqlite-large-value: allow-for-now lv-he75956cdc52e owner=st3::store::person_work::reconcile_candidates_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
          VALUES(?1,?1,?2,'work.person-asked','alder',?3,?4,'[]',?5)",
         params![id, subject, ask.actor, ask.body.to_string(), time.to_string()],
     ).unwrap();
@@ -37,7 +37,7 @@ fn person_ask_candidate_cost_does_not_grow_with_settled_history() {
             let connection = store.connection.write();
             let subject = format!("step-run/history-{n}/ask");
             connection.execute(
-                "INSERT INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,status,
+                /* sqlite-large-value: allow-for-now lv-hcffa7065c1a7 owner=st3::store::person_work::reconcile_candidates_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,status,
                  attempt,assignee,available_to,agentless,title,goals,created_at_unix_ms,updated_at_unix_ms,constraints)
                  SELECT ?1,run_id,generation_id,?1,definition_hash,'completed',
                  attempt,assignee,available_to,agentless,title,goals,created_at_unix_ms,updated_at_unix_ms,constraints
@@ -55,7 +55,7 @@ fn person_ask_candidate_cost_does_not_grow_with_settled_history() {
             let connection = store.readers.get();
             let query = canonical_sql(PERSON_ASKS_FOR_RECONCILE);
             let plan = connection
-                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .prepare(/* sqlite-large-value: allow-for-now lv-h9e5da9fec7b2 owner=st3::store::person_work::reconcile_candidates_tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {query}"))
                 .unwrap()
                 .query_map([], |row| row.get::<_, String>(3))
                 .unwrap()
@@ -64,7 +64,7 @@ fn person_ask_candidate_cost_does_not_grow_with_settled_history() {
                 .join("; ");
             assert!(plan.contains("USING INDEX step_runs_open_index"), "{plan}");
             {
-                let statement = connection.prepare_cached(&query).unwrap();
+                let statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h93f41ae8593a owner=st3::store::person_work::reconcile_candidates_tests TODO=trace-statement-and-value-representation */ &query).unwrap();
                 statement.reset_status(StatementStatus::VmStep);
                 statement.reset_status(StatementStatus::FullscanStep);
             }
@@ -73,7 +73,7 @@ fn person_ask_candidate_cost_does_not_grow_with_settled_history() {
                 candidates.iter().map(|claim| &claim.id).collect::<Vec<_>>(),
                 [&record.id]
             );
-            let statement = connection.prepare_cached(&query).unwrap();
+            let statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hc30b0f71091c owner=st3::store::person_work::reconcile_candidates_tests TODO=trace-statement-and-value-representation */ &query).unwrap();
             let vm = statement.get_status(StatementStatus::VmStep);
             assert!(
                 statement.get_status(StatementStatus::FullscanStep) <= 8,

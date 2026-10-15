@@ -41,7 +41,7 @@ fn selected_labels_preserve_public_fields_and_indexed_batch() {
     assert_eq!(label.updated_at_unix_ms, run.steps[0].updated_at_unix_ms);
     assert!(read(&connection, &[]).unwrap().is_empty());
     let plan = connection
-        .prepare(&format!("EXPLAIN QUERY PLAN {QUERY}"))
+        .prepare(/* sqlite-large-value: allow-for-now lv-hfad5bbcfc6bd owner=st3::store::step_labels::tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {QUERY}"))
         .unwrap()
         .query_map([serde_json::to_string(&subjects).unwrap()], |row| {
             row.get::<_, String>(3)

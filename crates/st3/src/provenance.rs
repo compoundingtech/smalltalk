@@ -146,7 +146,7 @@ pub(crate) fn read(
     revision: &str,
 ) -> anyhow::Result<Option<Provenance>> {
     let body = connection.query_row(
-        &smallclaims::store::canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='mission.provenance' ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+        /* sqlite-large-value: allow-for-now lv-he5cced97611c owner=st3::provenance TODO=trace-statement-and-value-representation */ &smallclaims::store::canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='mission.provenance' ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
         [subject(mission, revision)], |row| row.get::<_, String>(0),
     ).optional()?;
     body.map(|body| {

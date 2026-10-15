@@ -31,7 +31,7 @@ mod source_gap;
 /// Changes to local provenance/status bookkeeping require an explicit fenced installation.
 pub const LAYOUT: &str = "smallclaims.ivm.provenance-availability.v3";
 
-pub const SCHEMA: &str = r#"
+pub const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-ha879de4a84fc owner=smallclaims::ivm TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS ivm_source (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL,
     admitted INTEGER NOT NULL, projected INTEGER NOT NULL, local_generation INTEGER NOT NULL
@@ -553,7 +553,7 @@ impl Views {
     }
 
     pub fn create_schema(&self, connection: &Connection) -> Result<()> {
-        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h842d4ce4d9e5 owner=smallclaims::ivm TODO=trace-statement-and-value-representation */ SCHEMA)?;
         for view in &self.views {
             view.create_schema(connection)?;
         }
@@ -578,7 +578,7 @@ impl Views {
             );
         }
         transaction.execute(
-            "INSERT INTO ivm_source VALUES(1,?1,?2,?3,?4) ON CONFLICT(singleton) DO UPDATE SET
+            /* sqlite-large-value: allow-for-now lv-hb0c0edaf4815 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_source VALUES(1,?1,?2,?3,?4) ON CONFLICT(singleton) DO UPDATE SET
              admitted=excluded.admitted,projected=excluded.projected,local_generation=excluded.local_generation",
             params![cut.epoch,cut.admitted,cut.projected,cut.local_generation],
         )?;
@@ -605,7 +605,7 @@ impl Views {
                 .optional()?;
             if let Some((fingerprint, epoch)) = existing {
                 if &fingerprint != expected || epoch != cut.epoch {
-                    transaction.execute("UPDATE ivm_views SET ready=0 WHERE name=?1", [d.name])?;
+                    transaction.execute(/* sqlite-large-value: allow-for-now lv-h2d75b1f1e3c5 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET ready=0 WHERE name=?1", [d.name])?;
                 }
                 continue;
             }
@@ -619,7 +619,7 @@ impl Views {
                 "missing view identity with existing contributions"
             );
             transaction.execute(
-                "INSERT INTO ivm_views(name,fingerprint,epoch,ready,generation) VALUES(?1,?2,?3,?4,0)",
+                /* sqlite-large-value: allow-for-now lv-h7609b11cc853 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_views(name,fingerprint,epoch,ready,generation) VALUES(?1,?2,?3,?4,0)",
                 params![d.name, expected, cut.epoch, cut.admitted == 0],
             )?;
         }
@@ -747,11 +747,11 @@ impl Views {
                 self.view_readiness(transaction, d.name, epoch)?,
                 Readiness::Ready(_)
             ) {
-                transaction.execute("UPDATE ivm_views SET deferred_claim_index=MAX(deferred_claim_index,?2) WHERE name=?1",params![d.name,new.map(|(c,_)|c.store_index).unwrap_or(0)])?;
+                transaction.execute(/* sqlite-large-value: allow-for-now lv-h0a4eb1b87901 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET deferred_claim_index=MAX(deferred_claim_index,?2) WHERE name=?1",params![d.name,new.map(|(c,_)|c.store_index).unwrap_or(0)])?;
                 changes.deferred.insert(d.name.to_owned());
                 continue;
             }
-            transaction.execute_batch("SAVEPOINT ivm_view_change")?;
+            transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h6de9c358149a owner=smallclaims::ivm TODO=trace-statement-and-value-representation */ "SAVEPOINT ivm_view_change")?;
             let mut view_changes = Changes::default();
             let result = (|| -> Result<()> {
                 let extra_keys =
@@ -764,7 +764,7 @@ impl Views {
                 let mut before = BTreeMap::<(String, String), Option<StoredHead>>::new();
                 if let Some(old) = old {
                     transaction.execute(
-                        "DELETE FROM ivm_claim_views WHERE view=?1 AND input_claim_id=?2",
+                        /* sqlite-large-value: allow-for-now lv-h48de1ba2ea36 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM ivm_claim_views WHERE view=?1 AND input_claim_id=?2",
                         params![d.name, old.id],
                     )?;
                     let mut statement = transaction.prepare_cached(
@@ -786,7 +786,7 @@ impl Views {
                         );
                     }
                     transaction.execute(
-                        "DELETE FROM ivm_contributions WHERE view=?1 AND claim_id=?2",
+                        /* sqlite-large-value: allow-for-now lv-h37f72f1e4964 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM ivm_contributions WHERE view=?1 AND claim_id=?2",
                         params![d.name, old.id],
                     )?;
                 }
@@ -794,7 +794,7 @@ impl Views {
                     && self.subscribers(&claim.kind).contains(&index)
                 {
                     transaction.execute(
-                    "INSERT INTO ivm_claim_ranks VALUES(?1,?2) ON CONFLICT(claim_id) DO UPDATE SET position=excluded.position WHERE position<>excluded.position",
+                    /* sqlite-large-value: allow-for-now lv-h7296036e11f7 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_claim_ranks VALUES(?1,?2) ON CONFLICT(claim_id) DO UPDATE SET position=excluded.position WHERE position<>excluded.position",
                     params![claim.id,canonical.4],
                 )?;
                     let contributions = view.contributions(claim, canonical)?;
@@ -811,7 +811,7 @@ impl Views {
                     for dependency in dependencies {
                         ensure!(!dependency.is_empty(), "empty canonical dependency");
                         transaction.execute(
-                            "INSERT OR IGNORE INTO ivm_claim_views VALUES(?1,?2,?3)",
+                            /* sqlite-large-value: allow-for-now lv-h2c5a8e184bc8 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO ivm_claim_views VALUES(?1,?2,?3)",
                             params![d.name, claim.id, dependency],
                         )?;
                     }
@@ -835,7 +835,7 @@ impl Views {
                         }
                         let value = serde_json::to_string(&contribution.value)?;
                         transaction.execute(
-                        "INSERT INTO ivm_contributions VALUES(?1,?2,?3,?4,?5,?6)
+                        /* sqlite-large-value: allow-for-now lv-h48b3ca7ad3bd owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_contributions VALUES(?1,?2,?3,?4,?5,?6)
                          ON CONFLICT(view,key,register,claim_id) DO UPDATE SET value=excluded.value,rank=excluded.rank
                          WHERE value<>excluded.value OR rank<>excluded.rank",
                         params![d.name,contribution.key,contribution.register,claim.id,value,contribution.rank],
@@ -856,14 +856,14 @@ impl Views {
                     match next {
                         Some((value, claim, rank)) => {
                             transaction.execute(
-                            "INSERT INTO ivm_heads VALUES(?1,?2,?3,?4,?5,?6)
+                            /* sqlite-large-value: allow-for-now lv-h80f54cac496c owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_heads VALUES(?1,?2,?3,?4,?5,?6)
                              ON CONFLICT(view,key,register) DO UPDATE SET value=excluded.value,claim_id=excluded.claim_id,rank=excluded.rank",
                             params![d.name,key,register,value,claim,rank],
                         )?;
                         }
                         None => {
                             transaction.execute(
-                                "DELETE FROM ivm_heads WHERE view=?1 AND key=?2 AND register=?3",
+                                /* sqlite-large-value: allow-for-now lv-he47bbaa0ab0e owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM ivm_heads WHERE view=?1 AND key=?2 AND register=?3",
                                 params![d.name, key, register],
                             )?;
                         }
@@ -890,7 +890,7 @@ impl Views {
                 }
                 if !changed_keys.is_empty() {
                     transaction.execute(
-                        "UPDATE ivm_views SET generation=generation+1 WHERE name=?1",
+                        /* sqlite-large-value: allow-for-now lv-h6c2ae5eeea22 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET generation=generation+1 WHERE name=?1",
                         [d.name],
                     )?;
                     for key in changed_keys {
@@ -899,19 +899,19 @@ impl Views {
                     }
                 }
                 if let Some((claim, _)) = new {
-                    transaction.execute("UPDATE ivm_views SET applied_claim_index=MAX(applied_claim_index,?2) WHERE name=?1",params![d.name,claim.store_index])?;
+                    transaction.execute(/* sqlite-large-value: allow-for-now lv-h4b5d33fd90dc owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET applied_claim_index=MAX(applied_claim_index,?2) WHERE name=?1",params![d.name,claim.store_index])?;
                 }
                 Ok(())
             })();
             match result {
                 Ok(()) => {
-                    transaction.execute_batch("RELEASE ivm_view_change")?;
+                    transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h64f6ee7bd2a2 owner=smallclaims::ivm TODO=trace-statement-and-value-representation */ "RELEASE ivm_view_change")?;
                     changes.affected.extend(view_changes.affected);
                     changes.changed.extend(view_changes.changed);
                 }
                 Err(error) => {
                     transaction
-                        .execute_batch("ROLLBACK TO ivm_view_change; RELEASE ivm_view_change")?;
+                        .execute_batch(/* sqlite-large-value: allow-for-now lv-h1269cd039065 owner=smallclaims::ivm TODO=trace-statement-and-value-representation */ "ROLLBACK TO ivm_view_change; RELEASE ivm_view_change")?;
                     // Storage/transaction failures must reach the owning transaction. They
                     // are not operator evidence and cannot turn a transient failure into a
                     // persistent unavailable view while acknowledging the source write.
@@ -919,7 +919,7 @@ impl Views {
                         return Err(error);
                     }
                     fence_error(transaction, d.name, &error)?;
-                    transaction.execute("UPDATE ivm_views SET deferred_claim_index=MAX(deferred_claim_index,?2) WHERE name=?1",params![d.name,new.map(|(c,_)|c.store_index).unwrap_or(0)])?;
+                    transaction.execute(/* sqlite-large-value: allow-for-now lv-hc6618f094088 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET deferred_claim_index=MAX(deferred_claim_index,?2) WHERE name=?1",params![d.name,new.map(|(c,_)|c.store_index).unwrap_or(0)])?;
                     changes.deferred.insert(d.name.to_owned());
                 }
             }
@@ -959,11 +959,11 @@ impl Views {
                     self.view_readiness(transaction, d.name, cut.epoch)?,
                     Readiness::Ready(_)
                 ) {
-                    transaction.execute("UPDATE ivm_views SET deferred_local_generation=MAX(deferred_local_generation,?2) WHERE name=?1",params![d.name,cut.local_generation])?;
+                    transaction.execute(/* sqlite-large-value: allow-for-now lv-h39ad82a1c5c6 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET deferred_local_generation=MAX(deferred_local_generation,?2) WHERE name=?1",params![d.name,cut.local_generation])?;
                     changes.deferred.insert(d.name.to_owned());
                     continue;
                 }
-                transaction.execute_batch("SAVEPOINT ivm_local_view_change")?;
+                transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h7eb753a63737 owner=smallclaims::ivm TODO=trace-statement-and-value-representation */ "SAVEPOINT ivm_local_view_change")?;
                 let mut view_changes = Changes::default();
                 let result = (|| -> Result<()> {
                     ensure!(
@@ -981,7 +981,7 @@ impl Views {
                     }
                     if !changed.is_empty() {
                         transaction.execute(
-                            "UPDATE ivm_views SET generation=generation+1 WHERE name=?1",
+                            /* sqlite-large-value: allow-for-now lv-he6dafe2f904c owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET generation=generation+1 WHERE name=?1",
                             [d.name],
                         )?;
                         for key in changed {
@@ -991,24 +991,24 @@ impl Views {
                                 .insert((d.name.to_owned(), key.clone()));
                         }
                     }
-                    transaction.execute("UPDATE ivm_views SET applied_local_generation=MAX(applied_local_generation,?2) WHERE name=?1",params![d.name,cut.local_generation])?;
+                    transaction.execute(/* sqlite-large-value: allow-for-now lv-he5e94d11e5f9 owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET applied_local_generation=MAX(applied_local_generation,?2) WHERE name=?1",params![d.name,cut.local_generation])?;
                     Ok(())
                 })();
                 match result {
                     Ok(()) => {
-                        transaction.execute_batch("RELEASE ivm_local_view_change")?;
+                        transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h901a42c79592 owner=smallclaims::ivm TODO=trace-statement-and-value-representation */ "RELEASE ivm_local_view_change")?;
                         changes.affected.extend(view_changes.affected);
                         changes.changed.extend(view_changes.changed);
                     }
                     Err(error) => {
                         transaction.execute_batch(
-                            "ROLLBACK TO ivm_local_view_change; RELEASE ivm_local_view_change",
+                            /* sqlite-large-value: allow-for-now lv-h9474799e9c0d owner=smallclaims::ivm TODO=trace-statement-and-value-representation */ "ROLLBACK TO ivm_local_view_change; RELEASE ivm_local_view_change",
                         )?;
                         if error.chain().any(|cause| cause.is::<rusqlite::Error>()) {
                             return Err(error);
                         }
                         fence_error(transaction, d.name, &error)?;
-                        transaction.execute("UPDATE ivm_views SET deferred_local_generation=MAX(deferred_local_generation,?2) WHERE name=?1",params![d.name,cut.local_generation])?;
+                        transaction.execute(/* sqlite-large-value: allow-for-now lv-h264c7ed571bb owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET deferred_local_generation=MAX(deferred_local_generation,?2) WHERE name=?1",params![d.name,cut.local_generation])?;
                         changes.deferred.insert(d.name.to_owned());
                     }
                 }
@@ -1343,20 +1343,20 @@ pub fn source_cut(connection: &Connection) -> Result<Option<SourceCut>> {
 
 fn note_key_change(transaction: &Transaction<'_>, view: &str, key: &str) -> Result<()> {
     let sequence: u64 = transaction.query_row(
-        "UPDATE ivm_key_frontier SET sequence=sequence+1 WHERE singleton=1 RETURNING sequence",
+        /* sqlite-large-value: allow-for-now lv-h75c37d052fbc owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_key_frontier SET sequence=sequence+1 WHERE singleton=1 RETURNING sequence",
         [],
         |row| row.get(0),
     )?;
     transaction.execute(
-        "INSERT INTO ivm_keys VALUES(?1,?2,1,?3) ON CONFLICT(view,key) DO UPDATE SET generation=generation+1,changed_sequence=excluded.changed_sequence",
+        /* sqlite-large-value: allow-for-now lv-hb9a1f729ecad owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_keys VALUES(?1,?2,1,?3) ON CONFLICT(view,key) DO UPDATE SET generation=generation+1,changed_sequence=excluded.changed_sequence",
         params![view,key,sequence],
     )?;
     Ok(())
 }
 
 fn fence_error(transaction: &Transaction<'_>, view: &str, error: &anyhow::Error) -> Result<()> {
-    transaction.execute("UPDATE ivm_views SET ready=0 WHERE name=?1", [view])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h47a74825ea0b owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET ready=0 WHERE name=?1", [view])?;
     let bounded = format!("{error:#}").chars().take(1024).collect::<String>();
-    transaction.execute("INSERT INTO ivm_view_errors VALUES(?1,?2) ON CONFLICT(view) DO UPDATE SET error=excluded.error WHERE error<>excluded.error",params![view,bounded])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h8da0f11ae46f owner=smallclaims::ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_view_errors VALUES(?1,?2) ON CONFLICT(view) DO UPDATE SET error=excluded.error WHERE error<>excluded.error",params![view,bounded])?;
     Ok(())
 }

@@ -1228,7 +1228,7 @@ impl CatchUp {
         }
 
         let prepared = publication
-            .prepare()
+            .prepare(/* sqlite-large-value: allow-for-now lv-h1425d93741cd owner=st_drivers::resource_profile TODO=trace-statement-and-value-representation */ )
             .map_err(PublicationTransactionError::Publication)?;
         let outcome = prepared.outcome.clone();
         debug_assert_eq!(digest, outcome.digest);

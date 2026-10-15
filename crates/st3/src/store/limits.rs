@@ -208,7 +208,7 @@ pub(crate) fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, Strin
 // names. A claim's store index only grows, so a cursor in `meta` says which claims are folded.
 const LIMITS_PROJECTION_VERSION: &str = "1";
 const LIMITS_CURSOR: &str = "account_limits_through_index";
-const LIMITS_SCHEMA: &str = r#"
+const LIMITS_SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-hdff7d934e956 owner=st3::store::limits TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS account_limit_readings (
     driver TEXT NOT NULL,
     account TEXT NOT NULL,
@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS account_limit_seats (
 
 pub(super) fn create_limits_schema(connection: &Connection) -> Result<()> {
     connection
-        .execute_batch(LIMITS_SCHEMA)
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-hc03dbe4d9943 owner=st3::store::limits TODO=trace-statement-and-value-representation */ LIMITS_SCHEMA)
         .context("creating the account limits projection")
 }
 
@@ -257,14 +257,14 @@ pub(super) fn open_limits(transaction: &Transaction<'_>) -> Result<()> {
         )
         .optional()?;
     if version.as_deref() != Some(LIMITS_PROJECTION_VERSION) {
-        transaction.execute("DELETE FROM account_limit_readings", [])?;
-        transaction.execute("DELETE FROM account_limit_seats", [])?;
+        transaction.execute(/* sqlite-large-value: allow-for-now lv-hbdd2266fd158 owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM account_limit_readings", [])?;
+        transaction.execute(/* sqlite-large-value: allow-for-now lv-h5ed6d29b550d owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM account_limit_seats", [])?;
         transaction.execute(
-            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            /* sqlite-large-value: allow-for-now lv-h2c4f296b5bee owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key IN (?1, ?2)",
             [LIMITS_CURSOR, LIMITS_READY],
         )?;
         transaction.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('account_limits_version',?1)",
+            /* sqlite-large-value: allow-for-now lv-hc42014446330 owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO meta(key,value) VALUES('account_limits_version',?1)",
             [LIMITS_PROJECTION_VERSION],
         )?;
     }
@@ -287,7 +287,7 @@ pub(super) fn open_limits(transaction: &Transaction<'_>) -> Result<()> {
 
 fn mark_limits_ready(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute(
-        "INSERT OR REPLACE INTO meta(key,value) VALUES(?1, ?2)",
+        /* sqlite-large-value: allow-for-now lv-ha2532f223fd5 owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO meta(key,value) VALUES(?1, ?2)",
         [LIMITS_READY, LIMITS_PROJECTION_VERSION],
     )?;
     Ok(())
@@ -334,11 +334,11 @@ pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> 
         let weekly = limit.weekly_percent.is_some();
         transaction
             .prepare_cached(
-                "INSERT OR REPLACE INTO account_limit_readings
+                /* sqlite-large-value: allow-for-now lv-habbc4f06b5cb owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO account_limit_readings
                  (driver, account, account_ref, weekly, measured_at_unix_ms, subject, store_index, origin, body)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             )?
-            .execute(params![
+            .execute(/* sqlite-large-value: allow-for-now lv-h183120d94244 owner=st3::store::limits TODO=trace-statement-and-value-representation */ params![
                 limit.driver,
                 limit.account,
                 account_ref,
@@ -352,7 +352,7 @@ pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> 
         // The seat's newest reading by acceptance time, ties by arrival.
         transaction
             .prepare_cached(
-                "INSERT INTO account_limit_seats
+                /* sqlite-large-value: allow-for-now lv-he0a3b794e4bd owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO account_limit_seats
                  (subject, driver, account, account_ref, accepted_at_unix_ms, store_index)
                  VALUES (?1,?2,?3,?4,?5,?6)
                  ON CONFLICT(subject) DO UPDATE SET driver=excluded.driver,
@@ -362,7 +362,7 @@ pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> 
                  WHERE (excluded.accepted_at_unix_ms, excluded.store_index)
                     >= (accepted_at_unix_ms, store_index)",
             )?
-            .execute(params![
+            .execute(/* sqlite-large-value: allow-for-now lv-h5b64b4f83f23 owner=st3::store::limits TODO=trace-statement-and-value-representation */ params![
                 subject,
                 limit.driver,
                 limit.account,
@@ -376,13 +376,13 @@ pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> 
     for (driver, account, account_ref, weekly) in touched {
         transaction
             .prepare_cached(
-                "DELETE FROM account_limit_readings
+                /* sqlite-large-value: allow-for-now lv-hb98cbda38301 owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM account_limit_readings
                  WHERE driver=?1 AND account=?2 AND account_ref=?3 AND weekly=?4
                    AND measured_at_unix_ms < (
                        SELECT MAX(measured_at_unix_ms) FROM account_limit_readings
                        WHERE driver=?1 AND account=?2 AND account_ref=?3 AND weekly=?4) - ?5",
             )?
-            .execute(params![
+            .execute(/* sqlite-large-value: allow-for-now lv-h101c0250e3e2 owner=st3::store::limits TODO=trace-statement-and-value-representation */ params![
                 driver,
                 account,
                 account_ref,
@@ -392,7 +392,7 @@ pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> 
     }
     if newest_index > through {
         transaction.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+            /* sqlite-large-value: allow-for-now lv-hcd0de791f1f0 owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
             params![LIMITS_CURSOR, newest_index.to_string()],
         )?;
     }
@@ -412,9 +412,9 @@ pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> 
 /// Empty the projection and fold every `harness.limits` claim into it again, in one
 /// transaction: what a checkpoint proof's copy reads, as a node that never trimmed would.
 pub(crate) fn refold_limits_tx(transaction: &Transaction<'_>) -> Result<()> {
-    transaction.execute("DELETE FROM account_limit_readings", [])?;
-    transaction.execute("DELETE FROM account_limit_seats", [])?;
-    transaction.execute("DELETE FROM meta WHERE key=?1", [LIMITS_CURSOR])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h0395d3d866ef owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM account_limit_readings", [])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h56cc7b094f24 owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM account_limit_seats", [])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h241410f59923 owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key=?1", [LIMITS_CURSOR])?;
     while flush_limits_page(transaction, LIMITS_CATCH_UP_PAGE)? == LIMITS_CATCH_UP_PAGE {}
     Ok(())
 }
@@ -840,7 +840,7 @@ impl Store {
                 self.connection
                     .batched(|tx| {
                         tx.execute(
-                            "INSERT OR IGNORE INTO local_limit_stops(account, episode, seat, stopped_at_unix_ms)
+                            /* sqlite-large-value: allow-for-now lv-h473280d976ca owner=st3::store::limits TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO local_limit_stops(account, episode, seat, stopped_at_unix_ms)
                              VALUES (?1, ?2, ?3, ?4)",
                             params![episode_account, episode, seat, now as i64],
                         )

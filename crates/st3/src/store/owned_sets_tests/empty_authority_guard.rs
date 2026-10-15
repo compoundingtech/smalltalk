@@ -53,7 +53,7 @@ fn empty_effect_authority_cost_does_not_grow_with_subject_history() {
             let tx = writer.transaction().unwrap();
             let batch = format!("reader-history-{history}");
             tx.execute(
-                "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                /* sqlite-large-value: allow-for-now lv-h2e380d03768d owner=st3::store::owned_sets_tests::empty_authority_guard TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
                  VALUES(?1,'amber',?2,?1,'1')",
                 params![batch, history],
             )
@@ -61,14 +61,14 @@ fn empty_effect_authority_cost_does_not_grow_with_subject_history() {
             {
                 let mut insert = tx
                     .prepare(
-                        "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+                        /* sqlite-large-value: allow-for-now lv-h108d0786bd59 owner=st3::store::owned_sets_tests::empty_authority_guard TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
                          VALUES(?1,?2,?3,'harness.usage','amber',NULL,?4,'[]','1')",
                     )
                     .unwrap();
                 for index in inserted..history {
                     for subject in [captured.subject.as_str(), "agent/unrelated-history"] {
                         insert
-                            .execute(params![
+                            .execute(/* sqlite-large-value: allow-for-now lv-h0bcfaa391dd3 owner=st3::store::owned_sets_tests::empty_authority_guard TODO=trace-statement-and-value-representation */ params![
                                 format!("reader-history-{subject}-{index}"),
                                 batch,
                                 subject,
@@ -148,13 +148,13 @@ fn staged_only_proof_uses_any_claim_and_the_exact_non_null_marker() {
             let tx = writer.transaction().unwrap();
             let id = "reader-staged-fixture";
             tx.execute(
-                "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                /* sqlite-large-value: allow-for-now lv-hd659fc87d202 owner=st3::store::owned_sets_tests::empty_authority_guard TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
                  VALUES(?1,'amber',1,?1,'1')",
                 [id],
             )
             .unwrap();
             tx.execute(
-                "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+                /* sqlite-large-value: allow-for-now lv-hd37223241044 owner=st3::store::owned_sets_tests::empty_authority_guard TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
                  VALUES(?1,?1,?2,'fixture.staged','amber','person/operator',?3,'[]','1')",
                 params![id, captured.subject, json!({"owned_set": marker}).to_string()],
             ).unwrap();
@@ -199,7 +199,7 @@ fn empty_proof_errors_and_pinned_reads_do_not_authorize_effects() {
     store
         .connection
         .write()
-        .execute_batch("DROP TABLE claims")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-ha097f74858a0 owner=st3::store::owned_sets_tests::empty_authority_guard TODO=prepare-body-and-predecessor-values */ "DROP TABLE claims")
         .unwrap();
     let (failed, reads) = smallclaims::touched::record(|| store.owned_desired_guard(&declaration));
     assert_eq!(failed.unwrap_err().code, "internal");

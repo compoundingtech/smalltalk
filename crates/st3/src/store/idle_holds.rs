@@ -52,7 +52,7 @@ impl Store {
                 "SELECT subject FROM local_idle_messages INDEXED BY local_idle_messages_pending
                  WHERE recipient IN (?1,?2) AND pending=1 LIMIT 1",
             )?
-            .query_row(params![recipient, bare_recipient], |row| row.get(0))
+            .query_row(/* sqlite-large-value: allow-for-now lv-h083ad8d2cd00 owner=st3::store::idle_holds TODO=trace-statement-and-value-representation */ params![recipient, bare_recipient], |row| row.get(0))
             .optional()?;
         if let Some(subject) = &found {
             smallclaims::touched::note_read(|| subject.clone());
@@ -74,8 +74,8 @@ impl Store {
         smallclaims::touched::note_read(|| format!("mailbox:{recipient}"));
         let connection = self.readers.get();
         Ok(connection
-            .prepare_cached(LAST_WAKE_SQL)?
-            .query_row(params![recipient, bare_recipient, tag, prefix], |row| {
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h591efc51b18e owner=st3::store::idle_holds TODO=trace-statement-and-value-representation */ LAST_WAKE_SQL)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-h8b1d3078de1b owner=st3::store::idle_holds TODO=trace-statement-and-value-representation */ params![recipient, bare_recipient, tag, prefix], |row| {
                 row.get::<_, Option<u64>>(0)
             })?
             .map(u128::from))
@@ -133,7 +133,7 @@ impl Store {
         let item = format!("{resource}/pull-request/{}", thread.number);
         smallclaims::touched::note_read(|| item.clone());
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(QUEUE_EXIT_SQL)?;
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h61b3366e603a owner=st3::store::idle_holds TODO=trace-statement-and-value-representation */ QUEUE_EXIT_SQL)?;
         let mut rows = statement.query_map(params![item, THREAD_SCAN], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
@@ -213,7 +213,7 @@ impl Store {
              ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC, store_index DESC
              LIMIT 1",
             )?
-            .query_row(params![step.subject, step.attempt], |row| {
+            .query_row(/* sqlite-large-value: allow-for-now lv-h46ad93629c94 owner=st3::store::idle_holds TODO=trace-statement-and-value-representation */ params![step.subject, step.attempt], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .optional()?;
@@ -238,7 +238,7 @@ impl Store {
                AND json_extract(body, '$.fields.state')='working'
                AND json_extract(body, '$.fields.incarnation_id')=?2)",
             )?
-            .query_row(params![agent, incarnation, after], |row| row.get(0))?)
+            .query_row(/* sqlite-large-value: allow-for-now lv-ha88b43c5b791 owner=st3::store::idle_holds TODO=trace-statement-and-value-representation */ params![agent, incarnation, after], |row| row.get(0))?)
     }
 
     /// A step's newest nudge.

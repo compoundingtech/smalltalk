@@ -215,7 +215,7 @@ impl Store {
                 "SELECT COALESCE((SELECT MAX(store_index) FROM claims),0),
                     COALESCE((SELECT MAX(id) FROM local_observations),0)",
             )?
-            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?)
+            .query_row(/* sqlite-large-value: allow-for-now lv-hccb821aacb96 owner=st3::store::mailbox_wakes TODO=trace-statement-and-value-representation */ [], |r| Ok((r.get(0)?, r.get(1)?)))?)
     }
 
     fn mailbox_wake_batch(

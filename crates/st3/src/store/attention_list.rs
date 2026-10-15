@@ -200,7 +200,7 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_kind_index
              WHERE kind IN ('custom.client.pairing-completed','custom.client.pairing-revoked')
                AND store_index>?1 AND store_index<=?2)",
-        )?.query_row(params![checked, index], |row| row.get(0))?;
+        )?.query_row(/* sqlite-large-value: allow-for-now lv-hda1a9eb52996 owner=st3::store::attention_list TODO=trace-statement-and-value-representation */ params![checked, index], |row| row.get(0))?;
         list.pairings_checked.store(index, AtomicOrdering::Release);
         if changed {
             for view in PUBLISHED_VIEWS.into_iter().filter(|view| self.published_view_serving(view)) {
@@ -349,7 +349,7 @@ impl Store {
         let earliest: Option<i64> = self.readers.get().prepare_cached(
             "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
              WHERE store_index>?1 AND store_index<=?2 AND CAST(accepted_at_unix_ms AS INTEGER)>?3",
-        )?.query_row(params![after, through, i64::try_from(now).unwrap_or(i64::MAX)], |row| row.get(0))?;
+        )?.query_row(/* sqlite-large-value: allow-for-now lv-h85ba02f04f89 owner=st3::store::attention_list TODO=trace-statement-and-value-representation */ params![after, through, i64::try_from(now).unwrap_or(i64::MAX)], |row| row.get(0))?;
         Ok(earliest.and_then(|at| u128::try_from(at).ok()))
     }
 
@@ -554,7 +554,7 @@ fn blocked_on_human(connection: &Connection, id: &str) -> Result<bool> {
             "SELECT COALESCE(json_extract(body, '$.fields.blocked_on'), json_extract(body, '$.blocked_on'))='human'
              FROM claims WHERE id=?1",
         )?
-        .query_row([id], |row| row.get::<_, Option<bool>>(0))
+        .query_row(/* sqlite-large-value: allow-for-now lv-hf520acca42f6 owner=st3::store::attention_list TODO=trace-statement-and-value-representation */ [id], |row| row.get::<_, Option<bool>>(0))
         .optional()?
         .flatten()
         .unwrap_or(false))
@@ -565,7 +565,7 @@ fn blocked_on_human(connection: &Connection, id: &str) -> Result<bool> {
 fn declared_stop(connection: &Connection, subject: &str) -> Result<bool> {
     Ok(connection
         .prepare_cached("SELECT kind='stop' FROM desired WHERE subject=?1")?
-        .query_row([subject], |row| row.get(0))
+        .query_row(/* sqlite-large-value: allow-for-now lv-h48aa90a9f0d2 owner=st3::store::attention_list TODO=trace-statement-and-value-representation */ [subject], |row| row.get(0))
         .optional()?
         .unwrap_or(false))
 }

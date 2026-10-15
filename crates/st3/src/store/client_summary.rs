@@ -15,7 +15,7 @@ impl Store {
         let c = self.readers.get();
         // Published definitions with no run always read NotStarted and cannot be active.
         let candidates: Vec<String> = c.prepare_cached(
-            "WITH states AS (
+            /* sqlite-large-value: allow-for-now lv-h43732bf29184 owner=st3::store::client_summary TODO=trace-statement-and-value-representation */ "WITH states AS (
                 SELECT mission_id,MAX(status='running') running,MAX(status='standing') standing
                 FROM mission_runs GROUP BY mission_id
              ), latest AS (
@@ -46,7 +46,7 @@ impl Store {
         // Separate equal-width and longer-width ranges skip historical claims.
         for sql in [FUTURE_ASK_SAME_WIDTH, FUTURE_ASK_LONGER] {
             let next: Option<String> = c
-                .query_row(sql, [at.to_string()], |r| r.get(0))
+                .query_row(/* sqlite-large-value: allow-for-now lv-hb9b5d0029fa9 owner=st3::store::client_summary TODO=trace-statement-and-value-representation */ sql, [at.to_string()], |r| r.get(0))
                 .optional()?;
             if let Some(next) = next {
                 let next = next.parse::<u128>()?;

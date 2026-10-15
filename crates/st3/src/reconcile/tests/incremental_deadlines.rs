@@ -707,14 +707,14 @@ fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
             .connection
             .write()
             .execute(
-                "UPDATE local_observations SET observed_at_unix_ms=?1
+                /* sqlite-large-value: allow-for-now lv-he7e13644d0da owner=st3::reconcile::tests::incremental_deadlines TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_observations SET observed_at_unix_ms=?1
              WHERE subject=?2 AND kind='runtime.action.succeeded'",
                 rusqlite::params![i64::try_from(START - 1).unwrap(), operation],
             )
             .unwrap();
         if case == "local-start-wrong-runtime" {
             fixture.store.connection.write().execute(
-                "UPDATE local_observations SET body=json_set(body, '$.fields.runtime_id', 'wrong-runtime')
+                /* sqlite-large-value: allow-for-now lv-h94b40d74119a owner=st3::reconcile::tests::incremental_deadlines TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_observations SET body=json_set(body, '$.fields.runtime_id', 'wrong-runtime')
                  WHERE subject=?1 AND kind='runtime.action.succeeded' AND json_extract(body,'$.fields.action')='start'",
                 [&operation],
             ).unwrap();
@@ -778,7 +778,7 @@ fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
                 // Admission rejects this type. Mutate only this reader-negative fixture;
                 // it does not assert that a malformed receipt could be admitted.
                 fixture.store.connection.write().execute(
-                    "UPDATE claims SET body=json_set(body, '$.fields.exit_code', '0') WHERE id=?1",
+                    /* sqlite-large-value: allow-for-now lv-h73030805067a owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=json_set(body, '$.fields.exit_code', '0') WHERE id=?1",
                     [&completed.id],
                 ).unwrap();
             }
@@ -790,7 +790,7 @@ fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
                     .connection
                     .write()
                     .execute(
-                        "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                        /* sqlite-large-value: allow-for-now lv-h45dfbf35d0e3 owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                         rusqlite::params![(START - 1).to_string(), completed.id],
                     )
                     .unwrap();
@@ -799,15 +799,15 @@ fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
                 // Isolate the reader's claim/batch provenance checks without asserting that
                 // these deliberately inconsistent fixture rows would pass admission.
                 let query = if case == "foreign-origin" {
-                    "UPDATE claims SET origin='other' WHERE id=?1"
+                    /* sqlite-large-value: allow-for-now lv-heed0cb843404 owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET origin='other' WHERE id=?1"
                 } else {
-                    "UPDATE batches SET origin='other' WHERE id=(SELECT batch_id FROM claims WHERE id=?1)"
+                    /* sqlite-large-value: allow-for-now lv-h0ce344042951 owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE batches SET origin='other' WHERE id=(SELECT batch_id FROM claims WHERE id=?1)"
                 };
                 fixture
                     .store
                     .connection
                     .write()
-                    .execute(query, [&completed.id])
+                    .execute(/* sqlite-large-value: allow-for-now lv-hf424e358c337 owner=st3::reconcile::tests::incremental_deadlines TODO=trace-statement-and-value-representation */ query, [&completed.id])
                     .unwrap();
             }
             if matches!(case, "repaired" | "repaired-request") {
@@ -822,7 +822,7 @@ fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
                     completed.id
                 };
                 fixture.store.connection.write().execute(
-                    "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+                    /* sqlite-large-value: allow-for-now lv-he08f6bf61564 owner=st3::reconcile::tests::incremental_deadlines TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
                      VALUES('record/repaired-exit','node',999999,'repaired-exit',0,X'00','repaired',?1,?2)",
                     rusqlite::params![id, (START + at).to_string()],
                 ).unwrap();
@@ -834,7 +834,7 @@ fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
                 .connection
                 .write()
                 .execute(
-                    "UPDATE claims SET origin='other' WHERE subject=?1 AND kind='gate.requested'",
+                    /* sqlite-large-value: allow-for-now lv-h817b3f15e849 owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET origin='other' WHERE subject=?1 AND kind='gate.requested'",
                     [&operation],
                 )
                 .unwrap();
@@ -880,7 +880,7 @@ fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
                 .store
                 .connection
                 .write()
-                .execute("UPDATE claims SET actor=NULL WHERE id=?1", [&legacy.id])
+                .execute(/* sqlite-large-value: allow-for-now lv-hcc94326c46f2 owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET actor=NULL WHERE id=?1", [&legacy.id])
                 .unwrap();
             // Check ambiguity in the reader itself: a later runtime-incarnation
             // mismatch must not be the reason this mixed-source case times out.
@@ -1091,7 +1091,7 @@ fn mechanical_gate_reader_excludes_local_starts_before_the_request() {
         .connection
         .write()
         .execute(
-            "UPDATE local_observations SET actor='person/example' WHERE id=?1",
+            /* sqlite-large-value: allow-for-now lv-ha3c12feb26c8 owner=st3::reconcile::tests::incremental_deadlines TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_observations SET actor='person/example' WHERE id=?1",
             [extra.id.rsplit('/').next().unwrap()],
         )
         .unwrap();
@@ -1149,7 +1149,7 @@ fn mechanical_gate_reader_rejects_old_writer_history_inserted_late() {
         .connection
         .write()
         .execute(
-            "UPDATE claims SET store_index=?1 WHERE id=?2",
+            /* sqlite-large-value: allow-for-now lv-hf949215fde8a owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET store_index=?1 WHERE id=?2",
             rusqlite::params![late_index, old.id],
         )
         .unwrap();
@@ -1204,19 +1204,19 @@ fn mechanical_gate_reader_orders_positions_within_one_writer_batch() {
         let connection = fixture.store.connection.write();
         connection
             .execute(
-                "UPDATE claims SET batch_id=?1 WHERE id=?2",
+                /* sqlite-large-value: allow-for-now lv-h517703e0cb5c owner=st3::reconcile::tests::incremental_deadlines TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET batch_id=?1 WHERE id=?2",
                 rusqlite::params![requested.batch_id, completed.id],
             )
             .unwrap();
         connection
             .execute(
-                "DELETE FROM replica_records WHERE claim_id IN (?1,?2)",
+                /* sqlite-large-value: allow-for-now lv-h66ab2b616f45 owner=st3::reconcile::tests::incremental_deadlines TODO=chunk-or-reference-exact-wire-values */ "DELETE FROM replica_records WHERE claim_id IN (?1,?2)",
                 rusqlite::params![requested.id, completed.id],
             )
             .unwrap();
         for (id, slot) in [(&requested.id, 1), (&completed.id, position)] {
             connection.execute(
-                "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+                /* sqlite-large-value: allow-for-now lv-hcef4f14d63cb owner=st3::reconcile::tests::incremental_deadlines TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
                  VALUES(?1,'node',999999,'position-fixture',?2,X'00','valid',?3,?4)",
                 rusqlite::params![format!("record/position-{slot}"),slot,id,START.to_string()],
             ).unwrap();

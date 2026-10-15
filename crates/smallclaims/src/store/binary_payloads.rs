@@ -51,7 +51,7 @@ fn convert_page(tx: &Connection) -> Result<PayloadConversion> {
             // Bad base64 is forensic evidence, not something a storage conversion repairs.
             if let Ok(bytes) = payload.bytes() {
                 tx.execute(
-                    "UPDATE replica_envelopes SET payload=?1 WHERE rowid=?2",
+                    /* sqlite-large-value: allow-for-now lv-ha78b48a38c5d owner=smallclaims::store::binary_payloads TODO=chunk-or-reference-exact-wire-values */ "UPDATE replica_envelopes SET payload=?1 WHERE rowid=?2",
                     params![bytes, after],
                 )?;
                 report.converted += 1;
@@ -63,7 +63,7 @@ fn convert_page(tx: &Connection) -> Result<PayloadConversion> {
     }
     report.done = report.scanned == 0;
     tx.execute(
-        "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        /* sqlite-large-value: allow-for-now lv-hb6d22131026b owner=smallclaims::store::binary_payloads TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![CURSOR, if report.done { "done".into() } else { after.to_string() }],
     )?;
     Ok(report)

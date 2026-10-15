@@ -39,7 +39,7 @@ fn fleet_sized_document_reads_use_indexed_canonical_bindings_within_budget() {
         // Generate unrelated history directly: the measured path is reading, not batching
         // writes. The claim source digests still cover all 250,000 generated rows.
         transaction.execute(
-            "WITH RECURSIVE fixture(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM fixture WHERE n<250000)
+            /* sqlite-large-value: allow-for-now lv-h7c14943c0175 owner=st3::store::document_index_tests TODO=prepare-body-and-predecessor-values */ "WITH RECURSIVE fixture(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM fixture WHERE n<250000)
              INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
              SELECT 'fixture-'||n,?1,'daemon/alder','daemon.diagnostic','alder',?2,'[]',?3 FROM fixture",
             params![noise.batch_id,canonical_json_text(&noise.body).unwrap(),noise.accepted_at_unix_ms.to_string()],
@@ -50,7 +50,7 @@ fn fleet_sized_document_reads_use_indexed_canonical_bindings_within_budget() {
             let hash = hex::encode(Sha256::digest(bytes.as_bytes()));
             transaction
                 .execute(
-                    "INSERT INTO blobs VALUES(?1,?2,?3)",
+                    /* sqlite-large-value: allow-for-now lv-ha6334f4d8e82 owner=st3::store::document_index_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO blobs VALUES(?1,?2,?3)",
                     params![hash, bytes.as_bytes(), bytes.len()],
                 )
                 .unwrap();
@@ -164,7 +164,7 @@ fn schema_fourteen_document_bindings_gain_keys_once_on_upgrade() {
     configure_projection_writer(&connection).unwrap();
     connection
         .execute_batch(
-            "DROP TRIGGER projection_digest_documents_insert;
+            /* sqlite-large-value: allow-for-now lv-hdc5c0bd61b5f owner=st3::store::document_index_tests TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER projection_digest_documents_insert;
         DROP TRIGGER projection_digest_documents_update;
         DROP TRIGGER projection_digest_documents_delete;
         DROP INDEX document_canonical_latest;

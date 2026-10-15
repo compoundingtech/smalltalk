@@ -18,9 +18,9 @@ pub const ASSISTANT_SUBJECT: &str = "agent/st/assistant";
 /// The seat's subject is durable; people see this name.
 const ASSISTANT_NAME: &str = "Smalltalk Assistant";
 const MISSION: &str = "st/onboarding";
-const ASSISTANT: &str = include_str!("builtins/assistant.kdl");
-const ONBOARDING: &str = include_str!("builtins/onboarding.kdl");
-const GUIDE: &str = include_str!("../../../docs/st3/onboarding-guide.md");
+const ASSISTANT: &str = /* sqlite-large-value: allow-for-now lv-h43a8d8fd5ba8 owner=st3::onboarding TODO=trace-statement-and-value-representation */ include_str!("builtins/assistant.kdl");
+const ONBOARDING: &str = /* sqlite-large-value: allow-for-now lv-h5048786621c3 owner=st3::onboarding TODO=trace-statement-and-value-representation */ include_str!("builtins/onboarding.kdl");
+const GUIDE: &str = /* sqlite-large-value: allow-for-now lv-he9271c41f835 owner=st3::onboarding TODO=trace-statement-and-value-representation */ include_str!("../../../docs/st3/onboarding-guide.md");
 
 fn client(config: &Config) -> Result<Client> {
     Client::unix_as(

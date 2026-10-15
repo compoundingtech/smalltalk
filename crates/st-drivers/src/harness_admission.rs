@@ -512,13 +512,13 @@ fn valid_measurements(driver: Driver, measurements: &[Measurement]) -> bool {
 fn probe_digest() -> String {
     digest(
         concat!(
-            include_str!("harness_admission.rs"),
-            include_str!("harness_admission/omp.rs"),
-            include_str!("harness_admission/omp-probe.ts"),
-            include_str!("harness_admission/fixture.rs"),
-            include_str!("opencode_session/admission.rs"),
-            include_str!("opencode_session.rs"),
-            include_str!("harness_version.rs")
+            /* sqlite-large-value: allow-for-now lv-he51e56ea5949 owner=st_drivers::harness_admission TODO=trace-statement-and-value-representation */ include_str!("harness_admission.rs"),
+            /* sqlite-large-value: allow-for-now lv-h357188a09fd1 owner=st_drivers::harness_admission TODO=trace-statement-and-value-representation */ include_str!("harness_admission/omp.rs"),
+            /* sqlite-large-value: allow-for-now lv-hf5506eef3937 owner=st_drivers::harness_admission TODO=trace-statement-and-value-representation */ include_str!("harness_admission/omp-probe.ts"),
+            /* sqlite-large-value: allow-for-now lv-h7c02c0afcd96 owner=st_drivers::harness_admission TODO=trace-statement-and-value-representation */ include_str!("harness_admission/fixture.rs"),
+            /* sqlite-large-value: allow-for-now lv-ha29c0aed2dc8 owner=st_drivers::harness_admission TODO=trace-statement-and-value-representation */ include_str!("opencode_session/admission.rs"),
+            /* sqlite-large-value: allow-for-now lv-ha8b57d06ccee owner=st_drivers::harness_admission TODO=trace-statement-and-value-representation */ include_str!("opencode_session.rs"),
+            /* sqlite-large-value: allow-for-now lv-h941d28bb02c3 owner=st_drivers::harness_admission TODO=trace-statement-and-value-representation */ include_str!("harness_version.rs")
         )
         .as_bytes(),
     )

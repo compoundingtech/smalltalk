@@ -151,14 +151,14 @@ pub fn claim_or_tombstone_exists(connection: &Connection, id: &str) -> Result<bo
             "SELECT EXISTS(SELECT 1 FROM claims WHERE id=?1)
                  OR EXISTS(SELECT 1 FROM checkpoint_claims WHERE id=?1)",
         )?
-        .query_row([id], |row| row.get(0))?)
+        .query_row(/* sqlite-large-value: allow-for-now lv-ha3041d5fa76e owner=smallclaims::store::checkpoint::tombstones TODO=trace-statement-and-value-representation */ [id], |row| row.get(0))?)
 }
 
 /// Whether a checkpoint dropped this claim here.
 pub fn claim_tombstoned(connection: &Connection, id: &str) -> Result<bool> {
     Ok(connection
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM checkpoint_claims WHERE id=?1)")?
-        .query_row([id], |row| row.get(0))?)
+        .query_row(/* sqlite-large-value: allow-for-now lv-hb91cbaef2bf2 owner=smallclaims::store::checkpoint::tombstones TODO=trace-statement-and-value-representation */ [id], |row| row.get(0))?)
 }
 
 /// Whether a checkpoint dropped this envelope here.
@@ -173,7 +173,7 @@ pub fn envelope_tombstoned(
             "SELECT EXISTS(SELECT 1 FROM checkpoint_envelopes
                            WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3)",
         )?
-        .query_row(params![writer, sequence, envelope_hash], |row| row.get(0))?)
+        .query_row(/* sqlite-large-value: allow-for-now lv-hadd29522ed5d owner=smallclaims::store::checkpoint::tombstones TODO=trace-statement-and-value-representation */ params![writer, sequence, envelope_hash], |row| row.get(0))?)
 }
 
 /// The request digest and claim ID of each dropped claim of an operation.

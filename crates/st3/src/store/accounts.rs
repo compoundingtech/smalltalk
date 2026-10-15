@@ -41,7 +41,7 @@ impl Store {
         self.connection
             .batched(|tx| {
                 tx.execute(
-                    "INSERT INTO local_seat_accounts(seat, account, chosen_at_unix_ms) VALUES (?1, ?2, ?3)
+                    /* sqlite-large-value: allow-for-now lv-h0480deeb6665 owner=st3::store::accounts TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_seat_accounts(seat, account, chosen_at_unix_ms) VALUES (?1, ?2, ?3)
                      ON CONFLICT(seat) DO UPDATE SET account=excluded.account,
                                                      chosen_at_unix_ms=excluded.chosen_at_unix_ms",
                     params![seat, account, now as i64],
@@ -271,7 +271,7 @@ impl Store {
                 body["_operation"] = json!({"id": id, "request_digest": digest});
             }
             tx.execute(
-                "INSERT INTO local_seat_accounts(seat,account,chosen_at_unix_ms) VALUES (?1,?2,?3)
+                /* sqlite-large-value: allow-for-now lv-ha93e2ac6ce55 owner=st3::store::accounts TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_seat_accounts(seat,account,chosen_at_unix_ms) VALUES (?1,?2,?3)
                  ON CONFLICT(seat) DO UPDATE SET account=excluded.account, chosen_at_unix_ms=excluded.chosen_at_unix_ms",
                 params![seat, next, now as i64],
             ).map_err(internal)?;
@@ -280,7 +280,7 @@ impl Store {
                 .map_err(claim_append_error)?;
             register_operation_tx(tx, &claim).map_err(internal)?;
             tx.execute(
-                "INSERT INTO local_limit_stops(account,episode,seat,stopped_at_unix_ms) VALUES (?1,?2,?3,?4)",
+                /* sqlite-large-value: allow-for-now lv-h1173332617f0 owner=st3::store::accounts TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_limit_stops(account,episode,seat,stopped_at_unix_ms) VALUES (?1,?2,?3,?4)",
                 params![episode_account, episode, seat, now as i64],
             ).map_err(internal)?;
             Ok(true)
@@ -347,14 +347,14 @@ fn observation_at(
     kind: &str,
 ) -> Result<Option<ClaimRecord>> {
     let claim = connection.query_row(
-        &canonical_sql("SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+        /* sqlite-large-value: allow-for-now lv-h16e588346b63 owner=st3::store::accounts TODO=trace-statement-and-value-representation */ &canonical_sql("SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
             claims.origin, claims.actor, claims.body, claims.predecessors, claims.accepted_at_unix_ms
             FROM claims WHERE subject=?1 AND kind=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
         params![seat, kind], claim_from_row,
     ).optional()?;
     let local = connection
         .query_row(
-            &format!(
+            /* sqlite-large-value: allow-for-now lv-hcb7c39949af1 owner=st3::store::accounts TODO=trace-statement-and-value-representation */ &format!(
                 "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 1"
             ),
             params![seat, kind],

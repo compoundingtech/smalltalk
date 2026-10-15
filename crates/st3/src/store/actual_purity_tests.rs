@@ -110,7 +110,7 @@ fn repair_fixture(category: usize) -> (ReplicationExchange, String, Value) {
         .connection
         .write()
         .execute(
-            "UPDATE replica_records SET state='unknown' WHERE record_ref=?1",
+            /* sqlite-large-value: allow-for-now lv-h9fea7c254ef3 owner=st3::store::actual_purity_tests TODO=chunk-or-reference-exact-wire-values */ "UPDATE replica_records SET state='unknown' WHERE record_ref=?1",
             [&record.record_ref],
         )
         .unwrap();
@@ -127,7 +127,7 @@ fn repair_fixture(category: usize) -> (ReplicationExchange, String, Value) {
     reference
         .connection
         .write()
-        .execute("DELETE FROM claims WHERE id=?1", [&original.id])
+        .execute(/* sqlite-large-value: allow-for-now lv-h32c644aec35f owner=st3::store::actual_purity_tests TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id=?1", [&original.id])
         .unwrap();
     (exchange, original.id, actual_snapshot(&reference, subject))
 }
@@ -163,7 +163,7 @@ proptest! {
             prop_assert_eq!(actual_snapshot(&target, subject), expected.clone());
             // Trimming a local receipt must not revive a logically retired source.
             target.connection.write().execute(
-                "DELETE FROM replica_records WHERE claim_id=?1", [&original],
+                /* sqlite-large-value: allow-for-now lv-h4b015dc1790d owner=st3::store::actual_purity_tests TODO=chunk-or-reference-exact-wire-values */ "DELETE FROM replica_records WHERE claim_id=?1", [&original],
             ).unwrap();
             prop_assert_eq!(actual_snapshot(&target, subject), expected.clone());
             target.replay_replication_graph().unwrap();

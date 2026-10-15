@@ -20,6 +20,7 @@ Use these documents for implementation details:
 - [Typed custom subjects](custom-subjects.md) defines immutable registrations, generic reads and replies, and derived-state freshness,
   and the decision-tree manifest.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
+- [Large SQLite values](large-values.md) records variable-value storage debt and the source-site guard.
 - [0.x compatibility](compatibility.md) states upgrade baselines, independent contracts and current platform proof.
 - [Install/upgrade troubleshooting and support](../when-something-is-wrong.md) provides the diagnostic entry point and sanitized issue path.
 - [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.

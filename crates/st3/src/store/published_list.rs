@@ -321,7 +321,7 @@ impl Store {
                 "SELECT COALESCE(MAX(last_good_store_index), 0) FROM projection_health
                  WHERE aggregate='graph'",
             )?
-            .query_row([], |row| row.get::<_, u64>(0))?;
+            .query_row(/* sqlite-large-value: allow-for-now lv-h64061031bb0c owner=st3::store::published_list TODO=trace-statement-and-value-representation */ [], |row| row.get::<_, u64>(0))?;
         Ok(frontier)
     }
 
@@ -336,7 +336,7 @@ impl Store {
         }
         let connection = self.readers.get();
         let asks = connection
-            .prepare_cached(ASKS_BY_REQUESTERS)?
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h15eecd629e39 owner=st3::store::published_list TODO=trace-statement-and-value-representation */ ASKS_BY_REQUESTERS)?
             .query_map([serde_json::to_string(requesters)?], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?
@@ -349,8 +349,8 @@ impl Store {
     pub(crate) fn ask_origin_and_run(&self, ask: &str) -> Result<(Option<String>, Option<String>)> {
         let connection = self.readers.get();
         let found = connection
-            .prepare_cached(ASK_ORIGIN_AND_RUN)?
-            .query_row([ask], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)))
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-hd592ed6182e6 owner=st3::store::published_list TODO=trace-statement-and-value-representation */ ASK_ORIGIN_AND_RUN)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-h6e8682e52001 owner=st3::store::published_list TODO=trace-statement-and-value-representation */ [ask], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)))
             .optional()?;
         Ok(found.unwrap_or_default())
     }
@@ -374,8 +374,8 @@ impl Store {
     /// current. Walks the run and parent-step indexes, never the whole table.
     pub(crate) fn runs_under(&self, runs: &BTreeSet<String>) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
-        let mut steps_of = connection.prepare_cached(RUN_STEPS)?;
-        let mut children_of = connection.prepare_cached(CHILD_RUNS)?;
+        let mut steps_of = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hbd44ca2fbc70 owner=st3::store::published_list TODO=trace-statement-and-value-representation */ RUN_STEPS)?;
+        let mut children_of = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h43054668c937 owner=st3::store::published_list TODO=trace-statement-and-value-representation */ CHILD_RUNS)?;
         let mut found = BTreeSet::new();
         let mut queue = runs.iter().cloned().collect::<Vec<_>>();
         while let Some(run) = queue.pop() {
@@ -402,7 +402,7 @@ impl Store {
         }
         let connection = self.readers.get();
         let asks = connection
-            .prepare_cached(ASKS_FROM_STEPS)?
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h87f023a89acc owner=st3::store::published_list TODO=trace-statement-and-value-representation */ ASKS_FROM_STEPS)?
             .query_map([serde_json::to_string(steps)?], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(asks)
@@ -413,7 +413,7 @@ impl Store {
         let connection = self.readers.get();
         let run = connection
             .prepare_cached("SELECT run_id FROM revision_proposals WHERE id=?1")?
-            .query_row([proposal], |row| row.get::<_, String>(0))
+            .query_row(/* sqlite-large-value: allow-for-now lv-h482fccaf1dd9 owner=st3::store::published_list TODO=trace-statement-and-value-representation */ [proposal], |row| row.get::<_, String>(0))
             .optional()?;
         Ok(run)
     }

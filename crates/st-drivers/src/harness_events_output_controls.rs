@@ -362,7 +362,7 @@ pub(crate) fn write_timeline_with_output(
             }
             if previous.as_ref() != Some(&envelope) {
                 tx.execute(
-                    "INSERT INTO snapshots VALUES (?1,?2)
+                    /* sqlite-large-value: allow-for-now lv-h616b0d540baa owner=st_drivers::harness_events_output_controls TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO snapshots VALUES (?1,?2)
                      ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
                     params![SNAPSHOT_KIND, serde_json::to_vec(&envelope)?],
                 )?;

@@ -33,7 +33,7 @@ fn old(
     store
         .readers
         .get()
-        .prepare(OLD)?
+        .prepare(/* sqlite-large-value: allow-for-now lv-hd4cf17ad362b owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ OLD)?
         .query_map(
             params![
                 name,
@@ -107,7 +107,7 @@ fn bind(
         .connection
         .batched(|tx| {
             tx.execute(
-                "INSERT OR IGNORE INTO blobs(hash,bytes,size) VALUES(?1,?2,?3)",
+                /* sqlite-large-value: allow-for-now lv-h1122a13a5a90 owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO blobs(hash,bytes,size) VALUES(?1,?2,?3)",
                 params![hash, content.as_bytes(), content.len()],
             )?;
             let claim = store.runtime.append_claim_tx(
@@ -466,7 +466,7 @@ fn corrupt_document_metadata_stays_an_error_without_a_partial_page() {
         .connection
         .write()
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms='bad-time' WHERE id=?1",
+            /* sqlite-large-value: allow-for-now lv-h892f95ddc81a owner=smallclaims::store::document_pages::tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms='bad-time' WHERE id=?1",
             [&bad.id],
         )
         .unwrap();
@@ -513,18 +513,18 @@ fn corrupt_document_metadata_stays_an_error_without_a_partial_page() {
             .readers
             .get()
             .query_row(
-                &format!("SELECT {column} FROM {table} WHERE {predicate}"),
+                /* sqlite-large-value: allow-for-now lv-h42f1be3305c3 owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ &format!("SELECT {column} FROM {table} WHERE {predicate}"),
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        let sql = format!("UPDATE {table} SET {column}=?1 WHERE {predicate}");
-        assert_eq!(typed.connection.write().execute(&sql, [&value]).unwrap(), 1);
+        let sql = format!(/* sqlite-large-value: allow-for-now lv-h62d89f9f4d7f owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE {table} SET {column}=?1 WHERE {predicate}");
+        assert_eq!(typed.connection.write().execute(/* sqlite-large-value: allow-for-now lv-hc0edd49ade2a owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ &sql, [&value]).unwrap(), 1);
         for history in [false, true] {
             parity(&typed, Some("doc/typed"), None, history, None, 10);
             assert!(read(&typed, Some("doc/typed"), None, history, None, 10).is_err());
         }
-        assert_eq!(typed.connection.write().execute(&sql, [&saved]).unwrap(), 1);
+        assert_eq!(typed.connection.write().execute(/* sqlite-large-value: allow-for-now lv-hd33aab22558e owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ &sql, [&saved]).unwrap(), 1);
     }
 
     // The former inner joins excluded missing metadata before applying LIMIT. Keep
@@ -537,7 +537,7 @@ fn corrupt_document_metadata_stays_an_error_without_a_partial_page() {
     {
         let conn = missing.connection.write();
         conn.execute(
-            "UPDATE documents SET binding_claim_id='absent' WHERE name='doc/a'",
+            /* sqlite-large-value: allow-for-now lv-hadd33c4e0cb2 owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE documents SET binding_claim_id='absent' WHERE name='doc/a'",
             [],
         )
         .unwrap();
@@ -545,7 +545,7 @@ fn corrupt_document_metadata_stays_an_error_without_a_partial_page() {
         // Restore enforcement immediately; the old query is the eligibility oracle.
         conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
         conn.execute(
-            "DELETE FROM blobs WHERE hash=(SELECT hash FROM documents WHERE name='doc/b')",
+            /* sqlite-large-value: allow-for-now lv-h24e997aab3fc owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM blobs WHERE hash=(SELECT hash FROM documents WHERE name='doc/b')",
             [],
         )
         .unwrap();
@@ -577,14 +577,14 @@ fn corrupt_document_metadata_stays_an_error_without_a_partial_page() {
             if missing_blob {
                 conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
                 conn.execute(
-                    "DELETE FROM blobs WHERE hash=(SELECT hash FROM documents WHERE name='doc/b')",
+                    /* sqlite-large-value: allow-for-now lv-hbccafe49f0c6 owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM blobs WHERE hash=(SELECT hash FROM documents WHERE name='doc/b')",
                     [],
                 )
                 .unwrap();
                 conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
             } else {
                 conn.execute(
-                    "UPDATE documents SET binding_claim_id='absent' WHERE name='doc/b'",
+                    /* sqlite-large-value: allow-for-now lv-h72b16570b8c6 owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE documents SET binding_claim_id='absent' WHERE name='doc/b'",
                     [],
                 )
                 .unwrap();
@@ -624,7 +624,7 @@ fn plans(
     );
     let conn = store.readers.get();
     let old = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {OLD}"))
+        .prepare(/* sqlite-large-value: allow-for-now lv-h464a8f9dc23e owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {OLD}"))
         .unwrap()
         .query_map(
             params![
@@ -647,7 +647,7 @@ fn plans(
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     let new = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .prepare(/* sqlite-large-value: allow-for-now lv-hf84348139b26 owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap()
         .query_map(
             params![
@@ -756,7 +756,7 @@ fn actual_store_document_plans_seek_before_and_after_population_and_analyze() {
     }
     println!("document-page plan stage: populated distinct blobs");
     assert_plans(&store);
-    store.connection.write().execute_batch("ANALYZE").unwrap();
+    store.connection.write().execute_batch(/* sqlite-large-value: allow-for-now lv-hec196dcb5418 owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ "ANALYZE").unwrap();
     println!("document-page plan stage: analyzed distinct blobs");
     assert_plans(&store);
 }
@@ -842,7 +842,7 @@ fn normal_and_upgraded_document_read_indexes_match_the_required_layout() {
         .connection
         .write()
         .execute_batch(
-            "DROP TRIGGER projection_digest_documents_insert;
+            /* sqlite-large-value: allow-for-now lv-h28d782e2dd8a owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER projection_digest_documents_insert;
          DROP TRIGGER projection_digest_documents_update;
          DROP TRIGGER projection_digest_documents_delete;
          DROP INDEX document_canonical_latest;
@@ -890,7 +890,7 @@ fn bytecode(store: &Store, name: Option<&str>, prefix: Option<&str>, after: Opti
         sql: &str,
         values: &[&dyn rusqlite::ToSql],
     ) -> rusqlite::Result<Vec<Opcode>> {
-        conn.prepare(&format!("EXPLAIN {sql}"))?
+        conn.prepare(/* sqlite-large-value: allow-for-now lv-h128be0424e3e owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN {sql}"))?
             .query_map(values, |row| {
                 Ok((
                     row.get(0)?,
@@ -1053,7 +1053,7 @@ fn isolated_blob_boundary_explains_the_retained_one_step_difference() {
         let conn = store.readers.get();
         let scope = SqliteWorkScope::start();
         let result = conn
-            .prepare_cached(sql)
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h4f7a011b7194 owner=smallclaims::store::document_pages::tests TODO=trace-statement-and-value-representation */ sql)
             .unwrap()
             .query_map(
                 params![
@@ -1080,7 +1080,7 @@ fn isolated_blob_boundary_explains_the_retained_one_step_difference() {
             .connection
             .write()
             .execute(
-                "INSERT INTO blobs(hash,bytes,size) VALUES(?1,?2,?3)",
+                /* sqlite-large-value: allow-for-now lv-hefb8b69fd6f2 owner=smallclaims::store::document_pages::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO blobs(hash,bytes,size) VALUES(?1,?2,?3)",
                 params![hash, content.as_bytes(), content.len()],
             )
             .unwrap();

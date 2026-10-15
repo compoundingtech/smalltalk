@@ -186,7 +186,7 @@ fn missing_staged_subject_index_does_not_fence_valid_candidates() {
     store
         .connection
         .write()
-        .execute_batch("DROP INDEX claims_owned_set_subject_index")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-heabbe6a54af1 owner=st3::store::owned_sets_tests TODO=bound-or-reference-values-and-reclamation */ "DROP INDEX claims_owned_set_subject_index")
         .unwrap();
     assert_eq!(store.owned_desired_subjects(&desired).unwrap(), before);
     assert_pass_candidates_match_effect_guards(&store, &desired);
@@ -318,7 +318,7 @@ fn receipt_read_errors_do_not_turn_into_eligible_candidates() {
         .connection
         .write()
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
+            /* sqlite-large-value: allow-for-now lv-he1678dbf0485 owner=st3::store::owned_sets_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
             [&receipt.claim],
         )
         .unwrap();
@@ -358,7 +358,7 @@ fn repaired_receipt_eligibility_is_rechecked_between_passes() {
         .connection
         .write()
         .execute(
-            "UPDATE replica_records SET state='invalid' WHERE record_ref=?1",
+            /* sqlite-large-value: allow-for-now lv-hcd77b7b0b188 owner=st3::store::owned_sets_tests TODO=chunk-or-reference-exact-wire-values */ "UPDATE replica_records SET state='invalid' WHERE record_ref=?1",
             [&record.record_ref],
         )
         .unwrap();
@@ -589,12 +589,12 @@ fn a_staged_owned_set_member_check_seeks_tagged_claims() {
         ("agent/garden/absent", false),
     ] {
         let staged: bool = connection
-            .query_row(query, [subject], |row| row.get(0))
+            .query_row(/* sqlite-large-value: allow-for-now lv-h951ecb50f5b7 owner=st3::store::owned_sets_tests TODO=trace-statement-and-value-representation */ query, [subject], |row| row.get(0))
             .unwrap();
         assert_eq!(staged, expected, "{subject}");
     }
     let plan = connection
-        .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+        .prepare(/* sqlite-large-value: allow-for-now lv-h1563205cf235 owner=st3::store::owned_sets_tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {query}"))
         .unwrap()
         .query_map(["agent/garden/unmanaged"], |row| row.get::<_, String>(3))
         .unwrap()
@@ -1646,7 +1646,7 @@ fn pass_staged_subject_selection_uses_the_partial_index() {
     let store = Store::open_memory("amber").unwrap();
     let connection = store.readers.get();
     let plans = connection
-        .prepare(&format!(
+        .prepare(/* sqlite-large-value: allow-for-now lv-h59f59f29424d owner=st3::store::owned_sets_tests TODO=trace-statement-and-value-representation */ &format!(
             "EXPLAIN QUERY PLAN {}",
             super::owned_sets::STAGED_SUBJECTS_QUERY
         ))

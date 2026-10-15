@@ -366,7 +366,7 @@ fn ownership_error_diagnostics_are_bounded_across_candidates_and_passes() {
         .connection
         .write()
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
+            /* sqlite-large-value: allow-for-now lv-h874406525a4c owner=st3::reconcile::tests::ownership_guard_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
             [&receipt.claim],
         )
         .unwrap();
@@ -476,7 +476,7 @@ fn a_storage_guard_error_is_distinct_from_authority_rejection() {
         .connection
         .write()
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
+            /* sqlite-large-value: allow-for-now lv-h61a3050f190b owner=st3::reconcile::tests::ownership_guard_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
             [&receipt.claim],
         )
         .unwrap();
@@ -973,7 +973,7 @@ fn a_pass_snapshot_read_error_fences_member_effects_and_reports_once() {
         .connection
         .write()
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
+            /* sqlite-large-value: allow-for-now lv-h981a21334461 owner=st3::reconcile::tests::ownership_guard_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
             [&receipt.claim],
         )
         .unwrap();
@@ -1038,7 +1038,7 @@ fn a_pass_snapshot_read_error_fences_member_effects_and_reports_once() {
         .connection
         .write()
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+            /* sqlite-large-value: allow-for-now lv-hd7d3ce020010 owner=st3::reconcile::tests::ownership_guard_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
             rusqlite::params![accepted_at, receipt.claim],
         )
         .unwrap();

@@ -8,7 +8,7 @@ use super::*;
 use rusqlite::functions::FunctionFlags;
 use sha2::Sha512;
 
-pub const SCHEMA: &str = "
+pub const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-ha4d3e9766ad3 owner=smallclaims::store::projection_digest TODO=chunk-or-reference-variable-columns */ "
 CREATE TABLE IF NOT EXISTS projection_digest_state (
     table_name TEXT PRIMARY KEY,
     columns_json TEXT NOT NULL,
@@ -86,7 +86,7 @@ pub fn register(connection: &Connection) -> Result<()> {
 
 pub fn columns(connection: &Connection, table: &str, excluded: &[&str]) -> Result<Vec<String>> {
     let mut columns = connection
-        .prepare(&format!("PRAGMA table_info({table})"))?
+        .prepare(/* sqlite-large-value: allow-for-now lv-hedda02447ecc owner=smallclaims::store::projection_digest TODO=trace-statement-and-value-representation */ &format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
@@ -120,7 +120,7 @@ pub fn row_sql(columns: &[String], prefix: &str) -> String {
 
 pub fn change_sql(table: &str, old: &str, new: &str, delta: i32) -> String {
     format!(
-        "UPDATE projection_digest_state SET row_count=row_count+({delta}),
+        /* sqlite-large-value: allow-for-now lv-h91df596dc8c8 owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "UPDATE projection_digest_state SET row_count=row_count+({delta}),
         accumulator=st_projection_change(accumulator,table_name,columns_json,{old},{new},1)
         WHERE table_name='{table}';
         UPDATE projection_digest_generation SET value=value+1 WHERE id=1;"
@@ -129,7 +129,7 @@ pub fn change_sql(table: &str, old: &str, new: &str, delta: i32) -> String {
 
 /// Initialize once per registry/schema version. Subsequent opens inspect table schemas only.
 pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result<()> {
-    connection.execute_batch(SCHEMA)?;
+    connection.execute_batch(/* sqlite-large-value: allow-for-now lv-hf003c2793536 owner=smallclaims::store::projection_digest TODO=trace-statement-and-value-representation */ SCHEMA)?;
     let registry = tables
         .iter()
         .map(|(table, excluded)| Ok((*table, columns(connection, table, excluded)?)))
@@ -160,15 +160,15 @@ pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result
     )?.query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for trigger in triggers {
-        transaction.execute_batch(&format!("DROP TRIGGER {trigger}"))?;
+        transaction.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-h879e26a7295d owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER {trigger}"))?;
     }
     transaction.execute(
-        "INSERT OR IGNORE INTO projection_digest_repaired_claims
+        /* sqlite-large-value: allow-for-now lv-h5b1deaae5407 owner=smallclaims::store::projection_digest TODO=chunk-or-reference-exact-wire-values */ "INSERT OR IGNORE INTO projection_digest_repaired_claims
         SELECT claim_id FROM replica_records WHERE state='repaired' AND claim_id IS NOT NULL",
         [],
     )?;
-    transaction.execute("DELETE FROM projection_digest_state", [])?;
-    transaction.execute("DELETE FROM projection_digest_operation_rows", [])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h7c5ec9f77d0a owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM projection_digest_state", [])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h67b994dca42f owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM projection_digest_operation_rows", [])?;
     for (table, columns) in &registry {
         let encoded = serde_json::to_string(columns)?;
         let row = row_sql(columns, "");
@@ -190,7 +190,7 @@ pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result
             .collect::<Vec<_>>()
             .join(" OR ");
         transaction.execute_batch(&format!(
-            "
+            /* sqlite-large-value: allow-for-now lv-ha3571a06d76f owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "
             CREATE TRIGGER projection_digest_{table}_insert AFTER INSERT ON {table}
             BEGIN {} END;
             CREATE TRIGGER projection_digest_{table}_update AFTER UPDATE ON {table}
@@ -215,7 +215,7 @@ pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result
         ("checkpoint_claims", "claims"),
     ] {
         transaction.execute_batch(&format!(
-            "
+            /* sqlite-large-value: allow-for-now lv-h03b3be7e1a62 owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "
             CREATE TRIGGER projection_digest_{table}_insert AFTER INSERT ON {table}
             WHEN NOT EXISTS(SELECT 1 FROM {other} WHERE id=NEW.id)
               AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=NEW.id)
@@ -244,7 +244,7 @@ pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result
         } else {
             "NOT EXISTS(SELECT 1 FROM claims WHERE id=NEW.id)"
         };
-        transaction.execute_batch(&format!("CREATE TRIGGER projection_digest_{table}_time_update
+        transaction.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-hb91b1f8c3812 owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER projection_digest_{table}_time_update
             AFTER UPDATE OF accepted_at_unix_ms ON {table}
             WHEN {visible} AND OLD.accepted_at_unix_ms IS NOT NEW.accepted_at_unix_ms
               AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=NEW.id) BEGIN {} END;
@@ -255,11 +255,11 @@ pub fn initialize(connection: &Connection, tables: &[(&str, &[&str])]) -> Result
     }
     repair_source_triggers(&transaction)?;
     transaction.execute(
-        "INSERT OR REPLACE INTO meta(key,value) VALUES('projection_digest_registry',?1)",
+        /* sqlite-large-value: allow-for-now lv-h2325d6d6f486 owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO meta(key,value) VALUES('projection_digest_registry',?1)",
         [&signature],
     )?;
     transaction.execute(
-        "UPDATE projection_digest_generation SET value=value+1 WHERE id=1",
+        /* sqlite-large-value: allow-for-now lv-hb1bc499e2446 owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "UPDATE projection_digest_generation SET value=value+1 WHERE id=1",
         [],
     )?;
     transaction.commit()?;
@@ -300,7 +300,7 @@ pub fn refresh_operation(operation: &str) -> String {
         "COALESCE((SELECT json_array(canonical_claim_id,id,request_digest,state) FROM operations WHERE id={operation}),{})",
         operation_fallback(operation)
     );
-    format!("UPDATE projection_digest_state SET
+    format!(/* sqlite-large-value: allow-for-now lv-h8428f7b25b5a owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "UPDATE projection_digest_state SET
         row_count=row_count+({current} IS NOT NULL)-({previous} IS NOT NULL),
         accumulator=st_projection_change(accumulator,table_name,columns_json,{previous},{current},1)
         WHERE table_name='operations' AND {previous} IS NOT {current};
@@ -315,7 +315,7 @@ pub fn refresh_operation(operation: &str) -> String {
 pub fn operation_triggers(connection: &Connection, columns: &[String]) -> Result<()> {
     connection.execute(
         &format!(
-            "INSERT INTO projection_digest_operation_rows
+            /* sqlite-large-value: allow-for-now lv-h99708c42c036 owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO projection_digest_operation_rows
         SELECT json_extract(row_json,'$[1]'),row_json FROM ({}) AS rows",
             operation_rows()
         ),
@@ -351,7 +351,7 @@ pub fn operation_triggers(connection: &Connection, columns: &[String]) -> Result
                     )
                 };
                 connection.execute_batch(&format!(
-                    "CREATE TRIGGER projection_digest_operation_{table}_{event}_{prefix}
+                    /* sqlite-large-value: allow-for-now lv-h7406748c0e4e owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER projection_digest_operation_{table}_{event}_{prefix}
                     AFTER {event} ON {table} WHEN {when} BEGIN {} END;",
                     refresh_operation(&operation)
                 ))?;
@@ -376,7 +376,7 @@ pub fn repair_source_triggers(connection: &Connection) -> Result<()> {
         } else {
             "update"
         };
-        connection.execute_batch(&format!("CREATE TRIGGER projection_digest_repair_record_{suffix}
+        connection.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-h0c20be809d1f owner=smallclaims::store::projection_digest TODO=chunk-or-reference-exact-wire-values */ "CREATE TRIGGER projection_digest_repair_record_{suffix}
             AFTER {event} ON replica_records WHEN NEW.state='repaired' AND NEW.claim_id IS NOT NULL
             BEGIN INSERT OR IGNORE INTO projection_digest_repaired_claims VALUES(NEW.claim_id); END;"))?;
     }
@@ -386,7 +386,7 @@ pub fn repair_source_triggers(connection: &Connection) -> Result<()> {
               WHERE id={prefix}.id AND NOT EXISTS(SELECT 1 FROM claims WHERE id={prefix}.id) LIMIT 1)");
         let operation=format!("COALESCE((SELECT json_extract(body,'$._operation.id') FROM claims WHERE id={prefix}.id),
             (SELECT operation_id FROM checkpoint_claims WHERE id={prefix}.id))");
-        connection.execute_batch(&format!("CREATE TRIGGER projection_digest_repaired_claims_{event}
+        connection.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-he3f0bc408925 owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER projection_digest_repaired_claims_{event}
             AFTER {event} ON projection_digest_repaired_claims WHEN {row} IS NOT NULL BEGIN {} {} END;",
             if subtract {change_sql("claim_sources",&row,"NULL",-1)} else {change_sql("claim_sources","NULL",&row,1)},
             refresh_operation(&operation)))?;
@@ -402,7 +402,7 @@ pub fn scan(
 ) -> Result<(u64, [u8; 64])> {
     let mut accumulator = [0; 64];
     let mut count = 0;
-    let mut statement = connection.prepare(query)?;
+    let mut statement = connection.prepare(/* sqlite-large-value: allow-for-now lv-hff2fb7cc707f owner=smallclaims::store::projection_digest TODO=trace-statement-and-value-representation */ query)?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         add(
@@ -418,7 +418,7 @@ pub fn scan(
 pub fn seed(connection: &Connection, table: &str, columns: &str, query: &str) -> Result<()> {
     let (count, accumulator) = scan(connection, table, columns, query)?;
     connection.execute(
-        "INSERT INTO projection_digest_state VALUES(?1,?2,?3,?4)",
+        /* sqlite-large-value: allow-for-now lv-h09c10f84623c owner=smallclaims::store::projection_digest TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO projection_digest_state VALUES(?1,?2,?3,?4)",
         params![table, columns, count, accumulator.as_slice()],
     )?;
     Ok(())
@@ -439,7 +439,7 @@ pub fn table_digest(table: &str, columns: &str, count: u64, accumulator: &[u8]) 
 pub fn generation(connection: &Connection) -> Result<i64> {
     Ok(connection
         .prepare_cached("SELECT value FROM projection_digest_generation WHERE id=1")?
-        .query_row([], |row| row.get(0))?)
+        .query_row(/* sqlite-large-value: allow-for-now lv-hb49149840f8d owner=smallclaims::store::projection_digest TODO=trace-statement-and-value-representation */ [], |row| row.get(0))?)
 }
 
 pub fn tables(connection: &Connection) -> Result<BTreeMap<String, String>> {

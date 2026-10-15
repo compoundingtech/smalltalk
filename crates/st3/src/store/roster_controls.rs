@@ -109,7 +109,7 @@ fn lazy_named_keys_merge_legacy_nulls_and_preserve_historical_cut() {
     let mut writer = store.connection.write();
     let tx = writer.transaction().unwrap();
     tx.execute(
-        "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+        /* sqlite-large-value: allow-for-now lv-h470b2388592a owner=st3::store::roster_controls TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
         params![legacy.accepted_at_unix_ms.to_string(), latest.id],
     )
     .unwrap();

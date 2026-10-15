@@ -124,7 +124,7 @@ impl Store {
         let (page_size, pages, free) = {
             let connection = self.readers.get();
             let pragma = |name: &str| -> Result<u64> {
-                Ok(connection.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))?)
+                Ok(connection.query_row(/* sqlite-large-value: allow-for-now lv-h694f8425ef00 owner=st3::store::database_size TODO=trace-statement-and-value-representation */ &format!("PRAGMA {name}"), [], |row| row.get(0))?)
             };
             (pragma("page_size")?, pragma("page_count")?, pragma("freelist_count")?)
         };
@@ -165,7 +165,7 @@ impl Store {
         samples.drain(..excess);
         let stored = Value::Array(samples.iter().map(|sample| sample.to_value()).collect());
         transaction.execute(
-            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+            /* sqlite-large-value: allow-for-now lv-h4e4b40477018 owner=st3::store::database_size TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![SAMPLES, stored.to_string()],
         )?;

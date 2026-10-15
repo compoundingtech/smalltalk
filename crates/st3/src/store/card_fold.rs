@@ -55,7 +55,7 @@ fn canonical_order(
             let ids = rows[start..end].iter().map(|(row, _)| &row.0).collect::<Vec<_>>();
             let mut positions = HashMap::new();
             for row in connection
-                .prepare_cached(&format!(
+                .prepare_cached(/* sqlite-large-value: allow-for-now lv-hbf63e098bccb owner=st3::store::card_fold TODO=trace-statement-and-value-representation */ &format!(
                     "SELECT claims.id, {} FROM claims
                      WHERE claims.id IN (SELECT value FROM json_each(?1))",
                     smallclaims::store::canonical::position_sql("claims")
@@ -119,7 +119,7 @@ impl CardReads {
                 None => unowned.push(subject),
             }
         }
-        let mut statement = connection.prepare_cached(&canonical_sql(
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h98a91c817a2c owner=st3::store::card_fold TODO=trace-statement-and-value-representation */ &canonical_sql(
             "SELECT claims.subject, claims.id, claims.body, claims.predecessors
              FROM json_each(?1) subjects
              CROSS JOIN claims INDEXED BY claims_subject_kind_index
@@ -162,7 +162,7 @@ impl CardReads {
         // the actual-state claims, the fold leaving out `harness.` in any case. The cross join
         // reads them one subject at a time, and each subject's rows are put in canonical order
         // here (`canonical_order`) instead of by a sorter that would copy every body.
-        let mut statement = connection.prepare_cached(&format!(
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hfdae626f150d owner=st3::store::card_fold TODO=trace-statement-and-value-representation */ &format!(
             "SELECT claims.subject, claims.id, claims.kind, claims.origin, claims.body,
                     claims.kind NOT LIKE 'harness.%',
                     claims.accepted_at_unix_ms, batches.origin, batches.replica_sequence,
@@ -335,7 +335,7 @@ impl Store {
         reads: &mut CardReads,
     ) -> Result<HashMap<String, ViewEntry>> {
         debug_assert_eq!(reads.index, store_index);
-        let mut statement = connection.prepare_cached(&format!(
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h4b8aeb0dc573 owner=st3::store::card_fold TODO=trace-statement-and-value-representation */ &format!(
             "SELECT subjects.value,
                     (SELECT COALESCE(MAX(store_index), 0) FROM claims
                      WHERE subject=subjects.value AND store_index<=?2),
@@ -429,7 +429,7 @@ impl Store {
              WHERE claims.store_index<=?2",
         )?;
         // An undeclared card's provenance is its newest claim in canonical order.
-        let mut newest = connection.prepare_cached(&newest_claims_sql())?;
+        let mut newest = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h8c969f0d0313 owner=st3::store::card_fold TODO=trace-statement-and-value-representation */ &newest_claims_sql())?;
         for chunk in batched.chunks(CHUNK) {
             let chunk = chunk.to_vec();
             reads.load_desired(connection, &chunk)?;
@@ -640,7 +640,7 @@ impl Store {
         // A harness view needs a runtime observation naming an incarnation; then a running one,
         // or an admission refusal of that incarnation, is folded as `current_harness_fold_at`
         // folds it. Every other agent has none.
-        let mut newest_runtime = connection.prepare_cached(&format!(
+        let mut newest_runtime = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h7a711a05c44b owner=st3::store::card_fold TODO=trace-statement-and-value-representation */ &format!(
             "SELECT subjects.value, runtime.body
              FROM json_each(?1) subjects
              JOIN claims runtime ON runtime.id=(

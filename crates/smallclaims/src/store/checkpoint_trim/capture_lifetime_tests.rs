@@ -21,7 +21,7 @@ impl Runtime for CaptureRuntime {
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         Plain.create_schema(connection)?;
         connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS desired(claim_id TEXT);
+            /* sqlite-large-value: allow-for-now lv-hc3a032b75010 owner=smallclaims::store::checkpoint_trim::capture_lifetime_tests TODO=chunk-or-reference-variable-columns */ "CREATE TABLE IF NOT EXISTS desired(claim_id TEXT);
              CREATE TABLE IF NOT EXISTS mission_definitions(claim_id TEXT);
              CREATE TABLE IF NOT EXISTS mission_revisions(claim_id TEXT);
              CREATE TABLE IF NOT EXISTS documents(binding_claim_id TEXT);",
@@ -118,7 +118,7 @@ impl Runtime for CaptureRuntime {
             .collect::<Vec<_>>();
         body_bytes.sort_unstable();
         assert_eq!(body_bytes, [1024, 4096, 16384]);
-        planner.staging().execute("UPDATE claims SET dropped=1 WHERE first=1", [])?;
+        planner.staging().execute(/* sqlite-large-value: allow-for-now lv-hfba5f6c160ce owner=smallclaims::store::checkpoint_trim::capture_lifetime_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET dropped=1 WHERE first=1", [])?;
         Ok(())
     }
 
@@ -160,7 +160,7 @@ fn exercise(certified: bool, fault: Option<TrimFault>) {
     let staging_file = staged.path.clone();
     drop(staged);
     store.connection.write().execute(
-        "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, updated_at_unix_ms)
+        /* sqlite-large-value: allow-for-now lv-he57c3e1c3fb2 owner=smallclaims::store::checkpoint_trim::capture_lifetime_tests TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, updated_at_unix_ms)
          VALUES (?1, ?2, 'verified', ?3, ?2)",
         params![checkpoint, i64::try_from(cut).unwrap(), seal_rowid],
     ).unwrap();

@@ -67,7 +67,7 @@ fn bounded_row(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT {headers} FROM {table} WHERE rowid=?1");
-    let sizes = tx.query_row(&sql, [rowid], |row| {
+    let sizes = tx.query_row(/* sqlite-large-value: allow-for-now lv-hab494a26ac90 owner=st3::store::terminal_gate_evidence::native_source TODO=trace-statement-and-value-representation */ &sql, [rowid], |row| {
         columns
             .iter()
             .enumerate()
@@ -100,7 +100,7 @@ fn bounded_row(
         .collect::<Vec<_>>()
         .join(",");
     tx.query_row(
-        &format!("SELECT {names} FROM {table} WHERE rowid=?1 AND {guard}"),
+        /* sqlite-large-value: allow-for-now lv-hb060fefb04ce owner=st3::store::terminal_gate_evidence::native_source TODO=trace-statement-and-value-representation */ &format!("SELECT {names} FROM {table} WHERE rowid=?1 AND {guard}"),
         [rowid],
         |row| (0..columns.len()).map(|n| row.get(n)).collect(),
     )
@@ -109,7 +109,7 @@ fn bounded_row(
 fn point(tx: &Transaction<'_>, table: &str, column: &str, key: &str) -> Result<Option<i64>> {
     Ok(tx
         .query_row(
-            &format!("SELECT rowid FROM {table} WHERE {column}=?1"),
+            /* sqlite-large-value: allow-for-now lv-h28426de60a53 owner=st3::store::terminal_gate_evidence::native_source TODO=trace-statement-and-value-representation */ &format!("SELECT rowid FROM {table} WHERE {column}=?1"),
             [key],
             |r| r.get(0),
         )
@@ -173,14 +173,14 @@ impl NativeSource {
             "step_runs",
         ] {
             let any: bool = tx.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                /* sqlite-large-value: allow-for-now lv-h22daf2005fa9 owner=st3::store::terminal_gate_evidence::native_source TODO=trace-statement-and-value-representation */ &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
                 [],
                 |r| r.get(0),
             )?;
             ensure!(!any, "native source is nonempty");
         }
         tx.execute_batch(
-            "CREATE TABLE test_native_terminal_guard(
+            /* sqlite-large-value: allow-for-now lv-h68eba8d4faf4 owner=st3::store::terminal_gate_evidence::native_source TODO=chunk-or-reference-variable-columns */ "CREATE TABLE test_native_terminal_guard(
             id INTEGER PRIMARY KEY CHECK(id=1),identity TEXT NOT NULL,
             origin TEXT NOT NULL,mission TEXT NOT NULL,run_id TEXT NOT NULL,
             generation_id TEXT NOT NULL,step TEXT NOT NULL,exec TEXT NOT NULL,
@@ -189,7 +189,7 @@ impl NativeSource {
             managed_scope INTEGER NOT NULL DEFAULT 0 CHECK(managed_scope IN (0,1)));",
         )?;
         tx.execute(
-            "INSERT INTO test_native_terminal_guard VALUES(1,?1,?2,?3,?4,?5,?6,?7,0,0,NULL,NULL,0)",
+            /* sqlite-large-value: allow-for-now lv-hff5e8fcb3fcc owner=st3::store::terminal_gate_evidence::native_source TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO test_native_terminal_guard VALUES(1,?1,?2,?3,?4,?5,?6,?7,0,0,NULL,NULL,0)",
             params![
                 binding.identity()?,
                 binding.origin,
@@ -294,7 +294,7 @@ impl NativeSource {
                     String::new()
                 };
                 tx.execute_batch(&format!(
-                    "CREATE TRIGGER test_native_{table}_{timing}_{event}
+                    /* sqlite-large-value: allow-for-now lv-hdfa205cee7e2 owner=st3::store::terminal_gate_evidence::native_source TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER test_native_{table}_{timing}_{event}
                     {timing} {event} ON {table} WHEN {when} BEGIN
                     UPDATE {GUARD} SET {gap} revision=revision+1,pending=1 WHERE id=1;
                     UPDATE ivm_install_sources SET revision=revision+1 WHERE name='{SOURCE}';
@@ -320,7 +320,7 @@ impl NativeSource {
                         format!("EXISTS(SELECT 1 FROM claims WHERE batch_id={p}.id AND subject=(SELECT exec FROM {GUARD} WHERE id=1)) OR EXISTS(SELECT 1 FROM batches old JOIN claims ON claims.batch_id=old.id WHERE old.rowid={p}.rowid AND claims.subject=(SELECT exec FROM {GUARD} WHERE id=1))")
                     } else { "1".to_owned() }
                 }).collect::<Vec<_>>().join(" OR ");
-                tx.execute_batch(&format!("CREATE TRIGGER test_native_{table}_{timing}_{event}
+                tx.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-he81773f2d3bd owner=st3::store::terminal_gate_evidence::native_source TODO=stage-generation-and-keyed-reclamation */ "CREATE TRIGGER test_native_{table}_{timing}_{event}
                     {timing} {event} ON {table} WHEN {predicates} BEGIN
                     UPDATE {GUARD} SET revision=revision+1,pending=1,gap='unsupported native rank/repair/checkpoint mutation' WHERE id=1;
                     UPDATE ivm_install_sources SET revision=revision+1 WHERE name='{SOURCE}';
@@ -329,7 +329,7 @@ impl NativeSource {
         }
         // The binding is fixed for the entire fixture lifetime. Metadata changes cannot
         // redirect the capture predicates while leaving the old witness eligible.
-        tx.execute_batch(&format!("CREATE TRIGGER test_native_guard_binding
+        tx.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-h1be4c1aef851 owner=st3::store::terminal_gate_evidence::native_source TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER test_native_guard_binding
             AFTER UPDATE OF identity,origin,mission,run_id,generation_id,step,exec ON {GUARD}
             BEGIN
             UPDATE {GUARD} SET revision=revision+1,pending=1,gap='native binding replaced' WHERE id=1;
@@ -402,7 +402,7 @@ impl NativeSource {
             );
             // A malformed/over-cap operator may have fenced the namespace without SQL error.
             self.installer.root(tx, VIEW)?;
-            tx.execute("UPDATE test_native_terminal_guard SET pending=0,payload=?1 WHERE id=1 AND revision=?2",
+            tx.execute(/* sqlite-large-value: allow-for-now lv-h884b092956c2 owner=st3::store::terminal_gate_evidence::native_source TODO=bound-or-reference-values-and-reclamation */ "UPDATE test_native_terminal_guard SET pending=0,payload=?1 WHERE id=1 AND revision=?2",
                 params![next.map(|v|v.to_string()),revision])?;
             Ok::<_, anyhow::Error>(())
         })();
@@ -413,7 +413,7 @@ impl NativeSource {
             }
             let reason = error.to_string().chars().take(256).collect::<String>();
             tx.execute(
-                "UPDATE test_native_terminal_guard SET gap=?1,pending=1 WHERE id=1",
+                /* sqlite-large-value: allow-for-now lv-hcf0e12d43bcd owner=st3::store::terminal_gate_evidence::native_source TODO=bound-or-reference-values-and-reclamation */ "UPDATE test_native_terminal_guard SET gap=?1,pending=1 WHERE id=1",
                 [&reason],
             )?;
             self.installer.source_gap(tx, SOURCE, &reason)?;

@@ -44,7 +44,7 @@ fn probe_until(
             )?;
         }
     }
-    fs::write(scratch.path("probe.ts"), include_str!("omp-probe.ts"))?;
+    fs::write(scratch.path("probe.ts"), /* sqlite-large-value: allow-for-now lv-haed9fade9d5f owner=st_drivers::harness_admission::omp TODO=trace-statement-and-value-representation */ include_str!("omp-probe.ts"))?;
     // A channel protocol peer, not a fake ExtensionAPI: the shipped adapter opens the child,
     // binds its real session, receives the nonce and calls the installed sendUserMessage itself.
     // POSIX shell builtins keep this fixture independent of a separate Node/Python installation.

@@ -584,7 +584,7 @@ impl Store {
     /// Every admitted `checkpoint.*` claim, in canonical order.
     pub fn checkpoint_claims(&self) -> Result<Vec<CheckpointClaim>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(&format!(
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-he39b0f08fa41 owner=smallclaims::store::checkpoint_agreement TODO=trace-statement-and-value-representation */ &format!(
             "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.kind IN ('{CHECKPOINT_SEALED}', '{CHECKPOINT_VERIFIED}',
                                    '{CHECKPOINT_EXCUSED}')
@@ -692,7 +692,7 @@ impl Store {
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         transaction.execute(
-            "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, sealed_digest,
+            /* sqlite-large-value: allow-for-now lv-h7470bc661492 owner=smallclaims::store::checkpoint_agreement TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, sealed_digest,
                                      drop_digest, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET state=excluded.state, seal_rowid=excluded.seal_rowid,
@@ -830,7 +830,7 @@ impl Store {
         detail.as_object_mut().ok_or_else(|| anyhow::anyhow!("checkpoint detail is not an object"))?
             .insert("proof_failures".into(), serde_json::to_value(failures)?);
         transaction.execute(
-            "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, sealed_digest,
+            /* sqlite-large-value: allow-for-now lv-hb8994accebf5 owner=smallclaims::store::checkpoint_agreement TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, sealed_digest,
                                      drop_digest, detail, updated_at_unix_ms)
              VALUES (?1, ?2, 'sealed', ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET detail=excluded.detail,
@@ -1062,7 +1062,7 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         transaction
             .execute(
-                "UPDATE checkpoints SET state='set-aside', detail=?1, updated_at_unix_ms=?2
+                /* sqlite-large-value: allow-for-now lv-h7e11b486a2fc owner=smallclaims::store::checkpoint_agreement TODO=stage-generation-and-keyed-reclamation */ "UPDATE checkpoints SET state='set-aside', detail=?1, updated_at_unix_ms=?2
                  WHERE state='graph-changed'",
                 params![
                     json!({"resumed_by": actor, "reason": reason}).to_string(),
@@ -1236,9 +1236,9 @@ impl Store {
     /// clocks or days passing sets it; nothing else does.
     pub fn set_write_clock_offset(&self, offset_ms: i64) -> Result<()> {
         let connection = self.connection.write();
-        connection.execute("DELETE FROM temp.write_clock", [])?;
+        connection.execute(/* sqlite-large-value: allow-for-now lv-hf7027d3cb134 owner=smallclaims::store::checkpoint_agreement TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM temp.write_clock", [])?;
         connection.execute(
-            "INSERT INTO temp.write_clock(offset_ms) VALUES (?1)",
+            /* sqlite-large-value: allow-for-now lv-h4da262ac8192 owner=smallclaims::store::checkpoint_agreement TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO temp.write_clock(offset_ms) VALUES (?1)",
             [offset_ms],
         )?;
         Ok(())
@@ -1249,9 +1249,9 @@ impl Store {
     /// same claims however fast it runs. Nothing else sets it.
     pub fn set_write_clock_at(&self, at_unix_ms: u128) -> Result<()> {
         let connection = self.connection.write();
-        connection.execute("DELETE FROM temp.write_clock", [])?;
+        connection.execute(/* sqlite-large-value: allow-for-now lv-h956c01951452 owner=smallclaims::store::checkpoint_agreement TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM temp.write_clock", [])?;
         connection.execute(
-            "INSERT INTO temp.write_clock(offset_ms, at_ms) VALUES (0, ?1)",
+            /* sqlite-large-value: allow-for-now lv-hf41fabef76b6 owner=smallclaims::store::checkpoint_agreement TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO temp.write_clock(offset_ms, at_ms) VALUES (0, ?1)",
             [i64::try_from(at_unix_ms)?],
         )?;
         Ok(())
@@ -1274,17 +1274,17 @@ pub fn terms_key(terms: &SealTerms) -> String {
 pub fn write_time(connection: &Connection, origin: &str) -> Result<u128> {
     let floor: Option<i64> = connection
         .prepare_cached("SELECT MAX(cut_unix_ms) FROM checkpoints")?
-        .query_row([], |row| row.get(0))?;
+        .query_row(/* sqlite-large-value: allow-for-now lv-h493b95db430a owner=smallclaims::store::checkpoint_agreement TODO=trace-statement-and-value-representation */ [], |row| row.get(0))?;
     let newest_own: Option<String> = connection
         .prepare_cached(
             "SELECT accepted_at_unix_ms FROM batches WHERE origin=?1
              ORDER BY replica_sequence DESC LIMIT 1",
         )?
-        .query_row([origin], |row| row.get(0))
+        .query_row(/* sqlite-large-value: allow-for-now lv-hedbb3482a27f owner=smallclaims::store::checkpoint_agreement TODO=trace-statement-and-value-representation */ [origin], |row| row.get(0))
         .optional()?;
     let (offset, at): (i64, Option<i64>) = connection
         .prepare_cached("SELECT offset_ms, at_ms FROM temp.write_clock")
-        .and_then(|mut statement| statement.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
+        .and_then(|mut statement| statement.query_row(/* sqlite-large-value: allow-for-now lv-h34c3494cd92e owner=smallclaims::store::checkpoint_agreement TODO=trace-statement-and-value-representation */ [], |row| Ok((row.get(0)?, row.get(1)?))))
         .unwrap_or((0, None));
     let now = match at {
         Some(at) => i128::from(at),

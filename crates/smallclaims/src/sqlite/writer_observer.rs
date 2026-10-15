@@ -261,7 +261,7 @@ fn schema_generations(
         }
         let identifier = database.replace('"', "\"\"");
         let version = connection.query_row(
-            &format!("PRAGMA \"{identifier}\".schema_version"),
+            /* sqlite-large-value: allow-for-now lv-h72783baac7c1 owner=smallclaims::sqlite::writer_observer TODO=trace-statement-and-value-representation */ &format!("PRAGMA \"{identifier}\".schema_version"),
             [],
             |row| row.get(0),
         )?;
@@ -306,7 +306,7 @@ fn validate_tables(
              WHERE tbl_name=?1 ORDER BY name"
         );
         let rows = connection
-            .prepare(&sql)?
+            .prepare(/* sqlite-large-value: allow-for-now lv-h710267011525 owner=smallclaims::sqlite::writer_observer TODO=trace-statement-and-value-representation */ &sql)?
             .query_map([table], |row| {
                 Ok((
                     database.to_string(),

@@ -524,7 +524,7 @@ async fn collection_items_with_windows(
     if request.collection == "devices" && person.as_deref().is_none_or(|person| !person.starts_with("person/")) {
         return Err(forbidden("device inventory requires an explicitly authenticated person"));
     }
-    let prepared = windows.as_ref().and_then(|windows| windows.prepare(state, current, request));
+    let prepared = windows.as_ref().and_then(|windows| windows.prepare(/* sqlite-large-value: allow-for-now lv-hd9a199f8460a owner=st3::api::client_v0 TODO=trace-statement-and-value-representation */ state, current, request));
     let state = state.clone();
     let session = session.clone();
     let request = request.clone();

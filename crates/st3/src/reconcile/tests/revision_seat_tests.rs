@@ -991,7 +991,7 @@ fn failure_after_canonical_carry_rolls_back_seats_generation_and_public_cards() 
     let next = publish(&store, &source("Grow a revised garden."), "second");
     let before = store.index().unwrap();
     let cards_before = store.agent_card_status_at(None, before, false).unwrap();
-    store.connection.write().execute_batch("CREATE TEMP TRIGGER fail_cutover AFTER UPDATE OF current_generation_id ON mission_runs WHEN NEW.current_generation_id <> OLD.current_generation_id BEGIN SELECT RAISE(ABORT, 'injected cutover failure after seat carry'); END;").unwrap();
+    store.connection.write().execute_batch(/* sqlite-large-value: allow-for-now lv-h51e4e5210fac owner=st3::reconcile::tests::revision_seat_tests TODO=bound-or-reference-values-and-reclamation */ "CREATE TEMP TRIGGER fail_cutover AFTER UPDATE OF current_generation_id ON mission_runs WHEN NEW.current_generation_id <> OLD.current_generation_id BEGIN SELECT RAISE(ABORT, 'injected cutover failure after seat carry'); END;").unwrap();
     let error = store
         .adopt_mission_revision(
             &run.id,

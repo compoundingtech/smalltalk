@@ -40,7 +40,7 @@ fn install(store: &Store, views: &Views) {
         }
     }
     while !backfill_page(&tx, 0, 2).unwrap() {}
-    tx.execute("UPDATE ivm_views SET ready=1", []).unwrap();
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h92df3a56cfdd owner=st3::store::attention_ivm::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET ready=1", []).unwrap();
     tx.commit().unwrap();
 }
 
@@ -119,7 +119,7 @@ fn input(subject: &str, kind: &str, actor: &str, fields: Value) -> ClaimInput {
     }
 }
 fn custom(store: &Store, subject: &str, person: &str) {
-    let manifest = serde_json::from_str(include_str!(
+    let manifest = serde_json::from_str(/* sqlite-large-value: allow-for-now lv-h1df6ed95eab7 owner=st3::store::attention_ivm::tests TODO=trace-statement-and-value-representation */ include_str!(
         "../../../../../examples/st3/custom-review.json"
     ))
     .unwrap();
@@ -297,7 +297,7 @@ fn unrelated_writes_do_not_change_keys_and_rollback_restores_rows_and_journal() 
     let mut writer = store.connection.write();
     let tx = writer.transaction().unwrap();
     tx.execute(
-        "UPDATE step_runs SET status='cancelled' WHERE subject=?1",
+        /* sqlite-large-value: allow-for-now lv-h9ba2a42e29af owner=st3::store::attention_ivm::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET status='cancelled' WHERE subject=?1",
         [&ask.subject],
     )
     .unwrap();
@@ -347,7 +347,7 @@ fn run_closure_and_reopen_only_invalidate_dependents() {
             .connection
             .batched(|tx| -> Result<()> {
                 tx.execute(
-                    "UPDATE mission_runs SET status=?1 WHERE id=?2",
+                    /* sqlite-large-value: allow-for-now lv-h212fe4cfe4b8 owner=st3::store::attention_ivm::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status=?1 WHERE id=?2",
                     params![status, origin.run.trim_start_matches("mission-run/")],
                 )?;
                 Ok(())
@@ -418,7 +418,7 @@ fn source_reassignment_retires_old_public_key_without_rebuilding_other_rows() {
         .connection
         .batched(|tx| -> Result<()> {
             tx.execute(
-                "UPDATE step_runs SET assignee='person/robin' WHERE subject=?1",
+                /* sqlite-large-value: allow-for-now lv-h1e4250642ddf owner=st3::store::attention_ivm::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET assignee='person/robin' WHERE subject=?1",
                 [&ask.subject],
             )?;
             Ok(())
@@ -508,7 +508,7 @@ stop "agent/alder.asker"
 fn missing_document_dependency_and_recovery_match_full_reader() {
     let store = Store::open_memory("alder").unwrap();
     let views = views(&store);
-    let manifest = serde_json::from_str(include_str!(
+    let manifest = serde_json::from_str(/* sqlite-large-value: allow-for-now lv-hdcf4340b72e5 owner=st3::store::attention_ivm::tests TODO=trace-statement-and-value-representation */ include_str!(
         "../../../../../examples/st3/custom-review.json"
     ))
     .unwrap();
@@ -743,7 +743,7 @@ fn authored_person_assignee_matches_the_full_readers_lowercase_range() {
         .connection
         .write()
         .execute(
-            "UPDATE step_runs SET status='ready' WHERE assignee='person/avery'",
+            /* sqlite-large-value: allow-for-now lv-h0d834439e18e owner=st3::store::attention_ivm::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET status='ready' WHERE assignee='person/avery'",
             [],
         )
         .unwrap();
@@ -753,7 +753,7 @@ fn authored_person_assignee_matches_the_full_readers_lowercase_range() {
         .connection
         .write()
         .execute(
-            "UPDATE step_runs SET assignee='PERSON/avery',status='ready' WHERE assignee='person/avery'",
+            /* sqlite-large-value: allow-for-now lv-h57759ec7c6d6 owner=st3::store::attention_ivm::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET assignee='PERSON/avery',status='ready' WHERE assignee='person/avery'",
             [],
         )
         .unwrap();

@@ -10,7 +10,7 @@ fn authored_pull_request_lookup_indexes_existing_schema_seventeen_on_open() {
     let connection = store.connection.write();
     connection
         .execute_batch(
-            "DROP INDEX claims_authored_pull_request_url_index;
+            /* sqlite-large-value: allow-for-now lv-he58c50fde717 owner=st3::store::authored_pull_requests_tests TODO=bound-or-reference-values-and-reclamation */ "DROP INDEX claims_authored_pull_request_url_index;
          DROP INDEX claims_authored_pull_request_number_index;",
         )
         .unwrap();
@@ -54,13 +54,13 @@ fn authored_pull_request_lookup_indexes_existing_schema_seventeen_on_open() {
 fn insert(connection: &Connection, id: &str, subject: &str, kind: &str, facts: Value, time: &str) {
     connection
         .execute(
-            "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+            /* sqlite-large-value: allow-for-now lv-hb65689d89c4f owner=st3::store::authored_pull_requests_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
          VALUES(?1,'node',1,?1,?2)",
             params![id, time],
         )
         .unwrap();
     connection.execute(
-        "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+        /* sqlite-large-value: allow-for-now lv-h63d69ebc916e owner=st3::store::authored_pull_requests_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
          VALUES(?1,?1,?2,?3,'node',?4,'[]',?5)",
         params![id, subject, kind, json!({"fields":{"facts":facts}}).to_string(), time],
     ).unwrap();
@@ -157,13 +157,13 @@ fn authored_pull_request_lookup_preserves_identity_head_and_canonical_order() {
     // Ordinary SQLite index maintenance must reflect changed identities and removals.
     connection
         .execute(
-            "UPDATE claims SET body=?1 WHERE id='number'",
+            /* sqlite-large-value: allow-for-now lv-hbe86afcab68e owner=st3::store::authored_pull_requests_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=?1 WHERE id='number'",
             [json!({"fields":{"facts":{"repository":"other", "number":42}}}).to_string()],
         )
         .unwrap();
     connection
         .execute(
-            "DELETE FROM claims WHERE id IN ('url', 'both', 'duplicate-run')",
+            /* sqlite-large-value: allow-for-now lv-hc39f593a40b8 owner=st3::store::authored_pull_requests_tests TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id IN ('url', 'both', 'duplicate-run')",
             [],
         )
         .unwrap();
@@ -185,7 +185,7 @@ fn authored_pull_request_lookup_seeks_through_sparse_unrelated_history() {
     );
     let query = canonical_sql(AUTHORING_PULL_REQUEST_RUNS_QUERY);
     let plan = transaction
-        .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+        .prepare(/* sqlite-large-value: allow-for-now lv-hc364adf3b508 owner=st3::store::authored_pull_requests_tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {query}"))
         .unwrap()
         .query_map(params!["url", "repo", 42], |row| row.get::<_, String>(3))
         .unwrap()
@@ -233,7 +233,7 @@ fn authored_pull_request_lookup_seeks_through_sparse_unrelated_history() {
                 ),
             ] {
                 {
-                    let statement = transaction.prepare_cached(&query).unwrap();
+                    let statement = transaction.prepare_cached(/* sqlite-large-value: allow-for-now lv-hc85ddf2124ad owner=st3::store::authored_pull_requests_tests TODO=trace-statement-and-value-representation */ &query).unwrap();
                     statement.reset_status(StatementStatus::VmStep);
                     statement.reset_status(StatementStatus::FullscanStep);
                 }
@@ -241,7 +241,7 @@ fn authored_pull_request_lookup_seeks_through_sparse_unrelated_history() {
                     authoring_pull_request_runs_tx(&transaction, &facts).unwrap(),
                     expected
                 );
-                let statement = transaction.prepare_cached(&query).unwrap();
+                let statement = transaction.prepare_cached(/* sqlite-large-value: allow-for-now lv-h65ef46ad4b05 owner=st3::store::authored_pull_requests_tests TODO=trace-statement-and-value-representation */ &query).unwrap();
                 assert_eq!(
                     statement.get_status(StatementStatus::FullscanStep),
                     0,

@@ -562,7 +562,7 @@ impl Simulation {
                     connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
                     for claim in &lost {
                         connection
-                            .execute("DELETE FROM claims WHERE id=?1", [claim])
+                            .execute(/* sqlite-large-value: allow-for-now lv-h1137afc2fb80 owner=st3::store::convergence TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id=?1", [claim])
                             .unwrap();
                     }
                     connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
@@ -586,7 +586,7 @@ impl Simulation {
                     for claim in &unknown {
                         connection
                             .execute(
-                                "UPDATE replica_records SET state='unknown',
+                                /* sqlite-large-value: allow-for-now lv-h75cfb99161e5 owner=st3::store::convergence TODO=chunk-or-reference-exact-wire-values */ "UPDATE replica_records SET state='unknown',
                                      error_code='unknown-claim-kind',
                                      error_message='this build does not know the claim kind'
                                  WHERE claim_id=?1",
@@ -594,7 +594,7 @@ impl Simulation {
                             )
                             .unwrap();
                         connection
-                            .execute("DELETE FROM claims WHERE id=?1", [claim])
+                            .execute(/* sqlite-large-value: allow-for-now lv-hddff7ab1cc7a owner=st3::store::convergence TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id=?1", [claim])
                             .unwrap();
                     }
                     connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
@@ -608,7 +608,7 @@ impl Simulation {
                 let connection = self.nodes[node].store().connection.write();
                 let changed = connection
                     .execute(
-                        "UPDATE step_runs SET attempt=attempt+1 WHERE subject=(
+                        /* sqlite-large-value: allow-for-now lv-he020e5a3db50 owner=st3::store::convergence TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET attempt=attempt+1 WHERE subject=(
                              SELECT subject FROM step_runs ORDER BY subject
                              LIMIT 1 OFFSET ?1 % MAX(1, (SELECT COUNT(*) FROM step_runs)))",
                         [step_offset],
@@ -616,7 +616,7 @@ impl Simulation {
                     .unwrap()
                     + connection
                         .execute(
-                            "UPDATE mission_runs SET status='failed', phase='terminal' WHERE id=(
+                            /* sqlite-large-value: allow-for-now lv-h61f6bfff84b4 owner=st3::store::convergence TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status='failed', phase='terminal' WHERE id=(
                                  SELECT id FROM mission_runs ORDER BY id
                                  LIMIT 1 OFFSET ?1 % MAX(1, (SELECT COUNT(*) FROM mission_runs)))",
                             [run_offset],
@@ -637,7 +637,7 @@ impl Simulation {
         let ids = {
             let connection = self.nodes[node].store().readers.get();
             let mut statement = connection
-                .prepare(&format!(
+                .prepare(/* sqlite-large-value: allow-for-now lv-h6bc3d47991e4 owner=st3::store::convergence TODO=trace-statement-and-value-representation */ &format!(
                     "SELECT DISTINCT claims.id FROM claims
                      JOIN replica_records ON replica_records.claim_id=claims.id
                      WHERE replica_records.{filter}
@@ -698,7 +698,7 @@ fn differing_tables(left: &Node, right: &Node) -> Vec<String> {
     let rows = |node: &Node, table: &str, columns: &[&str], order: &str| {
         let connection = node.store().readers.get();
         let mut statement = connection
-            .prepare(&format!(
+            .prepare(/* sqlite-large-value: allow-for-now lv-he47445672b74 owner=st3::store::convergence TODO=trace-statement-and-value-representation */ &format!(
                 "SELECT json_array({}) FROM {table} ORDER BY {order}",
                 columns.join(", ")
             ))

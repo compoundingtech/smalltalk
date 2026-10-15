@@ -35,7 +35,7 @@ impl Adapter {
         let before = adapter.clone();
         let after = adapter.clone();
         store.connection.install_transaction_hooks(
-            move |tx| before.prepare(tx),
+            move |tx| before.prepare(/* sqlite-large-value: allow-for-now lv-h12286fe2814f owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks TODO=trace-statement-and-value-representation */ tx),
             move |tx| after.finalize(tx),
         )?;
         Ok(adapter)
@@ -75,13 +75,13 @@ impl Adapter {
                     .as_deref()
                     .unwrap_or("preexisting raw pending or managed scope");
                 tx.execute(
-                    "UPDATE test_native_terminal_guard SET gap=?1,pending=1 WHERE id=1",
+                    /* sqlite-large-value: allow-for-now lv-h9487c31fe34c owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks TODO=bound-or-reference-values-and-reclamation */ "UPDATE test_native_terminal_guard SET gap=?1,pending=1 WHERE id=1",
                     [reason],
                 )?;
                 source.installer.source_gap(tx, SOURCE, reason)?;
             }
             tx.execute(
-                "UPDATE test_native_terminal_guard SET managed_scope=1 WHERE id=1",
+                /* sqlite-large-value: allow-for-now lv-hb8a691ee25bc owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks TODO=bound-or-reference-values-and-reclamation */ "UPDATE test_native_terminal_guard SET managed_scope=1 WHERE id=1",
                 [],
             )?;
             if self.fault.load(Ordering::Relaxed) == 1 {
@@ -112,7 +112,7 @@ impl Adapter {
         if let Some(reason) = self.operator_error.constraint_reason()? {
             self.measured("operator-constraint-fence", || {
                 tx.execute(
-                    "UPDATE test_native_terminal_guard SET gap=?1,pending=1 WHERE id=1",
+                    /* sqlite-large-value: allow-for-now lv-hfac0a551334b owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks TODO=bound-or-reference-values-and-reclamation */ "UPDATE test_native_terminal_guard SET gap=?1,pending=1 WHERE id=1",
                     [&reason],
                 )?;
                 source.installer.source_gap(tx, SOURCE, &reason)
@@ -126,7 +126,7 @@ impl Adapter {
         self.measured("marker-clear", || {
             ensure!(
                 tx.execute(
-                    "UPDATE test_native_terminal_guard SET managed_scope=0 WHERE id=1",
+                    /* sqlite-large-value: allow-for-now lv-h93d3fd4809ac owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks TODO=bound-or-reference-values-and-reclamation */ "UPDATE test_native_terminal_guard SET managed_scope=0 WHERE id=1",
                     []
                 )? == 1,
                 "missing scope row"
@@ -143,7 +143,7 @@ impl Adapter {
             .set(source)
             .map_err(|_| anyhow::anyhow!("source already attached"))?;
         tx.execute(
-            "UPDATE test_native_terminal_guard SET managed_scope=1 WHERE id=1",
+            /* sqlite-large-value: allow-for-now lv-h34a1dcbe91ef owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks TODO=bound-or-reference-values-and-reclamation */ "UPDATE test_native_terminal_guard SET managed_scope=1 WHERE id=1",
             [],
         )?;
         if seed {

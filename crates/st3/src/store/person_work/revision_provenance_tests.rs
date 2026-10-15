@@ -123,7 +123,7 @@ fn retain_noncanonical_source(store: &Store, spec: &MissionSpec, claim: &ClaimRe
         .batched(|tx| -> Result<()> {
             assert_eq!(
                 tx.execute(
-                    "UPDATE mission_revisions SET claim_id=?3 WHERE mission_id=?1 AND revision=?2",
+                    /* sqlite-large-value: allow-for-now lv-hfbf5da96c833 owner=st3::store::person_work::revision_provenance_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_revisions SET claim_id=?3 WHERE mission_id=?1 AND revision=?2",
                     params![spec.id, spec.revision, claim.id],
                 )?,
                 1
@@ -227,7 +227,7 @@ fn person_definition_source_repairs_even_when_revision_history_is_already_canoni
         .batched(|tx| -> Result<()> {
             assert_eq!(
                 tx.execute(
-                    "UPDATE mission_definitions SET claim_id=?2 WHERE mission_id=?1",
+                    /* sqlite-large-value: allow-for-now lv-ha4b88c914f95 owner=st3::store::person_work::revision_provenance_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_definitions SET claim_id=?2 WHERE mission_id=?1",
                     params![spec.id, later.id],
                 )?,
                 1

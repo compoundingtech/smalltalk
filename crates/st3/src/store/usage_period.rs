@@ -24,10 +24,10 @@ fn observed_sql() -> &'static str {
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(&format!(
-        "CREATE INDEX IF NOT EXISTS {INDEX} ON claims({}, {}) WHERE {PREDICATE}",
+        /* sqlite-large-value: allow-for-now lv-h9c69afcd91b0 owner=st3::store::usage_period TODO=chunk-or-reference-variable-columns */ "CREATE INDEX IF NOT EXISTS {INDEX} ON claims({}, {}) WHERE {PREDICATE}",
         series_sql(), observed_sql()
     ))?;
-    connection.execute_batch("DROP INDEX IF EXISTS claims_usage_rollup_index")?;
+    connection.execute_batch(/* sqlite-large-value: allow-for-now lv-ha2460fc00513 owner=st3::store::usage_period TODO=bound-or-reference-values-and-reclamation */ "DROP INDEX IF EXISTS claims_usage_rollup_index")?;
     Ok(())
 }
 
@@ -39,18 +39,18 @@ pub(super) fn boundary_rows(
     let observed = observed_sql();
     let boundaries = boundaries.iter().map(|boundary| format!("{boundary:>20}")).collect::<Vec<_>>();
     // A loose index scan: one successor seek per series, regardless of its history length.
-    let mut next = connection.prepare_cached(&format!(
+    let mut next = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h3733108fb358 owner=st3::store::usage_period TODO=trace-statement-and-value-representation */ &format!(
         "SELECT {series} FROM claims INDEXED BY {INDEX} WHERE {PREDICATE} AND {series}>?1 ORDER BY {series} LIMIT 1"
     ))?;
-    let mut timestamp = connection.prepare_cached(&format!(
+    let mut timestamp = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-haca056b26f23 owner=st3::store::usage_period TODO=trace-statement-and-value-representation */ &format!(
         "SELECT {observed} FROM claims INDEXED BY {INDEX} WHERE {PREDICATE} AND {series}=?1 AND {observed}<=?2 ORDER BY {observed} DESC LIMIT 1"
     ))?;
-    let mut snapshots = connection.prepare_cached(&format!(
+    let mut snapshots = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h3f47b46650c4 owner=st3::store::usage_period TODO=trace-statement-and-value-representation */ &format!(
         "SELECT id,subject,store_index,body FROM claims INDEXED BY {INDEX} WHERE {PREDICATE} AND {series}=?1 AND {observed}=?2 LIMIT 2"
     ))?;
     // Canonical order matters only when a series has several snapshots at the same observed
     // timestamp. Keep the exact replicated tie-breaker, but never sort its whole history.
-    let mut tied = connection.prepare_cached(&canonical_sql(&format!(
+    let mut tied = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h9d08ff6465f8 owner=st3::store::usage_period TODO=trace-statement-and-value-representation */ &canonical_sql(&format!(
         "SELECT id,subject,store_index,body FROM claims INDEXED BY {INDEX} WHERE {PREDICATE} AND {series}=?1 AND {observed}=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"
     )))?;
     let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String, u64, String)> {
@@ -58,10 +58,10 @@ pub(super) fn boundary_rows(
     };
     let mut result = BTreeMap::new();
     let mut previous = String::new();
-    while let Some(key) = next.query_row([&previous], |row| row.get::<_, String>(0)).optional()? {
+    while let Some(key) = next.query_row(/* sqlite-large-value: allow-for-now lv-h230503476bd3 owner=st3::store::usage_period TODO=trace-statement-and-value-representation */ [&previous], |row| row.get::<_, String>(0)).optional()? {
         let mut previous_at = None;
         for boundary in &boundaries {
-            let Some(at) = timestamp.query_row(params![key, boundary], |row| row.get::<_, String>(0)).optional()? else {
+            let Some(at) = timestamp.query_row(/* sqlite-large-value: allow-for-now lv-hf86a1a5de56d owner=st3::store::usage_period TODO=trace-statement-and-value-representation */ params![key, boundary], |row| row.get::<_, String>(0)).optional()? else {
                 continue;
             };
             if previous_at.as_ref() == Some(&at) {
@@ -72,7 +72,7 @@ pub(super) fn boundary_rows(
             let has_ties = candidates.next()?.is_some();
             drop(candidates);
             let winner = if has_ties {
-                tied.query_row(params![key, at], read_row)?
+                tied.query_row(/* sqlite-large-value: allow-for-now lv-hcf2d26dd85d0 owner=st3::store::usage_period TODO=trace-statement-and-value-representation */ params![key, at], read_row)?
             } else {
                 first
             };

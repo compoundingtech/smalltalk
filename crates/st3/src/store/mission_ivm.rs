@@ -10,7 +10,7 @@ use smallclaims::ivm::{Definition, LocalChange, Readiness, View, Views, source_c
 
 pub(crate) const VIEW: &str = "st3.mission-selection.v1";
 const SOURCE: &str = "st3.mission-selection.changed";
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h0e26faf5be59 owner=st3::store::mission_ivm TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS local_mission_counts (
  mission_id TEXT NOT NULL, status TEXT NOT NULL, count INTEGER NOT NULL CHECK(count>0),
  PRIMARY KEY(mission_id,status)
@@ -92,7 +92,7 @@ impl View for MissionSelection {
         }
     }
     fn create_schema(&self, connection: &Connection) -> Result<()> {
-        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h6d8ec18abe1e owner=st3::store::mission_ivm TODO=trace-statement-and-value-representation */ SCHEMA)?;
         Ok(())
     }
     fn maintain_local_key(
@@ -141,7 +141,7 @@ fn maintain(tx: &Transaction<'_>, key: &str, at: u128) -> Result<bool> {
         .optional()?;
     if definition.is_none() && latest.is_none() {
         tx.execute(
-            "DELETE FROM local_mission_selection WHERE mission_id=?1",
+            /* sqlite-large-value: allow-for-now lv-h6a013b9f2301 owner=st3::store::mission_ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_mission_selection WHERE mission_id=?1",
             [mission],
         )?;
         return Ok(old.is_some());
@@ -195,7 +195,7 @@ fn maintain(tx: &Transaction<'_>, key: &str, at: u128) -> Result<bool> {
         return Ok(false);
     }
     tx.execute(
-        "INSERT INTO local_mission_selection VALUES(?1,?2,?3,?4,?5,?6)
+        /* sqlite-large-value: allow-for-now lv-h9090604f6e1f owner=st3::store::mission_ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_mission_selection VALUES(?1,?2,?3,?4,?5,?6)
         ON CONFLICT(mission_id) DO UPDATE SET updated_ms=excluded.updated_ms,state=excluded.state,
           grace_until_ms=excluded.grace_until_ms,visible=excluded.visible,body=excluded.body",
         params![mission, updated, state, grace, visible, body],
@@ -255,12 +255,12 @@ pub(crate) fn flush(tx: &Transaction<'_>, views: &Views, at: u128, limit: usize)
             "mission selection maintenance deferred"
         );
         tx.execute(
-            "DELETE FROM local_mission_pending WHERE mission_id=?1",
+            /* sqlite-large-value: allow-for-now lv-ha8f904173dca owner=st3::store::mission_ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_mission_pending WHERE mission_id=?1",
             [mission],
         )?;
     }
     tx.execute(
-        "UPDATE local_mission_clock SET through_ms=?1 WHERE through_ms<?1",
+        /* sqlite-large-value: allow-for-now lv-ha9cefbac25aa owner=st3::store::mission_ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_mission_clock SET through_ms=?1 WHERE through_ms<?1",
         [i64::try_from(at)?],
     )?;
     Ok(keys.len())
@@ -313,7 +313,7 @@ pub(crate) fn clock_page(
         );
     }
     tx.execute(
-        "UPDATE local_mission_clock SET through_ms=?1 WHERE singleton=1 AND through_ms<?1",
+        /* sqlite-large-value: allow-for-now lv-h17461557026d owner=st3::store::mission_ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_mission_clock SET through_ms=?1 WHERE singleton=1 AND through_ms<?1",
         [at_ms],
     )?;
     Ok(keys.len())
@@ -393,7 +393,7 @@ pub(crate) fn window(
         ORDER BY updated_ms DESC,mission_id ASC LIMIT ?5"
     );
     connection
-        .prepare_cached(&sql)?
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-h64f6bb6a2ac0 owner=st3::store::mission_ivm TODO=trace-statement-and-value-representation */ &sql)?
         .query_map(
             params![
                 history,

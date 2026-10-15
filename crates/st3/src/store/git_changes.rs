@@ -5,7 +5,7 @@ use crate::changes::{Revision, change_id, oid};
 
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 
-pub(super) const SCHEMA: &str = r#"
+pub(super) const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-hfacfd91f3978 owner=st3::store::git_changes TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS local_git_change_records (
     repository TEXT NOT NULL,
     object_id TEXT NOT NULL,
@@ -72,13 +72,13 @@ impl Store {
             );
         } else {
             transaction.execute(
-                "INSERT INTO local_git_change_records(repository,object_id,change_id,record_json,indexed_at)
+                /* sqlite-large-value: allow-for-now lv-h3dffebc50450 owner=st3::store::git_changes TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_git_change_records(repository,object_id,change_id,record_json,indexed_at)
                  VALUES(?1,?2,?3,?4,?5)",
                 params![repository, revision.oid, revision.record.change_id, body, indexed_at],
             )?;
         }
         transaction.execute(
-            "INSERT INTO local_git_change_latest(repository,change_id,object_id,generation)
+            /* sqlite-large-value: allow-for-now lv-hea50d1eece6e owner=st3::store::git_changes TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_git_change_latest(repository,change_id,object_id,generation)
              VALUES(?1,?2,?3,?4)
              ON CONFLICT(repository,change_id) DO UPDATE SET object_id=excluded.object_id,generation=excluded.generation
              WHERE excluded.generation>local_git_change_latest.generation",
@@ -111,7 +111,7 @@ impl Store {
         let mut records = BTreeMap::new();
         for object in objects {
             let row: Option<(String, String)> = statement
-                .query_row(params![repository, object], |row| {
+                .query_row(/* sqlite-large-value: allow-for-now lv-hc7b80e3581f4 owner=st3::store::git_changes TODO=trace-statement-and-value-representation */ params![repository, object], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })
                 .optional()?;
