@@ -1718,6 +1718,28 @@ impl Client {
     pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {
         self.get("/v1/client/mail-backlog").await
     }
+    pub async fn slo_list(&self) -> Result<Envelope<SloList>, ClientError> {
+        self.get("/v1/client/slo").await
+    }
+    pub async fn slo_history(
+        &self,
+        id: &str,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+        steps: Option<usize>,
+    ) -> Result<Envelope<SloHistory>, ClientError> {
+        let mut path = format!("/v1/client/slo/history?id={}", percent_encode(id));
+        if let Some(since_ms) = since_ms {
+            path.push_str(&format!("&since_ms={since_ms}"));
+        }
+        if let Some(until_ms) = until_ms {
+            path.push_str(&format!("&until_ms={until_ms}"));
+        }
+        if let Some(steps) = steps {
+            path.push_str(&format!("&steps={steps}"));
+        }
+        self.get(&path).await
+    }
     pub async fn usage_period(
         &self,
         since_ms: Option<u64>,

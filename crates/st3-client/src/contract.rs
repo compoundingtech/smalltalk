@@ -72,6 +72,8 @@ pub const READ_OPERATIONS: &[(&str, &str)] = &[
     ("publication.definition", "/v1/client/publication-definition"),
     ("subject.definition", "/v1/client/subject-definition"),
     ("mail-backlog.summary", "/v1/client/mail-backlog"),
+    ("slo.list", "/v1/client/slo"),
+    ("slo.history", "/v1/client/slo/history"),
     ("usage.period", "/v1/client/usage"),
     ("clients.list", "/v1/client/clients"),
     ("now.list", "/v1/client/now"),

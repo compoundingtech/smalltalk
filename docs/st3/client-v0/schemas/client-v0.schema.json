@@ -188,7 +188,9 @@
             { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
             { "$ref": "#/$defs/UsagePeriod" },
-            { "$ref": "#/$defs/MailBacklog" }
+            { "$ref": "#/$defs/MailBacklog" },
+            { "$ref": "#/$defs/SloList" },
+            { "$ref": "#/$defs/SloHistory" }
           ]
         }
       }
@@ -667,6 +669,45 @@
     },
     "ConnectedClient": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["actor", "person", "member", "via", "connected", "streams", "since", "last_seen", "follows", "kind"], "properties": {"actor": {"type": "string"}, "person": {"type": "string"}, "client": {"type": ["string", "null"]}, "device_id": {"type": "string"}, "device_name": {"type": "string"}, "member": {"type": "string"}, "via": {"enum": ["local", "gateway", "tailscale"]}, "connected": {"type": "boolean"}, "streams": {"type": "integer", "minimum": 0}, "since": {"$ref": "#/$defs/Timestamp"}, "last_seen": {"$ref": "#/$defs/Timestamp"}, "follows": {"type": "array", "items": {"type": "string"}}, "kind": {"const": "connected-client"}}}]},
     "Usage": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "value"], "properties": {"kind": {"const": "usage"}, "value": {"$ref": "#/$defs/UsagePeriod"}}}]},
+    "SloList": {
+      "type": "object", "additionalProperties": false,
+      "required": ["as_of_unix_ms", "rows"],
+      "properties": {
+        "as_of_unix_ms": { "type": "integer", "minimum": 0 },
+        "rows": { "type": "array", "items": { "$ref": "#/$defs/SloRow" } }
+      }
+    },
+    "SloRow": {
+      "description": "One objective (a target with windows and an error budget) or one budget (an allowance that resets), as this daemon measures it. about, target, current, window and explain are display text for a person, not a contract; the pair of slo reads is experimental.",
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "about", "target", "current", "window", "remaining_percent", "status", "explain"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "enum": ["objective", "budget"] },
+        "account": { "type": "string", "description": "A budget's declared account." },
+        "about": { "type": "string" },
+        "target": { "type": "string" },
+        "current": { "type": "string" },
+        "window": { "type": "string" },
+        "remaining_percent": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "What is left of the error budget or allowance; null when nothing was measured." },
+        "status": { "enum": ["met", "missed", "no-data", "stale"] },
+        "resets_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "measured_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "explain": { "type": "string" }
+      }
+    },
+    "SloHistory": {
+      "description": "What was left of one objective or budget across a period, in equal steps; a step holds its lowest reading and is null when nothing was read.",
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "since_ms", "until_ms", "samples", "steps"],
+      "properties": {
+        "id": { "type": "string" },
+        "since_ms": { "type": "integer", "minimum": 0 },
+        "until_ms": { "type": "integer", "minimum": 0 },
+        "samples": { "type": "integer", "minimum": 0 },
+        "steps": { "type": "array", "items": { "type": ["number", "null"], "minimum": 0, "maximum": 100 } }
+      }
+    },
     "UsagePeriod": {
       "type": "object", "additionalProperties": false,
       "required": ["since_ms", "until_ms", "rows"],

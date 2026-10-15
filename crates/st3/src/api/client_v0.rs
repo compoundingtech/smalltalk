@@ -2459,6 +2459,26 @@ pub(super) async fn usage_period(
     Ok(Json(value))
 }
 
+/// Every objective and budget with what is left of each: the rows `st slo` prints. The text
+/// fields are this daemon's own display wording, not a contract.
+pub(super) async fn slo_list(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    super::get_slo(State(state)).await
+}
+
+/// What was left of one objective or budget across a period, from the daemon's local history.
+pub(super) async fn slo_history(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<super::SloHistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    super::get_slo_history(State(state), Query(query)).await
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SubjectDefinitionQuery {
@@ -2859,6 +2879,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     // Attention rows say whether each is an alert and name its agent conversation; `alerts` names
     // the attention collection and routes, and the summary counts alerts.
     capabilities.push(json!({"id":"alerts", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    capabilities.push(json!({"id":"slo", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"inventory-collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
