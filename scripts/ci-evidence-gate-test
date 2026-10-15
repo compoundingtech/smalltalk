@@ -6,6 +6,7 @@ must end in `decision=run`, and every hostile or broken verifier must too.
 """
 import importlib.machinery
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,20 @@ fixtures = load('evidence_verify_test', 'scripts/evidence-verify-test')
 REPOSITORY = 'org/repo'
 CHECKS = ('linux-gate', 'typescript-client', 'isolation-vm', 'genie-freshness', 'mail-redelivery-canaries')
 WEEK = 7 * 24 * 3600
+# The wrapper notes' exact strings, as the note jobs record them (nix-evidence, #2795 / #2803), written out
+# here independently of the policy file so a typo in either cannot make the test agree with itself.
+GATE_ARGV = ['linux-gate', 'aggregate', 'genie-freshness', 'isolation-vm', 'linux-clippy', 'linux-fleet-compat',
+             'linux-gate', 'linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3',
+             'linux-tests-shard-4', 'mail-redelivery-canaries', 'typescript-client', 'upgrade-impact']
+CANARIES_ARGV = ['bash', 'scripts/ci-linux', 'mail-redelivery-canaries']
+# The step-outcome notes of the other three checks (nix-evidence, agent/evidence-more-checks).
+STEP_ARGV = {
+    'genie-freshness': ['bash', 'scripts/ci-genie-freshness'],
+    'typescript-client': ['bash', 'scripts/ci-typescript-client'],
+    'isolation-vm': ['isolation-vm', 'nixos-test-driver', 'transport-isolation-vm', 'sekrets-vm'],
+}
+ARGV = {'linux-gate': GATE_ARGV, 'mail-redelivery-canaries': CANARIES_ARGV, **STEP_ARGV}
+LOCK = 'fake flake.lock contents\n'
 # Written out here, not read from the script, so removing a path from the script cannot hide it.
 EXPECTED_PROTECTED = (
     'scripts/ci-evidence-gate', 'scripts/evidence-verify', '.st/evidence-skip-policy.json', '.st/evidence-keys',
@@ -49,11 +64,19 @@ RUNNER = f'github:{REPOSITORY}/actions/runs/7/attempts/1/jobs/9'
 
 def skip_policy(**per_check):
     """The repository's skip policy as a base commit would carry it, for all five checks."""
-    entry = {'trust_levels': ['fleet'],
+    entry = {'trust_levels': ['fleet'], 'enforce': True,
              'kinds': {'observed': {'command': ['github-actions', '{repository}', '.github/workflows/fleet.yml', '{check}'],
                                     'runner_prefix': 'github:{repository}/'}}}
     entry.update(per_check)
     return json.dumps({'version': 1, 'checks': {check: entry for check in CHECKS}})
+
+
+def enforcing(path):
+    """The repository's real skip policy with skipping turned on for every check: the one-line change per check."""
+    doc = json.loads(Path(path).read_text())
+    for entry in doc['checks'].values():
+        entry['enforce'] = True
+    return json.dumps(doc)
 
 
 def decision(text):
@@ -91,7 +114,7 @@ class Decide(unittest.TestCase):
         record = 'a' * 40
         now = gate.datetime.now(gate.timezone.utc).isoformat()
         context = {'check': 'linux-gate', 'fork': 'false', 'event': 'merge_group', 'protected_changed': []}
-        result = {'satisfied': True, 'policy': True, 'tier': 'full', 'kind': 'observed', 'trust_level': 'fleet',
+        result = {'satisfied': True, 'policy': True, 'enforce': True, 'tier': 'full', 'kind': 'observed', 'trust_level': 'fleet',
                   'tree': 'b' * 40, 'check': 'linux-gate', 'record': record, 'signer': 'fleet/ci', 'observed_at': now}
         return context, result, 'b' * 40
 
@@ -430,8 +453,37 @@ class EndToEnd(unittest.TestCase):
             self.note(commit, tree, **note_kwargs)
         return base, commit, tree
 
+    def test_skipping_is_off_unless_the_policy_turns_it_on_for_the_check(self):
+        for label, change in (('false', dict(enforce=False)), ('absent', None)):
+            doc = json.loads(skip_policy())
+            for entry in doc['checks'].values():
+                if change is None:
+                    entry.pop('enforce')
+                else:
+                    entry.update(change)
+            base, _, _ = self.scenario(policy=json.dumps(doc))
+            fields = self.assertRuns(base, label)
+            # The note is found and trusted - the proof - but the decision stays `run`, and says why.
+            self.assertEqual(fields['outcome'], 'satisfied', label)
+            self.assertEqual(fields['enforce'], 'False', label)  # absent means false
+            self.assertIn('shadow', fields['reason'], label)
+        base, _, _ = self.scenario(policy=skip_policy())
+        self.assertEqual(self.run_gate(base)[0]['decision'], 'skip')  # the same note, with enforce true
+        for bad in ('yes', 1, None):
+            base, _, _ = self.scenario(policy=skip_policy(enforce=bad))
+            self.assertEqual(self.assertRuns(base, repr(bad))['outcome'], 'unavailable', repr(bad))
+
+    def test_the_repository_policy_turns_skipping_on_only_for_the_checks_listed_here(self):
+        # Written out here, so turning a check on is a deliberate change to the policy AND to this list.
+        enforced = ()
+        policy = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
+        self.assertEqual(sorted(policy['checks']), sorted(CHECKS))
+        self.assertEqual(sorted(c for c, entry in policy['checks'].items() if entry.get('enforce') is True), sorted(enforced))
+        for check, entry in policy['checks'].items():
+            self.assertIn(entry.get('enforce', False), (True, False), check)
+
     def test_adding_a_required_input_tightens_future_notes_without_breaking_anything(self):
-        entry = {'trust_levels': ['fleet'], 'kinds': {'observed': {
+        entry = {'trust_levels': ['fleet'], 'enforce': True, 'kinds': {'observed': {
             'command': ['github-actions', '{repository}', '.github/workflows/fleet.yml', '{check}'],
             'runner_prefix': 'github:{repository}/', 'required_inputs': ['flake_lock_sha256', 'toolchain_sha256']}}}
         tight_policy = json.dumps({'version': 1, 'checks': {c: entry for c in CHECKS}})
@@ -472,6 +524,155 @@ class EndToEnd(unittest.TestCase):
         # A newer imitation of the observer by the weak signer cannot hide behind the wrapper grant.
         self.note(commit, tree, key=weak, signer='local/ci', seconds=2)
         self.assertEqual(self.assertRuns(base)['reason'], 'untrusted_level')
+
+    # ---- wrapper notes, against the real committed policy ------------------------------------
+
+    def wrapper_scenario(self):
+        """A fresh repository whose base carries the real policy file and a flake.lock, plus a weak signer."""
+        import hashlib
+        self.f = fixtures.Fixture()
+        self.addCleanup(self.f.tmp.cleanup)
+        self.ci = self.f.key('ci', 'fleet/ci')
+        self.local = self.f.key('local', 'local/ci')
+        self.machine = self.f.key('machine', 'machine/box')
+        self.stranger = self.f.key('stranger')
+        (self.f.repo / 'flake.lock').write_text(LOCK)
+        base = self.commit_base(policy=enforcing(ROOT / '.st/evidence-skip-policy.json'))
+        commit, tree = self.head()
+        return base, commit, tree, hashlib.sha256(LOCK.encode()).hexdigest()
+
+    def wrapper_note(self, commit, tree, lock, check='linux-gate', argv=None, **kwargs):
+        argv = argv or ARGV[check]
+        inputs = {'flake_lock_sha256': lock, 'toolchain_sha256': 't' * 64, 'wrapper_sha256': 'w' * 64,
+                  'system': 'x86_64-linux', 'attempt': '1'}
+        if check == 'mail-redelivery-canaries':
+            inputs.update(stage=ARGV[check][-1], job=check)
+        elif check in STEP_ARGV:
+            inputs.update(job=check, steps='client,install', step_outcomes='client=success,install=success')
+        inputs.update(kwargs.pop('inputs', {}))
+        for drop in kwargs.pop('drop', ()):
+            inputs.pop(drop, None)
+        defaults = dict(check=check, command=tuple(argv), runner='wrapper', inputs=inputs, key=self.ci, signer='fleet/ci')
+        defaults.update(kwargs)
+        return self.f.note(commit, tree, **defaults)
+
+    def test_exact_wrapper_notes_from_the_fleet_signer_skip_their_own_check(self):
+        base, commit, tree, lock = self.wrapper_scenario()
+        for check in CHECKS:
+            with self.subTest(check):
+                self.wrapper_note(commit, tree, lock, check=check)
+                fields, outputs = self.run_gate(base, check=check)
+                self.assertEqual((fields['decision'], fields['kind'], fields['trust_level'], fields['signer']),
+                                 ('skip', 'wrapper', 'fleet', 'fleet/ci'))
+                self.assertRegex(outputs['record'], r'^[0-9a-f]{40}$')
+
+    def test_a_wrapper_note_counts_only_for_its_own_check(self):
+        # Every check's note, filed under every OTHER check's name, is a different command: never a skip.
+        for noted, filed_under in itertools.permutations(CHECKS, 2):
+            with self.subTest(f'{noted} filed under {filed_under}'):
+                base, commit, tree, lock = self.wrapper_scenario()
+                self.wrapper_note(commit, tree, lock, check=filed_under, argv=ARGV[noted])
+                self.assertEqual(self.assertRuns(base, check=filed_under)['reason'], 'wrong_command')
+
+    def test_a_check_whose_policy_requires_the_observer_is_never_satisfied_by_a_wrapper_note(self):
+        base, commit, tree, lock = self.wrapper_scenario()
+        # Same repository but the base lists only the observer for every check.
+        self.f.git('checkout', '-q', '--detach', 'HEAD~1')
+        (self.f.repo / '.st/evidence-skip-policy.json').write_text(skip_policy())
+        self.f.git('add', '-A')
+        self.f.git('commit', '-q', '-m', 'observer-only policy')
+        observer_only_base = self.f.git('rev-parse', 'HEAD')
+        (self.f.repo / 'flake.lock').write_text(LOCK)
+        commit, tree = self.head()
+        self.wrapper_note(commit, tree, lock, check='isolation-vm')
+        self.assertEqual(self.assertRuns(observer_only_base, check='isolation-vm')['reason'], 'unsupported_kind')
+
+    def test_a_wrapper_note_for_another_tree_never_skips(self):
+        base, commit, tree, lock = self.wrapper_scenario()
+        (self.f.repo / 'flake.lock').write_text(LOCK)  # same contents...
+        (self.f.repo / 'other.txt').write_text('x')  # ...in a different tree
+        other_commit, other_tree = self.f.commit('other')
+        self.assertNotEqual(tree, other_tree)
+        self.assertEqual(self.f.git('rev-parse', 'HEAD'), other_commit)  # the gate runs in the later tree
+        self.wrapper_note(commit, tree, lock)  # the note is for the earlier one
+        self.assertRuns(base)
+
+    def test_any_change_to_the_command_is_a_different_command(self):
+        variants = {
+            'a job dropped': [a for a in GATE_ARGV if a != 'upgrade-impact'],
+            'a job added': GATE_ARGV + ['perf-load'],
+            'reordered': GATE_ARGV[:2] + list(reversed(GATE_ARGV[2:])),
+            'first word changed': ['linux-gates'] + GATE_ARGV[1:],
+            'extra trailing argument': GATE_ARGV + ['--force'],
+            'not an aggregate': ['linux-gate', 'run'] + GATE_ARGV[2:],
+            'empty job list': ['linux-gate', 'aggregate'],
+        }
+        for name, argv in variants.items():
+            with self.subTest(name):
+                base, commit, tree, lock = self.wrapper_scenario()
+                self.wrapper_note(commit, tree, lock, argv=argv)
+                self.assertEqual(self.assertRuns(base, name)['reason'], 'wrong_command')
+
+    def test_only_the_fleet_signer_counts_for_a_wrapper_note(self):
+        for name, who in {'unlisted key': ('stranger', 'fleet/ci'), 'weaker local level': ('local', 'local/ci'),
+                          'machine level': ('machine', 'machine/box'), 'key proves another principal': ('ci', 'fleet/other')}.items():
+            with self.subTest(name):
+                base, commit, tree, lock = self.wrapper_scenario()
+                self.wrapper_note(commit, tree, lock, key=getattr(self, who[0]), signer=who[1])
+                fields = self.assertRuns(base, name)
+                self.assertIn(fields['reason'], ('untrusted_signer', 'untrusted_level'))
+
+    def test_a_wrapper_note_must_carry_every_required_input_and_bind_the_lock_file(self):
+        required = ['flake_lock_sha256', 'toolchain_sha256', 'wrapper_sha256', 'system', 'attempt']
+        for missing in required:
+            with self.subTest('missing ' + missing):
+                base, commit, tree, lock = self.wrapper_scenario()
+                self.wrapper_note(commit, tree, lock, drop=[missing])
+                self.assertEqual(self.assertRuns(base)['reason'], 'missing_input' if missing != 'flake_lock_sha256' else 'missing_input')
+        for missing in ('stage', 'job'):
+            with self.subTest('canaries missing ' + missing):
+                base, commit, tree, lock = self.wrapper_scenario()
+                self.wrapper_note(commit, tree, lock, check='mail-redelivery-canaries', drop=[missing])
+                self.assertEqual(self.assertRuns(base, check='mail-redelivery-canaries')['reason'], 'missing_input')
+        with self.subTest('lock file differs from the tree'):
+            base, commit, tree, lock = self.wrapper_scenario()
+            self.wrapper_note(commit, tree, lock, inputs={'flake_lock_sha256': 'a' * 64})
+            self.assertEqual(self.assertRuns(base)['reason'], 'wrong_input')
+        with self.subTest('empty input value'):
+            base, commit, tree, lock = self.wrapper_scenario()
+            self.wrapper_note(commit, tree, lock, inputs={'toolchain_sha256': ''})
+            self.assertRuns(base)
+
+    def test_a_future_dated_or_newer_failing_wrapper_note_never_skips(self):
+        base, commit, tree, lock = self.wrapper_scenario()
+        self.wrapper_note(commit, tree, lock, seconds=3 * 3600)
+        self.assertEqual(self.assertRuns(base)['reason'], 'future_dated')
+        base, commit, tree, lock = self.wrapper_scenario()
+        self.wrapper_note(commit, tree, lock, seconds=0)
+        self.assertEqual(self.run_gate(base)[0]['decision'], 'skip')
+        self.wrapper_note(commit, tree, lock, seconds=1, exit_code=1)
+        self.assertEqual(self.assertRuns(base)['reason'], 'check_failed')
+        self.wrapper_note(commit, tree, lock, seconds=2)  # a later pass supersedes
+        self.assertEqual(self.run_gate(base)[0]['decision'], 'skip')
+
+    def test_forks_and_manual_runs_never_skip_on_a_wrapper_note(self):
+        base, commit, tree, lock = self.wrapper_scenario()
+        self.wrapper_note(commit, tree, lock)
+        for name, overrides in {'fork': dict(HEAD_REPOSITORY='someone/repo'), 'unknown head': dict(HEAD_REPOSITORY=''),
+                                'manual run': dict(EVENT_NAME='workflow_dispatch'), 'push': dict(EVENT_NAME='push')}.items():
+            with self.subTest(name):
+                fields = self.assertRuns(base, name, **overrides)
+                self.assertEqual(fields['outcome'], 'satisfied')
+
+    def test_a_wrapper_note_cannot_pose_as_observed_nor_the_reverse(self):
+        base, commit, tree, lock = self.wrapper_scenario()
+        # Wrapper command under an observer-style runner: judged by the observed rule, wrong command.
+        self.wrapper_note(commit, tree, lock, runner=RUNNER)
+        self.assertEqual(self.assertRuns(base)['reason'], 'wrong_command')
+        # Observed command under the wrapper runner: judged by the wrapper rule, wrong command.
+        base, commit, tree, lock = self.wrapper_scenario()
+        self.wrapper_note(commit, tree, lock, argv=['github-actions', REPOSITORY, '.github/workflows/fleet.yml', 'linux-gate'])
+        self.assertEqual(self.assertRuns(base)['reason'], 'wrong_command')
 
     # ---- the gate comes from the accepted base, and files that decide skipping are protected ---
 
@@ -596,7 +797,7 @@ class EndToEnd(unittest.TestCase):
         fields, outputs = self.run_gate(base, PR_NUMBER='123', EVENT_NAME='pull_request')
         self.assertEqual(list(fields), [
             'check', 'decision', 'outcome', 'reason', 'record', 'signer', 'trust_level', 'kind', 'tier',
-            'observed_at', 'age_s', 'max_age_s', 'attempts', 'tree', 'head', 'base', 'event', 'pr', 'repo', 'run',
+            'observed_at', 'age_s', 'max_age_s', 'attempts', 'enforce', 'tree', 'head', 'base', 'event', 'pr', 'repo', 'run',
             'attempt', 'fork', 'verifier_sha256', 'gate_sha256'])
         self.assertEqual((fields['pr'], fields['repo'], fields['run'], fields['attempt'], fields['fork']),
                          ('123', REPOSITORY, '42', '1', 'false'))
@@ -621,6 +822,298 @@ class WorkflowStructure(unittest.TestCase):
                 body = push.group(1) + push.group(2)
                 self.assertRegex(body, r'branches|tags', f'{path.name} has an unfiltered push trigger')
 
+    WIRED = ('genie-freshness', 'typescript-client')
+    NOT_YET_WIRED = ('linux-gate', 'isolation-vm', 'mail-redelivery-canaries')  # not wired at the check-job level (see below)
+
+    def job_text(self, name):
+        text = (ROOT / '.github/workflows/fleet.yml').read_text()
+        return re.search(rf'^  {re.escape(name)}:\n((?:    .*\n|\n)+)', text, re.M).group(1)
+
+    @staticmethod
+    def fields(chunk):
+        """Top-level keys of one generated step, whatever order the generator wrote them in."""
+        found = {}
+        for index, line in enumerate(chunk.split('\n')):
+            if index == 0:
+                match = re.match(r'([a-z][a-z-]*): ?(.*)$', line)
+            else:
+                match = re.match(r'        ([a-z][a-z-]*): ?(.*)$', line)
+            if match:
+                found.setdefault(match.group(1), match.group(2))
+        return found
+
+    def steps_of(self, name):
+        """(step name or uses, its if or None) for each step of a job, in order."""
+        body = self.job_text(name).split('    steps:\n', 1)[1]
+        steps = []
+        for chunk in re.split(r'^      - ', body, flags=re.M)[1:]:
+            found = self.fields(chunk)
+            steps.append((found.get('name') or found.get('uses'), found.get('if')))
+        return steps
+
+    def test_a_wired_check_skips_its_steps_only_when_its_own_gate_says_so(self):
+        for check in self.WIRED:
+            with self.subTest(check):
+                job = self.job_text(check)
+                covered = f"needs.evidence-gate-{check}.outputs.skip != 'true'"
+                header = job.split('    steps:\n', 1)[0]
+                self.assertRegex(header, rf'needs: \[[^\]]*evidence-gate-{re.escape(check)}[^\]]*\]')
+                # The job always runs: its own condition names a status function, so a gate job that failed,
+                # was skipped or never started cannot stop the required check, and never mentions the gate.
+                self.assertIn('!cancelled()', re.search(r'^    if: (.*)$', header, re.M).group(1))
+                self.assertNotIn('evidence-gate', re.search(r'^    if: (.*)$', header, re.M).group(1))
+                steps = self.steps_of(check)
+                self.assertTrue(steps[0][0].startswith('actions/checkout'))
+                self.assertIsNone(steps[0][1], 'the checkout is never skipped')
+                for name, condition in steps[1:]:
+                    if name == 'Report job cache coverage':
+                        self.assertEqual(condition, 'always()')  # the job still reports; it is not gated
+                    elif name == 'evidence covered by a trusted note':
+                        self.assertEqual(condition, f"needs.evidence-gate-{check}.outputs.skip == 'true'")
+                    else:
+                        self.assertIsNotNone(condition, f'{name} would run on a skip')
+                        self.assertIn(covered, condition, name)
+                names = [n for n, _ in steps]
+                self.assertIn('evidence covered by a trusted note', names)
+                self.assertEqual(names[-1], 'Report job cache coverage')
+        # The gate jobs publish exactly the decision and the record the consumers read.
+        for check in self.WIRED + self.NOT_YET_WIRED:
+            self.assertIn('      skip: ${{ steps.taken.outputs.skip }}\n      record: ${{ steps.taken.outputs.record }}\n',
+                          self.job_text(f'evidence-gate-{check}'))
+
+    LINUX_JOB_LEVEL = ('linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3',
+                       'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat')
+    LINUX_STEP_LEVEL = ('mail-redelivery-canaries', 'isolation-vm')
+
+    def blocks(self):
+        workflow = (ROOT / '.github/workflows/fleet.yml').read_text()
+        return dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
+
+    @staticmethod
+    def needs_of(block):
+        found = re.search(r'^    needs:(.*?)(?=^    \S|\Z)', block, re.M | re.S)
+        return set(re.findall(r'[A-Za-z][A-Za-z0-9_-]*', found.group(1))) if found else set()
+
+    @staticmethod
+    def truth(expression, gates, event):
+        """Evaluate a generated job or step condition for the given gate decisions and event."""
+        expression = expression.strip()
+        if expression.startswith('"'):
+            expression = json.loads(expression)
+        if expression.startswith('${{'):
+            expression = expression[3:-2].strip()
+        for gate, value in gates.items():
+            expression = expression.replace(f"needs.evidence-gate-{gate}.outputs.skip == 'true'", str(value))
+        expression = expression.replace("github.event_name != 'pull_request' || github.event.pull_request.draft == false", 'True')
+        expression = expression.replace('!cancelled()', 'True')
+        expression = expression.replace("github.event_name == 'merge_group'", str(event == 'merge_group'))
+        expression = expression.replace('!(', 'not (').replace('&&', ' and ').replace('||', ' or ')
+        return bool(eval(expression, {'__builtins__': {}}))
+
+    @staticmethod
+    def job_condition(block):
+        return re.search(r'^    if: (.*)$', block, re.M).group(1)
+
+    def first_gated_step_condition(self, block):
+        """The condition of the first step after the checkout: the one that decides whether the job's work runs."""
+        body = block.split('    steps:\n', 1)[1]
+        chunks = re.split(r'^      - ', body, flags=re.M)[1:]
+        seen_checkout = False
+        for chunk in chunks:
+            found = self.fields(chunk)
+            if str(found.get('uses', '')).startswith('actions/checkout'):
+                seen_checkout = True
+                continue
+            return found.get('if')
+        return None
+
+    def test_the_linux_group_is_consistent_for_every_combination_of_gate_decisions(self):
+        blocks = self.blocks()
+        aggregate = blocks['linux-gate']
+        script = __import__('textwrap').dedent(aggregate.split('run: |\n', 1)[1].split('\n      - ', 1)[0])
+        stage_names = re.findall(r'needs\.([a-z0-9-]+)\.result', re.search(r'^          RESULTS: (.*)$', aggregate, re.M).group(1))
+        self.assertEqual(len(stage_names), 7)
+
+        def accepts(event, results, skip):
+            env = {**os.environ, 'EVENT': event, 'RESULTS': ' '.join(results[n] for n in stage_names),
+                   'MERGE_RESULTS': f"{results['linux-tests-shard-3']} {results['linux-tests-shard-4']}"}
+            env.pop('GATE_SKIP', None)
+            if skip is not None:
+                env['GATE_SKIP'] = skip
+            return subprocess.run(['bash', '-c', script], env=env, capture_output=True).returncode == 0
+
+        checked = 0
+        for event, lg, iv, mrc in itertools.product(('pull_request', 'merge_group'), (False, True), (False, True), (False, True)):
+            gates = {'linux-gate': lg, 'isolation-vm': iv, 'mail-redelivery-canaries': mrc}
+            runs = {job: self.truth(self.job_condition(blocks[job]), gates, event) for job in self.LINUX_JOB_LEVEL}
+            canaries_work = self.truth(self.first_gated_step_condition(blocks['mail-redelivery-canaries']), gates, event)
+            isolation_work = self.truth(self.first_gated_step_condition(blocks['isolation-vm']), gates, event)
+            label = (event, lg, iv, mrc)
+            # The build runs whenever any job that needs its output does real work.
+            dependents_work = runs['linux-tests'] or runs['linux-tests-shard-2'] or runs['linux-tests-shard-3'] \
+                or runs['linux-tests-shard-4'] or canaries_work or isolation_work
+            if dependents_work:
+                self.assertTrue(runs['linux-test-build'], label)
+            # ...and it is skipped exactly when everything that needs it is covered.
+            self.assertEqual(not runs['linux-test-build'], lg and (lg or mrc) and iv, label)
+            # Whatever the gate decided, nothing is skipped unless the aggregate's own gate said skip.
+            if not lg:
+                self.assertTrue(all(runs[j] for j in self.LINUX_JOB_LEVEL if j not in ('linux-test-build',)
+                                    and not (event == 'pull_request' and j in ('linux-tests-shard-3', 'linux-tests-shard-4'))), label)
+            # The required checks themselves never report skipped: their jobs always run.
+            self.assertEqual(canaries_work, not (lg or mrc), label)
+            self.assertEqual(isolation_work, not iv, label)
+            # The real aggregate accepts the consistent outcome...
+            results = {n: ('success' if runs.get(n, True) else 'skipped') for n in stage_names + ['linux-tests-shard-3', 'linux-tests-shard-4']}
+            skip = 'true' if lg else None
+            self.assertTrue(accepts(event, results, skip), label)
+            # ...and rejects a failure in ANY job that ran, even under a skip.
+            for victim in stage_names + ['linux-tests-shard-3', 'linux-tests-shard-4']:
+                if results[victim] == 'success':
+                    broken = {**results, victim: 'failure'}
+                    self.assertFalse(accepts(event, broken, skip), label + (victim,))
+            # ...and rejects a skipped upgrade-impact or canaries even under a skip: they are never covered by it.
+            if lg:
+                for never in ('upgrade-impact', 'mail-redelivery-canaries'):
+                    self.assertFalse(accepts(event, {**results, never: 'skipped'}, 'true'), label + (never,))
+            # ...and rejects skipped stages if its own gate had not said skip.
+            if any(v == 'skipped' for n, v in results.items() if n not in ('linux-tests-shard-3', 'linux-tests-shard-4')):
+                self.assertTrue(lg, label)  # a stage can only be skipped when the aggregate's gate decided skip
+                self.assertFalse(accepts(event, results, None), label)
+            checked += 1
+        self.assertEqual(checked, 16)
+
+    def test_the_required_checks_that_are_jobs_keep_running_and_skip_only_their_steps(self):
+        blocks = self.blocks()
+        for check, gates in (('mail-redelivery-canaries', ('linux-gate', 'mail-redelivery-canaries')), ('isolation-vm', ('isolation-vm',))):
+            with self.subTest(check):
+                block = blocks[check]
+                self.assertTrue({f'evidence-gate-{g}' for g in gates} <= self.needs_of(block))
+                condition = self.job_condition(block)
+                self.assertIn('!cancelled()', condition)
+                self.assertNotIn('evidence-gate', condition)  # the job itself is never skipped: a required check never reports skipped
+                body = block.split('    steps:\n', 1)[1]
+                chunks = re.split(r'^      - ', body, flags=re.M)[1:]
+                self.assertTrue(self.fields(chunks[0]).get('name', '').startswith('Require the shared test producer'),
+                                'the pre-check on the build is the first step')
+                saw_checkout = False
+                for chunk in chunks:
+                    found = self.fields(chunk)
+                    label = found.get('name') or found.get('uses') or ''
+                    condition = found.get('if')
+                    if str(found.get('uses', '')).startswith('actions/checkout'):
+                        saw_checkout = True
+                        self.assertIsNone(condition, 'the checkout is never skipped')
+                    elif label.startswith('evidence covered by a trusted note'):
+                        self.assertTrue(all(f"needs.evidence-gate-{g}.outputs.skip == 'true'" in condition for g in gates))
+                    elif label.startswith('Report job cache coverage'):
+                        self.assertEqual(condition, 'always()')
+                    else:
+                        self.assertIsNotNone(condition, f'{label} would run on a skip')
+                        self.assertIn('!(', condition, label)
+                        for g in gates:
+                            self.assertIn(f"needs.evidence-gate-{g}.outputs.skip == 'true'", condition, label)
+                self.assertTrue(saw_checkout)
+
+    def test_every_step_that_reads_the_shared_build_carries_the_skip_term_in_both_required_jobs(self):
+        blocks = self.blocks()
+        for check, gates in (('mail-redelivery-canaries', ('linux-gate', 'mail-redelivery-canaries')), ('isolation-vm', ('isolation-vm',))):
+            with self.subTest(check):
+                body = blocks[check].split('    steps:\n', 1)[1]
+                readers = []
+                for chunk in re.split(r'^      - ', body, flags=re.M)[1:]:
+                    # A step reads the build when it mentions the producer's outputs or result, however it uses them.
+                    if 'needs.linux-test-build' in chunk and 'name: evidence covered' not in chunk:
+                        readers.append(chunk)
+                self.assertGreaterEqual(len(readers), 2, f'{check}: expected the pre-check and the download to be found')
+                for chunk in readers:
+                    found = self.fields(chunk)
+                    label = found.get('name') or found.get('uses') or chunk.split('\n')[0]
+                    condition = found.get('if')
+                    self.assertIsNotNone(condition, label)
+                    for gate in gates:
+                        self.assertIn(f"needs.evidence-gate-{gate}.outputs.skip == 'true'", condition, label)
+                    self.assertIn('!(', condition)
+
+    def test_the_build_is_skipped_only_through_its_dependents_never_on_its_own_say(self):
+        block = self.blocks()['linux-test-build']
+        condition = self.job_condition(block)
+        # Derived from every dependent: the linux-gate gate, the canaries' either-gate rule and isolation-vm's gate.
+        for term in ("needs.evidence-gate-linux-gate.outputs.skip == 'true'", "needs.evidence-gate-isolation-vm.outputs.skip == 'true'"):
+            self.assertIn(term, condition)
+        self.assertTrue({'evidence-gate-linux-gate', 'evidence-gate-isolation-vm', 'evidence-gate-mail-redelivery-canaries'} <= self.needs_of(block))
+        self.assertIn('!cancelled()', condition)
+
+    def test_the_skip_output_can_only_come_from_the_marker_step(self):
+        """The decision the check jobs act on must not exist unless `evidence skip taken` already ran."""
+        for check in self.WIRED + self.NOT_YET_WIRED:
+            with self.subTest(check):
+                job = self.job_text(f'evidence-gate-{check}')
+                outputs = re.search(r'^    outputs:\n((?:      .*\n)+)', job, re.M).group(1)
+                self.assertNotIn('steps.gate.outputs.skip', outputs)  # never straight from the decision step
+                self.assertIn('skip: ${{ steps.taken.outputs.skip }}', outputs)
+                steps = {}
+                body = job.split('    steps:\n', 1)[1]
+                for chunk in re.split(r'^      - ', body, flags=re.M)[1:]:
+                    name = re.match(r'name: (.*)', chunk)
+                    if name:
+                        steps[name.group(1)] = chunk
+                marker = steps['evidence skip taken']
+                self.assertIn('id: taken', marker)
+                self.assertIn("if: steps.gate.outputs.skip == 'true'", marker)
+                run = re.search(r'^        run: (.*)$', marker, re.M).group(1)
+                # The outputs are the last thing the marker writes, after the echo that names it.
+                self.assertTrue(run.startswith('echo evidence skip taken && '), run)
+                self.assertTrue(run.endswith('>> "$GITHUB_OUTPUT"'), run)
+                # No other step may write a job-visible skip=true.
+                others = [chunk for name, chunk in steps.items() if name != 'evidence skip taken' and 'id: gate' not in chunk]
+                for chunk in others:
+                    self.assertNotIn('skip=true', chunk)
+
+    def test_the_marker_steps_own_shell_writes_exactly_the_outputs_the_checks_read(self):
+        job = self.job_text('evidence-gate-genie-freshness')
+        marker = job.split('      - name: evidence skip taken\n', 1)[1].split('\n      - name: ', 1)[0]
+        run = re.search(r'^        run: (.*)$', marker, re.M).group(1)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.write_text('')
+            done = subprocess.run(['bash', '-e', '-c', run], env={**os.environ, 'RECORD': 'a' * 40, 'GITHUB_OUTPUT': str(output)},
+                                  capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr.decode())
+            self.assertEqual(output.read_text(), 'skip=true\nrecord=' + 'a' * 40 + '\n')
+            self.assertIn('evidence skip taken', done.stdout.decode())
+            # If the outputs cannot be written the step fails, so there is no skip and no marker success.
+            failing = subprocess.run(['bash', '-e', '-c', run], env={**os.environ, 'RECORD': 'a' * 40,
+                                                                   'GITHUB_OUTPUT': '/nonexistent/dir/out'}, capture_output=True)
+            self.assertNotEqual(failing.returncode, 0)
+
+    def test_every_signing_step_learns_when_its_gate_skipped_and_the_aggregate_sees_every_gate(self):
+        blocks = self.blocks()
+        signed = 0
+        for name, block in blocks.items():
+            body = block.split('    steps:\n', 1)
+            if len(body) != 2:
+                continue
+            for chunk in re.split(r'^      - ', body[1], flags=re.M)[1:]:
+                found = self.fields(chunk)
+                if not str(found.get('name', '')).startswith(('Sign this stage result', 'Sign this job result')):
+                    continue
+                signed += 1
+                env = re.search(r'^          GATE_SKIP: (.*)$', chunk, re.M)
+                self.assertIsNotNone(env, f'{name} signs without being told when its gate skipped')
+                referenced = set(re.findall(r'needs\.evidence-gate-([a-z-]+)\.outputs\.skip', env.group(1)))
+                self.assertTrue(referenced, name)
+                # Every gate it reads must be one of its needs, and the check's own gate must be among them.
+                self.assertTrue({f'evidence-gate-{g}' for g in referenced} <= self.needs_of(block), name)
+                expected = {'mail-redelivery-canaries': {'linux-gate', 'mail-redelivery-canaries'},
+                            'genie-freshness': {'genie-freshness'}, 'typescript-client': {'typescript-client'},
+                            'isolation-vm': {'isolation-vm'}}.get(name, {'linux-gate'})
+                self.assertEqual(referenced, expected, name)
+        self.assertGreaterEqual(signed, 10)  # the stage jobs, the canaries and the three step-outcome jobs
+        aggregate = self.needs_of(blocks['evidence-note-linux-gate'])
+        for check in CHECKS:
+            self.assertIn(f'evidence-gate-{check}', aggregate)
+
     def test_the_gate_jobs_can_write_nothing_and_start_nothing(self):
         text = (ROOT / '.github/workflows/fleet.yml').read_text()
         jobs = re.findall(r'^  (evidence-gate-[a-z-]+):\n((?:    .*\n|\n)+)', text, re.M)
@@ -631,7 +1124,7 @@ class WorkflowStructure(unittest.TestCase):
             self.assertNotIn('needs:', body.split('steps:')[0], name)
             self.assertIn('git show \\"$BASE_SHA:scripts/ci-evidence-gate\\"', body, name)  # the gate comes from the base
             self.assertNotIn('python3 scripts/ci-evidence-gate', body, name)  # never the tree under test
-            self.assertIn("- name: evidence skip taken\n        if: steps.gate.outputs.skip == 'true'", body, name)
+            self.assertIn("- name: evidence skip taken\n        id: taken\n        if: steps.gate.outputs.skip == 'true'", body, name)
 
 
     def test_a_push_to_main_gets_a_base_so_the_gate_can_verify_in_shadow_but_never_skips(self):
@@ -648,6 +1141,37 @@ class WorkflowStructure(unittest.TestCase):
             self.assertNotIn('workflow_dispatch', base)
         for head in heads:
             self.assertIn("((github.event_name == 'merge_group' || github.event_name == 'push') && github.repository)", head)
+
+    def test_the_linux_gate_wrapper_rule_is_the_argv_the_aggregate_job_records_from_its_needs(self):
+        """The aggregate note records ['linux-gate', 'aggregate'] + its needed jobs sorted, gates left out.
+        Derived here from the generated workflow so adding a needed job cannot silently disable skipping."""
+        text = (ROOT / '.github/workflows/fleet.yml').read_text()
+        job = re.search(r'^  evidence-note-linux-gate:\n((?:    .*\n|\n)+)', text, re.M).group(1)
+        needs = re.search(r'^    needs:\n((?:      - .*\n)+)', job, re.M).group(1)
+        names = [line.strip()[2:] for line in needs.splitlines()]
+        derived = ['linux-gate', 'aggregate'] + sorted(n for n in names if not n.startswith('evidence-gate-'))
+        policy = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
+        self.assertEqual(policy['checks']['linux-gate']['kinds']['wrapper']['command'], derived)
+        self.assertEqual(GATE_ARGV, derived)
+        self.assertIn('linux-gate', names)
+        # Every real gate job is awaited, so a skip taken anywhere stops the note.
+        self.assertEqual(sorted(n for n in names if n.startswith('evidence-gate-')),
+                         sorted(f'evidence-gate-{c}' for c in CHECKS))
+
+    def test_the_aggregate_note_job_signs_only_for_the_queue_main_and_pull_requests_of_this_repository(self):
+        text = (ROOT / '.github/workflows/fleet.yml').read_text()
+        job = re.search(r'^  evidence-note-linux-gate:\n((?:    .*\n|\n)+)', text, re.M).group(1)
+        condition = re.search(r'^    if: (.*)$', job, re.M).group(1)
+        # Other conjuncts (the draft filter) may be added around it; this one must stay whole. A pull request gets the
+        # key only from this repository (unit A3); a fork, whose head repository differs, never does.
+        self.assertIn("(always() && (github.event_name == 'merge_group' || (github.event_name == 'push' && "
+                      "github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && "
+                      "github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && "
+                      "github.event.pull_request.head.repo.full_name == github.repository)))", condition)
+        self.assertEqual(condition.count("github.event_name == 'pull_request'"), 1)
+        self.assertEqual(condition.count('head.repo.full_name == github.repository'), 1)
+        self.assertNotIn('true', condition)
+        self.assertEqual(condition.count('||'), 3 + condition.count("github.event_name != 'pull_request' ||"))
 
     def test_every_evidence_test_script_runs_in_the_required_genie_freshness_check(self):
         listed = (ROOT / 'scripts/ci-genie-freshness').read_text()

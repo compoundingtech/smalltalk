@@ -489,6 +489,8 @@ class SkipPolicy(unittest.TestCase):
         self.assertEqual(broken(lambda d: entry(d).update(kinds={})), 'error')
         self.assertEqual(broken(lambda d: entry(d).update(max_age_s=True)), 'error')
         self.assertEqual(broken(lambda d: entry(d).update(max_age_s=0)), 'error')
+        for bad in ('yes', 1, None, 'true'):
+            self.assertEqual(broken(lambda d, bad=bad: entry(d).update(enforce=bad)), 'error', repr(bad))  # enforce is a boolean
         self.assertEqual(broken(lambda d: entry(d)['kinds'].update(hand={'command': ['x']})), 'error')
         self.assertEqual(broken(lambda d: entry(d)['kinds']['wrapper'].update(typo=1)), 'error')
         self.assertEqual(broken(lambda d: entry(d)['kinds']['wrapper'].pop('command')), 'error')
@@ -648,6 +650,7 @@ class CommittedPolicy(unittest.TestCase):
             rules = self.rules(check)
             self.assertEqual(rules['trust_levels'], ('fleet',), check)
             self.assertIsNone(rules['max_age_s'], check)  # no age limit by default
+            self.assertIs(rules['enforce'], False, check)  # skipping is off until the policy says otherwise
             observed = rules['kinds']['observed']
             self.assertEqual(observed['command'], ['github-actions', 'compoundingtech/smalltalk',
                                                    '.github/workflows/fleet.yml', check])
@@ -655,9 +658,39 @@ class CommittedPolicy(unittest.TestCase):
         with self.assertRaises(evidence_verify.Failure):
             self.rules('a-check-nobody-listed')
 
-    def test_only_the_observed_kind_is_listed_until_the_wrapper_rules_are_reviewed(self):
+    def test_the_wrapper_rules_match_what_the_note_jobs_record(self):
+        gate = self.rules('linux-gate')['kinds']['wrapper']
+        self.assertEqual(gate['command'][:2], ['linux-gate', 'aggregate'])
+        jobs = gate['command'][2:]
+        self.assertEqual(jobs, sorted(jobs))  # the aggregate lists its needed jobs sorted
+        self.assertIn('linux-gate', jobs)
+        common = ['attempt', 'flake_lock_sha256', 'system', 'toolchain_sha256', 'wrapper_sha256']
+        self.assertEqual(gate['required_inputs'], common)
+        self.assertEqual(gate['bind_inputs'], {'flake_lock_sha256': 'flake.lock'})
+        canaries = self.rules('mail-redelivery-canaries')['kinds']['wrapper']
+        self.assertEqual(canaries['command'], ['bash', 'scripts/ci-linux', 'mail-redelivery-canaries'])
+        self.assertEqual(canaries['required_inputs'], sorted(common + ['job', 'stage']))
+        self.assertEqual(canaries['bind_inputs'], {'flake_lock_sha256': 'flake.lock'})
+
+    def test_the_step_outcome_notes_of_the_other_three_checks_have_their_own_exact_rules(self):
+        expected = {
+            'genie-freshness': ['bash', 'scripts/ci-genie-freshness'],
+            'typescript-client': ['bash', 'scripts/ci-typescript-client'],
+            'isolation-vm': ['isolation-vm', 'nixos-test-driver', 'transport-isolation-vm', 'sekrets-vm'],
+        }
+        required = ['attempt', 'flake_lock_sha256', 'job', 'step_outcomes', 'steps', 'system', 'toolchain_sha256', 'wrapper_sha256']
+        for check, command in expected.items():
+            wrapper = self.rules(check)['kinds']['wrapper']
+            self.assertEqual(wrapper['command'], command, check)
+            self.assertEqual(wrapper['required_inputs'], required, check)
+            self.assertEqual(wrapper['bind_inputs'], {'flake_lock_sha256': 'flake.lock'}, check)
+
+    def test_every_required_check_lists_observed_and_wrapper_and_only_the_fleet_signer(self):
         for check in ('linux-gate', 'typescript-client', 'isolation-vm', 'genie-freshness', 'mail-redelivery-canaries'):
-            self.assertEqual(sorted(self.rules(check)['kinds']), ['observed'], check)
+            rules = self.rules(check)
+            self.assertEqual(sorted(rules['kinds']), ['observed', 'wrapper'], check)
+            self.assertEqual(rules['trust_levels'], ('fleet',), check)  # the wrapper signs as fleet/ci
+            self.assertIsNone(rules['kinds']['wrapper']['trust_levels'], check)  # no weaker signer is admitted
 
 
 class Sha256Repository(unittest.TestCase):

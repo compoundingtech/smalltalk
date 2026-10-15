@@ -114,6 +114,93 @@ const linuxStageJob = ({
 })
 
 // Required gate. Label events belong to macos.yml so they never restart or cancel this workflow.
+// The Linux group. The jobs that are NOT required checks (the build, the test shards, clippy, fleet
+// compatibility) are skipped at the JOB level, so no runner is allocated. A skipped member shows up as
+// `skipped`, which is exactly what the aggregate evidence note producers refuse to sign for, so a skip cannot
+// refresh its own note. `linux-gate` accepts `skipped` members only when its own gate said skip. The jobs that
+// ARE required checks (mail-redelivery-canaries, isolation-vm) keep running and end in success with their steps
+// skipped, so a required check never reports `skipped`.
+// An existing step condition may be written as a whole `${{ ... }}`. Combining it with another term as text would
+// leave extra characters around the markers, which GitHub reads as a literal and always-true string (actionlint
+// reports it). Strip the markers first, then combine.
+const bareCondition = (condition: unknown) => String(condition).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '')
+const gateSkip = (gate: string) => `needs.evidence-gate-${gate}.outputs.skip == 'true'`
+const gateRecord = (gate: string) => `\${{ needs.evidence-gate-${gate}.outputs.record }}`
+const jobSkips: Record<string, { gates: string[]; skip: string }> = Object.fromEntries(
+  ['linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat'].map((id) => [
+    id,
+    { gates: ['linux-gate'], skip: gateSkip('linux-gate') },
+  ]),
+)
+// The aggregate note for linux-gate proves its member canaries passed, so either note covers the canaries.
+const stepSkips: Record<string, { gates: string[]; skip: string }> = {
+  'mail-redelivery-canaries': { gates: ['linux-gate', 'mail-redelivery-canaries'], skip: `${gateSkip('linux-gate')} || ${gateSkip('mail-redelivery-canaries')}` },
+  'isolation-vm': { gates: ['isolation-vm'], skip: gateSkip('isolation-vm') },
+}
+// The aggregate's RESULTS are positional. Exactly the stages skipped at job level may report `skipped` under an
+// evidence skip (derived here from the same list that skips them); every other stage, `upgrade-impact` and the
+// canaries among them, must succeed. Positions after the base stages are the merge-only shards.
+const aggregateStages = ['linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries']
+const mergeShards = ['linux-tests-shard-3', 'linux-tests-shard-4']
+const skippablePositions = [...aggregateStages, ...mergeShards].flatMap((id, index) => (id === 'linux-test-build' || jobSkips[id] ? [index + 1] : []))
+const skipStepsWhen = (steps: readonly any[], rule: { gates: string[]; skip: string }) => [
+  ...steps.map((step) =>
+    String(step.uses ?? '').startsWith('actions/checkout') ? step : { ...step, if: step.if == null ? `!(${rule.skip})` : `(${bareCondition(step.if)}) && !(${rule.skip})` },
+  ),
+  {
+    name: 'evidence covered by a trusted note',
+    if: rule.skip,
+    env: { RECORDS: rule.gates.map(gateRecord).join(' ') },
+    run: 'echo "covered by trusted evidence note: $RECORDS" >> "$GITHUB_STEP_SUMMARY"',
+  },
+]
+const wireEvidenceSkips = (jobs: Record<string, any>) => {
+  // The build feeds its dependents, so it may be skipped only when EVERY dependent is skipped, whether at job level
+  // or step level: derived from their rules, never written twice, so the two cannot drift apart.
+  const dependents = Object.keys(jobs).filter((id) => (jobSkips[id] || stepSkips[id]) && (jobs[id].needs ?? []).includes('linux-test-build'))
+  const rules = dependents.map((id) => jobSkips[id] ?? stepSkips[id])
+  const build = {
+    gates: [...new Set(rules.flatMap((rule) => rule.gates))],
+    skip: [...new Set(rules.map((rule) => `(${rule.skip})`))].join(' && '),
+  }
+  const withGates = (job: any, gates: string[]) => ({ ...job, needs: [...job.needs, ...gates.map((gate) => `evidence-gate-${gate}`)] })
+  const jobLevel = (job: any, rule: { gates: string[]; skip: string }) => {
+    const predicate = String(job.if).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '')
+    return { ...withGates(job, rule.gates), if: `\${{ (${predicate}) && !(${rule.skip}) }}` }
+  }
+  return Object.fromEntries(
+    Object.entries(jobs).map(([id, job]) => {
+      if (id === 'linux-test-build') return [id, jobLevel(job, build)]
+      if (jobSkips[id]) return [id, jobLevel(job, jobSkips[id])]
+      if (stepSkips[id]) return [id, { ...withGates(job, stepSkips[id].gates), steps: skipStepsWhen(job.steps, stepSkips[id]) }]
+      return [id, job]
+    }),
+  )
+}
+
+// Skip a check's heavy steps when its evidence gate decided to skip (docs/st3/gate-evidence.md). The job
+// itself still runs and ends in success, so the check keeps its name and every `needs` on it keeps working.
+// The checkout is never skipped (the job's own cache-coverage report reads the repository), and a gate job
+// that failed, was skipped or never started has no output, so the steps run exactly as before.
+const skipIfCovered = (check: string, steps: readonly any[]) => {
+  const covered = `needs.evidence-gate-${check}.outputs.skip != 'true'`
+  return [
+    ...steps.map((step) =>
+      String(step.uses ?? '').startsWith('actions/checkout')
+        ? step
+        // An existing condition may be written as a whole `${{ ... }}`; combining it as text would leave extra
+        // characters around the markers, which GitHub reads as a literal and always-true string. Strip them first.
+        : { ...step, if: step.if == null ? covered : `(${bareCondition(step.if)}) && ${covered}` },
+    ),
+    {
+      name: 'evidence covered by a trusted note',
+      if: `needs.evidence-gate-${check}.outputs.skip == 'true'`,
+      env: { RECORD: `\${{ needs.evidence-gate-${check}.outputs.record }}` },
+      run: 'echo "covered by trusted evidence note $RECORD" >> "$GITHUB_STEP_SUMMARY"',
+    },
+  ]
+}
+
 // Shadow mode: for each required check, ask the verifier from the accepted base whether a trusted note
 // exists for this run's tree and record the outcome in a fixed step name a collector can count.
 // It never skips a check, never fails, and is not itself a required check.
@@ -131,6 +218,9 @@ const evidenceGateJobs = Object.fromEntries(evidenceGateChecks.map((check) => [`
   'timeout-minutes': 5,
   'continue-on-error': true,
   permissions: { contents: 'read' },
+  // The decision the check jobs act on comes from the marker step below, not from the gate step: skip=true can
+  // exist only if the marker already ran, so the observer, which keys on the marker, can never miss a skip.
+  outputs: { skip: '${{ steps.taken.outputs.skip }}', record: '${{ steps.taken.outputs.record }}' },
   steps: [
     { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
     {
@@ -158,7 +248,14 @@ const evidenceGateJobs = Object.fromEntries(evidenceGateChecks.map((check) => [`
     })),
     // Fixed name: a decision to skip was taken. The observer must not record a check whose gate ran
     // this step as a fresh finished run, or one real run would keep refreshing its own skips.
-    { name: 'evidence skip taken', if: "steps.gate.outputs.skip == 'true'", run: 'echo evidence skip taken' },
+    {
+      name: 'evidence skip taken',
+      id: 'taken',
+      if: "steps.gate.outputs.skip == 'true'",
+      env: { RECORD: '${{ steps.gate.outputs.record }}' },
+      // The outputs are the LAST thing this step writes: if anything before them fails, there is no skip.
+      run: `echo evidence skip taken && printf 'skip=true\\nrecord=%s\\n' "$RECORD" >> "$GITHUB_OUTPUT"`,
+    },
   ],
 }]))
 
@@ -184,7 +281,7 @@ export default githubWorkflow(withQueueWatch(readyPRJobs(auditCaches({
     ...defaultActionlintConfig,
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
-  jobs: {
+  jobs: wireEvidenceSkips({
     [pickRunnerJobId]: pickRunnerJob,
     // Non-required provenance only: it runs alongside the gate and has no signer or key.
     // Retain the complete effective merge tree even after its ephemeral ref disappears.
@@ -290,28 +387,29 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       name: 'genie-freshness',
       env: { CI_CACHE_DEV_SHELL: 'genie' },
       ...afterPickRunner,
+      needs: [...afterPickRunner.needs, 'evidence-gate-genie-freshness'],
       'runs-on': 'ubuntu-latest',
       'timeout-minutes': 20,
       ...evidenceStepJob(),
-      steps: [
+      steps: skipIfCovered('genie-freshness', [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache') && step !== buildSnapshotPrepare && step !== buildSnapshotRestore),
         { ...nixDevelopStep({ name: 'Check license coverage, runner selection and generated files', flake: '.#genie', command: ['bash', 'scripts/ci-genie-freshness'] }), id: 'freshness' },
         { name: 'Save Nix outputs', if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`, run: 'bash scripts/ci-nix-cache save' },
         ...evidenceStepSteps('genie-freshness', ['bash', 'scripts/ci-genie-freshness'], ['freshness']),
-      ],
+      ]),
     },
     // Check the shared client and its iOS consumer before merge.
     'typescript-client': {
       name: 'typescript-client',
       // Keep generated-file validation ahead of its consumers.
-      needs: ['pick-runner', 'genie-freshness'],
+      needs: ['pick-runner', 'genie-freshness', 'evidence-gate-typescript-client'],
       if: "${{ !cancelled() && needs.genie-freshness.result == 'success' }}",
       'runs-on': 'ubuntu-latest',
       'timeout-minutes': 10,
       ...evidenceStepJob(),
       defaults: { run: { shell: 'bash' } },
       env: { COREPACK_ENABLE_DOWNLOAD_PROMPT: '0' },
-      steps: [
+      steps: skipIfCovered('typescript-client', [
         { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
         // Node 24, as in the workspace shell; schema tests use its native TypeScript loading.
         { uses: 'actions/setup-node@v4', with: { 'node-version': '24.18.0' } },
@@ -335,7 +433,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         { name: 'Install the frozen workspace', id: 'install', env: pnpmStoreEnv, run: 'corepack enable\npnpm install --frozen-lockfile' },
         { name: 'Check the client, shared views and iOS consumers', id: 'client', run: 'bash scripts/ci-typescript-client' },
         ...evidenceStepSteps('typescript-client', ['bash', 'scripts/ci-typescript-client'], ['install', 'client']),
-      ],
+      ]),
     },
     'linux-test-build': {
       name: 'linux-test-build',
@@ -446,7 +544,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     },
     'linux-gate': {
       name: 'linux-gate',
-      needs: [pickRunnerJobId, 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
+      needs: [pickRunnerJobId, 'evidence-gate-linux-gate', 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
       // Aggregation needs no build caches and must not queue behind the work it summarizes.
@@ -456,7 +554,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         {
           name: 'Require every Linux stage to pass',
           // The stages only: pick-runner is skipped whenever ci1 is off.
-          env: { RESULTS: '${{ needs.linux-test-build.result }} ${{ needs.upgrade-impact.result }} ${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}', EVENT: '${{ github.event_name }}', MERGE_RESULTS: '${{ needs.linux-tests-shard-3.result }} ${{ needs.linux-tests-shard-4.result }}' },
+          env: { GATE_SKIP: '${{ needs.evidence-gate-linux-gate.outputs.skip }}', RESULTS: aggregateStages.map((id) => `\${{ needs.${id}.result }}`).join(' '), EVENT: '${{ github.event_name }}', MERGE_RESULTS: '${{ needs.linux-tests-shard-3.result }} ${{ needs.linux-tests-shard-4.result }}' },
           run: `set -eu
 set -- $RESULTS
 [ "$#" = 7 ] || { echo "incomplete base-stage results"; exit 1; }
@@ -467,9 +565,17 @@ if [ "$EVENT" = merge_group ]; then
 else
   [ "$MERGE_RESULTS" = "skipped skipped" ] || { echo "extra shards must be merge-only"; exit 1; }
 fi
-echo "stage results: $RESULTS"
+echo "stage results: $RESULTS (evidence skip: \${GATE_SKIP:-none})"
+position=0
 for result in $RESULTS; do
-  [ "$result" = success ] || exit 1
+  position=$((position + 1))
+  [ "$result" = success ] && continue
+  # A stage the evidence gate skipped reports \`skipped\`: accepted only when this gate decided to skip, only
+  # in the positions of stages skipped at job level, and never for a failure or a cancellation.
+  if [ "\${GATE_SKIP:-}" = true ] && [ "$result" = skipped ]; then
+    case "$position" in ${skippablePositions.join('|')}) continue ;; esac
+  fi
+  exit 1
 done`,
         },
       ],
@@ -480,7 +586,7 @@ done`,
     // key. The signer scripts come from the BASE commit of the change, never from the tree under test.
     'evidence-note-linux-gate': {
       name: 'evidence-note-linux-gate',
-      needs: ['linux-gate', 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries', ...evidenceStepNames],
+      needs: ['linux-gate', 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries', ...evidenceStepNames, 'evidence-gate-linux-gate', 'evidence-gate-mail-redelivery-canaries', 'evidence-gate-isolation-vm', 'evidence-gate-genie-freshness', 'evidence-gate-typescript-client'],
       // The merge queue, main and pull requests from this repository sign; a fork never gets the key.
       if: "${{ always() && (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}",
       'runs-on': 'ubuntu-latest',
@@ -634,5 +740,5 @@ printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
     // runs have emitted it successfully.
     // workspace-ci embeds scripts/ci-fractal-web-changes; its consumed-input list is authoritative.
     ...fractalWebJobs,
-  },
+  }),
 }, {"evidence-source": "Retains Git source objects only; builds nothing and has no signing key.", "pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing.", "evidence-note-linux-gate": "Signs the aggregate gate result from workflow context; builds nothing.", "fractal-web-changes": "Diffs two fetched commits without blobs and builds nothing.", "fractal-web": "Collects the detection and execution results and builds nothing.", "evidence-gate-linux-gate": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-typescript-client": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-isolation-vm": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-genie-freshness": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-mail-redelivery-canaries": "Verifies Git notes only; builds nothing and never skips a check."}))))

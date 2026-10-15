@@ -193,7 +193,13 @@ for job, output in [('linux-tests-shard-2', 'ci1_secondary'), ('mail-redelivery-
     assert required_priority in blocks[job], job
 assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
 canaries = blocks['mail-redelivery-canaries']
-assert 'needs: [pick-runner, linux-test-build]' in canaries and 'needs: [linux-tests]' not in canaries, "canaries must run beside both test shards after the shared build"
+def needs_of(block):
+    """Job names in `needs`, whatever layout the generator chose: one line, a list, or a bracketed block."""
+    # Job-level keys sit at four spaces and may come before or after `steps` (a spread job puts them after).
+    found = re.search(r'^    needs:(.*?)(?=^    \S|\Z)', block, re.M | re.S)
+    return set(re.findall(r'[A-Za-z][A-Za-z0-9_-]*', found.group(1))) if found else set()
+canary_needs = needs_of(canaries)
+assert {'pick-runner', 'linux-test-build'} <= canary_needs and 'linux-tests' not in canary_needs, "canaries must run beside both test shards after the shared build"
 assert 'scripts/ci-linux mail-redelivery-canaries' in canaries, "the required check must execute the canaries itself"
 assert 'cargo-linux-tests-' in blocks['linux-test-build'], "producer must reuse protected-main test dependency caches"
 for consumer in ('linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'mail-redelivery-canaries', 'isolation-vm'):
@@ -271,9 +277,12 @@ for n in (3,4):
 # Execute the generated aggregate. Every merge shard must really pass; normal
 # events must prove the two additional merge-only jobs were skipped.
 gate_script = textwrap.dedent(blocks['linux-gate'].split('run: |\n',1)[1].split('\n      - ',1)[0])
-def gate(event,base,extra):
-    return subprocess.run([bash,'-c',gate_script],env={**os.environ,'EVENT':event,
-        'RESULTS':' '.join(base),'MERGE_RESULTS':' '.join(extra)},capture_output=True).returncode
+def gate(event,base,extra,skip=None):
+    env={**os.environ,'EVENT':event,'RESULTS':' '.join(base),'MERGE_RESULTS':' '.join(extra)}
+    env.pop('GATE_SKIP',None)
+    if skip is not None:
+        env['GATE_SKIP']=skip
+    return subprocess.run([bash,'-c',gate_script],env=env,capture_output=True).returncode
 assert gate('merge_group',['success']*7,['success']*2) == 0
 assert gate('pull_request',['success']*7,['skipped']*2) == 0
 assert gate('workflow_dispatch',['success']*7,['skipped']*2) == 0
@@ -285,6 +294,44 @@ assert gate('merge_group',['success']*6,['success']*2) != 0
 assert gate('merge_group',['success']*7,['success']) != 0
 assert gate('pull_request',['success']*7,['success']*2) != 0
 print('passed: four merge shards preserve exact archive provenance, merge roles and strict event-qualified aggregation')
+
+# Evidence skip: a stage the gate skipped at JOB level reports `skipped`. It is accepted only when this gate decided
+# skip, only in the positions of those stages, and never for a failure or a cancellation. RESULTS is, in order:
+# linux-test-build, upgrade-impact, linux-tests, linux-tests-shard-2, linux-clippy, linux-fleet-compat, canaries.
+SKIPPABLE = (0, 2, 3, 4, 5)      # build, tests, shard 2, clippy, fleet compat (zero-based)
+NEVER_SKIPPED = (1, 6)           # upgrade-impact and the canaries always run
+covered = ['skipped', 'success', 'skipped', 'skipped', 'skipped', 'skipped', 'success']
+for event in ('merge_group', 'pull_request', 'workflow_dispatch'):
+    assert gate(event, covered, ['skipped'] * 2, skip='true') == 0, event
+    assert gate(event, ['success'] * 7, ['skipped'] * 2, skip='true') == 0, event
+    # Each stage on its own: skipped is accepted exactly where a job-level skip is possible.
+    for i in range(7):
+        results = ['success'] * 7
+        results[i] = 'skipped'
+        assert (gate(event, results, ['skipped'] * 2, skip='true') == 0) == (i in SKIPPABLE), (event, i)
+        # ...and never without the gate's decision, whatever the value of the variable.
+        for not_true in (None, '', 'false', 'True', '1', 'yes', 'true ', 'TRUE'):
+            assert gate(event, results, ['skipped'] * 2, skip=not_true) != 0, (event, i, not_true)
+    # Every uncovered-position skip is refused even when every other stage was legitimately skipped.
+    for i in NEVER_SKIPPED:
+        results = list(covered)
+        results[i] = 'skipped'
+        assert gate(event, results, ['skipped'] * 2, skip='true') != 0, (event, i)
+for i in range(9):
+    for bad in ('failure', 'cancelled'):
+        results = ['skipped'] * 9
+        results[i] = bad
+        assert gate('merge_group', results[:7], results[7:], skip='true') != 0, (i, bad)
+        results = ['success'] * 9
+        results[i] = bad
+        assert gate('merge_group', results[:7], results[7:], skip='true') != 0, (i, bad)
+# The merge-only shards may be skipped under a skip (they are job-level skips too) but not otherwise.
+assert gate('merge_group', covered, ['skipped', 'skipped'], skip='true') == 0
+assert gate('merge_group', covered, ['skipped', 'skipped'], skip=None) != 0
+assert gate('merge_group', ['skipped'] * 6, ['skipped'] * 2, skip='true') != 0   # a missing stage result still fails
+assert gate('merge_group', covered, ['skipped'], skip='true') != 0
+assert gate('pull_request', covered, ['success', 'skipped'], skip='true') != 0  # extra shards stay merge-only
+print('passed: an evidence skip lets the aggregate accept skipped stages only when its own gate decided, never failures')
 
 assert 'runs-on: ubuntu-latest' in (ROOT / '.github/workflows/public-repo.yml').read_text()
 assert required_priority not in blocks['perf-cost'], 'optional cost must not join required PR priority'
@@ -303,6 +350,9 @@ for raw in cache_conditions:
             for cancelled in (False, True):
                 for succeeded in (False, True):
                     for local in ('', '1'):
+                      # A check whose evidence gate decided to skip turns its cache steps off too; an ordinary
+                      # run (no skip decision) must behave exactly as before.
+                      for skip in ('', 'true'):
                         expression = condition
                         for token, value in {
                             '!cancelled()': not cancelled,
@@ -310,13 +360,18 @@ for raw in cache_conditions:
                             'github.event_name': event,
                             'vars.CI_OUTAGE_FAST_QUEUE': switch,
                             'env.CI_LOCAL_CACHES': local,
+                            **{f'needs.evidence-gate-{gate}.outputs.skip': skip for gate in (
+                                'genie-freshness', 'typescript-client', 'linux-gate', 'mail-redelivery-canaries', 'isolation-vm')},
                         }.items():
                             expression = expression.replace(token, repr(value))
+                        expression = expression.replace('!(', 'not (')
                         actual = eval(expression.replace('&&', ' and ').replace('||', ' or '), {'__builtins__': {}})
                         expected = not cancelled and (event != 'merge_group' or switch != 'on')
                         if 'success()' in condition:
                             expected = expected and succeeded and local != '1'
-                        assert actual == expected, (condition, event, switch, cancelled, succeeded, local)
+                        if skip == 'true' and 'evidence-gate' in condition:
+                            expected = False
+                        assert actual == expected, (condition, event, switch, cancelled, succeeded, local, skip)
 for job, block in blocks.items():
     assert 'CI_OUTAGE_FAST_QUEUE' not in block.split('    steps:', 1)[0], (job, 'outage switch must not skip jobs')
 for step in ('Download this run attempt’s successful test build', 'Verify source, hashes and extract test archives',

@@ -543,10 +543,64 @@ check for the typed `nix` observation is a later slice, agreed with the Nix prod
 
 Five non-required jobs, `evidence-gate-<check>` for each required check (`linux-gate`,
 `typescript-client`, `isolation-vm`, `genie-freshness`, `mail-redelivery-canaries`), decide whether
-a trusted note already covers the run's tree. Nothing `needs` them, they hold `contents: read`
-only, write nothing and dispatch nothing, and every problem becomes `decision=run`. **The gate
-decides; it does not yet skip anything.** Wiring a skip into the jobs it would skip is a separate
-change, so this one cannot make any check run less.
+a trusted note already covers the run's tree. They hold `contents: read` only, write nothing and dispatch
+nothing, and every problem becomes `decision=run`. **Every required check now consumes its gate's decision**: `genie-freshness` and `typescript-client`
+(by skipping their steps), and the Linux group (below).
+
+### What a skip does
+
+When `evidence-gate-<check>` decides `skip`, the job of that check still runs and still ends in success, so it
+keeps its name, its place in the required set and every `needs` on it. It runs only the checkout and its own
+cache-coverage report, skips every other step, and adds the step `evidence covered by a trusted note`, which
+writes the record id to the job summary. The wiring is deliberately conservative:
+
+- Each wired job also waits for its gate job (a hosted runner start, typically 10 to 30 seconds), so while no
+  note exists these two checks start slightly later than before. That is the price of a single, auditable
+  decision.
+- A wired job's own `if` names a status function (`!cancelled()`), so a gate job that failed, was skipped or
+  never started cannot skip the required check: its output is empty, which is not `'true'`, and the steps run.
+- The checkout is never skipped, and a step that already had an `if` keeps it, combined with the skip
+  condition. A step that does not know about the skip runs.
+- The skip decision the check jobs read is the output of the `evidence skip taken` step itself, written as its last
+  command, not of the earlier decision step. So `skip=true` cannot exist unless that marker step already ran: a gate
+  job that dies between deciding and marking leaves no output and the check runs. The observer refuses to record a
+  check whose gate job ran the marker (and should also refuse one whose own job ran `evidence covered by a trusted
+  note`, the step a wired job runs only when it skipped its work), and the in-job producers refuse to sign for a
+  stage that did not run, so a skip never produces a fresh note for itself.
+- Every signing step is told when its gate skipped: it gets `GATE_SKIP` (true when any gate that can cover that job
+  said skip), and the signing helper then makes no note whatever the job's log or step outcomes say. The aggregate
+  note job `needs` every `evidence-gate-*` job, so it sees them all and refuses to sign when any says skip. Each
+  gate a job reads is one of that job's own `needs`, which a test checks.
+- A skip of `genie-freshness` skips the tests of this machinery too (`ci-evidence-gate-test`,
+  `evidence-verify-test`, `genie --check`) for that tree. That is accepted because the note is for the same tree and
+  a change to those files is a protected path that always runs in full; a reader must not assume they ran.
+- The skip rests on a note of kind `observed`, which the central observer records only for a `merge_group`
+  run, so a pull request can skip only a tree an earlier queue run already passed. Do not expect a saving at
+  pull-request time from these two checks.
+- Until a producer writes a note for a check, that check never skips. At the time of writing no note exists for
+  these two, so both run in full; the first skip needs a producer.
+
+### The Linux group
+
+`linux-gate` is an aggregate of jobs that are not themselves required checks, so those jobs skip at the **job**
+level, which allocates no runner at all: `linux-tests` and its three shards, `linux-clippy` and
+`linux-fleet-compat` skip when `evidence-gate-linux-gate` decides skip. `linux-test-build` feeds the test shards,
+`mail-redelivery-canaries` and `isolation-vm`, so it skips only when **every one of them** is covered; that
+condition is derived from theirs in the generator, never written twice. The two jobs that are required checks in
+their own right keep running and end in success with their steps skipped, so a required check never reports
+`skipped`: `mail-redelivery-canaries` is covered by its own note or by `linux-gate`'s (the aggregate note proves
+its canaries passed), `isolation-vm` by its own note; both gate their first step, the pre-check that the shared
+build succeeded.
+
+`linux-gate` itself still runs always and still fails on anything but success, with one addition: it reads its gate's
+decision, and a member that reports `skipped` is accepted only when that decision was exactly `true`, only
+in the **positions** of the stages that are skipped at job level (the build, the test shards, clippy and fleet
+compatibility, derived in the generator from the very list that skips them), never for a failure or a
+cancellation, and the stage counts are still enforced. `upgrade-impact` and `mail-redelivery-canaries` are never
+accepted as skipped, so a condition that skipped them for any other reason cannot be waved through just because a
+note exists. A skipped job reports `skipped` to
+the aggregate evidence-note producers, which refuse to sign for a skipped member, so a skipped run writes no
+fresh `linux-gate` note.
 
 ### The skip policy
 
@@ -556,6 +610,7 @@ group base), never from the change under test, and says per check what a note mu
 ```json
 {"version": 1, "checks": {"linux-gate": {
   "trust_levels": ["fleet"],
+  "enforce": false,
   "max_age_s": null,
   "kinds": {
     "observed": {"command": ["github-actions", "{repository}", ".github/workflows/fleet.yml", "{check}"],
@@ -563,6 +618,14 @@ group base), never from the change under test, and says per check what a note mu
     "wrapper": {"command": ["..."], "required_inputs": ["flake_lock_sha256", "toolchain_sha256"],
                 "bind_inputs": {"flake_lock_sha256": "flake.lock"}}}}}}
 ```
+
+`enforce` is the per-check switch for skipping and is **off unless it says `true`** (absent means
+false; any other value is an error). With it off the gate still looks the note up and verifies it, and
+prints `outcome=satisfied` with `decision=run` and a reason starting `shadow:`, so the proof that a
+note would have covered the check accumulates while the check keeps running as today. Turning a check
+on is the one-line change `"enforce": false` to `"enforce": true` in this file, reviewed and queued
+like any change (the file is read from the accepted base, so the change takes effect for the runs
+after it merges).
 
 Each kind has its own rule: the exact `command` the record must have run, an optional
 `runner_prefix`, optional per-kind `trust_levels`, the `required_inputs` it must carry (every one a nonempty string) and
@@ -577,8 +640,20 @@ by default (no age limit; a signature is meant to grow to cover more over time);
 a future time is always refused. The file is validated strictly: an unknown key is an error, so
 a typo cannot silently weaken a rule, and a check with no entry never skips. The tree, the check
 name, the command, the exit code and the output hash are part of every record and are always
-checked. Only `observed` (the central observer's record) is listed today; `wrapper` is added per
-check when its real command is known. Write `scripts/evidence-verify --policy-from BASE
+checked. `observed` (the central observer's record of a finished job) and `wrapper` (a note the in-job producer signs
+as `fleet/ci`) are listed for **every** required check, each with the exact command that producer records:
+- `linux-gate`: `["linux-gate", "aggregate", <the aggregate's needed jobs, sorted>]`;
+- `mail-redelivery-canaries`: the stage command `["bash", "scripts/ci-linux", "mail-redelivery-canaries"]`;
+- `genie-freshness`: `["bash", "scripts/ci-genie-freshness"]`; `typescript-client`: `["bash", "scripts/ci-typescript-client"]`;
+  `isolation-vm`: `["isolation-vm", "nixos-test-driver", "transport-isolation-vm", "sekrets-vm"]`.
+Every wrapper rule requires `flake_lock_sha256`, `toolchain_sha256`, `wrapper_sha256`, `system` and `attempt`
+and binds `flake_lock_sha256` to `flake.lock` in the verified tree; the stage rule also requires `stage` and
+`job`, and the step-outcome rules `job`, `steps` and `step_outcomes`. No rule names a weaker signer level, so only
+`fleet/ci` counts. A producer signs a step-outcome note only when every listed step actually ran, and refuses
+when a gate in its run said skip, so a skipped run writes no note for itself. If a producer's note changes (a job
+added to the aggregate, a step renamed), the policy must change with it; until it does, the notes simply stop
+matching and the check runs.
+Write `scripts/evidence-verify --policy-from BASE
 --repository OWNER/NAME` to apply it by hand.
 
 ### When the gate says skip
@@ -636,7 +711,7 @@ values and `-` for none:
 
 ```
 evidence-decision v1 check=… decision=skip|run outcome=satisfied|degraded|no_note|rejected|unavailable
-reason=… record=… signer=… trust_level=… kind=… tier=… observed_at=… age_s=… max_age_s=… attempts=…
+reason=… record=… signer=… trust_level=… kind=… tier=… observed_at=… age_s=… max_age_s=… attempts=… enforce=true|false
 tree=… head=… base=… event=… pr=… repo=… run=… attempt=… fork=true|false verifier_sha256=… gate_sha256=…
 ```
 

@@ -110,7 +110,8 @@ encoded = re.search(r"QUEUE_DEPENDENCIES: (.+)", guard)[1]
 dependencies = json.loads(ast.literal_eval(encoded))
 blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
 for name in ('linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'isolation-vm', 'mail-redelivery-canaries'):
-    actual = re.search(r"^    needs: (.+)$", blocks[name], re.M)
-    needs = actual[1].strip('[]').split(', ') if actual else []
+    # Job-level `needs` may be one line, a list or a bracketed block, and sits before or after `steps`.
+    actual = re.search(r"^    needs:(.*?)(?=^    \S|\Z)", blocks[name], re.M | re.S)
+    needs = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", actual[1]) if actual else []
     assert dependencies[name] == needs, (name, dependencies[name], needs)
 print('passed: observer uses actual generated stage dependencies')

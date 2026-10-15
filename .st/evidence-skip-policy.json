@@ -5,6 +5,7 @@
       "trust_levels": [
         "fleet"
       ],
+      "enforce": false,
       "kinds": {
         "observed": {
           "command": [
@@ -14,6 +15,35 @@
             "{check}"
           ],
           "runner_prefix": "github:{repository}/"
+        },
+        "wrapper": {
+          "command": [
+            "linux-gate",
+            "aggregate",
+            "genie-freshness",
+            "isolation-vm",
+            "linux-clippy",
+            "linux-fleet-compat",
+            "linux-gate",
+            "linux-test-build",
+            "linux-tests",
+            "linux-tests-shard-2",
+            "linux-tests-shard-3",
+            "linux-tests-shard-4",
+            "mail-redelivery-canaries",
+            "typescript-client",
+            "upgrade-impact"
+          ],
+          "required_inputs": [
+            "flake_lock_sha256",
+            "toolchain_sha256",
+            "wrapper_sha256",
+            "system",
+            "attempt"
+          ],
+          "bind_inputs": {
+            "flake_lock_sha256": "flake.lock"
+          }
         }
       }
     },
@@ -21,6 +51,7 @@
       "trust_levels": [
         "fleet"
       ],
+      "enforce": false,
       "kinds": {
         "observed": {
           "command": [
@@ -30,6 +61,25 @@
             "{check}"
           ],
           "runner_prefix": "github:{repository}/"
+        },
+        "wrapper": {
+          "command": [
+            "bash",
+            "scripts/ci-typescript-client"
+          ],
+          "required_inputs": [
+            "flake_lock_sha256",
+            "toolchain_sha256",
+            "wrapper_sha256",
+            "system",
+            "attempt",
+            "job",
+            "steps",
+            "step_outcomes"
+          ],
+          "bind_inputs": {
+            "flake_lock_sha256": "flake.lock"
+          }
         }
       }
     },
@@ -37,6 +87,7 @@
       "trust_levels": [
         "fleet"
       ],
+      "enforce": false,
       "kinds": {
         "observed": {
           "command": [
@@ -46,6 +97,27 @@
             "{check}"
           ],
           "runner_prefix": "github:{repository}/"
+        },
+        "wrapper": {
+          "command": [
+            "isolation-vm",
+            "nixos-test-driver",
+            "transport-isolation-vm",
+            "sekrets-vm"
+          ],
+          "required_inputs": [
+            "flake_lock_sha256",
+            "toolchain_sha256",
+            "wrapper_sha256",
+            "system",
+            "attempt",
+            "job",
+            "steps",
+            "step_outcomes"
+          ],
+          "bind_inputs": {
+            "flake_lock_sha256": "flake.lock"
+          }
         }
       }
     },
@@ -53,6 +125,7 @@
       "trust_levels": [
         "fleet"
       ],
+      "enforce": false,
       "kinds": {
         "observed": {
           "command": [
@@ -62,6 +135,25 @@
             "{check}"
           ],
           "runner_prefix": "github:{repository}/"
+        },
+        "wrapper": {
+          "command": [
+            "bash",
+            "scripts/ci-genie-freshness"
+          ],
+          "required_inputs": [
+            "flake_lock_sha256",
+            "toolchain_sha256",
+            "wrapper_sha256",
+            "system",
+            "attempt",
+            "job",
+            "steps",
+            "step_outcomes"
+          ],
+          "bind_inputs": {
+            "flake_lock_sha256": "flake.lock"
+          }
         }
       }
     },
@@ -69,6 +161,7 @@
       "trust_levels": [
         "fleet"
       ],
+      "enforce": false,
       "kinds": {
         "observed": {
           "command": [
@@ -78,6 +171,25 @@
             "{check}"
           ],
           "runner_prefix": "github:{repository}/"
+        },
+        "wrapper": {
+          "command": [
+            "bash",
+            "scripts/ci-linux",
+            "mail-redelivery-canaries"
+          ],
+          "required_inputs": [
+            "flake_lock_sha256",
+            "toolchain_sha256",
+            "wrapper_sha256",
+            "system",
+            "attempt",
+            "stage",
+            "job"
+          ],
+          "bind_inputs": {
+            "flake_lock_sha256": "flake.lock"
+          }
         }
       }
     }

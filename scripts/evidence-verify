@@ -61,7 +61,7 @@ def git(repo, *args, stdin=None, config=()):
 
 
 POLICY_KEYS = {'version', 'checks'}
-CHECK_KEYS = {'kinds', 'trust_levels', 'max_age_s'}
+CHECK_KEYS = {'kinds', 'trust_levels', 'max_age_s', 'enforce'}
 KIND_KEYS = {'command', 'runner_prefix', 'required_inputs', 'bind_inputs', 'trust_levels'}
 
 
@@ -87,6 +87,10 @@ def policy_rules(text, check, repository):
     max_age = entry.get('max_age_s')
     if max_age is not None and (isinstance(max_age, bool) or not isinstance(max_age, int) or max_age <= 0):
         raise Failure('error', f'skip policy for {check}: max_age_s must be null or a positive integer')
+    # Skipping is OFF unless a check says `"enforce": true`: without it the decision is only recorded.
+    enforce = entry.get('enforce', False)
+    if not isinstance(enforce, bool):
+        raise Failure('error', f'skip policy for {check}: enforce must be true or false')
     if not (isinstance(entry['kinds'], dict) and entry['kinds']):
         raise Failure('error', f'skip policy for {check}: kinds must name at least one kind')
 
@@ -120,7 +124,7 @@ def policy_rules(text, check, repository):
                        # A kind may name its own signer levels; otherwise it uses the check's. Naming them
                        # per kind is what lets a weaker signer satisfy `wrapper` without ever satisfying `observed`.
                        'trust_levels': tuple(kind_levels) if kind_levels else None}
-    return {'kinds': kinds, 'trust_levels': tuple(levels), 'max_age_s': max_age}
+    return {'kinds': kinds, 'trust_levels': tuple(levels), 'max_age_s': max_age, 'enforce': enforce}
 
 
 def kind_of(runner):
@@ -331,6 +335,7 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
         'tier': predicate['tier'], 'observed_at': predicate['observed_at'],
         'command': result['command'], 'inputs': inputs, 'attempts': attempts, 'policy': rules is not None,
         'max_age_s': rules['max_age_s'] if rules is not None else max_age,
+        'enforce': rules['enforce'] if rules is not None else False,
     }
 
 

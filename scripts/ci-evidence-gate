@@ -76,6 +76,7 @@ def decide(context, outcome, result, tree):
     if context.get('protected_changed') != []:
         return 'run', 'a file that decides skipping changed, or could not be compared'
     checks = [
+        (result.get('enforce') is True, 'shadow: the note would cover this check, but the skip policy has not turned skipping on for it'),
         (result.get('satisfied') is True, 'verifier did not report satisfied'),
         (result.get('policy') is True, 'the skip policy was not applied'),
         (result.get('tier') == 'full', 'tier is not full'),
@@ -163,7 +164,7 @@ def line(context, decision, outcome, result, detail, tree, verifier_sha, gate_sh
         ('record', result.get('record')), ('signer', result.get('signer')),
         ('trust_level', result.get('trust_level')), ('kind', result.get('kind')), ('tier', result.get('tier')),
         ('observed_at', result.get('observed_at')), ('age_s', age), ('max_age_s', result.get('max_age_s')),
-        ('attempts', result.get('attempts')), ('tree', tree), ('head', context['head']),
+        ('attempts', result.get('attempts')), ('enforce', result.get('enforce')), ('tree', tree), ('head', context['head']),
         ('base', context['base']), ('event', context['event']), ('pr', context['pr']),
         ('repo', context['repository']), ('run', context['run']), ('attempt', context['attempt']),
         ('fork', context['fork']), ('verifier_sha256', verifier_sha), ('gate_sha256', gate_sha),

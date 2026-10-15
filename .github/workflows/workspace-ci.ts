@@ -310,6 +310,16 @@ export const evidenceStageJob = (name: string) =>
 export const evidenceStepNames = ['genie-freshness', 'typescript-client', 'isolation-vm'] as const
 export const evidenceStepJob = () => ({ environment: evidenceEnvironment })
 
+// The evidence gate(s) that can cover a job's work. A job that took such a skip must not sign a note for a run in
+// which it did not run its work: the signing helper refuses when this is 'true' (and so makes no note), whatever the
+// job's log or step outcomes say. Every gate named here must be in that job's `needs`.
+export const gateSkipExpression = (name: string): string => {
+  const gates = name === 'mail-redelivery-canaries'
+    ? ['linux-gate', 'mail-redelivery-canaries']
+    : (evidenceStepNames as readonly string[]).includes(name) ? [name] : ['linux-gate']
+  return '${{ ' + gates.map((gate) => `needs.evidence-gate-${gate}.outputs.skip == 'true'`).join(' || ') + ' }}'
+}
+
 const signingCore = (
   name: string,
   facts: { helper: 'stage-facts' | 'step-facts'; env: Record<string, string>; toolchain: boolean },
@@ -357,7 +367,7 @@ python3 ${evidenceHelper} configure | tee "$RUNNER_TEMP/evidence-signer-home"`,
       ...soft,
       name: `Sign this ${facts.helper === 'stage-facts' ? 'stage' : 'job'} result`,
       if: "${{ always() && steps.evidence-configure.outcome == 'success' }}",
-      env: facts.env,
+      env: { ...facts.env, GATE_SKIP: gateSkipExpression(name) },
       run: `helper=${evidenceHelper}
 python3 "$helper" once ${facts.helper === 'stage-facts' ? '"$STAGE_JOB"' : '"$STEP_CHECK"'}
 python3 "$helper" ${facts.helper} "$RUNNER_TEMP/job-facts.json"

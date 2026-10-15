@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add wrapper-kind rules for genie-freshness, typescript-client and isolation-vm to the evidence skip policy",
+  "replay": {"status": "none", "detail": "No daemon replay change."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change; three entries in a policy file read from the accepted base."},
+  "rules": {"status": "none", "detail": "No required check, daemon rule or main landing change. These rules only let a note that a producer signs for the exact tree count; nothing skips until such a note exists."},
+  "compatibility": {"status": "none", "detail": "Policy data only; existing rules are unchanged."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "Nothing to do."},
+  "recovery": {"status": "none", "detail": "Removing the three entries restores observed-only acceptance for those checks."}
+}
