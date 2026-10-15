@@ -36,7 +36,14 @@ fn historical_status_reads_skip_arrangements_changed_after_the_frontier() {
     let history = store.status_history(None, None, Some(frontier)).unwrap();
     assert!(history.subjects.iter().all(|subject| subject.subject != SUBJECT));
     assert!(history.subjects.iter().any(|subject| subject.subject == "resource/historical"));
-    let prefix = store.status_for_subject_prefix_at("arrangement/", Some(frontier), false).unwrap();
+    let prefix = store
+        .status_for_subject_prefix_at(
+            "arrangement/",
+            Some(frontier),
+            false,
+            crate::store::ClaimsReduction::Summary,
+        )
+        .unwrap();
     assert!(prefix.subjects.is_empty());
 }
 
@@ -75,7 +82,7 @@ fn owner_admission_real_agent_and_atomic_identity_fences() {
     let mut forged = accepted.clone();
     forged.actor = Some("person/other".into());
     assert!(classify_replicated_claim_with_registry(&forged,st3_schema::registry()).is_err());
-    let status = subject_status_at(&connection,SUBJECT,None,None).unwrap().unwrap().0;
+    let status = subject_status_at(&connection,SUBJECT,None,None,crate::store::ClaimsReduction::Full).unwrap().unwrap().0;
     let mut changed_action = agent.clone();
     changed_action.fields.insert("action_id".into(),json!("action-two"));
     changed_action.fields.insert("action_digest".into(),json!("1".repeat(64)));
@@ -188,7 +195,7 @@ fn reads_and_write_validation_do_not_need_claim_history() {
     assert_eq!(arrangement_at(&transaction,SUBJECT,u64::MAX).unwrap().unwrap(),before);
     assert_eq!(arrangements_at(&transaction,"person/ada",u64::MAX).unwrap(),vec![before.clone()]);
     prepare(&transaction,&input(json!([{"op":"folder.rename","id":A,"name":"New"}]))).unwrap();
-    assert_eq!(subject_status_at(&transaction,SUBJECT,None,None).unwrap().unwrap().0.actual,Some(before));
+    assert_eq!(subject_status_at(&transaction,SUBJECT,None,None,crate::store::ClaimsReduction::Full).unwrap().unwrap().0.actual,Some(before));
     transaction.rollback().unwrap();
 }
 

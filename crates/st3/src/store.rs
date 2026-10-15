@@ -67,11 +67,12 @@ use uuid::Uuid;
 use crate::model::{
     ApplyResponse, AttentionActionView, AttentionClosing, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, Capability,
-    ClaimInput, ClaimRecord, ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, EventRecord,
-    FaultView, HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS,
-    MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
-    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
-    MissionRunReportView, MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
+    ClaimInput, ClaimRecord, ClaimsPage, ClaimsSummary, ContextUsage, DependencySpec,
+    DesiredSubject, EventRecord, FaultView, HumanReviewView, IntentInput, LoopRoundView,
+    LoopRunView, MAX_EVAL_TIMEOUT_MS, SESSION_CLAIMS, MessageView, MissionDefinitionView,
+    MissionInputKind, MissionOutputView, MissionResponse, MissionRevisionOperation,
+    MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView, MissionRunReportView,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
     OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
     PlannedAction, PlannerSpec, PlanningCandidateView, PlanningPreviewView,
     PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
@@ -1351,6 +1352,8 @@ pub(crate) struct SubjectCache {
     conflicts: u64,
     views: HashMap<String, ViewEntry>,
     statuses: HashMap<String, StatusEntry>,
+    summary_statuses: HashMap<String, StatusEntry>,
+    runtime_statuses: HashMap<String, StatusEntry>,
     // Summary and full statuses never share entries: their provenance/harness fields differ.
     card_statuses: HashMap<String, StatusEntry>,
 }
@@ -1363,10 +1366,12 @@ pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
 /// How long a roster refresh request may go unanswered before the daemon warns about it.
 const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
 
-/// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
+/// One subject's reduction, read at snapshot `read_at`, so it holds from there on. The claims
+/// mode is part of the answer: a summary reduction and a full one are cached side by side.
 struct StatusEntry {
     read_at: u64,
     owners: Vec<String>,
+    claims: ClaimsReduction,
     status: SubjectStatus,
     action: Option<PlannedAction>,
 }
@@ -1571,11 +1576,20 @@ fn runtime_only_authority(
     Ok(Some((Value::Object(actual), origin)))
 }
 
-#[derive(Clone, Copy)]
-enum SubjectStatusMode {
+/// Which claims — and, for agent cards, which provenance — a status reduction reads.
+/// `Full` carries the whole canonical id vector in `SubjectStatus::claims`, which costs a
+/// claim-by-claim pass over the subject's history: only reductions a public response
+/// serializes, and the apply/planning fences that compare vectors, need it. `Summary`
+/// leaves `claims` empty and fills `claims_summary` instead, resolving canonical tie keys
+/// only for the accepted-time groups the summary's answers can come from. `AgentCard`
+/// also skips the harness fold and desired conflicts, which cards replace with observed
+/// evidence; provenance is only the last canonical claim, and only without a declaration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimsReduction {
     Full,
-    /// Agent cards replace the harness with observed evidence and never expose desired
-    /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
+    Summary,
+    /// Runtime resources do not consume claim ids, counts, or session boundaries.
+    Runtime,
     AgentCard,
 }
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
@@ -1585,17 +1599,14 @@ fn subject_status_at(
     subject: &str,
     at_index: Option<u64>,
     owner_filter: Option<&str>,
+    claims: ClaimsReduction,
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
-    subject_status_at_with_mode(connection, subject, at_index, owner_filter, SubjectStatusMode::Full)
-}
-
-fn subject_status_at_with_mode(
-    connection: &Connection,
-    subject: &str,
-    at_index: Option<u64>,
-    owner_filter: Option<&str>,
-    mode: SubjectStatusMode,
-) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
+    let _profile = crate::profile::span(match claims {
+        ClaimsReduction::Full => "status/reduction-full",
+        ClaimsReduction::Summary => "status/reduction-summary",
+        ClaimsReduction::Runtime => "status/reduction-runtime",
+        ClaimsReduction::AgentCard => "status/reduction-agent-card",
+    });
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
     if subject.starts_with("arrangement/") {
@@ -1607,7 +1618,13 @@ fn subject_status_at_with_mode(
             subject: subject.into(), kind: Some("arrangement".into()),
             desired_token: None, desired_revision: None, desired: None,
             actual, actual_claim: revision.clone(), actual_origin: None,
-            harness: None, conflicts: vec![], claims: revision.into_iter().collect(),
+            harness: None, conflicts: vec![], claims: revision.clone().into_iter().collect(),
+            claims_summary: ClaimsSummary {
+                first: revision.clone(),
+                latest: revision.clone(),
+                count: usize::from(revision.is_some()),
+                session_boundary: None,
+            },
             owner_run: None, gap: None, reachability: if live { "reachable" } else { "unknown" }.into(),
             reason: None, under: vec![],
             projection: OperationalAnnotation { layer: if live { "current" } else { "history" }.into(), actionable: false,
@@ -1630,24 +1647,59 @@ fn subject_status_at_with_mode(
         at_index,
         member.as_ref().map(|member| member.host.as_str()),
     )?;
-    let (harness, claims, conflicts) = match mode {
-        SubjectStatusMode::Full => (
+    let (harness, claims, claims_summary, conflicts) = match claims {
+        ClaimsReduction::Full => (
             current_harness_at(connection, subject, at_index)?,
             claim_ids_at(connection, subject, at_index)?,
+            ClaimsSummary::default(),
+            desired_conflicts_at(
+                connection,
+                subject,
+                desired.as_ref().map(|row| row.claim_id.as_str()),
+                at_index,
+            )?,
+        ),
+        ClaimsReduction::Summary => (
+            current_harness_at(connection, subject, at_index)?,
+            Vec::new(),
+            claims_summary_at(connection, subject, at_index)?,
+            desired_conflicts_at(
+                connection,
+                subject,
+                desired.as_ref().map(|row| row.claim_id.as_str()),
+                at_index,
+            )?,
+        ),
+        ClaimsReduction::Runtime => (
+            current_harness_at(connection, subject, at_index)?,
+            Vec::new(),
+            ClaimsSummary::default(),
             desired_conflicts_at(connection, subject, desired.as_ref().map(|row| row.claim_id.as_str()), at_index)?,
         ),
-        SubjectStatusMode::AgentCard => {
-            let claims = if desired.is_some() {
-                Vec::new()
+        ClaimsReduction::AgentCard => {
+            let latest = if desired.is_some() {
+                None
             } else {
                 connection.prepare_cached(&canonical_sql(
                     "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
                      WHERE subject=?1 AND store_index<=?2
                      ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
-                    .optional()?.into_iter().collect()
+                    ))?
+                    .query_row(
+                        params![subject, at_index.unwrap_or(i64::MAX as u64)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
             };
-            (None, claims, Vec::new())
+            (
+                None,
+                latest.clone().into_iter().collect(),
+                ClaimsSummary {
+                    latest,
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
         }
     };
     if owner_filter.is_some_and(|run| {
@@ -1663,6 +1715,7 @@ fn subject_status_at_with_mode(
         actual_source: (actual_claim, actual_origin, actual_origin_conflict),
         harness,
         claims,
+        claims_summary,
         conflicts,
         unknown_claim,
     };
@@ -1673,7 +1726,7 @@ fn subject_status_at_with_mode(
 }
 
 /// What one subject's status reduction reads at a snapshot: read for one subject by
-/// [`subject_status_at_with_mode`], or for many at once by the agent card fold.
+/// [`subject_status_at`], or for many at once by the agent card fold.
 struct SubjectStatusInputs {
     desired: Option<DesiredRow>,
     member: Option<crate::model::MemberSpec>,
@@ -1682,6 +1735,7 @@ struct SubjectStatusInputs {
     actual_source: (Option<String>, Option<String>, bool),
     harness: Option<crate::model::CurrentHarnessView>,
     claims: Vec<String>,
+    claims_summary: ClaimsSummary,
     conflicts: Vec<String>,
     unknown_claim: Option<String>,
 }
@@ -1702,6 +1756,7 @@ fn assemble_subject_status(
         actual_source: (actual_claim, actual_origin, actual_origin_conflict),
         harness,
         claims,
+        claims_summary,
         conflicts,
         unknown_claim,
     } = inputs;
@@ -1803,6 +1858,7 @@ fn assemble_subject_status(
             harness,
             conflicts,
             claims,
+            claims_summary,
             owner_run,
             gap,
             reachability,
@@ -1849,8 +1905,8 @@ pub struct EndedDeclaration {
 }
 
 /// A kept agent status: the snapshot it answers, the agent projection index it was reduced at,
-/// whether it includes history, and the status.
-type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
+/// whether it includes history, which claims it carries, and the status.
+type AgentStatusEntry = (u64, u64, bool, ClaimsReduction, Arc<StatusResponse>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MissionGateRunner {
@@ -12073,6 +12129,7 @@ impl Store {
                 harness,
                 conflicts: Vec::new(),
                 claims: Vec::new(),
+                claims_summary: ClaimsSummary::default(),
                 owner_run: None,
                 gap: None,
                 reachability: "unknown".into(),
@@ -12097,12 +12154,14 @@ impl Store {
     ///
     /// Product projections use this instead of reducing every subject in the graph and filtering
     /// afterwards. The latter made small agent and host screens temporarily allocate the complete
-    /// claim graph on large stores.
+    /// claim graph on large stores. `claims` picks what the answers carry: projections that never
+    /// serialize `SubjectStatus::claims` pass [`ClaimsReduction::Summary`].
     pub fn status_for_subject_prefix_at(
         &self,
         prefix: &str,
         at_index: Option<u64>,
         include_history: bool,
+        claims: ClaimsReduction,
     ) -> Result<StatusResponse> {
         // Agent listings are expensive on large graphs. Hold this lock while building the
         // snapshot so concurrent callers share one reduction, then serve clones at the same
@@ -12117,17 +12176,22 @@ impl Store {
                 .agent_status_cache
                 .lock()
                 .expect("agent status cache poisoned");
-            if let Some((_, _, _, status)) = cache.iter().find(|(cached_index, _, history, _)| {
-                *cached_index == index && *history == include_history
-            }) {
+            if let Some((_, _, _, _, status)) =
+                cache.iter().find(|(cached_index, _, history, mode, _)| {
+                    *cached_index == index && *history == include_history && *mode == claims
+                })
+            {
                 let mut result = (**status).clone();
                 result.store_index = index;
                 return Ok(result);
             }
             let projection_index = self.agent_status_index(index)?;
-            if let Some((cached_index, _, _, status)) =
-                cache.iter_mut().find(|(_, cached_projection, history, _)| {
-                    *cached_projection == projection_index && *history == include_history
+            if let Some((cached_index, _, _, _, status)) = cache
+                .iter_mut()
+                .find(|(_, cached_projection, history, mode, _)| {
+                    *cached_projection == projection_index
+                        && *history == include_history
+                        && *mode == claims
                 })
             {
                 *cached_index = index;
@@ -12135,12 +12199,17 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
-            let status =
-                self.status_for_subject_prefix_uncached(prefix, Some(index), include_history)?;
+            let status = self.status_for_subject_prefix_uncached(
+                prefix,
+                Some(index),
+                include_history,
+                claims,
+            )?;
             cache.push_back((
                 index,
                 projection_index,
                 include_history,
+                claims,
                 Arc::new(status.clone()),
             ));
             if cache.len() > 8 {
@@ -12148,7 +12217,7 @@ impl Store {
             }
             return Ok(status);
         }
-        self.status_for_subject_prefix_uncached(prefix, at_index, include_history)
+        self.status_for_subject_prefix_uncached(prefix, at_index, include_history, claims)
     }
 
     fn status_for_subject_prefix_uncached(
@@ -12156,6 +12225,7 @@ impl Store {
         prefix: &str,
         at_index: Option<u64>,
         include_history: bool,
+        claims: ClaimsReduction,
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
@@ -12183,7 +12253,7 @@ impl Store {
                 .collect::<Result<BTreeSet<_>, _>>()?,
         }};
         drop(connection);
-        self.status_for_subject_names_at(subjects, store_index, include_history)
+        self.status_for_subject_names_at(subjects, store_index, include_history, claims)
     }
 
     /// Reduce only subjects that have emitted one claim kind at the selected snapshot.
@@ -12192,6 +12262,7 @@ impl Store {
         kind: &str,
         at_index: Option<u64>,
         include_history: bool,
+        claims: ClaimsReduction,
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
@@ -12215,7 +12286,7 @@ impl Store {
                 .collect::<Result<BTreeSet<_>, _>>()?
         };
         drop(connection);
-        self.status_for_subject_names_at(subjects, store_index, include_history)
+        self.status_for_subject_names_at(subjects, store_index, include_history, claims)
     }
 
     /// Candidate owners of a runtime resource at a snapshot. Retain historical observations:
@@ -12254,9 +12325,13 @@ impl Store {
             if conflicts != cache.conflicts {
                 cache.views.clear();
                 cache.statuses.clear();
+                cache.summary_statuses.clear();
+                cache.runtime_statuses.clear();
                 cache.card_statuses.clear();
                 cache.conflicts = conflicts;
-            } else if !cache.views.is_empty() || !cache.statuses.is_empty() || !cache.card_statuses.is_empty() {
+            } else if !cache.views.is_empty() || !cache.statuses.is_empty()
+                || !cache.summary_statuses.is_empty() || !cache.runtime_statuses.is_empty()
+                || !cache.card_statuses.is_empty() {
                 // The subjects and actors of the claims that arrived.
                 let mut statement = connection.prepare_cached(
                     "SELECT subject, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -12279,6 +12354,8 @@ impl Store {
                 cache
                     .statuses
                     .retain(|subject, entry| !stale(subject, &entry.owners));
+                cache.summary_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
+                cache.runtime_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
                 cache.card_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
             }
             cache.through = store_index;
@@ -12294,46 +12371,49 @@ impl Store {
         subject: &str,
         store_index: u64,
         newest: bool,
+        claims: ClaimsReduction,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        self.cached_subject_status_with_mode(connection, subject, store_index, newest, SubjectStatusMode::Full)
-    }
-
-    fn cached_subject_status_with_mode(
-        &self, connection: &Connection, subject: &str, store_index: u64,
-        newest: bool, mode: SubjectStatusMode,
-    ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        if let Some(kept) = self.kept_subject_status(subject, store_index, mode) {
+        if let Some(kept) = self.kept_subject_status(subject, store_index, claims) {
             return Ok(kept);
         }
-        let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
-            .expect("a reduction without an owner filter always has a status");
+        let (status, action) =
+            subject_status_at(connection, subject, Some(store_index), None, claims)?
+                .expect("a reduction without an owner filter always has a status");
         if newest {
-            self.keep_subject_status(subject, store_index, mode, &status, &action);
+            self.keep_subject_status(subject, store_index, claims, &status, &action);
         }
         Ok((status, action))
     }
 
     /// `subject`'s kept status reduction, if one holds at `store_index`.
     fn kept_subject_status(
-        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+        &self, subject: &str, store_index: u64, claims: ClaimsReduction,
     ) -> Option<(SubjectStatus, Option<PlannedAction>)> {
         let cache = self
             .smalltalk
             .subject_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let entries = match mode {
-            SubjectStatusMode::Full => &cache.statuses,
-            SubjectStatusMode::AgentCard => &cache.card_statuses,
+        // A summary and a full reduction of one subject are kept side by side; a public
+        // response must never be served a summary.
+        let entries = match claims {
+            ClaimsReduction::Full => &cache.statuses,
+            ClaimsReduction::Summary => &cache.summary_statuses,
+            ClaimsReduction::Runtime => &cache.runtime_statuses,
+            ClaimsReduction::AgentCard => &cache.card_statuses,
         };
         entries.get(subject)
-            .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
+            .filter(|entry| {
+                entry.claims == claims
+                    && entry.read_at <= store_index
+                    && store_index <= cache.through
+            })
             .map(|entry| (entry.status.clone(), entry.action.clone()))
     }
 
     /// Keep a reduction read at the newest applied snapshot, `store_index`.
     fn keep_subject_status(
-        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+        &self, subject: &str, store_index: u64, claims: ClaimsReduction,
         status: &SubjectStatus, action: &Option<PlannedAction>,
     ) {
         let mut cache = self
@@ -12351,13 +12431,15 @@ impl Store {
             .chain(status.projection.owner_generation.iter())
             .cloned()
             .collect();
-        let entries = match mode {
-            SubjectStatusMode::Full => &mut cache.statuses,
-            SubjectStatusMode::AgentCard => &mut cache.card_statuses,
+        let entries = match claims {
+            ClaimsReduction::Full => &mut cache.statuses,
+            ClaimsReduction::Summary => &mut cache.summary_statuses,
+            ClaimsReduction::Runtime => &mut cache.runtime_statuses,
+            ClaimsReduction::AgentCard => &mut cache.card_statuses,
         };
         // At capacity, a cold summary remains correct and uncached. Invalidation
         // frees slots; no growing history map or full-status cache warming is needed.
-        if matches!(mode, SubjectStatusMode::AgentCard)
+        if matches!(claims, ClaimsReduction::AgentCard)
             && entries.len() >= AGENT_CARD_STATUS_LIMIT && !entries.contains_key(subject) {
             return;
         }
@@ -12366,6 +12448,7 @@ impl Store {
             StatusEntry {
                 read_at: store_index,
                 owners,
+                claims,
                 status: status.clone(),
                 action: action.clone(),
             },
@@ -12506,7 +12589,7 @@ impl Store {
             self.current_view_candidates_with(&connection, names, index, true, &mut reads)?
         };
         let newest = self.advance_subject_cache(&connection, index)?;
-        let mode = SubjectStatusMode::AgentCard;
+        let mode = ClaimsReduction::AgentCard;
         let mut kept = HashMap::new();
         let mut missing = Vec::new();
         for name in &names {
@@ -12563,6 +12646,7 @@ impl Store {
         subjects: BTreeSet<String>,
         store_index: u64,
         include_history: bool,
+        claims: ClaimsReduction,
     ) -> Result<StatusResponse> {
         self.readers.request_read(|| {
             let subjects = if include_history {
@@ -12572,7 +12656,7 @@ impl Store {
             };
             if subjects.len() <= 64 {
                 return self.status_at_view_for_names(
-                    None, None, Some(store_index), include_history, Some(subjects),
+                    None, None, Some(store_index), include_history, Some(subjects), claims,
                 );
             }
             // The caller keeps its loan and reduces the LAST slice on it, so a full
@@ -12595,7 +12679,7 @@ impl Store {
                     .map(|(position, chunk)| {
                         let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
                         let read = move || self.status_at_view_for_names(
-                            None, None, Some(store_index), include_history, Some(names),
+                            None, None, Some(store_index), include_history, Some(names), claims,
                         );
                         let last = position + 1 == subjects.len().div_ceil(chunk_size);
                         if !last && let Some(permit) = self.readers.try_admit_read() {
@@ -12646,6 +12730,8 @@ impl Store {
             at_index,
             include_history,
             None,
+            // The response a public status endpoint serializes carries the full claims vector.
+            ClaimsReduction::Full,
         )
     }
 
@@ -12656,6 +12742,7 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
         selected_names: Option<BTreeSet<String>>,
+        claims: ClaimsReduction,
     ) -> Result<StatusResponse> {
         // A request reader loan alone can see a commit between statements. Keep the
         // selected declaration, runtime observation and conflict leaves in one snapshot.
@@ -12666,6 +12753,7 @@ impl Store {
                 at_index,
                 include_history,
                 selected_names,
+                claims,
             )
         })
     }
@@ -12677,6 +12765,7 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
         selected_names: Option<BTreeSet<String>>,
+        claims: ClaimsReduction,
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
@@ -12717,10 +12806,20 @@ impl Store {
                 continue;
             }
             let reduced = match newest {
-                Some(newest) => {
-                    Some(self.cached_subject_status(&connection, &subject, store_index, newest)?)
-                }
-                None => subject_status_at(&connection, &subject, at_index, selected_owner_run)?,
+                Some(newest) => Some(self.cached_subject_status(
+                    &connection,
+                    &subject,
+                    store_index,
+                    newest,
+                    claims,
+                )?),
+                None => subject_status_at(
+                    &connection,
+                    &subject,
+                    at_index,
+                    selected_owner_run,
+                    claims,
+                )?,
             };
             let Some((status, action)) = reduced else {
                 continue;
@@ -22235,6 +22334,20 @@ const CONFLICT_CLAIM_QUERY: &str =
        AND claims.subject=?1 AND claims.store_index<=?2
      ORDER BY operations.id LIMIT 1";
 
+// Seek once per distinct kind; the cut check seeks on the third index term.
+const SUBJECT_KINDS_AT_QUERY: &str = "WITH RECURSIVE kinds(kind) AS (
+    SELECT (SELECT kind FROM claims INDEXED BY claims_subject_kind_index
+            WHERE subject=?1 ORDER BY kind LIMIT 1)
+    UNION ALL
+    SELECT (SELECT kind FROM claims INDEXED BY claims_subject_kind_index
+            WHERE subject=?1 AND kind>kinds.kind ORDER BY kind LIMIT 1)
+    FROM kinds WHERE kind IS NOT NULL
+)
+SELECT kind FROM kinds WHERE kind IS NOT NULL AND EXISTS(
+    SELECT 1 FROM claims INDEXED BY claims_subject_kind_index
+    WHERE subject=?1 AND kind=kinds.kind AND store_index<=?2
+) ORDER BY kind";
+
 fn has_unknown_claim_at(
     connection: &Connection,
     subject: &str,
@@ -22265,9 +22378,9 @@ fn has_unknown_claim_at(
     if let Some(operation) = conflict {
         return Ok(Some(format!("idempotency-conflict:{operation}")));
     }
-    let mut statement = connection.prepare_cached(
-        "SELECT DISTINCT kind FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY kind",
-    )?;
+    // Seek once per distinct kind, then test the cut with the index's third term.
+    // DISTINCT would still visit every retained diagnostic of the subject.
+    let mut statement = connection.prepare_cached(SUBJECT_KINDS_AT_QUERY)?;
     let kinds = statement
         .query_map(params![subject, through], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -24235,6 +24348,149 @@ fn claim_ids_at_after_first_row(
         snapshot.commit()?;
     }
     Ok(ids)
+}
+
+/// The ids sharing one accepted time at the cut, in canonical order. Canonical order inside a
+/// single accepted time is decided by the whole claim key, so exactly this group — never the
+/// subject's entire history — needs key-by-key resolution.
+fn canonical_tie_group_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: u64,
+    accepted_at_unix_ms: &str,
+) -> Result<Vec<String>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
+         WHERE subject=?1 AND store_index<=?2 AND accepted_at_unix_ms=?3",
+    )?;
+    let ids = statement
+        .query_map(params![subject, at_index, accepted_at_unix_ms], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut keyed = ids
+        .into_iter()
+        .map(|id| Ok((canonical::claim_key(connection, &id)?, id)))
+        .collect::<Result<Vec<_>>>()?;
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(keyed.into_iter().map(|(_, id)| id).collect())
+}
+
+/// The `window`-th oldest canonical claim id, or `None` while the subject has `window` claims
+/// or fewer at the cut. Streams the accepted-time index up to the window and resolves
+/// canonical keys only for the accepted-time group the window boundary falls inside: every
+/// earlier group canonically precedes that group whole, so only the offset within it matters.
+fn window_boundary_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: u64,
+    window: usize,
+) -> Result<Option<String>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT accepted_at_unix_ms FROM claims INDEXED BY claims_subject_accepted_index
+         WHERE subject=?1 AND store_index<=?2
+         ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms LIMIT ?3",
+    )?;
+    let times = statement
+        .query_map(params![subject, at_index, window], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if times.len() < window {
+        return Ok(None);
+    }
+    let boundary_time = times.last().expect("a full window has a last time");
+    let within_window = times
+        .iter()
+        .filter(|time| time.as_str() == boundary_time)
+        .count();
+    let group = canonical_tie_group_at(connection, subject, at_index, boundary_time)?;
+    Ok(group.get(within_window - 1).cloned())
+}
+
+/// The bounded claims summary [`ClaimsReduction::Summary`] computes instead of the full
+/// canonical id vector: the canonically-latest id, the claim count at the cut, and the
+/// session-dating window's last canonical id once the count passes it. Each answer reads the
+/// subject's accepted-time index once, and canonical tie keys are resolved only for the top
+/// tie group and the group the window boundary falls inside, so the cost no longer follows
+/// the subject's history beyond the count and window index scans. The statements share one
+/// read cut, exactly like `claim_ids_at`.
+fn claims_summary_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+) -> Result<ClaimsSummary> {
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let at_index = at_index.unwrap_or(i64::MAX as u64);
+    let count = usize::try_from(
+        connection
+            .prepare_cached(
+                "SELECT COUNT(*) FROM claims INDEXED BY claims_subject_accepted_index
+                 WHERE subject=?1 AND store_index<=?2",
+            )?
+            .query_row(params![subject, at_index], |row| row.get::<_, i64>(0))?,
+    )?;
+    // The canonically-first claim: the session list's fallback date for a subject without any
+    // other evidence of when it started.
+    let first = if count == 0 {
+        None
+    } else {
+        let oldest = connection
+            .prepare_cached(
+                "SELECT accepted_at_unix_ms FROM claims INDEXED BY claims_subject_accepted_index
+                 WHERE subject=?1 AND store_index<=?2
+                 ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms LIMIT 1",
+            )?
+            .query_row(params![subject, at_index], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        oldest
+            .map(|time| {
+                canonical_tie_group_at(connection, subject, at_index, &time)
+                    .map(|group| group.into_iter().next())
+            })
+            .transpose()?
+            .flatten()
+    };
+    let latest = if count == 0 {
+        None
+    } else {
+        let top = connection
+            .prepare_cached(
+                "SELECT accepted_at_unix_ms FROM claims INDEXED BY claims_subject_accepted_index
+                 WHERE subject=?1 AND store_index<=?2
+                 ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
+            )?
+            .query_row(params![subject, at_index], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        top.map(|time| {
+            canonical_tie_group_at(connection, subject, at_index, &time)
+                .map(|mut group| group.pop())
+        })
+        .transpose()?
+        .flatten()
+    };
+    let session_boundary = if count > SESSION_CLAIMS {
+        window_boundary_at(connection, subject, at_index, SESSION_CLAIMS)?
+    } else {
+        None
+    };
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
+    Ok(ClaimsSummary {
+        first,
+        latest,
+        count,
+        session_boundary,
+    })
 }
 
 fn desired_conflicts_at(
@@ -26714,6 +26970,38 @@ mod fleet_admission_tests {
             let status = store.status(Some(subject)).unwrap();
             assert_eq!(narrow.reachability, "unreachable");
             assert_eq!(narrow.actual, status.subjects[0].actual);
+        }
+    }
+
+    #[test]
+    fn subject_kind_lookup_seeks_distinct_kinds_at_pinned_cuts() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE claims(subject TEXT,kind TEXT,store_index INTEGER);
+             CREATE INDEX claims_subject_kind_index ON claims(subject,kind,store_index);",
+        ).unwrap();
+        let mut prior = None;
+        for count in [32, 512, 7_900] {
+            connection.execute("DELETE FROM claims", []).unwrap();
+            connection.execute_batch(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{count})
+                 INSERT INTO claims SELECT 'agent/worker','harness.diagnostic',i FROM n;
+                 INSERT INTO claims VALUES ('agent/worker','runtime.future',{});", count + 1,
+            )).unwrap();
+            let mut statement = connection.prepare(SUBJECT_KINDS_AT_QUERY).unwrap();
+            let kinds = statement.query_map(params!["agent/worker", count], |row| row.get::<_, String>(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(kinds, ["harness.diagnostic"]);
+            let cost = statement.get_status(rusqlite::StatementStatus::VmStep);
+            if let Some(prior) = prior { assert!(cost <= prior + 20, "{prior} -> {cost}"); }
+            prior = Some(cost);
+            let kinds = statement.query_map(params!["agent/worker", count + 1], |row| row.get::<_, String>(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(first_unknown_kind(kinds), Some("runtime.future".into()));
+            let plan = connection.prepare(&format!("EXPLAIN QUERY PLAN {SUBJECT_KINDS_AT_QUERY}"))
+                .unwrap().query_map(params!["agent/worker", 1], |row| row.get::<_, String>(3))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().join("; ");
+            assert!(plan.contains("kind>?") && plan.contains("store_index<?"), "{plan}");
         }
     }
 
@@ -39371,7 +39659,12 @@ observer "ordered/file" {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let snapshot = store.index().unwrap();
         store
-            .status_for_subject_prefix_at("agent/", Some(snapshot), true)
+            .status_for_subject_prefix_at(
+                "agent/",
+                Some(snapshot),
+                true,
+                ClaimsReduction::Summary,
+            )
             .unwrap();
 
         let (ready_send, ready_recv) = std::sync::mpsc::channel();
@@ -39388,7 +39681,12 @@ observer "ordered/file" {
         let (result_send, result_recv) = std::sync::mpsc::channel();
         let read = std::thread::spawn(move || {
             result_send
-                .send(reader.status_for_subject_prefix_at("agent/", Some(snapshot), true))
+                .send(reader.status_for_subject_prefix_at(
+                    "agent/",
+                    Some(snapshot),
+                    true,
+                    ClaimsReduction::Summary,
+                ))
                 .unwrap();
         });
         let result = result_recv.recv_timeout(std::time::Duration::from_millis(250));
@@ -39436,7 +39734,7 @@ observer "ordered/file" {
             .unwrap();
 
         let agents = store
-            .status_for_subject_prefix_at("agent/", None, true)
+            .status_for_subject_prefix_at("agent/", None, true, ClaimsReduction::Summary)
             .unwrap();
         assert_eq!(
             agents
@@ -39448,7 +39746,7 @@ observer "ordered/file" {
         );
 
         let runtimes = store
-            .status_for_claim_kind_at("runtime.observed", None, true)
+            .status_for_claim_kind_at("runtime.observed", None, true, ClaimsReduction::Summary)
             .unwrap();
         assert_eq!(
             runtimes
@@ -39460,7 +39758,12 @@ observer "ordered/file" {
         );
 
         let first_snapshot = store
-            .status_for_claim_kind_at("runtime.observed", Some(first_index), true)
+            .status_for_claim_kind_at(
+                "runtime.observed",
+                Some(first_index),
+                true,
+                ClaimsReduction::Summary,
+            )
             .unwrap();
         assert_eq!(first_snapshot.store_index, first_index);
         assert_eq!(first_snapshot.subjects.len(), 1);
@@ -39468,11 +39771,16 @@ observer "ordered/file" {
 
         observe("agent/new", "new");
         let current_agents = store
-            .status_for_subject_prefix_at("agent/", None, true)
+            .status_for_subject_prefix_at("agent/", None, true, ClaimsReduction::Summary)
             .unwrap();
         assert_eq!(current_agents.subjects.len(), 2);
         let old_agents = store
-            .status_for_subject_prefix_at("agent/", Some(first_index), true)
+            .status_for_subject_prefix_at(
+                "agent/",
+                Some(first_index),
+                true,
+                ClaimsReduction::Summary,
+            )
             .unwrap();
         assert_eq!(old_agents.subjects.len(), 1);
 
@@ -39480,7 +39788,7 @@ observer "ordered/file" {
             observe(&format!("agent/bulk-{number:02}"), "bulk");
         }
         let bulk = store
-            .status_for_subject_prefix_at("agent/", None, true)
+            .status_for_subject_prefix_at("agent/", None, true, ClaimsReduction::Summary)
             .unwrap();
         assert_eq!(bulk.subjects.len(), 82);
         assert!(
@@ -39490,7 +39798,12 @@ observer "ordered/file" {
         );
         assert_eq!(
             store
-                .status_for_subject_prefix_at("agent/", Some(first_index), true)
+                .status_for_subject_prefix_at(
+                    "agent/",
+                    Some(first_index),
+                    true,
+                    ClaimsReduction::Summary,
+                )
                 .unwrap()
                 .subjects
                 .len(),
@@ -39522,7 +39835,12 @@ observer "ordered/file" {
                 .unwrap();
         }
         let current = store
-            .status_for_claim_kind_at("runtime.observed", None, false)
+            .status_for_claim_kind_at(
+                "runtime.observed",
+                None,
+                false,
+                ClaimsReduction::Summary,
+            )
             .unwrap();
         assert!(
             current.subjects.iter().all(|item| item.subject != subject),
@@ -39530,7 +39848,7 @@ observer "ordered/file" {
             current.subjects
         );
         let history = store
-            .status_for_claim_kind_at("runtime.observed", None, true)
+            .status_for_claim_kind_at("runtime.observed", None, true, ClaimsReduction::Summary)
             .unwrap();
         let gate = history
             .subjects
@@ -39565,7 +39883,12 @@ observer "ordered/file" {
     fn current_runtimes(store: &Store) -> (Vec<String>, usize) {
         SUBJECT_REDUCTIONS.with(|reductions| reductions.set(0));
         let view = store
-            .status_for_claim_kind_at("runtime.observed", None, false)
+            .status_for_claim_kind_at(
+                "runtime.observed",
+                None,
+                false,
+                ClaimsReduction::Summary,
+            )
             .unwrap();
         (
             view.subjects
@@ -39617,7 +39940,7 @@ observer "ordered/file" {
         let card = store.agent_card_status_at(None, cut, true).unwrap();
         assert!(card.subjects[0].harness.is_none());
         assert_eq!(card.subjects[0].claims.len(), 1);
-        let full = store.status_for_subject_prefix_at("agent/", Some(cut), true).unwrap();
+        let full = store.status_for_subject_prefix_at("agent/", Some(cut), true, ClaimsReduction::Full).unwrap();
         assert!(full.subjects[0].harness.is_some());
         assert_eq!(full.subjects[0].claims.len(), 2);
         SUBJECT_REDUCTIONS.with(|count| count.set(0));
@@ -39666,7 +39989,7 @@ observer "ordered/file" {
         store.terminal_resource_status_at(None, cut, true).unwrap();
         assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
         let full = store
-            .status_for_claim_kind_at("runtime.observed", Some(cut), true)
+            .status_for_claim_kind_at("runtime.observed", Some(cut), true, ClaimsReduction::Full)
             .unwrap();
         assert!(full.subjects[0].harness.is_some());
         assert!(full.subjects[0].claims.len() > 1);
@@ -39696,7 +40019,8 @@ observer "ordered/file" {
             cache.card_statuses.clear();
             for n in 0..AGENT_CARD_STATUS_LIMIT {
                 cache.card_statuses.insert(format!("agent/fill/{n}"), StatusEntry {
-                    read_at: cut, owners: Vec::new(), status: first.subjects[0].clone(), action: None,
+                    read_at: cut, owners: Vec::new(), claims: ClaimsReduction::AgentCard,
+                    status: first.subjects[0].clone(), action: None,
                 });
             }
         }
@@ -39759,12 +40083,12 @@ mission "card-owner" state="ready" {
         let index = store.index().unwrap();
         let expired = smallclaims::read_budget::ReadBudget::new("/parallel-status", std::time::Duration::ZERO);
         smallclaims::read_budget::with(Some(expired), || {
-            let error = store.status_for_subject_names_at(names.clone(), index, true).unwrap_err();
+            let error = store.status_for_subject_names_at(names.clone(), index, true, ClaimsReduction::Full).unwrap_err();
             assert_eq!(smallclaims::error::typed(error).code, "read-deadline");
         });
         let eligible = smallclaims::read_budget::ReadBudget::new("/parallel-status", std::time::Duration::from_secs(15));
         let result = smallclaims::read_budget::with(Some(eligible.clone()), || {
-            store.status_for_subject_names_at(names, index, true)
+            store.status_for_subject_names_at(names, index, true, ClaimsReduction::Full)
         }).unwrap();
         assert_eq!(result.subjects.len(), 65);
         assert!(!eligible.expired());
@@ -39793,7 +40117,7 @@ mission "card-owner" state="ready" {
                 worker_store.readers.request_read(|| {
                     worker_store.read_snapshot(|cut| {
                         worker_store.readers.request_read(|| {
-                            worker_store.status_for_subject_names_at(names, cut, true)
+                            worker_store.status_for_subject_names_at(names, cut, true, ClaimsReduction::Full)
                         })?
                     })
                 })?
@@ -39840,7 +40164,7 @@ mission "card-owner" state="ready" {
                 );
                 let result = smallclaims::read_budget::with(Some(budget), || {
                     store.readers.request_read(|| {
-                        store.status_for_subject_names_at(names.clone(), cut, history)
+                        store.status_for_subject_names_at(names.clone(), cut, history, ClaimsReduction::Full)
                     })
                 }).unwrap().unwrap();
                 assert_eq!(result.subjects.len(), names.len());
@@ -39882,7 +40206,7 @@ mission "card-owner" state="ready" {
         assert_eq!(current_runtimes(&store), (live.clone(), 1));
         // The view is the current layer of the full reduction.
         let full = store
-            .status_for_claim_kind_at("runtime.observed", None, true)
+            .status_for_claim_kind_at("runtime.observed", None, true, ClaimsReduction::Summary)
             .unwrap();
         assert_eq!(full.subjects.len(), 121);
         let current_layer = full
@@ -39944,7 +40268,12 @@ mission "card-owner" state="ready" {
                 let view = |store: &Store| {
                     serde_json::to_value(
                         store
-                            .status_for_claim_kind_at("runtime.observed", None, history)
+                            .status_for_claim_kind_at(
+                                "runtime.observed",
+                                None,
+                                history,
+                                ClaimsReduction::Summary,
+                            )
                             .unwrap(),
                     )
                     .unwrap()
@@ -39977,7 +40306,12 @@ mission "card-owner" state="ready" {
             .unwrap();
         let harness_state = |store: &Store| {
             store
-                .status_for_claim_kind_at("runtime.observed", None, false)
+                .status_for_claim_kind_at(
+                    "runtime.observed",
+                    None,
+                    false,
+                    ClaimsReduction::Summary,
+                )
                 .unwrap()
                 .subjects
                 .into_iter()
@@ -58388,9 +58722,13 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             }
         }
         for cut in [historical, store.index().unwrap()] {
-            let status = store
-                .status_for_subject_names_at(BTreeSet::from([subject.into()]), cut, true)
-                .unwrap();
+            let status = store.status_for_subject_names_at(
+                BTreeSet::from([subject.into()]),
+                cut,
+                true,
+                ClaimsReduction::Full,
+            )
+            .unwrap();
             let actual = &status
                 .subjects
                 .iter()
@@ -58400,6 +58738,393 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             let expected = full_canonical_claim_id_oracle(&store.readers.get(), subject, Some(cut));
             assert_eq!(actual, &expected);
             assert_eq!(actual.last(), expected.last());
+        }
+    }
+
+    /// `count` claims for one subject over a handful of writers, batches and replica
+    /// positions, with accepted times drawn from a set far smaller than the claim count so
+    /// canonical tie groups appear everywhere, including across the session-dating window.
+    fn seeded_claim_summary_fixture(connection: &Connection, seed: u64, count: usize) {
+        let mut create = String::from(
+            "CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
+             CREATE TABLE claims(id TEXT PRIMARY KEY, subject TEXT, kind TEXT, batch_id TEXT,
+                                 store_index INTEGER, accepted_at_unix_ms TEXT);
+             CREATE INDEX claims_subject_accepted_index ON claims
+                 (subject, length(accepted_at_unix_ms), accepted_at_unix_ms);
+             CREATE TABLE replica_records(claim_id TEXT, position INTEGER);",
+        );
+        for writer in 0..3 {
+            create.push_str(&format!(
+                "INSERT INTO batches VALUES ('batch-{writer}','writer-{writer}',{writer});"
+            ));
+        }
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let times = [
+            "9", "10", "11", "99", "100", "1000",
+            "340282366920938463463374607431768211455",
+        ];
+        for index in 0..count {
+            let time = times[(next() % times.len() as u64) as usize];
+            let batch = format!("batch-{}", next() % 3);
+            create.push_str(&format!(
+                "INSERT INTO claims VALUES ('claim-{index:06}','agent/target','runtime.observed','{batch}',{},'{time}');",
+                index + 1
+            ));
+            if next() % 2 == 0 {
+                create.push_str(&format!(
+                    "INSERT INTO replica_records VALUES ('claim-{index:06}',{});",
+                    next() % 7
+                ));
+            }
+        }
+        // Claims of other subjects must never leak into the subject's answers.
+        create.push_str(
+            "INSERT INTO claims VALUES ('elsewhere','agent/other','runtime.observed','batch-0',0,'10');",
+        );
+        connection.execute_batch(&create).unwrap();
+    }
+
+    #[test]
+    fn claims_summary_equals_the_full_canonical_vector_at_every_cut() {
+        for seed in 0..24 {
+            let counts = [0, 1, 2, 7, 40];
+            for count in counts {
+                let connection = Connection::open_in_memory().unwrap();
+                seeded_claim_summary_fixture(&connection, seed, count);
+                for cut in [None, Some(1), Some(count as u64 / 2), Some(count as u64)] {
+                    let full = full_canonical_claim_id_oracle(&connection, "agent/target", cut);
+                    assert_eq!(
+                        claim_ids_at(&connection, "agent/target", cut).unwrap(),
+                        full,
+                        "seed {seed}, count {count}"
+                    );
+                    let summary =
+                        claims_summary_at(&connection, "agent/target", cut).unwrap();
+                    assert_eq!(
+                        summary.latest,
+                        full.last().cloned(),
+                        "latest, seed {seed}, count {count}"
+                    );
+                    assert_eq!(
+                        summary.first,
+                        full.first().cloned(),
+                        "first, seed {seed}, count {count}"
+                    );
+                    assert_eq!(
+                        summary.count,
+                        full.len(),
+                        "count, seed {seed}, count {count}"
+                    );
+                    for window in 1..=(count + 2) {
+                        assert_eq!(
+                            window_boundary_at(
+                                &connection,
+                                "agent/target",
+                                cut.unwrap_or(i64::MAX as u64),
+                                window,
+                            )
+                            .unwrap(),
+                            (full.len() >= window)
+                                .then(|| full[window - 1].clone()),
+                            "window {window}, seed {seed}, count {count}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn claims_summary_resolves_the_real_session_window_inside_a_crossing_tie() {
+        let connection = Connection::open_in_memory().unwrap();
+        // The window edge lands inside a wide tie group: only canonical ordering decides the
+        // boundary, exactly what the full vector resolves claim by claim.
+        let mut fixture = String::from(
+            "CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
+             CREATE TABLE claims(id TEXT PRIMARY KEY, subject TEXT, kind TEXT, batch_id TEXT,
+                                 store_index INTEGER, accepted_at_unix_ms TEXT);
+             CREATE INDEX claims_subject_accepted_index ON claims
+                 (subject, length(accepted_at_unix_ms), accepted_at_unix_ms);
+             CREATE TABLE replica_records(claim_id TEXT, position INTEGER);
+             INSERT INTO batches VALUES ('a','writer-a',1),('b','writer-b',2);",
+        );
+        for index in 0..(SESSION_CLAIMS + 4) {
+            // One claim before the window, a tie group spanning it, one claim after.
+            let (time, batch) = if index < SESSION_CLAIMS - 3 {
+                ("10", "a")
+            } else if index < SESSION_CLAIMS + 2 {
+                ("12", if index % 2 == 0 { "a" } else { "b" })
+            } else {
+                ("340282366920938463463374607431768211455", "a")
+            };
+            fixture.push_str(&format!(
+                "INSERT INTO claims VALUES ('claim-{index:06}','agent/target','runtime.observed','{batch}',{},'{time}');
+                 INSERT INTO replica_records VALUES ('claim-{index:06}',{});",
+                index + 1,
+                (index % 5) as u64
+            ));
+        }
+        connection.execute_batch(&fixture).unwrap();
+        let full = full_canonical_claim_id_oracle(&connection, "agent/target", None);
+        assert_eq!(full.len(), SESSION_CLAIMS + 4);
+        let summary = claims_summary_at(&connection, "agent/target", None).unwrap();
+        assert_eq!(summary.count, full.len());
+        assert_eq!(summary.latest, full.last().cloned());
+        assert_eq!(
+            summary.session_boundary,
+            Some(full[SESSION_CLAIMS - 1].clone()),
+            "the boundary is the window's own canonical id, not a physical neighbor"
+        );
+    }
+
+    #[test]
+    fn summary_status_matches_full_status_for_every_internal_decision() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.summary";
+        let mut historical = 0;
+        for round in 0..6 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        json!(if round % 2 == 0 { "running" } else { "waiting" }),
+                    )]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if round == 2 {
+                historical = store.index().unwrap();
+            }
+        }
+        for cut in [historical, store.index().unwrap()] {
+            let full = store
+                .status_for_subject_names_at(
+                    BTreeSet::from([subject.into()]),
+                    cut,
+                    true,
+                    ClaimsReduction::Full,
+                )
+                .unwrap()
+                .subjects
+                .remove(0);
+            let summary = store
+                .status_for_subject_names_at(
+                    BTreeSet::from([subject.into()]),
+                    cut,
+                    true,
+                    ClaimsReduction::Summary,
+                )
+                .unwrap()
+                .subjects
+                .remove(0);
+            assert!(
+                summary.claims.is_empty(),
+                "a summary reduction carries no vector"
+            );
+            // The agent card's fallback revision.
+            assert_eq!(
+                summary
+                    .desired_revision
+                    .clone()
+                    .or_else(|| summary.claims_summary.latest.clone()),
+                full.desired_revision
+                    .clone()
+                    .or_else(|| full.claims.last().cloned())
+            );
+            // The session list's dating boundary, including its gate on the claim count.
+            assert_eq!(
+                summary.claims_summary.session_boundary,
+                (full.claims.len() > SESSION_CLAIMS)
+                    .then(|| full.claims[SESSION_CLAIMS - 1].clone())
+            );
+            assert_eq!(summary.claims_summary.count, full.claims.len());
+            assert_eq!(
+                summary.claims_summary.latest,
+                full.claims.last().cloned()
+            );
+        }
+    }
+
+    #[test]
+    fn full_status_stays_full_after_summary_reductions_share_the_caches() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.caches";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some("person/avery".into()),
+                fields: BTreeMap::from([("status".into(), json!("running"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let index = store.index().unwrap();
+        let summarized = store
+            .status_for_subject_prefix_at(
+                "agent/",
+                Some(index),
+                true,
+                ClaimsReduction::Summary,
+            )
+            .unwrap()
+            .subjects
+            .remove(0);
+        assert!(summarized.claims.is_empty());
+        // The public reduction still carries the whole vector at the same index, through the
+        // caches the summary reduction just shared.
+        let public = store.status_at(Some(subject), None, Some(index)).unwrap();
+        let public = public.subjects.iter().find(|row| row.subject == subject).unwrap();
+        assert_eq!(
+            public.claims,
+            full_canonical_claim_id_oracle(&store.readers.get(), subject, Some(index))
+        );
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let back = store
+            .status_for_subject_prefix_at(
+                "agent/",
+                Some(index),
+                true,
+                ClaimsReduction::Summary,
+            )
+            .unwrap()
+            .subjects
+            .remove(0);
+        assert!(back.claims.is_empty());
+        assert_eq!(back.claims_summary.latest, public.claims.last().cloned());
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+        store.status_at(Some(subject), None, Some(index)).unwrap();
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn forgetting_views_invalidates_every_status_reduction_mode() {
+        let store = Store::open_memory("node").unwrap();
+        observe_runtime(&store, "agent/cache/forget", "running", "one");
+        let cut = store.index().unwrap();
+        let modes = [
+            ClaimsReduction::Full,
+            ClaimsReduction::Summary,
+            ClaimsReduction::Runtime,
+            ClaimsReduction::AgentCard,
+        ];
+        let read = |mode| {
+            store
+                .status_for_subject_prefix_at("agent/", Some(cut), true, mode)
+                .unwrap()
+        };
+        for mode in modes {
+            read(mode);
+        }
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        for mode in modes {
+            read(mode);
+        }
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+        store.forget_current_views();
+        for mode in modes {
+            SUBJECT_REDUCTIONS.with(|count| count.set(0));
+            read(mode);
+            assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 1, "{mode:?}");
+        }
+    }
+
+
+    /// Run against a reflink-copied live store only:
+    /// `CLAIM_SUMMARY_BENCH=/path/to/copy.sqlite3 cargo test -p st3 --lib claim_summary -- --ignored --nocapture`.
+    /// Alternates full and summary reductions of the same subject at the same cut so both
+    /// answers measure one store, one index and one page cache.
+    #[test]
+    #[ignore = "points at a copied live store through CLAIM_SUMMARY_BENCH"]
+    fn claim_summary_bench_subject_status_at_on_a_copied_store() {
+        let path = std::env::var("CLAIM_SUMMARY_BENCH").unwrap_or_default();
+        if path.is_empty() {
+            return;
+        }
+        let store = Store::open(std::path::Path::new(&path), "bench-node").unwrap();
+        let index = store.index().unwrap();
+        let subjects = std::env::var("CLAIM_SUMMARY_BENCH_SUBJECTS")
+            .unwrap_or_else(|_| {
+                "agent/dotfiles/manager,agent/dotfiles/deployer,agent/dotfiles/smalltalk-graph,daemon/mbp2025".into()
+            })
+            .split(',')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let iterations = 30;
+        let percentile = |samples: &mut Vec<f64>, fraction: f64| {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[((samples.len() as f64 - 1.0) * fraction) as usize]
+        };
+        println!("subject\tclaims\tfull p50 ms\tfull p95 ms\tsummary p50 ms\tsummary p95 ms");
+        for subject in subjects {
+            let connection = store.readers.get();
+            let claims = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM claims WHERE subject=?1",
+                    [&subject],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            let mut full = Vec::new();
+            let mut summary = Vec::new();
+            for round in 0..iterations {
+                let start = std::time::Instant::now();
+                let (status, _) = subject_status_at(
+                    &connection,
+                    &subject,
+                    Some(index),
+                    None,
+                    ClaimsReduction::Full,
+                )
+                .unwrap()
+                .expect("the live subject reduces");
+                let full_ms = start.elapsed().as_secs_f64() * 1e3;
+                let start = std::time::Instant::now();
+                let (summarized, _) = subject_status_at(
+                    &connection,
+                    &subject,
+                    Some(index),
+                    None,
+                    ClaimsReduction::Summary,
+                )
+                .unwrap()
+                .expect("the live subject reduces");
+                let summary_ms = start.elapsed().as_secs_f64() * 1e3;
+                if round > 0 {
+                    full.push(full_ms);
+                    summary.push(summary_ms);
+                }
+                // Both answers must agree where internal readers look.
+                assert_eq!(summarized.claims_summary.first, status.claims.first().cloned());
+                assert_eq!(summarized.claims_summary.latest, status.claims.last().cloned());
+                assert_eq!(summarized.claims_summary.count, status.claims.len());
+                assert_eq!(
+                    summarized.claims_summary.session_boundary,
+                    (status.claims.len() > SESSION_CLAIMS)
+                        .then(|| status.claims[SESSION_CLAIMS - 1].clone())
+                );
+            }
+            println!(
+                "{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}",
+                subject,
+                claims,
+                percentile(&mut full, 0.5),
+                percentile(&mut full, 0.95),
+                percentile(&mut summary, 0.5),
+                percentile(&mut summary, 0.95)
+            );
         }
     }
 

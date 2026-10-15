@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound the per-subject history cost of internal status reductions: agent cards, session lists and runtime/host projections read a canonical claims summary instead of every claim id.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay change. The summary is a read-side reduction over the same accepted-time index and canonical claim keys."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention or fleet coordination change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, protocol or harness contract change. /v1/status and terminal listings still serialize the full canonical claims vector; summaries are proven equal to the vector's latest id, count and session window boundary at every cut."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required after upgrading."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

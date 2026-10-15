@@ -423,7 +423,7 @@ mod tests {
 
     fn oracle(store: &Store, at: u64) -> Owners {
         store
-            .status_for_subject_prefix_at("agent/", Some(at), true)
+            .status_for_subject_prefix_at("agent/", Some(at), true, crate::store::ClaimsReduction::Full)
             .unwrap()
             .subjects
             .into_iter()

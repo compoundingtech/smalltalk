@@ -3679,12 +3679,14 @@ fn runtime_resources_for_owner(
             BTreeSet::from([owner.to_owned()]),
             snapshot.store_index,
             history,
+            crate::store::ClaimsReduction::Runtime,
         )?
     } else {
         state.store.status_for_claim_kind_at(
             "runtime.observed",
             Some(snapshot.store_index),
             history,
+            crate::store::ClaimsReduction::Runtime,
         )?
     };
     runtime_resources_from_status(state, snapshot, session, status)
@@ -3702,7 +3704,7 @@ fn runtime_resources_for_id(
         include_owner.then_some(id),
         snapshot.store_index,
     )?;
-    let status = state.store.status_for_subject_names_at(subjects, snapshot.store_index, true)?;
+    let status = state.store.status_for_subject_names_at(subjects, snapshot.store_index, true, crate::store::ClaimsReduction::Runtime)?;
     Ok(runtime_resources_from_status(state, snapshot, session, status)?
         .into_iter()
         .filter(|runtime| runtime["id"] == id || (include_owner && runtime["owner_id"] == id))
@@ -4328,10 +4330,12 @@ fn machine_resources_and_hosts(
         .collect::<BTreeSet<_>>();
     host_ids.extend(configured_hosts.iter().cloned());
     host_ids.extend(host_runtime_ids.keys().cloned());
-    let status =
-        state
-            .store
-            .status_for_subject_prefix_at("host/", Some(snapshot.store_index), history)?;
+    let status = state.store.status_for_subject_prefix_at(
+        "host/",
+        Some(snapshot.store_index),
+        history,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     let mut host_statuses = status
         .subjects
         .into_iter()
@@ -10043,6 +10047,7 @@ fn validate_message_session(
             BTreeSet::from([recipient.clone()]),
             snapshot.store_index,
             false,
+            crate::store::ClaimsReduction::Summary,
         )
         .map_err(ApiError::internal)?;
     let current_session = status
@@ -18852,7 +18857,7 @@ mission "example/zero-run" state="ready" {
         append("agent/retired", json!({"status":"stopped", "runtime_id":"old", "incarnation_id":"retired"}));
         let current = state.store.index().unwrap();
         for index in [before, current] {
-            let roster = state.store.status_for_subject_prefix_at("agent/", Some(index), true).unwrap();
+            let roster = state.store.status_for_subject_prefix_at("agent/", Some(index), true, crate::store::ClaimsReduction::Full).unwrap();
             for subject in roster.subjects {
                 let exact = state.store.status_history(Some(&subject.subject), None, Some(index)).unwrap();
                 assert_eq!(serde_json::to_value(&exact.subjects[0]).unwrap(), serde_json::to_value(&subject).unwrap());
@@ -18922,7 +18927,7 @@ mission "example/zero-run" state="ready" {
         }
         state.store.forget_current_views();
         for index in snapshots {
-            let roster = state.store.status_for_subject_prefix_at("agent/", Some(index), true).unwrap();
+            let roster = state.store.status_for_subject_prefix_at("agent/", Some(index), true, crate::store::ClaimsReduction::Full).unwrap();
             let subject = &roster.subjects[0];
             let fields = subject.actual.as_ref().map(|actual| actual.get("fields").unwrap_or(actual)).unwrap();
             let incarnation = fields.get("incarnation_id").and_then(Value::as_str)
@@ -22123,6 +22128,61 @@ mission "example/zero-run" state="ready" {
         assert_eq!(runtime_detail(
             State(state), Extension(pinned), Extension(session), AxumPath("shared".into()),
         ).await.unwrap().0, expected);
+    }
+
+    #[test]
+    fn runtime_roster_fixed_page_cost_ignores_subject_history() {
+        crate::profile::init_from_env();
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "runtime-perf");
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let mut previous = None;
+        let mut written = 0;
+        for history in [32, 512, 7_900] {
+            for index in written..history {
+                state.store.append_claim(&ClaimInput {
+                    subject: "agent/runtime-perf".into(),
+                    kind: if index == 0 { "runtime.observed" } else { "harness.diagnostic" }.into(),
+                    actor: Some("agent/runtime-perf".into()),
+                    fields: serde_json::from_value(if index == 0 {
+                        json!({"runtime_id": "fixed-runtime", "status": "running", "terminal": false})
+                    } else {
+                        json!({"code": "retained-diagnostic", "reason": format!("retained diagnostic {index}")})
+                    }).unwrap(),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            written = history;
+            let snapshot = new_client_snapshot(&state);
+            let measure = |mode| {
+                state.store.forget_current_views();
+                let profile = crate::profile::Op::start(
+                    format!("GET /v1/client/runtimes?limit=100 history={history} mode={mode:?}"), None,
+                );
+                let entered = crate::profile::enter(profile.as_ref());
+                let started = std::time::Instant::now();
+                let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
+                let status = state.store.status_for_claim_kind_at(
+                    "runtime.observed", Some(snapshot.store_index), false, mode,
+                ).unwrap();
+                let resources = runtime_resources_from_status(&state, &snapshot, &session, status).unwrap();
+                let cost = scope.finish();
+                let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                drop(entered);
+                if let Some(profile) = profile { profile.finish(); }
+                (resources, cost, elapsed)
+            };
+            let (before, old_cost, before_ms) = measure(crate::store::ClaimsReduction::Full);
+            let (after, cost, after_ms) = measure(crate::store::ClaimsReduction::Runtime);
+            assert_eq!(before, after);
+            assert_eq!(after.len(), 1, "fixed live roster fits the fixed 100-item page");
+            eprintln!("runtime-roster history={history} page=100 live=1 before_ms={before_ms:.3} after_ms={after_ms:.3} before={old_cost:?} after={cost:?}");
+            if let Some(prior) = previous {
+                assert!(cost.vm_steps <= prior + 500, "runtime roster work grew with history: {prior} -> {cost:?}");
+            }
+            assert!(old_cost.vm_steps > cost.vm_steps, "full-history negative oracle: {old_cost:?} vs {cost:?}");
+            previous = Some(cost.vm_steps);
+        }
     }
 
     #[tokio::test]

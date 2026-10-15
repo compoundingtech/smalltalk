@@ -364,7 +364,7 @@ pub(in crate::api) fn published_machines(
         Some(held) => match store.summary_machines_hold(held.cut, index)? {
             Some(changed) if changed.is_empty() => Some((held.machines, held.runtimes)),
             Some(changed) => {
-                let status = store.status_for_subject_names_at(changed.clone(), index, false)?;
+                let status = store.status_for_subject_names_at(changed.clone(), index, false, crate::store::ClaimsReduction::Runtime)?;
                 let hosts = runtime_resources_from_status(state, snapshot, session, status)?
                     .into_iter()
                     .filter_map(|runtime| {

@@ -389,7 +389,7 @@ impl Store {
         Ok(entries)
     }
 
-    /// The agent card status ([`SubjectStatusMode::AgentCard`]) of each of `subjects` at
+    /// The agent card status ([`ClaimsReduction::AgentCard`]) of each of `subjects` at
     /// `store_index`, read a chunk at a time.
     pub(super) fn agent_card_statuses(
         &self,
@@ -403,8 +403,8 @@ impl Store {
         let (single, batched): (Vec<_>, Vec<_>) =
             subjects.iter().cloned().partition(|subject| subject.starts_with("arrangement/"));
         for subject in single {
-            let status = subject_status_at_with_mode(
-                connection, &subject, Some(store_index), None, SubjectStatusMode::AgentCard,
+            let status = subject_status_at(
+                connection, &subject, Some(store_index), None, ClaimsReduction::AgentCard,
             )?
             .expect("a reduction without an owner filter always has a status");
             statuses.insert(subject, status);
@@ -503,6 +503,10 @@ impl Store {
                     actual,
                     actual_source,
                     harness: None,
+                    claims_summary: ClaimsSummary {
+                        latest: claims.first().cloned(),
+                        ..Default::default()
+                    },
                     claims,
                     conflicts: Vec::new(),
                     unknown_claim,

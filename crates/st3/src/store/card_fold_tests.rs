@@ -36,8 +36,8 @@ fn per_subject_card_status(
                     .history
         })
         .map(|name| {
-            subject_status_at_with_mode(
-                connection, name, Some(index), None, SubjectStatusMode::AgentCard,
+            subject_status_at(
+                connection, name, Some(index), None, ClaimsReduction::AgentCard,
             )
             .unwrap()
             .unwrap()
@@ -73,8 +73,8 @@ pub(super) fn assert_card_fold_parity(store: &Store, indexes: &[u64]) {
                 .agent_card_statuses(&connection, &names, index, &mut reads)
                 .unwrap();
             for name in &names {
-                let (status, action) = subject_status_at_with_mode(
-                    &connection, name, Some(index), None, SubjectStatusMode::AgentCard,
+                let (status, action) = subject_status_at(
+                    &connection, name, Some(index), None, ClaimsReduction::AgentCard,
                 )
                 .unwrap()
                 .unwrap();
@@ -111,8 +111,8 @@ fn assert_card_reads_parity(store: &Store, names: &[String], index: u64) {
     let selected = names
         .iter()
         .map(|name| {
-            let (status, _) = subject_status_at_with_mode(
-                &connection, name, Some(index), None, SubjectStatusMode::AgentCard,
+            let (status, _) = subject_status_at(
+                &connection, name, Some(index), None, ClaimsReduction::AgentCard,
             )
             .unwrap()
             .unwrap();

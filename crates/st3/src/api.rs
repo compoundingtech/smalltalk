@@ -3059,7 +3059,12 @@ fn client_agent_resources_uncached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    let status = store.status_for_subject_prefix_at(
+        "agent/",
+        Some(snapshot_index),
+        history,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     client_agent_resources_from_status(store, history, snapshot_index, None, status)
 }
 
@@ -3392,7 +3397,7 @@ fn client_agent_cards_presented(
             let revision = subject
                 .desired_revision
                 .clone()
-                .or_else(|| subject.claims.last().cloned())
+                .or_else(|| subject.claims_summary.latest.clone())
                 .unwrap_or_else(|| format!("agent/{}", subject.subject));
             let queue = queues.queues
                 .get(&subject.subject)
@@ -3534,8 +3539,6 @@ fn managed_session_owner_for_subject_at(
     })
 }
 
-/// Bound the legacy runtime-only scan; incarnation dating uses two index seeks instead.
-const SESSION_CLAIMS: usize = 10_000;
 
 fn client_session_resources(
     store: &Arc<Store>,
@@ -3662,7 +3665,12 @@ fn managed_session_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<(Vec<Value>, BTreeSet<String>)> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    let status = store.status_for_subject_prefix_at(
+        "agent/",
+        Some(snapshot_index),
+        history,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     let mut sessions = Vec::new();
     for subject in status
         .subjects
@@ -3705,17 +3713,19 @@ fn managed_session_resources(
         };
         // Keep the old page bound only for runtime-only identities, which scan subject history.
         // Incarnation spans are index-bounded and must include incarnations after that page.
+        // The summary's boundary is set exactly while the count passes the window.
         let through_claim = subject
-            .claims
-            .get(SESSION_CLAIMS - 1)
-            .filter(|_| incarnation.is_none() && subject.claims.len() > SESSION_CLAIMS);
+            .claims_summary
+            .session_boundary
+            .as_deref()
+            .filter(|_| incarnation.is_none());
         let mut accepted_times = store
             .runtime_claim_span_at(
                 &subject.subject,
                 incarnation,
                 runtime,
                 snapshot_index,
-                through_claim.map(String::as_str),
+                through_claim,
             )?
             .map(|(first, last)| vec![first, last])
             .unwrap_or_default();
@@ -3736,7 +3746,7 @@ fn managed_session_resources(
             None => subject
                 .actual_claim
                 .as_deref()
-                .or_else(|| subject.claims.first().map(String::as_str))
+                .or(subject.claims_summary.first.as_deref())
                 .map(|id| store.claim_by_id(id))
                 .transpose()?
                 .flatten()
@@ -17124,6 +17134,7 @@ fn normalize_message_party(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SESSION_CLAIMS;
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
@@ -26880,7 +26891,12 @@ mission "wake" state="ready" {
                 let cards = client_agent_resources_selected(store, false, index, None)?;
                 assert_eq!(Sha256::digest(serde_json::to_vec(&cards)?),
                     Sha256::digest(serde_json::to_vec(&full)?));
-                let status = store.status_for_subject_prefix_at("agent/", Some(index), false)?;
+                let status = store.status_for_subject_prefix_at(
+                    "agent/",
+                    Some(index),
+                    false,
+                    crate::store::ClaimsReduction::Full,
+                )?;
                 let declared = status.subjects.iter().find(|s| s.subject == "agent/node.declared").unwrap();
                 assert_eq!(cards.iter().find(|c| c["id"] == declared.subject).unwrap()["revision"],
                     declared.desired_revision.as_ref().unwrap().as_str());
@@ -26905,7 +26921,7 @@ mission "wake" state="ready" {
         let full = client_agent_resources_uncached(store, false, index).unwrap();
         let cards = client_agent_resources_selected(store, false, index, None).unwrap();
         assert_eq!(Sha256::digest(serde_json::to_vec(&cards).unwrap()),
-            Sha256::digest(serde_json::to_vec(&full).unwrap()));
+            Sha256::digest(serde_json::to_vec(&full).unwrap()), "cards={cards:?}\nfull={full:?}");
         assert_eq!(cards.iter().find(|c| c["id"] == "agent/undeclared").unwrap()["revision"],
             runtime.id);
     }
