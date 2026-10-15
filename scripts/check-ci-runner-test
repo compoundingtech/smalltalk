@@ -37,6 +37,9 @@ def check(name, pages, expected=None, api=True, **overrides):
         gh.chmod(0o755)
         output, summary, calls = (tmp / n for n in ("output", "summary", "calls"))
         output.touch()
+        if isinstance(pages, list):
+            total = sum(len(page.get('runners', [])) for page in pages if isinstance(page, dict))
+            pages = [dict(page, total_count=total) if isinstance(page, dict) and 'total_count' not in page else page for page in pages]
         env = {
             **os.environ,
             "PATH": f"{tmp}:{os.environ['PATH']}",
@@ -137,7 +140,9 @@ check("merge chooses the common priority role on either host", [{'runners': [ci2
       'ci1-priority', EVENT='merge_group')
 check("release chooses the same common priority role", [{'runners': [ci2_priority]}],
       'ci1-priority', EVENT='push', MODE='priority')
-overflow = 'namespace-profile-linux-x86-64;job.priority=1;github.run-id=123'
+overflow_profile = 'namespace-profile-linux-x86-64;job.priority=1;github.run-id=123'
+overflow_shape = ['nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1', 'namespace-features:github.run-id=123']
+overflow = {'ci1': overflow_shape, 'ci1_profile': [overflow_profile]}
 check("saturated merge overflows on a positive census", [{'runners':[runner('ci1-priority',busy=True)]}],
       overflow, EVENT='merge_group',MERGE_OVERFLOW='on')
 check("below initial three-job capacity overflows", [{'runners':[ci2_priority]}],
@@ -163,7 +168,7 @@ check("overflow does not redirect a release", [], 'ci1-priority',
 dual = runner('ci1'); dual['labels'].append({'name': 'ci1-priority'})
 check("priority dual-labelled worker cannot serve two jobs", [{'runners': [dual]}],
       'ci1-priority', PR_LABELS='["ci-priority"]')
-check("duplicate pages do not create another slot", [{'runners': [dual]}, {'runners': [dual]}], 'ci1')
+check("duplicate pages do not create another slot", [{'runners': [dual]}, {'runners': [dual]}])
 conflict = dict(dual, busy=True)
 check("conflicting runner identity fails closed", [{'runners': [dual, conflict]}])
 check("fork cannot use common pool metadata", [{'runners': [ci2_worker]}],
@@ -231,7 +236,7 @@ for path in ("main-upkeep.yml",):
     assert ";job.priority=10" not in generated, path
 for path in ("public-repo.yml", "release-daily.yml", "release-smalltalk.yml", "macos.yml"):
     generated = (ROOT / ".github/workflows" / path).read_text()
-    assert "namespace-features:" not in generated, (path, "profile workflows must use inline controls")
+    assert all("namespace-features:" not in line for line in generated.splitlines() if line.lstrip().startswith(("runs-on:", "runner:"))), (path, "profile routing must use inline controls")
 release = (ROOT / ".github/workflows/release-smalltalk.yml").read_text()
 assert "github.event_name != 'pull_request' && (needs['pick-runner'].outputs.ci1" in release
 assert 'runner: macos-15' in release and 'namespace-profile-linux-x86-64;job.priority=2;github.run-id=${{ github.run_id }}' in release
@@ -254,6 +259,7 @@ def route(job, event, profile='', picked='', merge_ci1='', merge_picked='', part
     expression = expression.replace('needs.pick-runner.outputs.merge_ci1', repr(merge_picked))
     expression = expression.replace('needs.pick-runner.outputs.merge_primary', repr(partial_primary))
     expression = expression.replace('needs.pick-runner.outputs.merge_mail', repr(partial_mail))
+    expression = expression.replace('needs.pick-runner.outputs.ci1_profile', repr(merge_picked))
     expression = re.sub(r'needs\.pick-runner\.outputs\.ci1(?:_secondary|_mail)?', repr(picked), expression)
     expression = expression.replace('github.event_name', repr(event)).replace('github.run_id', '123').replace('vars.CI_MERGE_NAMESPACE_PROFILE', repr(profile)).replace('vars.CI_MERGE_CI1', repr(merge_ci1))
     return eval(expression.replace('&&', ' and ').replace('||', ' or '), {'__builtins__': {}}, {'fromJSON': json.loads, 'format': lambda template, *args: template.format(*args)})
@@ -382,3 +388,95 @@ for step in ('Download this run attempt’s successful test build', 'Verify sour
         assert 'CI_OUTAGE_FAST_QUEUE' not in tail.split('\n      - ', 1)[0], (step, 'required artifacts and evidence must remain available')
 print('passed: outage merge-group cache saves skip only while enabled; ordinary events, guards and artifacts unchanged')
 print("passed: bounded test shards, reserved primary lane, idle general slots, Namespace fallback, and required aggregation")
+
+# A stage overflow must not route isolation-vm onto the non-KVM shape.
+for job in ('linux-test-build','linux-clippy','linux-fleet-compat','linux-tests','linux-tests-shard-2','linux-tests-shard-3','linux-tests-shard-4','mail-redelivery-canaries'):
+    assert route(job,'merge_group',picked=json.dumps(overflow_shape),merge_picked=json.dumps([overflow_profile])) == overflow_shape,job
+assert route('isolation-vm','merge_group',picked=json.dumps(overflow_shape),merge_picked=json.dumps([overflow_profile])) == [overflow_profile]
+nix=(ROOT/'.github/workflows/nix.yml').read_text()
+assert '&& (false) }}' in nix and 'tags:' not in nix, 'optional Nix stays off merge-serving runners and release tags'
+print('passed: stage overflow uses 8x16; only VM uses KVM profile; optional Nix off shared pool')
+
+# Exercise the advisory reader's actual IO boundary with no network or credentials.
+import runpy
+from unittest.mock import patch
+read_queues = runpy.run_path(str(ROOT / 'scripts/ci-pick-runner'))['queue_waits']
+assert (ROOT/'scripts/ci-pick-runner').read_text() in script, 'generated picker must embed the exact reader source'
+from datetime import datetime, timezone, timedelta
+stamp = (datetime.now(timezone.utc)-timedelta(minutes=12)).isoformat()
+run_row = dict(id=17,run_attempt=1,head_sha='current')
+job_row = dict(id=18,run_attempt=1,head_sha='current',status='queued',created_at=stamp,labels=['ci1-priority'])
+def queue_fixture(env=None, change=None, failure=None):
+    calls=[]
+    def io(argv, **kw):
+        calls.append(argv[-1])
+        assert kw['env']['GH_TOKEN']=='repo-reader', 'never use the org token to read repository queues'
+        assert 0 < kw['timeout'] <= 8
+        if failure: raise failure
+        path=argv[-1]
+        data=({'resources':{'core':{'remaining':900}}} if path=='rate_limit' else
+              {'total_count':1,'workflow_runs':[run_row]} if 'status=queued' in path else
+              {'total_count':0,'workflow_runs':[]} if 'status=in_progress' in path else
+              {'total_count':1,'jobs':[dict(job_row)]})
+        if change:data=change(path,data)
+        return subprocess.CompletedProcess(argv,0,json.dumps(data),'')
+    with patch('subprocess.run',side_effect=io):
+        result=read_queues({'REPOSITORY':'example/project','GH_REPO_TOKEN':'repo-reader','GH_TOKEN':'org-reader',**(env or {})})
+    return result,calls
+result,calls=queue_fixture()
+assert result[0]['owned']>=719 and result[0]['namespace']==0 and len(calls)==6
+for error in (subprocess.TimeoutExpired('gh',1),OSError('unavailable'),ValueError('invalid')):
+    assert queue_fixture(failure=error)[0][0] is None
+for change in (
+    lambda path,d: dict(d,total_count=2) if 'workflow_runs' in d else d,
+    lambda path,d: dict(d,jobs=[dict(job_row,head_sha='changed')]) if 'jobs' in d else d,
+    lambda path,d: dict(d,jobs=[dict(job_row,created_at='bad')]) if 'jobs' in d else d,
+    lambda path,d: dict(d,jobs=[dict(job_row,labels=[None])]) if 'jobs' in d else d,
+    lambda path,d: dict(d,total_count=25,workflow_runs=[dict(run_row,id=i) for i in range(25)]) if 'status=queued' in path else d,
+):
+    assert queue_fixture(change=change)[0][0] is None
+for env in ({'GH_REPO_TOKEN':''},{'REPOSITORY':'../other'}):
+    result,calls=queue_fixture(env=env);assert result[0] is None and calls==[]
+result,calls=queue_fixture(change=lambda path,d:dict(d,jobs=[dict(job_row,labels=['namespace-profile-linux-x86-64;job.priority=2'])]) if 'jobs' in d else d)
+assert result[0]['namespace']>=719 and result[0]['owned']==0
+print('passed: advisory complete queue snapshot, provider waits, separate credential, timeout/malformed/changed/over-budget fail-open')
+
+picker_main = runpy.run_path(str(ROOT/'scripts/ci-pick-runner'))['main']
+def actual_admission(owned_age, namespace_age, event):
+    with tempfile.TemporaryDirectory() as scratch:
+        tmp=Path(scratch); out=tmp/'out'; summary=tmp/'summary'
+        env={'EVENT':event,'REPOSITORY':'example/project','HEAD_REPOSITORY':'example/project',
+             'OWNER':'example','GH_TOKEN':'org-reader','GH_REPO_TOKEN':'repo-reader',
+             'GITHUB_OUTPUT':str(out),'GITHUB_STEP_SUMMARY':str(summary),'RUN_ID':'123',
+             'MERGE_OVERFLOW':'on','MERGE_NEED':'3','NEED':'1','PR_LABELS':'[]'}
+        now=datetime.now(timezone.utc)
+        def io(argv,**kw):
+            path=argv[-1]
+            if path=='rate_limit':data={'resources':{'core':{'remaining':900}}}
+            elif path.startswith('orgs/'):
+                workers=[runner('ci1-priority') for _ in range(3)]+[runner('ci1')]
+                data=[{'total_count':4,'runners':workers}]
+            elif 'status=queued' in path:data={'total_count':1,'workflow_runs':[run_row]}
+            elif 'status=in_progress' in path:data={'total_count':0,'workflow_runs':[]}
+            else:
+                jobs=[dict(job_row,id=i,created_at=(now-timedelta(seconds=age)).isoformat(),labels=[label])
+                      for i,age,label in [(1,owned_age,'ci1-priority'),(2,namespace_age,'nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=2')]]
+                data={'total_count':2,'jobs':jobs}
+            return subprocess.CompletedProcess(argv,0,json.dumps(data),'')
+        with patch.dict(os.environ,env,clear=True),patch('subprocess.run',side_effect=io):picker_main()
+        return {k:json.loads(v) for k,v in (line.split('=',1) for line in out.read_text().splitlines())}
+assert actual_admission(1200,0,'merge_group')==overflow
+assert actual_admission(0,1200,'merge_group')=={'ci1':['ci1-priority']}
+assert actual_admission(1200,0,'pull_request')=={}
+assert actual_admission(0,1200,'pull_request')=={'ci1':['ci1']}
+print('passed: actual picker reverses merge/PR placement when measured queue direction flips, keeping reserved roles')
+
+for quota in (299,0,None,True):
+    result,calls=queue_fixture(change=lambda path,d: {'resources':{'core':{'remaining':quota}}} if path=='rate_limit' else d)
+    assert result[0] is None and calls==['rate_limit'], 'low or invalid repo quota never spends queue requests'
+seen_quota=[900,299]
+def falling_quota(path,data):
+    return {'resources':{'core':{'remaining':seen_quota.pop(0)}}} if path=='rate_limit' else data
+result,calls=queue_fixture(change=falling_quota)
+assert result[0] is None and len(calls)==3 and calls[-1]=='rate_limit', 'quota must be rechecked during the snapshot'
+print('passed: reserve 300 repository requests; low/invalid/falling quota stops advisory reads without retry')

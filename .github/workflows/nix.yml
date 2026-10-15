@@ -4,8 +4,6 @@
 name: Nix
 
 on:
-  push:
-    tags: ["**"]
   schedule:
     - cron: 17 1 * * *
   workflow_dispatch: {}
@@ -19,7 +17,7 @@ concurrency:
 
 jobs:
   nix-release-x86_64-linux:
-    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (false) }}
     runs-on: ci1
     timeout-minutes: 180
     steps:

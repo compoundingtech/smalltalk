@@ -73,10 +73,10 @@ use GitHub-hosted `ubuntu-latest`, keeping lightweight checks off reserved build
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-By default, required merge-group producers, the first two test shards, supporting Rust jobs, canaries and VM jobs use `ci1-priority` on either host. Merge shards 3 and 4 use the common `ci1-merge` role. An overflowed group uses its one selected Namespace profile for all these jobs.
+By default, required merge-group producers, the first two test shards, supporting Rust jobs, canaries and VM jobs use `ci1-priority` on either host. Merge shards 3 and 4 use the common `ci1-merge` role. An overflowed group uses the existing Namespace 8x16 shape for build/test stages and the existing KVM profile for isolation-vm. Both label forms retain priority 1 and the same run affinity; every consumer still uses its own exact-source producer archive.
 A GitHub-hosted picker reads the common group3 role census; unavailable metadata retains the
 existing priority role. GitHub chooses the physical host. The PR opt-in variable never disables merge picking.
-With `CI_MERGE_OVERFLOW` unset or off, they wait for owned capacity. Overflow uses the existing Namespace profile only when that switch is on and the qualified census is below its admission minimum.
+Merge overflow is enabled by default. `CI_MERGE_OVERFLOW=off` restores the owned-only admission policy. A positive complete runner census below the admission minimum selects Namespace; missing or malformed runner metadata retains the owned role.
 Main, tag and manual Linux releases use the same owned priority lane; release PR validation
 uses Namespace priority 2, preserving the self-hosted fork boundary. Native Mac releases and
 installer checks use standard GitHub-hosted `macos-15` (ARM64); Linux installer/assembly/publish
@@ -584,15 +584,54 @@ of `CI1_RUNNERS`; by default this is `ci1-priority` on either physical host.
 Existing running work is not preempted;
 the host controller must retain its release/merge-first classification and bounded reservations.
 `CI_MERGE_CI1` and `CI_MERGE_NAMESPACE_PROFILE` no longer redirect required merge jobs.
-`CI_MERGE_OVERFLOW=on` lets a merge group use the existing Linux Namespace
-profile when a valid group-3 census has fewer than `CI_MERGE_MIN_IDLE` idle
-priority runners (default three, for the initial producer, Clippy and fleet
-compatibility jobs). All required jobs follow the same picker output, with
-Namespace priority 1 and affinity to that run. An unset switch keeps the owned
-priority lane. Invalid metadata, an invalid minimum or run ID, and missing
-credentials retain that lane; they do not establish saturation. Priority PRs
-and releases keep their reservations. This changes admission capacity, not
-tests, required contexts, timeouts, cache provenance or resource caps.
+The picker measures capacity again for each new run rather than depending on an
+hourly manual switch. `CI_MERGE_OVERFLOW` defaults to `on`; `off` is the rollback.
+A complete group-3 census with fewer than `CI_MERGE_MIN_IDLE` idle priority
+runners (default three for producer, Clippy and compatibility) selects Namespace.
+It also takes an advisory snapshot of queued and in-progress repository runs:
+oldest queued job age by requested owned/Namespace label, not a billing or
+provider-wide capacity measurement. When owned work is over five minutes old
+and Namespace's oldest queue is at least a minute shorter, a merge overflows
+rather than adding work to the older owned queue. Ordinary PRs prefer Namespace
+when its queue is at least a minute shorter; when Namespace backs up they can
+use distinct positively idle general workers on either host. Reserved priority
+and merge-only roles never become ordinary PR fallback slots.
+
+The advisory read is bounded to 24 live runs, 100 jobs per run, 40 seconds total
+and eight seconds per request, using only the job's repository token with
+`actions:read`. Each charged advisory request first checks the token's free
+`rate_limit` endpoint and refuses the snapshot below a reserve of 300 requests;
+a missing or malformed balance is UNKNOWN too. Idle-role decisions that cannot
+benefit from queue data skip it entirely, as do priority release pickers.
+The reserve is a non-atomic safety margin shared with concurrent repository
+jobs, not an exclusive quota reservation. At the observed 07:30–08:30Z rate,
+33 Workspace runs/hour is a conservative picker upper bound (draft/skipped
+pickers included): 33 × 26 = 858 extra core requests/hour worst case out of
+1,000; merge groups alone were 7 × 26 = 182. That is why the guard, early exit
+and bounded reads are necessary rather than treating 26 calls as cheap. Incomplete counts, changed run/attempt/head, invalid data, API
+failure or a larger live inventory makes the advisory view UNKNOWN and logs
+that limitation; it never holds jobs. The existing idle-role policy then
+applies. No polling loop, dispatch, rerun, label write or admission lock occurs.
+Concurrent pickers can see the same snapshot and overshoot a pool; this is advisory admission, not an atomic reservation. Use CI_MERGE_OVERFLOW=off to restore owned-only merges. Queue age is not an assigned start wait. A complete runner view is required to
+infer saturation; an unavailable org reader still retains the owned role.
+
+Overflow build/test jobs use the established 8x16 shape; isolation-vm alone
+uses the KVM profile through `ci1_profile`. This avoids serializing all stages
+behind the smaller VM-profile limit. Profiles keep inline run-id controls;
+shape labels keep the separate namespace-features run-id label. Priority PRs
+and releases retain their existing policy. The provisioned PR fair-share cap
+remains a separate inactive-until-qualified change; these observations do not
+invent that profile or enforce a live count limit.
+
+Already-created GitHub jobs keep their requested labels, so this admission
+policy affects new decisions and does not migrate or restart queued work.
+Nix's optional persistent-store workflow is disabled on the shared pool,
+including schedule and manual jobs; release-tag triggers are removed. Its
+persistent-Cargo-home/cache proof cannot be moved to an unqualified ephemeral
+image by changing a label. Restore it only through a reviewed dedicated
+persistent-store placement, preserving exact native qualification and cache
+semantics. Cancelled partial proofs remain incomplete rather than passes.
+
 Genie, TypeScript and the aggregate remain on GitHub-hosted Ubuntu.
 The declared ci1 pool is five general workers (including one reserved priority worker) and one
 merge worker, with dynamic label lending. The current source run used `ci1-5` with

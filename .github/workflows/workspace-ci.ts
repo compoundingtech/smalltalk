@@ -56,9 +56,10 @@ export const pickRunnerJob = {
   // GitHub-hosted, so the choice never waits for either pool it chooses between.
   'runs-on': 'ubuntu-latest',
   'timeout-minutes': 3,
-  permissions: { 'pull-requests': 'read' },
+  permissions: { 'pull-requests': 'read', actions: 'read' },
   outputs: {
     ci1: '${{ steps.pick.outputs.ci1 }}',
+    ci1_profile: '${{ steps.pick.outputs.ci1_profile }}',
     ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
     ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
   },
@@ -69,13 +70,14 @@ export const pickRunnerJob = {
       env: {
         // A token that may only read the organization's self-hosted runners. Forks never receive it.
         GH_TOKEN: '${{ secrets.CI1_RUNNERS_READ_TOKEN }}',
+        GH_REPO_TOKEN: '${{ github.token }}',
         EVENT: '${{ github.event_name }}',
         REPOSITORY: '${{ github.repository }}',
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
         PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
         OWNER: '${{ github.repository_owner }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
-        MERGE_OVERFLOW: '${{ vars.CI_MERGE_OVERFLOW }}',
+        MERGE_OVERFLOW: "${{ vars.CI_MERGE_OVERFLOW || 'on' }}",
         MERGE_NEED: "${{ vars.CI_MERGE_MIN_IDLE || '3' }}",
         RUN_ID: '${{ github.run_id }}',
       },
@@ -92,6 +94,7 @@ export const priorityRunnerJob = {
 } as const
 
 // Every required merge job follows one pool decision, including explicit overflow.
+const mergeProfileLabels = `github.event_name == 'merge_group' && (needs.${pickRunnerJobId}.outputs.ci1_profile || needs.${pickRunnerJobId}.outputs.ci1 || '["ci1-priority"]')`
 const mergeCi1Labels = `github.event_name == 'merge_group' && (needs.${pickRunnerJobId}.outputs.ci1 || '["ci1-priority"]')`
 const pickedOr = (namespaceLabels: string, output = 'ci1') =>
   `\${{ fromJSON(${mergeCi1Labels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
@@ -132,7 +135,7 @@ export const linuxRunsOn = pickedOr(
 )
 
 /** Supporting merge jobs use the priority lane; supporting PR jobs use Namespace. */
-export const supportingLinuxRunsOn = `\${{ fromJSON(${mergeCi1Labels} || ${namespaceLabels(linuxRunner)}) }}`
+export const supportingLinuxRunsOn = `\${{ fromJSON(${mergeProfileLabels} || ${namespaceLabels(linuxRunner)}) }}`
 export const supportingStageRunsOn = `\${{ fromJSON(${mergeCi1Labels} || ${namespaceLabels(linuxStageRunner)}) }}`
 
 /** A job that needs `pick-runner` still runs when it was skipped (ci1 off). */
