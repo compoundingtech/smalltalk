@@ -204,7 +204,14 @@ def aggregate(path):
     """
     needs = json.loads(env('NEEDS_JSON') or '{}')
     # The gate jobs only feed the skip check below; they are not part of the recorded command or results.
-    results = {name: str(entry.get('result', 'unknown')) for name, entry in sorted(needs.items()) if not name.startswith('evidence-gate-')}
+    results = {name: str(entry.get('result', 'unknown')) for name, entry in sorted(needs.items())
+               if not name.startswith('evidence-gate-') and name != 'test-tier'}
+    # The test tier this run executed. Anything but the whole selection is part of the recorded COMMAND (`tier-fast`), so a note
+    # signed from a FAST run can never equal the policy's command for the full gate and no check that needs the full gate can
+    # accept it: the verifier compares the command exactly. Unknown or empty means `all`, which is what the shards ran.
+    tier = str(((needs.get('test-tier') or {}).get('outputs') or {}).get('tier') or 'all')
+    if not tier.replace('-', '').isalnum():
+        raise Refused(f'not recording: the test tier {tier!r} is not a plain name')
     gate = env('GATE_JOB', 'linux-gate')
     if gate not in results:
         raise Refused(f'the {gate!r} job is not among the needed jobs, so there is no verdict to record')
@@ -224,13 +231,14 @@ def aggregate(path):
     if not_run:
         raise Refused(f'not recording: {", ".join(not_run)} did not run in this workflow run (skipped), so it did not test this tree itself')
     facts = {
-        'command': [gate, 'aggregate', *results],
+        'command': [gate, 'aggregate', *results, *([] if tier == 'all' else [f'tier-{tier}'])],
         'exit_code': 0 if results[gate] == 'success' else 1,
         'output': {'gate': results[gate], 'needs': results},
         'inputs': {
             'run_id': env('GITHUB_RUN_ID'), 'run_attempt': env('GITHUB_RUN_ATTEMPT'), 'event_name': env('GITHUB_EVENT_NAME'),
             'ref': env('GITHUB_REF'), 'run_started_at': env('RUN_STARTED_AT'), 'workflow': env('GITHUB_WORKFLOW'),
             'needed_jobs': ','.join(results), 'stage_results': ','.join(f'{n}={r}' for n, r in results.items()),
+            'test_tier': tier,
         },
     }
     facts['inputs'] = {k: v for k, v in facts['inputs'].items() if v}

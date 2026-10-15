@@ -244,6 +244,17 @@ with tempfile.TemporaryDirectory() as directory:
     assert helper('aggregate', str(out), env=dict(NEEDS_JSON=json.dumps(shards), GITHUB_EVENT_NAME='merge_group')).returncode == 1
     missing = helper('aggregate', str(out), env=dict(NEEDS_JSON=json.dumps({'linux-tests': {'result': 'success'}})))
     assert missing.returncode == 1 and 'no verdict' in missing.stdout
+    # The test tier is part of the recorded command when it is not the whole selection, and the tier job itself is never a stage.
+    base_command = ['linux-gate', 'aggregate', 'linux-clippy', 'linux-gate', 'linux-tests']
+    for outputs, command, tier in [({'tier': 'all'}, base_command, 'all'), ({}, base_command, 'all'), (None, base_command, 'all'),
+                                   ({'tier': 'fast'}, base_command + ['tier-fast'], 'fast')]:
+        with_tier = {**needs, 'test-tier': {'result': 'success', **({} if outputs is None else {'outputs': outputs})}}
+        assert helper('aggregate', str(out), env=dict(NEEDS_JSON=json.dumps(with_tier), GITHUB_EVENT_NAME='pull_request')).returncode == 0
+        recorded = json.loads(out.read_text())
+        assert recorded['command'] == command, (outputs, recorded['command'])
+        assert recorded['inputs']['test_tier'] == tier and 'test-tier' not in recorded['output']['needs'], outputs
+    odd = {**needs, 'test-tier': {'result': 'success', 'outputs': {'tier': 'fast; rm'}}}
+    assert helper('aggregate', str(out), env=dict(NEEDS_JSON=json.dumps(odd), GITHUB_EVENT_NAME='pull_request')).returncode == 1, 'a tier that is not a plain name is refused'
     print('passed: the aggregate note records the needed jobs and the gate job\'s own verdict, and refuses to invent one')
 
     # --- stage-facts: the log digest and status of a stage that already ran

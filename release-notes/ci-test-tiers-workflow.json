@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Pull requests run the FAST test tier; the HEAVY end-to-end tier is proven in the merge queue (forced onto a pull request by the tier:heavy label or by listed paths); a FAST run signs a note that never satisfies the full gate",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this changes CI test selection scripts and docs."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, wire or harness contract change. CI only: what a green pull request check proves changes (FAST tier at the pull request head, HEAVY in the merge group), and the evidence note of a FAST run carries tier-fast in its command."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No upgrade downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery procedure; remove the CI_TEST_TIER lines from the shard jobs to return to the whole selection on pull requests."
+  }
+}

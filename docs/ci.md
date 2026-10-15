@@ -221,8 +221,18 @@ end-to-end modules in `scripts/ci-test-tiers.json` (today the `st3` integration 
 `daemon_restart`, `fleet` and `messaging_faults`); FAST is defined as everything else, so a test cannot belong to neither. The
 partition applies after the tier filter, and the build and an archive are the same for every tier. `scripts/ci-test-partitions`
 proves that the two tiers are disjoint and together equal the whole selection, that neither is empty (a misspelled module would
-otherwise leave HEAVY empty and FAST everything), and that the shards of the fast tier cover it. Nothing selects a tier in a
-workflow yet: every job runs `all` until the workflow change that makes pull requests run FAST.
+otherwise leave HEAVY empty and FAST everything), and that the shards of the fast tier cover it.
+
+**What a green pull request means.** The `test-tier` job (no checkout, builds nothing, never fails) sets `CI_TEST_TIER` for the
+four test shards. A pull request runs FAST unless it carries the label named in `scripts/ci-test-tiers.json` (`tier:heavy`), changes
+a path matching the `escalate` patterns of that file read from the BASE commit (the heavy modules' own test files and fixtures, the
+scripts they run, the tier and CI configuration, and the replication, schema, store and generated-contract paths), or the diff
+cannot be read; merge groups, pushes and manual runs run `all`. So a green `linux-gate` on a pull request means build, clippy,
+fleet-compat, the canaries and the FAST tier passed, and the aggregate says `test tier: FAST` in its log and summary; the HEAVY
+tier is proven in the merge queue, which still requires it. A note signed from a FAST run records `tier-fast` in the COMMAND of the
+aggregate, so it never equals the full-gate command in `.st/evidence-skip-policy.json` and no check that needs the full gate accepts
+it (`evidence-verify-test` shows the rejection with a real note). Rollback: remove the `CI_TEST_TIER` lines from the shard jobs
+(or make the `test-tier` job print `all`); nothing else depends on the tier.
 
 New test files and paths are checked automatically by `genie-freshness` on each PR and
 merge group. A guard failure names each file and line and points its author to `test_env!`

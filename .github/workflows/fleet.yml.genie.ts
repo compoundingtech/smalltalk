@@ -497,6 +497,29 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
             path: '${{ runner.temp }}/ci-build-memory', 'if-no-files-found': 'warn', 'retention-days': 3 } },
       ],
     },
+    // Which test tier this run executes. A pull request runs FAST unless the tier:heavy label, a forcing path or an unreadable diff
+    // says otherwise; every other event runs everything. Never fails (an error means `all`). No checkout, builds nothing.
+    'test-tier': {
+      name: 'test-tier',
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 2,
+      permissions: { contents: 'read' },
+      outputs: { tier: '${{ steps.select.outputs.tier }}' },
+      steps: [
+        {
+          name: 'Select the test tier',
+          id: 'select',
+          env: {
+            EVENT: '${{ github.event_name }}',
+            REMOTE: '${{ github.server_url }}/${{ github.repository }}.git',
+            BASE_SHA: '${{ github.event.pull_request.base.sha }}',
+            HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
+            LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
+          },
+          run: `python3 - <<'PY'\n${readFileSync(new URL('../../scripts/ci-test-tier-select', import.meta.url), 'utf8').trimEnd()}\nPY`,
+        },
+      ],
+    },
     // Four merge partitions (two for other events) reuse the one producer archive.
     // `linux-gate` below is the single required check that collects them.
     'linux-tests': {
@@ -507,11 +530,11 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         runsOn: primaryTestRunsOn,
         // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults and a failed
         // boot canary's evidence under target/boot-canaries.
-        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: "${{ github.event_name == 'merge_group' && 'hash:1/4' || 'hash:1/2' }}", CI_TEST_THREADS: '8' },
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: "${{ github.event_name == 'merge_group' && 'hash:1/4' || 'hash:1/2' }}", CI_TEST_THREADS: '8', CI_TEST_TIER: "${{ needs.test-tier.outputs.tier || 'all' }}" },
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
         before: [nixDevelopStep({ name: 'Prove shards form the complete selected inventory', command: ['python3', 'scripts/ci-test-partitions'] })],
       }),
-      needs: [pickRunnerJobId, 'linux-test-build'],
+      needs: [pickRunnerJobId, 'linux-test-build', 'test-tier'],
       if: "${{ !cancelled() }}",
     },
     'linux-tests-shard-2': {
@@ -520,30 +543,30 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         stage: 'tests',
         runsOn: secondaryStageRunsOn,
         setup: testArchiveConsumerSetup,
-        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: "${{ github.event_name == 'merge_group' && 'hash:2/4' || 'hash:2/2' }}", CI_TEST_THREADS: '8' },
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: "${{ github.event_name == 'merge_group' && 'hash:2/4' || 'hash:2/2' }}", CI_TEST_THREADS: '8', CI_TEST_TIER: "${{ needs.test-tier.outputs.tier || 'all' }}" },
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
       }),
-      needs: [pickRunnerJobId, 'linux-test-build'],
+      needs: [pickRunnerJobId, 'linux-test-build', 'test-tier'],
       if: "${{ !cancelled() }}",
     },
     'linux-tests-shard-3': {
       ...linuxStageJob({
         name: 'linux-tests-shard-3', stage: 'tests', setup: testArchiveConsumerSetup,
         runsOn: extraMergeTestRunsOn,
-        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:3/4', CI_TEST_THREADS: '8' },
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:3/4', CI_TEST_THREADS: '8', CI_TEST_TIER: "${{ needs.test-tier.outputs.tier || 'all' }}" },
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
       }),
-      needs: [pickRunnerJobId, 'linux-test-build'],
+      needs: [pickRunnerJobId, 'linux-test-build', 'test-tier'],
       if: "${{ !cancelled() && github.event_name == 'merge_group' }}",
     },
     'linux-tests-shard-4': {
       ...linuxStageJob({
         name: 'linux-tests-shard-4', stage: 'tests', setup: testArchiveConsumerSetup,
         runsOn: extraMergeTestRunsOn,
-        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:4/4', CI_TEST_THREADS: '8' },
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:4/4', CI_TEST_THREADS: '8', CI_TEST_TIER: "${{ needs.test-tier.outputs.tier || 'all' }}" },
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
       }),
-      needs: [pickRunnerJobId, 'linux-test-build'],
+      needs: [pickRunnerJobId, 'linux-test-build', 'test-tier'],
       if: "${{ !cancelled() && github.event_name == 'merge_group' }}",
     },
     'linux-clippy': linuxStageJob({
@@ -577,7 +600,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     },
     'linux-gate': {
       name: 'linux-gate',
-      needs: [pickRunnerJobId, 'evidence-gate-linux-gate', 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
+      needs: [pickRunnerJobId, 'evidence-gate-linux-gate', 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries', 'test-tier'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
       // Aggregation needs no build caches and must not queue behind the work it summarizes.
@@ -587,7 +610,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         {
           name: 'Require every Linux stage to pass',
           // The stages only: pick-runner is skipped whenever ci1 is off.
-          env: { GATE_SKIP: '${{ needs.evidence-gate-linux-gate.outputs.skip }}', RESULTS: aggregateStages.map((id) => `\${{ needs.${id}.result }}`).join(' '), EVENT: '${{ github.event_name }}', MERGE_RESULTS: '${{ needs.linux-tests-shard-3.result }} ${{ needs.linux-tests-shard-4.result }}' },
+          env: { GATE_SKIP: '${{ needs.evidence-gate-linux-gate.outputs.skip }}', TIER: '${{ needs.test-tier.outputs.tier }}', RESULTS: aggregateStages.map((id) => `\${{ needs.${id}.result }}`).join(' '), EVENT: '${{ github.event_name }}', MERGE_RESULTS: '${{ needs.linux-tests-shard-3.result }} ${{ needs.linux-tests-shard-4.result }}' },
           run: `set -eu
 set -- $RESULTS
 [ "$#" = 7 ] || { echo "incomplete base-stage results"; exit 1; }
@@ -597,6 +620,12 @@ if [ "$EVENT" = merge_group ]; then
   RESULTS="$RESULTS $MERGE_RESULTS"
 else
   [ "$MERGE_RESULTS" = "skipped skipped" ] || { echo "extra shards must be merge-only"; exit 1; }
+fi
+if [ "\${TIER:-all}" = fast ]; then
+  echo "test tier: FAST (boot_canaries, messaging_faults, convergence, fleet and daemon_restart are proven in the merge queue)"
+  echo "Test tier: **FAST**. The heavy tier (boot_canaries, messaging_faults, convergence, fleet, daemon_restart) is proven in the merge queue; add the tier:heavy label to run it on this pull request." >> "$GITHUB_STEP_SUMMARY"
+else
+  echo "test tier: all"
 fi
 echo "stage results: $RESULTS (evidence skip: \${GATE_SKIP:-none})"
 position=0
@@ -621,7 +650,7 @@ done`,
     // key. The signer scripts come from the BASE commit of the change, never from the tree under test.
     'evidence-note-linux-gate': {
       name: 'evidence-note-linux-gate',
-      needs: ['linux-gate', 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries', ...evidenceStepNames, 'evidence-gate-linux-gate', 'evidence-gate-mail-redelivery-canaries', 'evidence-gate-isolation-vm', 'evidence-gate-genie-freshness', 'evidence-gate-typescript-client'],
+      needs: ['linux-gate', 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries', 'test-tier', ...evidenceStepNames, 'evidence-gate-linux-gate', 'evidence-gate-mail-redelivery-canaries', 'evidence-gate-isolation-vm', 'evidence-gate-genie-freshness', 'evidence-gate-typescript-client'],
       // The merge queue, main and pull requests from this repository sign; a fork never gets the key.
       if: "${{ always() && (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}",
       'runs-on': 'ubuntu-latest',
@@ -776,4 +805,4 @@ printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
     // workspace-ci embeds scripts/ci-fractal-web-changes; its consumed-input list is authoritative.
     ...fractalWebJobs,
   }),
-}, {"evidence-source": "Retains Git source objects only; builds nothing and has no signing key.", "pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing.", "evidence-note-linux-gate": "Signs the aggregate gate result from workflow context; builds nothing.", "fractal-web-changes": "Diffs two fetched commits without blobs and builds nothing.", "fractal-web": "Collects the detection and execution results and builds nothing.", "evidence-gate-linux-gate": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-typescript-client": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-isolation-vm": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-genie-freshness": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-mail-redelivery-canaries": "Verifies Git notes only; builds nothing and never skips a check."}))))
+}, {"evidence-source": "Retains Git source objects only; builds nothing and has no signing key.", "pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing.", "evidence-note-linux-gate": "Signs the aggregate gate result from workflow context; builds nothing.", "test-tier": "Diffs two fetched commits without blobs and builds nothing.", "fractal-web-changes": "Diffs two fetched commits without blobs and builds nothing.", "fractal-web": "Collects the detection and execution results and builds nothing.", "evidence-gate-linux-gate": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-typescript-client": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-isolation-vm": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-genie-freshness": "Verifies Git notes only; builds nothing and never skips a check.", "evidence-gate-mail-redelivery-canaries": "Verifies Git notes only; builds nothing and never skips a check."}))))

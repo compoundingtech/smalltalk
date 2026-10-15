@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Decide which test tier a Workspace CI run executes: `fast` or `all`.
+
+A pull request runs the FAST tier unless (a) it carries the label named in scripts/ci-test-tiers.json ("tier:heavy"), (b) it
+changes a path matching the `escalate` patterns of that file (the heavy modules' own test files and fixtures and the scripts
+they run, the tier and CI configuration, and the replication, schema, store and generated-contract paths whose breakage the
+heavy tier exists to find), or (c) the diff or the list cannot be determined. Every other event (merge group, push, manual,
+schedule) runs `all`. The list is read from the BASE commit, never from the pull request, so a pull request cannot shrink its
+own escalation; a pull request that edits the list matches its own pattern and runs `all` anyway.
+
+The job never fails: any error means `all` (more tests, never fewer). Outputs `tier` and `reason`."""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+SHA = re.compile(r"[0-9a-f]{40}")
+LIST = "scripts/ci-test-tiers.json"
+
+
+def pattern_regex(pattern):
+    parts = re.split(r"(\*\*|\*)", pattern)
+    body = "".join(".*" if part == "**" else "[^/]*" if part == "*" else re.escape(part) for part in parts)
+    return re.compile(body + r"\Z", re.DOTALL)
+
+
+def git(directory, *args):
+    return subprocess.run(["git", "-C", directory, *args], check=True, capture_output=True, text=True, timeout=60).stdout
+
+
+def escalation(document):
+    escalate = document["escalate"]
+    label, paths = escalate["label"], escalate["paths"]
+    if not (isinstance(label, str) and label and isinstance(paths, list) and paths and all(isinstance(p, str) and p for p in paths)):
+        raise ValueError(f"{LIST}: escalate needs a label and a nonempty list of path patterns")
+    return label, [pattern_regex(pattern) for pattern in paths]
+
+
+def diff(remote, base, head):
+    """The base's escalation list and the changed paths of the pull request from its merge base."""
+    for name, value in (("base", base), ("head", head)):
+        if not SHA.fullmatch(value):
+            raise ValueError(f"{name} SHA is missing or malformed: {value!r}")
+    with tempfile.TemporaryDirectory() as directory:
+        git(directory, "init", "--quiet")
+        git(directory, "fetch", "--quiet", "--no-tags", "--filter=blob:none", remote, base, head)
+        start = git(directory, "merge-base", base, head).strip()
+        if not SHA.fullmatch(start):
+            raise ValueError(f"no merge base for {base} and {head}")
+        document = json.loads(git(directory, "show", f"{base}:{LIST}"))
+        output = git(directory, "diff", "--name-only", "--no-renames", "-z", start, head)
+    return document, [path for path in output.split("\0") if path]
+
+
+def decide(event, labels, remote, base, head):
+    if event != "pull_request":
+        return "all", f"{event or 'unknown'} event: the whole selection runs"
+    try:
+        document, paths = diff(remote, base, head)
+        label, matchers = escalation(document)
+    except (ValueError, KeyError, TypeError, subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+        return "all", f"the escalation list or the diff could not be read, so everything runs: {detail[:200]}"
+    if label in labels:
+        return "all", f"the pull request carries the label {label}"
+    matched = [path for path in paths if any(matcher.match(path) for matcher in matchers)]
+    if matched:
+        shown = ", ".join(f"`{path}`" for path in matched[:5]) + (f" and {len(matched) - 5} more" if len(matched) > 5 else "")
+        return "all", f"the pull request changes paths that force the heavy tier: {shown}"
+    return "fast", f"{len(paths)} changed path(s), none forces the heavy tier and there is no {label} label; the heavy tier runs in the merge queue"
+
+
+def main():
+    try:
+        labels = json.loads(os.environ.get("LABELS") or "[]")
+        labels = [str(name) for name in labels] if isinstance(labels, list) else []
+        tier, reason = decide(os.environ.get("EVENT", ""), labels, os.environ.get("REMOTE", ""),
+                              os.environ.get("BASE_SHA", ""), os.environ.get("HEAD_SHA", ""))
+    except Exception as error:  # fail toward running more
+        tier, reason = "all", f"selection failed, so everything runs: {str(error)[:200]}"
+    reason = " ".join(reason.split())  # one line: a path or an error message must not add a second output
+    with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a") as output:
+        output.write(f"tier={tier}\nreason={reason}\n")
+    with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as summary:
+        summary.write(f"Test tier: **{tier}**. {reason}.\n" + ("" if tier == "all" else
+                      "The heavy tier (boot_canaries, messaging_faults, convergence, fleet, daemon_restart) is proven in the merge queue.\n"))
+    print(f"tier={tier} ({reason})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

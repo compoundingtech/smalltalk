@@ -1576,11 +1576,14 @@ class WorkflowStructure(unittest.TestCase):
         job = re.search(r'^  evidence-note-linux-gate:\n((?:    .*\n|\n)+)', text, re.M).group(1)
         needs = re.search(r'^    needs:\n((?:      - .*\n)+)', job, re.M).group(1)
         names = [line.strip()[2:] for line in needs.splitlines()]
-        derived = ['linux-gate', 'aggregate'] + sorted(n for n in names if not n.startswith('evidence-gate-'))
+        # `test-tier` is needed only for its output: the aggregate leaves it out of the stages and records the tier itself
+        # (`tier-fast` in the command when a run executed only the FAST tier), so a FAST note never equals this rule.
+        derived = ['linux-gate', 'aggregate'] + sorted(n for n in names if not n.startswith('evidence-gate-') and n != 'test-tier')
         policy = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
         self.assertEqual(policy['checks']['linux-gate']['kinds']['wrapper']['command'], derived)
         self.assertEqual(GATE_ARGV, derived)
         self.assertIn('linux-gate', names)
+        self.assertIn('test-tier', names)
         # Every real gate job is awaited, so a skip taken anywhere stops the note.
         self.assertEqual(sorted(n for n in names if n.startswith('evidence-gate-')),
                          sorted(f'evidence-gate-{c}' for c in CHECKS))

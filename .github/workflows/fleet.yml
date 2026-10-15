@@ -746,7 +746,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
           QUEUE_SHA: ${{ github.event.merge_group.head_sha }}
-          QUEUE_DEPENDENCIES: '{"pick-runner":[],"evidence-source":[],"evidence-gate-linux-gate":[],"evidence-gate-typescript-client":[],"evidence-gate-isolation-vm":[],"evidence-gate-genie-freshness":[],"evidence-gate-mail-redelivery-canaries":[],"upgrade-impact":[],"namespace-capacity":[],"genie-freshness":["pick-runner","evidence-gate-genie-freshness"],"typescript-client":["pick-runner","genie-freshness","evidence-gate-typescript-client"],"linux-test-build":["pick-runner","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"linux-tests":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-2":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-3":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-4":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-clippy":["pick-runner","evidence-gate-linux-gate"],"linux-fleet-compat":["pick-runner","evidence-gate-linux-gate"],"mail-redelivery-canaries":["pick-runner","linux-test-build","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries"],"linux-gate":["pick-runner","evidence-gate-linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"evidence-note-linux-gate":["linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","genie-freshness","typescript-client","isolation-vm","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm","evidence-gate-genie-freshness","evidence-gate-typescript-client"],"perf-cost":[],"isolation-vm":["pick-runner","linux-test-build","evidence-gate-isolation-vm"],"fractal-web-changes":[],"fractal-web-execution":["fractal-web-changes","genie-freshness"],"fractal-web":["fractal-web-changes","fractal-web-execution"]}'
+          QUEUE_DEPENDENCIES: '{"pick-runner":[],"evidence-source":[],"evidence-gate-linux-gate":[],"evidence-gate-typescript-client":[],"evidence-gate-isolation-vm":[],"evidence-gate-genie-freshness":[],"evidence-gate-mail-redelivery-canaries":[],"upgrade-impact":[],"namespace-capacity":[],"genie-freshness":["pick-runner","evidence-gate-genie-freshness"],"typescript-client":["pick-runner","genie-freshness","evidence-gate-typescript-client"],"linux-test-build":["pick-runner","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"test-tier":[],"linux-tests":["pick-runner","linux-test-build","test-tier","evidence-gate-linux-gate"],"linux-tests-shard-2":["pick-runner","linux-test-build","test-tier","evidence-gate-linux-gate"],"linux-tests-shard-3":["pick-runner","linux-test-build","test-tier","evidence-gate-linux-gate"],"linux-tests-shard-4":["pick-runner","linux-test-build","test-tier","evidence-gate-linux-gate"],"linux-clippy":["pick-runner","evidence-gate-linux-gate"],"linux-fleet-compat":["pick-runner","evidence-gate-linux-gate"],"mail-redelivery-canaries":["pick-runner","linux-test-build","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries"],"linux-gate":["pick-runner","evidence-gate-linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","test-tier","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"evidence-note-linux-gate":["linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","test-tier","genie-freshness","typescript-client","isolation-vm","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm","evidence-gate-genie-freshness","evidence-gate-typescript-client"],"perf-cost":[],"isolation-vm":["pick-runner","linux-test-build","evidence-gate-isolation-vm"],"fractal-web-changes":[],"fractal-web-execution":["fractal-web-changes","genie-freshness"],"fractal-web":["fractal-web-changes","fractal-web-execution"]}'
         run: |
           python3 - <<'QUEUE_WATCH_PY'
           #!/usr/bin/env python3
@@ -1328,9 +1328,130 @@ jobs:
         env:
           CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+  test-tier:
+    name: test-tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      tier: ${{ steps.select.outputs.tier }}
+    steps:
+      - name: Select the test tier
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          REMOTE: "${{ github.server_url }}/${{ github.repository }}.git"
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Decide which test tier a Workspace CI run executes: `fast` or `all`.
+
+          A pull request runs the FAST tier unless (a) it carries the label named in scripts/ci-test-tiers.json ("tier:heavy"), (b) it
+          changes a path matching the `escalate` patterns of that file (the heavy modules' own test files and fixtures and the scripts
+          they run, the tier and CI configuration, and the replication, schema, store and generated-contract paths whose breakage the
+          heavy tier exists to find), or (c) the diff or the list cannot be determined. Every other event (merge group, push, manual,
+          schedule) runs `all`. The list is read from the BASE commit, never from the pull request, so a pull request cannot shrink its
+          own escalation; a pull request that edits the list matches its own pattern and runs `all` anyway.
+
+          The job never fails: any error means `all` (more tests, never fewer). Outputs `tier` and `reason`."""
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+
+          SHA = re.compile(r"[0-9a-f]{40}")
+          LIST = "scripts/ci-test-tiers.json"
+
+
+          def pattern_regex(pattern):
+              parts = re.split(r"(\*\*|\*)", pattern)
+              body = "".join(".*" if part == "**" else "[^/]*" if part == "*" else re.escape(part) for part in parts)
+              return re.compile(body + r"\Z", re.DOTALL)
+
+
+          def git(directory, *args):
+              return subprocess.run(["git", "-C", directory, *args], check=True, capture_output=True, text=True, timeout=60).stdout
+
+
+          def escalation(document):
+              escalate = document["escalate"]
+              label, paths = escalate["label"], escalate["paths"]
+              if not (isinstance(label, str) and label and isinstance(paths, list) and paths and all(isinstance(p, str) and p for p in paths)):
+                  raise ValueError(f"{LIST}: escalate needs a label and a nonempty list of path patterns")
+              return label, [pattern_regex(pattern) for pattern in paths]
+
+
+          def diff(remote, base, head):
+              """The base's escalation list and the changed paths of the pull request from its merge base."""
+              for name, value in (("base", base), ("head", head)):
+                  if not SHA.fullmatch(value):
+                      raise ValueError(f"{name} SHA is missing or malformed: {value!r}")
+              with tempfile.TemporaryDirectory() as directory:
+                  git(directory, "init", "--quiet")
+                  git(directory, "fetch", "--quiet", "--no-tags", "--filter=blob:none", remote, base, head)
+                  start = git(directory, "merge-base", base, head).strip()
+                  if not SHA.fullmatch(start):
+                      raise ValueError(f"no merge base for {base} and {head}")
+                  document = json.loads(git(directory, "show", f"{base}:{LIST}"))
+                  output = git(directory, "diff", "--name-only", "--no-renames", "-z", start, head)
+              return document, [path for path in output.split("\0") if path]
+
+
+          def decide(event, labels, remote, base, head):
+              if event != "pull_request":
+                  return "all", f"{event or 'unknown'} event: the whole selection runs"
+              try:
+                  document, paths = diff(remote, base, head)
+                  label, matchers = escalation(document)
+              except (ValueError, KeyError, TypeError, subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+                  detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+                  return "all", f"the escalation list or the diff could not be read, so everything runs: {detail[:200]}"
+              if label in labels:
+                  return "all", f"the pull request carries the label {label}"
+              matched = [path for path in paths if any(matcher.match(path) for matcher in matchers)]
+              if matched:
+                  shown = ", ".join(f"`{path}`" for path in matched[:5]) + (f" and {len(matched) - 5} more" if len(matched) > 5 else "")
+                  return "all", f"the pull request changes paths that force the heavy tier: {shown}"
+              return "fast", f"{len(paths)} changed path(s), none forces the heavy tier and there is no {label} label; the heavy tier runs in the merge queue"
+
+
+          def main():
+              try:
+                  labels = json.loads(os.environ.get("LABELS") or "[]")
+                  labels = [str(name) for name in labels] if isinstance(labels, list) else []
+                  tier, reason = decide(os.environ.get("EVENT", ""), labels, os.environ.get("REMOTE", ""),
+                                        os.environ.get("BASE_SHA", ""), os.environ.get("HEAD_SHA", ""))
+              except Exception as error:  # fail toward running more
+                  tier, reason = "all", f"selection failed, so everything runs: {str(error)[:200]}"
+              reason = " ".join(reason.split())  # one line: a path or an error message must not add a second output
+              with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a") as output:
+                  output.write(f"tier={tier}\nreason={reason}\n")
+              with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as summary:
+                  summary.write(f"Test tier: **{tier}**. {reason}.\n" + ("" if tier == "all" else
+                                "The heavy tier (boot_canaries, messaging_faults, convergence, fleet, daemon_restart) is proven in the merge queue.\n"))
+              print(f"tier={tier} ({reason})")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Diffs two fetched commits without blobs and builds nothing.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (success()) }}
   linux-tests:
     name: linux-tests
-    needs: [pick-runner, linux-test-build, evidence-gate-linux-gate]
+    needs: [pick-runner, linux-test-build, test-tier, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled()) && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
     runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
@@ -1345,6 +1466,7 @@ jobs:
       CI_RUN_ID: ${{ github.run_id }}
       CI_TEST_PARTITION: ${{ github.event_name == 'merge_group' && 'hash:1/4' || 'hash:1/2' }}
       CI_TEST_THREADS: "8"
+      CI_TEST_TIER: ${{ needs.test-tier.outputs.tier || 'all' }}
       CI_CACHE_DEV_SHELL: default
     steps:
       - name: Require the shared test producer to succeed
@@ -1510,7 +1632,7 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-tests-shard-2:
     name: linux-tests-shard-2
-    needs: [pick-runner, linux-test-build, evidence-gate-linux-gate]
+    needs: [pick-runner, linux-test-build, test-tier, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled()) && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
     runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1_secondary) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
@@ -1525,6 +1647,7 @@ jobs:
       CI_RUN_ID: ${{ github.run_id }}
       CI_TEST_PARTITION: ${{ github.event_name == 'merge_group' && 'hash:2/4' || 'hash:2/2' }}
       CI_TEST_THREADS: "8"
+      CI_TEST_TIER: ${{ needs.test-tier.outputs.tier || 'all' }}
       CI_CACHE_DEV_SHELL: default
     steps:
       - name: Require the shared test producer to succeed
@@ -1687,7 +1810,7 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-tests-shard-3:
     name: linux-tests-shard-3
-    needs: [pick-runner, linux-test-build, evidence-gate-linux-gate]
+    needs: [pick-runner, linux-test-build, test-tier, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled() && github.event_name == 'merge_group') && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 == '["ci1-priority"]' && '["ci1-merge"]' || needs.pick-runner.outputs.ci1 || '["ci1-merge"]') }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
@@ -1702,6 +1825,7 @@ jobs:
       CI_RUN_ID: ${{ github.run_id }}
       CI_TEST_PARTITION: "hash:3/4"
       CI_TEST_THREADS: "8"
+      CI_TEST_TIER: ${{ needs.test-tier.outputs.tier || 'all' }}
       CI_CACHE_DEV_SHELL: default
     steps:
       - name: Require the shared test producer to succeed
@@ -1864,7 +1988,7 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-tests-shard-4:
     name: linux-tests-shard-4
-    needs: [pick-runner, linux-test-build, evidence-gate-linux-gate]
+    needs: [pick-runner, linux-test-build, test-tier, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled() && github.event_name == 'merge_group') && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 == '["ci1-priority"]' && '["ci1-merge"]' || needs.pick-runner.outputs.ci1 || '["ci1-merge"]') }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
@@ -1879,6 +2003,7 @@ jobs:
       CI_RUN_ID: ${{ github.run_id }}
       CI_TEST_PARTITION: "hash:4/4"
       CI_TEST_THREADS: "8"
+      CI_TEST_TIER: ${{ needs.test-tier.outputs.tier || 'all' }}
       CI_CACHE_DEV_SHELL: default
     steps:
       - name: Require the shared test producer to succeed
@@ -2682,6 +2807,7 @@ jobs:
       - linux-clippy
       - linux-fleet-compat
       - mail-redelivery-canaries
+      - test-tier
       - evidence-gate-mail-redelivery-canaries
       - evidence-gate-isolation-vm
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (always()) }}
@@ -2691,6 +2817,7 @@ jobs:
       - name: Require every Linux stage to pass
         env:
           GATE_SKIP: ${{ needs.evidence-gate-linux-gate.outputs.skip }}
+          TIER: ${{ needs.test-tier.outputs.tier }}
           RESULTS: "${{ needs.linux-test-build.result }} ${{ needs.upgrade-impact.result }} ${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}"
           EVENT: ${{ github.event_name }}
           MERGE_RESULTS: "${{ needs.linux-tests-shard-3.result }} ${{ needs.linux-tests-shard-4.result }}"
@@ -2705,6 +2832,12 @@ jobs:
             RESULTS="$RESULTS $MERGE_RESULTS"
           else
             [ "$MERGE_RESULTS" = "skipped skipped" ] || { echo "extra shards must be merge-only"; exit 1; }
+          fi
+          if [ "${TIER:-all}" = fast ]; then
+            echo "test tier: FAST (boot_canaries, messaging_faults, convergence, fleet and daemon_restart are proven in the merge queue)"
+            echo "Test tier: **FAST**. The heavy tier (boot_canaries, messaging_faults, convergence, fleet, daemon_restart) is proven in the merge queue; add the tier:heavy label to run it on this pull request." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "test tier: all"
           fi
           echo "stage results: $RESULTS (evidence skip: ${GATE_SKIP:-none})"
           position=0
@@ -2739,6 +2872,7 @@ jobs:
       - linux-clippy
       - linux-fleet-compat
       - mail-redelivery-canaries
+      - test-tier
       - genie-freshness
       - typescript-client
       - isolation-vm

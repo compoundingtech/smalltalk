@@ -525,6 +525,26 @@ class SkipPolicy(unittest.TestCase):
         self.observed(seconds=3, command=('make', 'test'))
         self.assertEqual(self.reason(), 'wrong_command')
 
+    def test_a_note_signed_from_a_fast_tier_run_is_rejected_for_the_full_gate_and_a_full_one_is_accepted(self):
+        # The aggregate job records `tier-fast` in the COMMAND of a note signed from a run that executed only the FAST tier
+        # (scripts/ci-evidence-signing aggregate). The committed policy's command for linux-gate is the full gate, compared
+        # exactly, so such a note can never satisfy it, in a merge group or as a skip. The signer and the bound input are
+        # the fixture's; the command is the committed policy's own.
+        committed = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
+        full = committed['checks']['linux-gate']['kinds']['wrapper']['command']
+        self.assertIn('aggregate', full)
+        self.assertNotIn('tier-fast', full)
+        doc = json.loads(policy_text())
+        doc['checks']['unit']['kinds']['wrapper']['command'] = full
+        rules = self.rules(json.dumps(doc))
+        self.wrapper(seconds=1, command=tuple(full))
+        self.assertEqual(self.f.verify(self.tree, rules=rules)[0], 0, 'the full-gate note satisfies the full-gate command')
+        fast_commit, fast_tree = self.f.commit('two')
+        self.f.note(fast_commit, fast_tree, self.ci, 'machine/ci1', runner='wrapper', seconds=2, command=tuple(full) + ('tier-fast',),
+                    inputs={'flake_lock_sha256': hashlib.sha256(b'two').hexdigest(), 'toolchain_sha256': 'f' * 64})
+        code, result = self.f.verify(fast_tree, rules=rules)
+        self.assertEqual((code, result['reason']), (1, 'wrong_command'), result)
+
     def test_a_kind_the_policy_does_not_list_is_unsupported(self):
         doc = json.loads(policy_text())
         del doc['checks']['unit']['kinds']['wrapper']
