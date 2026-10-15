@@ -19485,7 +19485,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             client, subject, &incarnation, &args.driver, args.seed.as_deref(), &sessions,
             st3::native_resume::requested().is_some(),
         ).await? {
-            argv = st3::native_resume::pi_family_argv("omp", argv, &sessions, &session)
+            argv = st3::native_resume::pi_family_argv("omp", argv, &sessions, &session, None)
                 .map_err(|refusal| anyhow::anyhow!("{}: {}", refusal.code, refusal.reason))?;
         }
         if let (Some(message), Some(id)) = (&args.initial_message, &args.initial_message_id) {
@@ -19591,7 +19591,7 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    let select = |argv: Vec<String>, session: &str| -> Result<_> {
+    let select = |argv: Vec<String>, session: &str, path: Option<&Path>| -> Result<_> {
         Ok(match driver {
             "claude" => st3::native_resume::claude_argv(
                 argv,
@@ -19604,6 +19604,7 @@ async fn run_st2_native_driver(
                 argv,
                 &paths.session_dir.join("provider-sessions"),
                 session,
+                path,
             ),
             "opencode" => st3::native_resume::opencode_argv(
                 argv,
@@ -19637,7 +19638,8 @@ async fn run_st2_native_driver(
                 .await);
             }
         }
-        match select(argv, &session)? {
+        let path = std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from);
+        match select(argv, &session, path.as_deref())? {
             Ok(argv) => {
                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
                 selected_session = Some(session);
@@ -19660,7 +19662,9 @@ async fn run_st2_native_driver(
                 path.as_deref(),
             );
         }
-        match select(argv.clone(), &session)? {
+        // A saved continuation path is not the strict import bootstrap selector.
+        // OMP restarts keep selecting their session by ID in the managed inventory.
+        match select(argv.clone(), &session, None)? {
             Ok(argv) => {
                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
                 selected_session = Some(session);
@@ -21873,6 +21877,8 @@ async fn report_native_session(
                 "session_id": session,
                 "path": path.map(|path| path.to_string_lossy().into_owned()),
                 "account_ref": std::env::var("ST3_ACCOUNT").ok(),
+                "desired_token": std::env::var(st3::suspension::LAUNCH_DESIRED_TOKEN_ENV)
+                    .ok().filter(|token| !token.is_empty()),
             }),
         )
         .await?;
@@ -22970,6 +22976,8 @@ impl PiFamilyReports {
                         "session_id": native,
                         "path": path,
                         "account_ref": std::env::var("ST3_ACCOUNT").ok(),
+                        "desired_token": std::env::var(st3::suspension::LAUNCH_DESIRED_TOKEN_ENV)
+                            .ok().filter(|token| !token.is_empty()),
                     }),
                 )
                 .await;

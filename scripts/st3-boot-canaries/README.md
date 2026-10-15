@@ -32,6 +32,10 @@ the original native UUID and the same transcript inode. With real OMP, an inspec
 also verifies the historical conversation loaded on both starts. The Rust test runs this in
 the Linux gate with the same zero-retry policy as the other boot canaries.
 
+The fixture accepts both OMP session-ID and exact-transcript-path resume selectors. The first
+launch selects by ID; the strict replacement selects its pinned transcript path. Both fixture
+receipts must name that same transcript and report a resumed session.
+
 The Codex-only `utf8` scenario starts and ends the bounded transcript window inside a euro sign,
 withholds live receipts so transcript recovery must release the next message, then forces a
 discovery I/O error. A live status update and receipt must still reach the same seat, and repeated

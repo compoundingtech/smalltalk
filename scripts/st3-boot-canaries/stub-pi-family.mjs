@@ -44,7 +44,7 @@ record('started', { argv: process.argv.slice(2), harness });
 
 // The session, kept as pi and omp keep it: `<time>_<id>.jsonl` in `--session-dir`, whose first line
 // names the session. pi resumes `--session PATH` (and starts a new session at a path that does not
-// exist); omp resumes `--resume ID` and refuses an ID it has no transcript for.
+// exist); omp resumes `--resume ID` or `--resume PATH` and refuses a missing transcript.
 const option = (name) => {
   const index = process.argv.indexOf(name);
   return index > 0 ? process.argv[index + 1] : undefined;
@@ -55,13 +55,15 @@ let sessionFile;
 let sessionId;
 if (harness === 'omp' && option('--resume')) {
   sessionId = option('--resume');
-  const name = fs.readdirSync(sessionDir).find((entry) => entry.endsWith(`_${sessionId}.jsonl`));
-  if (!name) {
+  const name = path.isAbsolute(sessionId) ? undefined
+    : fs.readdirSync(sessionDir).find((entry) => entry.endsWith(`_${sessionId}.jsonl`));
+  sessionFile = path.isAbsolute(sessionId) ? sessionId : name && path.join(sessionDir, name);
+  if (!sessionFile || !fs.existsSync(sessionFile)) {
     console.error(`Session ${sessionId} not found`);
     record('session-missing', { sessionId });
     process.exit(1);
   }
-  sessionFile = path.join(sessionDir, name);
+  sessionId = headerId(sessionFile);
 } else if (harness === 'pi' && option('--session') && fs.existsSync(option('--session'))) {
   sessionFile = option('--session');
   sessionId = headerId(sessionFile);
