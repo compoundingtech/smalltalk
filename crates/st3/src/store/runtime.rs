@@ -342,6 +342,15 @@ impl Runtime for SmalltalkRuntime {
         classify_replicated_claim_with_registry(claim, self.claim_registry())
     }
 
+    fn classify_replicated_claim_unbound(
+        &self,
+        _batch: &ReplicaBatch,
+        claim: &ClaimRecord,
+    ) -> Option<Result<ReplicatedClaimAdmission, St3Error>> {
+        // The registry is this build's schema, fixed for the process.
+        Some(classify_replicated_claim_with_registry(claim, self.claim_registry()))
+    }
+
     fn append_claim(
         &self,
         store: &GraphStore,

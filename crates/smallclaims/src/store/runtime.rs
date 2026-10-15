@@ -85,6 +85,18 @@ pub trait Runtime: Send + Sync {
         claim: &ClaimRecord,
     ) -> Result<ReplicatedClaimAdmission, Error>;
 
+    /// `classify_replicated_claim` for a runtime whose answer depends only on the claim and this
+    /// build, never on the store: admission then classifies before it takes the writer. `None`,
+    /// the default, means the runtime reads the store, and the claim is classified under the
+    /// writer as before.
+    fn classify_replicated_claim_unbound(
+        &self,
+        _batch: &ReplicaBatch,
+        _claim: &ClaimRecord,
+    ) -> Option<Result<ReplicatedClaimAdmission, Error>> {
+        None
+    }
+
     /// Append a claim this node writes, from a client's input. The runtime decides how the claim
     /// is kept (some kinds stay local observations), validates it, appends it through the graph
     /// and projects it. The bool says whether the claim is new rather than an idempotent repeat.
