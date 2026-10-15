@@ -446,6 +446,29 @@ test('phone observation schema keeps histogram pairs and live-share as separate 
     ]) assert.throws(()=>decode({...report,samples}));
 });
 
+test('producer conformance fixtures decode strictly without losing tool results', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const replay = require(process.env.ST_TIMELINE_CONFORMANCE_OUTPUT
+        ?? '../../../docs/st3/client-v0/fixtures/timeline-conformance.json');
+    const fixtures = Array.isArray(replay) ? replay : replay.items;
+    assert.ok(fixtures.length > 0);
+    const decode = Rich.decodeUnknownSync(Rich.TimelineEntry, 'strict');
+    for (const entry of fixtures) {
+        assert.doesNotThrow(() => Schema.encodeSync(Rich.TimelineEntry)(decode(entry)), entry.id);
+    }
+});
+
+test('known daemon sender schema gap remains an explicit rejection (issue #1957)', async () => {
+    // https://github.com/compoundingtech/smalltalk/issues/1957 — pending sender amendment.
+    const [, Rich] = await modules;
+    const entry = {
+        id: 'timeline-entry/ada', sequence: 0, revision: 1, final: true,
+        timestamp: '2026-10-12T00:00:00.000Z', role: 'system', type: 'message',
+        body: { message_id: 'message/tester', from: 'daemon/runtime', to: 'agent/ada' },
+    };
+    assert.throws(() => Rich.decodeUnknownSync(Rich.TimelineEntry, 'strict')(entry));
+});
+
 test('exchange carrier additions preserve legacy absence and future carrier values', async () => {
     const [{ Schema }, Rich] = await modules;
     const wire = { host_id: 'host/birch', peer_only_envelopes: 5, local_only_envelopes: 0, last_exchange_at: null, estimated_catch_up_seconds: null, diverged_since: null };

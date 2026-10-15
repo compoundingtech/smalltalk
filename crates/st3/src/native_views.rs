@@ -7,36 +7,40 @@ fn fields(out: &mut Value, source: &Value, names: &[(&str, &str)]) {
             continue;
         };
         let projected = match target {
-            "fallback" | "timed_out" | "case" | "hidden" | "gitignore" | "reset" | "truncated" => {
+            "fallback" | "timed_out" | "case" | "hidden" | "gitignore" | "reset" | "truncated"
+            | "configured" => {
                 value.is_boolean().then(|| value.clone())
             }
-            "timeout_s"
-            | "exit_code"
-            | "wall_ms"
-            | "first_changed_line"
-            | "total_ms"
-            | "duration_ms"
+            // Native durations have fractional precision; the client contract uses
+            // whole milliseconds (or seconds for timeout_s). Round to the nearest unit.
+            "wall_ms" | "total_ms" | "duration_ms" | "timeout_s" => value
+                .as_u64()
+                .map(Value::from)
+                .or_else(|| {
+                    value
+                        .as_f64()
+                        .filter(|n| n.is_finite() && *n >= 0.0 && *n < u64::MAX as f64)
+                        .map(|n| Value::from(n.round() as u64))
+                }),
+            "cost_usd" => value
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|_| value.clone()),
+            "exit_code" => value.as_i64().map(Value::from),
+            "first_changed_line"
             | "tokens"
-            | "cost_usd"
             | "requests"
             | "tool_count"
             | "output_bytes"
             | "tokens_before"
             | "tokens_after"
             | "recommended"
-            | "input"
-            | "output"
-            | "cache_read"
-            | "cache_write"
-            | "total"
-            | "context_tokens"
-            | "ttft_ms"
             | "limit"
             | "skip"
             | "match_count"
             | "file_count"
             | "file_limit_reached"
-            | "per_file_limit_reached" => value.is_number().then(|| value.clone()),
+            | "per_file_limit_reached" => value.as_u64().map(Value::from),
             "started_at" | "ended_at" => timestamp(value).map(Value::String),
             _ => value.is_string().then(|| value.clone()),
         };
@@ -74,6 +78,7 @@ fn rows(source: &Value, key: &str, project: impl Fn(&Value) -> Value) -> Value {
             .flatten()
             .filter(|v| v.is_object())
             .map(project)
+            .filter(|value| !value.is_null())
             .collect(),
     )
 }
@@ -272,7 +277,7 @@ pub(crate) fn tool_call_view(tool: &str, args: &Value) -> Value {
     out
 }
 
-fn job(value: &Value, require_state: bool) -> Value {
+fn job(value: &Value) -> Value {
     let mut out = json!({});
     fields(
         &mut out,
@@ -292,8 +297,13 @@ fn job(value: &Value, require_state: bool) -> Value {
             ("output_bytes", "outputBytes"),
         ],
     );
-    if require_state && out.get("state").is_none() {
+    if out.get("state").is_none() {
         out["state"] = json!("unknown");
+    }
+    // A job without an identity cannot be a JobSummary. The native record
+    // remains available in the block payload rather than inventing an ID.
+    if out.get("id").is_none() {
+        return Value::Null;
     }
     out
 }
@@ -437,7 +447,7 @@ pub(crate) fn tool_output_view(
                 &[("op", "op"), ("timed_out", "timedOut"), ("state", "state")],
             );
             if details.get("jobs").is_some_and(Value::is_array) {
-                out["jobs"] = rows(details, "jobs", |v| job(v, false));
+                out["jobs"] = rows(details, "jobs", job);
             }
         }
         _ => {
@@ -478,7 +488,7 @@ pub(crate) fn omp_record_view(
             } else {
                 "jobs"
             };
-            out["jobs"] = rows(&record["details"], key, |v| job(v, true));
+            out["jobs"] = rows(&record["details"], key, job);
             "job"
         }
         ("custom_message", Some("skill-prompt")) => {
@@ -570,12 +580,28 @@ pub(crate) fn omp_record_view(
                     ("started_at", "startedAt"),
                 ],
             );
+            if out.get("started_at").is_none() {
+                out["started_at"] = timestamp(record.get("timestamp")?).map(Value::String)?;
+            }
+            if out.get("call_id").is_none() || out.get("tool").is_none() {
+                return None;
+            }
             visibility = Some("internal");
             "status"
         }
         _ => return None,
     };
     Some((kind, out, visibility))
+}
+
+// Metadata is an open native-data object, not a schema-integer view. Preserve
+// number precision here even when an alias also names a constrained view field.
+fn metadata_numbers(out: &mut Value, source: &Value, names: &[(&str, &str)]) {
+    for &(target, native) in names {
+        if let Some(value) = source.get(native).filter(|value| value.is_number()) {
+            out[target] = value.clone();
+        }
+    }
 }
 
 pub(crate) fn assistant_metadata(message: &Value) -> Option<Value> {
@@ -590,12 +616,15 @@ pub(crate) fn assistant_metadata(message: &Value) -> Option<Value> {
             ("model", "model"),
             ("provider", "provider"),
             ("stop_reason", "stopReason"),
-            ("ttft_ms", "ttft"),
-            ("duration_ms", "duration"),
         ],
     );
+    metadata_numbers(
+        &mut out,
+        message,
+        &[("ttft_ms", "ttft"), ("duration_ms", "duration")],
+    );
     let mut usage = json!({});
-    fields(
+    metadata_numbers(
         &mut usage,
         &message["usage"],
         &[
@@ -606,7 +635,7 @@ pub(crate) fn assistant_metadata(message: &Value) -> Option<Value> {
             ("total", "totalTokens"),
         ],
     );
-    fields(
+    metadata_numbers(
         &mut usage,
         &message["usage"]["cost"],
         &[("cost_usd", "total")],
@@ -614,7 +643,7 @@ pub(crate) fn assistant_metadata(message: &Value) -> Option<Value> {
     if usage.as_object().is_some_and(|v| !v.is_empty()) {
         out["usage"] = usage;
     }
-    fields(
+    metadata_numbers(
         &mut out,
         &message["contextSnapshot"],
         &[("context_tokens", "promptTokens")],
@@ -629,6 +658,14 @@ pub(crate) fn assistant_metadata(message: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_assistant_metadata_retains_fractional_timing() {
+        let metadata = assistant_metadata(&json!({
+            "role":"assistant", "ttft":0.75, "duration":12.75
+        })).unwrap();
+        assert_eq!(metadata, json!({"ttft_ms":0.75,"duration_ms":12.75}));
+    }
 
     #[test]
     fn call_views_parse_each_family_and_keep_only_env_keys() {
@@ -830,8 +867,8 @@ mod tests {
                 assert_eq!(view["jobs"][0]["state"], state.unwrap_or("unknown"));
             }
         }
-        let hub = tool_output_view("hub", "h", false, Some(&json!({"jobs":[{"jobId":"j"}]})));
-        assert!(hub["jobs"][0].get("state").is_none());
+        let hub = tool_output_view("hub", "operator", false, Some(&json!({"op":"list","jobs":[{"jobId":"tester"}]})));
+        assert_eq!(hub["jobs"][0]["state"], "unknown");
     }
 
     #[test]
@@ -884,7 +921,7 @@ mod tests {
                 "session_exit",
             ),
             (
-                json!({"type":"custom","customType":"tool_execution_start","data":{"toolCallId":"a"}}),
+                json!({"type":"custom","customType":"tool_execution_start","data":{"toolCallId":"operator","toolName":"bash","startedAt":"2026-10-12T00:00:00Z"}}),
                 "status",
                 "tool_start",
             ),

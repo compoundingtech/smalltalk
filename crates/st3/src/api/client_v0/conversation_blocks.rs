@@ -1131,7 +1131,7 @@ mod tests {
     use super::*;
     use crate::external_sessions::ExternalDriver;
 
-    fn fixture(root: &std::path::Path, content: Value) -> ExternalSession {
+    pub(super) fn fixture(root: &std::path::Path, content: Value) -> ExternalSession {
         let path = root.join(".omp/agent/sessions/example/native-test.jsonl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let header = json!({"type":"session","id":"native-test","cwd":"/work/example","timestamp":"2026-10-06T12:00:00Z"});
@@ -3190,3 +3190,6 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
     }
 }
+
+#[cfg(test)]
+mod conformance_tests;

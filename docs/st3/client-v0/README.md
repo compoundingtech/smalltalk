@@ -1974,6 +1974,21 @@ has it, and `working` comes only from the register. The full mapping tables live
 clients model `view` and `header` as optional loose JSON; `timeline-views.json` is the
 wire fixture.
 
+Schema-integer typed duration projections round native fractional values to the nearest
+whole contract unit: milliseconds for `wall_ms`, `total_ms` and `duration_ms`, seconds
+for `timeout_s`. Open assistant metadata, including `ttft_ms` and `duration_ms`, and
+native payloads and tool-result detail metadata preserve their original number precision.
+Integer counts are projected only from nonnegative integers; signed exit codes remain signed.
+Job summaries require a native identity and use `unknown` when no state was supplied;
+jobs without an identity remain in the native payload rather than receiving invented IDs.
+Tool-start views use the record timestamp when `startedAt` is absent or invalid. If neither
+instant is available, the native record remains readable without a typed tool-start view.
+The optional thinking-level `configured` field is projected only from native boolean
+evidence. A native string such as `"high"` stays in the payload but is omitted from the
+typed view; its presence does not imply an explicit-configuration fact.
+Non-fetchable prefix notices express that fact in `reason` and omit a continuation cursor,
+without adding undeclared fields to the closed truncation body.
+
 The pre-approval parity audit adds these parsed contract fields explicitly:
 `TimelineViewTask.context`, `SubagentSummary.name` (OMP name, distinct from agent
 type), `TimelineViewWrite.content` and `line_count`, search flags `case`, `hidden`,
