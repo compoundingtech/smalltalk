@@ -156,6 +156,21 @@ const itemOf = ({
 }): ConversationItem => {
   switch (entry.type) {
     case 'content': {
+      // body.text is a legacy fallback for the blocks, not independent visible prose.
+      // Source records only annotate that prose; internal presentation blocks replace it.
+      // Keep mixed bodies inspectable too: the fallback has no per-block text boundaries.
+      if (entry.body.blocks?.some((block) =>
+        block.kind !== 'source_record' &&
+        (block.visibility === 'internal' || block.visibility === 'hidden-by-harness'),
+      )) {
+        return {
+          _tag: 'UnknownEvent',
+          id: entry.id,
+          at: entryTimestamp(entry),
+          eventType: 'internal native content',
+          data: entry.body,
+        }
+      }
       const internal = unrecognizedOmpItem(entry)
       if (internal !== undefined) return internal
       const reasoning = parseNativeReasoning(entry)

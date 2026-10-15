@@ -2,6 +2,75 @@ import { TimelineEntry } from '@smalltalk/st3-client/schema'
 import { Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { LiveTimeline } from './fromTimeline.ts'
+import { transcriptTurnsForItems } from '../web/conversationTranscript.ts'
+
+describe('native block visibility', () => {
+  // Synthetic copy of st's normalize_omp tool_execution_start projection.
+  const raw = {
+    type: 'custom', customType: 'tool_execution_start',
+    data: { toolCallId: 'synthetic-call', toolName: 'bash', startedAt: 1792022400000 },
+  }
+  const text = `[omp tool start bash]\n${JSON.stringify({ raw })}`
+  const block = {
+    id: 'native-1/0', kind: 'status', source_type: 'custom',
+    payload: { raw }, visibility: 'internal',
+    view: {
+      type: 'tool_start', call_id: 'synthetic-call', tool: 'bash',
+      started_at: '2026-10-15T00:00:00Z',
+    },
+  }
+  const project = (text: string, blocks: ReadonlyArray<unknown>) => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [Schema.decodeUnknownSync(TimelineEntry)({
+        id: 'timeline-entry/synthetic-tool-start', sequence: 1, revision: 1, final: true,
+        timestamp: '2026-10-15T00:00:00Z', type: 'content', role: 'system',
+        body: { media_type: 'text/plain', text, blocks },
+      })],
+    })
+    return timeline.project().items
+  }
+
+  it('keeps internal tool-start fallback out of prose, preserving inspectable data', () => {
+    expect(project(text, [block])).toMatchObject([{
+      _tag: 'UnknownEvent', eventType: 'internal native content',
+      data: { blocks: [{ visibility: 'internal', payload: { raw }, view: { type: 'tool_start' } }] },
+    }])
+    expect(project(text, [block])[0]).not.toHaveProperty('text')
+    const turns = transcriptTurnsForItems(project(text, [block]), { firstTurnComplete: true })
+    expect(turns.flatMap((turn) => turn.items)).toEqual([])
+    expect(JSON.stringify(turns)).not.toContain('tool_execution_start')
+  })
+
+  it.each(['internal', 'hidden-by-harness'])('uses %s visibility, not a label or view type', (visibility) => {
+    expect(project('Different fallback with {"synthetic":true}', [{
+      id: block.id, kind: block.kind, source_type: block.source_type, payload: block.payload, visibility,
+    }])[0]?._tag).toBe('UnknownEvent')
+  })
+
+  it('keeps visible system JSON and even the same tool-start label as prose', () => {
+    for (const visibleText of ['System note: {"synthetic":true}', text]) {
+      expect(project(visibleText, [{ ...block, visibility: 'visible' }])).toMatchObject([{
+        _tag: 'Text', role: 'system', text: visibleText,
+      }])
+      expect(project(visibleText, [])).toMatchObject([{ _tag: 'Text', text: visibleText }])
+    }
+  })
+
+  it('does not treat an internal source record as the visibility of visible prose', () => {
+    expect(project('Visible system text {"synthetic":true}', [{
+      id: block.id, kind: 'source_record', source_type: block.source_type,
+      payload: block.payload, visibility: 'internal',
+    }])[0]?._tag).toBe('Text')
+  })
+
+  it('does not leak a mixed body fallback containing an internal block', () => {
+    expect(project(text, [block, {
+      ...block, id: 'native-1/1', visibility: 'visible',
+    }])[0]?._tag).toBe('UnknownEvent')
+  })
+})
 
 describe('native conversation page boundaries', () => {
   it('retains the older edge across newer deltas and resets it on replace', () => {
