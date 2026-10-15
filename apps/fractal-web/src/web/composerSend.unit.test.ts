@@ -14,6 +14,62 @@ const grants = { actions: 'granted', messageSend: 'granted', terminalInput: 'ung
 const seat = 'agent/example/scratch'
 
 describe('composer send contract', () => {
+  it.each(['Offline', 'Revoked', 'MissingGrant'] as const)('preserves %s drafts without dispatching or queueing mail', async state => {
+    const send = vi.fn<AttachmentPort['send']>()
+    const binding = composerSendBinding({
+      source: { attachments: { capabilities: vi.fn(), upload: vi.fn(), chunk: vi.fn(), send } },
+      agentRef: seat, grants: state === 'MissingGrant' ? { ...grants, messageSend: 'ungranted' } : grants,
+      online: state !== 'Offline', readable: true, items: [],
+      refusal: state === 'Revoked' ? { reason: 'ungranted', status: 401 } : undefined, onRefused: vi.fn(),
+    })
+    expect(binding.availability._tag).toBe(state)
+    expect(binding.runtime.isDisabled).toBe(state === 'MissingGrant')
+    await binding.runtime.onNew(message)
+    await binding.retry({ _tag: 'Text', id: 'pending/old-key', role: 'user', text: 'old', attachments: [], streaming: false,
+      at: new Date().toISOString(), sendState: { _tag: 'Failed', reason: 'failed', detail: 'Lost answer' } })
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('clears a revoked refusal only after a fresh native grant check, without resending', async () => {
+    const send = vi.fn<AttachmentPort['send']>()
+    const capabilities = vi.fn<AttachmentPort['capabilities']>()
+      .mockResolvedValueOnce({ _tag: 'Refused', reason: 'ungranted', status: 403, detail: 'Still revoked' })
+      .mockResolvedValueOnce({ _tag: 'Success', value: { upload: 'granted', send: 'granted', read: 'granted' } })
+    const onRefused = vi.fn()
+    const binding = composerSendBinding({
+      source: { attachments: { capabilities, upload: vi.fn(), chunk: vi.fn(), send } },
+      agentRef: seat, grants, readable: true, items: [], refusal: { reason: 'ungranted', status: 401 }, onRefused,
+    })
+    await binding.recover()
+    expect(onRefused).toHaveBeenLastCalledWith(expect.objectContaining({ status: 403 }))
+    await binding.recover()
+    expect(onRefused).toHaveBeenLastCalledWith(undefined)
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('does not retry terminal outbox failures', async () => {
+    const send = vi.fn<AttachmentPort['send']>()
+    const binding = composerSendBinding({
+      source: { attachments: { capabilities: vi.fn(), upload: vi.fn(), chunk: vi.fn(), send } },
+      agentRef: seat, grants, readable: true, items: [], onRefused: vi.fn(),
+    })
+    await binding.retry({ _tag: 'Text', id: 'pending/expired-key', role: 'user', text: 'old', attachments: [], streaming: false,
+      at: new Date().toISOString(), sendState: { _tag: 'Failed', reason: 'failed', detail: 'Expired committed key', retryable: false } })
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('binds a plain send to the authoritative active session', async () => {
+    const send = vi.fn<AttachmentPort['send']>().mockResolvedValue({ _tag: 'Refused', reason: 'failed', detail: 'Offline fixture' })
+    const binding = composerSendBinding({
+      source: { attachments: { capabilities: vi.fn(), upload: vi.fn(), chunk: vi.fn(), send } },
+      agentRef: seat, sessionId: 'session/active', grants, readable: true, items: [], onRefused: vi.fn(),
+    })
+    await binding.runtime.onNew(message)
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      parameters: { to: seat, content: 'hello', session_id: 'session/active', tags: [], attachments: [] },
+    }))
+  })
+
   it.each(['completed', 'accepted', 'rejected', 'failed'] as const)('clears a saved draft only on a completed send, not %s submission', async status => {
     localStorage.clear()
     const store = createLocalComposerDraftStore({ storage: localStorage, events: window })

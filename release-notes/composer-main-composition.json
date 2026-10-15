@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep composer presentation in the UI kit and connection recovery in the existing workspace footer, without duplicate composer banners.",
+  "replay": { "status": "none", "detail": "No claim replay or outbox identity changes." },
+  "schema": { "status": "none", "detail": "No persistent schema or data rewrites." },
+  "rules": { "status": "none", "detail": "No checkpoint or digest changes." },
+  "compatibility": { "status": "none", "detail": "Removes app-only composer recovery markup while retaining existing kit submission gates and workspace reconnect controls." },
+  "downtime": { "status": "none", "detail": "No service interruption or additional startup work." },
+  "manual": { "status": "none", "detail": "No upgrade actions required; existing device pairing and workspace connection controls are unchanged." },
+  "recovery": { "status": "none", "detail": "No persistent migration. Offline and revoked drafts remain editable and cannot dispatch automatically." }
+}

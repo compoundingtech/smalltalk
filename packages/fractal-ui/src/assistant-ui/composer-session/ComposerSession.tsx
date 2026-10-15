@@ -6,7 +6,7 @@ import { Button, Dialog, Modal, ModalOverlay, TokenFieldValue } from 'react-aria
 import { EmbraceComposer, EmbraceComposerToolbar, ComposerQueueStrip } from '../EmbraceComposer'
 import { EmbraceRuntimeProvider, type ConversationRuntimeOptions } from '../EmbraceRuntime'
 import { defaultCommands, DraftToken, type Draft, type MentionToken, type SerializedDraft } from '../embrace-composer/draft'
-import { accentVars as accent, borderVars as border, geometryVars as g, radiusVars as r, spaceVars as s, surfaceVars as surface, textVars as ink, typeVars as t } from '../composition-tokens.stylex'
+import { accentVars as accent, borderVars as border, geometryVars as g, radiusVars as r, spaceVars as s, statusVars as status, surfaceVars as surface, textVars as ink, typeVars as t } from '../composition-tokens.stylex'
 import { Icon } from '../composition/Icons'
 import type { ComposerTarget } from './composer-fixtures'
 import { unknownEffort, type EffortControl } from '../embrace-composer/EffortPicker'
@@ -128,16 +128,31 @@ function ComposerSessionBody({ draftKey, layout, runningBehavior, mentions, targ
   return <div data-testid="composer-session" data-layout={layout} data-running-behavior={runningBehavior} data-mentions={mentions} data-targeting={targeting} {...stylex.props(styles.stack)}>
     {failure !== undefined && <div role="alert" {...stylex.props(styles.notice)}>{failure}</div>}
     {offline && <div role="status" {...stylex.props(styles.notice)}>Offline: the draft remains editable and saved locally. Reconnect before sending.</div>}
-    <div {...stylex.props(styles.attachments)}><ComposerPrimitive.Attachments>{() => <AttachmentPreview />}</ComposerPrimitive.Attachments></div>
+    <ComposerAttachments picker={false} />
     <EmbraceComposer variant={layout} plainText={mentions === 'M1'} toolbar={toolbar} mentionCandidates={mentions === 'M3' ? allMentions : limitedMentions} mentionHints={mentionHints} commands={defaultCommands} tokenDraft={tokenSnapshot?.runtimeText === runtimeText ? tokenSnapshot.draft : undefined} onTokenDraftChange={onTokenDraftChange} onRequestSubmit={requestSubmit} submitLabel={submitLabel} showQueue={false} sendDisabled={offline} />
     <div {...stylex.props(styles.help)}>{running ? runningBehavior === 'R1' ? 'Enter queues · Mod+Enter steers' : runningBehavior === 'R2' ? 'Enter steers · Mod+Enter queues' : 'Choose queue or steer for each message' : 'Enter sends'} · Shift+Enter adds a newline</div>
     <ComposerQueueStrip disabled={offline} effortById={queuedEffort} />
     <ModalOverlay isOpen={ask} isDismissable onOpenChange={setAsk} {...stylex.props(styles.overlay)}><Modal {...stylex.props(styles.modal)}><Dialog aria-label="Choose running message action" {...stylex.props(styles.dialog)}><h2 {...stylex.props(styles.dialogTitle)}>Send while running</h2><p>Queue after the current run, or steer the current run?</p><div {...stylex.props(styles.dialogActions)}><Button onPress={() => send(false)} {...stylex.props(styles.button)}>Queue</Button><Button onPress={() => send(true)} {...stylex.props(styles.button)}>Steer</Button><Button onPress={() => setAsk(false)} {...stylex.props(styles.button)}>Cancel</Button></div></Dialog></Modal></ModalOverlay>
   </div>
 }
+/**
+ * Staged native composer attachments: preview, name, upload error and remove for each file, plus the
+ * native image picker. The picker follows the runtime's attachment capability and read-only state;
+ * hosts whose toolbar already owns selection pass `picker={false}`.
+ */
+export function ComposerAttachments({ picker = true, readOnly = false }: { readonly picker?: boolean; readonly readOnly?: boolean }) {
+  const supported = useAuiState(state => state.thread.capabilities.attachments)
+  const disabled = useAuiState(state => state.thread.isDisabled)
+  const selectable = picker && supported && !readOnly && !disabled
+  return <div data-testid="composer-attachments" {...stylex.props(styles.attachments)}>
+    <ComposerPrimitive.Attachments>{() => <AttachmentPreview />}</ComposerPrimitive.Attachments>
+    {selectable && <ComposerPrimitive.AddAttachment asChild><Button {...stylex.props(styles.button)}><Icon name="attach" />Attach image</Button></ComposerPrimitive.AddAttachment>}
+  </div>
+}
 function AttachmentPreview() {
   const attachment = useAuiState(state => state.attachment)
   const file = 'file' in attachment ? attachment.file : undefined
+  const failure = attachment.status.type === 'incomplete' && attachment.status.reason === 'error' ? attachment.status.message ?? 'Upload failed.' : undefined
   const [url, setUrl] = React.useState<string>()
   React.useEffect(() => {
     if (file === undefined) return
@@ -145,12 +160,19 @@ function AttachmentPreview() {
     setUrl(next)
     return () => URL.revokeObjectURL(next)
   }, [file])
-  return <AttachmentPrimitive.Root {...stylex.props(styles.attachment)}>{url !== undefined && <img src={url} alt={attachment.name} {...stylex.props(styles.image)} />}<span {...stylex.props(styles.name)}><AttachmentPrimitive.Name /></span><AttachmentPrimitive.Remove asChild><Button aria-label={`Remove ${attachment.name}`} {...stylex.props(styles.button)}><Icon name="x" /></Button></AttachmentPrimitive.Remove></AttachmentPrimitive.Root>
+  return <AttachmentPrimitive.Root data-attachment-status={attachment.status.type} {...stylex.props(styles.attachment)}>
+    {url !== undefined && <img src={url} alt={attachment.name} {...stylex.props(styles.image)} />}
+    <span {...stylex.props(styles.meta)}>
+      <span {...stylex.props(styles.name)}><AttachmentPrimitive.Name /></span>
+      {failure !== undefined && <span role="alert" {...stylex.props(styles.error)}>{failure}</span>}
+    </span>
+    <AttachmentPrimitive.Remove asChild><Button aria-label={`Remove ${attachment.name}`} {...stylex.props(styles.button)}><Icon name="x" /></Button></AttachmentPrimitive.Remove>
+  </AttachmentPrimitive.Root>
 }
 const styles = stylex.create({
   stack: { display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0 },
   button: { display: 'inline-flex', justifyContent: 'center', alignItems: 'center', gap: s.xs, flexShrink: 0, minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.control, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary }, ':disabled': { cursor: 'not-allowed', opacity: 0.64 } },
   help: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: ink.fgMuted }, notice: { padding: s.md, borderRadius: r.sm, backgroundColor: surface.rowActive, color: ink.fgSoft, fontSize: t.metaSize, lineHeight: t.metaLeading },
-  attachments: { display: 'flex', gap: s.md, flexWrap: 'wrap' }, attachment: { display: 'flex', alignItems: 'center', gap: s.md, padding: s.md, borderRadius: r.sm, backgroundColor: surface.rowActive, minWidth: 0 }, image: { width: g.band, height: g.band, objectFit: 'cover', borderRadius: r.sm }, name: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontSize: t.metaSize },
+  attachments: { display: 'flex', alignItems: 'center', gap: s.md, flexWrap: 'wrap' }, attachment: { display: 'flex', alignItems: 'center', gap: s.md, padding: s.md, borderRadius: r.sm, backgroundColor: surface.rowActive, minWidth: 0 }, image: { width: g.band, height: g.band, objectFit: 'cover', borderRadius: r.sm }, meta: { display: 'flex', flexDirection: 'column', minWidth: 0 }, name: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontSize: t.metaSize }, error: { color: status.dangerFg, fontSize: t.metaSize, lineHeight: t.metaLeading, overflowWrap: 'anywhere' },
   overlay: { position: 'fixed', inset: 0, backgroundColor: surface.scrim, display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 30, padding: s.xl }, modal: { backgroundColor: surface.raised, color: ink.fg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.lg, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading, maxWidth: '90vw', outline: 'none' }, dialog: { padding: s.xl, borderRadius: r.lg }, dialogTitle: { margin: 0, fontSize: t.headingSize, lineHeight: t.headingLeading }, dialogActions: { display: 'flex', gap: s.md, flexWrap: 'wrap' },
 })

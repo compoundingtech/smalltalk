@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep composer sends and retries bound to their original session and images, name the recipient, and distinguish offline drafts from revoked access.",
+  "replay": { "status": "none", "detail": "No claim replay changes. In-memory outbox retries retain the original action and payload." },
+  "schema": { "status": "none", "detail": "No persistent schema or data rewrites." },
+  "rules": { "status": "none", "detail": "No checkpoint rules or digest changes." },
+  "compatibility": { "status": "none", "detail": "Uses existing native message session and image upload APIs; no kit API changes." },
+  "downtime": { "status": "none", "detail": "No service interruption or additional startup work." },
+  "manual": { "status": "none", "detail": "No upgrade actions required. A revoked device still requires normal reconnect or pairing." },
+  "recovery": { "status": "none", "detail": "No persistent migration. Reconnection never automatically resends an outbox message." }
+}

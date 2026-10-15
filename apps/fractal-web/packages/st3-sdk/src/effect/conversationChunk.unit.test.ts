@@ -9,6 +9,10 @@ const frame: Extract<CollectionFrame, { kind: 'conversation' }> = {
 }
 
 describe('native conversation empty evidence', () => {
+  it('preserves the native session even for an empty conversation', () => {
+    expect(decodeConversationChunk(frame).sessionId).toBe('session/1')
+  })
+
   it('requires an explicitly complete native replace page', () => {
     expect(decodeConversationChunk({ ...frame, has_more: false }).observation).toEqual({ empty: true })
     expect(decodeConversationChunk({ ...frame, has_more: true }).observation).toEqual({ empty: false })

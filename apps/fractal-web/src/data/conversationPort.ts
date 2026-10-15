@@ -13,5 +13,5 @@ export const conversationPortFailure = (cause: unknown): Extract<ConversationPor
     ? 'ungranted'
     : 'failed',
   detail: cause instanceof ClientError ? cause.response.message : cause instanceof Error ? cause.message : String(cause),
-  ...(cause instanceof ClientError ? { error: cause.response } : {}),
+  ...(cause instanceof ClientError ? { error: cause.response, status: cause.status } : {}),
 })

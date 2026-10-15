@@ -75,16 +75,16 @@ function typingDraft(mode: MentionMode): { readonly text: string; readonly draft
 const decided: ComposerPolicy = { layout: 'C2', running: 'R3', mentions: 'M2', target: 'K1' }
 const policyId = ({ layout, running, mentions, target }: ComposerPolicy) => `${layout} · ${running} · ${mentions} · ${target}`
 
-function ComposerFrame({ policy, state, effort, frameId, composerWidth, fill = false }: { readonly policy: ComposerPolicy; readonly state: ComposerState; readonly effort: EffortSupport; readonly frameId: string; readonly composerWidth?: number; readonly fill?: boolean }) {
+function ComposerFrame({ policy, state, effort, frameId, composerWidth, fill = false, image }: { readonly policy: ComposerPolicy; readonly state: ComposerState; readonly effort: EffortSupport; readonly frameId: string; readonly composerWidth?: number; readonly fill?: boolean; readonly image?: File }) {
   const [source] = React.useState(() => createComposerFixture(state, fixtureEffortControls[effort]))
   const snapshot = React.useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot)
   const seeded = React.useMemo(() => state === 'typing multi-line' ? typingDraft(policy.mentions) : undefined, [state, policy.mentions])
   const session = React.useMemo<ComposerSessionProps>(() => ({
     options: snapshot.options, layout: policy.layout, runningBehavior: policy.running, mentions: policy.mentions, targeting: policy.target,
-    initialDraft: seeded?.text ?? source.initialDraft, initialTokenDraft: seeded?.draft, initialImage: source.imageFile,
+    initialDraft: seeded?.text ?? source.initialDraft, initialTokenDraft: seeded?.draft, initialImage: source.imageFile ?? image,
     recipients, models, limitedMentions, allMentions, mentionHints, failure: snapshot.failure, offline: snapshot.offline,
     effortControl: snapshot.effortControl, queuedEffort: snapshot.queuedEffort,
-  }), [snapshot, policy, source, seeded])
+  }), [snapshot, policy, source, seeded, image])
   return <section aria-label={`${policyId(policy)} composer · ${state} · effort ${effort}${composerWidth === undefined ? '' : ` · ${composerWidth}px`}`} data-composer-frame={frameId} data-footer-budget-width={composerWidth} data-footer-budget-layout={composerWidth === undefined ? undefined : policy.layout} data-footer-budget-target={composerWidth === undefined ? undefined : policy.target} data-footer-budget-running={composerWidth === undefined ? undefined : policy.running} {...stylex.props(styles.frame, composerWidth !== undefined && styles.budgetFrame(composerWidth), fill && styles.fillFrame)}>
     <header {...stylex.props(styles.frameHeader)}>
       <h3 {...stylex.props(styles.frameTitle)}>{policyId(policy)}</h3>
@@ -259,6 +259,35 @@ export const ImageAttached: Story = {
     await waitFor(() => expect(within(receiptLog(canvasElement)).getByText('Attachments: generated-layout.svg')).toBeVisible())
   },
 }
+
+/** Stable staged file: the session re-stages its initial image whenever this identity changes. */
+const offlineImage = new File(['<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" fill="#326af1"/></svg>'], 'offline-capture.svg', { type: 'image/svg+xml' })
+/** C1 lane at the reviewed 440/1440 widths: offline gates submission while staged images stay previewable and removable. */
+function OfflineImageLane({ scheme, width }: { readonly scheme: Scheme; readonly width: 440 | 1440 }) {
+  return <Surface scheme={scheme}><div data-testid="composer-offline-image-lane" {...stylex.props(styles.geometryLane(width))}><ComposerFrame policy={{ ...decided, layout: 'C1' }} state="offline draft" effort="supported" frameId={`offline-image.${width}`} image={offlineImage} /></div></Surface>
+}
+const offlineImagePlay: Story['play'] = async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const row = canvas.getByTestId('composer-attachments')
+  await expect(canvas.getByText(/Offline: the draft remains editable and saved locally/)).toBeVisible()
+  await waitFor(() => expect(within(row).getByRole('img', { name: 'offline-capture.svg' })).toBeVisible())
+  await expect(within(row).getByText('offline-capture.svg')).toBeVisible()
+  // The C1 toolbar owns selection here; the shared attachment row never adds a second picker.
+  await expect(within(row).queryByRole('button', { name: 'Attach image' })).toBeNull()
+  await expect(canvas.getByRole('button', { name: 'Send' })).toBeDisabled()
+  await userEvent.click(within(row).getByRole('button', { name: 'Remove offline-capture.svg' }))
+  await waitFor(() => expect(within(row).queryByRole('img', { name: 'offline-capture.svg' })).toBeNull())
+  await userEvent.click(canvas.getByRole('button', { name: 'Reconnect' }))
+  await waitFor(() => expect(canvas.getByRole('button', { name: 'Send' })).toBeEnabled())
+  await userEvent.click(canvas.getByRole('button', { name: 'Send' }))
+  const log = within(receiptLog(canvasElement))
+  await waitFor(() => expect(log.getByText('Keep this draft while the connection is offline.')).toBeVisible())
+  await expect(log.queryByText(/^Attachments:/)).toBeNull()
+}
+export const OfflineImageC1Dark1440: Story = { beforeEach: clearDrafts, render: () => <OfflineImageLane scheme="dark" width={1440} />, play: offlineImagePlay }
+export const OfflineImageC1Light1440: Story = { beforeEach: clearDrafts, render: () => <OfflineImageLane scheme="light" width={1440} />, play: offlineImagePlay }
+export const OfflineImageC1Dark440: Story = { beforeEach: clearDrafts, render: () => <OfflineImageLane scheme="dark" width={440} />, play: offlineImagePlay }
+export const OfflineImageC1Light440: Story = { beforeEach: clearDrafts, render: () => <OfflineImageLane scheme="light" width={440} />, play: offlineImagePlay }
 
 export const AllStates: Story = {
   beforeEach: clearDrafts,

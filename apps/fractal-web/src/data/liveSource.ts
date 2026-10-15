@@ -99,6 +99,7 @@ interface RetainedConversation extends RetainedFeed<ConversationPage> {
 
 interface PendingSend {
   item: TextItem
+  refusal?: Extract<ConversationPortResult<never>, { _tag: 'Refused' }>
 }
 /** Terminal-only presentation and recovery policy; unrelated feeds keep their existing verdicts. */
 const terminalUnavailable = (error: AttachFailure): Feed<never> => {
@@ -730,6 +731,7 @@ export const liveSource = ({
     // id and parameters are what every Resend of it repeats, even after its row retires.
     const sentActions = new Map<string, Pick<AttachmentSendRequest, 'id' | 'parameters'>>()
     let lastSendId: string | undefined
+    let sessionId: string | undefined
     let painted = false
     let publishedItems: ConversationPage['items'] = []
     let changedFrom = Infinity
@@ -748,6 +750,7 @@ export const liveSource = ({
       } else changedFrom = Math.min(changedFrom, projection.changedFrom)
       return {
         items,
+        ...(sessionId === undefined ? {} : { sessionId }),
         ...(lastSendId === undefined ? {} : { lastSendId }),
         hasOlder: timeline.hasOlder,
         change: { from: publishedItems, index: changedFrom },
@@ -775,6 +778,7 @@ export const liveSource = ({
             if (event._tag !== 'Observed') return event
             ux?.().switchDataReady(ref)
             const previousSize = timeline.size
+            sessionId = event.value.sessionId
             timeline.apply(event.value)
             // Entries are identity-deduplicated by the retained timeline, not counted per chunk.
             incrDebug('Wf.conversationEntries', timeline.size - previousSize)
@@ -791,7 +795,13 @@ export const liveSource = ({
     const send: AttachmentPort['send'] = async (request) => {
       const idempotencyKey = request._tag === 'Resend' ? request.idempotencyKey : crypto.randomUUID()
       const id = `pending/${idempotencyKey}`
-      const action = sentActions.get(idempotencyKey) ?? { id: request.id, parameters: request.parameters }
+      const previousRefusal = pending.get(id)?.refusal
+      if (request._tag === 'Resend' && previousRefusal?.error?.retryable === false
+        && previousRefusal.reason !== 'stale-fence' && previousRefusal.reason !== 'ungranted' && previousRefusal.reason !== 'unconfirmed'
+        && previousRefusal.error.code !== 'issuer-required') return previousRefusal
+      // Freeze the submission before any await, retaining main's action identity
+      // even after its optimistic row has reconciled with the server.
+      const action = sentActions.get(idempotencyKey) ?? structuredClone({ id: request.id, parameters: request.parameters })
       sentActions.set(idempotencyKey, action)
       const local: PendingSend = {
         item: {
@@ -840,11 +850,17 @@ export const liveSource = ({
         }
         const result = await submit()
         if (result._tag === 'Success' && result.value.status === 'rejected') {
-          local.item = { ...local.item, sendState: { _tag: 'Failed', reason: 'rejected', detail: 'The message action was rejected.' } }
+          local.item = { ...local.item, sendState: { _tag: 'Failed', reason: 'rejected', detail: 'The message action was rejected.', retryable: false } }
         } else if (result._tag === 'Refused') {
+          local.refusal = result
           local.item = { ...local.item, sendState: result.reason === 'unconfirmed'
             ? { _tag: 'Unconfirmed', detail: result.detail }
-            : { _tag: 'Failed', reason: result.reason, detail: result.detail } }
+            : {
+              _tag: 'Failed', reason: result.reason, detail: result.detail,
+              ...(result.error === undefined ? {} : { code: result.error.code }),
+              retryable: result.reason !== 'invalid' && (result.reason === 'stale-fence' || result.reason === 'ungranted'
+                || result.error?.code === 'issuer-required' || result.error?.retryable !== false),
+            } }
         } else if (result._tag === 'Success' && result.value.status === 'completed') {
           const affected = result.value.affected_ids.filter((affected) => affected.startsWith('message/'))
           if (affected.length > 0) timeline.keepOwnSendId(affected, id)

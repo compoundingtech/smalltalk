@@ -134,6 +134,6 @@ export type UnknownEventItem = Extract<ConversationItem, { _tag: 'UnknownEvent' 
 export type SendState =
   | { readonly _tag: 'Sent' }
   | { readonly _tag: 'Pending' }
-  | { readonly _tag: 'Failed'; readonly reason: { readonly _tag: 'Rejected' | 'Ungranted' | 'Invalid' | 'Failed' | 'StaleFence' | 'SnapshotUnavailable' }; readonly detail?: string }
+  | { readonly _tag: 'Failed'; readonly reason: { readonly _tag: 'Rejected' | 'Ungranted' | 'Invalid' | 'Failed' | 'StaleFence' | 'SnapshotUnavailable' }; readonly detail?: string; readonly retryable?: boolean }
   /** st may have taken the send and has not confirmed it yet; sending it again is safe. */
   | { readonly _tag: 'Unconfirmed'; readonly detail?: string }

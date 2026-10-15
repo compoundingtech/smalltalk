@@ -73,6 +73,8 @@ export const SendState = Schema.TaggedUnion({
   Failed: {
     reason: Schema.Literals(['rejected', 'ungranted', 'invalid', 'failed', 'stale-fence', 'snapshot-unavailable']),
     detail: Schema.String,
+    code: Schema.optional(Schema.String),
+    retryable: Schema.optional(Schema.Boolean),
   },
 })
 export type SendState = typeof SendState.Type

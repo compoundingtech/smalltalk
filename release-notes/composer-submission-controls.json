@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep offline and revoked composer drafts intact, capture the session before image upload, show removable image attachments, and hide terminal retry actions.",
+  "replay": { "status": "none", "detail": "No claim replay changes." },
+  "schema": { "status": "none", "detail": "No persistent schema or data rewrites." },
+  "rules": { "status": "none", "detail": "No checkpoint or digest changes." },
+  "compatibility": { "status": "none", "detail": "Existing plain composer sendDisabled and onSendDraft props now apply to native submission. Kit failed send states accept optional retryable metadata, and the existing attachment presenter is reusable." },
+  "downtime": { "status": "none", "detail": "No service restart or additional startup work required." },
+  "manual": { "status": "none", "detail": "No operator upgrade actions required." },
+  "recovery": { "status": "none", "detail": "No persistent migration. Offline and revoked drafts cannot be cleared by a disabled send action." }
+}

@@ -19,7 +19,7 @@ const sendFailureCopy: Readonly<Record<Extract<SendState, { _tag: 'Failed' }>['r
 export function SendFailure({ state, onRetry }: { readonly state: Extract<SendState, { _tag: 'Failed' }>; readonly onRetry?: () => void }) {
   const [open, setOpen] = React.useState(false)
   const detailId = React.useId()
-  const retryable = state.reason._tag === 'Failed' || state.reason._tag === 'StaleFence' || state.reason._tag === 'SnapshotUnavailable'
+  const retryable = state.retryable !== false && (state.reason._tag === 'Failed' || state.reason._tag === 'StaleFence' || state.reason._tag === 'SnapshotUnavailable')
   return <div role="alert" data-testid="send-failure" data-send-failure-reason={state.reason._tag} {...stylex.props(styles.sendFailure)}>
     <Button aria-expanded={open} aria-controls={state.detail === undefined ? undefined : detailId} onPress={() => setOpen(value => !value)} {...stylex.props(styles.sendFailureLine)}>{sendFailureCopy[state.reason._tag]}{state.detail !== undefined && <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />}</Button>
     {open && state.detail !== undefined ? <div id={detailId} {...stylex.props(styles.sendFailureDetail)}>{state.detail}</div> : null}

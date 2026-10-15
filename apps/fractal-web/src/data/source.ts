@@ -136,6 +136,8 @@ export interface Fleet {
 /** The loaded conversation window; older history is a boundary, not an available fetch operation. */
 export interface ConversationPage {
   readonly items: readonly ConversationItem[]
+  /** Authoritative active session reported by the native conversation feed. */
+  readonly sessionId?: string
   readonly hasOlder: boolean
   /** Native page provenance; filtered items cannot establish emptiness. */
   readonly observation?: { readonly empty: boolean }
@@ -169,6 +171,7 @@ export type ConversationPortResult<T> =
       readonly detail: string
       /** Preserve the daemon's complete refusal, including its retry policy. */
       readonly error?: ErrorEnvelope
+      readonly status?: number
     }
 
 /** Search native conversation content, not the loaded timeline or sidebar metadata. */

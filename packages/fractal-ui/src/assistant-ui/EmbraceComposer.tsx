@@ -297,7 +297,8 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
   </>
 }
 
-function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
+function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestSubmit, onSendDraft, sendDisabled = false, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
+  const aui = useAui()
   const isDisabled = useAuiState((s) => s.thread.isDisabled)
   const readOnly = disabledReason !== undefined || isDisabled
   const helpId = React.useId()
@@ -306,10 +307,21 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
   const runtimeText = useAuiState(s => s.composer.text)
   const composing = React.useRef(false)
   const { compact } = React.useContext(CompactComposerContext)
+  const prepareNativeSend = () => {
+    const composer = aui.composer.getState()
+    if (readOnly || sendDisabled || !composer.canSend) return false
+    onSendDraft?.(draftFromText(composer.text))
+    return true
+  }
   return (
     <ComposerPrimitive.Root
       {...stylex.props(styles.root, style)}
-      onSubmit={event => { if (readOnly || onRequestSubmit !== undefined) event.preventDefault(); if (!readOnly) onRequestSubmit?.(false) }}
+      onSubmit={event => {
+        if (onRequestSubmit !== undefined) {
+          event.preventDefault()
+          if (!readOnly && !sendDisabled) onRequestSubmit(false)
+        } else if (!prepareNativeSend()) event.preventDefault()
+      }}
       onCompositionStartCapture={() => { composing.current = true }}
       onCompositionEndCapture={() => { composing.current = false }}
       onKeyDownCapture={event => {
@@ -318,8 +330,14 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
         if (!(target instanceof HTMLElement && (target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'INPUT'))) return
         if (event.nativeEvent.isComposing || composing.current || event.nativeEvent.keyCode === 229) { event.stopPropagation(); return }
         if (event.repeat) { event.preventDefault(); event.stopPropagation(); return }
+        // The native input sends steering chords directly, bypassing form submit.
+        if (input === undefined && event.shiftKey && (event.metaKey || event.ctrlKey) && aui.thread.getState().capabilities.queue) {
+          event.preventDefault(); event.stopPropagation()
+          if (prepareNativeSend()) aui.composer.send({ steer: true })
+          return
+        }
         if (onRequestSubmit !== undefined && !event.shiftKey && !(window.matchMedia('(pointer: coarse) and (not (any-pointer: fine))').matches && !event.metaKey && !event.ctrlKey)) {
-          event.preventDefault(); event.stopPropagation(); if (!readOnly) onRequestSubmit(event.metaKey || event.ctrlKey)
+          event.preventDefault(); event.stopPropagation(); if (!readOnly && !sendDisabled) onRequestSubmit(event.metaKey || event.ctrlKey)
         }
       }}
     >
@@ -339,7 +357,7 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
         </div>
         {toolbar}
         <div {...stylex.props(styles.grow)} />
-        {actions !== undefined ? actions(compact) : onRequestSubmit === undefined ? <ComposerPrimitive.Send disabled={readOnly} aria-label={submitIcon === undefined ? undefined : 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? 'Send'}</ComposerPrimitive.Send> : <Button isDisabled={readOnly || !canSend} onPress={() => onRequestSubmit(false)} aria-label={submitIcon === undefined ? undefined : submitLabel ?? 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? submitLabel ?? 'Send'}</Button>}
+        {actions !== undefined ? actions(compact) : onRequestSubmit === undefined ? <ComposerPrimitive.Send disabled={readOnly || sendDisabled} onClick={event => { if (!prepareNativeSend()) event.preventDefault() }} aria-label={submitIcon === undefined ? undefined : 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? 'Send'}</ComposerPrimitive.Send> : <Button isDisabled={readOnly || sendDisabled || !canSend} onPress={() => onRequestSubmit(false)} aria-label={submitIcon === undefined ? undefined : submitLabel ?? 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? submitLabel ?? 'Send'}</Button>}
       </div>
     </ComposerPrimitive.Root>
   )

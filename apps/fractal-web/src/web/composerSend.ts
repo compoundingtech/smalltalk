@@ -1,8 +1,10 @@
 import type { ConversationRuntimeOptions } from '@smalltalk/fractal-ui/assistant-ui'
 import type { ConversationItem, SendState } from '../conversation/model.ts'
 import type { AttachmentSendRequest, DataSource, Grants } from '../data/source.ts'
+import { isComposerImageType } from './composerAttachments.ts'
+import { composerAvailability, type ComposerAvailability, type ComposerRefusal } from './composerAvailability.ts'
 
-export type SendRefusal = { readonly reason: string }
+export type SendRefusal = ComposerRefusal
 
 const sendFailureDetails: Readonly<Record<Extract<SendState, { _tag: 'Failed' }>['reason'], string>>
   & Readonly<Record<string, string | undefined>> = {
@@ -20,27 +22,31 @@ export const sendFailureDetail = (reason: string): string =>
   (Object.hasOwn(sendFailureDetails, reason) ? sendFailureDetails[reason] : undefined) ?? sendFailureDetails.failed
 
 /** The app owns draft persistence; the source owns keys, outbox, send state and echo reconciliation. */
-export const composerSendBinding = ({ source, agentRef, grants, readable, items, refusal, onRefused, onSending }: {
+export const composerSendBinding = ({ source, agentRef, sessionId, grants, readable, online = true, items, refusal, onRefused, onSending }: {
   readonly source: Pick<DataSource, 'attachments'>
   readonly agentRef: string
+  readonly sessionId?: string
   readonly grants: Grants
   /** The outbox shows a send only in a readable conversation; an unreadable one would hide its row and outcome. */
   readonly readable: boolean
+  readonly online?: boolean
   readonly items: NonNullable<ConversationRuntimeOptions['messages']>
   readonly refusal?: SendRefusal
-  readonly onRefused: (refusal: SendRefusal) => void
+  readonly onRefused: (refusal: SendRefusal | undefined) => void
   /** Capture before dispatch; optimistic clears are not confirmed sends. */
   readonly onSending?: (content: string) => (outcome: { readonly _tag: 'Confirmed' } | { readonly _tag: 'Unconfirmed' }) => void
-}): { readonly runtime: ConversationRuntimeOptions; readonly disabledReason?: string; readonly retry: (item: ConversationItem) => Promise<void> } => {
-  const disabledReason = refusal !== undefined ? sendFailureDetail(refusal.reason)
-    : source.attachments === undefined ? 'This view cannot send messages.'
-    : grants.messageSend !== 'granted' ? 'Message send is not granted for this device.'
-    : !readable ? 'Messages can be sent once this conversation loads.' : undefined
+}): { readonly runtime: ConversationRuntimeOptions; readonly availability: ComposerAvailability; readonly disabledReason?: string; readonly recover: () => Promise<void>; readonly retry: (item: ConversationItem) => Promise<void> } => {
+  const availability: ComposerAvailability = source.attachments === undefined && refusal === undefined
+    ? { _tag: 'Unavailable', detail: 'This view cannot send messages.' }
+    : composerAvailability({ online, readable, granted: grants.messageSend, refusal })
+  const disabledReason = availability._tag !== 'Ready' ? availability.detail
+    : refusal !== undefined ? sendFailureDetail(refusal.reason)
+    : source.attachments === undefined ? 'This view cannot send messages.' : undefined
   const dispatch = async (content: string, attachments: AttachmentSendRequest['parameters']['attachments'], retryKey?: string) => {
-    if (source.attachments === undefined || grants.messageSend !== 'granted') return
+    if (disabledReason !== undefined || source.attachments === undefined || grants.messageSend !== 'granted') return
     const request = {
       api_version: 'st3.client.v0', type: 'message.send', id: `action/${crypto.randomUUID()}`,
-      parameters: { to: agentRef, content, tags: [], attachments },
+      parameters: { to: agentRef, content, tags: [], attachments, ...(sessionId === undefined ? {} : { session_id: sessionId }) },
     } as const
     // An outbox retry has no original composer revision in this port. Never capture the
     // current draft as its submission: equal text does not establish submission identity.
@@ -51,26 +57,44 @@ export const composerSendBinding = ({ source, agentRef, grants, readable, items,
         ? { ...request, _tag: 'Send' }
         : { ...request, _tag: 'Resend', idempotencyKey: retryKey })
       // Retryable send failures belong to the outbox row, not the next draft's availability.
-      if (result._tag === 'Refused' && result.reason !== 'failed' && result.reason !== 'unconfirmed'
-        && result.reason !== 'stale-fence' && result.reason !== 'snapshot-unavailable') onRefused({ reason: result.reason })
+      if (result._tag === 'Refused' && (result.status === 401 || result.status === 403
+        || result.error?.code === 'issuer-required' || (result.reason !== 'failed' && result.reason !== 'unconfirmed'
+          && result.reason !== 'stale-fence' && result.reason !== 'snapshot-unavailable'))) onRefused(result)
       confirmed = result._tag === 'Success' && result.value.status === 'completed'
     } finally {
       settled?.({ _tag: confirmed ? 'Confirmed' : 'Unconfirmed' })
     }
   }
   return {
+    availability,
+    recover: async () => {
+      if (!online || source.attachments === undefined) return
+      const result = await source.attachments.capabilities()
+      if (result._tag === 'Success' && result.value.send === 'granted') onRefused(undefined)
+      else if (result._tag === 'Refused') onRefused(result)
+    },
     ...(disabledReason === undefined ? {} : { disabledReason }),
     runtime: {
-      messages: items, isDisabled: disabledReason !== undefined,
+      messages: items, isDisabled: disabledReason !== undefined
+        && availability._tag !== 'Offline' && availability._tag !== 'Revoked',
       onNew: async (message) => {
         if (disabledReason !== undefined) return
-        await dispatch(message.content.filter(part => part.type === 'text').map(part => part.text).join('\n'), [])
+        const attachments: AttachmentSendRequest['parameters']['attachments'][number][] = []
+        for (const attachment of message.attachments ?? []) {
+          const mediaType = attachment.contentType
+          if (attachment.status.type !== 'complete' || mediaType === undefined || !isComposerImageType(mediaType)) {
+            onRefused({ reason: 'invalid' })
+            return
+          }
+          attachments.push({ blob: attachment.id, media_type: mediaType, name: attachment.name })
+        }
+        await dispatch(message.content.filter(part => part.type === 'text').map(part => part.text).join('\n'), attachments)
       },
       // Deliberately no onCancel: runtime.signal is not a send-cancel contract.
     },
     retry: async (item) => {
       if (item._tag !== 'Text' || (item.sendState?._tag !== 'Failed' && item.sendState?._tag !== 'Unconfirmed')
-        || !item.id.startsWith('pending/')) return
+        || (item.sendState._tag === 'Failed' && item.sendState.retryable === false) || !item.id.startsWith('pending/')) return
       // pending/<key> is the source-owned outbox identity, not a text/time dedupe heuristic.
       // The source resends the key's recorded action id and parameters; these only route it.
       const attachments: AttachmentSendRequest['parameters']['attachments'][number][] = []

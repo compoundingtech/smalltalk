@@ -84,7 +84,7 @@ describe('native conversation content search port', () => {
     }
     const { port, calls } = searchClient({ reply: () => Response.json(error, { status: 409 }) })
     expect(await port.search({ text: 'orchid', cursor: 'real-cursor' })).toEqual({
-      _tag: 'Refused', reason: 'failed', detail: error.message, error,
+      _tag: 'Refused', reason: 'failed', detail: error.message, error, status: 409,
     })
     expect(calls).toHaveLength(2)
   })

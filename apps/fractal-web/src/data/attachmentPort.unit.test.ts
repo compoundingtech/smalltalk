@@ -168,7 +168,7 @@ describe('native attachment port', () => {
       request_id: 'request/native-refusal', details: { scope: 'control.messages' },
     }
     const { port, calls } = attachmentClient({ reply: () => Response.json(error, { status: 403 }) })
-    expect(await port.send(request)).toEqual({ _tag: 'Refused', reason: 'ungranted', detail: error.message, error })
+    expect(await port.send(request)).toEqual({ _tag: 'Refused', reason: 'ungranted', detail: error.message, error, status: 403 })
     expect(calls).toHaveLength(2)
   })
 

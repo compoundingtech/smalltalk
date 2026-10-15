@@ -440,7 +440,7 @@ describe('session inventory independence', () => {
         collection: 'conversation', session_id: 'session/selected', replace: true, has_more: false, items: [],
       })
       yield* settle
-      expect(live.registry.get(live.source.conversation(next))).toMatchObject({ _tag: 'Observed' })
+      expect(live.registry.get(live.source.conversation(next))).toMatchObject({ _tag: 'Observed', value: { sessionId: 'session/selected' } })
       live.suspendSockets()
       yield* settle
       live.resumeSockets()
@@ -451,7 +451,7 @@ describe('session inventory independence', () => {
         collection: 'conversation', session_id: 'session/reconnected', replace: true, has_more: false, items: [],
       })
       yield* settle
-      expect(live.registry.get(live.source.conversation(next))).toMatchObject({ _tag: 'Observed' })
+      expect(live.registry.get(live.source.conversation(next))).toMatchObject({ _tag: 'Observed', value: { sessionId: 'session/reconnected' } })
       expect(gateway.httpPaths.filter(path => path === '/v1/client/sessions')).toEqual([])
       releaseNext()
       releaseNextInterest()
@@ -1392,7 +1392,16 @@ describe('optimistic conversation sends', () => {
         gateway.fleet([agent])
         yield* settle
         gateway.staleSendFence = true
-        const refused = yield* Effect.promise(() => live.source.attachments!.send(request))
+        const contextual = { ...request, parameters: {
+          ...request.parameters, session_id: 'session/original', title: 'Original subject',
+          in_reply_to: 'message/original', tags: ['original'],
+          attachments: [{ blob: `blob/${'b'.repeat(64)}`, media_type: 'image/png' as const, name: 'original.png' }],
+        } }
+        const sending = live.source.attachments!.send(contextual)
+        // Caller mutation while snapshot/signing awaits must not rewrite captured mail.
+        contextual.parameters.tags.push('mutated')
+        contextual.parameters.attachments[0]!.name = 'mutated.png'
+        const refused = yield* Effect.promise(() => sending)
         expect(refused).toMatchObject({
           _tag: 'Refused', reason: 'stale-fence', detail: 'The observed snapshot belongs to an old gateway store.',
           error: { code: 'stale-fence' },
@@ -1412,11 +1421,16 @@ describe('optimistic conversation sends', () => {
         })
         yield* settle
         expect((yield* Effect.promise(() => live.source.attachments!.send({
-          ...request, _tag: 'Resend', idempotencyKey: first.idempotency_key,
+          ...request, id: 'action/changed', parameters: { ...request.parameters, session_id: 'session/changed' },
+          _tag: 'Resend', idempotencyKey: first.idempotency_key,
         })))._tag).toBe('Success')
         expect(gateway.messageActions[1]).toMatchObject({
           id: first.id, idempotency_key: first.idempotency_key, parameters: first.parameters,
           fence: { snapshot_id: refreshed.id, subject_revisions: {} },
+        })
+        expect(first.parameters).toMatchObject({
+          session_id: 'session/original', tags: ['original'],
+          attachments: [{ name: 'original.png' }],
         })
         expect(live.registry.get(conversation)).toMatchObject({
           _tag: 'Observed', value: { items: [{ _tag: 'Text', sendState: { _tag: 'Sent' } }] },
