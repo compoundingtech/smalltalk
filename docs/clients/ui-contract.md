@@ -459,7 +459,7 @@ agents.
 | | Derivation | Differs from this contract |
 |---|---|---|
 | Terminal UI | `crates/stui/src/ui/adapt.rs` `attention()` and `preview()` (about 345 lines); `alerts.rs` `unanswered_calls`; the variants fetch in `live.rs` | Fills launch agents' harness and host as unknown. Withholds allow when a call runs past four lines, instead of when its input is incomplete. |
-| Phone | `clients/typescript/st3-views/homeView.ts` (225 lines) `homeKind`, `pendingCalls`, `offeredAnswers` | Drops `custom.*` kinds. Shows launch variants and diagnostics, with no step preview. |
+| Phone | Reads `tier`, `kind` and `waiting` (`clients/typescript/st3-views/homeView.ts` `homeKind`, `homeRows`; a feedback gate shows as a review); an item without a presentation (an older st) shows as a request where its `alert` flag puts it. Still its own: `pendingCalls`, `offeredAnswers` | Shows launch variants and diagnostics, with no step preview. |
 | Fractal | None live; `projections.ts` `attentionRefs` only | Nothing to delete. |
 
 Settled: `custom.*` kinds are Today requests, as in the terminal UI. Allow depends on

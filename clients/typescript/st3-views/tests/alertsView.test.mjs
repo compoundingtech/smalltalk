@@ -1,7 +1,23 @@
 import assert from 'node:assert/strict';
 import { alertConversations, alertsHeading, alertsIn, homeRows, isAlert, offeredAnswers, openAlerts, pendingCalls, promptAnswers } from '@smalltalk/st3-views/homeView';
 
-const item = (id, attention_kind, extra = {}) => ({ id: `attention/${id}`, kind: 'attention', attention_kind, title: id, detail: '', priority: 'normal', state: 'open', person_id: 'person/alex', requested_at: '2026-09-30T11:00:00Z', source_id: 'x', actions: [], ...extra });
+// What st presents for each kind (docs/clients/ui-contract.md, Attention row): Home reads it and
+// derives nothing, so these rows carry it as st serves them.
+const presented = (attention_kind, extra) => {
+  const card = {
+    'human-gate': { tier: 'stopped', kind: extra.review_mode === 'feedback' ? 'feedback' : 'review' },
+    'person-step': extra.update ? { tier: 'later', kind: 'update' } : { tier: 'stopped', kind: 'request' },
+    'agent-request': { tier: 'stopped', kind: 'request' },
+    'launch-approval': { tier: 'today', kind: 'launch' },
+    'revision-approval': { tier: 'today', kind: 'revision' },
+    'harness-prompt': { tier: 'stopped', kind: 'prompt' },
+    'harness-login': { tier: 'stopped', kind: 'login' },
+    fault: { tier: null, kind: 'fault' },
+  }[attention_kind] ?? { tier: null, kind: null };
+  const step = extra.step_run_id;
+  return { ...card, agent: null, raised_by: null, waiting: step ? { step, path: step.split('/').pop() } : null };
+};
+const item = (id, attention_kind, extra = {}) => ({ id: `attention/${id}`, kind: 'attention', attention_kind, title: id, detail: '', priority: 'normal', state: 'open', person_id: 'person/alex', requested_at: '2026-09-30T11:00:00Z', source_id: 'x', actions: [], presentation: presented(attention_kind, extra), ...extra });
 const actor = 'person/alex/session/phone';
 
 // Zero prints nothing; one is singular.

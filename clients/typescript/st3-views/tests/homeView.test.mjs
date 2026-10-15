@@ -2,7 +2,23 @@ import assert from 'node:assert/strict';
 import { homeRows, homeSections, keepClosed, onHome } from '@smalltalk/st3-views/homeView';
 
 const now = Date.parse('2026-09-30T12:00:00Z');
-const item = (id, attention_kind, extra = {}) => ({ id: `attention/${id}`, kind: 'attention', attention_kind, title: id, detail: '', priority: 'normal', state: 'open', person_id: 'person/alex', requested_at: '2026-09-30T11:00:00Z', source_id: 'x', actions: [], ...extra });
+// What st presents for each kind (docs/clients/ui-contract.md, Attention row): Home reads it and
+// derives nothing, so these rows carry it as st serves them.
+const presented = (attention_kind, extra) => {
+  const card = {
+    'human-gate': { tier: 'stopped', kind: extra.review_mode === 'feedback' ? 'feedback' : 'review' },
+    'person-step': extra.update ? { tier: 'later', kind: 'update' } : { tier: 'stopped', kind: 'request' },
+    'agent-request': { tier: 'stopped', kind: 'request' },
+    'launch-approval': { tier: 'today', kind: 'launch' },
+    'revision-approval': { tier: 'today', kind: 'revision' },
+    'harness-prompt': { tier: 'stopped', kind: 'prompt' },
+    'harness-login': { tier: 'stopped', kind: 'login' },
+    fault: { tier: null, kind: 'fault' },
+  }[attention_kind] ?? { tier: null, kind: null };
+  const step = extra.step_run_id;
+  return { ...card, agent: null, raised_by: null, waiting: step ? { step, path: step.split('/').pop() } : null };
+};
+const item = (id, attention_kind, extra = {}) => ({ id: `attention/${id}`, kind: 'attention', attention_kind, title: id, detail: '', priority: 'normal', state: 'open', person_id: 'person/alex', requested_at: '2026-09-30T11:00:00Z', source_id: 'x', actions: [], presentation: presented(attention_kind, extra), ...extra });
 
 // Home shows what stui's Home shows: the person's unresolved requests and reviews, items without
 // app actions included. A message, a fault and a kind st adds later never reach Home.
@@ -46,7 +62,7 @@ assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);
 
 // Nothing leaves Home by itself: an item st closes (or resolves) while it is shown stays, marked.
 {
-  const open = id => ({ id, state: 'open', attention_kind: 'person-step', actions: ['work.done'], title: id, requested_at: '2026-10-07T07:00:00Z', update: { summary: 'x', about: 'y' } });
+  const open = id => ({ id, state: 'open', attention_kind: 'person-step', actions: ['work.done'], title: id, requested_at: '2026-10-07T07:00:00Z', update: { summary: 'x', about: 'y' }, presentation: presented('person-step', { update: true }) });
   const first = [open('attention/a'), open('attention/b'), open('attention/c')];
   // a is gone, b is resolved, c was answered here.
   const next = [{ ...open('attention/b'), state: 'resolved' }];
@@ -69,4 +85,23 @@ assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);
   assert.deepEqual(list.filter(item => item.closedElsewhere).map(item => item.id).sort(), ['attention/2', 'attention/3', 'attention/4', 'attention/5', 'attention/6']);
   // An item that comes back open loses its mark.
   assert.equal(keepClosed(kept, [open('attention/a')], new Set()).find(item => item.id === 'attention/a').closedElsewhere, undefined);
+}
+
+// st places each item and names its step: a gate st puts in Today sits in Today, and the step is
+// named by its path, not by its ID.
+{
+  const gate = item('gate', 'human-gate', { presentation: { tier: 'today', kind: 'feedback', agent: null, raised_by: null, waiting: { step: 'step-run/abc/1/review', path: 'review' } } });
+  const [row] = homeRows([gate], 'person/alex', now);
+  assert.deepEqual([row.tier, row.kind, row.waiting], ['today', 'review', 'step review']);
+  // A group Home has no section for, or no group at all, keeps it off Home.
+  assert.deepEqual(homeRows([{ ...gate, presentation: { ...gate.presentation, tier: 'alert' } }, { ...gate, presentation: { ...gate.presentation, tier: null } }], 'person/alex', now), []);
+}
+
+// An st too old to present its items: each shows as a request where its alert flag puts it, and
+// says st does not name it.
+{
+  const older = [item('ask', 'person-step', { presentation: undefined, alert: true }), item('note', 'person-step', { presentation: undefined, alert: false })];
+  const rows = homeRows(older, 'person/alex', now);
+  assert.deepEqual(rows.map(row => [row.item.id, row.tier, row.kind]), [['attention/ask', 'stopped', 'request'], ['attention/note', 'later', 'request']]);
+  assert.match(rows[0].waiting, /st is older/);
 }

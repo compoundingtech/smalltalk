@@ -3,8 +3,10 @@ import { ago } from './time.ts';
 
 // Home, drawn the way stui draws it (crates/stui/src/ui/screens.rs home_list, adapt.rs
 // attention): the requests and reviews st holds for the person that are not resolved, grouped by
-// how urgently someone is waiting. Messages stay in conversations, and st sends a fault to the
-// agent that owns it, so neither is ever on Home.
+// how urgently someone is waiting. st presents each item (`Attention.presentation`, see
+// docs/clients/ui-contract.md, Attention row): its group, its card and the step it holds. A
+// message stays in its conversation, and st sends a fault to the agent that owns it, so st puts
+// neither on Now.
 
 export const TIERS = ['stopped', 'today', 'later'] as const;
 export type Tier = typeof TIERS[number];
@@ -31,22 +33,20 @@ export type HomeRow = {
   age: string;
 };
 
-type Kindish = Pick<Attention, 'attention_kind' | 'priority'> & { update?: Attention['update'] };
-/** Where Home shows an item, or null for a kind that is not a request or a review. */
+const HOME_KINDS: readonly string[] = ['review', 'launch', 'revision', 'request', 'update', 'prompt', 'login'];
+
+type Kindish = Pick<Attention, 'presentation'> & { alert?: boolean };
+/**
+ * Where Home shows an item, as st presents it, or null for one st puts on no Now (or in a group
+ * Home has no section for). A feedback gate is a review here. An st too old to present its items
+ * presents none: each shows as a request, where its alert flag puts it.
+ */
 export function homeKind(item: Kindish): { tier: Tier; kind: HomeKind } | null {
-  switch (item.attention_kind as string) {
-    case 'human-gate': return { tier: 'stopped', kind: 'review' };
-    // Information the person asked for (`st work update`): nothing waits on it.
-    case 'person-step': return item.update ? { tier: 'later', kind: 'update' } : { tier: 'stopped', kind: 'request' };
-    case 'agent-request': return { tier: 'stopped', kind: 'request' };
-    case 'launch-approval': return { tier: 'today', kind: 'launch' };
-    case 'revision-approval': return { tier: 'today', kind: 'revision' };
-    // A native prompt a seat's harness waits on, and a provider sign-in a seat needs: alerts in
-    // the seat's conversation, and on Home beside every other thing that waits on the person.
-    case 'harness-prompt': return { tier: 'stopped', kind: 'prompt' };
-    case 'harness-login': return { tier: 'stopped', kind: 'login' };
-    default: return null;
-  }
+  const presented = item.presentation;
+  if (!presented) return { tier: item.alert === false ? 'later' : 'stopped', kind: 'request' };
+  const tier = TIERS.find(tier => tier === presented.tier);
+  const kind = presented.kind === 'feedback' ? 'review' : presented.kind;
+  return tier && kind && HOME_KINDS.includes(kind) ? { tier, kind: kind as HomeKind } : null;
 }
 
 export function kindGlyph(kind: HomeKind): { glyph: string; color: HomeColor } {
@@ -98,8 +98,11 @@ export function homeRows(items: KeptAttention[], actor: string | undefined, now 
   const rows = items.filter(item => onHome(item, actor)).flatMap((item): HomeRow[] => {
     const place = homeKind(item);
     if (!place) return [];
-    const step = item.step_run_id?.split('/').pop();
-    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting: item.closedElsewhere ? 'closed; stays until you clear it' : step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
+    const step = item.presentation?.waiting?.path;
+    const waiting = item.closedElsewhere ? 'closed; stays until you clear it'
+      : !item.presentation ? 'st is older and does not say what this is'
+      : step ? `step ${step}` : null;
+    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting, age: ago(item.requested_at, now) }];
   });
   // A stable sort by tier keeps st's order within each tier; what st closed sits last, apart.
   const rank = (row: HomeRow) => (row.item.closedElsewhere ? TIERS.length : 0) + TIERS.indexOf(row.tier);

@@ -6,10 +6,27 @@ import { alertsHeading, homeRows, homeSections, keepClosed, openAlerts, personAn
 
 const now = Date.parse('2026-10-14T12:00:00Z');
 const actor = 'person/demo/session/example-phone';
+// What st presents for each kind (docs/clients/ui-contract.md, Attention row): Home reads it and
+// derives nothing, so these rows carry it as st serves them.
+const presented = (attention_kind, extra) => {
+  const card = {
+    'human-gate': { tier: 'stopped', kind: extra.review_mode === 'feedback' ? 'feedback' : 'review' },
+    'person-step': extra.update ? { tier: 'later', kind: 'update' } : { tier: 'stopped', kind: 'request' },
+    'agent-request': { tier: 'stopped', kind: 'request' },
+    'launch-approval': { tier: 'today', kind: 'launch' },
+    'revision-approval': { tier: 'today', kind: 'revision' },
+    'harness-prompt': { tier: 'stopped', kind: 'prompt' },
+    'harness-login': { tier: 'stopped', kind: 'login' },
+    fault: { tier: null, kind: 'fault' },
+  }[attention_kind] ?? { tier: null, kind: null };
+  const step = extra.step_run_id;
+  return { ...card, agent: null, raised_by: null, waiting: step ? { step, path: step.split('/').pop() } : null };
+};
 const attention = (id, attention_kind, extra = {}) => ({
   id: `attention/demo/${id}`, kind: 'attention', attention_kind, title: 'Review the example',
   detail: 'Invented test content.', priority: 'normal', state: 'open', person_id: 'person/demo',
-  requested_at: '2026-10-14T11:00:00Z', source_id: `step-run/demo/${id}`, actions: [], ...extra,
+  requested_at: '2026-10-14T11:00:00Z', source_id: `step-run/demo/${id}`, actions: [],
+  presentation: presented(attention_kind, extra), ...extra,
 });
 const update = attention('update', 'person-step', {
   actions: ['work.done'], update: { version: 1, type: 'update', summary: 'Example completed.', about: 'message/demo' },
