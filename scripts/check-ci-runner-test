@@ -277,8 +277,11 @@ for n in (3,4):
 # Execute the generated aggregate. Every merge shard must really pass; normal
 # events must prove the two additional merge-only jobs were skipped.
 gate_script = textwrap.dedent(blocks['linux-gate'].split('run: |\n',1)[1].split('\n      - ',1)[0])
-def gate(event,base,extra,skip=None):
-    env={**os.environ,'EVENT':event,'RESULTS':' '.join(base),'MERGE_RESULTS':' '.join(extra)}
+# The per-stage skip flags the workflow computes when every covered stage's own rule says skip (build, tests, shard 2,
+# clippy, fleet compat, then the two merge-only shards); scripts/ci-evidence-gate-test checks the flags against the rules.
+COVERED_FLAGS='true false true true true true false true true'
+def gate(event,base,extra,skip=None,flags=COVERED_FLAGS):
+    env={**os.environ,'EVENT':event,'RESULTS':' '.join(base),'MERGE_RESULTS':' '.join(extra),'STAGE_SKIPS':flags}
     env.pop('GATE_SKIP',None)
     if skip is not None:
         env['GATE_SKIP']=skip
