@@ -165,6 +165,7 @@ mod limits;
 mod database_size;
 pub use database_size::DatabaseSize;
 mod person_work;
+pub use person_work::AskImages;
 mod reconcile_work_context;
 pub(crate) mod work_summaries_ivm;
 mod subagents;

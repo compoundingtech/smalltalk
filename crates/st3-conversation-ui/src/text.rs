@@ -262,7 +262,8 @@ fn remember_link(text: &str, url: &str) {
     });
 }
 
-/// Inline markdown: **bold**, `code`, [text](url).
+/// Inline markdown: **bold**, `code`, [text](url), and an image ![alt](url) as a line that opens
+/// it: an image on the web is never fetched just to draw it.
 pub fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Run> {
     let mut runs = Vec::new();
     let mut plain = String::new();
@@ -285,6 +286,20 @@ pub fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Run> {
             flush(&mut plain, &mut runs);
             runs.push(run(&after[..end], base.fg(theme.teal)));
             rest = &after[end + 1..];
+        } else if let Some(after) = rest.strip_prefix("![")
+            && let Some(close) = after.find("](")
+            && let Some(end) = after[close + 2..].find(')')
+        {
+            flush(&mut plain, &mut runs);
+            let alt = after[..close].trim();
+            let label = format!("▣ {}", if alt.is_empty() { "image" } else { alt });
+            remember_link(&label, &after[close + 2..close + 2 + end]);
+            runs.push(run(
+                label,
+                base.fg(theme.blue).add_modifier(Modifier::UNDERLINED),
+            ));
+            runs.push(run(" · image link", base.add_modifier(Modifier::DIM)));
+            rest = &after[close + 2 + end + 1..];
         } else if let Some(after) = rest.strip_prefix('[')
             && let Some(close) = after.find("](")
             && let Some(end) = after[close + 2..].find(')')
@@ -647,6 +662,14 @@ mod tests {
             Some(Color::Red),
         );
         assert_eq!(lines[0].width(), 10);
+    }
+
+    #[test]
+    fn an_image_in_markdown_is_a_line_that_opens_it_not_a_bang() {
+        let theme = Theme::default();
+        let runs = inline("Plant it?  ![north bed](https://example.com/north-bed.png)", Style::default(), &theme);
+        let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(text, "Plant it?  ▣ north bed · image link");
     }
 
     #[test]
