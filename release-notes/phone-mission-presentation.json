@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The phone reads each mission's word, steps, owners and notes from st's presentation and deletes its own derivation",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Client-only. Upgrade daemons first, then the app. Against an st that serves no mission presentation, the phone lists each mission's raw state with 'st does not say' and its steps as unknown, rather than a guessed word. The decision word now reads 'needs you', as in the terminal UI."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or swap-back restrictions."}
+}

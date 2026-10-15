@@ -1,15 +1,17 @@
-import type { Agent, Attention, Mission, MissionStep, WorkState } from '../../clients/typescript/st3-client';
+import type { Mission, MissionStepPresentation, PresentationActor } from '../../clients/typescript/st3-client';
 import { ago } from './presentation';
 import { missionSteps } from './presentation';
 import { theme } from './theme';
 
-// The Missions list, drawn the way stui draws it (crates/stui/src/ui/screens.rs missions_list,
-// adapt.rs missions): one word per mission naming who has to move, in this order.
-export const WORDS = ['decision', 'stalled', 'unstaffed', 'unclaimed', 'queued', 'working', 'watching', 'held', 'idle', 'done', 'failed', 'cancelled'] as const;
+// The Missions list, drawn the way stui draws it (crates/stui/src/ui/screens.rs missions_list):
+// one word per mission naming who has to move, in fixtures/clients/words.json order. st serves the
+// word, each step and who must act on the mission row (Mission.presentation,
+// docs/clients/ui-contract.md, Mission); the phone keeps no derivation of its own.
+export const WORDS = ['decision', 'stalled', 'unstaffed', 'unclaimed', 'queued', 'working', 'watching', 'held', 'idle', 'done', 'failed', 'cancelled', 'not_started', 'unknown'] as const;
 export type Word = typeof WORDS[number];
 
 export function wordName(word: Word): string {
-  return word === 'decision' ? 'alert' : word;
+  return word === 'decision' ? 'needs you' : word === 'not_started' ? 'not started' : word;
 }
 
 export function wordStyle(word: Word, spinner = '⠿'): { glyph: string; color: string } {
@@ -26,46 +28,35 @@ export function wordStyle(word: Word, spinner = '⠿'): { glyph: string; color: 
     case 'done': return { glyph: '✓', color: theme.done };
     case 'failed': return { glyph: '✕', color: theme.fault };
     case 'cancelled': return { glyph: '⊘', color: theme.quiet };
+    case 'not_started': return { glyph: '○', color: theme.quiet };
+    case 'unknown': return { glyph: '?', color: theme.quiet };
   }
 }
 
 export const MISSION_LEGEND: ReadonlyArray<Word> = ['decision', 'stalled', 'unstaffed', 'queued', 'watching', 'working', 'idle', 'done'];
 
-
-type QueueAgent = Pick<Agent, 'state' | 'fault' | 'next_work_id' | 'upcoming_work_ids'>;
-function queuedFor<A extends QueueAgent>(agents: A[], work: string): A | undefined {
-  return agents.find(agent => agent.next_work_id === work || (agent.upcoming_work_ids ?? []).includes(work));
+/** The word st serves for a mission. A daemon too old to serve one, or a word this phone does not
+ *  know, reads unknown rather than a guess. */
+export function missionWord(mission: Pick<Mission, 'presentation'>): Word {
+  const word: string | undefined = mission.presentation?.word;
+  return word !== undefined && (WORDS as ReadonlyArray<string>).includes(word) ? word as Word : 'unknown';
 }
 
-// Keep cached projections readable while the gateway moves to the contract states.
-function stepState(state: string): string {
-  if (state === 'working' || state === 'running') return 'claimed';
-  return state === 'pending' ? 'waiting' : state;
-}
-function activeStep(state: string): boolean {
-  return state === 'claimed' || state === 'verifying';
+/** What a list calls a mission: its word, or, when st serves none (an older st, or one that has
+ *  not read its agents yet), its raw state and that st does not say. */
+export function missionLabel(mission: Pick<Mission, 'presentation' | 'state'>): string {
+  const word = missionWord(mission);
+  return word === 'unknown' && mission.state ? `${mission.state} · st does not say` : wordName(word);
 }
 
-export function missionWord(mission: Pick<Mission, 'id' | 'state' | 'run_details'>, attention: Array<Pick<Attention, 'attention_kind' | 'mission_id' | 'state'>>, agents: QueueAgent[]): Word {
-  const work: MissionStep[] = missionSteps(mission);
-  const states = work.map(step => stepState(step.state));
-  const state = mission.state as string;
-  if (attention.some(item => item.state !== 'resolved' && item.attention_kind === 'human-gate' && item.mission_id === mission.id)) return 'decision';
-  if (state === 'blocked' || states.includes('blocked')) return 'stalled';
-  if (state === 'completed') return 'done';
-  if (state === 'failed' || states.includes('failed')) return 'failed';
-  if (state === 'cancelled') return 'cancelled';
-  if (work.length && work.every(step => step.state === 'completed' || (activeStep(stepState(step.state)) && step.agentless && step.keep_open)) && work.some(step => step.state !== 'completed')) return 'watching';
-  if (states.some(activeStep)) return 'working';
-  const ready = work.find(step => step.state === 'ready' && !step.claimant);
-  if (ready) {
-    const agent = queuedFor(agents, ready.id);
-    if (!agent) return 'unclaimed';
-    return agent.state === 'failed' || agent.state === 'stopped' || agent.fault ? 'unstaffed' : 'queued';
+/** Who st says holds a step or must act: "you" for the reader. */
+export function actorName(actor: PresentationActor | undefined, reader?: string): string | undefined {
+  switch (actor?.kind) {
+    case 'person': return actor.person === reader ? 'you' : actor.label ?? actor.person;
+    case 'agent': return actor.label ?? actor.agent;
+    case 'st': return 'st';
+    default: return undefined;
   }
-  if (states.includes('waiting')) return 'held';
-  if (['standing', 'running', 'ready', 'draft'].includes(state)) return 'idle';
-  return 'done';
 }
 
 const labelWords: Record<string, string> = { tui: 'TUI', ios: 'iOS', st3: 'ST', omp: 'OMP', api: 'API', pty: 'PTY' };
@@ -80,21 +71,22 @@ export function missionTitle(mission: Pick<Mission, 'id' | 'title'>): string {
 }
 
 
-export type MissionRow = { mission: Mission; word: Word; title: string; path: string; age: string; done: number; total: number; system: boolean; progress?: string };
-export function missionRows(missions: Mission[], attention: Attention[], agents: Agent[], showSystem: boolean, now = Date.now()): { rows: MissionRow[]; hidden: number } {
+export type MissionRow = { mission: Mission; word: Word; label: string; title: string; path: string; age: string; done: number; total: number; system: boolean; progress?: string };
+export function missionRows(missions: Mission[], showSystem: boolean, now = Date.now()): { rows: MissionRow[]; hidden: number } {
   const all = missions.map((mission): MissionRow => {
-    const steps = missionSteps(mission);
+    const progress = mission.presentation?.progress;
     return {
       mission,
-      word: missionWord(mission, attention, agents),
+      word: missionWord(mission),
+      label: missionLabel(mission),
       title: missionTitle(mission),
       path: mission.id.replace(/^mission\//, ''),
       age: ago(mission.updated_at, now),
-      done: steps.filter(step => step.state === 'completed').length,
-      total: steps.length,
+      done: progress?.done ?? 0,
+      total: progress?.total ?? missionSteps(mission).length,
       system: mission.system === true,
       // What a step in hand last reported: the status of a run in progress.
-      progress: steps.filter(step => ['claimed', 'working', 'running'].includes(step.state)).map(step => step.last_progress?.split(/\s+/).filter(Boolean).join(' ')).find(Boolean),
+      progress: mission.presentation?.last_progress?.split(/\s+/).filter(Boolean).join(' ') || undefined,
     };
   });
   // A failure ages out of the list after its day, as in stui (Nathan, 2026-10-02); showing the
@@ -104,10 +96,10 @@ export function missionRows(missions: Mission[], attention: Attention[], agents:
   return { rows, hidden: showSystem ? 0 : all.filter(hide).length };
 }
 
-/** A failed mission whose last change was before today, on this device's clock. */
+/** A failed mission that settled before today, on this device's clock. */
 export function failedBeforeToday(row: Pick<MissionRow, 'word' | 'mission'>, now = Date.now()): boolean {
   if (row.word !== 'failed') return false;
-  const at = Date.parse(row.mission.updated_at);
+  const at = Date.parse(row.mission.presentation?.settled_at ?? row.mission.updated_at);
   if (Number.isNaN(at)) return false;
   const today = new Date(now); today.setHours(0, 0, 0, 0);
   return at < today.getTime();
@@ -119,36 +111,36 @@ export function missionSections(rows: MissionRow[]): MissionSection[] {
   for (const row of rows) {
     const last = sections.at(-1);
     if (last?.word === row.word) { last.rows.push(row); last.count++; }
-    else sections.push({ word: row.word, title: wordName(row.word), count: 1, rows: [row] });
+    else sections.push({ word: row.word, title: row.word === 'unknown' ? 'st does not say' : wordName(row.word), count: 1, rows: [row] });
   }
   return sections;
 }
 
 type StepStyle = { glyph: string; color: string; word: string; rank: number };
-const stepStyles: Record<WorkState, StepStyle> = {
-  completed: { glyph: '▰', color: theme.done, word: 'done', rank: 0 },
+const stepStyles: Record<MissionStepPresentation['word'], StepStyle> = {
+  done: { glyph: '▰', color: theme.done, word: 'done', rank: 0 },
   cancelled: { glyph: '⊘', color: theme.quiet, word: 'cancelled', rank: 0 },
+  needs_you: { glyph: '◆', color: theme.person, word: 'needs you', rank: 1 },
   failed: { glyph: '✕', color: theme.fault, word: 'failed', rank: 1 },
-  claimed: { glyph: '⠿', color: theme.working, word: 'working', rank: 2 },
-  verifying: { glyph: '⠿', color: theme.working, word: 'working', rank: 2 },
+  working: { glyph: '⠿', color: theme.working, word: 'working', rank: 2 },
   ready: { glyph: '▱', color: theme.waiting, word: 'ready', rank: 3 },
-  'waiting-person': { glyph: '◐', color: theme.sapphire, word: 'waiting for a person', rank: 4 },
   waiting: { glyph: '◐', color: theme.sapphire, word: 'waiting', rank: 4 },
-  blocked: { glyph: '◐', color: theme.sapphire, word: 'waiting', rank: 4 },
+  pending: { glyph: '▱', color: theme.surface2, word: 'later', rank: 5 },
 };
 
-/** A step's state as stui draws it in a mission's pipeline, done first. */
-export function stepStyle(state: string, spinner = '⠿'): StepStyle {
-  const style = stepStyles[stepState(state) as WorkState];
-  if (!style) return { glyph: '▱', color: theme.surface2, word: 'later', rank: 5 };
-  return activeStep(stepState(state)) ? { ...style, glyph: spinner } : style;
+/** A step's word as st serves it, drawn as stui draws it in a mission's pipeline. A step st
+ *  serves no word for reads unknown. */
+export function stepStyle(word: string | undefined, spinner = '⠿'): StepStyle {
+  const style = stepStyles[word as MissionStepPresentation['word']];
+  if (!style) return { glyph: '?', color: theme.surface2, word: 'unknown', rank: 6 };
+  return word === 'working' ? { ...style, glyph: spinner } : style;
 }
 
 /** Match every search word against a mission's title, path, status and progress. */
 export function filterMissionRows(rows: MissionRow[], filter: string): MissionRow[] {
   const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
   return words.length ? rows.filter(row => {
-    const text = `${row.title} ${row.path} ${wordName(row.word)} ${row.progress ?? ''}`.toLowerCase();
+    const text = `${row.title} ${row.path} ${row.label} ${row.progress ?? ''}`.toLowerCase();
     return words.every(word => text.includes(word));
   }) : rows;
 }

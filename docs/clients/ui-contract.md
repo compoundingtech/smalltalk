@@ -392,7 +392,7 @@ changing in a newer roster. A roster publication wakes the refresher.
 | | Derivation | Differs from this contract |
 |---|---|---|
 | Terminal UI | Moved: reads the presentation. `crates/stui/src/ui/screens.rs` `display_rank` and `what_you_can_do` remain | Sorts working before needs you. Finds the stuck agent only among agents already working on the mission, so an unstaffed mission's idle agent never appears. Retry and restart print CLI hints. |
-| Phone | `apps/ios/missionsView.ts` (163 lines) and parts of `presentation.ts` | Calls decision "alert", has no `not_started`, reads every run's steps, has no who-must-act, stuck step or actions. |
+| Phone | Moved: `apps/ios/missionsView.ts` reads the presentation; a row without one reads `unknown` and shows its raw `state` with "st does not say" | Has no stuck step or actions yet. |
 | Fractal | None live; the unmounted `shell/Sidebar.tsx` groups by `must_act` | Nothing to delete; reads the projection when it adds Missions. |
 
 Settled: the word for decision is "needs you"; `not_started` is a word; steps come from the open

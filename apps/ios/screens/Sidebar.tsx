@@ -119,7 +119,7 @@ export function SidebarScreen({ navigation }: RootScreen<'ResourcesRoot'>) {
   const agentsById = new Map(agents.map(agent => [agent.id, agent])), missionsById = new Map(data.missions.map(mission => [mission.id, mission]));
   const mark = (row: SidebarResource) => {
     const agent = agentsById.get(row.id), mission = missionsById.get(row.id);
-    return agent ? agentGlyph(agent.state) : mission ? wordStyle(missionWord(mission, data.attention, data.agents)) : { glyph: row.missing ? '?' : '·', color: theme.overlay0 };
+    return agent ? agentGlyph(agent.state) : mission ? wordStyle(missionWord(mission)) : { glyph: row.missing ? '?' : '·', color: theme.overlay0 };
   };
   const targets: DragTarget[] = [];
   for (const group of view.groups.filter(g => g.folder)) {

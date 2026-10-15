@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { agentHeaderDetail, agentHealth, attentionActionLabel, attentionHeadline, attentionKindLabel, blockedLine, clientDetail, clientTitle, currentWorkSummary, deviceDetail, deviceTitle, missionDetail, missionGroup, missionLabels, missionSteps, olderThanMember, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation.ts';
+import { agentHeaderDetail, agentHealth, attentionActionLabel, attentionHeadline, attentionKindLabel, blockedLine, clientDetail, clientTitle, currentWorkSummary, deviceDetail, deviceTitle, missionLabels, missionSteps, olderThanMember, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation.ts';
 
 const now = Date.parse('2026-09-25T08:25:00Z');
 
@@ -25,35 +25,10 @@ assert.equal(currentWorkSummary({ current_work: [{ ...route, path: 'review/diff'
 assert.equal(currentWorkSummary({ current_work: [{ ...route, title: 'Route output', state: 'claimed' }] }), 'Current: Route output (claimed)');
 assert.equal(currentWorkSummary({}), null);
 
-// The mission list groups and describes missions from the steps st joined into each run: no work list.
+// A mission's steps are the ones st joined into its runs: no work list.
 const step = (path, state) => ({ id: `step-run/9f/${path}`, path, state, attempt: 1, since: '2026-09-25T08:00:00Z' });
-const release = { id: 'mission/fleet/app/release', title: 'fleet/app/release', state: 'running', runs: ['mission-run/9f'], visualization: { nodes: [{ kind: 'step' }, { kind: 'step' }, { kind: 'group' }], groups: [] }, run_details: [{ id: 'mission-run/9f', steps: [step('build', 'completed'), step('review', 'claimed')] }] };
+const release = { id: 'mission/fleet/app/release', title: 'fleet/app/release', state: 'running', runs: ['mission-run/9f'], run_details: [{ id: 'mission-run/9f', steps: [step('build', 'completed'), step('review', 'claimed')] }] };
 assert.deepEqual(missionSteps(release).map(s => s.path), ['build', 'review']);
-assert.equal(missionGroup(release), 'Running');
-assert.equal(missionDetail(release), '1 runs · 2 planned steps · review (claimed)');
-const stuck = { ...release, run_details: [{ id: 'mission-run/9f', steps: [step('build', 'claimed'), step('sign', 'blocked')] }] };
-assert.equal(missionGroup(stuck), 'Blocked');
-assert.equal(missionDetail(stuck), '1 runs · 2 planned steps · sign (blocked)');
-assert.equal(missionGroup({ ...release, run_details: [{ id: 'mission-run/9f', steps: [step('approve', 'waiting')] }] }), 'Waiting');
-assert.equal(missionGroup({ ...release, state: 'completed', run_details: [{ id: 'mission-run/9f', steps: null }] }), 'Archive');
-assert.equal(missionGroup({ state: 'draft' }), 'Drafts');
-assert.equal(missionDetail({ runs: [], run_details: [] }), '0 runs');
-const shipped = { runs: ['mission-run/9f'], run_details: [{ id: 'mission-run/9f', steps: [step('gate', 'failed')], outcome: { status: 'completed', previous_status: 'failed', actor: 'person/avery', reason: 'it merged after the gate was fixed', at: '2026-09-25T08:20:00Z' } }] };
-assert.equal(missionDetail(shipped), '1 runs · gate (failed) · set completed (was failed) by person/avery: it merged after the gate was fixed');
-
-// Every contract state is grouped deliberately, with active work ahead of waiting dependencies.
-const expectedGroups = { waiting: 'Waiting', ready: 'Running', claimed: 'Running', blocked: 'Blocked', verifying: 'Running', completed: 'Drafts', failed: 'Blocked', cancelled: 'Drafts', working: 'Running', pending: 'Waiting' };
-for (const [state, expected] of Object.entries(expectedGroups)) {
-  const mission = { ...release, state: 'ready', run_details: [{ id: 'mission-run/9f', steps: [step('review', state)] }] };
-  assert.equal(missionGroup(mission), expected, state);
-  assert.equal(missionDetail(mission), `1 runs · 2 planned steps · review (${state})`);
-}
-for (const state of ['claimed', 'working', 'verifying']) {
-  const mission = { ...release, run_details: [{ id: 'mission-run/9f', steps: [step('build', 'completed'), step('review', state), step('deploy', 'waiting')] }] };
-  assert.equal(missionGroup(mission), 'Running', state);
-  assert.equal(missionDetail(mission), `1 runs · 2 planned steps · review (${state})`);
-}
-assert.equal(missionGroup({ ...stuck, state: 'completed' }), 'Archive');
 
 // Small Talk st joined into a conversation shows who wrote to whom and its title.
 assert.deepEqual(smallTalkPresentation({ message_id: 'message/1', from: 'agent/example/cos/standing/cos', to: 'person/alex', title: 'Release is ready' }), { from: 'COS → alex', text: 'Release is ready' });

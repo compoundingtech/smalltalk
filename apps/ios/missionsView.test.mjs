@@ -1,66 +1,88 @@
 import assert from 'node:assert/strict';
-import { filterMissionRows, missionRows, missionSections, missionTitle, missionWord, stepStyle } from './missionsView.ts';
+import { actorName, filterMissionRows, missionLabel, missionRows, missionSections, missionTitle, missionWord, stepStyle, wordName } from './missionsView.ts';
 
 const step = (id, state, extra = {}) => ({ id: `step-run/${id}`, path: id, state, attempt: 1, since: '2026-09-30T11:00:00Z', ...extra });
 const mission = (id, state, steps = [], extra = {}) => ({ id: `mission/${id}`, kind: 'mission', title: id, state, runs: ['r'], run_details: [{ id: 'mission-run/r', status: state, steps }], updated_at: '2026-09-30T11:00:00Z', ...extra });
+// A mission row as st serves it, with its presentation (docs/clients/ui-contract.md, Mission).
+const served = (row, word, presentation = {}) => ({
+  ...row,
+  presentation: {
+    word, system: row.system === true, who: { kind: 'nobody' }, steps: [], stuck: null, queued_behind: null, card: null, actions: [],
+    progress: { done: 0, total: 0 }, last_progress: null, settled_at: null, ...presentation,
+  },
+});
 
-assert.equal(missionWord(mission('a', 'running', [step('s', 'ready')]), [{ attention_kind: 'human-gate', mission_id: 'mission/a', state: 'open' }], []), 'decision');
-assert.equal(missionWord(mission('a', 'running', [step('s', 'blocked')]), [], []), 'stalled');
-assert.equal(missionWord(mission('a', 'running', [step('s', 'running')]), [], []), 'working');
-assert.equal(missionWord(mission('a', 'standing', [step('keep-watch', 'running', { agentless: true, keep_open: true }), step('x', 'completed')]), [], []), 'watching');
-// st marks keep-open steps; the name alone no longer decides.
-assert.equal(missionWord(mission('a', 'standing', [step('keep-watch', 'running', { agentless: true }), step('x', 'completed')]), [], []), 'working');
-assert.equal(missionWord(mission('a', 'running', [step('s', 'ready')]), [], []), 'unclaimed');
-assert.equal(missionWord(mission('a', 'running', [step('s', 'ready')]), [], [{ state: 'stopped', next_work_id: 'step-run/s' }]), 'unstaffed');
-assert.equal(missionWord(mission('a', 'running', [step('s', 'ready')]), [], [{ state: 'running', next_work_id: 'step-run/s' }]), 'queued');
-assert.equal(missionWord(mission('a', 'completed', [step('s', 'failed')]), [], []), 'done');
-assert.equal(missionWord(mission('a', 'standing', []), [], []), 'idle');
+// The phone reads the word st serves and derives none.
+for (const word of ['decision', 'stalled', 'unstaffed', 'unclaimed', 'queued', 'working', 'watching', 'held', 'idle', 'done', 'failed', 'cancelled', 'not_started']) {
+  assert.equal(missionWord(served(mission('a', 'running'), word)), word);
+}
+// The word st serves wins over anything the row's steps suggest.
+assert.equal(missionWord(served(mission('a', 'running', [step('s', 'blocked')]), 'queued')), 'queued');
+// An older st serves none, and a word this phone does not know is not guessed at.
+assert.equal(missionWord(mission('a', 'running', [step('s', 'running')])), 'unknown');
+assert.equal(missionWord(served(mission('a', 'running'), 'becalmed')), 'unknown');
+assert.equal(missionLabel(mission('a', 'running')), 'running · st does not say');
+assert.equal(missionLabel(served(mission('a', 'running'), 'decision')), 'needs you');
+assert.equal(wordName('not_started'), 'not started');
 
-for (const [state, word] of Object.entries({ waiting: 'waiting', ready: 'ready', claimed: 'working', blocked: 'waiting', verifying: 'working', completed: 'done', failed: 'failed', cancelled: 'cancelled' })) {
-  assert.equal(stepStyle(state).word, word, state);
+for (const [word, name] of Object.entries({ needs_you: 'needs you', done: 'done', working: 'working', ready: 'ready', waiting: 'waiting', cancelled: 'cancelled', failed: 'failed', pending: 'later' })) {
+  assert.equal(stepStyle(word).word, name, word);
 }
-for (const state of ['claimed', 'verifying', 'working', 'running']) {
-  assert.equal(missionWord(mission('a', 'running', [step('held', state), step('next', 'waiting')]), [], []), 'working', state);
-  assert.equal(stepStyle(state, '*').glyph, '*', state);
-}
-assert.equal(missionWord(mission('a', 'running', [step('next', 'pending')]), [], []), 'held');
-assert.equal(stepStyle('pending').word, 'waiting');
-assert.equal(missionWord(mission('a', 'standing', [step('keep-watch', 'verifying', { agentless: true, keep_open: true })]), [], []), 'watching');
-assert.equal(missionWord(mission('a', 'cancelled', [step('held', 'cancelled')]), [], []), 'cancelled');
+assert.equal(stepStyle('working', '*').glyph, '*');
+assert.equal(stepStyle(undefined).word, 'unknown', 'an older st serves no step word');
+assert.equal(stepStyle('claimed').word, 'unknown', 'a raw step state is not a served word');
+
+assert.equal(actorName({ kind: 'person', person: 'person/avery', label: 'Avery' }, 'person/avery'), 'you');
+assert.equal(actorName({ kind: 'person', person: 'person/avery', label: 'Avery' }, 'person/blair'), 'Avery');
+assert.equal(actorName({ kind: 'agent', agent: 'agent/keeper', label: 'keeper' }), 'keeper');
+assert.equal(actorName({ kind: 'st' }), 'st');
+assert.equal(actorName({ kind: 'nobody' }), undefined);
 
 assert.equal(missionTitle({ id: 'mission/fleet/stui/client-api', title: 'fleet/stui/client-api' }), 'fleet/stui · Client API');
 
-const missions = [mission('fleet/b/idle', 'standing'), mission('fleet/a/work', 'running', [step('x', 'running'), step('y', 'completed')]), mission('fleet/smalltalk/ci/run', 'running', [step('z', 'running')], { system: true })];
-const { rows, hidden } = missionRows(missions, [], [], false, Date.parse('2026-09-30T12:00:00Z'));
+const missions = [
+  served(mission('fleet/b/idle', 'standing'), 'idle'),
+  served(mission('fleet/a/work', 'running', [step('x', 'running'), step('y', 'completed')]), 'working', { progress: { done: 1, total: 2 } }),
+  served(mission('fleet/smalltalk/ci/run', 'running', [step('z', 'running')], { system: true }), 'working'),
+];
+const { rows, hidden } = missionRows(missions, false, Date.parse('2026-09-30T12:00:00Z'));
 assert.deepEqual(rows.map(row => [row.word, row.title, row.done, row.total]), [['working', 'fleet/a · Work', 1, 2], ['idle', 'fleet/b · Idle', 0, 0]]);
 assert.equal(hidden, 1);
 assert.deepEqual(missionSections(rows).map(section => section.title), ['working', 'idle']);
-assert.equal(missionRows(missions, [], [], true).rows.length, 3);
-
-// A failed mission ages out of the list after its day, and showing hidden ones brings it back.
+assert.equal(missionRows(missions, true).rows.length, 3);
+// Rows from an older st list last, under "st does not say", with their raw state.
 {
-  const now = new Date(2026, 9, 2, 22, 0).getTime();
-  const failedAt = (at) => ({ id: `mission/example/failed-${at}`, title: 'failed', state: 'failed', updated_at: new Date(at).toISOString(), run_details: null });
-  const yesterday = failedAt(new Date(2026, 9, 1, 23, 0).getTime());
-  const today = failedAt(new Date(2026, 9, 2, 9, 0).getTime());
-  const { rows, hidden } = missionRows([yesterday, today], [], [], false, now);
-  assert.deepEqual(rows.map(row => row.mission.id), [today.id]);
-  assert.equal(hidden, 1);
-  assert.equal(missionRows([yesterday, today], [], [], true, now).rows.length, 2);
+  const { rows } = missionRows([mission('fleet/c/old', 'running'), ...missions], true);
+  assert.equal(rows.at(-1).label, 'running · st does not say');
+  assert.equal(missionSections(rows).at(-1).title, 'st does not say');
 }
 
-// A run in progress shows what its step last reported (Nathan, 2026-10-06).
+// A failed mission ages out of the list after the day it settled, and showing hidden ones brings it back.
 {
-  const busy = mission('busy', 'running', [step('s', 'running', { last_progress: ' Tests pass;\n opening the PR ' }), step('t', 'ready')]);
-  const quiet = mission('quiet', 'running', [step('s', 'running')]);
-  const done = mission('done', 'completed', [step('s', 'completed', { last_progress: 'Finished' })]);
-  const { rows } = missionRows([busy, quiet, done], [], [], true, Date.parse('2026-09-30T12:00:00Z'));
+  const now = new Date(2026, 9, 2, 22, 0).getTime();
+  const failedAt = (at) => served({ id: `mission/example/failed-${at}`, title: 'failed', state: 'failed', updated_at: new Date(2026, 9, 2, 21, 0).toISOString(), run_details: null }, 'failed', { settled_at: new Date(at).toISOString() });
+  const yesterday = failedAt(new Date(2026, 9, 1, 23, 0).getTime());
+  const today = failedAt(new Date(2026, 9, 2, 9, 0).getTime());
+  const { rows, hidden } = missionRows([yesterday, today], false, now);
+  assert.deepEqual(rows.map(row => row.mission.id), [today.id]);
+  assert.equal(hidden, 1);
+  assert.equal(missionRows([yesterday, today], true, now).rows.length, 2);
+}
+
+// A run in progress shows what its step last reported (Nathan, 2026-10-06), as st serves it.
+{
+  const busy = served(mission('busy', 'running'), 'working', { last_progress: ' Tests pass;\n opening the PR ' });
+  const quiet = served(mission('quiet', 'running'), 'working');
+  const { rows } = missionRows([busy, quiet], true, Date.parse('2026-09-30T12:00:00Z'));
   const byId = Object.fromEntries(rows.map(row => [row.mission.id, row.progress]));
-  assert.deepEqual(byId, { 'mission/busy': 'Tests pass; opening the PR', 'mission/quiet': undefined, 'mission/done': undefined });
+  assert.deepEqual(byId, { 'mission/busy': 'Tests pass; opening the PR', 'mission/quiet': undefined });
 }
 
 // Resources keeps mission search usable across names, paths, status and current progress.
-const searchable = missionRows([mission('demo/ship', 'running', [step('build', 'claimed', { last_progress: 'Checking package' })]), mission('demo/idle', 'standing')], [], [], true).rows;
+const searchable = missionRows([
+  served(mission('demo/ship', 'running'), 'working', { last_progress: 'Checking package' }),
+  served(mission('demo/idle', 'standing'), 'idle'),
+], true).rows;
 assert.deepEqual(filterMissionRows(searchable, 'DEMO checking').map(row => row.mission.id), ['mission/demo/ship']);
 assert.deepEqual(filterMissionRows(searchable, 'working ship').map(row => row.mission.id), ['mission/demo/ship']);
 assert.deepEqual(filterMissionRows(searchable, 'ship idle'), []);

@@ -6,7 +6,7 @@ import type { LaunchVariant, Mission } from '../../../clients/typescript/st3-cli
 import { agentName } from '../agentsView';
 import SegmentedControl from '@react-native-segmented-control/segmented-control';
 import { Banners, Empty, StatusLine, useDebugScroll, useListsOnFocus, useMissionsOnFocus, useRefresh } from '../chrome';
-import { MISSION_LEGEND, missionRows, missionSections, filterMissionRows, missionTitle, missionWord, stepStyle, wordName, wordStyle, type MissionRow } from '../missionsView';
+import { MISSION_LEGEND, actorName, missionLabel, missionRows, missionSections, filterMissionRows, missionTitle, missionWord, stepStyle, wordName, wordStyle, type MissionRow } from '../missionsView';
 import type { RootParams, RootScreen } from '../navigation';
 import { missionSteps } from '../presentation';
 import { homeRows } from '@smalltalk/st3-views';
@@ -49,7 +49,7 @@ export function MissionsScreen() {
       ],
     });
   }, [navigation, showSystem]);
-  const { rows, hidden } = useMemo(() => missionRows(data.missions, data.attention, data.agents, showSystem), [data.missions, data.attention, data.agents, showSystem]);
+  const { rows, hidden } = useMemo(() => missionRows(data.missions, showSystem), [data.missions, showSystem]);
   const sections = missionSections(filterMissionRows(rows, filter)).map(section => ({ ...section, data: section.rows }));
   const open = data.launches.filter(launch => launch.phase !== 'approved' && launch.phase !== 'cancelled');
   return <Screen>
@@ -94,8 +94,13 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
   const mission = detail ?? listed;
   useLayoutEffect(() => { navigation.setOptions({ title: route.params.title ?? (mission ? missionTitle(mission) : 'Mission') }); }, [navigation, route.params.title, mission]);
   if (!mission) return <Screen><Banners /><Empty text={status === 'online' ? 'Loading this mission…' : 'This mission is not in the last loaded data.'} /></Screen>;
-  const word = missionWord(mission, data.attention, data.agents);
-  const steps = [...missionSteps(mission)].sort((a, b) => stepStyle(a.state).rank - stepStyle(b.state).rank || a.path.localeCompare(b.path));
+  const word = missionWord(mission);
+  // The steps st presents, in its order; steps st serves no presentation for read unknown.
+  const raw = new Map(missionSteps(mission).map(step => [step.id, step]));
+  const steps = mission.presentation
+    ? mission.presentation.steps.map(shown => ({ shown, step: raw.get(shown.id) }))
+    : [...raw.values()].map(step => ({ shown: undefined, step }));
+  const who = actorName(mission.presentation?.who, caps?.session_actor);
   const runs = mission.run_details ?? [];
   const outcome = runs.at(-1)?.outcome;
   // What this mission waits on the person for, first and answerable: each opens its card.
@@ -105,7 +110,8 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingBottom: 32 }}>
       <StatusLine />
       <View style={{ padding: 12, gap: 4 }}>
-        <T><T bold color={wordStyle(word).color}>{wordStyle(word).glyph} {wordName(word)}</T><T dim>  {mission.state} · {mission.runs.length} run{mission.runs.length === 1 ? '' : 's'}</T></T>
+        <T><T bold color={wordStyle(word).color}>{wordStyle(word).glyph} {missionLabel(mission)}</T><T dim>  {mission.state} · {mission.runs.length} run{mission.runs.length === 1 ? '' : 's'}</T></T>
+        {who ? <T soft>{word === 'decision' ? 'waiting on' : 'with'} {who}</T> : null}
         <T dim selectable>{mission.id}</T>
         {outcome ? <T soft>set {outcome.status}{outcome.previous_status ? ` (was ${outcome.previous_status})` : ''} by {outcome.actor}: {outcome.reason}</T> : null}
       </View>
@@ -121,18 +127,19 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
         />)}
       </> : null}
       <SectionHeader title="steps" count={steps.length} />
-      {steps.map(step => {
-        const style = stepStyle(step.state);
-        const holder = step.agentless ? 'st' : step.claimant ?? step.assignee;
+      {steps.map(({ shown, step }) => {
+        const style = stepStyle(shown?.word);
+        const holder = shown?.owner.kind === 'agent' ? shown.owner.agent : undefined;
         const agent = holder ? data.agents.find(candidate => candidate.id === holder) : undefined;
-        return <View key={step.id} style={{ paddingHorizontal: 12, paddingVertical: 5 }}>
-          <T><T bold color={style.color}>{style.glyph} </T><T bold>{step.path}</T><T color={style.color}>  {style.word}</T></T>
-          {step.blocked_reason ? <T color={theme.waiting} style={{ paddingLeft: 22 }}>{step.blocked_reason}</T> : null}
-          {['claimed', 'working', 'running'].includes(step.state) && step.last_progress ? <T style={{ paddingLeft: 22 }}>{step.last_progress}</T> : null}
-          {step.goals?.[0] ? <View style={{ paddingLeft: 22 }}><Markdown text={step.goals[0]} color={theme.subtext0} /></View> : null}
-          {holder ? agent
+        const owner = actorName(shown?.owner, caps?.session_actor);
+        return <View key={shown?.id ?? step?.id} style={{ paddingHorizontal: 12, paddingVertical: 5 }}>
+          <T><T bold color={style.color}>{style.glyph} </T><T bold>{shown?.path ?? step?.path}</T><T color={style.color}>  {style.word}</T></T>
+          {shown?.note ? <T color={theme.waiting} style={{ paddingLeft: 22 }}>{shown.note}</T> : null}
+          {shown?.word === 'working' && step?.last_progress ? <T style={{ paddingLeft: 22 }}>{step.last_progress}</T> : null}
+          {step?.goals?.[0] ? <View style={{ paddingLeft: 22 }}><Markdown text={step.goals[0]} color={theme.subtext0} /></View> : null}
+          {agent
             ? <Pressable onPress={() => navigation.navigate('Conversation', { target: agent.id, title: agentName(agent) })} style={{ paddingLeft: 22 }}><T><T dim>held by </T><T color={theme.accent}>{agentName(agent)}</T></T></Pressable>
-            : <T dim style={{ paddingLeft: 22 }}>held by {holder}</T> : null}
+            : owner ? <T dim style={{ paddingLeft: 22 }}>held by {owner}</T> : null}
         </View>;
       })}
       {!steps.length ? <Note>No steps are visible for this mission's runs.</Note> : null}

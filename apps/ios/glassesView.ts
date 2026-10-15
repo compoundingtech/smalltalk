@@ -1,6 +1,6 @@
 import type { Agent, Attention, Glass, GlassLayout, GlassTab, Mission } from '../../clients/typescript/st3-client';
 import { agentGlyph, agentName, agentState, agentWord } from './agentsView';
-import { missionWord, wordName, wordStyle } from './missionsView';
+import { missionLabel, missionWord, wordStyle } from './missionsView';
 import { missionLabels } from './presentation';
 import type { MachineView } from './projectionCache';
 
@@ -113,7 +113,7 @@ export function paneTarget(key: string, lists: GlassLists, labels = missionLabel
       title: mission ? (labels.get(id) ?? mission.title) : id,
       needsYou: waiting.some(item => item.mission_id === id),
       gone: !mission,
-      status: mission ? (word => ({ ...wordStyle(word), word: wordName(word) }))(missionWord(mission, lists.attention, lists.agents)) : undefined,
+      status: mission ? { ...wordStyle(missionWord(mission)), word: missionLabel(mission) } : undefined,
     };
   }
   if (kind === 'machine') {
