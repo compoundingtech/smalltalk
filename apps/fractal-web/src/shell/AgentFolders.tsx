@@ -263,7 +263,7 @@ export const AgentFolders = React.memo(
             workspace,
             agent,
             status,
-            needsMe: status === 'waiting' || needsYou.has(workspace.id),
+            needsMe: needsYou.has(workspace.id),
           },
         ]
       }),

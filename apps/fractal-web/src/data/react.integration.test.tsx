@@ -52,7 +52,7 @@ const card = decodeUnknownSync(Attention)({
   detail: 'Independent request',
   priority: 'normal',
   state: 'open',
-  actions: [],
+  actions: ['work.done'],
   revision: '1',
   requested_at: '2026-10-04T12:00:00.000Z',
   updated_at: '2026-10-04T12:00:00.000Z',
