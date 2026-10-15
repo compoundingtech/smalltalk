@@ -360,6 +360,151 @@ fn a_cancelled_run_is_reported_without_the_reason() {
 }
 
 #[test]
+fn a_queued_run_gets_its_full_timeout_after_admission() {
+    let (_clock, fixture) = fixture();
+    let source = SOURCE.replace(
+        r#"mission "watched-with-default-limit" state="ready""#,
+        r#"mission "watched-with-default-limit" state="ready" timeout="5m""#,
+    );
+    apply_source(&fixture.store, &source, "queued-timeout-missions");
+    let predecessor = fixture.start("unwatched", "timeout-predecessor");
+    let revision = fixture
+        .store
+        .mission_spec("watched-with-default-limit", None)
+        .unwrap()
+        .unwrap()
+        .revision;
+    apply_source(
+        &fixture.store,
+        &format!(
+            "version 2\nmission-run \"timed-successor\" {{\n  mission \"mission/watched-with-default-limit@{revision}\"\n  workspace \"/tmp\"\n  requester \"person/operator\"\n  after {:?}\n}}\n",
+            predecessor.subject,
+        ),
+        "queued-timeout-run",
+    );
+    let queued = fixture
+        .store
+        .mission_run("timed-successor")
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.timeout_ms, Some(5 * MINUTE as u64));
+    assert_eq!(
+        queued.deadline_at_unix_ms, None,
+        "Waiting is outside the run timeout"
+    );
+    let replica = Store::open_memory("replica").unwrap();
+    replica
+        .import_replication("node", &fixture.store.export_replication(0).unwrap())
+        .unwrap();
+    let replicated = replica.mission_run("timed-successor").unwrap().unwrap();
+    assert_eq!(replicated.timeout_ms, queued.timeout_ms);
+    assert_eq!(replicated.deadline_at_unix_ms, None);
+
+    let admitted_at = start() + 6 * MINUTE;
+    let _past_creation_budget = Clock::at(&fixture.store, admitted_at);
+    fixture.passes(3);
+    let waiting = fixture
+        .store
+        .mission_run("timed-successor")
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.phase, "normal");
+    assert_eq!(
+        waiting
+            .steps
+            .iter()
+            .find(|step| step.step == "after-run")
+            .unwrap()
+            .status,
+        "working"
+    );
+    assert_eq!(waiting.deadline_at_unix_ms, None);
+    assert_eq!(
+        fixture.store.next_active_mission_deadline("node").unwrap(),
+        None
+    );
+
+    fixture
+        .store
+        .set_mission_run_state(&predecessor.id, "completed", "terminal", None)
+        .unwrap();
+    fixture.passes(3);
+    let admitted = fixture
+        .store
+        .mission_run("timed-successor")
+        .unwrap()
+        .unwrap();
+    let deadline = admitted_at + 5 * MINUTE;
+    assert_eq!(admitted.deadline_at_unix_ms, Some(deadline));
+    assert_eq!(admitted.timeout_ms, Some(5 * MINUTE as u64));
+    assert_eq!(
+        admitted
+            .steps
+            .iter()
+            .find(|step| step.step == "after-run")
+            .unwrap()
+            .status,
+        "completed"
+    );
+    assert_eq!(
+        fixture.store.next_active_mission_deadline("node").unwrap(),
+        Some(deadline)
+    );
+    replica
+        .import_replication("node", &fixture.store.export_replication(0).unwrap())
+        .unwrap();
+    assert_eq!(
+        replica
+            .mission_run("timed-successor")
+            .unwrap()
+            .unwrap()
+            .deadline_at_unix_ms,
+        Some(deadline)
+    );
+
+    let _before_deadline = Clock::at(&fixture.store, deadline - 1);
+    fixture.passes(3);
+    assert_eq!(
+        fixture
+            .store
+            .mission_run("timed-successor")
+            .unwrap()
+            .unwrap()
+            .phase,
+        "normal"
+    );
+    let _at_deadline = Clock::at(&fixture.store, deadline);
+    fixture.passes(6);
+    assert_eq!(
+        fixture
+            .store
+            .mission_run("timed-successor")
+            .unwrap()
+            .unwrap()
+            .status,
+        "failed"
+    );
+    let reports = fixture.reports(REPORTER);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports[0]
+            .tags
+            .contains(&"st3-run-report:failed".to_owned())
+    );
+    // A late join uses the accepted admission stamp, even after expiry.
+    let late = Store::open_memory("late-replica").unwrap();
+    late.import_replication("node", &fixture.store.export_replication(0).unwrap())
+        .unwrap();
+    assert_eq!(
+        late.mission_run("timed-successor")
+            .unwrap()
+            .unwrap()
+            .deadline_at_unix_ms,
+        Some(deadline)
+    );
+}
+
+#[test]
 fn a_timed_out_run_is_reported_as_failed() {
     let source = SOURCE.replace(
         r#"mission "watched-with-default-limit" state="ready""#,

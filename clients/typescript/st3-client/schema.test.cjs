@@ -4,6 +4,24 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('queued mission deadlines decode null and admission timestamps', async () => {
+    const [{ Option, Schema }, Rich] = await modules;
+    const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');
+    for (const mode of ['strict', 'tolerant']) {
+        const decode = Rich.decodeUnknownSync(Rich.Mission, mode);
+        const queued = structuredClone(wire);
+        queued.run_details[0].after = 'mission-run/predecessor';
+        queued.run_details[0].deadline = null;
+        const value = decode(queued);
+        assert(Option.isNone(value.run_details[0].deadline));
+        assert.equal(Schema.encodeSync(Rich.Mission)(value).run_details[0].deadline, null);
+        queued.run_details[0].deadline = '2026-09-20T11:05:00.000Z';
+        assert(Option.isSome(decode(queued).run_details[0].deadline));
+        assert.equal(Schema.encodeSync(Rich.Mission)(decode(queued)).run_details[0].deadline,
+            '2026-09-20T11:05:00.000Z');
+    }
+});
+
 test('terminal refusal and unconfirmed send envelopes preserve their applied answers', async () => {
     const [{ Schema }, Rich] = await modules;
     const decode = Rich.decodeUnknownSync(Rich.ErrorEnvelope);

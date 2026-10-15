@@ -52,6 +52,10 @@ pub struct ReplicationExchange {
     pub peer: String,
     pub fleet_id: String,
     pub schema_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_registry_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projection_versions: BTreeMap<String, u64>,
     pub authority_digest: String,
     /// Six-table compatibility digest for older peers. Modern peers compare projection_digests.
     pub graph_digest: String,
@@ -335,6 +339,12 @@ pub struct ReplicationPeerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<String>,
     pub schema_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_registry_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projection_versions: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incompatible_projection_tables: Vec<String>,
     pub authority_digest: Option<String>,
     pub graph_digest: Option<String>,
     #[serde(default)]

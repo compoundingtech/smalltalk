@@ -918,6 +918,51 @@ impl Store {
         Ok(items)
     }
 
+    /// A completed after-step with an unarmed budget is missing admission provenance,
+    /// not queued work. Keep the time unknown and make its loss an actionable fault.
+    fn missing_admission_clock_faults(
+        &self,
+        person: Option<&str>,
+    ) -> Result<Vec<AttentionItemView>> {
+        let connection = self.readers.get();
+        // Begin with the small open-run index, then point-read each deadline and its
+        // after-steps. Finished history is never scanned for this fault.
+        let runs = connection.prepare_cached(&format!(
+            "SELECT mission_runs.id FROM mission_runs INDEXED BY mission_runs_open_index
+             CROSS JOIN mission_run_deadlines AS deadlines
+             WHERE {OPEN_MISSION_RUN} AND deadlines.run_id=mission_runs.id
+               AND deadlines.deadline_at_unix_ms IS NULL
+               AND EXISTS(SELECT 1 FROM step_runs INDEXED BY step_runs_run_index
+                 WHERE step_runs.run_id=mission_runs.id AND step_runs.step_path=?1
+                   AND step_runs.status='completed')"
+        ))?.query_map([crate::mission::AFTER_RUN_STEP], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut items = Vec::new();
+        for id in runs {
+            let run = mission_run_header_tx(&connection, &id)?;
+            if !person_work::run_live(&connection, &run.subject, Some(&run.generation), true)?
+                || person.is_some_and(|person| person != run.requester)
+            {
+                continue;
+            }
+            items.push(AttentionItemView {
+                episode: format!("deadline-admission-missing:{id}"),
+                priority: "high".into(), kind: "fault".into(), review_mode: None,
+                subject: run.subject.clone(), person: run.requester.clone(),
+                requester_id: None, launch_id: None, variant_id: None, message_id: None,
+                answers: Vec::new(), conversation: None,
+                title: "Run admission time unavailable".into(),
+                detail: "This run was admitted, but its timeout cannot be reconstructed because the accepted admission history is unavailable. Its timeout is not armed. Restore the original admission history from a trusted copy and rebuild the projection, or cancel the run. A retry or duplicate completion cannot start a fresh timeout budget.".into(),
+                mission: Some(run.mission.clone()), mission_run: Some(run.subject.clone()),
+                step: None, targets: vec![run.subject.clone()],
+                requested_at_unix_ms: run.created_at_unix_ms,
+                actions: vec![attention_action("inspect run", &["st", "missions", "show", &run.subject])],
+                request: None,
+            });
+        }
+        Ok(items)
+    }
+
     fn loop_attention_items(
         &self,
         person: Option<&str>,
@@ -1160,6 +1205,7 @@ impl Store {
         let mut items = self.reconcile_fault_attention(person, as_of)?;
         items.extend(self.observer_attention_items(person, as_of)?);
         items.extend(self.loop_attention_items(person, as_of)?);
+        items.extend(self.missing_admission_clock_faults(person)?);
         items.extend(self.parked_runtime_attention_items(person, as_of)?);
         items.extend(self.unstarted_seat_attention_items(person, as_of)?);
         let failures = self.operational_failures()?;

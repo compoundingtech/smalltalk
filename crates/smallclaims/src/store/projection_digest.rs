@@ -103,7 +103,10 @@ pub fn row_sql(columns: &[String], prefix: &str) -> String {
         .iter()
         .map(|column| {
             // SQLite JSON does not accept blobs; their complete bytes are shared data.
-            if matches!(column.as_str(), "bytes" | "binding_key" | "created_key" | "head_key" | "winner") {
+            if matches!(
+                column.as_str(),
+                "bytes" | "binding_key" | "created_key" | "head_key" | "winner"
+            ) {
                 format!("hex({prefix}{column})")
             } else {
                 // JSON functions attach a transient subtype to TEXT. NEW values can retain
@@ -481,6 +484,33 @@ pub fn differing(
         .into_iter()
         .filter(|table| local.get(*table) != remote.get(*table))
         .cloned()
+        .collect()
+}
+
+/// Tables whose definitions differ are not comparable, even if their row hashes happen
+/// to agree. Missing table rows with the same definition remain a real difference.
+pub fn incompatible_versions(
+    local: &BTreeMap<String, u64>,
+    remote: &BTreeMap<String, u64>,
+) -> BTreeSet<String> {
+    local
+        .keys()
+        .chain(remote.keys())
+        .filter(|table| {
+            local.get(*table).copied().unwrap_or(1) != remote.get(*table).copied().unwrap_or(1)
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn comparable(
+    digests: &BTreeMap<String, String>,
+    incompatible: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    digests
+        .iter()
+        .filter(|(table, _)| !incompatible.contains(*table))
+        .map(|(table, digest)| (table.clone(), digest.clone()))
         .collect()
 }
 
