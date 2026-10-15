@@ -52,6 +52,18 @@ fn js(value: &Value) -> String {
     value.to_string()
 }
 
+/// Lists of this many string cases or more are written one case per line, so two changes that add
+/// different cases merge instead of conflicting on the one line that held them all.
+pub const ONE_PER_LINE_FROM: usize = 8;
+
+fn js_cases(values: &[Value]) -> String {
+    if values.len() < ONE_PER_LINE_FROM {
+        return js(&Value::Array(values.to_vec()));
+    }
+    let lines = values.iter().map(js).collect::<Vec<_>>();
+    format!("[\n  {}\n]", lines.join(",\n  "))
+}
+
 // ------------------------------------------------------------------ normalization
 
 fn resolve<'a>(value: &'a Value, defs: &'a Defs) -> Result<&'a Value> {
@@ -585,16 +597,13 @@ fn emit(value: &Value, cx: &mut Cx) -> Result<String> {
         if known.is_empty() || known.iter().any(|value| !value.is_string()) {
             bail!("open enum must contain known string cases");
         }
-        return Ok(format!("openEnum({})", js(&Value::Array(known))));
+        return Ok(format!("openEnum({})", js_cases(&known)));
     }
     if let Some(constant) = object.get("const") {
         return Ok(format!("Schema.Literal({})", js(constant)));
     }
     if let Some(values) = object.get("enum").and_then(Value::as_array) {
-        return Ok(format!(
-            "Schema.Literals({})",
-            js(&Value::Array(values.clone()))
-        ));
+        return Ok(format!("Schema.Literals({})", js_cases(values)));
     }
     for combinator in ["oneOf", "anyOf"] {
         let Some(branches) = object.get(combinator).and_then(Value::as_array) else {
