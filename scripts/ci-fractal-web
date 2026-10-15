@@ -41,14 +41,27 @@ production_build() (
 )
 
 
+kit_storybook() {
+  local start=$SECONDS
+  pnpm --filter @smalltalk/fractal-ui build-storybook
+  export KIT_STORYBOOK_BUILD_SECONDS=$((SECONDS - start))
+}
+
 kit_plays() (
-  local receipt_dir
-  receipt_dir=$(mktemp -d "${TMPDIR:-/tmp}/fractal-kit-plays.XXXXXX")
-  trap 'rm -rf "$receipt_dir"' EXIT
-  node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook-static "$receipt_dir"
+  local receipt_dir="${KIT_RECEIPT_DIRECTORY:-${RUNNER_TEMP:-/tmp}/kit-play-receipts}"
+  mkdir -p "$receipt_dir"
+  # Keep sharding scoped to the kit; app strict plays (#2958) run unsharded on shard 0.
+  KIT_PLAY_SHARD_INDEX=${KIT_SHARD_INDEX:-0} KIT_PLAY_SHARD_COUNT=${KIT_SHARD_COUNT:-1} \
+    node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook-static "$receipt_dir"
 )
 lane "Toolchain and Buck root" toolchain
 lane "Frozen install" pnpm install --frozen-lockfile
+# App/static lanes belong to shard 0. Independent strict subshells ensure either lane's
+# failure cannot suppress the other's receipt (including the incoming #2958 app plays).
+set +e
+(
+  set -e
+if [ "${KIT_SHARD_INDEX:-0}" -eq 0 ]; then
 lane "Dependency licenses" python3 scripts/ci-fractal-web-licenses --check
 lane "Buck typecheck" buck2 build //:typecheck
 lane "Scenario typecheck" pnpm --filter @smalltalk/st3-scenarios typecheck
@@ -68,11 +81,18 @@ lane "App unit tests" pnpm --filter fractal-web test
 lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts
 lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts
 lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck
+fi
+)
+app_status=$?
+(
+  set -e
 case "${KIT_INPUTS:-true}" in
   true)
     lane "UI kit play index contracts" node --test packages/fractal-ui/scripts/kit-play-index.node-test.mjs
-    lane "UI kit context isolation controls" node packages/fractal-ui/scripts/kit-play-isolation.browser-test.mjs
-    lane "UI kit Storybook" pnpm --filter @smalltalk/fractal-ui build-storybook
+    if [ "${KIT_SHARD_INDEX:-0}" -eq 0 ]; then
+      lane "UI kit context isolation controls" node packages/fractal-ui/scripts/kit-play-isolation.browser-test.mjs
+    fi
+    lane "UI kit Storybook" kit_storybook
     lane "UI kit strict plays (440/1440 × dark/light)" kit_plays
     ;;
   false)
@@ -83,3 +103,8 @@ case "${KIT_INPUTS:-true}" in
     exit 1
     ;;
 esac
+)
+kit_status=$?
+set -e
+if [ "$app_status" -ne 0 ]; then exit "$app_status"; fi
+exit "$kit_status"

@@ -1,15 +1,18 @@
 import { createServer } from 'node:http'
-import { readFile, stat, mkdir, writeFile } from 'node:fs/promises'
+import { readFile, stat, mkdir, writeFile, appendFile } from 'node:fs/promises'
 import { resolve, sep, extname, join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { strictStoryGuard } from './details-strict-story-guard.mjs'
 import { availableParallelism } from 'node:os'
 import { storyIdsFromIndex } from './kit-play-index.mjs'
 import { createIsolatedKitWorker } from './kit-play-isolation.mjs'
+import { shardStories } from './kit-play-shards.mjs'
 
 // Own an ephemeral localhost server: missing assets remain real, standard 404s.
 const [buildDirectory, outputDirectory] = process.argv.slice(2)
 if (!buildDirectory || !outputDirectory) throw new Error('Usage: node kit-play-gate.mjs <storybook-static> <receipt-directory>')
+const shardIndex = Number(process.env.KIT_PLAY_SHARD_INDEX ?? 0)
+const shardCount = Number(process.env.KIT_PLAY_SHARD_COUNT ?? 1)
 const root = resolve(buildDirectory)
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2' }
 const server = createServer(async (request, response) => {
@@ -41,7 +44,7 @@ const base = `http://127.0.0.1:${server.address().port}`
 const started = performance.now()
 const rows = []
 const workers = Math.min(6, availableParallelism())
-let ids = [], browser, fatalError
+let ids = [], fullIds = [], browser, fatalError
 await mkdir(outputDirectory, { recursive: true })
 const writeReceipt = async () => {
   const elapsedSeconds = (performance.now() - started) / 1000
@@ -55,8 +58,14 @@ const writeReceipt = async () => {
   }
   const phaseMeanMilliseconds = Object.fromEntries([...phaseTotals].map(([name, { sum, count }]) => [name, sum / count]))
   const receipt = {
-    pass: !fatalError && ids.length > 0 && rows.length === ids.length * 4 && rows.every(row => row.pass),
+    pass: !fatalError && fullIds.length > 0 && rows.length === ids.length * 4 && rows.every(row => row.pass),
+    shardIndex, shardCount, fullIds,
+    runId: process.env.GITHUB_RUN_ID, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+    headSha: process.env.GITHUB_SHA,
     stories: ids.length, expectedCases: ids.length * 4, cases: rows.length, workers,
+    passed: rows.filter(row => row.pass).length, failed: rows.filter(row => !row.pass).length,
+    playMinutes: elapsedSeconds / 60,
+    storybookBuildSeconds: Number(process.env.KIT_STORYBOOK_BUILD_SECONDS ?? 0),
     isolation: 'reused-context-fresh-page-cleared-storage',
     elapsedSeconds, fatalError, rows: rows.toSorted((a, b) => a.id.localeCompare(b.id) || a.scheme.localeCompare(b.scheme) || a.width - b.width),
     effectiveWorkerSecondsPerCase: rows.length ? elapsedSeconds * workers / rows.length : null,
@@ -66,12 +75,18 @@ const writeReceipt = async () => {
   await writeFile(join(outputDirectory, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n')
   const { rows: _rows, ...summary } = receipt
   console.log(`KIT_PLAY_SUMMARY ${JSON.stringify(summary)}`)
+  if (process.env.GITHUB_STEP_SUMMARY && process.env.KIT_PLAY_SHARD_COUNT) {
+    await appendFile(process.env.GITHUB_STEP_SUMMARY, `\n| Shard | Cases (completed/expected) | Passed | Failed | Play minutes | Result |\n| --- | --- | --- | --- | --- | --- |\n| kit ${shardIndex}/${shardCount} | ${receipt.cases}/${receipt.expectedCases} | ${receipt.passed} | ${receipt.failed} | ${receipt.playMinutes.toFixed(2)} | ${receipt.pass ? 'PASS' : 'FAIL'} |\n`)
+    await appendFile(process.env.GITHUB_STEP_SUMMARY, `\nkit ${shardIndex}/${shardCount} Storybook build: ${(receipt.storybookBuildSeconds / 60).toFixed(2)} runner-minutes (included in this shard; duplicate build cost is the sum of nonzero-shard builds).\n`)
+  }
   return receipt
 }
 try {
   const response = await fetch(`${base}/index.json`)
   if (!response.ok) throw new Error(`Storybook index: HTTP ${response.status}`)
-  ids = storyIdsFromIndex(await response.json())
+  // Every shard validates the complete Storybook contract before selecting work.
+  fullIds = storyIdsFromIndex(await response.json()).toSorted()
+  ids = shardStories(fullIds, shardIndex, shardCount)
   const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? 'playwright')
   browser = await chromium.launch(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {})
   const cases = ids.flatMap(id => ['dark', 'light'].flatMap(scheme => [440, 1440].map(width => ({ id, scheme, width }))))
