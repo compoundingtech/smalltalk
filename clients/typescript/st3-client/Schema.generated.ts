@@ -2451,6 +2451,20 @@ export const TimelineViewModelChange = /*#__PURE__*/ (() => Schema.Struct({
 export type TimelineViewModelChange = typeof TimelineViewModelChange.Type
 export type TimelineViewModelChangeEncoded = typeof TimelineViewModelChange.Encoded
 
+/** A view on a visible OMP custom_message with no more specific view (its block keeps its shape), and on the `status` blocks of the administrative records model_usage, session_init and ttsr_injection. `kind` is the native customType (or record type); attribution, content and details are the native values, each present only when the record carries it, so attribution is never inferred. Content and details are bounded separately to the native-value limit, an over-limit one becoming marked JSON text; the complete record stays in the raw payload. */
+export const TimelineViewOmpEvent = /*#__PURE__*/ (() => Schema.Struct({
+  /** Native attribution, any JSON */
+  "attribution": optionalKey(Schema.Unknown).annotate({ description: "Native attribution, any JSON" }),
+  /** Native content, any JSON */
+  "content": optionalKey(Schema.Unknown).annotate({ description: "Native content, any JSON" }),
+  /** Native details, any JSON */
+  "details": optionalKey(Schema.Unknown).annotate({ description: "Native details, any JSON" }),
+  "kind": Schema.String,
+  "type": Schema.Literal("omp_event")
+}).annotate({ identifier: "TimelineViewOmpEvent", description: "A view on a visible OMP custom_message with no more specific view (its block keeps its shape), and on the `status` blocks of the administrative records model_usage, session_init and ttsr_injection. `kind` is the native customType (or record type); attribution, content and details are the native values, each present only when the record carries it, so attribution is never inferred. Content and details are bounded separately to the native-value limit, an over-limit one becoming marked JSON text; the complete record stays in the raw payload." }))()
+export type TimelineViewOmpEvent = typeof TimelineViewOmpEvent.Type
+export type TimelineViewOmpEventEncoded = typeof TimelineViewOmpEvent.Encoded
+
 export const TimelineViewRead = /*#__PURE__*/ (() => Schema.Struct({
   "intent": optionalKey(Schema.String),
   "path": Schema.String,
@@ -2631,7 +2645,8 @@ export const TimelineView = /*#__PURE__*/ (() => Schema.Union([
   TimelineViewToolStart,
   TimelineViewResetBoundary,
   TimelineViewCredentialPin,
-  Schema.Struct({ "type": unknownCase(["bash","edit","write","read","search","todo","ask","task","hub","eval","generic","irc","job","skill","compaction","assistant_error","model_change","thinking_level","title","session_exit","tool_start","reset_boundary","credential_pin"]) })
+  TimelineViewOmpEvent,
+  Schema.Struct({ "type": unknownCase(["bash","edit","write","read","search","todo","ask","task","hub","eval","generic","irc","job","skill","compaction","assistant_error","model_change","thinking_level","title","session_exit","tool_start","reset_boundary","credential_pin","omp_event"]) })
 ], { mode: "oneOf" }).annotate({ identifier: "TimelineView", description: "Parsed typed projection of a block, discriminated by type. Known types are closed; future types keep JSON through the fallback." }))()
 export type TimelineView = typeof TimelineView.Type
 export type TimelineViewEncoded = typeof TimelineView.Encoded

@@ -448,6 +448,32 @@ pub(crate) fn tool_output_view(
     out
 }
 
+/// The `omp_event` view: a native OMP event as its kind, attribution, content and details. The
+/// view omits what the record does not carry (attribution is never inferred) and bounds content
+/// and details separately; the complete record stays in the block's raw payload.
+fn omp_event_view(
+    out: &mut Value,
+    kind: &Value,
+    attribution: Option<&Value>,
+    content: Option<&Value>,
+    details: Option<&Value>,
+) {
+    use crate::external_sessions::{
+        MAX_OMP_EVENT_IDENTITY_BYTES, MAX_TIMELINE_VALUE_BYTES, bounded_value,
+    };
+    out["type"] = json!("omp_event");
+    out["kind"] = bounded_value(kind, MAX_OMP_EVENT_IDENTITY_BYTES);
+    if let Some(attribution) = attribution {
+        out["attribution"] = bounded_value(attribution, MAX_OMP_EVENT_IDENTITY_BYTES);
+    }
+    if let Some(content) = content {
+        out["content"] = bounded_value(content, MAX_TIMELINE_VALUE_BYTES);
+    }
+    if let Some(details) = details {
+        out["details"] = bounded_value(details, MAX_TIMELINE_VALUE_BYTES);
+    }
+}
+
 pub(crate) fn omp_record_view(
     record: &Value,
 ) -> Option<(&'static str, Value, Option<&'static str>)> {
@@ -487,6 +513,28 @@ pub(crate) fn omp_record_view(
                 &mut out,
                 &record["details"],
                 &[("name", "name"), ("path", "path"), ("args", "args")],
+            );
+            "status"
+        }
+        // Any other visible extension message, and the observed administrative records, keep
+        // their native kind, attribution, content and details; nothing is inferred from text.
+        ("custom_message", _) => {
+            omp_event_view(
+                &mut out,
+                &json!(custom.unwrap_or(record_type)),
+                record.get("attribution"),
+                record.get("content"),
+                Some(&record["details"]).filter(|details| !details.is_null()),
+            );
+            "status"
+        }
+        ("model_usage" | "session_init" | "ttsr_injection", _) => {
+            omp_event_view(
+                &mut out,
+                &json!(record_type),
+                record.get("attribution"),
+                None,
+                Some(record),
             );
             "status"
         }
@@ -911,7 +959,16 @@ mod tests {
             )
             .is_none()
         );
-        assert!(omp_record_view(&json!({"type":"custom_message","customType":"other"})).is_none());
+        // Any other visible extension message keeps its native kind, attribution and content.
+        let (kind, view, visibility) = omp_record_view(
+            &json!({"type":"custom_message","customType":"other","attribution":"human","content":"hi"}),
+        )
+        .unwrap();
+        assert_eq!((kind, visibility), ("status", None));
+        assert_eq!(
+            view,
+            json!({"type":"omp_event","kind":"other","attribution":"human","content":"hi"})
+        );
     }
 
     #[test]

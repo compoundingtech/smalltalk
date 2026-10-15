@@ -773,6 +773,16 @@ the same ref fetches the complete original `/body`, including its unbounded bloc
 The final per-entry size guard remains authoritative and can replace an entry with a
 `native-entry-too-large` error whose continuation fetches its original body.
 
+A timeline page is also bounded after preparation. An entry that alone still exceeds the response
+ceiling (the 1 MiB response cap minus 128,000 reserved bytes) does not fail the page: it is
+replaced in place by an `error` entry that keeps its `id` and `sequence`, with body
+`{code: "timeline-entry-too-large", message, retryable: false, details: {size}}`, and the page
+cursor continues after it. This applies to native keyset pages and cached offset pages alike. The
+code is an entry-level string in the open `error` body, not an HTTP error code. Native entries
+normally reach this limit through the `native-entry-too-large` guard above, so they keep its
+continuation; the `timeline-entry-too-large` entry carries only the entry's size and has no
+continuation.
+
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
 `details.reason: native-session-unidentified` and `details.session_id`, explaining that the
