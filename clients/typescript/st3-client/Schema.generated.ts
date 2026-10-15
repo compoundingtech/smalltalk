@@ -2985,6 +2985,44 @@ export const ResourcesPage = /*#__PURE__*/ (() => Schema.Struct({
 export type ResourcesPage = typeof ResourcesPage.Type
 export type ResourcesPageEncoded = typeof ResourcesPage.Encoded
 
+/** What was left of one objective or budget across a period, in equal steps; a step holds its lowest reading and is null when nothing was read. */
+export const SloHistory = /*#__PURE__*/ (() => Schema.Struct({
+  "id": Schema.String,
+  "samples": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "since_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "steps": Schema.Array(Schema.NullOr(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(100)))),
+  "until_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "SloHistory", description: "What was left of one objective or budget across a period, in equal steps; a step holds its lowest reading and is null when nothing was read." }))()
+export type SloHistory = typeof SloHistory.Type
+export type SloHistoryEncoded = typeof SloHistory.Encoded
+
+/** One objective (a target with windows and an error budget) or one budget (an allowance that resets), as this daemon measures it. about, target, current, window and explain are display text for a person, not a contract; the pair of slo reads is experimental. */
+export const SloRow = /*#__PURE__*/ (() => Schema.Struct({
+  "about": Schema.String,
+  /** A budget's declared account. */
+  "account": optionalKey(Schema.String).annotate({ description: "A budget's declared account." }),
+  "current": Schema.String,
+  "explain": Schema.String,
+  "id": Schema.String,
+  "kind": Schema.Literals(["objective","budget"]),
+  "measured_at_unix_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** What is left of the error budget or allowance; null when nothing was measured. */
+  "remaining_percent": Schema.OptionFromNullOr(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(100))).annotate({ description: "What is left of the error budget or allowance; null when nothing was measured." }),
+  "resets_at_unix_ms": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "status": Schema.Literals(["met","missed","no-data","stale"]),
+  "target": Schema.String,
+  "window": Schema.String
+}).annotate({ identifier: "SloRow", description: "One objective (a target with windows and an error budget) or one budget (an allowance that resets), as this daemon measures it. about, target, current, window and explain are display text for a person, not a contract; the pair of slo reads is experimental." }))()
+export type SloRow = typeof SloRow.Type
+export type SloRowEncoded = typeof SloRow.Encoded
+
+export const SloList = /*#__PURE__*/ (() => Schema.Struct({
+  "as_of_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "rows": Schema.Array(SloRow)
+}).annotate({ identifier: "SloList" }))()
+export type SloList = typeof SloList.Type
+export type SloListEncoded = typeof SloList.Encoded
+
 export const StatusTransition = /*#__PURE__*/ (() => Schema.Struct({
   "observed_at": Timestamp,
   /** An incarnation starts here. A runtime reset without a harness observation has a null state. */
@@ -3033,7 +3071,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([DirectiveNotes, Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([DirectiveNotes, Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog, SloList, SloHistory], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

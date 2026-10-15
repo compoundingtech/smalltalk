@@ -475,6 +475,42 @@ pub struct MailBacklog {
     pub threshold_ms: u64,
     pub cleanup_command: String,
 }
+/// Every objective and budget at one moment.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SloList {
+    pub as_of_unix_ms: u64,
+    pub rows: Vec<SloRow>,
+}
+/// One objective (a target with windows and an error budget) or one budget (an allowance that
+/// resets). `remaining_percent` is null when nothing was measured.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SloRow {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    pub about: String,
+    pub target: String,
+    pub current: String,
+    pub window: String,
+    pub remaining_percent: Option<f64>,
+    pub status: String,
+    #[serde(default)]
+    pub resets_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub measured_at_unix_ms: Option<u64>,
+    pub explain: String,
+}
+/// What was left of one objective or budget across a period, in equal steps. A step holds its
+/// lowest reading and is null when nothing was read.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SloHistory {
+    pub id: String,
+    pub since_ms: u64,
+    pub until_ms: u64,
+    pub samples: u64,
+    pub steps: Vec<Option<f64>>,
+}
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {

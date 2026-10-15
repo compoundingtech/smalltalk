@@ -111,6 +111,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "GET /v1/harness-prompts/state",
         "one newest harness.observed read by its subject index and one answer read by its operation index",
     ),
+    (
+        "GET /v1/harness-prompts/answer",
+        "one claim read by its id and one answer read by its operation index; the poll beside GET /v1/harness-prompts/state",
+    ),
     // Aliases: the same handler as a measured route under the name a person reads.
     (
         "GET /v1/client/alerts",
@@ -638,6 +642,8 @@ const PROBES: &[Probe] = &[
         "/v1/client/attention/{attention}",
     ),
     get("GET /v1/client/mail-backlog", "/v1/client/mail-backlog"),
+    get("GET /v1/client/slo", "/v1/client/slo"),
+    get("GET /v1/client/slo/history", "/v1/client/slo/history?id=cpu"),
     post("POST /v1/messages/cleanup", "/v1/messages/cleanup", |_, _| {
         json!({ "all": true, "older_than_ms": 1, "dry_run": true })
     }),
