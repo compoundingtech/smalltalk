@@ -156,7 +156,9 @@ def observe(context, revision='HEAD'):
         return 'unavailable', None, 'no accepted base commit for this event', None
     if run('git', 'fetch', '--no-tags', '--depth=1', '-q', 'origin', base).returncode != 0:
         return 'unavailable', None, 'could not fetch the accepted base', None
-    context['notes_fetch'] = 'ok' if run('git', 'fetch', '--no-tags', '--depth=1', '-q', 'origin', NOTES).returncode == 0 else 'failed'
+    # --no-filter: choose_tree may have made this a partial clone (history without blobs); the notes' blobs must arrive in this one fetch,
+    # not one lazy round trip each when the verifier reads them (that took more than the verifier's 30 seconds on a runner).
+    context['notes_fetch'] = 'ok' if run('git', 'fetch', '--no-tags', '--depth=1', '--no-filter', '-q', 'origin', NOTES).returncode == 0 else 'failed'
     for name, path in (('policy_sha256', POLICY), ('keys_sha256', KEYS)):
         shown = run('git', 'show', f'{base}:{path}')
         context[name] = hashlib.sha256(shown.stdout).hexdigest()[:16] if shown.returncode == 0 else 'none'
@@ -198,7 +200,7 @@ def fetch_input_notes(verifier, base, check, repository, revision='HEAD'):
         return
     if isinstance(key, str) and OID.match(key):
         prefix = f'refs/notes/evidence-input/{check}/{key}'
-        run('git', 'fetch', '--no-tags', '--depth=1', '-q', 'origin', f'{prefix}/*:{prefix}/*')
+        run('git', 'fetch', '--no-tags', '--depth=1', '--no-filter', '-q', 'origin', f'{prefix}/*:{prefix}/*')
 
 
 def field(value):

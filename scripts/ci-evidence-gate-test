@@ -439,6 +439,28 @@ class EndToEnd(unittest.TestCase):
         self.assertIn(fields['notes_fetch'], ('ok', 'failed'))
         self.assertEqual((fields['outcome'], fields['tree_of']), ('no_note', 'head'))
 
+    def test_the_notes_are_fetched_without_the_partial_clone_filter_so_their_blobs_arrive_at_once(self):
+        """A pull request run deepens the history with a blob filter (a partial clone); a notes fetch that kept the filter would leave
+        each note's blob to a lazy round trip when the verifier reads it (genie-freshness timed out at 30 s on a hosted runner)."""
+        calls = []
+        real_run = gate.run
+
+        def fake(*command, **kwargs):
+            calls.append(command)
+            return real_run('true')
+        context = gate.context_from({'CHECK': 'typescript-client', 'REPOSITORY': REPOSITORY, 'BASE_SHA': 'a' * 40, 'EVENT_NAME': 'pull_request'})
+        gate.run = fake
+        try:
+            gate.observe(context, 'HEAD')
+            gate.fetch_input_notes('/nonexistent-verifier', 'a' * 40, 'typescript-client', REPOSITORY, 'HEAD')
+        finally:
+            gate.run = real_run
+        note_fetches = [c for c in calls if c[:2] == ('git', 'fetch') and any('refs/notes/evidence' in str(part) for part in c)]
+        self.assertTrue(note_fetches)
+        for command in note_fetches:
+            self.assertIn('--no-filter', command)
+        self.assertNotIn('--no-filter', [part for c in calls if c[:2] == ('git', 'fetch') and 'refs/notes' not in ' '.join(map(str, c)) for part in c])
+
     def test_a_notes_fetch_that_fails_is_logged_as_failed_not_as_no_note(self):
         calls = []
         real_run = gate.run
