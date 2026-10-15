@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Declare the inputs of the linux-gate evidence check (shadow only: enforce stays false), so a pull request that touches none of them would reuse the note of a tree on which the gate passed",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this changes the evidence skip policy (read from the accepted base) and a test."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, wire or harness contract change. With enforce false nothing is skipped: the gate records match=inputs lines for linux-gate and the real jobs still run."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No upgrade downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery procedure; reverting the policy hunk restores exact-tree matching for linux-gate."
+  }
+}

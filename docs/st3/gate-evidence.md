@@ -662,6 +662,21 @@ key stops the skip by itself. Paths are literal and relative; an under-declared 
 keeps running the real job for one run in N even when a note matches, chosen by a hash of the check, the key and
 the head, so a retry behaves the same; the gate prints `decision=run` with a reason starting `sampled`.
 
+`linux-gate` declares its inputs too (shadow only: `enforce` stays false, `sample_one_in` 5). The list is the Rust test stage's
+(`doc/fleet/factory/nix-evidence/rust-test-declared-inputs`, a textual scan of what the Rust sources name) plus what the other
+members of the aggregate read: the whole of `.github` (workflows, the clippy and fleet-compat baselines) and `scripts` (the stage
+scripts and their tests), `fixtures` and `templates`. A pull request that changes none of those paths (documentation outside
+`docs/st2`, `docs/st3` and `docs/vrs`, `apps`, `packages`, `release-notes`, `AGENTS.md`, `README*`) has the same key as a tree
+on which the whole gate passed. `slo` (`include_str!` of `slo/targets.toml` into the st3 crate), `evals` (the example and graph tests read `evals/st3`),
+`claude-channel` and `plugins` (the plugin files `include_bytes!`d into st-drivers) and `docs/st2` (`tests/invariants.rs` includes
+`docs/st2/invariants.md`) are declared because Rust sources open them; a committed-policy test fails when any literal `include_str!`,
+`include_bytes!` or `include!` path in the Rust sources resolves outside the declared inputs. `release-notes` is deliberately not declared: the Rust sources only name `release-notes` as an
+artifact name, and `upgrade-impact`, which reads the fragments, always runs. The scan misses paths a test builds at run time, so
+the first runs are shadow: a miss shows up as a satisfied note beside a failing real job, and `scripts` and `.github` are declared
+whole until a per-file list is reviewed against a trace of what each stage opens. The skip decision is taken once per stage group
+before the partitions (`needs.evidence-gate-linux-gate.outputs.skip` on the shards, clippy and fleet-compat), so the four shards
+share one key.
+
 The projection reads names as bytes and passes them NUL-terminated both ways (`ls-tree -z`, `update-index -z`),
 so a newline in a name cannot split one file into two entries; symlinks and gitlinks keep their modes. When none
 of the declared paths exists the projection would be the empty tree that every such tree shares, so there is no

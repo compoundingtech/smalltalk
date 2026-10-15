@@ -6,6 +6,35 @@
         "fleet"
       ],
       "enforce": false,
+      "sample_one_in": 5,
+      "inputs": [
+        ".cargo",
+        ".config/nextest.toml",
+        ".github",
+        "Cargo.lock",
+        "Cargo.toml",
+        "claude-channel",
+        "clients",
+        "components",
+        "crates",
+        "docs/st2",
+        "docs/st3",
+        "docs/vrs",
+        "evals",
+        "examples",
+        "fixtures",
+        "flake.lock",
+        "flake.nix",
+        "nix",
+        "plugins",
+        "scripts",
+        "slo",
+        "src",
+        "templates",
+        "tests",
+        "vendor",
+        "wit"
+      ],
       "kinds": {
         "observed": {
           "command": [
