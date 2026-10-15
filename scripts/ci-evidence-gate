@@ -12,8 +12,15 @@ Outcomes (each has a fixed step name in the workflow so a collector can count th
   rejected     a note exists but was refused (bad signature, untrusted signer, failed check ...)
   unavailable  the verifier or the notes could not be obtained
 `decision=skip` additionally needs every condition in `decide` to hold.
+
+Which tree: a `pull_request` run checks out GitHub's merge of the head into the CURRENT base, which is a new tree
+whenever main moved. For such a run the gate asks about the tree of the PULL REQUEST HEAD commit instead (the tree an
+agent built and signed; GitHub attaches the required checks to that sha), but only when every condition in
+`choose_tree` holds; otherwise it asks about the merge tree, as before. A merge_group run always uses its own tree.
 """
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -35,12 +42,15 @@ PROTECTED = (
     'scripts/ci-evidence-gate', 'scripts/evidence-verify', '.st/evidence-skip-policy.json', '.st/evidence-keys',
     '.github/workflows/fleet.yml', '.github/workflows/fleet.yml.genie.ts', '.github/workflows/workspace-ci.ts',
     'scripts/ci-evidence-gate-test', 'scripts/evidence-verify-test',
+    # What decides who may have a head tree used: the author list and the rule that reads it.
+    '.st/evidence-authors.json', 'scripts/ci-evidence-signing',
 )
 
 NOTES = 'refs/notes/evidence/*:refs/notes/evidence/*'
 CHECK_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 VERIFIER = 'scripts/evidence-verify'
 KEYS = '.st/evidence-keys'
+POLICY = '.st/evidence-skip-policy.json'
 MISSING = ('no_record', 'stale_tree', 'wrong_check')
 UNAVAILABLE = ('error', 'no_policy')
 OID = re.compile(r'^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
@@ -75,6 +85,8 @@ def decide(context, outcome, result, tree):
         return 'run', 'fork or unknown head repository'
     if context['event'] not in SKIP_EVENTS:
         return 'run', 'event does not allow skipping'
+    if context.get('tree_of') == 'head' and context['event'] != 'pull_request':
+        return 'run', 'a head-tree note covers pull request runs only'
     if context.get('protected_changed') != []:
         return 'run', 'a file that decides skipping changed, or could not be compared'
     checks = [
@@ -137,14 +149,17 @@ def protected_changes(base):
     return [p for p in paths if p in PROTECTED]
 
 
-def observe(context):
+def observe(context, revision='HEAD'):
     """(outcome, result dict or None, detail, verifier sha256) without ever raising."""
     base, check, repository = context['base'], context['check'], context['repository']
     if not base:
         return 'unavailable', None, 'no accepted base commit for this event', None
     if run('git', 'fetch', '--no-tags', '--depth=1', '-q', 'origin', base).returncode != 0:
         return 'unavailable', None, 'could not fetch the accepted base', None
-    run('git', 'fetch', '--no-tags', '--depth=1', '-q', 'origin', NOTES)
+    context['notes_fetch'] = 'ok' if run('git', 'fetch', '--no-tags', '--depth=1', '-q', 'origin', NOTES).returncode == 0 else 'failed'
+    for name, path in (('policy_sha256', POLICY), ('keys_sha256', KEYS)):
+        shown = run('git', 'show', f'{base}:{path}')
+        context[name] = hashlib.sha256(shown.stdout).hexdigest()[:16] if shown.returncode == 0 else 'none'
     script = run('git', 'show', f'{base}:{VERIFIER}')
     if script.returncode != 0:
         return 'unavailable', None, 'the accepted base has no verifier yet', None
@@ -160,8 +175,8 @@ def observe(context):
             empty = os.path.join(scratch, 'empty-keys')
             open(empty, 'w').close()
             keys = ['--keys', empty]
-        fetch_input_notes(path, base, check, repository)
-        done = run(sys.executable, path, '--repo', '.', '--revision', 'HEAD', '--check', check,
+        fetch_input_notes(path, base, check, repository, revision)
+        done = run(sys.executable, path, '--repo', '.', '--revision', revision, '--check', check,
                    '--policy-from', base, '--repository', repository, *keys, timeout=VERIFIER_TIMEOUT)
     try:
         result = json.loads(done.stdout)
@@ -170,13 +185,13 @@ def observe(context):
     return classify(done.returncode, result), result, result.get('reason') or 'satisfied', digest
 
 
-def fetch_input_notes(verifier, base, check, repository):
+def fetch_input_notes(verifier, base, check, repository, revision='HEAD'):
     """For a check that declares inputs: fetch only the records indexed under this tree's input key.
     Best effort: a failure here just means no input-keyed record is seen, and the check runs."""
     if not CHECK_NAME.fullmatch(check):
         return
     try:
-        done = run(sys.executable, verifier, '--repo', '.', '--revision', 'HEAD', '--check', check, '--project',
+        done = run(sys.executable, verifier, '--repo', '.', '--revision', revision, '--check', check, '--project',
                    '--policy-from', base, '--repository', repository, timeout=VERIFIER_TIMEOUT)
         key = json.loads(done.stdout).get('source_inputs') if done.returncode == 0 else None
     except (ValueError, AttributeError, subprocess.TimeoutExpired, OSError):
@@ -201,7 +216,10 @@ def line(context, decision, outcome, result, detail, tree, verifier_sha, gate_sh
         ('trust_level', result.get('trust_level')), ('kind', result.get('kind')), ('tier', result.get('tier')),
         ('observed_at', result.get('observed_at')), ('age_s', age), ('max_age_s', result.get('max_age_s')),
         ('attempts', result.get('attempts')), ('enforce', result.get('enforce')), ('match', result.get('match')),
-        ('source_inputs', result.get('source_inputs')), ('tree', tree), ('head', context['head']),
+        ('source_inputs', result.get('source_inputs')), ('tree', tree), ('tree_of', context.get('tree_of')),
+        ('pr_head', context.get('pr_head')), ('merge_tree', context.get('merge_tree')), ('head_tree', context.get('head_tree')),
+        ('notes_fetch', context.get('notes_fetch')), ('policy_sha256', context.get('policy_sha256')), ('keys_sha256', context.get('keys_sha256')),
+        ('head', context['head']),
         ('base', context['base']), ('event', context['event']), ('pr', context['pr']),
         ('repo', context['repository']), ('run', context['run']), ('attempt', context['attempt']),
         ('fork', context['fork']), ('verifier_sha256', verifier_sha), ('gate_sha256', gate_sha),
@@ -219,26 +237,132 @@ def context_from(environ):
         'head': environ.get('HEAD_SHA', ''), 'event': environ.get('EVENT_NAME', ''),
         'pr': environ.get('PR_NUMBER', ''), 'run': environ.get('RUN_ID', ''),
         'attempt': environ.get('RUN_ATTEMPT', ''), 'fork': fork,
+        'pr_head': environ.get('PR_HEAD_SHA', ''), 'pr_user': environ.get('PR_USER', ''), 'actor': environ.get('ACTOR', ''),
+        'triggering_actor': environ.get('TRIGGERING_ACTOR', ''), 'draft': environ.get('PR_DRAFT', ''),
+        'tree_of': 'merge', 'merge_tree': None, 'head_tree': '-', 'notes_fetch': '-', 'policy_sha256': '-', 'keys_sha256': '-',
     }
+
+
+class Fallback(Exception):
+    """A condition for using the pull request head's tree failed: ask about the merge tree instead."""
+
+
+def git_out(*args, check=True):
+    done = run('git', *args)
+    if check and done.returncode != 0:
+        raise Fallback(f'git {args[0]} failed')
+    return done.stdout.decode(errors='replace').strip()
+
+
+def base_signing_module(base):
+    """scripts/ci-evidence-signing as it is at the accepted base: its check_authors is the rule that decides who
+    may have a pull request run signed, and the pull request cannot change it."""
+    shown = run('git', 'show', f'{base}:scripts/ci-evidence-signing')
+    if shown.returncode != 0:
+        raise Fallback('the accepted base has no ci-evidence-signing')
+    with tempfile.TemporaryDirectory() as scratch:
+        path = os.path.join(scratch, 'ci_evidence_signing')
+        with open(path, 'wb') as handle:
+            handle.write(shown.stdout)
+        loader = importlib.machinery.SourceFileLoader('base_ci_evidence_signing', path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+    return module
+
+
+def choose_tree(context):
+    """The revision whose tree this run asks about, and why not the pull request head when it is the merge.
+
+    Uses the pull request head only for a same-repository pull_request run, and only when all of these hold:
+    the payload head is a full object id that is present or fetchable; the checked-out commit is the merge whose
+    second parent IS that head (or the head itself); the PR author, the actor and the triggering actor are on the
+    author list at the BASE and every non-merge commit in the branch has a listed author and committer (the signing
+    guard's own check, taken from the base); and no protected file differs between the branch point and the head, nor
+    between the branch point and the base (main's protected files moved since the branch). Any failure is a Fallback."""
+    merge_tree = git_out('rev-parse', '--verify', 'HEAD^{tree}', check=False) or None
+    context['merge_tree'] = merge_tree
+    if context['event'] != 'pull_request':
+        context['head_tree'] = 'not-a-pull-request'
+        return 'HEAD', None
+    try:
+        if context['fork'] != 'false':
+            raise Fallback('not from this repository')
+        if context['draft'] != 'false':
+            raise Fallback('not positively a non-draft pull request')
+        head, base = context['pr_head'], context['base']
+        if not OID.match(head or '') or not OID.match(base or ''):
+            raise Fallback('no full head or base object id')
+        if not (context['pr_user'] and context['actor'] and context['triggering_actor']):
+            raise Fallback('the opener, actor or triggering actor is not known')
+        # History work first, and all of it before the depth-1 fetch of the base in observe() would cut it.
+        if git_out('rev-parse', '--is-shallow-repository') == 'true' and \
+                run('git', 'fetch', '--no-tags', '-q', '--filter=blob:none', '--unshallow', 'origin').returncode != 0:
+            raise Fallback('could not deepen the history')
+        if run('git', 'cat-file', '-e', f'{head}^{{commit}}').returncode != 0 and \
+                run('git', 'fetch', '--no-tags', '-q', 'origin', head).returncode != 0:
+            raise Fallback('the head commit is not available')
+        checked_out = git_out('rev-parse', 'HEAD')
+        second_parent = git_out('rev-parse', '--verify', '-q', 'HEAD^2', check=False)
+        if checked_out != head and second_parent != head:
+            raise Fallback('the checked-out commit is not the merge of this head')
+        if run('git', 'cat-file', '-e', f'{base}^{{commit}}').returncode != 0 and \
+                run('git', 'fetch', '--no-tags', '-q', '--filter=blob:none', 'origin', base).returncode != 0:
+            raise Fallback('the accepted base is not available')
+        try:
+            base_signing_module(base).check_authors(base, head, context['pr_user'], context['actor'], context['triggering_actor'])
+        except Fallback:
+            raise
+        except BaseException as error:  # Refused, or anything the base's script raises
+            raise Fallback(f'authors: {str(error)[:120]}')
+        branch_point = git_out('merge-base', base, head)
+        current = git_out('rev-parse', '--verify', '-q', 'HEAD^1', check=False) if checked_out != head else base
+        changed = []
+        for first, second in ((branch_point, head), (branch_point, base), (branch_point, current or base)):
+            diff = run('git', 'diff', '--no-renames', '--name-only', '-z', first, second)
+            if diff.returncode != 0:
+                raise Fallback('could not compare protected files')
+            changed += [p for p in diff.stdout.decode(errors='replace').split('\0') if p in PROTECTED]
+        if changed:
+            raise Fallback('protected files differ from the branch point')
+        context['tree_of'], context['head_tree'] = 'head', 'used'
+        return head, []
+    except Fallback as reason:
+        context['head_tree'] = 'fallback:' + str(reason).replace(' ', '_')
+    except Exception as error:
+        context['head_tree'] = f'fallback:{type(error).__name__}'
+    context['tree_of'] = 'merge'
+    return 'HEAD', None
 
 
 def main():
     context = context_from(os.environ)
     outcome, result, detail, verifier_sha, tree = 'unavailable', None, 'not run', None, None
+    revision, protected = 'HEAD', None
+    try:
+        context['merge_tree'] = git_out('rev-parse', '--verify', 'HEAD^{tree}', check=False) or None
+    except Exception:
+        pass
+    try:
+        revision, protected = choose_tree(context)
+    except Exception as error:  # never raise out of the gate
+        context['head_tree'] = f'fallback:{type(error).__name__}'
+        context['tree_of'] = 'merge'
     try:
         if not context['check']:
             detail = 'no check named'
         else:
-            done = run('git', 'rev-parse', '--verify', 'HEAD^{tree}')
+            done = run('git', 'rev-parse', '--verify', f'{revision}^{{tree}}')
             tree = done.stdout.decode().strip() if done.returncode == 0 else None
             if tree is None:
                 detail = 'could not read this run\'s tree'
             else:
-                outcome, result, detail, verifier_sha = observe(context)
+                outcome, result, detail, verifier_sha = observe(context, revision)
     except Exception as error:  # the gate must never fail the job
         outcome, result, detail = 'unavailable', None, f'{type(error).__name__}: {error}'
     try:
-        context['protected_changed'] = protected_changes(context['base'])
+        # In head-tree mode the branch point decides (choose_tree compared it); otherwise the base against this run's tree.
+        context['protected_changed'] = protected if protected is not None else protected_changes(context['base'])
     except Exception:
         context['protected_changed'] = ['<comparison failed>']
     try:

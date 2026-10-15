@@ -253,6 +253,13 @@ const evidenceGateJobs = Object.fromEntries(evidenceGateChecks.map((check) => [`
         HEAD_REPOSITORY: "${{ github.event.pull_request.head.repo.full_name || ((github.event_name == 'merge_group' || github.event_name == 'push') && github.repository) || '' }}",
         EVENT_NAME: '${{ github.event_name }}',
         PR_NUMBER: '${{ github.event.pull_request.number }}',
+        // A pull request run may ask about the pull request HEAD's tree (scripts/ci-evidence-gate, choose_tree); these are
+        // the payload facts it checks that head and its authors against. All empty outside a pull request.
+        PR_HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
+        PR_USER: '${{ github.event.pull_request.user.login }}',
+        PR_DRAFT: '${{ github.event.pull_request.draft }}',
+        ACTOR: '${{ github.actor }}',
+        TRIGGERING_ACTOR: '${{ github.triggering_actor }}',
         RUN_ID: '${{ github.run_id }}',
         RUN_ATTEMPT: '${{ github.run_attempt }}',
       },

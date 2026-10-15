@@ -53,6 +53,7 @@ EXPECTED_PROTECTED = (
     'scripts/ci-evidence-gate', 'scripts/evidence-verify', '.st/evidence-skip-policy.json', '.st/evidence-keys',
     '.github/workflows/fleet.yml', '.github/workflows/fleet.yml.genie.ts', '.github/workflows/workspace-ci.ts',
     'scripts/ci-evidence-gate-test', 'scripts/evidence-verify-test',
+    '.st/evidence-authors.json', 'scripts/ci-evidence-signing',
 )
 
 
@@ -301,6 +302,247 @@ class EndToEnd(unittest.TestCase):
         for check in CHECKS[1:]:
             with self.subTest('uncovered ' + check):
                 self.assertRuns(base, check=check)
+
+    # ---- a pull request run asks about the PULL REQUEST HEAD tree, not the merge ref --------------------------
+
+    AUTHORS = {'about': 'test', 'logins': ['alice', 'bob'], 'emails': ['fixture@example.invalid'], 'noreply_logins': [],
+               'committers_also': []}
+
+    def pull_request(self, main_moves=True, signing=True, head_files=None, main_files=None, head_email=None, policy=None,
+                     base_files=None, authors_text=None):
+        """Base B (with the gate, verifier, policy, keys, author list and signing script), a branch head H on it, and the
+        merge M of H into a main that moved (B2), as GitHub's merge ref is. The repository's HEAD is M, as the checkout."""
+        repo = self.f.repo
+        (repo / 'scripts').mkdir(exist_ok=True)
+        if signing:
+            shutil.copy(ROOT / 'scripts/ci-evidence-signing', repo / 'scripts/ci-evidence-signing')
+        (repo / '.st').mkdir(exist_ok=True)
+        (repo / '.st/evidence-authors.json').write_text(authors_text if authors_text is not None else json.dumps(self.AUTHORS))
+        for name, content in (base_files or {}).items():
+            (repo / name).write_text(content)
+        base = self.commit_base(policy=policy or skip_policy())
+        self.f.git('config', 'uploadpack.allowAnySHA1InWant', 'true')
+        self.f.git('config', 'uploadpack.allowFilter', 'true')
+        for name, content in (head_files or {}).items():
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo / name).write_text(content)
+        if head_email:
+            (repo / 'file.txt').write_text('head')
+            self.f.git('add', '-A')
+            self.f.git('-c', f'user.email={head_email}', 'commit', '-q', '-m', 'head', '--author', f'Other <{head_email}>')
+            head, head_tree = self.f.git('rev-parse', 'HEAD'), self.f.git('rev-parse', 'HEAD^{tree}')
+        else:
+            head, head_tree = self.head()
+        self.f.git('checkout', '-q', '--detach', base)
+        for name, content in ((main_files or {'moved.txt': 'main moved'}) if main_moves else {}).items():
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo / name).write_text(content)
+        self.f.git('add', '-A')
+        self.f.git('commit', '-q', '--allow-empty', '-m', 'main moves')
+        tip = self.f.git('rev-parse', 'HEAD')
+        merged_tree = self.f.git('merge-tree', '--write-tree', '--no-messages', tip, head).splitlines()[0]
+        merge = self.f.git('commit-tree', merged_tree, '-p', tip, '-p', head, '-m', 'merge ref')
+        self.f.git('checkout', '-q', '--detach', merge)
+        return dict(base=base, base_tree=self.f.git('rev-parse', base + '^{tree}'), head=head, head_tree=head_tree, tip=tip, merge=merge,
+                    merge_tree=merged_tree)
+
+    def pr_env(self, scenario, **overrides):
+        env = dict(EVENT_NAME='pull_request', PR_HEAD_SHA=scenario['head'], PR_USER='alice', ACTOR='alice',
+                   TRIGGERING_ACTOR='alice', PR_NUMBER='7', HEAD_SHA=scenario['merge'], PR_DRAFT='false')
+        env.update(overrides)
+        return env
+
+    def test_a_pull_request_run_skips_on_the_note_for_its_head_tree_although_main_moved(self):
+        s = self.pull_request()
+        self.assertNotEqual(s['head_tree'], s['merge_tree'])
+        record = self.note(s['head'], s['head_tree'], seconds=1)
+        fields, outputs = self.run_gate(s['base'], **self.pr_env(s))
+        self.assertEqual((fields['decision'], fields['tree_of'], fields['head_tree'], outputs['record']), ('skip', 'head', 'used', record))
+        self.assertEqual((fields['tree'], fields['pr_head'], fields['merge_tree']), (s['head_tree'], s['head'], s['merge_tree']))
+        # The runner's checkout is depth 1; the gate deepened it itself (the head commit and the merge's history are present now).
+        shallow = Path(self.work_dir.name) / 'precondition'
+        subprocess.run(['git', 'clone', '-q', '--depth=1', 'file://' + str(self.f.repo), str(shallow)], check=True, capture_output=True)
+        self.assertEqual(subprocess.run(['git', '-C', str(shallow), 'rev-parse', '--is-shallow-repository'], capture_output=True, text=True).stdout.strip(), 'true')
+        self.assertNotEqual(subprocess.run(['git', '-C', str(shallow), 'cat-file', '-e', s['head'] + '^{commit}'], capture_output=True).returncode, 0)
+        work = Path(self.work_dir.name) / 'work'
+        self.assertEqual(subprocess.run(['git', '-C', str(work), 'cat-file', '-e', s['head'] + '^{commit}'], capture_output=True).returncode, 0)
+        self.assertGreater(int(subprocess.run(['git', '-C', str(work), 'rev-list', '--count', s['merge']], capture_output=True, text=True).stdout), 3)
+        self.assertEqual(fields['notes_fetch'], 'ok')
+        self.assertRegex(fields['policy_sha256'], r'^[0-9a-f]{16}$')
+        self.assertRegex(fields['keys_sha256'], r'^[0-9a-f]{16}$')
+
+    def test_a_note_for_the_merge_tree_alone_does_not_cover_a_pull_request_head(self):
+        s = self.pull_request()
+        self.note(s['merge'], s['merge_tree'], seconds=1)
+        fields = self.assertRuns(s['base'], 'merge-tree note only', **self.pr_env(s))
+        self.assertEqual((fields['tree_of'], fields['tree'], fields['outcome']), ('head', s['head_tree'], 'no_note'))
+
+    def test_a_merge_group_run_never_uses_a_head_tree_note(self):
+        s = self.pull_request()
+        self.note(s['head'], s['head_tree'], seconds=1)
+        fields = self.assertRuns(s['base'], 'merge group with a valid head-tree note', **self.pr_env(s, EVENT_NAME='merge_group'))
+        self.assertEqual((fields['tree_of'], fields['tree'], fields['head_tree']), ('merge', s['merge_tree'], 'not-a-pull-request'))
+        # And with a note for the merge group's own tree, only that may skip there.
+        self.note(s['merge'], s['merge_tree'], seconds=2)
+        fields, _ = self.run_gate(s['base'], **self.pr_env(s, EVENT_NAME='merge_group'))
+        self.assertEqual((fields['decision'], fields['tree_of'], fields['tree']), ('skip', 'merge', s['merge_tree']))
+
+    def test_every_failed_condition_falls_back_to_the_merge_tree_and_never_skips_on_the_head_note(self):
+        s = self.pull_request()
+        self.note(s['head'], s['head_tree'], seconds=1)
+        other = self.f.git('rev-parse', s['tip'])
+        cases = {
+            'a fork': dict(HEAD_REPOSITORY='someone/fork'),
+            'a draft': dict(PR_DRAFT='true'),
+            'a draft flag that is not positively false': dict(PR_DRAFT=''),
+            'pull_request_target': dict(EVENT_NAME='pull_request_target'),
+            'a stale head (not the merge\'s second parent)': dict(PR_HEAD_SHA=other),
+            'a short head sha': dict(PR_HEAD_SHA=s['head'][:12]),
+            'a head object nobody has': dict(PR_HEAD_SHA='a' * 40),
+            'no head sha': dict(PR_HEAD_SHA=''),
+            'an author not on the list': dict(PR_USER='mallory'),
+            'an actor not on the list': dict(ACTOR='mallory'),
+            'a re-run by someone not on the list': dict(TRIGGERING_ACTOR='mallory'),
+            'no actor at all': dict(ACTOR='', TRIGGERING_ACTOR=''),
+            'no accepted base': dict(BASE_SHA=''),
+        }
+        for name, extra in cases.items():
+            with self.subTest(name):
+                env = self.pr_env(s, **extra)
+                fields = self.assertRuns(env.pop('BASE_SHA', s['base']), name, **env)
+                self.assertEqual(fields['tree_of'], 'merge', name)
+                self.assertTrue(fields['head_tree'].startswith('fallback:') or fields['head_tree'] in ('-', 'not-a-pull-request'), (name, fields['head_tree']))
+                self.assertEqual(fields['tree'], s['merge_tree'] if fields['tree'] != '-' else '-', name)
+
+    def test_the_input_keyed_lookup_uses_the_head_trees_key_not_the_merge_trees(self):
+        doc = json.loads(skip_policy())
+        for entry in doc['checks'].values():
+            entry['inputs'] = ['inputs.txt']
+        s = self.pull_request(policy=json.dumps(doc), base_files={'inputs.txt': 'declared'}, main_files={'inputs.txt': 'main changed it'})
+        key = fixtures.evidence_verify.project(str(self.f.repo), s['base_tree'], ('inputs.txt',))
+        self.assertEqual(key, fixtures.evidence_verify.project(str(self.f.repo), s['head_tree'], ('inputs.txt',)))
+        self.assertNotEqual(key, fixtures.evidence_verify.project(str(self.f.repo), s['merge_tree'], ('inputs.txt',)))  # main moved the input
+        record = self.note(s['base'], s['base_tree'], inputs={'source_inputs': key}, seconds=1)
+        self.f.git('update-ref', f'refs/notes/evidence-input/linux-gate/{key}/{record}', record)
+        fields, outputs = self.run_gate(s['base'], **self.pr_env(s))
+        self.assertEqual((fields['decision'], fields['tree_of'], fields['match'], fields['source_inputs'], outputs['record']),
+                         ('skip', 'head', 'inputs', key, record))
+        # The same run asking about the merge tree (a fork-like fallback) misses: its key moved with main.
+        fields = self.assertRuns(s['base'], 'merge tree key', **self.pr_env(s, PR_USER='mallory'))
+        self.assertEqual((fields['tree_of'], fields['outcome']), ('merge', 'no_note'))
+
+    def test_a_repository_with_no_notes_yet_fetches_nothing_without_failing_and_the_check_runs(self):
+        # Whether git calls a glob refspec that matches nothing a failure depends on its version and protocol (here: the one
+        # in the test environment); either way the line says which, the outcome is no_note and the check runs.
+        s = self.pull_request()
+        fields = self.assertRuns(s['base'], 'no notes at all', **self.pr_env(s))
+        self.assertIn(fields['notes_fetch'], ('ok', 'failed'))
+        self.assertEqual((fields['outcome'], fields['tree_of']), ('no_note', 'head'))
+
+    def test_a_notes_fetch_that_fails_is_logged_as_failed_not_as_no_note(self):
+        calls = []
+        real_run = gate.run
+
+        def fake(*command, **kwargs):
+            calls.append(command)
+            done = real_run('true')
+            if command[:2] == ('git', 'fetch') and any(str(part).startswith('refs/notes/evidence/*') for part in command):
+                return real_run('false')
+            return done
+        context = gate.context_from({'CHECK': 'linux-gate', 'REPOSITORY': REPOSITORY, 'BASE_SHA': 'a' * 40, 'EVENT_NAME': 'pull_request'})
+        gate.run = fake
+        try:
+            outcome, result, detail, sha = gate.observe(context, 'HEAD')
+        finally:
+            gate.run = real_run
+        self.assertEqual(context['notes_fetch'], 'failed')
+        self.assertTrue(any(str(part).startswith('refs/notes/evidence/*') for call in calls for part in call))
+        self.assertEqual(outcome, 'unavailable')  # and the check runs
+
+    def test_an_unreadable_policy_or_author_file_means_run(self):
+        s = self.pull_request(policy='{ not json')
+        self.note(s['head'], s['head_tree'], seconds=1)
+        fields = self.assertRuns(s['base'], 'unparseable policy', **self.pr_env(s))
+        self.assertEqual(fields['outcome'], 'unavailable')
+        self.tmp_reset()
+        s = self.pull_request(authors_text='{ not json')
+        self.note(s['head'], s['head_tree'], seconds=1)
+        fields = self.assertRuns(s['base'], 'unparseable author list', **self.pr_env(s))
+        self.assertEqual(fields['tree_of'], 'merge')
+        self.assertIn('authors', fields['head_tree'])
+
+    def test_a_note_for_an_earlier_head_does_not_cover_a_force_pushed_head(self):
+        s = self.pull_request()
+        older = self.f.git('rev-parse', s['base'])
+        self.note(older, s['base_tree'], seconds=1)  # signed for what the head was before the force-push
+        fields = self.assertRuns(s['base'], 'older head signed', **self.pr_env(s))
+        self.assertEqual((fields['tree_of'], fields['outcome']), ('head', 'no_note'))
+
+    def test_the_same_head_can_run_and_then_skip_on_a_re_run_once_a_note_exists(self):
+        s = self.pull_request()
+        self.assertRuns(s['base'], 'before the agent signed', **self.pr_env(s))
+        self.note(s['head'], s['head_tree'], seconds=1)
+        fields, _ = self.run_gate(s['base'], **self.pr_env(s, RUN_ATTEMPT='2'))
+        self.assertEqual((fields['decision'], fields['tree_of']), ('skip', 'head'))
+
+    def test_the_base_copy_of_the_gate_runs_when_the_branch_rewrites_it(self):
+        poison = ("import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('outcome=satisfied\\nskip=true\\nrecord=" + 'a' * 40 +
+                  "\\n')\nprint('POISON evidence-decision v1 decision=skip')\n")
+        s = self.pull_request(head_files={'scripts/ci-evidence-gate': poison})
+        self.note(s['head'], s['head_tree'], seconds=1)
+        outputs, printed = self.run_step(s['base'], **self.pr_env(s))
+        self.assertEqual(outputs['skip'], 'false')
+        self.assertNotIn('POISON', printed)
+        self.assertIn('evidence-decision v1', printed)
+
+    def test_after_a_fallback_the_old_merge_tree_note_still_works_as_before(self):
+        s = self.pull_request()
+        self.note(s['merge'], s['merge_tree'], seconds=1)
+        fields, _ = self.run_gate(s['base'], **self.pr_env(s, PR_USER='mallory'))
+        self.assertEqual((fields['decision'], fields['tree_of'], fields['tree']), ('skip', 'merge', s['merge_tree']))
+
+    def test_a_commit_by_an_unlisted_email_in_the_branch_falls_back(self):
+        s = self.pull_request(head_email='stranger@example.invalid')
+        self.note(s['head'], s['head_tree'], seconds=1)
+        fields = self.assertRuns(s['base'], 'unlisted commit author', **self.pr_env(s))
+        self.assertEqual(fields['tree_of'], 'merge')
+        self.assertIn('authors', fields['head_tree'])
+
+    def test_a_branch_that_edits_a_protected_file_falls_back_even_with_a_valid_head_note(self):
+        for path in ('scripts/ci-evidence-gate', 'scripts/evidence-verify', '.st/evidence-skip-policy.json', '.st/evidence-keys',
+                     '.github/workflows/fleet.yml'):
+            with self.subTest(path):
+                self.tmp_reset()
+                s = self.pull_request(head_files={path: 'edited by the branch\n'})
+                self.note(s['head'], s['head_tree'], seconds=1)
+                fields = self.assertRuns(s['base'], path, **self.pr_env(s))
+                self.assertEqual((fields['tree_of'], fields['head_tree']), ('merge', 'fallback:protected_files_differ_from_the_branch_point'))
+
+    def test_main_changing_a_protected_file_after_the_branch_point_falls_back(self):
+        s = self.pull_request(main_files={'.st/evidence-skip-policy.json': skip_policy(trust_levels=['fleet']) + '\n'})
+        self.note(s['head'], s['head_tree'], seconds=1)
+        fields = self.assertRuns(s['base'], 'main moved a protected file', **self.pr_env(s))
+        self.assertEqual((fields['tree_of'], fields['head_tree']), ('merge', 'fallback:protected_files_differ_from_the_branch_point'))
+
+    def test_a_base_without_the_signing_script_falls_back(self):
+        s = self.pull_request(signing=False)
+        self.note(s['head'], s['head_tree'], seconds=1)
+        fields = self.assertRuns(s['base'], 'no author rule at the base', **self.pr_env(s))
+        self.assertEqual((fields['tree_of'], fields['head_tree']), ('merge', 'fallback:the_accepted_base_has_no_ci-evidence-signing'))
+
+    def test_a_head_note_with_the_wrong_check_command_or_signer_does_not_skip_either(self):
+        s = self.pull_request()
+        self.note(s['head'], s['head_tree'], key=self.stranger, seconds=1)
+        self.assertEqual(self.assertRuns(s['base'], 'stranger', **self.pr_env(s))['outcome'], 'rejected')
+
+    def tmp_reset(self):
+        """A fresh repository for the next scenario inside one test."""
+        self.f.tmp.cleanup()
+        self.f = fixtures.Fixture()
+        self.addCleanup(self.f.tmp.cleanup)
+        self.ci = self.f.key('ci', 'fleet/ci')
+        self.stranger = self.f.key('stranger')
+        self.machine = self.f.key('machine', 'machine/box')
 
     # ---- every way a note can fail to cover the check --------------------------------------
 
@@ -854,7 +1096,8 @@ class EndToEnd(unittest.TestCase):
                 (self.f.repo / '.github/workflows').mkdir(parents=True, exist_ok=True)
                 (self.f.repo / '.github/workflows/fleet.yml').write_text('name: x\n')
                 (self.f.repo / '.github/workflows/fleet.yml.genie.ts').write_text('export default 1\n')
-                for name in ('.github/workflows/workspace-ci.ts', 'scripts/ci-evidence-gate-test', 'scripts/evidence-verify-test'):
+                for name in ('.github/workflows/workspace-ci.ts', 'scripts/ci-evidence-gate-test', 'scripts/evidence-verify-test',
+                             '.st/evidence-authors.json', 'scripts/ci-evidence-signing'):
                     (self.f.repo / name).parent.mkdir(parents=True, exist_ok=True)
                     (self.f.repo / name).write_text('placeholder\n')
                 base = self.commit_base()
@@ -881,7 +1124,8 @@ class EndToEnd(unittest.TestCase):
         fields, outputs = self.run_gate(base, PR_NUMBER='123', EVENT_NAME='pull_request')
         self.assertEqual(list(fields), [
             'check', 'decision', 'outcome', 'reason', 'record', 'signer', 'trust_level', 'kind', 'tier',
-            'observed_at', 'age_s', 'max_age_s', 'attempts', 'enforce', 'match', 'source_inputs', 'tree', 'head', 'base', 'event', 'pr', 'repo', 'run',
+            'observed_at', 'age_s', 'max_age_s', 'attempts', 'enforce', 'match', 'source_inputs', 'tree', 'tree_of', 'pr_head', 'merge_tree',
+            'head_tree', 'notes_fetch', 'policy_sha256', 'keys_sha256', 'head', 'base', 'event', 'pr', 'repo', 'run',
             'attempt', 'fork', 'verifier_sha256', 'gate_sha256'])
         self.assertEqual((fields['pr'], fields['repo'], fields['run'], fields['attempt'], fields['fork']),
                          ('123', REPOSITORY, '42', '1', 'false'))
@@ -1144,6 +1388,18 @@ class WorkflowStructure(unittest.TestCase):
         code, output = generate("bareCondition('${{ always() }} && ${{ true }}')")
         self.assertNotEqual(code, 0, output)
         self.assertIn('markers inside it', output)
+
+    def test_every_gate_job_passes_the_pull_request_payload_the_head_tree_choice_checks(self):
+        blocks = self.blocks()
+        for check in CHECKS:
+            with self.subTest(check):
+                block = blocks[f'evidence-gate-{check}']
+                for name, expression in (('PR_HEAD_SHA', 'github.event.pull_request.head.sha'), ('PR_USER', 'github.event.pull_request.user.login'),
+                                         ('PR_DRAFT', 'github.event.pull_request.draft'), ('ACTOR', 'github.actor'),
+                                         ('TRIGGERING_ACTOR', 'github.triggering_actor')):
+                    self.assertRegex(block, rf"{name}: .*\${{{{ {re.escape(expression)} }}}}")
+                # The gate itself is still taken from the accepted base, never from the checkout.
+                self.assertIn('BASE_SHA:scripts/ci-evidence-gate', block)
 
     def test_the_required_checks_that_are_jobs_keep_running_and_skip_only_their_steps(self):
         blocks = self.blocks()

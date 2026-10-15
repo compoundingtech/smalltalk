@@ -320,6 +320,11 @@ jobs:
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || ((github.event_name == 'merge_group' || github.event_name == 'push') && github.repository) || '' }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: "git fetch --no-tags --depth=1 -q origin \"$BASE_SHA\" && git show \"$BASE_SHA:scripts/ci-evidence-gate\" > \"$RUNNER_TEMP/ci-evidence-gate\" && python3 \"$RUNNER_TEMP/ci-evidence-gate\" || { printf 'outcome=unavailable\\nskip=false\\nrecord=-\\n' >> \"$GITHUB_OUTPUT\"; echo \"evidence-decision v1 check=$CHECK decision=run outcome=unavailable reason=no-gate-at-base run=$RUN_ID\"; }"
@@ -375,6 +380,11 @@ jobs:
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || ((github.event_name == 'merge_group' || github.event_name == 'push') && github.repository) || '' }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: "git fetch --no-tags --depth=1 -q origin \"$BASE_SHA\" && git show \"$BASE_SHA:scripts/ci-evidence-gate\" > \"$RUNNER_TEMP/ci-evidence-gate\" && python3 \"$RUNNER_TEMP/ci-evidence-gate\" || { printf 'outcome=unavailable\\nskip=false\\nrecord=-\\n' >> \"$GITHUB_OUTPUT\"; echo \"evidence-decision v1 check=$CHECK decision=run outcome=unavailable reason=no-gate-at-base run=$RUN_ID\"; }"
@@ -430,6 +440,11 @@ jobs:
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || ((github.event_name == 'merge_group' || github.event_name == 'push') && github.repository) || '' }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: "git fetch --no-tags --depth=1 -q origin \"$BASE_SHA\" && git show \"$BASE_SHA:scripts/ci-evidence-gate\" > \"$RUNNER_TEMP/ci-evidence-gate\" && python3 \"$RUNNER_TEMP/ci-evidence-gate\" || { printf 'outcome=unavailable\\nskip=false\\nrecord=-\\n' >> \"$GITHUB_OUTPUT\"; echo \"evidence-decision v1 check=$CHECK decision=run outcome=unavailable reason=no-gate-at-base run=$RUN_ID\"; }"
@@ -485,6 +500,11 @@ jobs:
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || ((github.event_name == 'merge_group' || github.event_name == 'push') && github.repository) || '' }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: "git fetch --no-tags --depth=1 -q origin \"$BASE_SHA\" && git show \"$BASE_SHA:scripts/ci-evidence-gate\" > \"$RUNNER_TEMP/ci-evidence-gate\" && python3 \"$RUNNER_TEMP/ci-evidence-gate\" || { printf 'outcome=unavailable\\nskip=false\\nrecord=-\\n' >> \"$GITHUB_OUTPUT\"; echo \"evidence-decision v1 check=$CHECK decision=run outcome=unavailable reason=no-gate-at-base run=$RUN_ID\"; }"
@@ -540,6 +560,11 @@ jobs:
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || ((github.event_name == 'merge_group' || github.event_name == 'push') && github.repository) || '' }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: "git fetch --no-tags --depth=1 -q origin \"$BASE_SHA\" && git show \"$BASE_SHA:scripts/ci-evidence-gate\" > \"$RUNNER_TEMP/ci-evidence-gate\" && python3 \"$RUNNER_TEMP/ci-evidence-gate\" || { printf 'outcome=unavailable\\nskip=false\\nrecord=-\\n' >> \"$GITHUB_OUTPUT\"; echo \"evidence-decision v1 check=$CHECK decision=run outcome=unavailable reason=no-gate-at-base run=$RUN_ID\"; }"
