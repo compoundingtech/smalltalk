@@ -129,13 +129,18 @@ pub(super) fn person_reads_message(store: &Store, person: &str, message: &Messag
     false
 }
 
-/// What the request may read, and the attachment record its message gives for it.
+/// What the request may read, and the attachment record its carrier gives for it. The carrier
+/// is a message, or the person step of an ask whose request carries images: the person it asks
+/// reads them, and, as with a message to or from an agent, so may anyone in the fleet.
 fn authorize(
     state: &AppState,
     session: &ClientSession,
     hash: &str,
     message: Option<&str>,
 ) -> Result<Option<MessageAttachment>, ApiError> {
+    if let Some(step) = message.filter(|carrier| carrier.starts_with("step-run/")) {
+        return authorize_ask(state, session, hash, step);
+    }
     let carrier = message
         .map(|subject| state.store.message(&message_subject(subject)))
         .transpose()
@@ -170,6 +175,36 @@ fn authorize(
         }
     }
     Ok(carrier.map(|(_, attachment)| attachment))
+}
+
+fn authorize_ask(
+    state: &AppState,
+    session: &ClientSession,
+    hash: &str,
+    step: &str,
+) -> Result<Option<MessageAttachment>, ApiError> {
+    let ask = state.store.ask_images(step).map_err(ApiError::internal)?;
+    let attachment = ask.as_ref().and_then(|ask| {
+        ask.attachments
+            .iter()
+            .find(|attachment| attachment.sha256 == hash)
+            .cloned()
+    });
+    let actor = session.authority_actor.as_str();
+    if actor.starts_with("person/") && actor.matches('/').count() == 1 {
+        let reads = ask.as_ref().is_some_and(|ask| {
+            ask.person.as_deref() == Some(actor) || ask.asker.starts_with("agent/")
+        });
+        if attachment.is_none() || !reads {
+            return Err(ApiError {
+                status: StatusCode::FORBIDDEN,
+                code: "forbidden".into(),
+                message: "this image is not on an ask the session may read".into(),
+                details: Box::default(),
+            });
+        }
+    }
+    Ok(attachment)
 }
 
 fn blob_parts(id: &str) -> Result<String, ApiError> {
@@ -231,7 +266,16 @@ pub(super) async fn ensure_local(
         .client_relay
         .as_ref()
         .ok_or_else(|| remote_unavailable_for_owner(state, &attachment.origin))?;
-    let message = message.map(message_subject).unwrap_or_default();
+    // An ask's images travel under its step, which the owner authorizes the same way.
+    let message = message
+        .map(|carrier| {
+            if carrier.starts_with("step-run/") {
+                carrier.to_owned()
+            } else {
+                message_subject(carrier)
+            }
+        })
+        .unwrap_or_default();
     let mut bytes = Vec::new();
     loop {
         let value = relay
@@ -609,6 +653,69 @@ agent "example/bridge" {
 
     fn json_of(bytes: &[u8]) -> Value {
         serde_json::from_slice(bytes).unwrap_or_else(|_| json!({"raw": bytes.len()}))
+    }
+
+    #[tokio::test]
+    async fn an_ask_carries_images_the_person_it_asks_reads_by_its_step() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        let actor = "agent/example/gardener";
+        let source = "version 2\nagent \"example/gardener\" {\n  workspace \"/tmp\"\n  argv \"/usr/bin/true\"\n}".to_owned();
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let planned = state.store.mission(&intent, crate::model::IntentInput { kdl: source, source_name: None }).unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "ask-images").unwrap();
+        let app = router_for_transport(state.clone(), ClientTransportBoundary::Unix);
+        let image = png(64, 3);
+        let hash = hex::encode(Sha256::digest(&image));
+        let (status, _, bytes) = call(&app, "POST", "/v1/client/blobs", actor, Some("image/png"), image.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let ask = |key: &str, attachments: Value| {
+            let app = app.clone();
+            let body = json!({"person":"person/ada","title":"North bed","reason":"The sketch decides it","actor":actor,
+                "new_run":format!("example/{key}"),"idempotency_key":key,"request":{"version":1,"type":"feedback",
+                "question":"What would you change in this sketch?","why_person":"Only Ada knows how the garden should feel.",
+                "attachments":attachments}});
+            async move {
+                let (status, _, bytes) = call(&app, "POST", "/v1/work/ask", actor, Some("application/json"), serde_json::to_vec(&body).unwrap()).await;
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        // An image names the asker's upload; the ask claim keeps it completed, never as given.
+        let (status, body) = ask("forged", json!([{"sha256":hash,"media_type":"image/png","size":64,"origin":"host/elsewhere"}])).await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        let (status, body) = ask("not-uploaded", json!([{"blob":format!("blob/{}", "ab".repeat(32)),"media_type":"image/png"}])).await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        let (status, body) = ask("sketch", json!([{"blob":format!("blob/{hash}"),"media_type":"image/png","name":"/home/example/north-bed.png"}])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let step = body["value"]["subject"].as_str().unwrap_or_else(|| panic!("{body}")).to_owned();
+        let asked = state.store.ask_images(&step).unwrap().unwrap();
+        assert_eq!(asked.person.as_deref(), Some("person/ada"));
+        assert_eq!(asked.attachments, vec![MessageAttachment {
+            sha256: hash.clone(),
+            media_type: "image/png".into(),
+            name: Some("north-bed.png".into()),
+            size: image.len() as u64,
+            origin: client_host_id(&state.node),
+        }]);
+        // The person's card names each image by its blob reference, as a message's does.
+        let cards = crate::api::client_attention_resources_at(&state.store, Some("person/ada"), false, super::client_now_ms()).unwrap();
+        let card = cards.iter().find(|card| card["source_id"] == step.as_str()).expect("the ask's card");
+        assert_eq!(card["request"]["attachments"][0]["blob"], format!("blob/{hash}"));
+        // The person it asks reads the image by the ask's step, whole or in chunks.
+        let (status, _, bytes) = call(&app, "GET", &format!("/v1/client/blobs/{hash}?message={step}"), "person/ada", None, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, image);
+        let (status, _, bytes) = call(&app, "GET", &format!("/v1/client/blobs/{hash}/chunk?message={step}&offset=0"), "person/ada", None, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        assert_eq!(json_of(&bytes)["value"]["size"], image.len());
+        // A step whose ask does not carry the image, or no ask at all, answers nothing.
+        let other = png(64, 9);
+        let other_hash = hex::encode(Sha256::digest(&other));
+        call(&app, "POST", "/v1/client/blobs", actor, Some("image/png"), other).await;
+        for (hash, carrier) in [(other_hash.as_str(), step.as_str()), (hash.as_str(), "step-run/none/ask")] {
+            let (status, _, _) = call(&app, "GET", &format!("/v1/client/blobs/{hash}?message={carrier}"), "person/ada", None, Vec::new()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{carrier}");
+        }
     }
 
     #[tokio::test]

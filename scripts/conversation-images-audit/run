@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# Put every kind of image into conversations on an isolated st instance, then look at each in the
+# terminal UI under several terminals' answers. Reproduces the table in
+# docs/clients/ui-contract.md (Conversations › Images › Audit).
+#
+# Usage:
+#   run up ST3_BINARY PTY_BINARY  start an instance daemon in a throwaway HOME, seed every case and
+#                              stay until the daemon stops
+#   run look PROFILE [tmux]    open stui under a terminal answering as PROFILE (kitty, iterm2,
+#                              sixel, silent), optionally inside tmux; open SCENE (claude, the
+#                              default: the Claude transcript; gardener: the mail; now: the asks),
+#                              where a drawing terminal loads the first image by itself, then load
+#                              one by hand; keep the screens and the image bytes drawn under
+#                              $AUDIT/looks/SCENE-PROFILE[-tmux]/
+#   run pond                   join a second host (its own instance and HOME) to the fleet, send
+#                              an image only it holds, and stay until it stops
+#   run pond-off               stop the second host, so its image is remote-unavailable
+#   run capture DIR            write each case's timeline, normalized, to DIR as client fixtures
+#   run down                   stop the instances and remove the throwaway HOMEs
+#
+# AUDIT (default /var/tmp/st-images-audit) holds the HOME, the images, the seeded ids and the
+# screens. The daemon refuses a process that descends from a seat, so run this outside one, for
+# example: systemd-run --user --wait --pipe --collect env -u ST_AGENT scripts/conversation-images-audit/run up ST3 PTY
+#
+# Every image is drawn by draw.py. Every name is invented.
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+audit="${AUDIT:-/var/tmp/st-images-audit}"
+home="$audit/home"
+instance=images-audit
+person=person/ada
+
+# st on the garden host (the instance every case lives on), and on the pond host, a second
+# instance with its own HOME that joins the garden's fleet and owns one image.
+st() { on garden-host "$home" "$instance" "$@"; }
+st_pond() { on pond-host "$audit/home-pond" images-audit-pond "$@"; }
+on() {
+  local host="$1" at="$2" name="$3"; shift 3
+  env -i HOME="$at" PATH="$audit/tools:$(dirname "$(command -v ls)"):/usr/bin:/bin" USER="$(id -un)" \
+    LANG=C.UTF-8 SHELL=/bin/sh HOSTNAME="$host" ST3_PERSON="$person" ST3_WORKER_INTERVAL_MS=300 \
+    "$audit/tools/st3" --instance "$name" "$@"
+}
+
+socket() { find "$home/.st-instance/$instance/run" -name 'st3.sock' -print -quit 2>/dev/null; }
+
+# curl over the instance socket as ACTOR.
+api() {
+  local actor="$1" method="$2" path="$3"; shift 3
+  curl -sS --unix-socket "$(socket)" -X "$method" -H "X-St3-Person: $actor" "$@" "http://st3$path"
+}
+
+b64() { base64 -w0 "$1"; }
+
+up() {
+  local st3_binary pty_binary
+  st3_binary="$(readlink -f "$1")"
+  pty_binary="$(readlink -f "$2")"
+  mkdir -p "$audit/tools" "$home" "$audit/images" "$audit/workspace"
+  cp --reflink=auto "$st3_binary" "$audit/tools/st3"
+  ln -sf st3 "$audit/tools/st"
+  # st3 finds pty beside itself.
+  cp --reflink=auto "$pty_binary" "$audit/tools/pty"
+  for profile in .bash_profile .zprofile; do
+    printf 'export PATH="%s:$PATH"\n' "$audit/tools" >"$home/$profile"
+  done
+  python3 -I "$here/draw.py" "$audit/images"
+
+  # A fleet of one on loopback, so a second host can join it for the remote image case.
+  st fleet create --no-service --name garden --port 47811 --transports loopback --advertise-loopback \
+    >"$audit/fleet-create.txt" 2>&1 || { cat "$audit/fleet-create.txt"; exit 1; }
+  st up >"$audit/daemon.log" 2>&1 &
+  st replication-worker >"$audit/worker.log" 2>&1 &
+  for _ in $(seq 1 120); do
+    st --daemon-wait 0 agents ls >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  st --daemon-wait 0 agents ls >/dev/null || { tail -20 "$audit/daemon.log"; exit 1; }
+  st setup --person "${person#person/}" --yes --service false >"$audit/setup.txt" 2>&1 || { cat "$audit/setup.txt"; exit 1; }
+
+  # Two program seats: a gardener that receives and sends images, and a bridge enrolled to import
+  # a Discord-style sender into the gardener's conversation.
+  # Not resolved: a multi-call coreutils would be named instead of sleep.
+  local sleep_bin
+  sleep_bin="$(command -v sleep)"
+  cat >"$audit/seats.kdl" <<KDL
+version 2
+agent "example/gardener" {
+  workspace "$audit/workspace"
+  argv "$sleep_bin" "infinity"
+}
+agent "example/bridge" {
+  workspace "$audit/workspace"
+  argv "$sleep_bin" "infinity"
+  tags st3.adapter.sources="external/discord/user/404" st3.adapter.target="agent/example/gardener"
+}
+KDL
+  st apply "$audit/seats.kdl" --as "$person" >"$audit/apply.txt" 2>&1 || { cat "$audit/apply.txt"; exit 1; }
+  # A conversation shows the mail accepted while the seat's current incarnation runs, so send
+  # only once both seats run.
+  for _ in $(seq 1 60); do
+    [ "$(st agents ls 2>/dev/null | grep -c 'running$')" = 2 ] && break
+    sleep 0.5
+  done
+  sleep 2
+
+  seed
+  echo "ready: the daemon runs until \`run down\`"
+  # A service manager stops what a finished unit leaves behind, so stay with the daemon.
+  wait
+}
+
+seed() {
+  local images="$audit/images" ids="$audit/ids.txt"
+  : >"$ids"
+
+  # 1. A person sends the gardener a message with two images (st conversations send --attach).
+  st conversations send agent/example/gardener --from "$person" --body 'two sketches for the north bed' \
+    --attach "$images/garden.png" --attach "$images/pond.png" >"$audit/case-person-send.txt" 2>&1 || true
+  echo "person-send $(grep -o 'message/[0-9a-f]*' "$audit/case-person-send.txt" | head -1)" >>"$ids"
+
+  # 2. The gardener answers the person with images, as a reply in the person's thread. st refuses
+  #    an agent's send or reply to a person (people have no inbox); case-agent-reply.txt keeps it.
+  local first
+  first="$(grep -o 'message/[0-9a-f]*' "$audit/case-person-send.txt" | head -1)"
+  st conversations reply "$first" --from agent/example/gardener --body 'the bed today, and the whole wall' \
+    --attach "$images/garden.png" --attach "$images/mural.png" >"$audit/case-agent-reply.txt" 2>&1 || true
+  echo "agent-reply $(grep -o 'message/[0-9a-f]*' "$audit/case-agent-reply.txt" | tail -1)" >>"$ids"
+
+  # 3. A Discord-bridge-style import: the bridge uploads the image and imports the message. Its
+  #    bytes are unique to it, so nothing else in the conversation names the same image.
+  local blob
+  blob="$(api agent/example/bridge POST /v1/client/blobs -H 'Content-Type: image/png' --data-binary "@$images/tiny.png" \
+    | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["value"]["blob"])')"
+  api agent/example/bridge POST /v1/client/adapter/import -H 'Content-Type: application/json' \
+    --data-binary "{\"idempotency_key\":\"audit-discord-1\",\"from\":\"external/discord/user/404\",\"to\":\"agent/example/gardener\",\"content\":\"a red seed\",\"attachments\":[{\"blob\":\"$blob\",\"media_type\":\"image/png\",\"name\":\"image-seed.png\"}]}" \
+    >"$audit/case-discord.json"
+  echo "discord $(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["value"]["subject"])' "$audit/case-discord.json")" >>"$ids"
+
+  # 4. A Claude transcript with an image in a user turn, in a tool result, a huge one, and an st
+  #    delivery that names its attachment by path, as a driver hands it to the harness; kept alive by a
+  #    process whose command line names the transcript, as a found-running Claude does.
+  local claude_id=7d3c1a52-0b8e-4c1f-9a64-2f0e6c1d5b10 claude_dir="$home/.claude/projects/-garden"
+  mkdir -p "$claude_dir"
+  local claude="$claude_dir/$claude_id.jsonl" now
+  now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  cat >"$claude" <<JSONL
+{"type":"user","sessionId":"$claude_id","cwd":"$audit/workspace","timestamp":"$now","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"what is growing here?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"$(b64 "$images/garden.png")"}}]}}
+{"type":"assistant","sessionId":"$claude_id","cwd":"$audit/workspace","timestamp":"$now","uuid":"a1","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"Rings of clover. Let me look at the pond sketch."},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"$audit/workspace/pond.png"}}]}}
+{"type":"user","sessionId":"$claude_id","cwd":"$audit/workspace","timestamp":"$now","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"$(b64 "$images/pond.png")"}}]}]}}
+{"type":"assistant","sessionId":"$claude_id","cwd":"$audit/workspace","timestamp":"$now","uuid":"a2","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"A round pond on a checkered lawn."}]}}
+{"type":"user","sessionId":"$claude_id","cwd":"$audit/workspace","timestamp":"$now","uuid":"u3","message":{"role":"user","content":[{"type":"text","text":"and the whole wall"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"$(b64 "$images/mural.png")"}}]}}
+{"type":"assistant","sessionId":"$claude_id","cwd":"$audit/workspace","timestamp":"$now","uuid":"a3","message":{"id":"m3","role":"assistant","content":[{"type":"text","text":"A wide gradient wall."}]}}
+{"type":"user","sessionId":"$claude_id","cwd":"$audit/workspace","timestamp":"$now","uuid":"u4","message":{"role":"user","content":[{"type":"text","text":"<channel source=\\"plugin:st-channel:st\\" from=\\"person/ada\\" messageId=\\"message/0a1b2c3d4e5f6071\\">\\n<smalltalk-message id=\\"0a1b2c3d4e5f6071\\" from=\\"person/ada\\" to=\\"agent/example/gardener\\" subject=\\"(no subject)\\" sha256=\\"00\\" graph=\\"message/0a1b2c3d4e5f6071\\">\\nthe pond again\\n<attachment path=\\"$audit/home/.st-instance/images-audit/state/st3/drivers/gardener/attachments/52c6aa6b.png\\" media_type=\\"image/png\\" bytes=\\"1269\\" name=\\"pond.png\\"/>\\n</smalltalk-message>\\n</channel>"}]}}
+JSONL
+
+  # 5. A Codex rollout: an input_image in a user message, a pasted image named only in the event
+  #    stream (local_images), and an image the view_image tool returned.
+  local codex_id=0199e2a4-6c1b-7f30-8d2e-5a4b3c2d1e0f codex_dir="$home/.codex/sessions/2026/10/13"
+  mkdir -p "$codex_dir"
+  local codex="$codex_dir/rollout-2026-10-13T09-00-00-$codex_id.jsonl"
+  cp "$images/pond.png" "$audit/workspace/pond.png"
+  cat >"$codex" <<JSONL
+{"timestamp":"$now","type":"session_meta","payload":{"id":"$codex_id","timestamp":"$now","cwd":"$audit/workspace","originator":"codex_cli_rs","cli_version":"0.50.0"}}
+{"timestamp":"$now","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"compare these beds"},{"type":"input_image","image_url":"data:image/png;base64,$(b64 "$images/garden.png")"}]}}
+{"timestamp":"$now","type":"event_msg","payload":{"type":"user_message","message":"compare these beds","images":[],"local_images":["$audit/workspace/pond.png"]}}
+{"timestamp":"$now","type":"response_item","payload":{"type":"function_call","name":"view_image","arguments":"{\"path\":\"$audit/workspace/pond.png\"}","call_id":"c1"}}
+{"timestamp":"$now","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"attached local image"}}
+{"timestamp":"$now","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,$(b64 "$images/pond.png")"}]}}
+{"timestamp":"$now","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The left bed is rings; the right is a pond."}]}}
+JSONL
+  # Processes named like the harnesses whose command lines name each transcript.
+  (cd "$audit/workspace" && exec -a claude python3 -I -c 'import time; time.sleep(86400)' --resume "$claude") &
+  (cd "$audit/workspace" && exec -a codex python3 -I -c 'import time; time.sleep(86400)' resume "$codex") &
+  echo "claude $claude_id" >>"$ids"
+  echo "codex $codex_id" >>"$ids"
+
+  # 6. An alert whose card and decision form name an image, in every way the request allows.
+  local garden_sha
+  garden_sha="$(sha256sum "$images/garden.png" | cut -d' ' -f1)"
+  cat >"$audit/request.json" <<JSON
+{"version":1,"type":"decision","question":"Plant the north bed like this?\n\n![north bed](https://example.com/north-bed.png)",
+ "why_person":"Ada decides what grows in the north bed.",
+ "subjects":[{"kind":"link","label":"north bed sketch","url":"https://example.com/north-bed.png"},
+             {"kind":"document","label":"north bed sketch (sent)","ref":"$first"},
+             {"kind":"document","label":"north bed sketch (blob)","ref":"blob/$garden_sha"}],
+ "answers":[{"id":"yes","label":"Plant it","outcome":"accept","consequence":"The gardener plants the north bed."},
+            {"id":"no","label":"Not yet","outcome":"decline","consequence":"The bed stays fallow."}]}
+JSON
+  st work ask --for "$person" --title 'North bed plan' --new-run example/north-bed \
+    --request "$audit/request.json" --idempotency-key audit-ask-1 --as agent/example/gardener >"$audit/case-ask.txt" 2>&1 || true
+  cat >"$audit/feedback.json" <<JSON
+{"version":1,"type":"feedback","question":"What would you change in this sketch?",
+ "why_person":"Only Ada knows how the garden should feel.",
+ "subjects":[{"kind":"document","label":"pond sketch","ref":"$first"}]}
+JSON
+  st work ask --for "$person" --title 'Pond sketch' --new-run example/pond-sketch \
+    --request "$audit/feedback.json" --idempotency-key audit-ask-3 --as agent/example/gardener >"$audit/case-feedback.txt" 2>&1 || true
+  # An ask that carries the image itself (st work ask --attach); a build without it says so.
+  st work ask --for "$person" --title 'North bed plan, with the sketch' --new-run example/north-bed-2 \
+    --request "$audit/request.json" --attach "$images/garden.png" --idempotency-key audit-ask-2 \
+    --as agent/example/gardener >"$audit/case-ask-attach.txt" 2>&1 || true
+
+  cat "$ids"
+}
+
+# 7. An image whose origin is another host. The pond host joins the fleet and sends the gardener
+#    an image only it holds; `run pond-off` stops it so the read answers remote-unavailable.
+pond() {
+  local images="$audit/images" code
+  mkdir -p "$audit/home-pond"
+  for profile in .bash_profile .zprofile; do cp "$home/$profile" "$audit/home-pond/$profile"; done
+  code="$(st fleet invite pond --code-only --via loopback --as "$person")"
+  st_pond fleet join "$code" --no-service --name pond --port 47812 --transports loopback --advertise-loopback \
+    >"$audit/fleet-join.txt" 2>&1 || { cat "$audit/fleet-join.txt"; exit 1; }
+  st_pond up >"$audit/daemon-pond.log" 2>&1 &
+  st_pond replication-worker >"$audit/worker-pond.log" 2>&1 &
+  st_pond fleet wait --timeout 90s >"$audit/fleet-wait.txt" 2>&1 || { cat "$audit/fleet-wait.txt"; exit 1; }
+  st_pond conversations send agent/example/gardener --from "$person" --body 'the far pond, from the other host' \
+    --attach "$images/far.png" >"$audit/case-pond-send.txt" 2>&1 || { cat "$audit/case-pond-send.txt"; exit 1; }
+  echo "pond-send $(grep -o 'message/[0-9a-f]*' "$audit/case-pond-send.txt" | head -1)" >>"$audit/ids.txt"
+  tail -1 "$audit/ids.txt"
+  echo "pond: runs until \`run pond-off\` or \`run down\`"
+  wait
+}
+
+pond_off() {
+  pkill -u "$(id -u)" -f "$audit/tools/st3 --instance images-audit-pond" 2>/dev/null || true
+}
+
+# Keep each case's timeline as a client sees it (conversation blocks negotiated), with the signed
+# content references and machine paths replaced by short invented ones, as fixtures for the
+# clients' view tests.
+capture() {
+  local out="$1" sock
+  sock="$(socket)"
+  mkdir -p "$out"
+  read_timeline() {
+    curl -sS --unix-socket "$sock" -H "X-St3-Person: $person" -H 'x-st3-features: custom-subjects.v1, conversation-blocks.v1' \
+      "http://st3/v1/client/$1"
+  }
+  local gardener claude codex
+  gardener="$(read_timeline 'conversations/agent%2Fexample%2Fgardener/changes' | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["value"]["session_id"])')"
+  read_timeline "sessions/$gardener/timeline" >"$audit/timeline-gardener.json"
+  session_of() {
+    read_timeline sessions | python3 -I -c 'import json,sys; print(next(s["id"] for s in json.load(sys.stdin)["value"]["items"] if s.get("owner_id")==sys.argv[1]))' "$1"
+  }
+  claude="$(session_of "external-session/claude/$(awk '$1=="claude"{print $2}' "$audit/ids.txt")")"
+  codex="$(session_of "external-session/codex/$(awk '$1=="codex"{print $2}' "$audit/ids.txt")")"
+  [ -z "$claude" ] || read_timeline "sessions/$claude/timeline" >"$audit/timeline-claude.json"
+  [ -z "$codex" ] || read_timeline "sessions/$codex/timeline" >"$audit/timeline-codex.json"
+  python3 -I "$here/normalize.py" "$audit" "$out" "$audit"/timeline-*.json
+}
+
+look() {
+  local profile="$1" in_tmux="${2:-}" name out
+  name="${SCENE:-claude}-$profile${in_tmux:+-tmux}"
+  out="$audit/looks/$name"
+  mkdir -p "$out"
+  # The UI sees only the throwaway HOME and what the terminal itself sets (TERM and its kin, as
+  # the profile or tmux set them), never this machine's other variables.
+  cat >"$audit/tools/ui" <<UI
+#!/bin/sh
+set -- HOME="$home" PATH="$audit/tools:$(dirname "$(command -v ls)"):/usr/bin:/bin" USER="$(id -un)" LANG=C.UTF-8 ST3_PERSON="$person"
+for name in TERM TERM_PROGRAM LC_TERMINAL KITTY_WINDOW_ID ITERM_SESSION_ID TMUX; do
+  eval "[ -n \"\\\${\$name+set}\" ]" && eval "set -- \"\\\$@\" \"\$name=\\\$\$name\""
+done
+exec env -i "\$@" "$audit/tools/st3" --instance "$instance" ui --local
+UI
+  chmod +x "$audit/tools/ui"
+  local ui=("$audit/tools/ui")
+  if [ -n "$in_tmux" ]; then
+    ui=(tmux -L "audit-$name" -f /dev/null new-session -x 120 -y 40 "$audit/tools/ui")
+  fi
+  # SCENE picks what to open: the Claude transcript (default), the gardener's mail, or Now with
+  # the asks' cards. Ctrl+K finds it and Enter opens it; a terminal that draws loads the first
+  # image by itself; Ctrl+Up focuses the image row above and Ctrl+U loads it by hand. The query
+  # is the agent's own row; an Enter that misses saves a space by that name, which the daemon
+  # keeps and ranks first after that, so a fresh `up` starts without them.
+  local open
+  case "${SCENE:-claude}" in
+    claude) open=(--key '4:^K' --key '5:claude in workspace' --key '7:\r') ;;
+    gardener) open=(--key '4:^K' --key '5:gardener' --key '7:\r') ;;
+    now) open=(--key '4:^H') ;;
+    *) echo "SCENE is claude, gardener or now"; exit 2 ;;
+  esac
+  python3 -I "$here/terminal.py" --profile "$profile" --out "$out" --seconds "${SECONDS_PER_LOOK:-20}" \
+    "${open[@]}" --snapshot 12.5 --key '13:\x1b[1;5A' --key '14:^U' \
+    "${@:3}" -- "${ui[@]}"
+  [ -z "$in_tmux" ] || tmux -L "audit-$name" kill-server 2>/dev/null || true
+}
+
+down() {
+  # Only processes that run from the audit tree, never a shell that merely names it.
+  pkill -u "$(id -u)" -f "$audit/(tools|home|workspace)/" 2>/dev/null || true
+  sleep 1
+  rm -rf "$audit"
+}
+
+case "${1:-}" in
+  up) up "$2" "$3" ;;
+  seed) seed ;;
+  capture) capture "$2" ;;
+  pond) pond ;;
+  pond-off) pond_off ;;
+  look) shift; look "$@" ;;
+  down) down ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
+esac

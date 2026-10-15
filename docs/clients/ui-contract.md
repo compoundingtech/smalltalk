@@ -288,6 +288,64 @@ Rules every client follows; `transcripts/*.expected.json` checks the cleaning.
 - Read a fresh snapshot right before every action and retry once on `StaleFence`: a graph that
   moved is not the person's problem.
 
+### Images
+
+An image is shown as it was sent, wherever it appears: a message's attachments, an image in a
+harness transcript, a card or a request. The bytes stay with the owner of the message
+([attachments](../st3/attachments.md)), so before they arrive the image is a placeholder that
+names its type and real size and says it is loading. An owner that cannot be reached says so on
+the image itself, never a blank and never a spinner that does not end. The placeholder never
+shows a file path. Its open action opens the image in the person's own viewer or saves it where
+they choose. A terminal that draws images draws it inline; any other terminal shows half blocks
+or the placeholder, never raw escape bytes.
+
+#### Audit, 2026-10-13
+
+`scripts/conversation-images-audit/run` reproduces every case on an isolated instance. It
+seeds the cases, joins a second host that owns one image, and opens stui under a pseudo-terminal
+that answers stui's capability query as kitty, iTerm2 or a sixel terminal would, or not at all,
+both inside and outside tmux. `run capture` writes the timelines a client reads to
+`fixtures/clients/conversation-images/`. `ios-views.mjs` feeds those timelines to the view model
+the iOS feed draws (`conversationEntries`). The iOS app was not built: the iOS column comes
+from that view model, the components that draw it, `tsc` and the existing view tests. The st
+under test is release `ed31cfe`; main at `4f763ce` has no change to any path below.
+
+| Case | Terminal UI | iOS | Cause of each miss |
+|---|---|---|---|
+| Message with images (`st conversations send --attach`) | One line per image, `▣ garden.png · 71 KB  open`. Never drawn inline, in any terminal. | 200×150 box loaded at once; `🖼 name · size…` until then. | stui: the mail renderer draws no pictures (`st3-conversation-ui/src/conversation.rs`, "a terminal draws no pictures here"), so no inline load exists for mail. iOS: `MailImageView` loads on mount, not when visible (FlatList overscan reads too), unlike transcript images. |
+| Open a message image | Saves to `$XDG_STATE_HOME/st3/stui/attachments/received/<sha>.png` and flashes the path. It runs `xdg-open` only when `DISPLAY` or `WAYLAND_DISPLAY` is set. | No open or save action. | stui: `attach::show` opens only on a local display; the person cannot choose where it is saved. iOS: `MailImageView` has no press or share action. |
+| Agent sends a person an image | Refused: `people do not have inboxes`, for `send` and `reply` alike. | Same. | By design, mail goes to agents. An agent shows a person an image only through its transcript (see the tool-result rows). |
+| Discord-bridge import (`external/discord/user/…` → agent) | Text only, no image line, until the person clicks the mail open. | Image shown, as for any message. | stui: mail between two others folds to two lines (`conversation.rs:124`, `mail_lines`), which drop its images with no marker. |
+| Claude transcript, image in the person's turn | `image · Ctrl+Enter details · Ctrl+U load inline` row, then `[image application/octet-stream, size unknown]`. Loads with Ctrl+Up then Ctrl+U, or by itself in kitty and iTerm2. | A `[image · load from owner]` text row, then a box: `Image`, `Loading image…`, the image. | Both: the server's continuation names `application/octet-stream` and no size (`conversation_blocks.rs`, `image_media`), though the native block names its type and its bytes are at hand. iOS: the fallback text is shown as the person's words besides the box. |
+| Claude tool result with an image (`Read` of a PNG) | `[image]` under the call; Ctrl+U and Ctrl+Enter load nothing. | Box under the call; loads when visible. | stui: the tool result's block is `tool_output` with `body_ref`; the image reference is in `body.content[].content`, which `Content::index` (`stui/src/ui/content.rs`) never reads, since it reads only block payloads, continuations and metadata. This is how an agent shows a person an image. |
+| Codex transcript (`input_image`, `view_image` result) | Both are `image` rows inside a "3 tool calls" bundle; each loads with Ctrl+U. | `[image · load from owner]` text rows with boxes. | stui: a person's pasted image counts and folds as a tool call. Both: type and size unknown before load, as above. |
+| st delivery echoed in a transcript (`<attachment path=…/>`) | The raw element, file path included. | The same raw text in the mail body. | Neither client reads the `attachment` element of the delivery envelope (`docs/st3/attachments.md`, "Delivery to a seat"). The path is private and the image is not offered. |
+| Huge image (6000×4000 PNG, 623 KB) in a transcript | Drawn; stui grows from 36 MB to 108 MB resident (200 MB peak) and keeps it after the tab is left. | Whole file as a base64 data URI in a 200×150 box. | stui: the decoded image is held at full size (`Loaded::Image`). The draw path clones it to build the terminal protocol (`Content::draw_image`) at each new size. It is released on hide, collapse or eviction, not when it leaves the screen. iOS: no downscale; mail images keep up to 24 data URIs. |
+| Alert card, decision or feedback form | Subjects are text: `north bed sketch  message/…`, `blob/<sha>`; Markdown `![alt](url)` reads `!north bed`. | Same text; `![alt](url)` reads `!` and a link. | The request schema has no image field (`person_request.rs`: `attachments` is refused, and no subject kind is an image). Neither Markdown renderer draws images. |
+| Image owned by another host, reachable | Same line as a local image; `open` fetches it from the owner. | Same box; the claim's size is shown before it loads. | Both drop `origin`, so neither can say whose it is. |
+| Image owned by another host, unreachable | `Not done: pond cannot be reached right now` flashes for about two seconds; the line itself does not change. | `🖼 name · size` and the server's message, with no retry; transcript images get Retry. | stui: the failure is a transient flash, not a state of the image. iOS: `MailImageView` reads again only when its row mounts again; remote-unavailable and expired are not told apart. |
+
+Terminals: each profile answers the query as that terminal does. Outside tmux, the pseudo-terminal
+is the terminal. Inside tmux, tmux 3 runs inside it with `allow-passthrough` set by
+ratatui-image.
+
+| Terminal answer | Outside tmux | Inside tmux |
+|---|---|---|
+| kitty (`TERM=xterm-kitty`, answers the graphics query) | Queried; kitty graphics; the first visible image loads by itself | Queried through passthrough; kitty Unicode placeholders; loads by itself |
+| iTerm2 (`TERM_PROGRAM=iTerm.app`) | Queried; one iTerm2 inline image; loads by itself | Not queried; half blocks after Ctrl+U |
+| sixel (DA1 lists attribute 4) | Not queried; half blocks after Ctrl+U | Not queried; half blocks after Ctrl+U |
+| Answers nothing | Half blocks after Ctrl+U; no escape bytes in the conversation | The same |
+
+Cause: stui sends the capability query only to terminals it knows by name
+(`attach::graphics_terminal`: `TERM` names kitty, Ghostty or WezTerm, `TERM_PROGRAM` names
+iTerm2, WezTerm or Ghostty, or `KITTY_WINDOW_ID` is set). A sixel terminal is never asked, and
+neither is iTerm2 inside tmux, where `TERM_PROGRAM` is `tmux`. No kitty, iTerm2 or sixel terminal
+was installed on the audit host, so each was checked by its answer to the query.
+
+Typing and key-to-redraw were not measured here. `st ui --slo` printed no samples for the
+isolated instance after a clean quit, because the counters are written hourly. The terminal-UI
+change measures them before and after with an image on screen.
+
 ## Presentation projections
 
 Today the terminal UI derives mission words, agent states and Now cards in Rust, the phone
