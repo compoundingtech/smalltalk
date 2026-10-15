@@ -177,7 +177,7 @@ ST_TILES_ROOT_TEST=1 cargo test -p st3 --test integration tiles_root:: -- --noca
 ```
 
 CI does not run these: its runners have no root, and the tests return at once there. The builder
-of every change to `crates/st3/src/tiles` or `tests/tiles_root.rs` runs them on a Linux host with
+of every change to `crates/st3-daemon/src/tiles` or `tests/tiles_root.rs` runs them on a Linux host with
 root before review, and the pull request says where and at which commit. Before a release that
 ships a harness in a tile (design step 2), a release gate must run them on a host like the ones
 that will run tiles; that gate is part of step 2.
