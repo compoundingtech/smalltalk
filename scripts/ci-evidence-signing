@@ -167,6 +167,31 @@ def once(root, check):
     ledger.write_text(json.dumps(signed))
 
 
+def add_source_inputs(facts, check):
+    """Record the input key of the tested tree when the skip policy at the BASE commit declares inputs for CHECK.
+
+    The key is the git tree of the tested tree reduced to the declared paths, computed by evidence-verify
+    (--project) from the same base scripts the rest of the signing uses; a record signed with it can be found
+    by another tree whose declared paths are the same. No declaration, no base commit, a base whose
+    evidence-verify has no --project yet, or any error: no key, and the record stays an exact-tree record."""
+    base, repository = env('PROJECT_BASE_SHA'), env('GITHUB_REPOSITORY')
+    verify = Path(__file__).resolve().parent / 'evidence-verify'
+    if not (check and base and repository and verify.exists()):
+        return
+    clean = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    key = None
+    try:
+        done = subprocess.run([sys.executable, str(verify), '--project', '--check', check, '--revision', 'HEAD',
+                               '--policy-from', base, '--repository', repository],
+                              capture_output=True, text=True, env=clean, timeout=120)
+        if done.returncode == 0:
+            key = json.loads(done.stdout).get('source_inputs')
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        pass
+    if isinstance(key, str) and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', key):
+        facts['inputs']['source_inputs'] = key
+
+
 def aggregate(path):
     """What an aggregate job honestly knows: which jobs it needed, what each reported, its verdict.
 
@@ -248,6 +273,7 @@ def stage_facts(path):
         },
     }
     facts['inputs'] = {k: v for k, v in facts['inputs'].items() if v}
+    add_source_inputs(facts, env('STAGE_JOB') or stage)
     Path(path).write_text(json.dumps(facts, sort_keys=True))
 
 
@@ -285,6 +311,7 @@ def step_facts(path):
         },
     }
     facts['inputs'] = {k: v for k, v in facts['inputs'].items() if v}
+    add_source_inputs(facts, check)
     Path(path).write_text(json.dumps(facts, sort_keys=True))
 
 

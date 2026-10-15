@@ -270,6 +270,41 @@ with tempfile.TemporaryDirectory() as directory:
     assert helper('step-facts', str(out), env=dict(base_env, STEP_OUTCOMES='{}')).returncode == 1
     print('passed: a step-based job note records each step outcome; a skipped, cancelled or missing step means no note, a failed one a failure')
 
+    # --- source_inputs: recorded only when the BASE evidence-verify projects the check's declared inputs
+    stub_dir = tmp / 'stub-scripts'
+    stub_dir.mkdir()
+    shutil_copy = __import__('shutil').copy
+    shutil_copy(HELPER, stub_dir / 'ci-evidence-signing')
+    KEY = 'a' * 40
+
+    def with_verify(body):
+        (stub_dir / 'evidence-verify').write_text(body)
+
+    def project_run(extra=None):
+        env_ = dict(base_env, STEP_OUTCOMES=json.dumps({'driver': 'success'}), PROJECT_BASE_SHA='b' * 40, GITHUB_REPOSITORY='example/repo')
+        env_.update(extra or {})
+        done = subprocess.run([sys.executable, str(stub_dir / 'ci-evidence-signing'), 'step-facts', str(out)], capture_output=True, text=True,
+                              env=dict(BASE, **env_))
+        return done, json.loads(out.read_text()) if done.returncode == 0 else None
+
+    seen = tmp / 'verify-argv.json'
+    with_verify(f'import json,sys\njson.dump(sys.argv[1:], open({str(seen)!r}, "w"))\nprint(json.dumps({{"source_inputs": {KEY!r}}}))\n')
+    done, facts = project_run()
+    assert done.returncode == 0 and facts['inputs']['source_inputs'] == KEY, done.stdout
+    assert json.loads(seen.read_text()) == ['--project', '--check', 'isolation-vm', '--revision', 'HEAD', '--policy-from', 'b' * 40, '--repository', 'example/repo']
+    with_verify('print(\'{"source_inputs": null}\')\n')
+    assert 'source_inputs' not in project_run()[1]['inputs'], 'a check without declared inputs stays an exact-tree note'
+    with_verify('import sys\nsys.exit(2)\n')
+    done, facts = project_run()
+    assert done.returncode == 0 and 'source_inputs' not in facts['inputs'], 'a base whose evidence-verify has no --project signs an exact-tree note'
+    with_verify('print(\'{"source_inputs": "not-a-tree"}\')\n')
+    assert 'source_inputs' not in project_run()[1]['inputs'], 'a malformed key is dropped, never signed'
+    with_verify(f'print(\'{{"source_inputs": "{KEY}\\\\n"}}\')\n')
+    assert 'source_inputs' not in project_run()[1]['inputs'], 'a key with a trailing newline is dropped'
+    with_verify(f'import json\nprint(json.dumps({{"source_inputs": {KEY!r}}}))\n')
+    assert 'source_inputs' not in project_run(dict(PROJECT_BASE_SHA=''))[1]['inputs'], 'no base commit, no key'
+    print('passed: source_inputs is signed only when the base evidence-verify projects a well-formed key; every other case is an exact-tree note')
+
     # --- a job whose gate said skip makes no note even if its logs and steps look like a success
     assert helper('stage-facts', str(out), env=dict(stage_env, STAGE='tests', GATE_SKIP='false')).returncode == 0
     gated = helper('stage-facts', str(out), env=dict(stage_env, STAGE='tests', GATE_SKIP='true'))
