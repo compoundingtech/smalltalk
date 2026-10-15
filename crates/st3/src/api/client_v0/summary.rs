@@ -4,6 +4,17 @@ use super::*;
 use crate::store::summary_list::{SummaryInputs, SummaryMachines, SummaryShared};
 use st3_ui_model::missions::Display;
 
+#[derive(Debug)]
+struct RosterNotPublished;
+
+impl std::fmt::Display for RosterNotPublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the agents roster is still being prepared; retry shortly")
+    }
+}
+
+impl std::error::Error for RosterNotPublished {}
+
 pub(super) fn working(agent: &Value) -> bool {
     agent["state"] == "running"
         && agent["harness_state"] == "working"
@@ -118,7 +129,7 @@ fn shared(
         let Some((cut, cards, published_at)) = store.published_agent_roster(snapshot.store_index, false)
         else {
             store.request_agent_roster_refresh();
-            anyhow::bail!("the agents roster is still being prepared; retry shortly");
+            return Err(RosterNotPublished.into());
         };
         if cut < snapshot.store_index {
             store.request_agent_roster_refresh();
@@ -252,10 +263,11 @@ const PUBLISHED_PERIOD_MS: u128 = 30_000;
 /// person from the newest attention publication, in memory. As the daemon starts the shared
 /// counts are computed with no selection until they first succeed (the complete roster they
 /// count agents from may come later), so the first window is served at once. If they
-/// cannot be computed the previous ones stay published; with none, every selection is not
-/// published and its windows read for themselves. With `waiting_only`, only the selections a
-/// window waits for, and the shared counts only if there are none yet. Returns whether any
-/// selection's counts changed.
+/// cannot be computed the previous ones stay published. Before the first successful computation,
+/// selections stay pending only while the agent roster has not published; other failures let
+/// their windows read for themselves.
+/// With `waiting_only`, only the selections a window waits for, and the shared counts only if
+/// there are none yet. Returns whether any selection's counts changed.
 pub(in crate::api) fn refresh_published(
     state: &AppState,
     idle_ms: u64,
@@ -291,6 +303,7 @@ pub(in crate::api) fn refresh_published(
         let machines = published_machines(state, generation, &session, &snapshot, inputs.period)?;
         Ok(Some((shared(state, &session, &request, &snapshot, now, None, None, Some(machines))?, inputs)))
     });
+    let mut waiting_for_roster = false;
     let shared = match computed {
         Ok(None) => before.map(|(shared, _)| shared),
         Ok(Some((shared, inputs))) => {
@@ -298,19 +311,50 @@ pub(in crate::api) fn refresh_published(
             store.publish_summary_shared(generation, shared.clone(), inputs);
             store.start_summary_shared();
             store.note_summary_shared_failed(false);
+            if starting {
+                tracing::debug!(
+                    event = "summary.startup",
+                    outcome = "published",
+                    selections = selections.len(),
+                    cut = shared.cut,
+                    "summary startup shared counts published"
+                );
+            }
             Some(shared)
         }
         Err(error) => {
-            // Retried every pass (as the daemon starts, until the complete roster is published):
-            // said once until they are computed again.
-            if store.note_summary_shared_failed(true) {
-                eprintln!("st3: the summary's shared counts failed: {error:#}");
+            waiting_for_roster = starting && error.is::<RosterNotPublished>();
+            // Expected dependency waits do not hide a later real error in the same startup.
+            if waiting_for_roster {
+                store.note_summary_shared_failed(false);
+                tracing::debug!(
+                    event = "summary.shared_counts_failed",
+                    outcome = "pending",
+                    reason = "roster_not_published",
+                    selections = selections.len(),
+                    %error,
+                    "summary waiting for initial roster publication"
+                );
+            } else if store.note_summary_shared_failed(true) {
+                tracing::warn!(
+                    event = "summary.shared_counts_failed",
+                    outcome = "previous_or_fallback",
+                    reason = "computation_error",
+                    selections = selections.len(),
+                    %error,
+                    "summary shared counts unavailable"
+                );
             }
             before.map(|(shared, _)| shared)
         }
     };
     let mut changed = false;
     let Some(shared) = shared else {
+        // Only the expected initial roster dependency is a wait. Other errors must preserve
+        // the native fallback even if no shared computation has succeeded yet.
+        if waiting_for_roster {
+            return Ok(false);
+        }
         // Nothing to count from: every selection's windows read for themselves until there is.
         for person in &selections {
             changed |= store.publish_summary_row(generation, person, None);
