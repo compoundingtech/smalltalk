@@ -422,3 +422,29 @@ previous controls, helpers, strict/growth/crash bodies, limits and nextest
 settings remain unchanged. The original strict page has zero statement
 headroom and eight characterized growth pages remain over 128; no old work or
 crash receipt qualifies this new two-consumer path.
+
+## Signature-schema composition accounting
+
+The signature-candidate schema exposed the existing per-table foreign-key metadata
+probe again: final signature head e1844d574 measured 135 statements, 6,844 VM
+steps, 691 fullscan steps, one sort and zero autoindex rows in the unchanged
+whole-page control, exceeding its 128-statement ceiling on all hosted attempts.
+The same failure reproduced locally before the correction.
+
+Capture now keeps the complete bounded schema inventory but invokes the actual
+foreign-key PRAGMA only for tables whose schema SQL could contain REFERENCES.
+SQLite requires that ASCII keyword for both column and table foreign keys;
+case folding preserves mixed-case declarations. Comments, quoted identifiers,
+string literals and missing SQL conservatively use the real PRAGMA. No metadata
+is cached across cuts. The 256-table and 128-FK-column limits, complete inbound
+and outbound refusal, final schema check and atomic metadata acceptance stay.
+
+The corrected whole-page control measures 84 statements, 6,897 VM steps, 744
+fullscan steps, one sort and zero autoindex rows, including physical reader/writer
+return. All 22 admitted/applied slice controls and 19 prepared-page controls pass.
+A new positive-work regression adds 128 unrelated FK-free tables: metadata
+statements stay at seven, VM work grows from 1,008 to 8,560 and fullscan steps
+from 90 to 730. The keyword false-positive and mixed-case/quoted-target controls
+retain genuine incoming-FK refusal. This reduces unnecessary PRAGMA calls;
+schema bytes and VM work still depend on inventory, and no general metadata
+work bound or production activation is qualified by these fixtures.

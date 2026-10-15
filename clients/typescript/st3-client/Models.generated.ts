@@ -1124,6 +1124,7 @@ export type MessageBody = {
 };
 
 export type MessageProvenance = {
+  authorization_model?: "legacy" | "candidate";
   device?: string;
   key?: string;
   reason?: string;

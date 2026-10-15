@@ -9,6 +9,7 @@ fn independently_folded_faults(store: &Store, as_of: u128) -> Result<Vec<FaultVi
             .filter(|item| !item.person.starts_with("person/")),
     );
     items.extend(store.checkpoint_attention_items(None, as_of)?);
+    items.extend(store.signature_attention_items()?);
     let fallback = store.fleet_fault_agent()?;
     store.current_attention(items, as_of)?
         .into_iter()
@@ -158,6 +159,11 @@ fn fault_snapshot_removes_one_history_select_and_standalone_gate_still_folds() {
     store.broken_gate_items(None, as_of).unwrap();
     let standalone_work = standalone_scope.finish();
     assert_eq!(standalone_work.statements, shared_gate_work.statements + 1);
+    // The independently folded oracle must include the new diagnostic family too;
+    // its one-history-SELECT advantage compares paths with identical output.
+    store.fail_signature_migration("fixture signature inventory corruption").unwrap();
+    let faults = assert_fault_parity(&store, as_of);
+    assert!(faults.iter().any(|fault| fault.item.title == "signature-state-corrupt"));
 }
 
 #[test]

@@ -2240,6 +2240,84 @@ mod tests {
         assert_eq!(resolved.result.unwrap()["error"], "producer unverified");
     }
 
+    #[test]
+    fn signature_storage_19_to_20_upgrade_preserves_runtime_operation_and_format_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.db");
+        let store = Store::open(&path, "node").unwrap();
+        let subject = "agent/example/worker";
+        assert_eq!(
+            store
+                .admit_runtime_start(&mut operation("upgrade-operation", subject, None), 2)
+                .unwrap(),
+            RuntimeStartAdmission::Admitted
+        );
+        store
+            .revoke_runtime_start("upgrade-operation", "upgrade-stop")
+            .unwrap();
+        let before =
+            serde_json::to_value(store.runtime_start_for(subject).unwrap().unwrap()).unwrap();
+        let generation = |connection: &Connection| {
+            connection
+                .query_row(
+                    "SELECT value FROM local_runtime_start_observation_generation WHERE id=1",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap()
+        };
+        let roots = |connection: &Connection, legacy: bool| {
+            let prefix = if legacy { "legacy_" } else { "" };
+            let tables = [
+                "claim_signatures",
+                "claim_verdicts",
+                "claim_verdict_links",
+                "claim_verdict_queue",
+                "claim_verdict_fresh",
+            ]
+            .map(|name| format!("'{prefix}{name}'"))
+            .join(",");
+            connection.prepare(&format!("SELECT name,rootpage FROM sqlite_schema WHERE type IN ('table','index') AND tbl_name IN ({tables})")).unwrap()
+                .query_map([], |row| Ok((row.get::<_, String>(0)?.replace("legacy_", ""), row.get::<_, i64>(1)?))).unwrap()
+                .collect::<rusqlite::Result<BTreeMap<_, _>>>().unwrap()
+        };
+        // Reconstruct the landed version-19 signature schema without altering the
+        // actual operation, revocation, observation-generation or format-cut state.
+        let (before_roots, before_generation, before_cuts) = {
+            let connection = store.connection.write();
+            connection.execute_batch("DROP TABLE claim_signature_candidates; DROP TABLE claim_signature_sources; DROP TABLE claim_signature_counts; DROP TABLE claim_signature_writer_counts; DROP TABLE claim_signature_nonce_uses; DROP TABLE claim_signature_judging; DROP TABLE claim_signature_migration;
+                DROP INDEX claim_candidate_verdicts_verdict_index; DROP INDEX claim_candidate_verdict_links_claim_index;
+                CREATE INDEX claim_verdicts_verdict_index ON claim_verdicts(verdict);
+                CREATE INDEX claim_verdict_links_claim_index ON claim_verdict_links(claim_id);
+                CREATE INDEX claim_signatures_nonce_index ON claim_signatures(key,nonce); PRAGMA user_version=19;").unwrap();
+            (
+                roots(&connection, false),
+                generation(&connection),
+                format_cuts(&connection),
+            )
+        };
+        assert_eq!(before_roots.len(), 10);
+        assert!(before_generation > 0);
+        drop(store);
+        let upgraded = Store::open(&path, "node").unwrap();
+        let reader = upgraded.readers.get();
+        assert_eq!(
+            reader
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            20
+        );
+        assert_eq!(roots(&reader, true), before_roots);
+        assert_eq!(generation(&reader), before_generation);
+        assert_eq!(format_cuts(&reader), before_cuts);
+        assert_eq!(
+            serde_json::to_value(upgraded.runtime_start_for(subject).unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert!(upgraded.runtime_start_revoked("upgrade-operation").unwrap());
+        assert_eq!(upgraded.unresolved_runtime_start_counts().unwrap(), (1, 1));
+    }
+
     fn format_cuts(connection: &Connection) -> (i64, i64) {
         let read_cut = |key| {
             connection
