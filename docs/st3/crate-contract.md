@@ -5,7 +5,7 @@ Two packages come from what used to be the single `st3` package:
 | package | path | holds |
 |---|---|---|
 | `st3-daemon` | `crates/st3-daemon` | the library: the claims graph, store, API, reconciliation and every module the daemon runs, its `hooks/`, `fixtures/` and `proptest-regressions/` |
-| `st3` | `crates/st3` | the `st3` binary (`main.rs` and the modules only the binary uses: `cli_help`, `completion`, `directive_note`, `doctor_cli`, `change_cli`, `presentation`, `setup`, `onboarding`), the `st3-fixture` binary, `build.rs`, `tests/`, `examples/` |
+| `st3` | `crates/st3` | the `st3` binary (`main.rs` and the modules only the binary uses: `cli_help`, `completion`, `directive_note`, `doctor_cli`, `change_cli`, `presentation`, `setup`, `onboarding`), the `st3-fixture` binary, `build.rs`, `tests/`, `examples/`, and an empty library target (`src/package_marker.rs`, see below) |
 
 The binary and the tests depend on the library under the name `st3`
 (`st3 = { package = "st3-daemon", path = "../st3-daemon" }`), so `use st3::...` reads the same in
@@ -39,6 +39,14 @@ macros. Other crates use a part of it:
   `ST3_FIXTURE_*` variables for the same `test-support` feature: the library reads them in
   `test_support.rs`, the tests read them with `env!`.
 - **`cargo test -p st3 --features test-support` still works**: the feature forwards to the library.
+- **The `st3` package switches on its own `test-support` in tests.** Before the split a dev-dependency
+  of the package on itself did it, and `build.rs` (the `ST3_FIXTURE_*` variables), the `st3-fixture`
+  binary and the `required-features` targets depend on it. Cargo allows that only for a package with
+  a library target, so `crates/st3/src/package_marker.rs` is an empty library (named
+  `st3_package_marker`, in a file other than `lib.rs` so that other pull requests' edits to
+  `lib.rs` follow the moved library) and `st3_package_self` is the dev-dependency.
+- **The fixtures only the library's unit tests read moved with it**
+  (`crates/st3-daemon/tests/fixtures/`). The binary's tests keep `crates/st3/tests/fixtures/`.
 - The nextest overrides select a library unit test by `package(st3)` or `package(st3-daemon)`.
 
 `scripts/check-module-layers` reports the first three.
