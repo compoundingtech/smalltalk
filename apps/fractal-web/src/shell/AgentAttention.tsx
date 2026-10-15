@@ -1,5 +1,6 @@
 import type { Attention } from '@smalltalk/st3-client/schema'
 import type { ReactNode } from 'react'
+import { isWaitingForAnswer } from '../data/attention.ts'
 import { useAgentAttentionSelection } from '../data/react.tsx'
 import type { Feed } from '../data/source.ts'
 import { WfIcon } from '../icons/WfIcon.tsx'
@@ -15,7 +16,7 @@ const attentionCounts = (feed: Feed<readonly Attention[]>): AttentionCounts => {
   if (feed._tag === 'Observed')
     for (const card of feed.value)
       if (card.attention_kind === 'unread-message') inbox++
-      else decisions++
+      else if (isWaitingForAnswer(card)) decisions++
   return { inbox, decisions, attentionStale: feed._tag === 'Observed' && feed.freshness === 'stale' }
 }
 // oxlint-disable-next-line overeng/named-args -- Atom.withEquality fixed comparator ABI.
@@ -29,6 +30,6 @@ export const AgentAttentionSignals = ({ agentRef }: { readonly agentRef: string 
   const { inbox, decisions, attentionStale } = useAgentAttentionCounts(agentRef)
   return <>
     {inbox === 0 ? null : <span aria-label={`${inbox} inbox items${attentionStale ? ", stale" : ""}`}><WfIcon name="inbox" />{inbox}</span>}
-    {decisions === 0 ? null : <span aria-label={`${decisions} decisions or other attention${attentionStale ? ", stale" : ""}`}><WfIcon name="attention" />{decisions}</span>}
+    {decisions === 0 ? null : <span aria-label={`${decisions} waiting for answer${attentionStale ? ", stale" : ""}`}><WfIcon name="attention" />{decisions}</span>}
   </>
 }
