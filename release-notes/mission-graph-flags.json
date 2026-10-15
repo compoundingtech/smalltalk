@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Missions declare system and steps declare keep-open; mission rows serve both, replacing client name heuristics",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites. MissionSpec gains system and StepSpec gains keep_open, both omitted when false, so existing published revisions serialize and hash as before. Mission rows gain optional system and per-step keep_open."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "A revision that declares a flag carries a new field, which older daemons ignore when they read it. Older daemons serve neither field, which clients read as false; this daemon serves both, deriving them from today's name rule for revisions published before the flags. The terminal UI and the phone read the served flags instead of their own name rules."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption. The summary reads the current definitions of its candidate missions in one query."},
+  "manual": {"status": "none", "detail": "No operator actions required. Fleets may add keep-open and system to their declarations; until then the name rule applies."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or swap-back restrictions."}
+}

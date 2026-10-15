@@ -23806,6 +23806,88 @@ mission "visible-agentless" state="ready" {
         );
     }
 
+    /// Mission rows mark st's keep-open steps and system missions from the declaration, and from
+    /// the names the fleet used for revisions published before those flags.
+    #[test]
+    fn mission_rows_carry_keep_open_and_system_flags() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "observer" state="ready" {
+  system
+  goal "Watch for work."
+  step "hold" { agentless; keep-open }
+  step "keep-watch" { agentless }
+  step "work" { agentless }
+}
+mission "plain" state="ready" {
+  goal "Do work."
+  step "work" { agentless }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "flags")
+            .unwrap();
+        for mission in ["observer", "plain"] {
+            state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: mission.into(),
+                    revision: None,
+                    workspace: workspace.display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("flags-{mission}"),
+                })
+                .unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let detail = |id: &str| {
+            client_v0::mission_resources(&state.store, index, false, Some(id))
+                .unwrap()
+                .remove(0)
+        };
+        let observer = detail("mission/observer");
+        assert_eq!(observer["system"], true);
+        let keep_open = observer["run_details"][0]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| (step["path"].as_str().unwrap().to_owned(), step["keep_open"].clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(keep_open["hold"], true, "declared");
+        assert_eq!(keep_open["keep-watch"], true, "a fleet name, before the flag");
+        assert_eq!(keep_open["work"], false);
+        assert_eq!(detail("mission/plain")["system"], false);
+        let cards = client_v0::mission_list_cards_with(
+            &state.store,
+            &["mission/observer".into(), "mission/plain".into()],
+            client_now_ms(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let system = cards
+            .iter()
+            .map(|card| (card["id"].as_str().unwrap().to_owned(), card["system"].clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(system["mission/observer"], true);
+        assert_eq!(system["mission/plain"], false);
+    }
+
     /// A work item is the resource the work history lists for it, read without enriching every
     /// other step the store has run.
     #[test]

@@ -954,6 +954,9 @@ pub struct Mission {
     pub title: String,
     pub state: String,
     pub mission_revision: String,
+    /// st's own plumbing or a standing observer; false from older daemons.
+    #[serde(default)]
+    pub system: bool,
     #[serde(default)]
     pub runs: Vec<String>,
     #[serde(default)]
@@ -1022,6 +1025,9 @@ pub struct MissionStep {
     pub claimant: Option<String>,
     #[serde(default)]
     pub agentless: bool,
+    /// st's own step that holds its run open; false from older daemons.
+    #[serde(default)]
+    pub keep_open: bool,
     pub since: String,
     #[serde(default)]
     pub last_progress: Option<String>,

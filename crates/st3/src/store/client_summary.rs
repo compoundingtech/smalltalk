@@ -53,8 +53,16 @@ impl Store {
                 deadline = Some(deadline.map_or(next, |held| held.min(next)));
             }
         }
+        // Declared flags (keep-open steps, system missions) come from each current definition.
+        let definitions = self
+            .mission_definitions_for_ids(&candidates)?
+            .into_iter()
+            .map(|definition| (definition.mission.subject.clone(), definition.mission))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut result = Vec::new();
         for mission in candidates {
+            let mission_subject = format!("mission/{mission}");
+            let definition = definitions.get(&mission_subject);
             let retired: bool = c
                 .query_row(
                     "SELECT state='retired' FROM mission_definitions WHERE mission_id=?1",
@@ -97,10 +105,10 @@ impl Store {
                 {
                     state = "blocked".into();
                 }
-                let steps=steps.iter().map(|step|json!({"id":step.subject,"path":step.step,"state":crate::api::client_work_state(&step.status),"attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,"agentless":step.agentless,"since":crate::api::client_timestamp(step.updated_at_unix_ms),"goals":[],"constraints":[],"blockers":[]})).collect::<Vec<_>>();
+                let steps=steps.iter().map(|step|json!({"id":step.subject,"path":step.step,"state":crate::api::client_work_state(&step.status),"attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,"agentless":step.agentless,"keep_open":crate::mission::step_keeps_open(definition, &step.step),"since":crate::api::client_timestamp(step.updated_at_unix_ms),"goals":[],"constraints":[],"blockers":[]})).collect::<Vec<_>>();
                 details.push(json!({"id":subject,"generation_id":format!("run-generation/{generation}"),"requester":requester,"status":status,"phase":phase,"progress":{"done":0,"total":0},"current_steps":[],"must_act":"nobody","state_since":crate::api::client_timestamp(0),"steps":steps}));
             }
-            result.push(serde_json::from_value(json!({"id":format!("mission/{mission}"),"kind":"mission","revision":"summary-input","updated_at":crate::api::client_timestamp(0),"title":mission,"state":state,"mission_revision":"summary-input","runs":details.iter().map(|r|r["id"].clone()).collect::<Vec<_>>(),"run_details":details}))?);
+            result.push(serde_json::from_value(json!({"id":mission_subject,"system":crate::mission::is_system(&mission_subject, definition),"kind":"mission","revision":"summary-input","updated_at":crate::api::client_timestamp(0),"title":mission,"state":state,"mission_revision":"summary-input","runs":details.iter().map(|r|r["id"].clone()).collect::<Vec<_>>(),"run_details":details}))?);
         }
         Ok((result, deadline))
     }
