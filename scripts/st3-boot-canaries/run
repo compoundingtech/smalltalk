@@ -810,16 +810,37 @@ def idle_delivery_control(node, seats):
     def read(reference):
         return (node.api("/v1/messages/read/" + reference) or {}).get("status") in ("read", "closed")
 
-    def calls():
+    def counts():
         result = subprocess.run(["curl", "-sf", "--max-time", "10", "--unix-socket", str(node.endpoint),
                                  "-H", "x-st3-person: person/eval",
                                  "http://localhost/v1/client/request-latency"],
                                 capture_output=True, text=True, check=True)
         report = json.loads(result.stdout)["value"]
-        return sum(row["count"] for row in report["routes"] if row["route"] == "/v1/delivery/hold")
+        return {route: sum(row["count"] for row in report["routes"] if row["route"] == route)
+                for route in ("/v1/delivery/hold", "/v1/mailbox/receipts")}
 
-    # Let the boot receipt settle before measuring. Its permit must expire without fresh mail.
-    time.sleep(4)
+    def calls():
+        return counts()["/v1/delivery/hold"]
+
+    # Let the boot mail settle before measuring: the driver renews its hold permit every tick
+    # while any offered message still waits, and a message stays waiting for the driver until
+    # its own receipts land. Wait until each offered message is read, then for one permit lease
+    # (3 s) plus a tick with neither a hold read nor a driver receipt, instead of a fixed pause
+    # that a slow daemon outlasts.
+    def offered():
+        return {"message/" + row["text"].split('<smalltalk-message id="', 1)[1].split('"', 1)[0]
+                for row in receipts(node, "a")
+                if row.get("event") == "turn" and '<smalltalk-message id="' in row.get("text", "")}
+
+    until(lambda: offered() and all(read(reference) for reference in offered()), seats.bound,
+          "boot mail was never read")
+
+    def quiet():
+        first = counts()
+        time.sleep(4)
+        return counts() == first
+
+    until(quiet, seats.bound, "the driver kept reading delivery hold after boot mail was read")
     original = set(driver_processes(node))
     before = calls()
     start = time.monotonic()
@@ -838,19 +859,22 @@ def idle_delivery_control(node, seats):
         return node.json("conversations", "send", subject, "--from", "person/eval",
                          "--subject", label, "--body", label)["subject"]
 
+    # Each delivery waits on its event within the phase bound. That the first mail after the
+    # minute gets its permit at once, not after a poll, now rests on the idle minute alone (no
+    # hold poll runs); after_idle_seconds records the latency. The hold below outlasts the
+    # bound, so only its release can deliver the held message, and only expiry the last one.
     def finish(reference, label):
         start = time.monotonic()
-        until(lambda: read(reference), 10, label + " did not reach consumption/read")
+        until(lambda: read(reference), seats.bound, label + " did not reach consumption/read")
         measured[label + "_seconds"] = round(time.monotonic() - start, 3)
         until(lambda: sum(row.get("event") == "read" and row.get("reference") == reference
                           for row in receipts(node, "a")) == 1,
-              10, label + " has no unique native read receipt")
+              seats.bound, label + " has no unique native read receipt")
 
-    # First mail after the minute must obtain a fresh permit immediately, not wait for a poll.
     fresh = send("after-idle")
     finish(fresh, "after_idle")
-    node.cli("agents", "hold", subject, "--for", "30s", "--reason", "fixture quiet interval",
-             "--as", "person/eval")
+    node.cli("agents", "hold", subject, "--for", f"{int(seats.bound) + 60}s",
+             "--reason", "fixture quiet interval", "--as", "person/eval")
     held = send("held-delivery")
     time.sleep(4)
     if read(held) or any(row.get("reference") == held for row in receipts(node, "a")):
@@ -858,11 +882,17 @@ def idle_delivery_control(node, seats):
     node.cli("agents", "hold", subject, "--release", "--reason", "fixture release", "--as", "person/eval")
     finish(held, "released")
     node.cli("agents", "hold", subject, "--for", "4s", "--reason", "fixture expiry", "--as", "person/eval")
+    claims = (node.api("/v1/claims?subject=" + subject + "&limit=500") or {}).get("claims", [])
+    hold = max((row for row in claims if row.get("kind") == "delivery.hold"),
+               key=lambda row: row.get("store_index", 0))["body"]["fields"]
     expiry = send("expiry-delivery")
-    time.sleep(1)
-    if read(expiry) or any(row.get("reference") == expiry for row in receipts(node, "a")):
-        fail("a message reached the native provider before hold expiry")
     finish(expiry, "expired")
+    # A slow send can outlast a 4 s hold, so compare the provider's turn with the recorded
+    # expiry instead of checking a fixed second after sending.
+    turns = [row["at"] for row in receipts(node, "a")
+             if row.get("event") == "turn" and expiry.removeprefix("message/") in row.get("text", "")]
+    if not hold.get("held") or not turns or min(turns) * 1000 < hold["until_unix_ms"]:
+        fail(f"a message reached the native provider before hold expiry: {hold} {turns}")
     time.sleep(3)
     counts = Counter(row.get("reference") for row in receipts(node, "a") if row.get("event") == "read")
     for reference in seats.read_probes | {fresh, held, expiry}:
