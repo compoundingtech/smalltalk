@@ -2840,6 +2840,40 @@ pub struct WorkExtendRequest {
     pub idempotency_key: String,
 }
 
+/// One-shot repair of current person-bound work; this never aliases identities or rewrites history.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PersonRenameRequest {
+    pub old_person: String,
+    pub new_person: String,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PersonRenameReport {
+    pub old_person: String,
+    pub new_person: String,
+    pub reassigned_steps: Vec<String>,
+    pub reassigned_reviews: Vec<String>,
+    pub run_requesters: Vec<String>,
+    pub missions_to_republish: Vec<String>,
+    /// Open, immutable inbox records that this repair does not move.
+    #[serde(default)]
+    pub unchanged_attention_requests: Vec<String>,
+    #[serde(default)]
+    pub unchanged_fault_cards: Vec<String>,
+    #[serde(default)]
+    pub unchanged_revision_approvals: Vec<String>,
+    #[serde(default)]
+    pub unchanged_planning_launch_approvals: Vec<String>,
+    /// Remaining routing references, keyed by subject with sorted JSON-pointer paths.
+    #[serde(default)]
+    pub live_run_references: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub published_mission_references: BTreeMap<String, Vec<String>>,
+    pub namespace_notice: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PersonAskRequest {
     #[serde(skip)]

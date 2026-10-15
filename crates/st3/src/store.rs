@@ -157,8 +157,10 @@ pub(crate) mod attention_ivm;
 mod backup;
 mod checkpoint_rules;
 mod checkpoint_status;
+mod human_review_reassignment;
 mod mission_eligibility;
 pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
+mod person_rename;
 mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
@@ -679,6 +681,21 @@ WHERE kind='intent.desired'
 -- The gate requests a person reviews, a small part of every gate request a fleet makes.
 CREATE INDEX IF NOT EXISTS claims_human_gate_request_index
 ON claims(json_extract(body, '$.fields.reviewer'), store_index)
+WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL;
+-- Exact-request repairs and answers must be sought without reading other gate episodes.
+CREATE INDEX IF NOT EXISTS claims_human_gate_reassignment_request_index
+ON claims(json_extract(body, '$.fields.request'), subject)
+WHERE kind='gate.reviewer-reassigned';
+CREATE INDEX IF NOT EXISTS claims_human_gate_reassignment_reviewer_index
+ON claims(json_extract(body, '$.fields.reviewer'), json_extract(body, '$.fields.request'))
+WHERE kind='gate.reviewer-reassigned';
+CREATE INDEX IF NOT EXISTS claims_human_gate_answer_request_index
+ON claims(json_extract(body, '$.fields.request'), subject)
+WHERE kind='gate.result';
+CREATE INDEX IF NOT EXISTS claims_human_gate_episode_index
+ON claims(json_extract(body, '$.fields.owner'), json_extract(body, '$.fields.reviewer'),
+          json_extract(body, '$.fields.attempt'), json_extract(body, '$.fields.mission_revision'),
+          json_extract(body, '$.fields.step_definition'))
 WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL;
 -- The subjects that ever observed a runtime, found one seek per subject (RUNTIME_SUBJECTS)
 -- instead of reading every runtime observation. It holds runtime observations alone, so queries
@@ -14532,16 +14549,23 @@ impl Store {
         pending_human_reviews_tx(&connection, reviewer)
     }
 
+    /// The current reviewer of this exact immutable gate request, including one-shot repairs.
+    pub fn human_review_reviewer(&self, request: &ClaimRecord) -> Result<String> {
+        human_review_reassignment::reviewer_tx(&self.readers.get(), request)
+    }
+
     /// Every human gate request as (request, owner, reviewer): the episodes a human gate's
     /// attention card can name, open or long closed.
     pub fn human_gate_requests(&self) -> Result<Vec<(String, String, String)>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT id, json_extract(body, '$.fields.owner'), json_extract(body, '$.fields.reviewer')
-             FROM claims INDEXED BY claims_human_gate_request_index
-             WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL
-               AND json_extract(body, '$.fields.owner') IS NOT NULL",
-        )?;
+        let mut statement = connection.prepare(&canonical_sql(&format!(
+            "SELECT request.id, json_extract(request.body, '$.fields.owner'), {}
+             FROM claims request INDEXED BY claims_human_gate_request_index
+             WHERE request.kind='gate.requested' AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
+               AND json_extract(request.body, '$.fields.owner') IS NOT NULL
+             ORDER BY CANONICAL_ASC(request)",
+            human_review_reassignment::reviewer_sql("request", None),
+        )))?;
         statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()
@@ -24503,7 +24527,7 @@ fn human_review_currency(
 ) -> Result<std::result::Result<HumanReviewView, String>> {
     let fields = request.body.get("fields").unwrap_or(&request.body);
     let text = |name: &str| fields.get(name).and_then(Value::as_str);
-    let (Some(owner), Some(reviewer), Some(mission_revision), Some(step_definition)) = (
+    let (Some(owner), Some(_reviewer), Some(mission_revision), Some(step_definition)) = (
         text("owner"),
         text("reviewer"),
         text("mission_revision"),
@@ -24643,6 +24667,7 @@ fn human_review_currency(
             })
             .unwrap_or_default()
     };
+    let reviewer = human_review_reassignment::reviewer_tx(connection, &request)?;
     Ok(Ok(HumanReviewView {
         operation: fields
             .get("operation")
@@ -24656,7 +24681,7 @@ fn human_review_currency(
         generation: run.generation,
         step,
         title,
-        reviewer: reviewer.to_owned(),
+        reviewer,
         mode: fields
             .get("mode")
             .and_then(Value::as_str)
@@ -24679,13 +24704,14 @@ fn human_review_currency(
 /// the gate both read answers by this rule, so a review the list no longer offers is always one
 /// whose answer the gate acts on.
 fn reviewer_answer_sql(result: &str) -> String {
+    let reviewer = human_review_reassignment::reviewer_sql("request", Some(result));
     format!(
         "{result}.subject=request.subject
          AND {result}.kind='gate.result'
-         AND json_extract({result}.body, '$.fields.request')=request.id
-         AND ({result}.actor=json_extract(request.body, '$.fields.reviewer')
+         AND json_extract({result}.body, '$.fields.request')=+request.id
+         AND ({result}.actor={reviewer}
               OR ({result}.actor LIKE 'agent/%'
-                  AND json_extract({result}.body, '$.fields.acted_for')=json_extract(request.body, '$.fields.reviewer')
+                  AND json_extract({result}.body, '$.fields.acted_for')={reviewer}
                   AND json_extract({result}.body, '$.fields.delegation.episode')=request.id))
          AND json_extract({result}.body, '$.fields.verdict') IN ('pass','fail','feedback')"
     )
@@ -24700,7 +24726,7 @@ fn human_review_answer_tx(connection: &Connection, request: &str) -> Result<Opti
                 "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject,
                         claims.kind, claims.origin, claims.actor, claims.body,
                         claims.predecessors, claims.accepted_at_unix_ms
-                 FROM claims request JOIN claims ON {}
+                 FROM claims request JOIN claims INDEXED BY claims_human_gate_answer_request_index ON {}
                  WHERE request.id=?1 AND request.kind='gate.requested'
                  ORDER BY CANONICAL_ASC(claims) LIMIT 1",
                 reviewer_answer_sql("claims")
@@ -24760,46 +24786,22 @@ fn pending_human_reviews_tx(
     reviewer: Option<&str>,
 ) -> Result<Vec<HumanReviewView>> {
     let requests = {
-        let mut statement = connection.prepare(&canonical_sql(&format!(
-            "SELECT request.id, request.store_index, request.batch_id, request.subject,
-                    request.kind, request.origin, request.actor, request.body,
-                    request.predecessors, request.accepted_at_unix_ms
-             FROM claims request INDEXED BY claims_human_gate_request_index
-             WHERE request.kind='gate.requested'
-               AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
-               AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
-               AND NOT EXISTS (SELECT 1 FROM claims result WHERE {})
-             ORDER BY CANONICAL_ASC(request)",
-            reviewer_answer_sql("result")
-        )))?;
+        let mut statement =
+            connection.prepare(&human_review_reassignment::pending_requests_sql(reviewer.is_some()))?;
         statement
-            .query_map([reviewer], claim_from_row)?
+            .query_map([reviewer], |row| {
+                Ok((claim_from_row(row)?, row.get::<_, String>(10)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?
     };
-    // A build that words a gate's request differently asks the same gate again. The reviewer
-    // answers the newest request, which is the one the gate waits on, and has waited since the
-    // first.
-    let mut reviews: Vec<HumanReviewView> = Vec::new();
-    for request in requests {
-        let Some(review) = current_human_review(connection, request)? else {
-            continue;
-        };
-        match reviews.iter_mut().find(|kept| {
-            kept.owner == review.owner
-                && kept.reviewer == review.reviewer
-                && kept.attempt == review.attempt
-        }) {
-            Some(kept) => {
-                let first = kept.requested_at_unix_ms.min(review.requested_at_unix_ms);
-                if review.requested_at_unix_ms >= kept.requested_at_unix_ms {
-                    *kept = review;
-                }
-                kept.requested_at_unix_ms = first;
-            }
-            None => reviews.push(review),
+    let mut pending = Vec::with_capacity(requests.len());
+    for (request, first_requested_at) in requests {
+        if let Some(mut review) = current_human_review(connection, request)? {
+            review.requested_at_unix_ms = first_requested_at.parse()?;
+            pending.push(review);
         }
     }
-    Ok(reviews)
+    Ok(pending)
 }
 
 fn attention_request_view_tx(
@@ -30129,6 +30131,7 @@ fn try_project_simple_replication_tx(
                 "intent.desired"
                     | "agent.retired"
                     | "work.person-asked"
+                    | "work.person-reassigned"
                     | "work.person-done"
                     | "work.person-cancelled"
                     | "doc.bound"
@@ -30168,11 +30171,31 @@ fn try_project_simple_replication_tx(
         // before its ask, or a later local update, has the same result as canonical replay.
         if matches!(
             claim.kind.as_str(),
-            "work.person-asked" | "work.person-done" | "work.person-cancelled"
+            "work.person-asked" | "work.person-reassigned" | "work.person-done" | "work.person-cancelled"
         ) && let Some(aggregate) = aggregate_of_tx(transaction, claim)
             .map_err(|error| incremental_claim_error(error, claim, "aggregate-owner"))?
         {
             mark_dirty(&mut dirty, aggregate, "person ask, answer or cancel");
+        }
+        // A receipt chooses one destination for independent concurrent repairs. It can arrive
+        // after either repair's work claims, so rebuild their trees when that choice changes.
+        if claim.kind == "person.rename.completed" {
+            let mut repaired_work = transaction.prepare(
+                "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+                 FROM claims WHERE kind='work.person-reassigned'
+                 AND json_extract(body,'$.fields.previous_person')=?1",
+            ).map_err(|error| incremental_claim_error(internal(error), claim, "rename-work-dependency"))?;
+            let dependencies = repaired_work.query_map([&claim.subject], claim_from_row)
+                .map_err(|error| incremental_claim_error(internal(error), claim, "rename-work-dependency"))?;
+            for dependency in dependencies {
+                let dependency = dependency
+                    .map_err(|error| incremental_claim_error(internal(error), claim, "rename-work-dependency"))?;
+                if let Some(aggregate) = aggregate_of_tx(transaction, &dependency)
+                    .map_err(|error| incremental_claim_error(error, claim, "rename-work-aggregate"))?
+                {
+                    mark_dirty(&mut dirty, aggregate, "person rename receipt selected its destination");
+                }
+            }
         }
         if !Store::simple_replication_kind(&claim.kind) {
             let key = canonical::claim_key(transaction, &claim.id).map_err(|error| {
@@ -31009,7 +31032,7 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
             1 => "claims.kind IN ('mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                   'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
                   'step-run.carried','step-run.state','step-run.retried',
-                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.extended','work.person-asked','work.person-done','work.person-cancelled')",
+                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.extended','work.person-asked','work.person-reassigned','work.person-done','work.person-cancelled')",
             _ => "claims.kind='step-run.carried'",
         };
         let mut statement = transaction

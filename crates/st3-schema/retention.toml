@@ -50,6 +50,7 @@
 "fleet.member-removed" = { class = "durable" }
 "gate.requested" = { class = "durable" }
 "gate.result" = { class = "durable" }
+"gate.reviewer-reassigned" = { class = "durable" }
 "github.posted" = { class = "durable" }
 "glass.deleted" = { class = "durable" }
 "glass.upserted" = { class = "durable" }
@@ -100,6 +101,7 @@
 "owned-set.revised" = { class = "durable" }
 "person.delegation-set" = { class = "durable" }
 "person.directive-note-set" = { class = "durable" }
+"person.rename.completed" = { class = "durable" }
 "planning-session.approved" = { class = "durable" }
 "planning-session.cancelled" = { class = "durable" }
 "planning-session.candidate-submitted" = { class = "durable" }
@@ -177,6 +179,7 @@
 "work.person-asked" = { class = "durable" }
 "work.person-cancelled" = { class = "durable" }
 "work.person-done" = { class = "durable" }
+"work.person-reassigned" = { class = "durable" }
 "work.progress" = { class = "durable" }
 "work.released" = { class = "durable" }
 "work.renewed" = { class = "current", pending = "the step timing fold reads every renewal" }

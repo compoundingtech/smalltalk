@@ -4770,6 +4770,153 @@ async fn cli_seat_suspension_and_resume_wait_for_durable_owner_acknowledgements(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_persons_rename_migrates_current_work_and_reviews_across_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    const NEW_PERSON: &str = "person/robin";
+    let mut daemon = Daemon::new().await;
+    daemon.worker();
+    daemon.store().append_claim(&ClaimInput {
+        subject: "message/cli-known-rename-person".into(),
+        kind: "message.sent".into(),
+        actor: Some(NEW_PERSON.into()),
+        fields: BTreeMap::from([
+            ("from".into(), json!(NEW_PERSON)),
+            ("to".into(), json!(WORKER)),
+            ("content".into(), json!("The new person already participates in the graph.")),
+            ("status".into(), json!("sent")),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some("cli-known-rename-person".into()),
+    }).unwrap();
+    daemon.apply(
+        r#"version 2
+mission "example/person-rename" state="ready" {
+  goal "Review the person routing repair."
+  step "review" { agentless; gate "accept" type="human" mode="approve" { reviewer "person/avery"; question "Is the repair acceptable?" } }
+}
+"#,
+        "person-rename-mission",
+    );
+    let run = daemon.start("example/person-rename", "person-rename-run");
+    let review_step = &run.steps[0].subject;
+    daemon.reconcile();
+    let review_request = daemon
+        .store()
+        .gate_request_for_owner(review_step)
+        .unwrap()
+        .unwrap();
+    let ask = cli_value(
+        daemon
+            .cli(
+                WORKER,
+                &[
+                    "work",
+                    "ask",
+                    "--for",
+                    PERSON,
+                    "--title",
+                    "Choose the repaired routing",
+                    "--reason",
+                    "An open request must move to the new person.",
+                    "--new-run",
+                    "person-rename-ask",
+                    "--as",
+                    WORKER,
+                    "--idempotency-key",
+                    "person-rename-ask",
+                ],
+            )
+            .await,
+    );
+    let ask_step = ask["subject"].as_str().unwrap();
+    let original_work = daemon.store().step_run(ask_step).unwrap().unwrap();
+    assert_eq!(original_work.assigned_to.as_deref(), Some(PERSON));
+    let original_ask = daemon
+        .store()
+        .claims_for(ask_step, Some("work.person-asked"))
+        .unwrap();
+    assert_eq!(original_ask.len(), 1);
+    let original_reviews: Value = daemon.transport().get("/v1/reviews").await.unwrap();
+    assert_eq!(original_reviews.as_array().unwrap().len(), 1);
+    assert_eq!(original_reviews[0]["reviewer"], PERSON);
+
+    let args = [
+        "persons",
+        "rename",
+        PERSON,
+        NEW_PERSON,
+        "--as",
+        PERSON,
+        "--idempotency-key",
+        "person-rename-repair",
+    ];
+    daemon.restart().await;
+    let report = cli_value(daemon.cli(PERSON, &args).await);
+    assert_eq!(report["old_person"], PERSON);
+    assert_eq!(report["new_person"], NEW_PERSON);
+    assert_eq!(report["reassigned_steps"], json!([ask_step]));
+    assert_eq!(report["reassigned_reviews"], json!([review_step]));
+    assert!(report["run_requesters"].as_array().unwrap().contains(&json!(run.subject)));
+    let ask_mission = daemon
+        .store()
+        .mission_run(&original_work.run)
+        .unwrap()
+        .unwrap()
+        .mission;
+    let mut missions_to_republish = vec!["mission/example/person-rename".to_owned(), ask_mission];
+    missions_to_republish.sort();
+    assert_eq!(report["missions_to_republish"], json!(missions_to_republish));
+    assert!(
+        report["namespace_notice"]
+            .as_str()
+            .unwrap()
+            .contains("not automatically moved")
+    );
+    let index = daemon.store().index().unwrap();
+    assert_eq!(cli_value(daemon.cli(PERSON, &args).await), report);
+    assert_eq!(daemon.store().index().unwrap(), index);
+    daemon.restart().await;
+    assert_eq!(cli_value(daemon.cli(PERSON, &args).await), report);
+    assert_eq!(daemon.store().index().unwrap(), index, "rename replay wrote twice");
+
+    let moved = daemon.store().step_run(ask_step).unwrap().unwrap();
+    assert_eq!(moved.assigned_to.as_deref(), Some(NEW_PERSON));
+    assert_eq!(moved.status, original_work.status);
+    assert_eq!(moved.attempt, original_work.attempt);
+    assert_eq!(moved.definition_hash, original_work.definition_hash);
+    assert_eq!(daemon.store().mission_run(&run.subject).unwrap().unwrap().requester, PERSON);
+    let asks = daemon
+        .store()
+        .claims_for(ask_step, Some("work.person-asked"))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&asks).unwrap(),
+        serde_json::to_value(&original_ask).unwrap(),
+    );
+    let unchanged_review = daemon
+        .store()
+        .claim_by_id(&review_request.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&unchanged_review).unwrap(),
+        serde_json::to_value(&review_request).unwrap(),
+    );
+    let reviews: Value = daemon.transport().get("/v1/reviews").await.unwrap();
+    assert_eq!(reviews.as_array().unwrap().len(), 1);
+    assert_eq!(reviews[0]["owner"].as_str(), Some(review_step.as_str()));
+    assert_eq!(reviews[0]["reviewer"], NEW_PERSON);
+    assert_eq!(reviews[0]["request"], review_request.id);
+    assert!(daemon.store().attention_items(Some(PERSON)).unwrap().is_empty());
+    let attention = daemon.store().attention_items(Some(NEW_PERSON)).unwrap();
+    assert!(attention.iter().any(|item| item.subject == ask_step));
+    assert!(attention.iter().any(|item| item.subject == *review_step));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_human_reviews_act_on_the_current_card_after_restart() {
     if st3::test_support::supervise_test() {
         return;

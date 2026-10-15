@@ -58,7 +58,7 @@ use crate::model::{
     SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
     WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
-use crate::model::{PersonAskRequest, PersonStepResponse};
+use crate::model::{PersonAskRequest, PersonRenameReport, PersonRenameRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
@@ -409,10 +409,12 @@ impl ApiError {
             | "stale-launch-preview"
             | "fleet-leaving"
             | "glass-deleted"
+            | "person-rename-conflict"
             | "glass-limit" => StatusCode::CONFLICT,
             "launch-review-not-authorized"
             | "wrong-message-recipient"
             | "lane-approval-denied"
+            | "person-rename-forbidden"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
             "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
@@ -704,6 +706,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sets/apply", post(owned_sets::apply))
         .route("/v1/intent/apply", post(apply_with_bound))
         .route("/v1/agents/rename", post(rename_agent))
+        .route("/v1/persons/rename", post(rename_person))
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/rollout", post(rollout_agent))
         .route("/v1/agents/start", post(start_mission_seat))
@@ -1772,12 +1775,15 @@ fn client_error_code(code: Option<&str>) -> String {
         | "wrong-message-recipient"
         | "lane-approval-denied"
         | "glass-owner-forbidden"
+        | "person-rename-forbidden"
         | "foreign-agent-actor" => "forbidden".into(),
         "lane-not-found" => "not-found".into(),
         "invalid-person-ask"
         | "invalid-person-response"
         | "invalid-person-request"
         | "invalid-person-answer"
+        | "invalid-person-rename"
+        | "unknown-person"
         | "answer-required"
         | "unsupported-person-request"
         | "missing-ask-owner"
@@ -1791,6 +1797,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-review-decision"
         | "feedback-gate-needs-step" => "validation-failed".into(),
         "wrong-reviewer" => "forbidden".into(),
+        "person-rename-conflict" => "conflict".into(),
         "stale-work-ask"
         | "stale-subject"
         | "missing-subject-token"
@@ -7531,6 +7538,7 @@ async fn guard_bound_request(
         "/v1/sets/",
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
+        "/v1/persons/rename",
         "/v1/agents/restart",
         "/v1/agents/rollout",
         "/v1/agents/start",
@@ -12420,6 +12428,15 @@ async fn rename_agent(
     Ok(Json(response))
 }
 
+async fn rename_person(
+    State(state): State<AppState>,
+    Json(request): Json<PersonRenameRequest>,
+) -> Result<Json<PersonRenameReport>, ApiError> {
+    let response = state.store.rename_person(&request).map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
 async fn apply(
     State(state): State<AppState>,
     Json(request): Json<ApplyRequest>,
@@ -13560,12 +13577,11 @@ async fn post_review(
             .claim_by_id(&pending.request)
             .map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::internal("the pending review request does not exist"))?;
-        let reviewer = review_request
-            .body
-            .pointer("/fields/reviewer")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiError::internal("a human review request has no reviewer"))?;
-        if actor.as_deref() != Some(reviewer)
+        let reviewer = state
+            .store
+            .human_review_reviewer(&review_request)
+            .map_err(ApiError::internal)?;
+        if actor.as_deref() != Some(reviewer.as_str())
             && !request.delegation.as_ref().is_some_and(|proof| {
                 proof.person == reviewer
                     && actor
@@ -17715,6 +17731,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         for path in [
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
+            "/v1/persons/rename",
             "/v1/agents/restart",
             "/v1/agents/rollout",
             "/v1/agents/start",
@@ -29147,6 +29164,58 @@ version 2
             json!(mission_request.accepted_at_unix_ms)
         );
 
+        let index_before_refusals = store.index().unwrap();
+        for actor in ["agent/test.operator", "person/intruder"] {
+            let (status, error) = json_request(app.clone(), "/v1/persons/rename", json!({
+                "old_person": "person/alex",
+                "new_person": "person/robin",
+                "actor": actor,
+                "idempotency_key": format!("review-api-refused-{actor}"),
+            })).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
+            assert_eq!(store.index().unwrap(), index_before_refusals);
+        }
+        let (status, error) = json_request(app.clone(), "/v1/persons/rename", json!({
+            "old_person": "person/alex",
+            "new_person": "person/robin",
+            "actor": "person/alex",
+            "idempotency_key": "review-api-unknown-person",
+        })).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(store.index().unwrap(), index_before_refusals);
+        store.append_claim(&ClaimInput {
+            subject: "message/review-api-known-robin".into(),
+            kind: "message.sent".into(),
+            actor: Some("person/robin".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/robin")),
+                ("to".into(), json!("person/alex")),
+                ("content".into(), json!("The new person already participates in the graph.")),
+                ("status".into(), json!("sent")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("review-api-known-robin".into()),
+        }).unwrap();
+        let repair = json!({
+            "old_person": "person/alex",
+            "new_person": "person/robin",
+            "actor": "person/alex",
+            "idempotency_key": "review-api-person-rename",
+        });
+        let (status, renamed) =
+            json_request(app.clone(), "/v1/persons/rename", repair.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{renamed}");
+        assert_eq!(renamed["reassigned_reviews"], json!([run.subject, step.subject]));
+        let (status, repeated) =
+            json_request(app.clone(), "/v1/persons/rename", repair).await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
+        assert_eq!(renamed, repeated);
+        assert_eq!(
+            store.claim_by_id(&mission_again.id).unwrap().unwrap().body["fields"]["reviewer"],
+            "person/alex"
+        );
+
         let body = |actor: &str| {
             serde_json::to_value(ReviewRequest {
                 delegation: None,
@@ -29160,7 +29229,7 @@ version 2
         let (status, rejected) = json_request(
             app.clone(),
             &format!("/v1/reviews/{}", run.subject),
-            body("person/someone-else"),
+            body("person/alex"),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
@@ -29169,7 +29238,7 @@ version 2
         let (status, accepted_mission) = json_request(
             app.clone(),
             &format!("/v1/reviews/{}", run.subject),
-            body("person/alex"),
+            body("person/robin"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{accepted_mission}");
@@ -29184,7 +29253,7 @@ version 2
             delegation: None,
             decision: "rejected".into(),
             reason: None,
-            actor: Some("person/alex".into()),
+            actor: Some("person/robin".into()),
             expected_subject: None,
         })
         .unwrap();
@@ -29201,7 +29270,7 @@ version 2
             delegation: None,
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
-            actor: Some("person/alex".into()),
+            actor: Some("person/robin".into()),
             expected_subject: None,
         })
         .unwrap();

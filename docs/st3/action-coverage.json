@@ -1506,6 +1506,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st persons rename",
+      "description": "Reassign open work and pending reviews; report declarations needing republishing.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_persons_rename_migrates_current_work_and_reviews_across_restart"
+      ],
+      "verification": "real CLI over a private Unix socket; current person work and pending reviews move, historical claims and run requesters stay unchanged, declarations needing republishing are reported, and idempotent replay writes nothing before or after disk-store reopen"
+    },
+    {
       "command": "st recorder report",
       "description": "Summarize recent calls from local or supplied host logs",
       "tests": [
