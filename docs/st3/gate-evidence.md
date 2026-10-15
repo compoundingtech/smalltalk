@@ -584,11 +584,12 @@ check when its real command is known. Write `scripts/evidence-verify --policy-fr
 ### Running the checks locally (`scripts/st-test`)
 
 `scripts/st-test` runs each required check that has a local command (today `genie-freshness` and
-`typescript-client`; `--list` prints them) once, through `evidence-wrap`, on the tree the pull request will be
-tested as, and the host's signer records the exit code and output digest. GitHub tests the merge of the branch into
-its base, so when the branch does not hold the base's tip the script computes the merge tree (`git merge-tree`) and
-makes a merge commit with that tree; a merge that conflicts stops it. The command always runs in a fresh throwaway
-worktree of that commit, so untracked or ignored files in your checkout cannot change the result. A failing run is
+`typescript-client`; `--list` prints them) once, through `evidence-wrap`, on the commit you are pushing (HEAD), and the host's signer
+records the exit code and output digest. The CI gate looks up the note for the pull request head's own tree (see "Which tree a pull
+request run asks about"), so the tree you built and signed is the tree that counts even when main has moved since; the script tells you how
+many commits behind the base the branch is. It no longer signs the merge tree (the merge of the branch into the base): the merge queue still tests
+the integrated tree, and a pass of the merge tree is not made here. The command always runs in a fresh
+throwaway worktree of that commit, so untracked or ignored files in your checkout cannot change the result. A failing run is
 recorded too. `evidence-wrap`, `evidence-sign` and `evidence-verify` come from the accepted base. It prints one
 line per check: result, seconds, and whether the verifier, from the base, now counts the tree as covered
 (`untrusted_signer` until the host's key line is on main). `--push REMOTE` pushes the notes after they verify, with the identity git uses for REMOTE (or

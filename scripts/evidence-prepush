@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Pre-push: when the tree about to be tested has no signed evidence, produce it, then let the push go.
 
-When you push the branch you have checked out, `scripts/st-test --status` says whether its merge tree is covered. If
+When you push the branch you have checked out, `scripts/st-test --status` says whether its head tree is covered. If
 every check that has a local command is covered the push goes, silently. If not, `scripts/st-test --push REMOTE` runs the checks
 once on this machine, the host's signer records them, the notes are pushed, and then the push goes.
 
 The installed hook runs THIS file and scripts/st-test from the base branch of the remote (<remote>/main), copied to a
 temporary directory, never from the tree being pushed: the hook and the runner are not the pushed branch's. The checks
-are: st-test runs `nix develop`, `pnpm install` and the tests of the merge tree in a clean worktree, so the pushed
+are: st-test runs `nix develop`, `pnpm install` and the tests of the pushed commit in a clean worktree, so the pushed
 tree's code does run on this machine, as you, with your signing key within reach. That is what testing it means on a
 machine we trust (cooperative trust, known defect 22); it is not something the base-pinned hook protects against.
 
@@ -22,7 +22,7 @@ machine we trust (cooperative trust, known defect 22); it is not something the b
     the hook waits at most ST_EVIDENCE_AGENT_LIMIT seconds (default 120), prints that signing continues in the
     background with its log path, and lets the push go; the notes are pushed when the run finishes. Agents should run
     `scripts/st-test --push origin` before pushing so the first CI run already sees the notes.
-  * It signs only the checked-out branch's merge tree and only when the work tree has no uncommitted changes to tracked
+  * It signs only the checked-out branch's head commit and only when the work tree has no uncommitted changes to tracked
     files; anything else (other refs, tags, deletes, the base branch, a remote given as a URL) is pushed untouched.
     Pushing notes from inside the run does not run this hook again.
 """

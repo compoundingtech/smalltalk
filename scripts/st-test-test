@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""scripts/st-test against real repositories: the tree it signs, the merge case, failures, refusals."""
+"""scripts/st-test against real repositories: the tree it signs (the head), the lag, failures, refusals."""
 import contextlib
 import hashlib
 import importlib.machinery
@@ -26,7 +26,7 @@ st_test = importlib.util.module_from_spec(spec)
 loader.exec_module(st_test)
 
 DATE = '2026-10-14T12:00:00Z'
-GIT_ENV = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null', LC_ALL='C',
+GIT_ENV = dict({k: v for k, v in os.environ.items() if k not in ('GITHUB_ACTIONS', 'CI')}, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null', LC_ALL='C',
                GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid', GIT_COMMITTER_NAME='t',
                GIT_COMMITTER_EMAIL='t@example.invalid', GIT_AUTHOR_DATE=DATE, GIT_COMMITTER_DATE=DATE)
 POLICY = {'version': 1, 'checks': {'demo': {'trust_levels': ['host'], 'kinds': {'wrapper': {
@@ -89,7 +89,7 @@ class StTest(unittest.TestCase):
         cwd = os.getcwd()
         os.chdir(self.work)
         try:
-            with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 try:
                     code = st_test.main(['--base', 'origin/main', '--repository', 'org/repo', '--toolchain-sha256', hashlib.sha256(b'drv').hexdigest(), *args])
                 except st_test.Failure as error:
@@ -116,7 +116,8 @@ class StTest(unittest.TestCase):
         self.assertEqual(statement['predicate']['signer'], 'host/box-1')
         self.assertIn('demo', out)
         self.assertIn('covered by wrapper', out)
-        self.assertIn('this branch', out)
+        self.assertIn('(HEAD)', out)
+        self.assertNotIn('behind', out)  # the branch holds the base's tip: nothing to report
         self.assertIn('clean worktree', out)
 
     def test_untracked_and_ignored_files_in_the_checkout_cannot_change_the_result(self):
@@ -130,20 +131,19 @@ class StTest(unittest.TestCase):
         self.assertEqual(code, 0, err + out)
         self.assertEqual(len(self.statements()), 1)
 
-    def test_after_the_base_moved_the_merge_tree_is_what_is_signed(self):
+    def test_after_the_base_moved_the_heads_own_tree_is_what_is_signed_and_the_lag_is_reported(self):
         self.commit('b.txt', 'feature work')
         self.commit('c.txt', 'main moved', branch='main')
         git(self.work, 'push', '-q', 'origin', 'main')
         git(self.work, 'checkout', '-q', 'feature')
-        merged = git(self.work, 'merge-tree', '--write-tree', '--no-messages', 'origin/main', 'HEAD').splitlines()[0]
-        self.assertNotEqual(merged, git(self.work, 'rev-parse', 'HEAD^{tree}'))
         code, out, err = self.run_st_test('--check', 'demo')
         self.assertEqual(code, 0, err)
         statement, = self.statements()
-        self.assertEqual(statement['subject'][0]['digest']['gitTree'], merged)
-        self.assertIn('merge with origin/main', out)
+        self.assertEqual(statement['subject'][0]['digest']['gitTree'], git(self.work, 'rev-parse', 'HEAD^{tree}'))
+        self.assertEqual(statement['subject'][0]['name'], git(self.work, 'rev-parse', 'HEAD'))
+        self.assertIn('1 commit(s) behind origin/main', out)
         self.assertIn('covered by wrapper', out)
-        self.assertNotIn('merge', git(self.work, 'worktree', 'list'))  # the throwaway worktree is gone
+        self.assertNotIn('st-test-', git(self.work, 'worktree', 'list'))  # the throwaway worktree is gone
         self.assertEqual(git(self.work, 'rev-parse', 'HEAD^{tree}'), git(self.work, 'rev-parse', 'feature^{tree}'))
 
     def test_a_failing_run_is_recorded_and_the_exit_code_says_so(self):
@@ -161,16 +161,39 @@ class StTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('timed out', out)
 
-    def test_a_branch_that_conflicts_with_the_base_stops_before_running_anything(self):
+    def test_behind_counts_the_bases_commits_the_branch_lacks_and_is_none_when_it_cannot_tell(self):
+        self.commit('b.txt', 'feature work')
+        cwd = os.getcwd()
+        os.chdir(self.work)
+        try:
+            self.assertEqual(st_test.behind('origin/main'), 0)
+            self.commit('c.txt', 'main moved', branch='main')
+            git(self.work, 'push', '-q', 'origin', 'main')
+            git(self.work, 'checkout', '-q', 'feature')
+            self.assertEqual(st_test.behind('origin/main'), 1)
+            self.assertIsNone(st_test.behind('no-such-ref'))
+        finally:
+            os.chdir(cwd)
+
+    def test_nothing_about_lag_is_printed_when_it_cannot_be_counted(self):
+        self.commit('b.txt', 'two')
+        with mock.patch.object(st_test, 'behind', return_value=None):
+            code, out, err = self.run_st_test('--check', 'demo')
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('behind', out)
+        self.assertIn('(HEAD)', out)
+
+    def test_a_branch_that_conflicts_with_the_base_is_signed_as_it_is(self):
         self.commit('a.txt', 'feature edit\n')
         self.commit('a.txt', 'main edit\n', branch='main')
         git(self.work, 'push', '-q', 'origin', 'main')
         git(self.work, 'checkout', '-q', 'feature')
-        code, _, _ = self.run_st_test('--check', 'demo')
-        self.assertIn('does not merge cleanly', str(code))
-        self.assertEqual(self.statements(), [])
+        code, out, err = self.run_st_test('--check', 'demo')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.statements()), 1)
+        self.assertIn('behind origin/main', out)
 
-    def test_status_runs_nothing_and_says_whether_the_merge_tree_is_covered(self):
+    def test_status_runs_nothing_and_says_whether_the_head_tree_is_covered(self):
         self.commit('b.txt', 'two')
         code, out, err = self.run_st_test('--check', 'demo', '--status')
         self.assertEqual((code, self.statements()), (3, []))
@@ -179,10 +202,12 @@ class StTest(unittest.TestCase):
         code, out, err = self.run_st_test('--check', 'demo', '--status')
         self.assertEqual(code, 0, out + err)
         self.assertIn('covered by wrapper', out)
-        # After the base moves the merge tree differs, so the earlier note no longer covers it.
+        # The base moving does not change the head's own tree, so the note still covers it; a new commit does not.
         self.commit('c.txt', 'main moved', branch='main')
         git(self.work, 'push', '-q', 'origin', 'main')
         git(self.work, 'checkout', '-q', 'feature')
+        self.assertEqual(self.run_st_test('--check', 'demo', '--status')[0], 0)
+        self.commit('d.txt', 'another change')
         self.assertEqual(self.run_st_test('--check', 'demo', '--status')[0], 3)
 
     def test_a_worktree_left_by_a_killed_run_is_removed_by_the_next_run(self):

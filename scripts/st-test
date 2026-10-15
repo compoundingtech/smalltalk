@@ -10,11 +10,11 @@ request will be tested as, through scripts/evidence-wrap, and the signer records
 the output it measured under this host's key (scripts/evidence-keygen). A failing run is recorded too. It then
 asks the verifier, from the accepted base, whether the tree is now covered, and prints one line per check.
 
-The tree: GitHub tests the merge of a pull request into its base, not the branch. When the branch already holds
-the base's tip that is the branch itself; otherwise the merge tree is computed (`git merge-tree`) and a merge commit
-with that tree is made, so "merge main, then push" signs the tree that will be tested. A merge that conflicts stops
-here. The command always runs in a fresh throwaway worktree of that commit, never in this checkout, so untracked or
-ignored files here cannot change the result; nothing is linked in (the dev shells create their own helper links).
+The tree: HEAD, the commit you are pushing. The CI gate looks up the note for the pull request head's own tree, so the tree
+you built and signed is the tree that counts even when main has moved since; the merge queue still tests the integrated tree.
+It tells you how far behind the base the branch is. The command always runs in a fresh throwaway worktree of that commit, never
+in this checkout, so untracked or ignored files here cannot change the result; nothing is linked in (the dev shells create
+their own helper links).
 
 evidence-wrap, evidence-sign and evidence-verify come from the accepted base, not from the change under test.
 Commands that call cargo reach the build admission shim on PATH like any other cargo; nothing here knows about
@@ -27,7 +27,7 @@ signing key within reach: code in that tree runs here. That is the cooperative t
 ("Host keys"); do not run it on a branch you would not run by hand.
 
 Exit 0 when every selected check passed and was signed; 1 when a check failed, timed out or could not be signed; 2 when it
-could not start (a refusal: dirty tree, bad argument, merge conflict); 3 from --status when the tree is not covered.
+could not start (a refusal: dirty tree, bad argument); 3 from --status when the tree is not covered.
 """
 import argparse
 import json
@@ -70,17 +70,18 @@ def text(done):
 
 
 def target_commit(base):
-    """The commit the pull request will be tested as: HEAD when it holds the base's tip, else a merge commit made
-    from the merge tree (objects only; nothing is checked out)."""
-    if git('merge-base', '--is-ancestor', base, 'HEAD', check=False).returncode == 0:
-        return text(git('rev-parse', 'HEAD'))
-    merged = git('merge-tree', '--write-tree', '--no-messages', base, 'HEAD', check=False)
-    if merged.returncode != 0:
-        raise Failure(f'HEAD does not merge cleanly into {base}; merge it first and run again')
-    tree = text(merged).splitlines()[0]
-    identity = {'GIT_AUTHOR_NAME': 'st-test', 'GIT_AUTHOR_EMAIL': 'st-test@example.invalid',
-                'GIT_COMMITTER_NAME': 'st-test', 'GIT_COMMITTER_EMAIL': 'st-test@example.invalid'}
-    return text(git('commit-tree', tree, '-p', base, '-p', 'HEAD', '-m', f'st-test: HEAD merged into {base}', env=identity))
+    """The commit that is signed: HEAD, the commit being pushed.
+
+    A pull request check is reported on the head commit, and the CI gate looks up the note for the head's own tree (see
+    docs/st3/gate-evidence.md, "Which tree a pull request run asks about"), so the tree an agent built and signed is the
+    tree that counts, whether or not main has moved since. The merge queue still tests the integrated tree."""
+    return text(git('rev-parse', 'HEAD'))
+
+
+def behind(base):
+    """How many commits of the base this branch lacks (0 when it holds the base's tip)."""
+    done = git('rev-list', '--count', f'HEAD..{base}', check=False)
+    return int(text(done)) if done.returncode == 0 and text(done).isdigit() else None
 
 
 def target_worktree(base, scratch):
@@ -161,7 +162,7 @@ def main(argv):
 
     remote, _, branch = args.base.partition('/')
     if branch:
-        git('fetch', '-q', remote, branch)  # the base moves; sign the merge with its current tip
+        git('fetch', '-q', remote, branch)  # the base moves; the lag and the policy are read at its current tip
     git('rev-parse', '--verify', '-q', args.base + '^{commit}')
     if args.status:
         commit = target_commit(args.base)
@@ -190,7 +191,7 @@ def main(argv):
         directory = Path(scratch) / 'tree'
         try:
             directory, commit = target_worktree(args.base, scratch)
-            merged = text(git('rev-parse', 'HEAD')) != commit
+            lag = behind(args.base)
             tree = text(git('rev-parse', f'{commit}^{{tree}}', cwd=directory))
             repository = args.repository or repository_of(remote or 'origin')
             signer = os.environ.get('EVIDENCE_SIGNER') or json.dumps([sys.executable, tools['evidence-sign']])
@@ -213,7 +214,7 @@ def main(argv):
                 failed = failed or not ok
                 is_covered, why = covered(tools['evidence-verify'], directory, tree, name, args.base, repository)
                 rows.append((name, 'passed' if ok else ('timed out' if code == 124 else f'FAILED ({code})'), seconds, why))
-            print(f'\nst-test: tree {tree[:12]} ({"merge with " + args.base if merged else "this branch"}), in a clean worktree')
+            print(f'\nst-test: tree {tree[:12]} (HEAD{f", {lag} commit(s) behind {args.base}: the queue tests the merge" if lag else ""}), in a clean worktree')
             for name, result, seconds, why in rows:
                 print(f'  {name:<20} {result:<12} {seconds:>6}s  {why}')
             return 1 if failed else 0
