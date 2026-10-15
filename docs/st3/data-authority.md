@@ -241,6 +241,9 @@ order from the same admitted claims.
 | `resource_observations` | Shared projection | Latest canonical `resource.observed` claim per resource subject; indexed by resource kind and opener |
 | `revision_proposals` | Shared projection | Shared candidate/source generation, reviewers/approvals, cutover/compatibility, status/preview/successor and durable timestamps. |
 | `run_generations` | Shared projection | Shared generation identity, revision, predecessor, actor/reason, status and durable timestamps. |
+| `slo_episode_events` | Shared projection | Deterministic minimum-id signed transition per episode/event, with conflict witnesses. Origin attestation is not independent OS measurement. |
+| `slo_episode_heads` | Shared projection | Logical fleet/member/objective lineage head, independent of process and credential rotation; conflicting heads fail closed. |
+| `slo_pending` | Shared projection | Durable undispatched obligations reconstructed from canonical episode transitions; no replica originates missions. |
 | `step_runs` | Shared projection | Step definition, attempts, results, durable claimant/incarnation and readiness. Local lease_expires_at_unix_ms and updated_at_unix_ms overlays are excluded from projection digests. |
 | `stop_deferral_claims` | Local cache | Trigger-maintained claim ids, subjects and recovered-failure references of retained-stop diagnostics, faults and recoveries, plus the ceiling and completion of the one-time copy of older claims. Rebuildable from claims; never replicated; excluded from shared projection digests. |
 | `unread_mail` | Local cache | Rebuildable unread-message timestamp and prefix-count indexes, plus a deduplicated queue of changed messages, over this node's retained sent/read/closed claims. They accelerate current age counts, are not replicated, and do not add shared identities to projection digests. |

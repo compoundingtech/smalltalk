@@ -124,3 +124,10 @@ retries = 0
 [[profile.ci.overrides]]
 filter = 'package(=st3) and binary(=integration) and kind(test) and (test(=daemon_restart::stop_escalation::claude_stop_escalation_records_ended_before_its_group_sigkill) or test(=daemon_restart::stop_escalation::opencode_stop_escalation_records_cover_before_its_group_sigkill) or test(=daemon_restart::stop_escalation::opencode_graceful_stop_rewrites_cover_with_the_reaped_signal))'
 retries = 0
+
+# SLO source controls retain the first adverse result. Measurement cases run in
+# nextest's isolated per-test process and print actual tuples on success.
+[[profile.ci.overrides]]
+filter = 'package(=st3) and test(/^store::slo_breaches::tests::/)'
+retries = 0
+success-output = "immediate"

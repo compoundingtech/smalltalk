@@ -2,6 +2,9 @@
 // including columns the old graph digest did not cover. Local arrival cursors are tested through
 // the shared readers they accelerate rather than compared as if they were replicated identities.
 const SHARED_TABLES: &[(&str, &[&str])] = &[
+    ("slo_episode_events", &[]),
+    ("slo_episode_heads", &[]),
+    ("slo_pending", &[]),
     ("operations", &[]),
     ("blobs", &[]),
     ("documents", &["created_index"]),

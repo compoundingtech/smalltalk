@@ -18005,6 +18005,7 @@ pub(crate) mod tests {
     mod differential;
     mod doctor_eligibility_tests;
     mod first_readiness_tests;
+    pub(crate) mod slo_breach_tests;
     mod gate_on_demand;
     mod github_watch_selection;
     mod incremental_deadlines;

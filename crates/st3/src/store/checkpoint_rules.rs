@@ -34,7 +34,9 @@ pub(crate) use staged::plan_staged;
 /// than an hour older than their account group's newest, other than each seat's newest. The
 /// proof compares the account fold across every seat. It also keeps only the newest
 /// `runtime.reconcile-decision` of each decision key.
-pub const RULES_VERSION: u32 = 15;
+/// Version 16 retains SLO episode fences and their conflict witnesses, compacting only
+/// redundant receipts of recovered episodes after seven days.
+pub const RULES_VERSION: u32 = 16;
 
 /// Usage rollups keep their hourly history for this long before the cut, so a usage period that
 /// ends within it is exact to the hour. Before it, each rollup series keeps only its newest
@@ -105,6 +107,7 @@ pub(crate) enum Rule {
     UsageSeries,
     UsageCumulative,
     AccountLimits,
+    SloEventFences,
 }
 
 pub(crate) fn fields(claim: &ClaimRecord) -> Option<&serde_json::Map<String, Value>> {
@@ -145,6 +148,7 @@ fn planner_rule(rule: &st3_schema::retention::RulePolicy) -> Option<Rule> {
             Rule::UsageSeries
         }
         "newest,largest-total_tokens" => Rule::UsageCumulative,
+        "episode-event-fences-and-conflicts-after-recovery-7d" => Rule::SloEventFences,
         "newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at" => {
             Rule::AccountLimits
         }
@@ -479,7 +483,7 @@ impl Rule {
     pub(crate) fn reads_bodies(self) -> bool {
         matches!(
             self,
-            Rule::HarnessObserved | Rule::UsageSeries | Rule::UsageCumulative | Rule::AccountLimits | Rule::LoopState
+            Rule::HarnessObserved | Rule::UsageSeries | Rule::UsageCumulative | Rule::AccountLimits | Rule::LoopState | Rule::SloEventFences
         )
     }
 
@@ -501,6 +505,7 @@ impl Rule {
             Rule::UsageSeries => "usage-series".into(),
             Rule::UsageCumulative => "usage-cumulative".into(),
             Rule::AccountLimits => "account-limits".into(),
+            Rule::SloEventFences => "slo-event-fences".into(),
         }
     }
 
@@ -513,6 +518,7 @@ impl Rule {
             "usage-series" => Rule::UsageSeries,
             "usage-cumulative" => Rule::UsageCumulative,
             "account-limits" => Rule::AccountLimits,
+            "slo-event-fences" => Rule::SloEventFences,
             tag => Rule::NewestAged(tag.strip_prefix("newest-aged:")?.parse().ok()?),
         })
     }
@@ -547,9 +553,45 @@ pub(crate) fn rule_keep(
         Rule::UsageCumulative => usage_cumulative_keep(claims),
         Rule::AccountLimits => limits_keep(claims, limits_newest),
         Rule::LoopState => loop_keep(claims),
+        Rule::SloEventFences => slo_fences_keep(claims, cut),
         Rule::Deferral if closed => newest,
         Rule::Deferral => (0..len).collect(),
     }
+}
+
+/// The minimum claim id for each event is the reducer's authority. Retain one
+/// differing body as well so a conflict remains UNKNOWN after trim. No episode is
+/// compactable until its recovery is seven days old; ordinary reference guards
+/// additionally keep cited/mission-linked evidence and complete envelopes.
+fn slo_fences_keep(claims: &[&ClaimRecord], cut: u128) -> BTreeSet<usize> {
+    let all = || (0..claims.len()).collect();
+    let records = claims.iter().map(|claim| serde_json::from_value::<st3_schema::slo_breaches::Record>(
+        claim.body["fields"]["record"].clone())).collect::<std::result::Result<Vec<_>, _>>();
+    let Ok(records) = records else { return all(); };
+    let recovered = records.iter().zip(claims).filter(|(record, _)|
+        record.event == st3_schema::slo_breaches::Event::Recovered)
+        .max_by_key(|(_, claim)| claim.accepted_at_unix_ms);
+    if recovered.is_none_or(|(_, claim)| claim.accepted_at_unix_ms >= cut.saturating_sub(7 * DAY_MS)) {
+        return all();
+    }
+    let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, record) in records.iter().enumerate() {
+        groups.entry(record.event.name()).or_default().push(index);
+    }
+    let mut keep = BTreeSet::new();
+    for members in groups.values() {
+        let first = *members.iter().min_by_key(|index| &claims[**index].id).expect("nonempty event");
+        keep.insert(first);
+        let maximum_ordinal = members.iter().map(|index| records[*index].ordinal).max().expect("nonempty event");
+        let ordinal_witness = members.iter().filter(|index| records[**index].ordinal == maximum_ordinal)
+            .min_by_key(|index| &claims[**index].id).expect("maximum ordinal exists");
+        keep.insert(*ordinal_witness);
+        if let Some(other) = members.iter().filter(|index| records[**index] != records[first])
+            .min_by_key(|index| &claims[**index].id) {
+            keep.insert(*other);
+        }
+    }
+    keep
 }
 
 /// The positions among one seat's status-history sources, in canonical order, that the
@@ -616,7 +658,10 @@ pub(crate) fn cited_by(claim: &ClaimRecord) -> impl Iterator<Item = &str> {
         .into_iter()
         .flat_map(|inputs| inputs.values())
         .filter_map(|input| input.get("claim_id").and_then(Value::as_str));
-    evidence.chain(inputs)
+    let lineage = (claim.kind == st3_schema::slo_breaches::KIND)
+        .then(|| body.pointer("/fields/record/previous_recovery").and_then(Value::as_str))
+        .flatten().into_iter();
+    evidence.chain(inputs).chain(lineage)
 }
 
 /// Whether claims of `kind` are never dropped, because their validation reads them: a kind that
@@ -886,7 +931,10 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 26] = [
+pub(crate) const PROJECTION_TABLES: [&str; 29] = [
+    "slo_episode_events",
+    "slo_episode_heads",
+    "slo_pending",
     "operations",
     "arrangement_registers",
     "arrangements",
@@ -938,6 +986,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     }
     rebuild_operations_tx(transaction)?;
     project_replicated_base_claims(transaction)?;
+    slo_breaches::rebuild(transaction)?;
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction)?;
     resources::rebuild(transaction)?;

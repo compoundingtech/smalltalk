@@ -8,6 +8,8 @@ use super::*;
 /// the graph for the caches its reads use.
 #[derive(Default)]
 pub struct SmalltalkRuntime {
+    /// Source-owned observation fencing only; no canonical sample log or timer.
+    pub(super) slo_source: Mutex<slo_breaches::SourceState>,
     /// Committed launch-source invalidation, independent of append frontiers.
     pub(crate) publication_cache_epoch: Mutex<Option<(i64, bool)>>,
     pub(crate) publication_cache_observer: Mutex<Option<smallclaims::sqlite::CommitObserver>>,
@@ -137,6 +139,7 @@ impl SmalltalkRuntime {
             None
         };
         resources::create_schema(connection)?;
+        slo_breaches::create_schema(connection)?;
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
         coordination::create_schema(connection)?;
@@ -377,7 +380,8 @@ impl Runtime for SmalltalkRuntime {
         repaired: &str,
         replacement: &str,
     ) -> Result<()> {
-        select_desired_repair_tx(transaction, repaired, replacement)
+        select_desired_repair_tx(transaction, repaired, replacement)?;
+        slo_breaches::repair(transaction, repaired)
     }
 
     fn append_claim_tx(
