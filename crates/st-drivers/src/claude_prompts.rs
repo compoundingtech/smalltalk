@@ -20,6 +20,7 @@
 //! transcript, not in the seat's conversation where a client shows the pending call, so a client
 //! never offers to allow it beside a call it could not show (st offers only deny for it).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -39,6 +40,23 @@ struct Queue {
     prompts: Vec<Prompt>,
     /// The top level's own state beneath the prompts, written again when the last one closes.
     base: Option<Base>,
+    /// Each agent's latest call, from its `PreToolUse` (the top level's under ""): Claude asks
+    /// about a call right after that event, and the `PermissionRequest` names no call itself.
+    #[serde(default)]
+    calls: BTreeMap<String, Call>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Call {
+    id: String,
+    tool: String,
+    digest: String,
+}
+
+/// A digest of a call's tool and input, to pair a prompt with the call it asks about.
+fn call_digest(tool: &str, input: &serde_json::Value) -> String {
+    let digest = Sha256::digest(format!("{tool}\n{input}").as_bytes());
+    digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,12 +69,25 @@ struct Prompt {
     /// The state record's (ownership, transition) sequences of the observation that shows it,
     /// once it is the oldest open prompt and that observation is written.
     shown: Option<(u64, u64)>,
+    /// The id of the call it asks about (the asking agent's `PreToolUse` of the same tool and
+    /// input), when Claude reported it.
+    #[serde(default)]
+    call: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Base {
     state: Activity,
     reason: Option<String>,
+}
+
+/// The id of the call the prompt `id` asks about, when its asker's `PreToolUse` named it.
+pub fn prompt_call(agent_dir: &Path, id: &str) -> Option<String> {
+    load(agent_dir)
+        .prompts
+        .into_iter()
+        .find(|prompt| prompt.id == id)
+        .and_then(|prompt| prompt.call)
 }
 
 /// Where one waiting prompt stands, as its hook reads it.
@@ -153,21 +184,42 @@ pub(crate) fn observe(
                 .filter(|tool| !tool.is_empty())
                 .unwrap_or("permissionRequest")
                 .to_owned();
+            // The call this prompt asks about: the asker's latest call, of the same tool and input.
+            let input = payload.get("tool_input").cloned().unwrap_or(serde_json::Value::Null);
+            let call = queue
+                .calls
+                .get(agent.as_deref().unwrap_or_default())
+                .filter(|call| call.tool == tool && call.digest == call_digest(&tool, &input))
+                .map(|call| call.id.clone());
             if !queue.prompts.iter().any(|prompt| prompt.id == id) {
                 queue.prompts.push(Prompt {
                     id,
                     agent: agent.clone(),
                     tool,
                     shown: None,
+                    call,
                 });
             }
         }
         // The asking agent moved on: its prompt was answered, wherever.
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => {
             queue.prompts.retain(|prompt| prompt.agent != agent);
+            if event == "PreToolUse"
+                && let (Some(id), Some(tool)) = (
+                    payload.get("tool_use_id").and_then(serde_json::Value::as_str),
+                    payload.get("tool_name").and_then(serde_json::Value::as_str),
+                )
+            {
+                let input = payload.get("tool_input").cloned().unwrap_or(serde_json::Value::Null);
+                queue.calls.insert(
+                    agent.clone().unwrap_or_default(),
+                    Call { id: id.to_owned(), tool: tool.to_owned(), digest: call_digest(tool, &input) },
+                );
+            }
         }
         "SubagentStop" if agent.is_some() => {
             queue.prompts.retain(|prompt| prompt.agent != agent);
+            queue.calls.remove(agent.as_deref().unwrap_or_default());
         }
         "Stop" | "StopFailure" | "UserPromptSubmit" | "PreCompact" if agent.is_none() => {
             queue.prompts.retain(|prompt| prompt.agent.is_some());
@@ -358,6 +410,71 @@ mod tests {
             record.shows(),
             (Activity::Active, BlockedOn::Human, Some("subagent:Bash".into()))
         );
+    }
+
+    /// A prompt is bound to the exact call it asks about: the asker's own preceding call of the
+    /// same tool and input. Another call, or one Claude did not name, binds nothing.
+    #[test]
+    fn a_prompt_names_the_call_it_asks_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = Record::default();
+        record.event(dir.path(), "UserPromptSubmit", json!({}));
+        record.event(
+            dir.path(),
+            "PreToolUse",
+            json!({"tool_name": "Bash", "tool_use_id": "toolu_7", "tool_input": {"command": "make"}}),
+        );
+        let asked = request("Bash", None, "make");
+        let id = prompt_id(&asked.to_string());
+        record.event(dir.path(), "PermissionRequest", asked);
+        assert_eq!(prompt_call(dir.path(), &id).as_deref(), Some("toolu_7"));
+
+        // The next call's prompt is about another input: its call is not this one.
+        record.event(
+            dir.path(),
+            "PreToolUse",
+            json!({"tool_name": "Bash", "tool_use_id": "toolu_8", "tool_input": {"command": "ls"}}),
+        );
+        let other = request("Bash", None, "make clean");
+        let other_id = prompt_id(&other.to_string());
+        record.event(dir.path(), "PermissionRequest", other);
+        assert_eq!(prompt_call(dir.path(), &other_id), None);
+    }
+
+    /// A parent's Task call and its subagent's prompt are open at once: the prompt names the
+    /// subagent's own call, never the parent's Task call, and another subagent asking the same
+    /// thing names none of theirs.
+    #[test]
+    fn a_subagents_prompt_beside_its_parents_task_call_names_the_subagents_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = Record::default();
+        record.event(dir.path(), "UserPromptSubmit", json!({}));
+        record.event(
+            dir.path(),
+            "PreToolUse",
+            json!({"tool_name": "Task", "tool_use_id": "toolu_task",
+                "tool_input": {"prompt": "run the build"}}),
+        );
+        record.event(
+            dir.path(),
+            "PreToolUse",
+            json!({"tool_name": "Bash", "agent_id": "agent-a", "tool_use_id": "toolu_sub",
+                "tool_input": {"command": "make"}}),
+        );
+        let asked = request("Bash", Some("agent-a"), "make");
+        let id = prompt_id(&asked.to_string());
+        record.event(dir.path(), "PermissionRequest", asked);
+        assert_eq!(prompt_call(dir.path(), &id).as_deref(), Some("toolu_sub"));
+
+        let other = request("Bash", Some("agent-b"), "make");
+        let other_id = prompt_id(&other.to_string());
+        record.event(dir.path(), "PermissionRequest", other);
+        assert_eq!(prompt_call(dir.path(), &other_id), None, "agent-b made no call of its own");
+
+        let parents = request("Bash", None, "make");
+        let parents_id = prompt_id(&parents.to_string());
+        record.event(dir.path(), "PermissionRequest", parents);
+        assert_eq!(prompt_call(dir.path(), &parents_id), None, "the parent's call is its Task");
     }
 
     /// A question is its own ask, and a new session forgets every prompt.

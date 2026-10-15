@@ -1661,6 +1661,7 @@ mod tests {
             launch_id: None,
             variant_id: None,
             message_id: None, answers: Vec::new(), conversation: None,
+            prompt_call: None,
             title: "Fabric needs review".into(),
             detail: "The queue did not recover.".into(),
             mission: Some("mission/fabric".into()),

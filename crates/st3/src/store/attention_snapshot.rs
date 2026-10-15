@@ -201,6 +201,8 @@ impl Store {
                 .filter(|reason| !reason.is_empty())
                 .unwrap_or("its terminal shows a prompt");
             let answerable = answerable(&harness, as_of);
+            // The exact call it asks about, as its hook or driver named it for this observation.
+            let call = prompt_call(&connection, &seat, &harness)?;
             items.push(AttentionItemView {
                 episode: claim,
                 priority: "high".into(),
@@ -212,6 +214,7 @@ impl Store {
                 launch_id: None,
                 variant_id: None,
                 message_id: None,
+                prompt_call: call,
                 answers: prompt_answers(&harness, as_of),
                 conversation: Some(seat.clone()),
                 title: format!("{seat} is waiting for {what}"),
@@ -635,7 +638,7 @@ impl Store {
                 requester_id: None,
                 launch_id: None,
                 variant_id: None,
-                message_id: None, answers: Vec::new(), conversation: None,
+                message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
                 title: format!("st cannot reconcile {source}"),
                 detail: format!(
                     "{scope}: {}. Inspect with `st subject show {source}`.",
@@ -768,7 +771,7 @@ impl Store {
             requester_id: None,
             launch_id: None,
             variant_id: None,
-            message_id: None, answers: Vec::new(), conversation: None,
+            message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
             title,
             detail,
             mission: Some(run.mission.clone()),
@@ -829,7 +832,7 @@ impl Store {
             let diagnostic = self.last_driver_diagnostic(&source)?;
             items.push(AttentionItemView {
                 episode: decision.id.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
-                subject: source.clone(), person: reviewer.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, answers: Vec::new(), conversation: None,
+                subject: source.clone(), person: reviewer.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
                 title: if codex { "A Codex agent stopped after repeated failures" } else { "An agent stopped after repeated runtime failures" }.into(),
                 detail: format!("{source}: {}.{} Inspect the seat and revise its desired declaration before restarting.", decision.body["fields"]["reason"].as_str().unwrap_or("the runtime is parked"), diagnostic.map(|diagnostic| format!(" The driver's last diagnostic: {diagnostic}.")).unwrap_or_default()),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: decision.accepted_at_unix_ms,
@@ -907,7 +910,7 @@ impl Store {
             };
             items.push(AttentionItemView {
                 episode: token.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
-                subject: source.clone(), person: REVIEWER.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, answers: Vec::new(), conversation: None,
+                subject: source.clone(), person: REVIEWER.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
                 title: "An agent seat has not started".into(),
                 detail: format!("{source} has been declared to run on {host} for over {} minutes and no runtime has ever been observed for it, so it is still `desired`.{diagnostic} Check that the host is up and its daemon can start the seat.", SEAT_NOT_STARTED_MS / 60_000),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: due,
@@ -1058,7 +1061,7 @@ impl Store {
                 requester_id: None,
                 launch_id: None,
                 variant_id: None,
-                message_id: None, answers: Vec::new(), conversation: None,
+                message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
                 title: condition.title().into(),
                 detail: condition.reason(&source, &latest.origin),
                 mission: None,
@@ -1477,7 +1480,7 @@ pub(super) fn person_attention_item(
         requester_id: ask.and_then(|ask| ask.actor),
         launch_id: None,
         variant_id: None,
-        message_id: None, answers: Vec::new(),
+        message_id: None, prompt_call: None, answers: Vec::new(),
         title: view
             .title
             .unwrap_or_else(|| "A step needs your response".into()),
@@ -1691,6 +1694,7 @@ impl Store {
             launch_id: None,
             variant_id: None,
             message_id: None,
+            prompt_call: None,
             answers,
             conversation: Some(seat.to_owned()),
             title: format!("{seat} is waiting for you"),
@@ -1771,6 +1775,7 @@ impl Store {
                 launch_id: None,
                 variant_id: None,
                 message_id: None,
+                prompt_call: serde_json::from_str::<Value>(fields["matched_line"].as_str().unwrap_or_default()).ok().and_then(|line| line["call_id"].as_str().map(str::to_owned)),
                 answers: DENIAL_ANSWERS.iter().map(|answer| (*answer).to_owned()).collect(),
                 conversation: Some(seat.to_owned()),
                 title: format!("{seat} needs you to allow a {tool} call"),
@@ -2143,6 +2148,38 @@ fn answerable(harness: &Value, now: u128) -> bool {
             || harness["observed_since_ms"].as_u64().is_none_or(|since| {
                 now.saturating_sub(u128::from(since)) < CLAUDE_PROMPT_ANSWER_WAIT_MS
             }))
+}
+
+/// The id of the exact call the prompt `harness` reports asks about: what its hook (Claude) or
+/// driver (Codex) published for that very observation, its ownership and transition sequences.
+fn prompt_call(connection: &Connection, seat: &str, harness: &Value) -> Result<Option<String>> {
+    let (Some(ownership), Some(transition)) = (
+        harness["ownership_sequence"].as_u64(),
+        harness["transition_sequence"].as_u64(),
+    ) else {
+        return Ok(None);
+    };
+    let rows = connection
+        .prepare_cached(&format!(
+            "{} LIMIT 8",
+            newest_claims_of_kind_query("claims.body", "harness.diagnostic").replace(
+                " ORDER BY",
+                " AND json_extract(claims.body, '$.fields.code')='native-prompt-call' ORDER BY"
+            )
+        ))?
+        .query_map(params![seat, i64::MAX], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for body in rows {
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        let Ok(line) = serde_json::from_str::<Value>(fields["matched_line"].as_str().unwrap_or_default()) else {
+            continue;
+        };
+        if fields["ownership_sequence"] == ownership && line["transition"] == transition {
+            return Ok(line["call_id"].as_str().map(str::to_owned));
+        }
+    }
+    Ok(None)
 }
 
 /// The idempotency key of the person's answer to the native prompt `observation` opened.

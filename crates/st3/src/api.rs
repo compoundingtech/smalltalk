@@ -3939,8 +3939,12 @@ fn client_attention_resources_from_items(
         // A prompt st can answer offers its answers as one typed action.
         if !item.answers.is_empty() {
             resource["actions"] = json!(["prompt.respond"]);
+            // `call_id` names the exact call a native prompt asks about, or null when its
+            // harness did not name it: a client offers to allow only that call, so a null one is
+            // allowed in the terminal. Daemons before it omit the field.
             resource["action_parameters"] = json!({"prompt.respond": {
-                "target_id": item.subject, "episode": item.episode, "answers": item.answers}});
+                "target_id": item.subject, "episode": item.episode, "answers": item.answers,
+                "call_id": item.prompt_call}});
         }
         if item.kind.starts_with("custom.")
             && let Some(source) = store.custom_subject(&item.subject)?

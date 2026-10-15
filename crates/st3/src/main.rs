@@ -23290,6 +23290,7 @@ fn codex_prompt_answers(
     let client = client.clone();
     let runtime = tokio::runtime::Handle::current();
     let agent = urlencoding::encode(subject).into_owned();
+    let publisher = (client.clone(), runtime.clone(), subject.to_owned());
     st_drivers::session_control::PromptAnswers::new(move |ownership, transition| {
         let path = format!(
             "/v1/harness-prompts/state?agent={agent}&ownership={ownership}&transition={transition}"
@@ -23304,6 +23305,13 @@ fn codex_prompt_answers(
             .ok()?
             .ok()
         })
+    })
+    // Each approval's item, so a client offers to allow only that exact call.
+    .with_call_publisher(move |ownership, transition, call| {
+        let (client, runtime, subject) = &publisher;
+        runtime.block_on(st3::driver_hook::publish_prompt_call(
+            client, "codex", subject, ownership, transition, call,
+        ));
     })
 }
 

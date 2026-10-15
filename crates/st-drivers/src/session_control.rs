@@ -103,15 +103,31 @@ type PromptAnswerRead = dyn Fn(u64, u64) -> Option<PromptAnswer> + Send + Sync;
 /// transition) sequences of the state record observation the prompt wrote. The owning control
 /// plane supplies it; `None` means st could not say this time.
 #[derive(Clone)]
-pub struct PromptAnswers(Arc<PromptAnswerRead>);
+pub struct PromptAnswers(Arc<PromptAnswerRead>, Option<Arc<PromptCallPublish>>);
+
+/// Records that the prompt shown as (ownership, transition) asks about the call with this id.
+type PromptCallPublish = dyn Fn(u64, u64, &str) + Send + Sync;
 
 impl PromptAnswers {
     pub fn new(read: impl Fn(u64, u64) -> Option<PromptAnswer> + Send + Sync + 'static) -> Self {
-        Self(Arc::new(read))
+        Self(Arc::new(read), None)
+    }
+
+    /// Also record which call each shown prompt asks about, so a client offers to allow only
+    /// that exact call.
+    pub fn with_call_publisher(mut self, publish: impl Fn(u64, u64, &str) + Send + Sync + 'static) -> Self {
+        self.1 = Some(Arc::new(publish));
+        self
     }
 
     pub(crate) fn read(&self, ownership: u64, transition: u64) -> Option<PromptAnswer> {
         (self.0)(ownership, transition)
+    }
+
+    pub(crate) fn publish_call(&self, ownership: u64, transition: u64, call: &str) {
+        if let Some(publish) = &self.1 {
+            publish(ownership, transition, call);
+        }
     }
 }
 
