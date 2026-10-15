@@ -1126,8 +1126,8 @@ pub struct ReaderUsage {
 }
 
 pub use read_lifetime::{
-    LiveReadToken, OldestLiveRead, ReadLifetime, ReadLifetimeReport, oldest_live_read,
-    open_snapshots_over, register_live_read,
+    LiveReadToken, OldestLiveRead, ReadLifetime, ReadLifetimeReport, RouteLoans, loans_by_route,
+    oldest_live_read, open_snapshots_over, register_live_read,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use read_lifetime::live_read_locations;

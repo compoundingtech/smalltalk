@@ -335,3 +335,68 @@ fn ordinary_reuse_and_reporting_add_no_sql_per_checkout() {
     assert_eq!((pool.usage().open, pool.usage().opened), (1, 1));
     assert_eq!(pool.live_read_report().live_checkouts, 0);
 }
+
+/// The live-read table is process-wide. The route assertions look only at this test's routes,
+/// so they hold beside other tests' loans; the `(other)` check also needs this test's routes to
+/// be the only ones, which nextest gives by running each test in its own process.
+#[test]
+fn loans_are_grouped_by_route_with_their_oldest_checkout_and_confirmed_snapshot() {
+    let (_directory, _writer, pool) = file_pool();
+    let export = crate::read_budget::ReadBudget::new(
+        "/test-loans/export",
+        std::time::Duration::from_secs(30),
+    );
+    let (held, reader, pending) = crate::read_budget::with(Some(export), || {
+        (pool.get(), pool.get(), pool.register_snapshot())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // A budget cancelled after its loan was taken has expired when the loan is reported. (A
+    // budget already spent would not get a loan: opening a connection under it is interrupted.)
+    let messages = crate::read_budget::ReadBudget::new(
+        "/test-loans/messages",
+        std::time::Duration::from_secs(30),
+    );
+    let late = crate::read_budget::with(Some(messages.clone()), || pool.get());
+    messages.cancel();
+    let mine = || {
+        loans_by_route(usize::MAX)
+            .into_iter()
+            .filter(|loans| loans.route.starts_with("/test-loans/"))
+            .collect::<Vec<_>>()
+    };
+    let routes = mine();
+    assert_eq!(routes.len(), 2, "{routes:#?}");
+    let (oldest, newer) = (&routes[0], &routes[1]);
+    assert_eq!(oldest.route, "/test-loans/export");
+    assert_eq!(
+        (oldest.checkouts, oldest.snapshot_checkouts, oldest.expired),
+        (3, 1, 0)
+    );
+    assert!(oldest.oldest_checkout_age_ms >= 20, "{oldest:#?}");
+    assert_eq!(
+        oldest.oldest_snapshot_confirmed_age_ms, None,
+        "a registered snapshot has not read yet"
+    );
+    assert_eq!(newer.route, "/test-loans/messages");
+    assert_eq!(
+        (newer.checkouts, newer.snapshot_checkouts, newer.expired),
+        (1, 0, 1)
+    );
+    reader
+        .execute_batch("BEGIN; SELECT * FROM payload")
+        .unwrap();
+    pending.snapshot_started(reader.connection.as_ref().unwrap());
+    let confirmed = &mine()[0];
+    assert!(
+        confirmed.oldest_snapshot_confirmed_age_ms.is_some(),
+        "{confirmed:#?}"
+    );
+    // Past the limit, the newer routes are summed into `(other)`.
+    let limited = loans_by_route(1);
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].route, "/test-loans/export");
+    assert_eq!(limited[1].route, "(other)");
+    assert_eq!((limited[1].checkouts, limited[1].expired), (1, 1));
+    drop((held, reader, pending, late));
+    assert!(mine().is_empty());
+}

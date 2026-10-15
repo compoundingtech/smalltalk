@@ -82,6 +82,27 @@ snapshots open past the target now. `waiting` counts callers waiting for the wri
 waiting for admission, and `threads` counts this process's threads, in all and by name. `st
 doctor` prints it as `slo/writer-hold`.
 
+Three more fields show what keeps the WAL from recycling:
+- `read_loans` lists every read loan now, grouped by the route label of the read budget it works
+  under (`(no budget)` for background work). Each route gives `checkouts`,
+  `snapshot_checkouts`, `expired` (loans whose budget has run out), `oldest_checkout_age_ms` and
+  `oldest_snapshot_confirmed_age_ms`. The eight routes with the oldest checkouts come first, and
+  the rest are summed as `(other)`. A checked-out loan need not hold a read transaction; a
+  confirmed snapshot has completed its first read and does.
+- `wal` is the newest attempt by the WAL checkpoint worker, which tries every five seconds:
+  `checkpoint` (`outcome` empty, recycled, deferred or error, with `frames`, `backfilled`,
+  `not_backfilled` and its phase times), `wal_bytes` (the WAL file's size), `age_ms`, and
+  `deferred_ms`, how long checkpoints have been deferred or failing since one last settled.
+- `snapshot_build` gives windows for the three phases of building a replication snapshot:
+  `wait` for the build lock, which one build holds at a time; `inventory` for reading the
+  envelope inventory; and `digest` for hashing its digests. A build that fails partway still
+  records the phases it reached, so these are not only successful builds.
+
+Waiting for a reader, the writer's queue, commits and checkpoints are measured as OpenTelemetry
+histograms when export is on: `db.client.connection.wait_time` (read admission),
+`st.db.writer.queue.duration` (writer admission), `st.db.writer.commit.duration` and
+`st.db.wal.checkpoint.duration`.
+
 The `database` row is this member's store: `max_live_gb` for the pages in use (the file less its
 free pages, which SQLite reuses before the file grows) and `max_growth_mb_per_day` for their net
 daily growth, what is written less what checkpoints and retention free. The daemon samples the
