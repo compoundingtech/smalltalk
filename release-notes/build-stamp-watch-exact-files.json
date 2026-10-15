@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Build scripts of agent-spec and st-drivers no longer watch the shared Git refs directory, so an unrelated ref update no longer rebuilds the workspace",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this changes which Git files two build scripts tell Cargo to watch."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, wire or harness contract change. The build stamp (revision, dirty flag) is computed exactly as before; only the files that trigger recomputing it change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No upgrade downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery procedure; reverting the change restores the previous build-script behavior."
+  }
+}
