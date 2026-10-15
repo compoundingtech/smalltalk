@@ -839,6 +839,11 @@ no required check until its numbers are stable. "Without the hog" is
 the host's load as it was: on a shared host that is not an idle machine, and the report gives the
 load average. Keep a Mac's load average under 10 outside the test window.
 
+`perf-load-hog-macos` runs the same stage on a macOS runner under `taskpolicy -b`, by manual dispatch
+only, and keeps the compiled test binary in the `perf-load-hog-macos` artifact. A Mac of the fleet
+runs that binary (`ST_LOAD_GATE=1 ST_LOAD_HOG=1 ./perf_load-macos-arm64 a_seat_priority_hog --nocapture`);
+nothing is built on a Mac.
+
 #### Measuring a change on hetz2: the perf slot
 
 A builder measures a change with `nix develop .#perf -c bash scripts/ci-perf load`. Outside CI on

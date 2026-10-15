@@ -283,3 +283,57 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
           overwrite: true
+  perf-load-hog-macos:
+    name: perf-load-hog-macos
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name == 'workflow_dispatch') }}
+    runs-on: ["namespace-profile-macos-arm64;github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 60
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Isolate test state
+        run: |
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home"/{.config,.cache,.local/state}
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Run the release load test beside a seat-priority hog
+        shell: bash
+        run: "nix develop '.#perf' -c bash scripts/ci-perf load-hog"
+      - name: Keep the compiled test binary
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/perf"
+          binary=$(find target/release/deps -maxdepth 1 -type f -name 'perf_load-*' ! -name '*.d' -perm -u+x | head -n 1)
+          [ -n "$binary" ] && cp "$binary" "$RUNNER_TEMP/perf/perf_load-macos-arm64" || echo "no perf_load binary was built"
+      - name: Retain the macOS hog report, log and test binary
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-load-hog-macos
+          path: "${{ runner.temp }}/perf/"
+          retention-days: 30
+          if-no-files-found: ignore
+          overwrite: true

@@ -155,6 +155,13 @@ for event in ['push', 'workflow_dispatch']:
 for event in ['pull_request', 'schedule']:
     assert not hog_admits(event, output='true'), event
 assert re.search(r'^  perf-load-hog:\n(?:    .*\n)*?    continue-on-error: true$', workflow, re.M), 'the hog run reports without failing the workflow'
+# The macOS hog run is manual dispatch only: a macOS runner is costly and nothing waits on it.
+macos = re.search(r'^  perf-load-hog-macos:\n((?:    .*\n|\n)*)', workflow, re.M)
+assert macos, 'the macOS hog job exists'
+assert re.search(r"^    if: \$\{\{ \(github\.event_name != 'pull_request' \|\| github\.event\.pull_request\.draft == false\) && \(github\.event_name == 'workflow_dispatch'\) \}\}$", macos.group(1), re.M), 'the macOS hog job runs only on manual dispatch'
+assert re.search(r'^    continue-on-error: true$', macos.group(1), re.M), 'the macOS hog run reports without failing the workflow'
+assert 'namespace-profile-macos-arm64' in macos.group(1), 'the macOS hog job runs on a macOS runner'
+assert 'scripts/ci-perf load-hog' in macos.group(1) or 'load-hog' in macos.group(1), 'the macOS hog job runs the hog stage'
 assert not admits('perf-load'), 'only successful explicit false may skip the load'
 for result in ['failure', 'timed_out', 'cancelled', 'skipped', '']:
     assert admits('perf-load', result=result, output=''), result

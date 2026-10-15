@@ -1,7 +1,7 @@
 import { readyPRJobs } from './ready-pr.ts'
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep, plainFlakeSetupSteps } from '../../repos/effect-utils/genie/external.ts'
 import { readFileSync } from 'node:fs'
-import { buildEnv, linuxRunner, linuxStageRunner, performanceRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
+import { buildEnv, linuxRunner, linuxStageRunner, macosRunner, performanceRunner, readOnlyBinaryCaches } from './workspace-ci.ts'
 
 const snapshotAttempt = "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
 const snapshotPublished = "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
@@ -150,6 +150,42 @@ python3 scripts/ci-perf-cache pack`,
           uses: 'actions/upload-artifact@v4',
           if: 'always()',
           with: { name: 'perf-load-hog-logs', path: '${{ runner.temp }}/perf/', 'retention-days': 30, 'if-no-files-found': 'ignore', overwrite: true },
+        },
+      ],
+    },
+    // The same hog run on a macOS runner, under `taskpolicy -b`: the hog's priority on a Mac. It also
+    // keeps the compiled test binary, which is what runs on a fleet Mac (builds happen on hetz2 and
+    // CI only). Manual dispatch only: a macOS runner is costly and nothing waits on it.
+    'perf-load-hog-macos': {
+      name: 'perf-load-hog-macos',
+      if: `github.event_name == 'workflow_dispatch'`,
+      'runs-on': macosRunner,
+      'timeout-minutes': 60,
+      'continue-on-error': true,
+      defaults: { run: { shell: 'bash' } },
+      env: { ...buildEnv, SCCACHE_IDLE_TIMEOUT: '0' },
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
+        ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+        {
+          name: 'Isolate test state',
+          run: `home="$RUNNER_TEMP/test-home"
+mkdir -p "$home"/{.config,.cache,.local/state}
+printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"`,
+        },
+        nixDevelopStep({ name: 'Run the release load test beside a seat-priority hog', flake: '.#perf', command: ['bash', 'scripts/ci-perf', 'load-hog'] }),
+        {
+          name: 'Keep the compiled test binary',
+          if: 'always()',
+          run: `mkdir -p "$RUNNER_TEMP/perf"
+binary=$(find target/release/deps -maxdepth 1 -type f -name 'perf_load-*' ! -name '*.d' -perm -u+x | head -n 1)
+[ -n "$binary" ] && cp "$binary" "$RUNNER_TEMP/perf/perf_load-macos-arm64" || echo "no perf_load binary was built"`,
+        },
+        {
+          name: 'Retain the macOS hog report, log and test binary',
+          uses: 'actions/upload-artifact@v4',
+          if: 'always()',
+          with: { name: 'perf-load-hog-macos', path: '${{ runner.temp }}/perf/', 'retention-days': 30, 'if-no-files-found': 'ignore', overwrite: true },
         },
       ],
     },
