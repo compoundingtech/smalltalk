@@ -98,8 +98,23 @@ export function applyWindow(window: CollectionWindow | undefined, frame: Collect
 }
 
 function defaultTerminalSocket(url: string, protocols: string[], headers: Record<string, string>): TerminalSocket {
-    const Socket = WebSocket as unknown as new (url: string, protocols: string[], options: { headers: Record<string, string> }) => TerminalSocket;
-    return new Socket(url, protocols, { headers });
+    const Socket = WebSocket as unknown as new (url: string, protocols: string[] | { protocols: string[]; headers: Record<string, string> }, options?: { headers: Record<string, string> }) => CollectionSocket;
+    // Browser windows and workers cannot supply WebSocket handshake headers.
+    const browser = (typeof window !== 'undefined' && typeof window.document !== 'undefined')
+        || (typeof navigator !== 'undefined' && 'importScripts' in globalThis);
+    if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') {
+        return new Socket(url, protocols, { headers });
+    }
+    if (!browser) return new Socket(url, { protocols, headers });
+    const authorization = headers.Authorization;
+    if (authorization) {
+        const credential = authorization.slice('Bearer '.length);
+        if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(credential)) {
+            throw new TypeError('The browser WebSocket credential must contain only HTTP token characters');
+        }
+        protocols = [...protocols, `st3.bearer.${credential}`];
+    }
+    return new Socket(url, protocols);
 }
 
 export class ClientError extends Error {
@@ -209,7 +224,8 @@ export class St3Client {
         if (this.client) headers['x-st3-client'] = this.client;
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
         this.applyTraceContext(headers);
-        const response = await this.fetchImpl(this.baseUrl + path, {
+        const fetchImpl = this.fetchImpl;
+        const response = await fetchImpl(this.baseUrl + path, {
             method, headers, ...(body === undefined ? {} : { body: raw ? (body as BodyInit) : JSON.stringify(body) }),
         });
         const payload: unknown = await response.json();

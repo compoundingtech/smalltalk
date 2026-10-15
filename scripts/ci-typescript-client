@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 pnpm --filter @smalltalk/st3-client test
+pnpm --filter @smalltalk/st3-client run test:socket
 pnpm --filter @smalltalk/st3-client typecheck
 pnpm --filter @smalltalk/st3-views test
 pnpm --filter @smalltalk/st3-views typecheck

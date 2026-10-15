@@ -58,6 +58,15 @@ pub struct Config {
     /// What this node does when an account nears its weekly limit. Off unless enabled.
     #[serde(skip_serializing_if = "LimitsConfig::is_default")]
     pub limits: LimitsConfig,
+    /// Optional browser bundle and relays on the paired client gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_web: Option<crate::api::client_web::ClientWebConfig>,
+    /// Allowlisted paired-client reads from an OMP Usage endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::api::client_web::UsageConfig>,
+    /// Maximum subscriptions per collection WebSocket.
+    #[serde(skip_serializing_if = "is_default_client_subscription_limit")]
+    pub client_subscription_limit: usize,
     /// Background reconciliation start cap, reloaded with daemon policies.
     #[serde(skip_serializing_if = "ReconcileConfig::is_default")]
     pub reconcile: ReconcileConfig,
@@ -70,6 +79,10 @@ pub struct Config {
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
+}
+
+fn is_default_client_subscription_limit(limit: &usize) -> bool {
+    *limit == crate::api::ClientSubscriptionLimit::default().0
 }
 
 /// `[github]`: an explicit token file, or gateway-authorized requests with a sekrets profile.
@@ -380,6 +393,9 @@ impl Default for Config {
             changes: crate::changes::config::Config::default(),
             checkpoint: CheckpointConfig::default(),
             limits: LimitsConfig::default(),
+            client_web: None,
+            usage: None,
+            client_subscription_limit: crate::api::ClientSubscriptionLimit::default().0,
             reconcile: ReconcileConfig::default(),
             codex_work_without_asking: None,
             fleet: None,
@@ -557,6 +573,16 @@ impl Config {
             otlp.validate()?;
         }
         self.limits.validate()?;
+        if let Some(web) = &self.client_web {
+            web.validate()?;
+        }
+        if let Some(usage) = &self.usage {
+            usage.validate()?;
+        }
+        anyhow::ensure!(
+            self.client_subscription_limit > 0,
+            "client_subscription_limit must be positive"
+        );
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
                 person.starts_with("person/")
@@ -826,6 +852,30 @@ fn machine_host_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_client_subscription_limit_is_omitted_from_written_config() {
+        let config = super::Config::default();
+        let written = toml::to_string(&config).unwrap();
+        assert!(!written.contains("client_subscription_limit"));
+        let loaded: super::Config = toml::from_str(&written).unwrap();
+        assert_eq!(
+            loaded.client_subscription_limit,
+            config.client_subscription_limit
+        );
+    }
+
+    #[test]
+    fn custom_client_subscription_limit_round_trips_in_written_config() {
+        let config = super::Config {
+            client_subscription_limit: 17,
+            ..super::Config::default()
+        };
+        let written = toml::to_string(&config).unwrap();
+        assert!(written.contains("client_subscription_limit = 17"));
+        let loaded: super::Config = toml::from_str(&written).unwrap();
+        assert_eq!(loaded.client_subscription_limit, 17);
+    }
+
     #[test]
     fn the_work_root_defaults_to_a_folder_inside_home_that_macos_does_not_guard() {
         let Ok(home) = super::home_dir() else { return };

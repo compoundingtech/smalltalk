@@ -152,13 +152,7 @@ pub(crate) async fn stream(
     // This protocol subscribes in the upgrade request, without a JSON subscribe command.
     let first_frame = subscription_first_frame("terminal", "raw", upgrade.as_ref())
         .map(|first| first.span);
-    let protocols = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .collect::<Vec<_>>();
+    let protocols = stream_protocols(&headers);
     let capabilities = protocols
         .iter()
         .filter_map(|protocol| protocol.strip_prefix(TERMINAL_CAPABILITY_PROTOCOL_PREFIX))
@@ -180,14 +174,18 @@ pub(crate) async fn stream(
     if !live.terminal {
         return Err(validation("raw attachment requires a terminal runtime"));
     }
-    let acquisition_epoch = if direct_peek {
-        Some(authorization_epoch(&state, &session)?)
+    // Only a non-PEEK raw attachment consumes a durable capability claim, and its viewer ends it.
+    let (acquisition_epoch, viewer) = if direct_peek {
+        (Some(authorization_epoch(&state, &session)?), None)
     } else if query.mode == st3_client::RawTerminalMode::Peek {
-        Some(peek_capability::consume(
-            &state, &session, &client_detail_id("terminal", &id), &live, capabilities[0],
-        )?)
+        (
+            Some(peek_capability::consume(
+                &state, &session, &client_detail_id("terminal", &id), &live, capabilities[0],
+            )?),
+            None,
+        )
     } else {
-        consume_terminal_attachment_mode(
+        let viewer = consume_terminal_attachment_mode(
             &state,
             &session,
             &client_detail_id("terminal", &id),
@@ -195,7 +193,7 @@ pub(crate) async fn stream(
             Some(capabilities[0]),
             Some(mode_name(query.mode)),
         )?;
-        None
+        (None, Some(viewer))
     };
     let origin = headers
         .get(ORIGIN_HEADER)
@@ -275,7 +273,10 @@ pub(crate) async fn stream(
         .protocols([SUBPROTOCOL])
         .max_message_size(CHUNK * 4)
         .max_frame_size(CHUNK * 4)
-        .on_upgrade(move |socket| splice(socket, transport, Some(query.mode), lease, control, upgrade, first_frame)))
+        .on_upgrade(move |socket| async move {
+            let _viewer = viewer;
+            splice(socket, transport, Some(query.mode), lease, control, upgrade, first_frame).await;
+        }))
 }
 
 /// One bounded byte splice; closing either direction drops the persistent owner connection.

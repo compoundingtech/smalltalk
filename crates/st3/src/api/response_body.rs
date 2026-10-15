@@ -23,7 +23,12 @@ pub(super) struct Metrics {
 }
 
 pub(super) fn is_json(response: &Response) -> bool {
+    // A byte-preserving relay keeps its upstream body; it is never reframed as an envelope.
     response.status() != StatusCode::SWITCHING_PROTOCOLS
+        && response
+            .extensions()
+            .get::<super::client_web::RelayResponse>()
+            .is_none()
         && response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)

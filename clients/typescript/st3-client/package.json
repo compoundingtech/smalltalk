@@ -7,6 +7,7 @@
     "test": "node --test contract.test.cjs schema.test.cjs",
     "test:contract": "node --test contract.test.cjs",
     "test:schema": "node --test schema.test.cjs",
+    "test:socket": "node --test socket.integration.test.cjs",
     "typecheck": "pnpm run typecheck:client && pnpm run typecheck:schema",
     "typecheck:client": "tsc -p tsconfig.json",
     "typecheck:schema": "tsc -p tsconfig.schema.json"

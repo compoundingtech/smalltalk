@@ -9,6 +9,7 @@ package_view(
     dependency_view = "//buck2/dependencies:view_clients_typescript_st3_client_418fd70e574e",
     files = {
         "Client.generated.ts": "Client.generated.ts",
+        "IndexedDbCredentialStore.ts": "IndexedDbCredentialStore.ts",
         "Models.generated.ts": "Models.generated.ts",
         "Schema.generated.ts": "Schema.generated.ts",
         "errors.ts": "errors.ts",

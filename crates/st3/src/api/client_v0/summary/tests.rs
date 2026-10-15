@@ -291,6 +291,7 @@ async fn summary_socket_tiny_snapshot_count_delta_silence_and_person_refusal() {
                         state,
                         ClientSession::local(Some("person/avery")).unwrap(),
                         None,
+                        no_trace(),
                         move |state, session, request, permit| {
                             let windows = windows.clone();
                             let reads = reads.clone();

@@ -36,6 +36,7 @@ async fn conversation_first_frame_profile_lifecycle() {
             let windows = collection_windows::Windows::attach(&state.store);
             upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
                 socket, state, ClientSession::local(None).unwrap(), None,
+                no_trace(),
                 move |state, session, request, permit| {
                     let windows = windows.clone();
                     async move { collection_items_with_windows(&state, &session, &request, permit, windows).await }
@@ -118,6 +119,7 @@ async fn cold_open_four_subscriptions_do_not_wait_for_slow_roster() {
             let windows = collection_windows::Windows::attach(&state.store);
             upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
                 socket, state, ClientSession::local(None).unwrap(), None,
+                no_trace(),
                 move |state, session, request, permit| {
                     let windows = windows.clone();
                     async move { collection_items_with_windows(&state, &session, &request, permit, windows).await }

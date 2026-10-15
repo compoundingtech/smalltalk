@@ -23,6 +23,64 @@ const capabilityFixture = require('../../../docs/st3/client-v0/fixtures/capabili
 const cursorGapFixture = require('../../../docs/st3/client-v0/fixtures/cursor-gap-error.json');
 const capabilities = { ...capabilityFixture.value, limits: { ...capabilityFixture.value.limits, max_page_items: 2, max_event_items: 3, max_wait_ms: 10 } };
 
+test('default sockets use headers in Node, Bun and React Native, and bearer protocols only in browsers', async () => {
+    const names = ['WebSocket', 'window', 'navigator', 'importScripts', 'Bun'];
+    const descriptors = names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+    const opened = [];
+    const set = (name, value) => Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    try {
+        set('WebSocket', class {
+            constructor(...args) { opened.push(args); }
+            close() {}
+            send() {}
+        });
+        for (const runtime of ['Node', 'Bun', 'ReactNative', 'browser', 'worker']) {
+            set('window', runtime === 'browser' ? { document: {} } : undefined);
+            set('navigator', { product: runtime === 'ReactNative' ? runtime : 'Gecko' });
+            set('Bun', runtime === 'Bun' ? {} : undefined);
+            if (runtime === 'worker') set('importScripts', () => {});
+            else delete globalThis.importScripts;
+            const browser = runtime === 'browser' || runtime === 'worker';
+            const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'secret' });
+            opened.length = 0;
+            const streams = [
+                await client.terminalStream('terminal/example', { streamCapability: 'attach-proof', onScreen() {} }),
+                await client.conversationStream('example', { onChange() {} }),
+                await client.collectionStream({ onFrame() {} }),
+            ];
+            const protocols = [
+                ['st3.client.terminal.v0', 'st3.cap.attach-proof'],
+                ['st3.client.conversation.v0'],
+                ['st3.client.collections.v0'],
+            ];
+            assert.equal(opened.length, 3, runtime);
+            for (const [index, args] of opened.entries()) {
+                const nativeOptions = !browser && runtime !== 'ReactNative';
+                assert.deepEqual(nativeOptions ? args[1].protocols : args[1], [...protocols[index], ...(browser ? ['st3.bearer.secret'] : [])], runtime);
+                assert.equal(args.length, runtime === 'ReactNative' ? 3 : 2, runtime);
+                if (!browser) assert.equal((nativeOptions ? args[1] : args[2]).headers.Authorization, 'Bearer secret', runtime);
+            }
+            streams.forEach(stream => stream.close());
+        }
+        set('window', { document: {} });
+        for (const credential of ['has space', 'has,comma', 'has/slash', 'has=padding', 'has\nnewline', 'nonascii-ä']) {
+            const client = new St3Client({ baseUrl: 'https://example.test', credential: () => credential });
+            const count = opened.length;
+            await assert.rejects(client.collectionStream({ onFrame() {} }), /HTTP token characters/);
+            assert.equal(opened.length, count);
+        }
+        const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'base64_URL-safe-123' });
+        const stream = await client.collectionStream({ onFrame() {} });
+        assert.deepEqual(opened.at(-1)[1], ['st3.client.collections.v0', 'st3.bearer.base64_URL-safe-123']);
+        stream.close();
+    } finally {
+        for (const [name, descriptor] of descriptors) {
+            if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+            else delete globalThis[name];
+        }
+    }
+});
+
 test('notesList reads the typed advisory current notes endpoint', async () => {
     const wire = require('../../../docs/st3/client-v0/fixtures/directive-notes.json');
     const calls = [];

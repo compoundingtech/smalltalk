@@ -60,6 +60,7 @@ impl Fixture {
                             state,
                             session,
                             None,
+                            no_trace(),
                             move |state, session, request, permit| {
                                 let (reads, windows) = (reads.clone(), windows.clone());
                                 let gate = gate.clone();
