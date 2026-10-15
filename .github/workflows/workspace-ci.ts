@@ -61,6 +61,7 @@ export const pickRunnerJob = {
     ci1: '${{ steps.pick.outputs.ci1 }}',
     ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
     ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
+    ci1_build: '${{ steps.pick.outputs.ci1_build }}',
   },
   steps: [
     {
@@ -76,6 +77,8 @@ export const pickRunnerJob = {
         OWNER: '${{ github.repository_owner }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
         MERGE_OVERFLOW: '${{ vars.CI_MERGE_OVERFLOW }}',
+        MERGE_PRODUCER_OWNED: '${{ vars.CI_MERGE_TEST_BUILD_OWNED }}',
+        MERGE_NAMESPACE_PROFILE: '${{ vars.CI_MERGE_NAMESPACE_PROFILE }}',
         MERGE_NEED: "${{ vars.CI_MERGE_MIN_IDLE || '3' }}",
         RUN_ID: '${{ github.run_id }}',
       },
@@ -91,10 +94,10 @@ export const priorityRunnerJob = {
   steps: pickRunnerJob.steps.map(step => ({ ...step, env: { ...step.env, MODE: 'priority' } })),
 } as const
 
-// Every required merge job follows one pool decision, including explicit overflow.
+// Consumers retain the common merge choice; the opt-in producer has its own admission.
 const mergeCi1Labels = `github.event_name == 'merge_group' && (needs.${pickRunnerJobId}.outputs.ci1 || '["ci1-priority"]')`
-const pickedOr = (namespaceLabels: string, output = 'ci1') =>
-  `\${{ fromJSON(${mergeCi1Labels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
+const pickedOr = (namespaceLabels: string, output = 'ci1', mergeLabels = mergeCi1Labels) =>
+  `\${{ fromJSON(${mergeLabels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
 
 // Deployment and merge progress take precedence during saturation. Required PR
 // checks precede optional/manual work; local reservations remain unchanged.
@@ -111,6 +114,12 @@ export const linuxStageRunsOn = pickedOr(
 
 /** Both test consumers and their producer use the owned merge lane. */
 export const primaryTestRunsOn = pickedOr(namespaceLabels(linuxStageRunner), 'ci1')
+
+// Unset is inert. 'on' uses qualified six-member host admission; 'off' (or an
+// invalid nonempty mode) forces Namespace for an immediate forward-only rollback.
+// Only the merge-group producer reads ci1_build; consumers retain their choices.
+export const testBuildRunsOn = pickedOr(namespaceLabels(linuxStageRunner), 'ci1',
+  `github.event_name == 'merge_group' && vars.CI_MERGE_TEST_BUILD_OWNED && (needs.${pickRunnerJobId}.outputs.ci1_build || ${namespaceLabels(linuxStageRunner)}) || ${mergeCi1Labels}`)
 
 /** Extra PR jobs use idle general slots; merges always use the priority reserve. */
 export const secondaryStageRunsOn = pickedOr(

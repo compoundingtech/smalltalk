@@ -30,6 +30,7 @@ import {
   pickRunnerJob,
   pickRunnerJobId,
   primaryTestRunsOn,
+  testBuildRunsOn,
   pnpmStoreEnv,
   supportingLinuxRunsOn,
   supportingStageRunsOn,
@@ -464,7 +465,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     'linux-test-build': {
       name: 'linux-test-build',
       ...afterPickRunner,
-      'runs-on': linuxStageRunsOn,
+      'runs-on': testBuildRunsOn,
       'timeout-minutes': 120,
       env: { ...buildEnv, CI_CACHE_DEV_SHELL: 'default' },
       outputs: {
