@@ -3167,6 +3167,44 @@ export const PairingComplete = /*#__PURE__*/ (() => Schema.Struct({
 export type PairingComplete = typeof PairingComplete.Type
 export type PairingCompleteEncoded = typeof PairingComplete.Encoded
 
+/** Only the paired member stores the target. The token is never a graph claim or response field. */
+export const PushRegistration = /*#__PURE__*/ (() => Schema.Struct({
+  "app_version": Schema.String.check(Schema.isPattern(new RegExp("^[!-~]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(64)),
+  "bundle_id": Schema.String.check(Schema.isPattern(new RegExp("^[A-Za-z0-9.-]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(255)),
+  "environment": Schema.Literals(["development","production"]),
+  "token": Schema.String.check(Schema.isPattern(new RegExp("^([0-9a-f]{2}){32,256}$", "u")))
+}).annotate({ identifier: "PushRegistration", description: "Only the paired member stores the target. The token is never a graph claim or response field." }))()
+export type PushRegistration = typeof PushRegistration.Type
+export type PushRegistrationEncoded = typeof PushRegistration.Encoded
+
+export const PushRegistrationAccepted = /*#__PURE__*/ (() => Schema.Struct({
+  "registered": Schema.Literal(true)
+}).annotate({ identifier: "PushRegistrationAccepted" }))()
+export type PushRegistrationAccepted = typeof PushRegistrationAccepted.Type
+export type PushRegistrationAcceptedEncoded = typeof PushRegistrationAccepted.Encoded
+
+export const PushRegistrationResponse = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "request_id": RequestId,
+  "value": PushRegistrationAccepted
+}).annotate({ identifier: "PushRegistrationResponse" }))()
+export type PushRegistrationResponse = typeof PushRegistrationResponse.Type
+export type PushRegistrationResponseEncoded = typeof PushRegistrationResponse.Encoded
+
+export const PushRevocationAccepted = /*#__PURE__*/ (() => Schema.Struct({
+  "revoked": Schema.Literal(true)
+}).annotate({ identifier: "PushRevocationAccepted" }))()
+export type PushRevocationAccepted = typeof PushRevocationAccepted.Type
+export type PushRevocationAcceptedEncoded = typeof PushRevocationAccepted.Encoded
+
+export const PushRevocationResponse = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "request_id": RequestId,
+  "value": PushRevocationAccepted
+}).annotate({ identifier: "PushRevocationResponse" }))()
+export type PushRevocationResponse = typeof PushRevocationResponse.Type
+export type PushRevocationResponseEncoded = typeof PushRevocationResponse.Encoded
+
 export const ResourceHeader = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   /** Resource family. */

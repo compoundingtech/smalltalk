@@ -1490,6 +1490,33 @@ export type PublicationDefinition = {
   token: string;
 };
 
+export type PushRegistration = {
+  app_version: string;
+  bundle_id: string;
+  environment: "development" | "production";
+  token: string;
+};
+
+export type PushRegistrationAccepted = {
+  registered: true;
+};
+
+export type PushRegistrationResponse = {
+  api_version: "st3.client.v0";
+  request_id: RequestId;
+  value: PushRegistrationAccepted;
+};
+
+export type PushRevocationAccepted = {
+  revoked: true;
+};
+
+export type PushRevocationResponse = {
+  api_version: "st3.client.v0";
+  request_id: RequestId;
+  value: PushRevocationAccepted;
+};
+
 export type ReplicatedNotice = {
   complete: boolean;
   owner_host_id: Id;
