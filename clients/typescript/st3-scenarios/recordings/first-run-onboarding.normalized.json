@@ -1,0 +1,4660 @@
+[
+  {
+    "kind": "header",
+    "ordinal": 0,
+    "receive_ms": -273,
+    "socket_id": null,
+    "value": {
+      "daemon_build": "st 0.1.0 — running from local source (10f03e9d6, 55 minutes ago, dirty)",
+      "daemon_sha256": "62de0698878a718f853af5cbd5f346059a07d5b78406817b11fff79fc4edb8a4",
+      "format_version": 1,
+      "script_format_version": 2,
+      "started_at": "2030-01-01T11:59:31.063Z",
+      "world": "first-run-onboarding"
+    }
+  },
+  {
+    "kind": "command",
+    "ordinal": 1,
+    "receive_ms": -5,
+    "socket_id": "socket#1",
+    "value": {
+      "actor": null,
+      "collection": "agents",
+      "id": "agents",
+      "kind": "subscribe",
+      "limit": 100,
+      "status": null
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 2,
+    "receive_ms": -3,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "agents",
+      "has_more": false,
+      "id": "agents",
+      "items": [],
+      "kind": "snapshot",
+      "order": [],
+      "snapshot": {
+        "created_at": "2030-01-01T12:00:00.113Z",
+        "host_id": "host/quarry",
+        "id": "snapshot/host/quarry/store#1",
+        "projection_version": "client-projection.v0",
+        "published_at": "2030-01-01T12:00:00.168Z",
+        "store_index": "store#1"
+      }
+    }
+  },
+  {
+    "kind": "command",
+    "ordinal": 3,
+    "receive_ms": -2,
+    "socket_id": "socket#1",
+    "value": {
+      "actor": null,
+      "collection": "terminals",
+      "id": "terminals",
+      "kind": "subscribe",
+      "limit": 100,
+      "status": null
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 4,
+    "receive_ms": 0,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "terminals",
+      "has_more": false,
+      "id": "terminals",
+      "items": [],
+      "kind": "snapshot",
+      "order": [],
+      "snapshot": {
+        "created_at": "2030-01-01T12:00:00.174Z",
+        "host_id": "host/quarry",
+        "id": "snapshot/host/quarry/store#2",
+        "projection_version": "client-projection.v0",
+        "store_index": "store#2"
+      }
+    }
+  },
+  {
+    "kind": "baseline",
+    "ordinal": 5,
+    "receive_ms": 1,
+    "socket_id": null,
+    "value": {
+      "last_pre_timeline_ordinal": 4
+    }
+  },
+  {
+    "kind": "command",
+    "ordinal": 6,
+    "receive_ms": 1,
+    "socket_id": "socket#1",
+    "value": {
+      "id": "agents",
+      "kind": "unsubscribe"
+    }
+  },
+  {
+    "kind": "command",
+    "ordinal": 7,
+    "receive_ms": 1,
+    "socket_id": "socket#1",
+    "value": {
+      "id": "terminals",
+      "kind": "unsubscribe"
+    }
+  },
+  {
+    "kind": "http",
+    "ordinal": 8,
+    "receive_ms": 3983,
+    "socket_id": null,
+    "value": {
+      "body": {
+        "api_version": "st3.client.v0",
+        "request_id": "request#1",
+        "snapshot": {
+          "created_at": "2030-01-01T12:00:04.145Z",
+          "host_id": "host/quarry",
+          "id": "snapshot/host/quarry/store#4",
+          "projection_version": "client-projection.v0",
+          "store_index": "store#4"
+        },
+        "value": {
+          "columns": 80,
+          "cursor": {
+            "blinking": false,
+            "column": 0,
+            "row": 1,
+            "style": "block",
+            "visible": true
+          },
+          "kind": "terminal-screen",
+          "lines": [
+            {
+              "redacted": false,
+              "row": 0,
+              "runs": [
+                {
+                  "cells": 22,
+                  "text": "scenario harness ready"
+                }
+              ],
+              "text": "scenario harness ready",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 1,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 2,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 3,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 4,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 5,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 6,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 7,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 8,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 9,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 10,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 11,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 12,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 13,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 14,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 15,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 16,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 17,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 18,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 19,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 20,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 21,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 22,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 23,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            }
+          ],
+          "modes": {
+            "alternate_screen": false,
+            "application_cursor": false,
+            "application_keypad": false,
+            "bracketed_paste": false,
+            "focus_events": false,
+            "kitty_keyboard": 0,
+            "mouse_encoding": "default",
+            "mouse_tracking": "none"
+          },
+          "next_sequence": 2875042815661289,
+          "revision": "a36d611bdd4e9df295b251af",
+          "rows": 24,
+          "runtime_incarnation": "incarnation#1",
+          "terminal_id": "terminal/example-sprout-builder",
+          "title": "example.sprout.builder",
+          "truncated": false
+        }
+      },
+      "method": "GET",
+      "path": "/v1/client/terminals/agent%2Fexample%2Fsprout%2Fbuilder/screen",
+      "query": "",
+      "request_body": null,
+      "status": 200
+    }
+  },
+  {
+    "kind": "attach",
+    "ordinal": 9,
+    "receive_ms": 3988,
+    "socket_id": null,
+    "value": {
+      "api_version": "st3.client.v0",
+      "fence": {
+        "runtime_incarnation": "incarnation#1",
+        "snapshot_id": "snapshot/host/quarry/store#4",
+        "subject_revisions": {}
+      },
+      "id": "action/example-attach",
+      "idempotency_key": "scenario-example-attach",
+      "parameters": {
+        "target_id": "terminal/example-sprout-builder"
+      },
+      "type": "terminal.attach"
+    }
+  },
+  {
+    "kind": "http",
+    "ordinal": 10,
+    "receive_ms": 4005,
+    "socket_id": null,
+    "value": {
+      "body": {
+        "api_version": "st3.client.v0",
+        "request_id": "request#2",
+        "snapshot": {
+          "created_at": "2030-01-01T12:00:04.145Z",
+          "host_id": "host/quarry",
+          "id": "snapshot/host/quarry/store#4",
+          "projection_version": "client-projection.v0",
+          "store_index": "store#4"
+        },
+        "value": {
+          "action_id": "action/example-attach",
+          "affected_ids": [
+            "attachment#1"
+          ],
+          "kind": "action-result",
+          "operation_id": "operation#1",
+          "snapshot_id": "snapshot/host/quarry/store#5",
+          "status": "completed",
+          "terminal_attachment": {
+            "attachment_id": "attachment#1",
+            "expires_at": "2030-01-01T12:05:04.195Z",
+            "owner_host_id": "host/quarry",
+            "retry_hint": null,
+            "reusable": true,
+            "runtime_incarnation": "incarnation#1",
+            "state": "available",
+            "stream_capability": "capability#1",
+            "stream_url": "/v1/client/terminals/agent%2Fexample%2Fsprout%2Fbuilder/stream?incarnation=incarnation%231",
+            "terminal_id": "terminal/example-sprout-builder",
+            "ttl_s": 300
+          }
+        }
+      },
+      "method": "POST",
+      "path": "/v1/client/actions",
+      "query": "",
+      "request_body": {
+        "api_version": "st3.client.v0",
+        "fence": {
+          "runtime_incarnation": "incarnation#1",
+          "snapshot_id": "snapshot/host/quarry/store#4",
+          "subject_revisions": {}
+        },
+        "id": "action/example-attach",
+        "idempotency_key": "scenario-example-attach",
+        "parameters": {
+          "target_id": "terminal/example-sprout-builder"
+        },
+        "type": "terminal.attach"
+      },
+      "status": 200
+    }
+  },
+  {
+    "kind": "command",
+    "ordinal": 11,
+    "receive_ms": 4006,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "conversation": "agent/example/sprout/builder",
+      "id": "conversation",
+      "kind": "subscribe"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 12,
+    "receive_ms": 4011,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "detail": "starting",
+            "status": "queued"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-1",
+          "revision": 1,
+          "role": "system",
+          "sequence": 28,
+          "timestamp": "2030-01-01T12:00:02.211Z",
+          "type": "status"
+        },
+        {
+          "body": {
+            "code": "transcript-not-bound",
+            "details": {
+              "availability": "transcript-unavailable",
+              "claim_id": "3f3b040103f98ed72f19c31066060e2eeca8618abefc84241f71b2677eced2ed",
+              "driver": "claude",
+              "not_yet": true
+            },
+            "message": "transcript not bound: the Claude driver has not reported which process owns the seat",
+            "retryable": true
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-2",
+          "revision": 1,
+          "role": "system",
+          "sequence": 30,
+          "timestamp": "2030-01-01T12:00:02.211Z",
+          "type": "error"
+        },
+        {
+          "body": {
+            "detail": "starting",
+            "status": "queued"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-3",
+          "revision": 1,
+          "role": "system",
+          "sequence": 32,
+          "timestamp": "2030-01-01T12:00:02.306Z",
+          "type": "status"
+        },
+        {
+          "body": {
+            "detail": "running",
+            "status": "running"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-4",
+          "revision": 1,
+          "role": "system",
+          "sequence": 36,
+          "timestamp": "2030-01-01T12:00:04.145Z",
+          "type": "status"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "command",
+    "ordinal": 13,
+    "receive_ms": 4013,
+    "socket_id": "socket#1",
+    "value": {
+      "capability": "capability#1",
+      "collection": "terminal",
+      "id": "terminal",
+      "incarnation": "incarnation#1",
+      "kind": "subscribe",
+      "terminal": "terminal/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 14,
+    "receive_ms": 4018,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "terminal",
+      "id": "terminal",
+      "kind": "screen",
+      "snapshot": {
+        "created_at": "2030-01-01T12:00:04.198Z",
+        "host_id": "host/quarry",
+        "id": "snapshot/host/quarry/store#5",
+        "projection_version": "client-projection.v0",
+        "store_index": "store#5"
+      },
+      "value": {
+        "columns": 80,
+        "cursor": {
+          "blinking": false,
+          "column": 0,
+          "row": 1,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 22,
+                "text": "scenario harness ready"
+              }
+            ],
+            "text": "scenario harness ready",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 16,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 17,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 18,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 19,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 20,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 21,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 22,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 23,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "kitty_keyboard": 0,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 2875042815661289,
+        "revision": "a36d611bdd4e9df295b251af",
+        "rows": 24,
+        "runtime_incarnation": "incarnation#1",
+        "terminal_id": "terminal/example-sprout-builder",
+        "title": "example.sprout.builder",
+        "truncated": false
+      }
+    }
+  },
+  {
+    "kind": "harness",
+    "ordinal": 15,
+    "receive_ms": 4023,
+    "socket_id": null,
+    "value": {
+      "agent": "agent/example/sprout/builder",
+      "answer": "The first mission is running. Checking sprout now.",
+      "command": null,
+      "prompt": "Launch the smoke check.",
+      "revisions": [],
+      "timestamp": "2030-01-01T12:00:04.219Z",
+      "tool": null,
+      "turn": 0
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 16,
+    "receive_ms": 4102,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "code": "claude-channel-unattached",
+            "details": {
+              "claim_id": "96dc3ee57954105d0956c7a69caa54f5fd5b88f50a4042195009cc4c49ca5f73",
+              "severity": "warning"
+            },
+            "message": "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.",
+            "retryable": true
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-5",
+          "revision": 1,
+          "role": "system",
+          "sequence": 48,
+          "timestamp": "2030-01-01T12:00:04.258Z",
+          "type": "error"
+        }
+      ],
+      "kind": "conversation",
+      "replace": false,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 17,
+    "receive_ms": 4103,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "harness",
+    "ordinal": 18,
+    "receive_ms": 4106,
+    "socket_id": null,
+    "value": {
+      "agent": "agent/example/sprout/builder",
+      "answer": "Observed shell result for Launch the smoke check..",
+      "command": "printf '%s\\n' '$ pnpm test smoke' '\u001b[32m3 tests passed; 0 failures\u001b[0m'",
+      "prompt": "Launch the smoke check.",
+      "revisions": [],
+      "timestamp": "2030-01-01T12:00:04.302Z",
+      "tool": {
+        "id": "call-builder-4",
+        "input": {
+          "command": "pnpm test smoke"
+        },
+        "name": "shell",
+        "result": "3 tests passed; 0 failures"
+      },
+      "turn": 1
+    }
+  },
+  {
+    "kind": "pty_output",
+    "ordinal": 19,
+    "receive_ms": 4237,
+    "socket_id": null,
+    "value": {
+      "terminal": "terminal/example-sprout-builder",
+      "text": "$ pnpm test smoke\n\u001b[32m3 tests passed; 0 failures\u001b[0m\n",
+      "turn": 1
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 20,
+    "receive_ms": 4238,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 21,
+    "receive_ms": 4241,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 22,
+    "receive_ms": 4245,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 23,
+    "receive_ms": 4248,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 24,
+    "receive_ms": 4251,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9568/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-12"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9568,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9569/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9569,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": false,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 25,
+    "receive_ms": 4253,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "terminal",
+      "id": "terminal",
+      "kind": "screen",
+      "snapshot": {
+        "created_at": "2030-01-01T12:00:04.338Z",
+        "host_id": "host/quarry",
+        "id": "snapshot/host/quarry/store#6",
+        "projection_version": "client-projection.v0",
+        "store_index": "store#6"
+      },
+      "value": {
+        "columns": 80,
+        "cursor": {
+          "blinking": false,
+          "column": 0,
+          "row": 5,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 22,
+                "text": "scenario harness ready"
+              }
+            ],
+            "text": "scenario harness ready",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 17,
+                "text": "$ pnpm test smoke"
+              }
+            ],
+            "text": "$ pnpm test smoke",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 26,
+                "fg": 2,
+                "text": "3 tests passed; 0 failures"
+              }
+            ],
+            "text": "3 tests passed; 0 failures",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "scenario turn 1 output complete"
+              }
+            ],
+            "text": "scenario turn 1 output complete",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 16,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 17,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 18,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 19,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 20,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 21,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 22,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 23,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "kitty_keyboard": 0,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 3356830379042117,
+        "revision": "bed04fa506545ec6eeb0b42f",
+        "rows": 24,
+        "runtime_incarnation": "incarnation#1",
+        "terminal_id": "terminal/example-sprout-builder",
+        "title": "example.sprout.builder",
+        "truncated": false
+      }
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 26,
+    "receive_ms": 4260,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9568/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-12"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9568,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9569/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9569,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 27,
+    "receive_ms": 4265,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9568/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-12"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9568,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9569/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9569,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-13824/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "id": "call-builder-4",
+                          "input": {
+                            "command": "pnpm test smoke"
+                          },
+                          "name": "shell",
+                          "type": "tool_use"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ecde7c89-9cb8-5d44-89fe-f055d96e63a9"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-15"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-16",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13824,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm test smoke"
+            },
+            "blocks": [
+              {
+                "id": "native-13825/0",
+                "kind": "tool_call",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_call"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-17",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13825,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_call"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19504/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "content": "3 tests passed; 0 failures",
+                          "tool_use_id": "call-builder-4",
+                          "type": "tool_result"
+                        }
+                      ],
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "d5e0fcbb-3867-5369-9cec-4e9a180b2533"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-18"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-19",
+          "revision": 1,
+          "role": "user",
+          "sequence": 19504,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19505/0",
+                "kind": "tool_output",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_result"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "content": "3 tests passed; 0 failures",
+            "media_type": "application/json",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-20",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 19505,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_result"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 28,
+    "receive_ms": 4273,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9568/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-12"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9568,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9569/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9569,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-13824/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "id": "call-builder-4",
+                          "input": {
+                            "command": "pnpm test smoke"
+                          },
+                          "name": "shell",
+                          "type": "tool_use"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ecde7c89-9cb8-5d44-89fe-f055d96e63a9"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-15"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-16",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13824,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm test smoke"
+            },
+            "blocks": [
+              {
+                "id": "native-13825/0",
+                "kind": "tool_call",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_call"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-17",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13825,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_call"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19504/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "content": "3 tests passed; 0 failures",
+                          "tool_use_id": "call-builder-4",
+                          "type": "tool_result"
+                        }
+                      ],
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "d5e0fcbb-3867-5369-9cec-4e9a180b2533"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-18"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-19",
+          "revision": 1,
+          "role": "user",
+          "sequence": 19504,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19505/0",
+                "kind": "tool_output",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_result"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "content": "3 tests passed; 0 failures",
+            "media_type": "application/json",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-20",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 19505,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_result"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24944/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "Observed shell result for Launch the smoke check..",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-21"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-22",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24944,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24945/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Observed shell result for Launch the smoke check.."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-23",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24945,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "harness",
+    "ordinal": 29,
+    "receive_ms": 4281,
+    "socket_id": null,
+    "value": {
+      "agent": "agent/example/sprout/builder",
+      "answer": "The first run is green: 3 tests passed, 0 failures.",
+      "command": null,
+      "prompt": "Launch the smoke check.",
+      "revisions": [],
+      "timestamp": "2030-01-01T12:00:04.477Z",
+      "tool": null,
+      "turn": 2
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 30,
+    "receive_ms": 4360,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9568/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-12"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9568,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9569/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9569,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-13824/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "id": "call-builder-4",
+                          "input": {
+                            "command": "pnpm test smoke"
+                          },
+                          "name": "shell",
+                          "type": "tool_use"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ecde7c89-9cb8-5d44-89fe-f055d96e63a9"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-15"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-16",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13824,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm test smoke"
+            },
+            "blocks": [
+              {
+                "id": "native-13825/0",
+                "kind": "tool_call",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_call"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-17",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13825,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_call"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19504/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "content": "3 tests passed; 0 failures",
+                          "tool_use_id": "call-builder-4",
+                          "type": "tool_result"
+                        }
+                      ],
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "d5e0fcbb-3867-5369-9cec-4e9a180b2533"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-18"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-19",
+          "revision": 1,
+          "role": "user",
+          "sequence": 19504,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19505/0",
+                "kind": "tool_output",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_result"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "content": "3 tests passed; 0 failures",
+            "media_type": "application/json",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-20",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 19505,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_result"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24944/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "Observed shell result for Launch the smoke check..",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-21"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-22",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24944,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24945/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Observed shell result for Launch the smoke check.."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-23",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24945,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 31,
+    "receive_ms": 4369,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9568/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-12"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9568,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9569/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9569,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-13824/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "id": "call-builder-4",
+                          "input": {
+                            "command": "pnpm test smoke"
+                          },
+                          "name": "shell",
+                          "type": "tool_use"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ecde7c89-9cb8-5d44-89fe-f055d96e63a9"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-15"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-16",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13824,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm test smoke"
+            },
+            "blocks": [
+              {
+                "id": "native-13825/0",
+                "kind": "tool_call",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_call"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-17",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13825,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_call"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19504/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "content": "3 tests passed; 0 failures",
+                          "tool_use_id": "call-builder-4",
+                          "type": "tool_result"
+                        }
+                      ],
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "d5e0fcbb-3867-5369-9cec-4e9a180b2533"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-18"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-19",
+          "revision": 1,
+          "role": "user",
+          "sequence": 19504,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19505/0",
+                "kind": "tool_output",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_result"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "content": "3 tests passed; 0 failures",
+            "media_type": "application/json",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-20",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 19505,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_result"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24944/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "Observed shell result for Launch the smoke check..",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-21"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-22",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24944,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24945/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Observed shell result for Launch the smoke check.."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-23",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24945,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 32,
+    "receive_ms": 4379,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "has_more": false,
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-16/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "user",
+                    "uuid": "27177e18-4c2d-517c-84af-8a46405ca683"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-6"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-17/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4272/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first mission is running. Checking sprout now.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:41.954Z",
+                    "type": "assistant",
+                    "uuid": "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-9"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4272,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-4273/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first mission is running. Checking sprout now."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 4273,
+          "timestamp": "2030-01-01T12:00:04.219Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9568/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-12"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9568,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-9569/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9569,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-13824/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "id": "call-builder-4",
+                          "input": {
+                            "command": "pnpm test smoke"
+                          },
+                          "name": "shell",
+                          "type": "tool_use"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ecde7c89-9cb8-5d44-89fe-f055d96e63a9"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-15"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-16",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13824,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm test smoke"
+            },
+            "blocks": [
+              {
+                "id": "native-13825/0",
+                "kind": "tool_call",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_call"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-17",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13825,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_call"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19504/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "content": "3 tests passed; 0 failures",
+                          "tool_use_id": "call-builder-4",
+                          "type": "tool_result"
+                        }
+                      ],
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "user",
+                    "uuid": "d5e0fcbb-3867-5369-9cec-4e9a180b2533"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-18"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-19",
+          "revision": 1,
+          "role": "user",
+          "sequence": 19504,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-19505/0",
+                "kind": "tool_output",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "tool_result"
+              }
+            ],
+            "call_id": "call-builder-4",
+            "content": "3 tests passed; 0 failures",
+            "media_type": "application/json",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-20",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 19505,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "tool_result"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24944/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "Observed shell result for Launch the smoke check..",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.037Z",
+                    "type": "assistant",
+                    "uuid": "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-21"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-22",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24944,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-24945/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Observed shell result for Launch the smoke check.."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-23",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 24945,
+          "timestamp": "2030-01-01T12:00:04.302Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": true,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "frame",
+    "ordinal": 33,
+    "receive_ms": 4389,
+    "socket_id": "socket#1",
+    "value": {
+      "collection": "conversation",
+      "id": "conversation",
+      "items": [
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-30240/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": "Launch the smoke check.",
+                      "role": "user"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.212Z",
+                    "type": "user",
+                    "uuid": "88164bfc-05a1-51b2-ae5e-fc9cd6cbcaa0"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-24"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-25",
+          "revision": 1,
+          "role": "user",
+          "sequence": 30240,
+          "timestamp": "2030-01-01T12:00:04.477Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-30241/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "Launch the smoke check."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-26",
+          "revision": 1,
+          "role": "user",
+          "sequence": 30241,
+          "timestamp": "2030-01-01T12:00:04.477Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-34496/source",
+                "kind": "source_record",
+                "payload": {
+                  "raw": {
+                    "cwd": "~/src/sprout/.worktrees/builder",
+                    "message": {
+                      "content": [
+                        {
+                          "text": "The first run is green: 3 tests passed, 0 failures.",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "assistant"
+                    },
+                    "sessionId": "example-atlas-builder",
+                    "timestamp": "2026-10-13T06:08:42.212Z",
+                    "type": "assistant",
+                    "uuid": "3e59d868-c554-5ea7-abe5-c140a7250f3e"
+                  }
+                },
+                "source_type": "claude",
+                "visibility": "internal"
+              }
+            ],
+            "message_id": "message/scenario-first-run-onboarding/captured-27"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-28",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 34496,
+          "timestamp": "2030-01-01T12:00:04.477Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "blocks": [
+              {
+                "id": "native-34497/0",
+                "kind": "text",
+                "payload": {
+                  "body_ref": true
+                },
+                "source_type": "content"
+              }
+            ],
+            "media_type": "text/plain",
+            "text": "The first run is green: 3 tests passed, 0 failures."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-first-run-onboarding/captured-29",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 34497,
+          "timestamp": "2030-01-01T12:00:04.477Z",
+          "type": "content"
+        }
+      ],
+      "kind": "conversation",
+      "replace": false,
+      "session_id": "session/example-sprout-builder"
+    }
+  },
+  {
+    "kind": "http",
+    "ordinal": 34,
+    "receive_ms": 4401,
+    "socket_id": null,
+    "value": {
+      "body": {
+        "api_version": "st3.client.v0",
+        "request_id": "request#3",
+        "snapshot": {
+          "created_at": "2030-01-01T12:00:00.229Z",
+          "host_id": "host/quarry",
+          "id": "snapshot/host/quarry/store#3",
+          "projection_version": "client-projection.v0",
+          "published_at": "2030-01-01T12:00:01.176Z",
+          "store_index": "store#3"
+        },
+        "value": {
+          "collection": "agents",
+          "filters": {},
+          "items": [
+            {
+              "active_work_count": 0,
+              "activity": null,
+              "ask": null,
+              "blocked_on": null,
+              "checkout": null,
+              "current_session_id": null,
+              "current_work": [],
+              "current_work_ids": [],
+              "driver": "claude",
+              "fault": null,
+              "handoff": null,
+              "harness_error_state": null,
+              "harness_state": null,
+              "host_id": "host/quarry",
+              "id": "agent/example/sprout/builder",
+              "incarnation_id": null,
+              "kind": "agent",
+              "last_activity_at": null,
+              "name": "example/sprout/builder",
+              "next_work": null,
+              "next_work_id": null,
+              "observation": "missing",
+              "operational": {
+                "actionable": false,
+                "layer": "current",
+                "reasons": [
+                  "unhealthy"
+                ]
+              },
+              "owner_run_id": null,
+              "queued_work_count": 0,
+              "reachability": "indeterminate",
+              "reason": null,
+              "revision": "e0caf166b0bd837b523e6310be265eed7e146ced3169b9ad50cfec1b396e7ccc",
+              "rollout": null,
+              "runtime_ids": [],
+              "silent_since": null,
+              "since": null,
+              "state": "desired",
+              "subagents": [],
+              "suspension": null,
+              "todo": null,
+              "under": [],
+              "upcoming_work": [],
+              "upcoming_work_ids": [],
+              "updated_at": "2030-01-01T12:00:00.229Z",
+              "usage": null,
+              "workspace": "~/src/sprout/.worktrees/builder"
+            }
+          ],
+          "kind": "page",
+          "page": {
+            "has_more": false,
+            "limit": 50
+          }
+        }
+      },
+      "method": "GET",
+      "path": "/v1/client/agents",
+      "query": "",
+      "request_body": null,
+      "status": 200
+    }
+  },
+  {
+    "kind": "http",
+    "ordinal": 35,
+    "receive_ms": 4413,
+    "socket_id": null,
+    "value": {
+      "body": {
+        "api_version": "st3.client.v0",
+        "request_id": "request#4",
+        "snapshot": {
+          "created_at": "2030-01-01T12:00:04.550Z",
+          "host_id": "host/quarry",
+          "id": "snapshot/host/quarry/store#7",
+          "projection_version": "client-projection.v0",
+          "store_index": "store#7"
+        },
+        "value": {
+          "items": [
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-6"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-7",
+              "revision": 1,
+              "role": "user",
+              "sequence": 16,
+              "timestamp": "2030-01-01T12:00:04.219Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "media_type": "text/plain",
+                "text": "Launch the smoke check."
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-8",
+              "revision": 1,
+              "role": "user",
+              "sequence": 17,
+              "timestamp": "2030-01-01T12:00:04.219Z",
+              "type": "content"
+            },
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-9"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-10",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 4272,
+              "timestamp": "2030-01-01T12:00:04.219Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "media_type": "text/plain",
+                "text": "The first mission is running. Checking sprout now."
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-11",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 4273,
+              "timestamp": "2030-01-01T12:00:04.219Z",
+              "type": "content"
+            },
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-12"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-13",
+              "revision": 1,
+              "role": "user",
+              "sequence": 9568,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "media_type": "text/plain",
+                "text": "Launch the smoke check."
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-14",
+              "revision": 1,
+              "role": "user",
+              "sequence": 9569,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "content"
+            },
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-15"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-16",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 13824,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "arguments": {
+                  "command": "pnpm test smoke"
+                },
+                "call_id": "call-builder-4",
+                "name": "shell"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-17",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 13825,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "tool_call"
+            },
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-18"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-19",
+              "revision": 1,
+              "role": "user",
+              "sequence": 19504,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "call_id": "call-builder-4",
+                "content": "3 tests passed; 0 failures",
+                "media_type": "application/json",
+                "status": "success"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-20",
+              "revision": 1,
+              "role": "tool",
+              "sequence": 19505,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "tool_result"
+            },
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-21"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-22",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 24944,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "media_type": "text/plain",
+                "text": "Observed shell result for Launch the smoke check.."
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-23",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 24945,
+              "timestamp": "2030-01-01T12:00:04.302Z",
+              "type": "content"
+            },
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-24"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-25",
+              "revision": 1,
+              "role": "user",
+              "sequence": 30240,
+              "timestamp": "2030-01-01T12:00:04.477Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "media_type": "text/plain",
+                "text": "Launch the smoke check."
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-26",
+              "revision": 1,
+              "role": "user",
+              "sequence": 30241,
+              "timestamp": "2030-01-01T12:00:04.477Z",
+              "type": "content"
+            },
+            {
+              "body": {
+                "message_id": "message/scenario-first-run-onboarding/captured-27"
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-28",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 34496,
+              "timestamp": "2030-01-01T12:00:04.477Z",
+              "type": "message"
+            },
+            {
+              "body": {
+                "media_type": "text/plain",
+                "text": "The first run is green: 3 tests passed, 0 failures."
+              },
+              "final": true,
+              "id": "timeline-entry/scenario-first-run-onboarding/captured-29",
+              "revision": 1,
+              "role": "assistant",
+              "sequence": 34497,
+              "timestamp": "2030-01-01T12:00:04.477Z",
+              "type": "content"
+            }
+          ],
+          "kind": "timeline-page",
+          "page": {
+            "has_more": false,
+            "limit": 50
+          },
+          "session_id": "session/example-sprout-builder"
+        }
+      },
+      "method": "GET",
+      "path": "/v1/client/sessions/agent/example/sprout/builder/timeline",
+      "query": "",
+      "request_body": null,
+      "status": 200
+    }
+  },
+  {
+    "kind": "http",
+    "ordinal": 36,
+    "receive_ms": 4427,
+    "socket_id": null,
+    "value": {
+      "body": {
+        "api_version": "st3.client.v0",
+        "request_id": "request#5",
+        "snapshot": {
+          "created_at": "2030-01-01T12:00:04.550Z",
+          "host_id": "host/quarry",
+          "id": "snapshot/host/quarry/store#7",
+          "projection_version": "client-projection.v0",
+          "store_index": "store#7"
+        },
+        "value": {
+          "columns": 80,
+          "cursor": {
+            "blinking": false,
+            "column": 0,
+            "row": 5,
+            "style": "block",
+            "visible": true
+          },
+          "kind": "terminal-screen",
+          "lines": [
+            {
+              "redacted": false,
+              "row": 0,
+              "runs": [
+                {
+                  "cells": 22,
+                  "text": "scenario harness ready"
+                }
+              ],
+              "text": "scenario harness ready",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 1,
+              "runs": [
+                {
+                  "cells": 17,
+                  "text": "$ pnpm test smoke"
+                }
+              ],
+              "text": "$ pnpm test smoke",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 2,
+              "runs": [
+                {
+                  "cells": 26,
+                  "fg": 2,
+                  "text": "3 tests passed; 0 failures"
+                }
+              ],
+              "text": "3 tests passed; 0 failures",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 3,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 4,
+              "runs": [
+                {
+                  "cells": 31,
+                  "text": "scenario turn 1 output complete"
+                }
+              ],
+              "text": "scenario turn 1 output complete",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 5,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 6,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 7,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 8,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 9,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 10,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 11,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 12,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 13,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 14,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 15,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 16,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 17,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 18,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 19,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 20,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 21,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 22,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            },
+            {
+              "redacted": false,
+              "row": 23,
+              "runs": [],
+              "text": "",
+              "truncated": false,
+              "wrapped": false
+            }
+          ],
+          "modes": {
+            "alternate_screen": false,
+            "application_cursor": false,
+            "application_keypad": false,
+            "bracketed_paste": false,
+            "focus_events": false,
+            "kitty_keyboard": 0,
+            "mouse_encoding": "default",
+            "mouse_tracking": "none"
+          },
+          "next_sequence": 3356830379042117,
+          "revision": "bed04fa506545ec6eeb0b42f",
+          "rows": 24,
+          "runtime_incarnation": "incarnation#1",
+          "terminal_id": "terminal/example-sprout-builder",
+          "title": "example.sprout.builder",
+          "truncated": false
+        }
+      },
+      "method": "GET",
+      "path": "/v1/client/terminals/agent%2Fexample%2Fsprout%2Fbuilder/screen",
+      "query": "",
+      "request_body": null,
+      "status": 200
+    }
+  },
+  {
+    "kind": "command",
+    "ordinal": 37,
+    "receive_ms": 4433,
+    "socket_id": "socket#1",
+    "value": {
+      "kind": "disconnect"
+    }
+  }
+]

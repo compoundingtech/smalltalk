@@ -1,0 +1,199 @@
+{
+  "agent": "agent/example/atlas/builder",
+  "agents": [
+    {
+      "agent": "agent/example/atlas/builder",
+      "host": "host/meadow"
+    }
+  ],
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "empty_baseline": false,
+  "format_version": 2,
+  "historical_turns": 2,
+  "host": "host/meadow",
+  "id_map": {
+    "16fdea40-d13b-5957-b2e5-7a45ad595faf": "message/scenario-ci-failing-fix/captured-45",
+    "19a49f27-ea8c-5f6b-b30c-6958f6fd3829": "message/scenario-ci-failing-fix/captured-42",
+    "22653a08-a560-5d20-960d-c982844929e0": "message/scenario-ci-failing-fix/captured-30",
+    "27177e18-4c2d-517c-84af-8a46405ca683": "message/scenario-ci-failing-fix/captured-6",
+    "3375778d-cafa-58a2-99d8-8fe426bb938c": "message/scenario-ci-failing-fix/captured-66",
+    "3e59d868-c554-5ea7-abe5-c140a7250f3e": "message/scenario-ci-failing-fix/captured-27",
+    "4432f5aa-5009-5fdd-b443-810e45400115": "message/scenario-ci-failing-fix/captured-51",
+    "5d53fd56-cc48-5e72-aaf2-4c546e7e2736": "message/scenario-ci-failing-fix/captured-75",
+    "61d6b5a4-1e54-5054-be90-b941ab9f9785": "message/scenario-ci-failing-fix/captured-69",
+    "664b9c46-9d50-524b-aa8d-86f0cdcfba0b": "message/scenario-ci-failing-fix/captured-33",
+    "88164bfc-05a1-51b2-ae5e-fc9cd6cbcaa0": "message/scenario-ci-failing-fix/captured-24",
+    "897ac304-e4ce-55d2-a15c-27ff1f0ba2e7": "message/scenario-ci-failing-fix/captured-72",
+    "96737ffb-ccd2-5bb1-bd11-f3c21d2e18ca": "message/scenario-ci-failing-fix/captured-60",
+    "acde1bb4-4c7e-5cc5-9d2d-6dd8f054d62a": "message/scenario-ci-failing-fix/captured-39",
+    "action/example-attach": "action/example-attach",
+    "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef": "message/scenario-ci-failing-fix/captured-12",
+    "ae6cd380-1440-5b92-8b40-c83035ca7ed5": "message/scenario-ci-failing-fix/captured-57",
+    "af7c34dc-c14e-5a5b-8ba6-4ab2dcb2f98c": "message/scenario-ci-failing-fix/captured-54",
+    "agent/example/atlas/builder": "agent/example/atlas/builder",
+    "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91": "message/scenario-ci-failing-fix/captured-9",
+    "cae19314-dcf0-5974-b0b3-821cd5ea2732": "message/scenario-ci-failing-fix/captured-36",
+    "d5e0fcbb-3867-5369-9cec-4e9a180b2533": "message/scenario-ci-failing-fix/captured-18",
+    "d73a8142-8d45-5cdc-a719-9a664055c669": "message/scenario-ci-failing-fix/captured-63",
+    "e6c7aca8-e795-51b4-8dd3-ba13765c5712": "message/scenario-ci-failing-fix/captured-48",
+    "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f": "message/scenario-ci-failing-fix/captured-21",
+    "ecde7c89-9cb8-5d44-89fe-f055d96e63a9": "message/scenario-ci-failing-fix/captured-15",
+    "host/meadow": "host/meadow",
+    "person/ada": "person/ada",
+    "runtime/example-atlas-builder": "runtime/example-atlas-builder",
+    "runtime/example-atlas-builder-shell": "runtime/example-atlas-builder-shell",
+    "session/c122764a0cb9ce88134f825e": "session/example-atlas-builder",
+    "session/example-atlas-builder": "session/example-atlas-builder",
+    "terminal/agent/example/atlas/builder": "terminal/example-atlas-builder",
+    "terminal/example-atlas-builder": "terminal/example-atlas-builder",
+    "timeline-entry/c122764a0cb9ce88134f825e/189db140bd28f08dca979917": "timeline-entry/scenario-ci-failing-fix/captured-2",
+    "timeline-entry/c122764a0cb9ce88134f825e/1fbbe39436929ac6960f6a48": "timeline-entry/scenario-ci-failing-fix/captured-1",
+    "timeline-entry/c122764a0cb9ce88134f825e/2350249454231cb5f449b375": "timeline-entry/scenario-ci-failing-fix/captured-4",
+    "timeline-entry/c122764a0cb9ce88134f825e/23dbcd887e0d1e5ef98a02c1": "timeline-entry/scenario-ci-failing-fix/captured-3",
+    "timeline-entry/c122764a0cb9ce88134f825e/f73a749684244a65ba7aaa4b": "timeline-entry/scenario-ci-failing-fix/captured-5",
+    "timeline-entry/native-106240": "timeline-entry/scenario-ci-failing-fix/captured-58",
+    "timeline-entry/native-106241": "timeline-entry/scenario-ci-failing-fix/captured-59",
+    "timeline-entry/native-111904": "timeline-entry/scenario-ci-failing-fix/captured-61",
+    "timeline-entry/native-111905": "timeline-entry/scenario-ci-failing-fix/captured-62",
+    "timeline-entry/native-116544": "timeline-entry/scenario-ci-failing-fix/captured-64",
+    "timeline-entry/native-116545": "timeline-entry/scenario-ci-failing-fix/captured-65",
+    "timeline-entry/native-123072": "timeline-entry/scenario-ci-failing-fix/captured-67",
+    "timeline-entry/native-123073": "timeline-entry/scenario-ci-failing-fix/captured-68",
+    "timeline-entry/native-12512": "timeline-entry/scenario-ci-failing-fix/captured-13",
+    "timeline-entry/native-12513": "timeline-entry/scenario-ci-failing-fix/captured-14",
+    "timeline-entry/native-130016": "timeline-entry/scenario-ci-failing-fix/captured-70",
+    "timeline-entry/native-130017": "timeline-entry/scenario-ci-failing-fix/captured-71",
+    "timeline-entry/native-135696": "timeline-entry/scenario-ci-failing-fix/captured-73",
+    "timeline-entry/native-135697": "timeline-entry/scenario-ci-failing-fix/captured-74",
+    "timeline-entry/native-140192": "timeline-entry/scenario-ci-failing-fix/captured-76",
+    "timeline-entry/native-140193": "timeline-entry/scenario-ci-failing-fix/captured-77",
+    "timeline-entry/native-16": "timeline-entry/scenario-ci-failing-fix/captured-7",
+    "timeline-entry/native-17": "timeline-entry/scenario-ci-failing-fix/captured-8",
+    "timeline-entry/native-18464": "timeline-entry/scenario-ci-failing-fix/captured-16",
+    "timeline-entry/native-18465": "timeline-entry/scenario-ci-failing-fix/captured-17",
+    "timeline-entry/native-24368": "timeline-entry/scenario-ci-failing-fix/captured-19",
+    "timeline-entry/native-24369": "timeline-entry/scenario-ci-failing-fix/captured-20",
+    "timeline-entry/native-32688": "timeline-entry/scenario-ci-failing-fix/captured-22",
+    "timeline-entry/native-32689": "timeline-entry/scenario-ci-failing-fix/captured-23",
+    "timeline-entry/native-39680": "timeline-entry/scenario-ci-failing-fix/captured-25",
+    "timeline-entry/native-39681": "timeline-entry/scenario-ci-failing-fix/captured-26",
+    "timeline-entry/native-44320": "timeline-entry/scenario-ci-failing-fix/captured-28",
+    "timeline-entry/native-44321": "timeline-entry/scenario-ci-failing-fix/captured-29",
+    "timeline-entry/native-50144": "timeline-entry/scenario-ci-failing-fix/captured-31",
+    "timeline-entry/native-50145": "timeline-entry/scenario-ci-failing-fix/captured-32",
+    "timeline-entry/native-54784": "timeline-entry/scenario-ci-failing-fix/captured-34",
+    "timeline-entry/native-54785": "timeline-entry/scenario-ci-failing-fix/captured-35",
+    "timeline-entry/native-5968": "timeline-entry/scenario-ci-failing-fix/captured-10",
+    "timeline-entry/native-5969": "timeline-entry/scenario-ci-failing-fix/captured-11",
+    "timeline-entry/native-60928": "timeline-entry/scenario-ci-failing-fix/captured-37",
+    "timeline-entry/native-60929": "timeline-entry/scenario-ci-failing-fix/captured-38",
+    "timeline-entry/native-69664": "timeline-entry/scenario-ci-failing-fix/captured-40",
+    "timeline-entry/native-69665": "timeline-entry/scenario-ci-failing-fix/captured-41",
+    "timeline-entry/native-75344": "timeline-entry/scenario-ci-failing-fix/captured-43",
+    "timeline-entry/native-75345": "timeline-entry/scenario-ci-failing-fix/captured-44",
+    "timeline-entry/native-79984": "timeline-entry/scenario-ci-failing-fix/captured-46",
+    "timeline-entry/native-79985": "timeline-entry/scenario-ci-failing-fix/captured-47",
+    "timeline-entry/native-86912": "timeline-entry/scenario-ci-failing-fix/captured-49",
+    "timeline-entry/native-86913": "timeline-entry/scenario-ci-failing-fix/captured-50",
+    "timeline-entry/native-91552": "timeline-entry/scenario-ci-failing-fix/captured-52",
+    "timeline-entry/native-91553": "timeline-entry/scenario-ci-failing-fix/captured-53",
+    "timeline-entry/native-98832": "timeline-entry/scenario-ci-failing-fix/captured-55",
+    "timeline-entry/native-98833": "timeline-entry/scenario-ci-failing-fix/captured-56"
+  },
+  "person": "person/ada",
+  "reads": [
+    "/v1/client/agents",
+    "/v1/client/sessions/agent/example/atlas/builder/timeline",
+    "/v1/client/terminals/agent%2Fexample%2Fatlas%2Fbuilder/screen"
+  ],
+  "reconnect_after": [],
+  "turns": [
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "The bump installed cleanly, but parseOptions({}) no longer supplies the omitted limit. I will bisect before changing the schema.",
+      "prompt": "main turned red after the option-schema 4.0 to 4.1 lockfile bump. Find the first bad change and make the smallest compatible fix.",
+      "timestamp": "2030-01-01T11:50:00.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for main turned red after the option-schema 4.0 to 4.1 lockfile bump. Find the first bad change and make the smallest compatible fix..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/api test' '\u001b[31mFAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit\nTypeError: Expected a number, received undefined\nat parseOptions (packages/api/src/options.ts:18)\nTests: 1 failed, 47 passed; exit 1\u001b[0m'",
+      "prompt": "main turned red after the option-schema 4.0 to 4.1 lockfile bump. Find the first bad change and make the smallest compatible fix.",
+      "timestamp": "2030-01-01T11:50:04.000Z",
+      "tool": {
+        "id": "call-builder-4",
+        "input": {
+          "command": "pnpm --filter @atlas/api test"
+        },
+        "name": "shell",
+        "result": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit\nTypeError: Expected a number, received undefined\nat parseOptions (packages/api/src/options.ts:18)\nTests: 1 failed, 47 passed; exit 1"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Testing the three candidates between the last green main and the red lockfile bump.",
+      "prompt": "Keep the dependency bump; bisect the red range.",
+      "timestamp": "2030-01-01T12:00:02.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Keep the dependency bump; bisect the red range..",
+      "command": "printf '%s\\n' '$ git bisect run pnpm --filter @atlas/api test' '\u001b[32mcandidate 1: refactor request logging — good\ncandidate 2: update API fixtures — good\ncandidate 3: bump option-schema 4.0 to 4.1 — bad\nfirst bad change: option-schema now validates undefined before applying defaults\u001b[0m'",
+      "prompt": "Keep the dependency bump; bisect the red range.",
+      "timestamp": "2030-01-01T12:00:06.000Z",
+      "tool": {
+        "id": "call-builder-9",
+        "input": {
+          "command": "git bisect run pnpm --filter @atlas/api test"
+        },
+        "name": "shell",
+        "result": "candidate 1: refactor request logging — good\ncandidate 2: update API fixtures — good\ncandidate 3: bump option-schema 4.0 to 4.1 — bad\nfirst bad change: option-schema now validates undefined before applying defaults"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "The dependency bump is the first bad change. Make our omitted-value default explicit at the schema boundary; leave the dependency and all callers alone.",
+      "prompt": "Keep the dependency bump; bisect the red range.",
+      "timestamp": "2030-01-01T12:00:08.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed edit result for Keep the dependency bump; bisect the red range..",
+      "prompt": "Keep the dependency bump; bisect the red range.",
+      "timestamp": "2030-01-01T12:00:14.000Z",
+      "tool": {
+        "id": "call-builder-13",
+        "input": {
+          "new_string": "limit: number().default(20),",
+          "old_string": "limit: number().optional(),",
+          "path": "packages/api/src/options.ts"
+        },
+        "name": "edit",
+        "result": "--- a/packages/api/src/options.ts\n+++ b/packages/api/src/options.ts\n@@ -1,1 +1,1 @@\n-limit: number().optional(),\n+limit: number().default(20),\n"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Keep the dependency bump; bisect the red range..",
+      "command": "printf '%s\\n' '$ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build' '\u001b[32mPASS packages/api/test/parseOptions.test.ts\nTests: 48 passed, 0 failed\nCI retry #2: typecheck, test, build all passed\u001b[0m'",
+      "prompt": "Keep the dependency bump; bisect the red range.",
+      "timestamp": "2030-01-01T12:00:20.000Z",
+      "tool": {
+        "id": "call-builder-15",
+        "input": {
+          "command": "pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+        },
+        "name": "shell",
+        "result": "PASS packages/api/test/parseOptions.test.ts\nTests: 48 passed, 0 failed\nCI retry #2: typecheck, test, build all passed"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Yes. Retry #2 passed all three CI jobs and all 48 tests. option-schema 4.1 remains installed; the patch changes exactly one line.",
+      "prompt": "Is the retry green without a rollback?",
+      "timestamp": "2030-01-01T12:00:29.000Z"
+    }
+  ],
+  "workspace": "~/src/atlas/.worktrees/builder",
+  "world": "ci-failing-fix"
+}

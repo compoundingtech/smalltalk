@@ -62,13 +62,16 @@ describe('decode gate', () => {
 
   it('strict-decodes imported raw and normalized slices at anchor and rebased time', () => {
     expect(decodeRecordings(RECORDINGS_DIR, [ANCHOR_MS, Date.UTC(2101, 6, 4, 3, 2, 1, 7)])).toEqual([])
-  })
+  }, 30_000)
 
   for (const suffix of ['script.json', 'recording.jsonl', 'normalized.json']) {
     it('rejects a corrupt recording ' + suffix + ' input independently', () => {
       const dir = mkdtempSync(join(tmpdir(), 'st3-scenarios-recording-decode-'))
       scratch.push(dir)
-      cpSync(RECORDINGS_DIR, dir, { recursive: true })
+      for (const name of ['script.json', 'recording.jsonl', 'normalized.json']) {
+        const file = 'fleet-mid-refactor-proof.' + name
+        cpSync(join(RECORDINGS_DIR, file), join(dir, file))
+      }
       writeFileSync(join(dir, 'fleet-mid-refactor-proof.' + suffix), '{}\\n')
       expect(decodeRecordings(dir).length).toBeGreaterThan(0)
     })
@@ -78,7 +81,10 @@ describe('decode gate', () => {
     it('detects schema-valid stale content in ' + suffix, () => {
       const dir = mkdtempSync(join(tmpdir(), 'st3-scenarios-recording-stale-'))
       scratch.push(dir)
-      cpSync(RECORDINGS_DIR, dir, { recursive: true })
+      for (const name of ['script.json', 'recording.jsonl', 'normalized.json']) {
+        const file = 'fleet-mid-refactor-proof.' + name
+        cpSync(join(RECORDINGS_DIR, file), join(dir, file))
+      }
       const path = join(dir, 'fleet-mid-refactor-proof.' + suffix)
       const rows = decodeRecording(readFileSync(path, 'utf8')).map((row) => row.kind === 'pty_output'
         ? { ...row, value: { ...row.value, text: 'different captured PTY bytes' } } : row)

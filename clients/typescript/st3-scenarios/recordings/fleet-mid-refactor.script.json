@@ -1,0 +1,221 @@
+{
+  "agent": "agent/example/atlas/builder",
+  "agents": [
+    {
+      "agent": "agent/example/atlas/builder",
+      "host": "host/meadow"
+    },
+    {
+      "agent": "agent/example/atlas/migrator",
+      "host": "host/meadow"
+    }
+  ],
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "empty_baseline": false,
+  "format_version": 2,
+  "historical_turns": 5,
+  "host": "host/meadow",
+  "id_map": {
+    "085034bb-7ef4-52c2-a777-082977558ccb": "message/scenario-fleet-mid-refactor/captured-22",
+    "27177e18-4c2d-517c-84af-8a46405ca683": "message/scenario-fleet-mid-refactor/captured-36",
+    "3e59d868-c554-5ea7-abe5-c140a7250f3e": "message/scenario-fleet-mid-refactor/captured-55",
+    "45b540a3-3d09-5f8a-8383-51de320b0a74": "message/scenario-fleet-mid-refactor/captured-28",
+    "467d8459-5357-5351-b055-de4267fad9a9": "message/scenario-fleet-mid-refactor/captured-16",
+    "5192796c-3128-5bd3-ade4-fe3c36176c2c": "message/scenario-fleet-mid-refactor/captured-13",
+    "57a26574-1754-5b6b-b956-d3b18dedba88": "message/scenario-fleet-mid-refactor/captured-70",
+    "62d8734d-a23b-5392-ac5e-84801c88a9b1": "message/scenario-fleet-mid-refactor/captured-64",
+    "759ce202-5ec1-5d62-b28f-1f136880b24b": "message/scenario-fleet-mid-refactor/captured-25",
+    "85d322bf-d7cc-57c0-a462-5c08653db3ca": "message/scenario-fleet-mid-refactor/captured-19",
+    "87aea516-aebd-5c88-86ed-cf0849c43fe9": "message/scenario-fleet-mid-refactor/captured-73",
+    "88164bfc-05a1-51b2-ae5e-fc9cd6cbcaa0": "message/scenario-fleet-mid-refactor/captured-52",
+    "956743b5-a406-51d1-8d45-9f0b5afb363a": "message/scenario-fleet-mid-refactor/captured-76",
+    "action/example-attach": "action/example-attach",
+    "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef": "message/scenario-fleet-mid-refactor/captured-40",
+    "agent/example/atlas/builder": "agent/example/atlas/builder",
+    "agent/example/atlas/docs": "agent/example/atlas/docs",
+    "agent/example/atlas/migrator": "agent/example/atlas/migrator",
+    "agent/example/atlas/reviewer": "agent/example/atlas/reviewer",
+    "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91": "message/scenario-fleet-mid-refactor/captured-37",
+    "c2f24540-00be-57fb-9e74-e4bd78af1ad8": "message/scenario-fleet-mid-refactor/captured-67",
+    "d5e0fcbb-3867-5369-9cec-4e9a180b2533": "message/scenario-fleet-mid-refactor/captured-46",
+    "e0540524-0f8e-5175-a0e2-05a5c7741d68": "message/scenario-fleet-mid-refactor/captured-58",
+    "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f": "message/scenario-fleet-mid-refactor/captured-49",
+    "ecde7c89-9cb8-5d44-89fe-f055d96e63a9": "message/scenario-fleet-mid-refactor/captured-43",
+    "f454038a-2e03-5280-81d0-dfce2b6e2f41": "message/scenario-fleet-mid-refactor/captured-79",
+    "fb661187-fd8b-5710-aa24-6552e978c5c7": "message/scenario-fleet-mid-refactor/captured-61",
+    "host/foundry": "host/foundry",
+    "host/meadow": "host/meadow",
+    "message/458ee9f4a53653a57ae57be8": "message/scenario-fleet-mid-refactor/captured-31",
+    "person/ada": "person/ada",
+    "person/robin": "person/robin",
+    "runtime/example-atlas-builder": "runtime/example-atlas-builder",
+    "runtime/example-atlas-builder-shell": "runtime/example-atlas-builder-shell",
+    "runtime/example-atlas-docs": "runtime/example-atlas-docs",
+    "runtime/example-atlas-docs-shell": "runtime/example-atlas-docs-shell",
+    "runtime/example-atlas-migrator": "runtime/example-atlas-migrator",
+    "runtime/example-atlas-migrator-shell": "runtime/example-atlas-migrator-shell",
+    "runtime/example-atlas-reviewer": "runtime/example-atlas-reviewer",
+    "runtime/example-atlas-reviewer-shell": "runtime/example-atlas-reviewer-shell",
+    "session/0e4828ae690bc53788bb6d60": "session/example-atlas-migrator",
+    "session/b7f0bb1db2d9950165295f34": "session/example-atlas-builder",
+    "session/example-atlas-builder": "session/example-atlas-builder",
+    "session/example-atlas-docs": "session/example-atlas-docs",
+    "session/example-atlas-migrator": "session/example-atlas-migrator",
+    "session/example-atlas-reviewer": "session/example-atlas-reviewer",
+    "terminal/agent/example/atlas/builder": "terminal/example-atlas-builder",
+    "terminal/example-atlas-builder": "terminal/example-atlas-builder",
+    "terminal/example-atlas-docs": "terminal/example-atlas-docs",
+    "terminal/example-atlas-migrator": "terminal/example-atlas-migrator",
+    "terminal/example-atlas-reviewer": "terminal/example-atlas-reviewer",
+    "timeline-entry/0e4828ae690bc53788bb6d60/08fd8639c5cf60cab5557868": "timeline-entry/scenario-fleet-mid-refactor/captured-7",
+    "timeline-entry/0e4828ae690bc53788bb6d60/18ae9440dc5b81d36d9281de": "timeline-entry/scenario-fleet-mid-refactor/captured-8",
+    "timeline-entry/0e4828ae690bc53788bb6d60/8502a3205dc9476bfd00c990": "timeline-entry/scenario-fleet-mid-refactor/captured-6",
+    "timeline-entry/0e4828ae690bc53788bb6d60/a04833e97935e5b71cdd79f8": "timeline-entry/scenario-fleet-mid-refactor/captured-12",
+    "timeline-entry/0e4828ae690bc53788bb6d60/a6f905a66cf17087bfa05e08": "timeline-entry/scenario-fleet-mid-refactor/captured-5",
+    "timeline-entry/5dc8d02aaadc9b6f99d4309308f3ff96": "timeline-entry/scenario-fleet-mid-refactor/captured-33",
+    "timeline-entry/b7f0bb1db2d9950165295f34/058f9cc1caadbd6ce1febf35": "timeline-entry/scenario-fleet-mid-refactor/captured-4",
+    "timeline-entry/b7f0bb1db2d9950165295f34/0dbbdfb3bb57ab570ede709b": "timeline-entry/scenario-fleet-mid-refactor/captured-10",
+    "timeline-entry/b7f0bb1db2d9950165295f34/1108f8b7d0c867f8f8fa1dfa": "timeline-entry/scenario-fleet-mid-refactor/captured-9",
+    "timeline-entry/b7f0bb1db2d9950165295f34/3d42cbe4212f16be6fc522b0": "timeline-entry/scenario-fleet-mid-refactor/captured-2",
+    "timeline-entry/b7f0bb1db2d9950165295f34/49399ffd3251675e43543ab5": "timeline-entry/scenario-fleet-mid-refactor/captured-3",
+    "timeline-entry/b7f0bb1db2d9950165295f34/8faf5e8209c16a24f0e3cb76": "timeline-entry/scenario-fleet-mid-refactor/captured-1",
+    "timeline-entry/b7f0bb1db2d9950165295f34/c359c70650477f20bf289cfe": "timeline-entry/scenario-fleet-mid-refactor/captured-11",
+    "timeline-entry/b7f0bb1db2d9950165295f34/ca5fe900ae64911a44189f8c": "timeline-entry/scenario-fleet-mid-refactor/captured-35",
+    "timeline-entry/b7f0bb1db2d9950165295f34/d5436bcd1daca3ed01a7b44f": "timeline-entry/scenario-fleet-mid-refactor/captured-34",
+    "timeline-entry/ec45a4cf9ffd41a86744a3a9dd322a37": "timeline-entry/scenario-fleet-mid-refactor/captured-32",
+    "timeline-entry/native-11184": "timeline-entry/scenario-fleet-mid-refactor/captured-41",
+    "timeline-entry/native-11185": "timeline-entry/scenario-fleet-mid-refactor/captured-42",
+    "timeline-entry/native-11664": "timeline-entry/scenario-fleet-mid-refactor/captured-20",
+    "timeline-entry/native-11665": "timeline-entry/scenario-fleet-mid-refactor/captured-21",
+    "timeline-entry/native-16": "timeline-entry/scenario-fleet-mid-refactor/captured-14",
+    "timeline-entry/native-16064": "timeline-entry/scenario-fleet-mid-refactor/captured-44",
+    "timeline-entry/native-16065": "timeline-entry/scenario-fleet-mid-refactor/captured-45",
+    "timeline-entry/native-16736": "timeline-entry/scenario-fleet-mid-refactor/captured-23",
+    "timeline-entry/native-16737": "timeline-entry/scenario-fleet-mid-refactor/captured-24",
+    "timeline-entry/native-17": "timeline-entry/scenario-fleet-mid-refactor/captured-15",
+    "timeline-entry/native-21776": "timeline-entry/scenario-fleet-mid-refactor/captured-47",
+    "timeline-entry/native-21777": "timeline-entry/scenario-fleet-mid-refactor/captured-48",
+    "timeline-entry/native-26992": "timeline-entry/scenario-fleet-mid-refactor/captured-26",
+    "timeline-entry/native-26993": "timeline-entry/scenario-fleet-mid-refactor/captured-27",
+    "timeline-entry/native-30000": "timeline-entry/scenario-fleet-mid-refactor/captured-50",
+    "timeline-entry/native-30001": "timeline-entry/scenario-fleet-mid-refactor/captured-51",
+    "timeline-entry/native-35920": "timeline-entry/scenario-fleet-mid-refactor/captured-53",
+    "timeline-entry/native-35921": "timeline-entry/scenario-fleet-mid-refactor/captured-54",
+    "timeline-entry/native-37552": "timeline-entry/scenario-fleet-mid-refactor/captured-29",
+    "timeline-entry/native-37553": "timeline-entry/scenario-fleet-mid-refactor/captured-30",
+    "timeline-entry/native-40800": "timeline-entry/scenario-fleet-mid-refactor/captured-56",
+    "timeline-entry/native-40801": "timeline-entry/scenario-fleet-mid-refactor/captured-57",
+    "timeline-entry/native-43648": "timeline-entry/scenario-fleet-mid-refactor/captured-59",
+    "timeline-entry/native-43649": "timeline-entry/scenario-fleet-mid-refactor/captured-60",
+    "timeline-entry/native-48720": "timeline-entry/scenario-fleet-mid-refactor/captured-62",
+    "timeline-entry/native-48721": "timeline-entry/scenario-fleet-mid-refactor/captured-63",
+    "timeline-entry/native-4896": "timeline-entry/scenario-fleet-mid-refactor/captured-38",
+    "timeline-entry/native-4897": "timeline-entry/scenario-fleet-mid-refactor/captured-39",
+    "timeline-entry/native-5088": "timeline-entry/scenario-fleet-mid-refactor/captured-17",
+    "timeline-entry/native-5089": "timeline-entry/scenario-fleet-mid-refactor/captured-18",
+    "timeline-entry/native-53936": "timeline-entry/scenario-fleet-mid-refactor/captured-65",
+    "timeline-entry/native-53937": "timeline-entry/scenario-fleet-mid-refactor/captured-66",
+    "timeline-entry/native-59008": "timeline-entry/scenario-fleet-mid-refactor/captured-68",
+    "timeline-entry/native-59009": "timeline-entry/scenario-fleet-mid-refactor/captured-69",
+    "timeline-entry/native-64928": "timeline-entry/scenario-fleet-mid-refactor/captured-71",
+    "timeline-entry/native-64929": "timeline-entry/scenario-fleet-mid-refactor/captured-72",
+    "timeline-entry/native-70000": "timeline-entry/scenario-fleet-mid-refactor/captured-74",
+    "timeline-entry/native-70001": "timeline-entry/scenario-fleet-mid-refactor/captured-75",
+    "timeline-entry/native-77872": "timeline-entry/scenario-fleet-mid-refactor/captured-77",
+    "timeline-entry/native-77873": "timeline-entry/scenario-fleet-mid-refactor/captured-78",
+    "timeline-entry/native-85872": "timeline-entry/scenario-fleet-mid-refactor/captured-80",
+    "timeline-entry/native-85873": "timeline-entry/scenario-fleet-mid-refactor/captured-81"
+  },
+  "person": "person/ada",
+  "reads": [
+    "/v1/client/agents",
+    "/v1/client/sessions/agent/example/atlas/builder/timeline",
+    "/v1/client/sessions/agent/example/atlas/migrator/timeline",
+    "/v1/client/terminals/agent%2Fexample%2Fatlas%2Fbuilder/screen"
+  ],
+  "reconnect_after": [],
+  "turns": [
+    {
+      "agent": "agent/example/atlas/migrator",
+      "answer": "I found 23 call sites of fetchUser in four packages. I will rename them package by package and run the typecheck after each one.",
+      "prompt": "Please rename fetchUser to loadUser everywhere and keep the tests green.",
+      "timestamp": "2030-01-01T11:39:00.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/migrator",
+      "answer": "Observed edit result for Please rename fetchUser to loadUser everywhere and keep the tests green..",
+      "prompt": "Please rename fetchUser to loadUser everywhere and keep the tests green.",
+      "timestamp": "2030-01-01T11:41:00.000Z",
+      "tool": {
+        "id": "call-migrator-4",
+        "input": {
+          "new_string": "import { loadUser } from '@atlas/api'\n\nexport const useProfile = (id: string) => useQuery(() => loadUser(id))\n",
+          "old_string": "import { fetchUser } from '@atlas/api'\n\nexport const useProfile = (id: string) => useQuery(() => fetchUser(id))\n",
+          "path": "packages/web/src/profile/useProfile.ts"
+        },
+        "name": "edit",
+        "result": "--- a/packages/web/src/profile/useProfile.ts\n+++ b/packages/web/src/profile/useProfile.ts\n@@ -1,3 +1,3 @@\n-import { fetchUser } from '@atlas/api'\n-\n-export const useProfile = (id: string) => useQuery(() => fetchUser(id))\n+import { loadUser } from '@atlas/api'\n+\n+export const useProfile = (id: string) => useQuery(() => loadUser(id))\n"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "The worker passes only the user id. loadUser now needs the session too, so syncAvatars has to thread it through.",
+      "prompt": "Can you check why the worker typecheck fails after the rename?",
+      "timestamp": "2030-01-01T11:51:00.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Can you check why the worker typecheck fails after the rename?.",
+      "command": "printf '%s\\n' '$ pnpm -r typecheck' '\u001b[31mpackages/api typecheck: Done\npackages/web typecheck: Done\npackages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but got 1.\npackages/worker typecheck: Failed\u001b[0m'",
+      "prompt": "Can you check why the worker typecheck fails after the rename?",
+      "timestamp": "2030-01-01T11:52:40.000Z",
+      "tool": {
+        "id": "call-builder-4",
+        "input": {
+          "command": "pnpm -r typecheck"
+        },
+        "name": "shell",
+        "result": "packages/api typecheck: Done\npackages/web typecheck: Done\npackages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but got 1.\npackages/worker typecheck: Failed"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "The typecheck still fails in packages/worker: syncAvatars calls loadUser with one argument. I asked Robin whether to thread the session through.",
+      "prompt": "Can you check why the worker typecheck fails after the rename?",
+      "timestamp": "2030-01-01T11:53:30.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/migrator",
+      "answer": "Next: packages/api/src/users/index.ts still",
+      "prompt": "Please rename fetchUser to loadUser everywhere and keep the tests green.",
+      "timestamp": "2030-01-01T12:00:02.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/migrator",
+      "answer": "Next: packages/api/src/users/index.ts still re-exports fetchUser. Replacing the export.",
+      "prompt": "Please rename fetchUser to loadUser everywhere and keep the tests green.",
+      "revisions": [
+        "Next: packages/api/src/users/index.ts still"
+      ],
+      "timestamp": "2030-01-01T12:00:03.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/migrator",
+      "answer": "Observed edit result for Please rename fetchUser to loadUser everywhere and keep the tests green..",
+      "prompt": "Please rename fetchUser to loadUser everywhere and keep the tests green.",
+      "timestamp": "2030-01-01T12:00:05.000Z",
+      "tool": {
+        "id": "call-migrator-7",
+        "input": {
+          "new_string": "export { loadUser } from './loadUser.ts'\n",
+          "old_string": "export { fetchUser } from './fetchUser.ts'\n",
+          "path": "packages/api/src/users/index.ts"
+        },
+        "name": "edit",
+        "result": "--- a/packages/api/src/users/index.ts\n+++ b/packages/api/src/users/index.ts\n@@ -1,1 +1,1 @@\n-export { fetchUser } from './fetchUser.ts'\n+export { loadUser } from './loadUser.ts'\n"
+      }
+    }
+  ],
+  "workspace": "~/src/atlas/.worktrees/builder",
+  "world": "fleet-mid-refactor"
+}
