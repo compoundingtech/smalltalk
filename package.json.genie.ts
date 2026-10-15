@@ -1,4 +1,8 @@
 import { packageJson } from './repos/effect-utils/genie/external.ts'
+import devbarPkg from './repos/effect-utils/packages/@overeng/devbar/package.json.genie.ts'
+
+// Imported package composition owns the complete diagnostics workspace closure.
+export const diagnosticsPackages = [devbarPkg]
 
 /**
  * The root pnpm workspace's members, listed explicitly: no `apps/**`, `packages/**` or
@@ -16,7 +20,7 @@ export const workspaceMembers = [
 ] as const
 
 export default packageJson.aggregateFromPackages({
-  packages: [],
+  packages: diagnosticsPackages,
   name: 'smalltalk-workspace',
   repoName: 'smalltalk',
   extraMembers: workspaceMembers,

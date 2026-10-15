@@ -700,6 +700,13 @@ jobs:
       - name: Use the cached Nix outputs
         if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+      - name: Materialize megarepo members
+        env:
+          MEGAREPO_STORE: "${{ runner.temp }}/megarepo"
+        run: |
+          nix run "github:overengineeringstudio/effect-utils/$(jq -r '.nodes["effect-utils"].locked.rev' flake.lock)#megarepo" -- apply --worktree-mode commit --git-protocol https
+          printf 'MEGAREPO_STORE=%s\n' "$MEGAREPO_STORE" >> "$GITHUB_ENV"
+        if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Build missing cache contents
         shell: bash
         run: "nix develop '.#genie' -c bash scripts/ci-cache-warm genie"
@@ -965,6 +972,13 @@ jobs:
             extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
             access-tokens = github.com=${{ github.token }}
           summarize: true
+        if: steps.pnpm-store.outputs.cache-hit != 'true'
+      - name: Materialize megarepo members
+        env:
+          MEGAREPO_STORE: "${{ runner.temp }}/megarepo"
+        run: |
+          nix run "github:overengineeringstudio/effect-utils/$(jq -r '.nodes["effect-utils"].locked.rev' flake.lock)#megarepo" -- apply --worktree-mode commit --git-protocol https
+          printf 'MEGAREPO_STORE=%s\n' "$MEGAREPO_STORE" >> "$GITHUB_ENV"
         if: steps.pnpm-store.outputs.cache-hit != 'true'
       - name: Fetch the locked packages
         shell: bash

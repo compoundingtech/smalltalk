@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Use the pinned shared developer bar, meters and build identity utilities in Fractal web, retaining the recent-changes disclosure and provisioning member sources consistently in CI.",
+  "replay": { "status": "none", "detail": "No replay or rebuild of persisted application state." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "No client protocol or persisted-state compatibility change. Development and performance builds use a shared diagnostics shell; production builds retain the existing diagnostics loading boundary. Recent changes remain available from the developer bar." },
+  "downtime": { "status": "none", "detail": "No downtime is required." },
+  "manual": { "status": "none", "detail": "No upgrade action for installed applications. Source checkouts use the documented member bootstrap and web shell to materialize the pinned diagnostics dependencies." },
+  "recovery": { "status": "none", "detail": "No data migration or rollback recovery is required." }
+}

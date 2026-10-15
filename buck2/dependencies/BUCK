@@ -2,7 +2,7 @@
 # Source: BUCK.genie.ts
 
 # Projected from pnpm-lock.yaml for the Buck importers in lock.ts.
-# Store fingerprint: sha256:f880343580f6d9ce77ab1511648efab1bede69abf370508b41ffbc4140ee1226
+# Store fingerprint: sha256:1cafc25bab89b8b1b1b22aa3f9ffbcc18784ad3355ed0c30efe9a542f2d15b03
 
 load("@rules//buck2/dependencies:defs.bzl", "pnpm_package", "pnpm_platform_gated_packages")
 

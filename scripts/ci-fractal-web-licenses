@@ -30,8 +30,8 @@ PROVENANCE = {
 
 
 def lock_packages(text):
-    # This is deliberately a fail-closed reader of pnpm's registry-only v9 projection,
-    # not a general YAML parser. Unsupported lock formats/resolutions require updating it.
+    # Fail closed on registry resolutions; root-owned staged member sources are
+    # verified separately and are not npm registry license-inventory entries.
     if not re.search(r"^lockfileVersion: ['\"]?9\.0['\"]?$", text, re.M):
         raise ValueError("expected pnpm lockfileVersion 9.0")
     sections = re.split(r"^packages:\s*$", text, flags=re.M)
@@ -39,6 +39,8 @@ def lock_packages(text):
         raise ValueError("expected exactly one packages section")
     section = re.split(r"^\S", sections[1], maxsplit=1, flags=re.M)[0]
     packages = {}
+    source_directories = {}
+    resolved_sources = set()
     current = None
     for line in section.splitlines():
         if not line.strip():
@@ -48,6 +50,16 @@ def lock_packages(text):
             if not match:
                 raise ValueError(f"unsupported package key: {line}")
             key = next(value for value in match.groups() if value is not None)
+            source_name, is_source, directory = key.partition("@file:")
+            if is_source:
+                pattern = r"\.devenv/pnpm-source-inputs/current/repos/[a-z0-9._-]+/packages/" + re.escape(source_name)
+                if not re.fullmatch(r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+", source_name) or not re.fullmatch(pattern, directory):
+                    raise ValueError(f"unsupported staged source package: {key}")
+                current = (source_name, "file:" + directory)
+                if current in source_directories:
+                    raise ValueError(f"duplicate lock source package: {key}")
+                source_directories[current] = directory
+                continue
             name, separator, version = key.rpartition("@")
             if not separator or not re.fullmatch(r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+", name) or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?", version):
                 raise ValueError(f"unsupported registry package: {key}")
@@ -56,12 +68,20 @@ def lock_packages(text):
                 raise ValueError(f"duplicate lock package: {key}")
             packages[current] = None
         elif line.startswith("    resolution:"):
+            if current in source_directories:
+                expected = f"    resolution: {{directory: {source_directories[current]}, type: directory}}"
+                if line != expected or current in resolved_sources:
+                    raise ValueError(f"unsupported staged source resolution: {line}")
+                resolved_sources.add(current)
+                continue
             match = re.fullmatch(r"    resolution: \{integrity: (sha512-[A-Za-z0-9+/]+={0,2})\}", line)
             if current is None or not match or packages[current] is not None:
                 raise ValueError(f"unsupported registry resolution: {line}")
             packages[current] = match[1]
         elif not line.startswith("    ") or current is None:
             raise ValueError(f"unsupported packages line: {line}")
+    if resolved_sources != source_directories.keys():
+        raise ValueError("every staged source package must have its matching directory resolution")
     if not packages or any(value is None for value in packages.values()):
         raise ValueError("every lock package must have a sha512 registry resolution")
     return packages

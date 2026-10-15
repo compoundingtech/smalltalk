@@ -35,12 +35,16 @@ const ChangelogContent = () => {
   const retry = useAtomRefresh(manifest)
   return <ChangelogView state={state} baseline={previous} onRetry={retry} buildRevision={buildIdentity.rev} />
 }
+/** Unseen while this build lists an entry the device has not acknowledged; drives every dot. */
+export const useChangelogUnseen = (): boolean => {
+  const cursor = useAtomValue(seen)
+  const ids = new Set(cursor.entryIds)
+  return changelogEntryIds.some((id) => !ids.has(id))
+}
 /** The status-bar disclosure loads prose only after activation. */
 export const Changelog = ({ dark }: { readonly dark: boolean }) => {
   const registry = React.useContext(RegistryContext)
-  const cursor = useAtomValue(seen)
-  const ids = new Set(cursor.entryIds)
-  const hasUnseen = changelogEntryIds.some((id) => !ids.has(id))
+  const hasUnseen = useChangelogUnseen()
   const [open, setOpen] = React.useState(false)
   const onOpenChange = (next: boolean) => {
     if (next) acknowledgeChangelog(registry)

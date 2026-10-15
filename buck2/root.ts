@@ -40,7 +40,7 @@ export const buckConfig = `[cells]
   execution_platforms = rules//buck2/platforms:host_execution_platform
 
 [buck2]
-  file_watcher = notify
+  file_watcher = watchman
   digest_algorithms = SHA256
   remote_cache_enabled = false
   allow_cache_uploads = false

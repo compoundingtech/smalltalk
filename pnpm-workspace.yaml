@@ -10,11 +10,30 @@ packages:
   - clients/typescript/st3-views
   - packages/fractal-ui
 
+overrides:
+  "@overeng/content-address": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/content-address"
+  "@overeng/devbar": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/devbar"
+  "@overeng/effect-distributed-lock": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/effect-distributed-lock"
+  "@overeng/effect-rpc-explorer": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/effect-rpc-explorer"
+  "@overeng/effect-rpc-explorer-react": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/effect-rpc-explorer-react"
+  "@overeng/effect-rpc-observer": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/effect-rpc-observer"
+  "@overeng/effect-rust": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/effect-rust"
+  "@overeng/meters": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/meters"
+  "@overeng/otel-browser": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/otel-browser"
+  "@overeng/otel-contract": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/otel-contract"
+  "@overeng/rpc-devtools": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/rpc-devtools"
+  "@overeng/stylex-tokens": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/stylex-tokens"
+  "@overeng/utils": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/utils"
+  "@overeng/utils-dev": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/utils-dev"
+  "@overeng/utils-storybook": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/utils-storybook"
+  "@effect/platform-node>@effect/platform-node-shared": 4.0.0
+
 peerDependencyRules:
   allowedVersions:
     typescript: ">=6.0.0"
     vitest: ">=4.0.0"
     unplugin: ">=3.0.0"
+    "@overeng/devbar>@overeng/utils": "file:.devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/utils"
 
 minimumReleaseAgeExclude: ["@types/node"]
 

@@ -5,6 +5,7 @@ import {
   buildEnv,
   cargoCacheStep,
   commonSetupSteps,
+  megarepoApplyStep,
   fractalWebStoreCache,
   linuxRunner,
   linuxStageJob,
@@ -50,6 +51,7 @@ fi`,
     },
     ...whenMissing([
       ...(stage === 'genie' ? setup.filter((step) => step !== buildSnapshotRestore && step !== buildSnapshotPrepare) : setup),
+      ...(stage === 'genie' ? [megarepoApplyStep] : []),
       nixDevelopStep({ name: 'Build missing cache contents', flake: stage === 'genie' ? '.#genie' : '.', command: ['bash', 'scripts/ci-cache-warm', stage] }),
       { name: 'Save Nix outputs', run: 'bash scripts/ci-nix-cache save' },
       // PR/merge builds restore these entries and retain exact-source artifacts. Only
@@ -143,6 +145,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         { name: 'Probe the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: { ...fractalWebStoreCache, 'lookup-only': true } },
         ...[
           ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+          megarepoApplyStep,
           { ...nixDevelopStep({ name: 'Fetch the locked packages', flake: '.#web', command: ['pnpm', 'fetch'] }), env: pnpmStoreEnv },
           { name: 'Save the pnpm store', uses: 'actions/cache/save@v4', with: fractalWebStoreCache },
         ].map((step) => ({ ...step, if: "steps.pnpm-store.outputs.cache-hit != 'true'" })),

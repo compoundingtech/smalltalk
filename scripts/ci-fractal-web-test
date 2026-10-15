@@ -260,12 +260,21 @@ assert "needs: [fractal-web-changes, genie-freshness]" in execution
 assert "needs.fractal-web-changes.outputs.relevant == 'true'" in execution
 assert "needs.genie-freshness.result == 'success'" in execution
 assert "nix develop '.#web' -c bash scripts/ci-fractal-web" in execution
+assert "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" in execution
+assert execution.index("kernel.apparmor_restrict_unprivileged_userns=0") < execution.index("nix develop '.#web' -c bash scripts/ci-fractal-web")
+assert workflow.count("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0") == 1, "only the Buck TypeScript execution job changes host namespace policy"
 assert "actions/cache/restore@" in execution and "actions/cache/save@" not in execution, "only main upkeep publishes caches"
 assert "(always())" in gate_job and "needs: [fractal-web-changes, fractal-web-execution]" in gate_job
 assert "fractal-web" not in blocks["linux-gate"], "Rust-only gates never wait for web execution"
 settings = (root / ".github/repo-settings.json").read_text()
 assert '"fractal-web"' not in settings, "fractal-web becomes required only after PR and queue runs emit it"
 print("passed: generated jobs are unfiltered, hosted, bounded and fail closed")
+
+client = blocks["typescript-client"]
+assert "nix develop '.#web' -c pnpm install --frozen-lockfile" in client
+assert "nix develop '.#web' -c bash scripts/ci-typescript-client" in client
+assert "corepack enable" not in client, "Nix owns the client job's pnpm toolchain"
+print("passed: client install and checks use the same Nix web toolchain")
 
 freshness = blocks["genie-freshness"]
 assert "scripts/ci-genie-freshness" in freshness
