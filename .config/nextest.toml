@@ -42,7 +42,7 @@ not (
 # Retain the synthetic sorter byte/latency comparisons on success as well as failure.
 # Output visibility only: selection, retries, threads and byte budgets are unchanged.
 [[profile.ci.overrides]]
-filter = 'package(=st3) and test(/^store::actual_state_sorter_tests::actual_identity_stream_bounds_native_reader_and_writer_temp_bytes$/)'
+filter = '(package(=st3) or package(=st3-daemon)) and test(/^store::actual_state_sorter_tests::actual_identity_stream_bounds_native_reader_and_writer_temp_bytes$/)'
 success-output = "immediate"
 
 # The fleet reconnect test also includes a real two-minute outage. The ci profile inherits the
