@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Harden the evidence verifier for skipping: record age, repository and signer trust level, and a refusal on any unexpected error",
+  "replay": {"status": "none", "detail": "No daemon replay change."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change."},
+  "rules": {"status": "none", "detail": "No daemon rule, required check or main landing change. Nothing calls the new options yet."},
+  "compatibility": {"status": "none", "detail": "New optional flags and reasons on a script; existing calls behave as before."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "Nothing to do."},
+  "recovery": {"status": "none", "detail": "Reverting removes the new options."}
+}

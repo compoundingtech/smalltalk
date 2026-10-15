@@ -21,7 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 sys.dont_write_bytecode = True
 
@@ -32,6 +32,7 @@ STATEMENT_TYPE = 'https://in-toto.io/Statement/v1'
 PREDICATE_TYPE = 'https://smalltalk.dev/evidence/gate/v1'
 KEYS_PATH = '.st/evidence-keys'
 KINDS = ('nix', 'wrapper', 'sekrets', 'observed')
+FUTURE_SKEW = timedelta(minutes=2)
 
 
 class Failure(Exception):
@@ -166,7 +167,8 @@ def signature(repo, commit, keys, revocations):
     return status, principal
 
 
-def verify(repo, tree, check, keys, command, kinds=KINDS, bind=()):
+def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None, runner_prefix=None,
+           trust_levels=None, now=None):
     with tempfile.NamedTemporaryFile() as revocations:
         everything = note_refs(repo)
         hits = with_note_for(repo, everything, tree)
@@ -216,6 +218,20 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=()):
     if kind is None or kind not in kinds:
         raise Failure('unsupported_kind', f'runner {observed["runner"]!r} is not one of {", ".join(kinds)}',
                       attempts=attempts)
+    level = principal.split('/', 1)[0]
+    if trust_levels is not None and level not in trust_levels:
+        raise Failure('untrusted_level', f'signer trust level {level!r} is not accepted for this check',
+                      attempts=attempts)
+    if runner_prefix is not None and not observed['runner'].startswith(runner_prefix):
+        raise Failure('wrong_runner', 'record is for a different repository or producer', attempts=attempts)
+    # A future-dated record is refused whether or not an age limit is set: otherwise a trusted
+    # signer's future-dated pass would stay the latest record and hide every later real failure.
+    moment = parse_time(predicate['observed_at'])
+    current = now or datetime.now(timezone.utc)
+    if moment > current + FUTURE_SKEW:
+        raise Failure('future_dated', 'record claims to be observed in the future', attempts=attempts)
+    if max_age is not None and current - moment > timedelta(seconds=max_age):
+        raise Failure('too_old', f'record is older than {max_age} seconds', attempts=attempts)
     if result['exit_code'] != 0:
         raise Failure('check_failed', f'latest record for check {check} exited {result["exit_code"]}',
                       attempts=attempts)
@@ -232,7 +248,7 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=()):
                           attempts=attempts)
     return {
         'satisfied': True, 'tree': tree, 'check': check, 'record': commit,
-        'kind': kind, 'signer': principal, 'trust_level': principal.split('/', 1)[0],
+        'kind': kind, 'signer': principal, 'trust_level': level,
         'tier': predicate['tier'], 'observed_at': predicate['observed_at'],
         'command': result['command'], 'inputs': inputs, 'attempts': attempts,
     }
@@ -300,6 +316,10 @@ def main(argv):
     source.add_argument('--keys-from', help=f'read {KEYS_PATH} from this commit (the accepted base)')
     parser.add_argument('--command', help='JSON argument vector the record must have run')
     parser.add_argument('--kinds', help=f'comma-separated record kinds this check accepts (default: {",".join(KINDS)})')
+    parser.add_argument('--max-age', type=int, metavar='SECONDS',
+                        help='reject a record observed longer ago than this, or claiming a future time')
+    parser.add_argument('--runner-prefix', help='the record runner must start with this (e.g. github:org/repo/)')
+    parser.add_argument('--trust-levels', help='comma-separated signer trust levels this check accepts')
     parser.add_argument('--bind-input', action='append', default=[], metavar='KEY=PATH',
                         help="require the record's input KEY to equal the sha256 of PATH in the verified tree")
     try:
@@ -320,6 +340,15 @@ def main(argv):
         kinds = tuple(k for k in args.kinds.split(',') if k)
         if not kinds or not set(kinds) <= set(KINDS):
             print(f'--kinds must be a comma-separated subset of {",".join(KINDS)}', file=sys.stderr)
+            return 2
+    if args.max_age is not None and args.max_age <= 0:
+        print('--max-age must be a positive number of seconds', file=sys.stderr)
+        return 2
+    trust_levels = None
+    if args.trust_levels is not None:
+        trust_levels = tuple(level for level in args.trust_levels.split(',') if level)
+        if not trust_levels:
+            print('--trust-levels must name at least one level', file=sys.stderr)
             return 2
     bind = []
     for item in args.bind_input:
@@ -344,12 +373,17 @@ def main(argv):
             keys = os.path.abspath(args.keys)
             if not os.path.isfile(keys):
                 raise Failure('error', f'key list {args.keys} not found')
-        result = verify(args.repo, tree, args.check, keys, command, kinds, bind)
+        result = verify(args.repo, tree, args.check, keys, command, kinds, bind, args.max_age, args.runner_prefix,
+                        trust_levels)
         print(json.dumps(result, indent=2))
         return 0
     except Failure as failure:
         print(json.dumps({'satisfied': False, 'reason': failure.reason, 'check': args.check,
                           'detail': failure.detail, **failure.extra}, indent=2))
+        return 1
+    except Exception as error:  # any surprise is a refusal with a reason, never a traceback or a pass
+        print(json.dumps({'satisfied': False, 'reason': 'error', 'check': args.check,
+                          'detail': f'{type(error).__name__}: {error}'}, indent=2))
         return 1
     finally:
         if keyfile is not None:

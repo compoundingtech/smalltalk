@@ -60,7 +60,7 @@ class Fixture:
         return self.git('rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD^{tree}')
 
     def note(self, commit, tree, key, signer, check='unit', command=('make', 'test'), exit_code=0,
-             runner='nix', tier='full', seconds=0, sign=True, naive=False, inputs=None, omit_inputs=False):
+             runner='nix', tier='full', seconds=0, sign=True, naive=False, inputs=None, omit_inputs=False, mutate=None):
         statement = {
             '_type': 'https://in-toto.io/Statement/v1',
             'subject': [{'name': commit, 'digest': {'gitTree': tree}}],
@@ -76,7 +76,10 @@ class Fixture:
         }
         if omit_inputs:
             del statement['predicate']['observed']['inputs']
-        blob = self.git('hash-object', '-w', '--stdin', stdin=json.dumps(statement).encode())
+        body = json.dumps(statement).encode()
+        if mutate is not None:
+            body = mutate(body)
+        blob = self.git('hash-object', '-w', '--stdin', stdin=body)
         notes = self.git('mktree', stdin=f'100644 blob {blob}\t{tree}\n'.encode())
         args = ['-c', 'gpg.format=ssh', '-c', f'user.signingKey={key}', 'commit-tree']
         if sign:
@@ -242,6 +245,102 @@ class Verifier(unittest.TestCase):
         self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', seconds=2)
         code, result = self.f.verify(self.tree)
         self.assertEqual((code, result['attempts']), (0, 3))
+
+    def test_the_same_file_contents_in_a_different_tree_is_not_covered(self):
+        record = self.f.note(self.commit, self.tree, self.ci, 'machine/ci1')
+        (self.f.repo / 'extra.txt').write_text('extra')
+        other_commit, other_tree = self.f.commit('one')  # file.txt is byte-identical, the tree is not
+        self.assertNotEqual(other_tree, self.tree)
+        self.assertEqual(self.reason(other_tree), 'stale_tree')
+        self.assertEqual(self.f.verify(self.tree)[1]['record'], record)
+
+    def test_a_record_for_another_repository_is_refused_by_the_runner_prefix(self):
+        mine = 'github:org/repo/actions/runs/7/attempts/1/jobs/9'
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', runner=mine)
+        self.assertEqual(self.f.verify(self.tree, runner_prefix='github:org/repo/')[0], 0)
+        self.assertEqual(self.reason(self.tree, runner_prefix='github:org/other/'), 'wrong_runner')
+        # A prefix without the trailing slash would also match org/repo2; the slash is what anchors it.
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', seconds=1,
+                    runner='github:org/repo2/actions/runs/7/attempts/1/jobs/9')
+        self.assertEqual(self.reason(self.tree, runner_prefix='github:org/repo/'), 'wrong_runner')
+
+    def test_a_check_accepts_only_the_signer_trust_levels_it_names(self):
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1')
+        self.assertEqual(self.f.verify(self.tree, trust_levels=('machine',))[0], 0)
+        self.assertEqual(self.reason(self.tree, trust_levels=('fleet', 'namespace')), 'untrusted_level')
+        # A newer failure from a level the check does not accept still stops a skip.
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', exit_code=1, seconds=1)
+        self.assertEqual(self.reason(self.tree, trust_levels=('fleet',)), 'untrusted_level')
+
+    def test_old_and_future_dated_records_do_not_count(self):
+        week = 7 * 24 * 3600
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', seconds=-(week + 60))
+        self.assertEqual(self.reason(self.tree, max_age=week), 'too_old')
+        self.assertEqual(self.f.verify(self.tree)[0], 0)  # no age policy, no age check
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', seconds=-(week - 3600))
+        self.assertEqual(self.f.verify(self.tree, max_age=week)[0], 0)
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', seconds=3600)
+        self.assertEqual(self.reason(self.tree, max_age=week), 'future_dated')
+        # ...and with no age limit at all: a future-dated pass must not become the latest record.
+        self.assertEqual(self.reason(self.tree), 'future_dated')
+        # A little clock skew is tolerated.
+        other = Fixture()
+        self.addCleanup(other.tmp.cleanup)
+        key = other.key('ci', 'machine/ci1')
+        commit, tree = other.commit('skew')
+        other.note(commit, tree, key, 'machine/ci1', seconds=60)
+        self.assertEqual(other.verify(tree, max_age=week)[0], 0)
+
+    def test_signed_content_edited_after_signing_is_a_bad_signature(self):
+        record = self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', exit_code=1)
+        raw = run('git', '-C', str(self.f.repo), 'cat-file', 'commit', record)
+        passing = json.loads(self.f.git('cat-file', 'blob', f'{record}:{self.tree}'))
+        passing['predicate']['observed']['checks']['unit']['exit_code'] = 0
+        blob = self.f.git('hash-object', '-w', '--stdin', stdin=json.dumps(passing).encode())
+        tree = self.f.git('mktree', stdin=f'100644 blob {blob}\t{self.tree}\n'.encode())
+        old_tree = self.f.git('rev-parse', f'{record}^{{tree}}')
+        forged = self.f.git('hash-object', '-t', 'commit', '-w', '--stdin',
+                            stdin=raw.replace(f'tree {old_tree}', f'tree {tree}', 1).encode())
+        self.f.git('update-ref', '-d', f'refs/notes/evidence/{record}')
+        self.f.git('update-ref', f'refs/notes/evidence/{forged}', forged)
+        self.assertEqual(self.reason(self.tree), 'bad_signature')
+
+    def test_garbage_in_the_notes_namespace_is_ignored_without_a_crash(self):
+        record = self.f.note(self.commit, self.tree, self.ci, 'machine/ci1')
+        blob = self.f.git('hash-object', '-w', '--stdin', stdin=b'not a commit')
+        self.f.git('update-ref', f'refs/notes/evidence/{blob}', blob)  # a ref to a blob
+        empty = self.f.git('mktree', stdin=b'')
+        bare = self.f.git('commit-tree', empty, '-p', self.commit, '-m', 'empty notes')
+        self.f.git('update-ref', f'refs/notes/evidence/{bare}', bare)  # a note with no statement
+        extra = self.f.git('hash-object', '-w', '--stdin', stdin=b'{}')
+        two = self.f.git('mktree', stdin=(f'100644 blob {extra}\t{self.tree}\n'
+                                          f'100644 blob {extra}\t{"0" * 40}\n').encode())
+        crowded = self.f.git('commit-tree', two, '-p', self.commit, '-m', 'two entries')
+        self.f.git('update-ref', f'refs/notes/evidence/{crowded}', crowded)  # more than one blob
+        self.assertEqual(self.f.verify(self.tree)[1]['record'], record)
+
+    def test_two_conflicting_records_resolve_toward_failure(self):
+        moment = 5
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', seconds=moment)
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', exit_code=1, seconds=moment)
+        self.assertEqual(self.reason(self.tree), 'check_failed')
+
+    def test_a_statement_that_is_not_valid_utf8_is_not_evidence(self):
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1',
+                    mutate=lambda body: body.replace(b'"make"', b'"ma\xffke"'))
+        self.assertEqual(self.reason(self.tree), 'no_record')
+
+    def test_an_unreadable_repository_is_an_error_with_json_and_never_a_pass(self):
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', runner='github:x/y/jobs/1')
+        code, out, _ = self.f.cli('--tree', self.tree, '--check', 'unit', '--keys', str(self.f.keys),
+                                  '--max-age', '60', '--trust-levels', 'machine', '--runner-prefix', 'github:x/')
+        self.assertEqual(code, 0, out)  # sanity: all the options parse and a good record passes
+        missing = subprocess.run([sys.executable, str(SCRIPT), '--repo', '/nonexistent', '--tree', self.tree,
+                                  '--check', 'unit', '--keys', str(self.f.keys)], capture_output=True)
+        self.assertEqual((missing.returncode, json.loads(missing.stdout)['reason']), (1, 'error'))
+        for bad in (['--max-age', '0'], ['--max-age', 'soon'], ['--trust-levels', ',']):
+            self.assertEqual(self.f.cli('--tree', self.tree, '--check', 'unit', '--keys', str(self.f.keys),
+                                        *bad)[0], 2)
 
     def test_only_full_tier_counts(self):
         self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', tier='test')

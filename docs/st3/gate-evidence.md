@@ -489,7 +489,7 @@ trusted record for the tree and check decides, so a newer failure supersedes an 
 pass. Reasons: `no_record`, `stale_tree` (records exist only for other trees),
 `wrong_check`, `bad_signature` (forged or unsigned), `untrusted_signer` (a valid
 signature from a key not on the list, or a principal that differs from the record's
-signer), `untrusted_tier`, `degraded`, `unsupported_kind`, `check_failed`, `wrong_command`, `wrong_input` and
+signer), `untrusted_tier`, `untrusted_level`, `wrong_runner`, `too_old`, `future_dated`, `degraded`, `unsupported_kind`, `check_failed`, `wrong_command`, `wrong_input` and
 `error` (unreadable input: no decision was made, count it separately). Notes are found
 by the tree they name with one `git cat-file --batch-check`, so the cost grows with the
 number of evidence refs; pack refs, or add a per-tree index, before they reach the
@@ -501,7 +501,18 @@ statement's tree stands. When the subject commit is present its tree must equal 
 statement's, so a record cannot be rebound to a different tree. The tree claim is the
 signer's: the signature covers the statement, so only a key on the list can make it.
 
-`--kinds nix,wrapper` limits the record kinds a check accepts. `--bind-input KEY=PATH`
+`--kinds nix,wrapper` limits the record kinds a check accepts. `--max-age SECONDS` rejects a record observed longer ago than that (`too_old`) or claiming a time
+more than two minutes ahead (`future_dated`). `--runner-prefix github:ORG/REPO/` requires the record
+to come from this repository's runs (`wrong_runner`; keep the trailing slash, it is what stops `repo`
+matching `repo2`). `--trust-levels fleet,machine` limits which signer trust levels a check accepts
+(`untrusted_level`); a newer failure from a level the check does not accept still stops a skip.
+A record claiming a time more than two minutes ahead is always `future_dated`, with or without
+`--max-age`. Every one of these options defaults to permissive, so **a check that skips on an
+observed record must pass `--kinds`, `--command`, `--runner-prefix`, `--trust-levels` and
+`--max-age` explicitly** (or, better, `--policy-from`). Any unexpected exception is a JSON
+refusal with reason `error`, never a traceback and never a pass.
+
+`--bind-input KEY=PATH`
 (repeatable) requires the record's input `KEY` to equal the sha256 of `PATH` as it is in
 the tree being verified, for example `flake_lock_sha256=flake.lock`, so an environment
 fingerprint is tied to the tree and not to a claim; any mismatch, missing key or missing
