@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Select a provisioned PR-only Namespace profile without sampling capacity."""
+import json
+import os
+import re
+import subprocess
+
+
+def pr_namespace_profile(env, summary):
+    """Select the provisioned PR profile; queue lookup failures keep existing routing.
+
+    Namespace, not a sampled count here, enforces its static concurrency limit.
+    This read only exempts an exact head already in the merge queue at selection.
+    """
+    profile = env.get("PR_NAMESPACE_PROFILE", "")
+    if env.get("EVENT") != "pull_request" or not profile:
+        return None
+    def unchanged(reason):
+        print(f'PR Namespace profile: existing routing ({reason})', file=summary)
+        return None
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", profile):
+        return unchanged("invalid profile name")
+    number, run = env.get("PR_NUMBER", ""), env.get("RUN_ID", "")
+    head = env.get("PR_HEAD_SHA", "")
+    repo = env.get("REPOSITORY", "").split("/")
+    if (len(repo) != 2 or not all(repo) or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or not all(s.isascii() and s.isdigit() and int(s) > 0 for s in (number, run))
+            or not env.get("GH_REPO_TOKEN")):
+        return unchanged("queue identity or read token unavailable")
+    query = """query($owner:String!,$repo:String!,$number:Int!) {
+      repository(owner:$owner,name:$repo) {
+        pullRequest(number:$number) { headRefOid mergeQueueEntry { id } }
+      }
+    }"""
+    try:
+        result = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}",
+            "-f", f"owner={repo[0]}", "-f", f"repo={repo[1]}", "-F", f"number={number}"],
+            env={**env, "GH_TOKEN": env["GH_REPO_TOKEN"]}, check=True,
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict) or data.get("errors"):
+            return unchanged("queue read errors")
+        pr = data["data"]["repository"]["pullRequest"]
+        if pr["headRefOid"] != head:
+            return unchanged("PR head changed")
+        entry = pr["mergeQueueEntry"]
+        if entry is not None:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+                return unchanged("invalid queue entry")
+            return unchanged("exact PR head already queued")
+    except (subprocess.SubprocessError, ValueError, TypeError, KeyError):
+        return unchanged("queue read unavailable or invalid")
+    print(f'PR Namespace profile: **{profile}** (provider queues above its static limit)', file=summary)
+    return f"namespace-profile-{profile};job.priority=2;github.run-id={run}"
+
+
+def main():
+    env = os.environ
+    with open(env['GITHUB_STEP_SUMMARY'], 'a') as summary:
+        profile = pr_namespace_profile(env, summary)
+    if profile:
+        with open(env['GITHUB_OUTPUT'], 'a') as output:
+            print(f'namespace_pr={json.dumps([profile], separators=(",", ":"))}', file=output)
+            optional = profile.replace(';job.priority=2;', ';job.priority=3;')
+            print(f'namespace_pr_optional={json.dumps([optional], separators=(",", ":"))}', file=output)
+
+
+if __name__ == '__main__':
+    main()

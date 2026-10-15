@@ -20,7 +20,7 @@ concurrency:
 jobs:
   pick-runner:
     name: pick-runner
-    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name == 'merge_group' || vars.CI1_RUNNERS == 'on') }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name == 'merge_group' || vars.CI1_RUNNERS == 'on' || (github.event_name == 'pull_request' && vars.CI_PR_NAMESPACE_PROFILE != '')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
@@ -29,8 +29,94 @@ jobs:
       ci1: ${{ steps.pick.outputs.ci1 }}
       ci1_secondary: ${{ steps.pick.outputs.ci1_secondary }}
       ci1_mail: ${{ steps.pick.outputs.ci1_mail }}
+      namespace_pr: ${{ steps.namespace.outputs.namespace_pr }}
+      namespace_pr_optional: ${{ steps.namespace.outputs.namespace_pr_optional }}
     steps:
-      - name: Keep reserved primary lanes and use idle general runners for tests and canaries
+      - name: Select the provisioned PR profile unless this exact head is already queued
+        id: namespace
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_REPO_TOKEN: ${{ github.token }}
+          PR_NAMESPACE_PROFILE: ${{ vars.CI_PR_NAMESPACE_PROFILE }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'CI_PR_PROFILE'
+          #!/usr/bin/env python3
+          """Select a provisioned PR-only Namespace profile without sampling capacity."""
+          import json
+          import os
+          import re
+          import subprocess
+
+
+          def pr_namespace_profile(env, summary):
+              """Select the provisioned PR profile; queue lookup failures keep existing routing.
+
+              Namespace, not a sampled count here, enforces its static concurrency limit.
+              This read only exempts an exact head already in the merge queue at selection.
+              """
+              profile = env.get("PR_NAMESPACE_PROFILE", "")
+              if env.get("EVENT") != "pull_request" or not profile:
+                  return None
+              def unchanged(reason):
+                  print(f'PR Namespace profile: existing routing ({reason})', file=summary)
+                  return None
+              if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", profile):
+                  return unchanged("invalid profile name")
+              number, run = env.get("PR_NUMBER", ""), env.get("RUN_ID", "")
+              head = env.get("PR_HEAD_SHA", "")
+              repo = env.get("REPOSITORY", "").split("/")
+              if (len(repo) != 2 or not all(repo) or not re.fullmatch(r"[0-9a-f]{40}", head)
+                      or not all(s.isascii() and s.isdigit() and int(s) > 0 for s in (number, run))
+                      or not env.get("GH_REPO_TOKEN")):
+                  return unchanged("queue identity or read token unavailable")
+              query = """query($owner:String!,$repo:String!,$number:Int!) {
+                repository(owner:$owner,name:$repo) {
+                  pullRequest(number:$number) { headRefOid mergeQueueEntry { id } }
+                }
+              }"""
+              try:
+                  result = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}",
+                      "-f", f"owner={repo[0]}", "-f", f"repo={repo[1]}", "-F", f"number={number}"],
+                      env={**env, "GH_TOKEN": env["GH_REPO_TOKEN"]}, check=True,
+                      capture_output=True, text=True, timeout=10)
+                  data = json.loads(result.stdout)
+                  if not isinstance(data, dict) or data.get("errors"):
+                      return unchanged("queue read errors")
+                  pr = data["data"]["repository"]["pullRequest"]
+                  if pr["headRefOid"] != head:
+                      return unchanged("PR head changed")
+                  entry = pr["mergeQueueEntry"]
+                  if entry is not None:
+                      if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+                          return unchanged("invalid queue entry")
+                      return unchanged("exact PR head already queued")
+              except (subprocess.SubprocessError, ValueError, TypeError, KeyError):
+                  return unchanged("queue read unavailable or invalid")
+              print(f'PR Namespace profile: **{profile}** (provider queues above its static limit)', file=summary)
+              return f"namespace-profile-{profile};job.priority=2;github.run-id={run}"
+
+
+          def main():
+              env = os.environ
+              with open(env['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  profile = pr_namespace_profile(env, summary)
+              if profile:
+                  with open(env['GITHUB_OUTPUT'], 'a') as output:
+                      print(f'namespace_pr={json.dumps([profile], separators=(",", ":"))}', file=output)
+                      optional = profile.replace(';job.priority=2;', ';job.priority=3;')
+                      print(f'namespace_pr_optional={json.dumps([optional], separators=(",", ":"))}', file=output)
+
+
+          if __name__ == '__main__':
+              main()
+          CI_PR_PROFILE
+
+      - if: github.event_name == 'merge_group' || vars.CI1_RUNNERS == 'on'
+        name: Keep reserved primary lanes and use idle general runners for tests and canaries
         id: pick
         env:
           GH_TOKEN: ${{ secrets.CI1_RUNNERS_READ_TOKEN }}
@@ -623,7 +709,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
           QUEUE_SHA: ${{ github.event.merge_group.head_sha }}
-          QUEUE_DEPENDENCIES: '{"pick-runner":[],"evidence-source":[],"evidence-gate-linux-gate":[],"evidence-gate-typescript-client":[],"evidence-gate-isolation-vm":[],"evidence-gate-genie-freshness":[],"evidence-gate-mail-redelivery-canaries":[],"upgrade-impact":[],"namespace-capacity":[],"genie-freshness":["pick-runner","evidence-gate-genie-freshness"],"typescript-client":["pick-runner","genie-freshness","evidence-gate-typescript-client"],"linux-test-build":["pick-runner","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"linux-tests":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-2":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-3":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-4":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-clippy":["pick-runner","evidence-gate-linux-gate"],"linux-fleet-compat":["pick-runner","evidence-gate-linux-gate"],"mail-redelivery-canaries":["pick-runner","linux-test-build","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries"],"linux-gate":["pick-runner","evidence-gate-linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"evidence-note-linux-gate":["linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","genie-freshness","typescript-client","isolation-vm","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm","evidence-gate-genie-freshness","evidence-gate-typescript-client"],"perf-cost":[],"isolation-vm":["pick-runner","linux-test-build","evidence-gate-isolation-vm"],"fractal-web-changes":[],"fractal-web-execution":["fractal-web-changes","genie-freshness"],"fractal-web":["fractal-web-changes","fractal-web-execution"]}'
+          QUEUE_DEPENDENCIES: '{"pick-runner":[],"evidence-source":[],"evidence-gate-linux-gate":[],"evidence-gate-typescript-client":[],"evidence-gate-isolation-vm":[],"evidence-gate-genie-freshness":[],"evidence-gate-mail-redelivery-canaries":[],"upgrade-impact":[],"namespace-capacity":[],"genie-freshness":["pick-runner","evidence-gate-genie-freshness"],"typescript-client":["pick-runner","genie-freshness","evidence-gate-typescript-client"],"linux-test-build":["pick-runner","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"linux-tests":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-2":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-3":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-tests-shard-4":["pick-runner","linux-test-build","evidence-gate-linux-gate"],"linux-clippy":["pick-runner","evidence-gate-linux-gate"],"linux-fleet-compat":["pick-runner","evidence-gate-linux-gate"],"mail-redelivery-canaries":["pick-runner","linux-test-build","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries"],"linux-gate":["pick-runner","evidence-gate-linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm"],"evidence-note-linux-gate":["linux-gate","linux-test-build","upgrade-impact","linux-tests","linux-tests-shard-2","linux-tests-shard-3","linux-tests-shard-4","linux-clippy","linux-fleet-compat","mail-redelivery-canaries","genie-freshness","typescript-client","isolation-vm","evidence-gate-linux-gate","evidence-gate-mail-redelivery-canaries","evidence-gate-isolation-vm","evidence-gate-genie-freshness","evidence-gate-typescript-client"],"perf-cost":["pick-runner"],"isolation-vm":["pick-runner","linux-test-build","evidence-gate-isolation-vm"],"fractal-web-changes":[],"fractal-web-execution":["fractal-web-changes","genie-freshness"],"fractal-web":["fractal-web-changes","fractal-web-execution"]}'
         run: |
           python3 - <<'QUEUE_WATCH_PY'
           #!/usr/bin/env python3
@@ -1050,7 +1136,7 @@ jobs:
         evidence-gate-isolation-vm,
       ]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled()) && !((needs.evidence-gate-linux-gate.outputs.skip == 'true') && (needs.evidence-gate-linux-gate.outputs.skip == 'true' || needs.evidence-gate-mail-redelivery-canaries.outputs.skip == 'true') && (needs.evidence-gate-isolation-vm.outputs.skip == 'true'))) }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1) || github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     timeout-minutes: 120
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -1194,7 +1280,7 @@ jobs:
     name: linux-tests
     needs: [pick-runner, linux-test-build, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled()) && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1) || github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
     timeout-minutes: 120
     defaults:
@@ -1374,7 +1460,7 @@ jobs:
     name: linux-tests-shard-2
     needs: [pick-runner, linux-test-build, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled()) && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1_secondary) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1_secondary) || github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
     timeout-minutes: 120
     defaults:
@@ -1905,7 +1991,7 @@ jobs:
     name: linux-clippy
     needs: [pick-runner, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled()) && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
     timeout-minutes: 120
     defaults:
@@ -2101,7 +2187,7 @@ jobs:
     name: linux-fleet-compat
     needs: [pick-runner, evidence-gate-linux-gate]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && ((!cancelled()) && !(needs.evidence-gate-linux-gate.outputs.skip == 'true')) }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
     timeout-minutes: 120
     defaults:
@@ -2294,7 +2380,7 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   mail-redelivery-canaries:
     name: mail-redelivery-canaries
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1_mail) || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || (github.event_name != 'merge_group' && needs.pick-runner.outputs.ci1_mail) || github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
     timeout-minutes: 120
     defaults:
@@ -2696,12 +2782,8 @@ jobs:
         run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
   perf-cost:
     name: perf-cost
-    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'merge_group') }}
-    runs-on:
-      [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 3 }}",
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (!cancelled() && github.event_name != 'merge_group') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr_optional || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 3)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -2854,11 +2936,12 @@ jobs:
         env:
           CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the generated stores","outcome":"${{ steps.cache-10.outcome }}","hit":"${{ steps.cache-10.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+    needs: [pick-runner]
   isolation-vm:
     name: isolation-vm
     needs: [pick-runner, linux-test-build, evidence-gate-isolation-vm]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (!cancelled()) }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && (needs.pick-runner.outputs.ci1 || '["ci1-priority"]') || github.event_name == 'pull_request' && needs.pick-runner.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3)) }}
     timeout-minutes: 60
     environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'evidence-signing' || '' }}
     defaults:

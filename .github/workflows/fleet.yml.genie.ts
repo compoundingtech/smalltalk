@@ -26,6 +26,7 @@ import {
   linuxStageRunner,
   linuxStageRunsOn,
   perfStoresCache,
+  performanceCostRunsOn,
   mailStageRunsOn,
   pickRunnerJob,
   pickRunnerJobId,
@@ -686,10 +687,10 @@ python3 "$RUNNER_TEMP/evidence-base/scripts/evidence-publish" --notes "$RUNNER_T
     // runs in perf.yml. It runs where the stages run, and skips merge-queue entries, which do not
     // wait for it, so each queued entry still needs only its required jobs' capacity. A required
     // perf-cost must run there too.
-    'perf-cost': namespaceStageJob({
+    'perf-cost': { ...namespaceStageJob({
       name: 'perf-cost',
       stage: 'cost',
-      runsOn: linuxStageRunner,
+      runsOn: performanceCostRunsOn,
       condition: "github.event_name != 'merge_group'",
       setup: commonSetupSteps,
       description: 'Run the cost check',
@@ -697,7 +698,7 @@ python3 "$RUNNER_TEMP/evidence-base/scripts/evidence-publish" --notes "$RUNNER_T
       env: { CARGO_PROFILE_DEV_OPT_LEVEL: '1' },
       extraLogs: '${{ runner.temp }}/perf/',
       before: [perfStoresCache('cost')],
-    }),
+    }), needs: [pickRunnerJobId], if: "${{ !cancelled() && github.event_name != 'merge_group' }}" },
     // st2's transport-isolation cascade tests need a real systemd user manager, which the
     // runner image lacks. A NixOS VM runs this job's prebuilt test binary; it compiles nothing.
     'isolation-vm': {
