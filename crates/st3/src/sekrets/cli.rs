@@ -377,7 +377,8 @@ async fn identified_connection(endpoint: Option<&str>) -> Result<Connection> {
 
 /// This user's daemon, found as every other st command finds it: `--endpoint`, then
 /// `ST3_ENDPOINT`, then the configured socket. A seat's driver sets `ST3_ENDPOINT` to the daemon
-/// that runs it, which need not be at the configured socket.
+/// that runs it, which need not be at the configured socket. Only a Unix socket: the daemon
+/// vouches for a seat and says its node key, so it must be this host's own.
 fn daemon_client(endpoint: Option<&str>) -> Result<crate::client::Client> {
     let endpoint = daemon_endpoint(
         endpoint.map(str::to_owned),
@@ -396,12 +397,17 @@ fn daemon_endpoint(
     environment: Option<String>,
     configured: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<crate::client::Endpoint> {
-    Ok(
-        match flag.or(environment).filter(|value| !value.is_empty()) {
-            Some(endpoint) => crate::client::Endpoint::parse(endpoint),
-            None => crate::client::Endpoint::Unix(configured()?),
+    match flag.or(environment).filter(|value| !value.is_empty()) {
+        // The value is not echoed: a URL can carry a password or a token.
+        Some(endpoint) => match crate::client::Endpoint::parse(&endpoint) {
+            crate::client::Endpoint::Http(_) => bail!(
+                "sekrets reaches this host's daemon only through its Unix socket, not an http(s) \
+                 endpoint (value omitted)"
+            ),
+            unix => Ok(unix),
         },
-    )
+        None => Ok(crate::client::Endpoint::Unix(configured()?)),
+    }
 }
 
 fn describe(caller: &CallerView) -> String {
@@ -792,15 +798,23 @@ mod tests {
             unix(daemon_endpoint(None, Some(String::new()), configured).unwrap()),
             Path::new("/run/user/1000/st3.sock")
         );
-        assert!(matches!(
+        assert!(
             daemon_endpoint(
                 None,
                 Some("http://127.0.0.1:7777".into()),
                 || unreachable!()
             )
-            .unwrap(),
-            crate::client::Endpoint::Http(_)
-        ));
+            .is_err()
+        );
+        let refused = daemon_endpoint(
+            Some("https://ada:hunter2@example.invalid/?token=t0ken".into()),
+            None,
+            || unreachable!(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("only through its Unix socket"));
+        assert!(!refused.contains("hunter2") && !refused.contains("t0ken"));
     }
 
     #[test]
