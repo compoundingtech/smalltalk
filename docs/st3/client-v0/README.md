@@ -1955,6 +1955,9 @@ Assistant session errors add `TimelineViewAssistantError` with `status`,
 `superseded_by` with epoch-ms `timestamp`, `response_id`, `provider`, `model`).
 Recovery markers do not invent live retry state. Recovered errors start compact,
 retain original errors on expansion, and superseded errors are not drawn.
+The optional open `native` object preserves exact `stopReason`, `errorMessage`,
+`errorStatus`, `errorId` and `retryRecovery` values, including structured/null
+diagnostics and future fields, without changing the presentation projection.
 
 
 `read.projections` authorizes **raw native conversation content**, including full

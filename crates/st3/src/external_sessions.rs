@@ -4105,6 +4105,20 @@ fn omp_assistant_error_view(message: &Value) -> Option<Value> {
                     },
                 )
             }
+            Some("length") => (
+                "failed",
+                "full",
+                true,
+                error_message.unwrap_or(
+                    "The native assistant reached its output limit; its response may be incomplete.",
+                ),
+            ),
+            Some(stop) if !matches!(stop, "stop" | "toolUse") => (
+                "failed",
+                "full",
+                true,
+                error_message.unwrap_or("The native assistant stopped with an unsupported reason."),
+            ),
             _ => {
                 let text = error_message?;
                 if text.is_empty() || silent_abort || user_interrupt {
@@ -4122,6 +4136,20 @@ fn omp_assistant_error_view(message: &Value) -> Option<Value> {
         "label": label,
         "message": error_message.unwrap_or(""),
     });
+    // Keep the exact native diagnostics alongside the harness presentation projection.
+    let mut native = serde_json::Map::new();
+    for field in [
+        "stopReason",
+        "errorMessage",
+        "errorStatus",
+        "errorId",
+        "retryRecovery",
+    ] {
+        if let Some(value) = message.get(field) {
+            native.insert(field.to_owned(), value.clone());
+        }
+    }
+    view["native"] = Value::Object(native);
     if let Some(stop_reason) = stop_reason {
         view["stop_reason"] = json!(stop_reason);
     }
@@ -4262,6 +4290,24 @@ fn normalize_omp(
                             value,
                         );
                     }
+                }
+            }
+            return;
+        }
+        Some("custom")
+            if driver == ExternalDriver::Omp
+                && value.get("customType").and_then(Value::as_str) == Some("session_exit") =>
+        {
+            push_omp_exit(items, sequence, &timestamp, &value["data"]);
+            let block = &mut items.last_mut().expect("exit item just pushed")["body"]["blocks"][0];
+            block["payload"] = json!({"body_ref": true, "raw": value});
+            if let Some((_, view, visibility)) = record_view
+                && view["kind"].is_string()
+                && view["reason"].is_string()
+            {
+                block["view"] = view;
+                if let Some(visibility) = visibility {
+                    block["visibility"] = json!(visibility);
                 }
             }
             return;
@@ -4481,6 +4527,71 @@ fn normalize_omp(
             block["metadata"] = metadata;
         }
     }
+}
+
+fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &Value) {
+    // A stopped process says nothing about the turn or pending tools. Unknown exits
+    // must not look successful; keep the complete checkpoint in either body shape.
+    let kind = data.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let reason = data
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let exit_code = data
+        .get("exitCode")
+        .or_else(|| data.get("code"))
+        .and_then(Value::as_i64);
+    let fatal_reason = matches!(
+        reason,
+        "fatal"
+            | "crash"
+            | "uncaughtException"
+            | "uncaught_exception"
+            | "unhandledRejection"
+            | "unhandled_rejection"
+    );
+    let code = match kind {
+        "fatal"
+        | "crash"
+        | "uncaughtException"
+        | "uncaught_exception"
+        | "unhandledRejection"
+        | "unhandled_rejection" => Some("native_session_exit_fatal"),
+        "normal" | "signal" | "process_exit" | "exit"
+            if fatal_reason || exit_code.is_some_and(|code| code != 0) =>
+        {
+            Some("native_session_exit_fatal")
+        }
+        "normal" => None,
+        "signal" if matches!(reason, "sigterm" | "sigint" | "sighup") => None,
+        "process_exit" | "exit" if exit_code == Some(0) => None,
+        _ => Some("native_session_exit_unknown"),
+    };
+    let (entry_type, body) = if let Some(code) = code {
+        (
+            "error",
+            json!({
+                "code":code,
+                "message":if code == "native_session_exit_fatal" {
+                    "The native OMP process exited abnormally."
+                } else {
+                    "The native OMP process exit outcome is unknown."
+                },
+                "retryable":false,"details":data,
+            }),
+        )
+    } else {
+        (
+            "status",
+            json!({
+                "status":"cancelled",
+                "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
+            }),
+        )
+    };
+    items.push(timeline_item(
+        sequence, timestamp, "system", entry_type, body,
+    ));
 }
 
 fn push_omp_content(
@@ -4844,7 +4955,13 @@ mod tests {
                     },
                 });
                 let first = items.len();
-                normalize_omp(driver, &record, sequence, "2026-10-06T00:00:00Z", &mut items);
+                normalize_omp(
+                    driver,
+                    &record,
+                    sequence,
+                    "2026-10-06T00:00:00Z",
+                    &mut items,
+                );
                 let blocks: Vec<_> = items[first..]
                     .iter()
                     .filter_map(|item| item["body"]["blocks"].as_array())
@@ -4853,7 +4970,13 @@ mod tests {
                 let owner = blocks.last().unwrap();
                 assert_eq!(owner["metadata"]["usage"]["cost_usd"], usd);
                 assert_eq!(owner["metadata"]["usage"]["total"], 17);
-                assert_eq!(blocks.iter().filter(|block| block["metadata"]["usage"].is_object()).count(), 1);
+                assert_eq!(
+                    blocks
+                        .iter()
+                        .filter(|block| block["metadata"]["usage"].is_object())
+                        .count(),
+                    1
+                );
             }
             let header = crate::conversation_header::derive(&items, false);
             assert_eq!(header["cost"]["value"]["usd"], 0.75);
@@ -4890,19 +5013,32 @@ mod tests {
         for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
             let mut items = Vec::new();
             for (sequence, message, timestamp) in [
-                (0, json!({
-                    "role": "assistant", "content": "previous answer", "model": "old-model",
-                    "usage": {"cost": {"total": 0.25}},
-                    "contextSnapshot": {"promptTokens": 11},
-                }), "2026-10-06T00:00:00Z"),
-                (1000, json!({
-                    "role": "assistant", "content": content, "model": "latest-model",
-                    "usage": {"input": 12, "output": 5, "totalTokens": 17, "cost": {"total": 0.5}},
-                    "contextSnapshot": {"promptTokens": 23}, "ttft": 10, "duration": 30,
-                }), "2026-10-06T00:00:01Z"),
+                (
+                    0,
+                    json!({
+                        "role": "assistant", "content": "previous answer", "model": "old-model",
+                        "usage": {"cost": {"total": 0.25}},
+                        "contextSnapshot": {"promptTokens": 11},
+                    }),
+                    "2026-10-06T00:00:00Z",
+                ),
+                (
+                    1000,
+                    json!({
+                        "role": "assistant", "content": content, "model": "latest-model",
+                        "usage": {"input": 12, "output": 5, "totalTokens": 17, "cost": {"total": 0.5}},
+                        "contextSnapshot": {"promptTokens": 23}, "ttft": 10, "duration": 30,
+                    }),
+                    "2026-10-06T00:00:01Z",
+                ),
             ] {
-                normalize_omp(driver, &json!({"type": "message", "message": message}),
-                    sequence, timestamp, &mut items);
+                normalize_omp(
+                    driver,
+                    &json!({"type": "message", "message": message}),
+                    sequence,
+                    timestamp,
+                    &mut items,
+                );
             }
             let owner = &items.last().unwrap()["body"]["blocks"][0];
             assert_eq!(owner["kind"], "tool_call");
@@ -4914,7 +5050,10 @@ mod tests {
             items.reverse();
             let head = &items[..200];
             assert_eq!(head.len(), 200);
-            assert!(head.iter().all(|item| item["sequence"].as_u64().unwrap() > 1001));
+            assert!(
+                head.iter()
+                    .all(|item| item["sequence"].as_u64().unwrap() > 1001)
+            );
             let header = crate::conversation_header::derive(head, true);
             assert_eq!(header["cost"]["value"], json!({"usd": 0.5, "window": true}));
             assert_eq!(header["model"]["value"], "latest-model");
@@ -5023,8 +5162,12 @@ mod tests {
                     .any(|block| block["view"]["type"] == "tool_start"
                         && block["visibility"] == "internal")
             );
-            assert!(blocks.iter().any(|block| block["metadata"]["context_tokens"] == 23
-                && block["metadata"]["usage"]["cost_usd"] == 0.01));
+            assert!(
+                blocks
+                    .iter()
+                    .any(|block| block["metadata"]["context_tokens"] == 23
+                        && block["metadata"]["usage"]["cost_usd"] == 0.01)
+            );
             for kind in ["text", "reasoning"] {
                 assert!(blocks.iter().any(|block| block["kind"] == kind));
             }
@@ -5488,7 +5631,10 @@ mod tests {
             base.join("logins/first/projects"),
             base.join("elsewhere/second-login/projects"),
         ];
-        assert_eq!(find("on-first", None, &extra).unwrap().transcript, first.join("on-first.jsonl"));
+        assert_eq!(
+            find("on-first", None, &extra).unwrap().transcript,
+            first.join("on-first.jsonl")
+        );
         assert_eq!(find("on-second", None, &extra).unwrap().transcript, hint);
         // A recorded path never stands in for a different session, a relative path, or a link.
         assert!(find("on-first", Some(&hint), &[]).is_none());
@@ -5587,6 +5733,309 @@ mod tests {
             assert_eq!(block["kind"], "image");
             assert_eq!(block["payload"], part);
             assert_eq!(items[1]["body"]["text"], "[image · load from owner]");
+        }
+    }
+
+    #[test]
+    fn omp_managed_stop_fixture_preserves_the_complete_checkpoint() {
+        let mut items = Vec::new();
+        let mut checkpoint = Value::Null;
+        for (offset, line) in include_str!("../fixtures/omp-resume/managed-stop-cancelled.jsonl")
+            .lines()
+            .enumerate()
+        {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            if entry["customType"] == "session_exit" {
+                checkpoint = entry["data"].clone();
+            }
+            normalize_omp(
+                ExternalDriver::Omp,
+                &entry,
+                offset as u64 * 16,
+                "",
+                &mut items,
+            );
+        }
+        assert!(
+            !items
+                .iter()
+                .any(|item| item["body"]["code"] == "native_process_exit")
+        );
+        let status = items.iter().find(|item| item["type"] == "status").unwrap();
+        assert_eq!(status["body"]["status"], "cancelled");
+        let details: Value =
+            serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
+        assert_eq!(details, checkpoint);
+        assert_eq!(
+            details["pendingToolCalls"][0]["args"]["questions"][0]["question"],
+            "Heal canary: which color?"
+        );
+        assert!(
+            items
+                .windows(2)
+                .all(|pair| pair[0]["sequence"].as_u64() < pair[1]["sequence"].as_u64())
+        );
+    }
+
+    #[test]
+    fn omp_exit_checkpoint_preserves_open_native_values_without_normalizer_bounds() {
+        let data = json!({
+            "kind":"future-kind","reason":"Bearer planted-secret\n\u{1b}",
+            "pendingToolCalls": (0..20).map(|_| json!({
+                "toolCallId":99, "toolName":null, "args":{"intent":"x".repeat(32_768)}
+            })).collect::<Vec<_>>(),
+            "future":{"native":true},
+        });
+        let mut items = Vec::new();
+        normalize_omp(
+            ExternalDriver::Omp,
+            &json!({
+                "type":"custom","customType":"session_exit","data":data
+            }),
+            0,
+            "",
+            &mut items,
+        );
+        assert_eq!(items[0]["type"], "error");
+        assert_eq!(items[0]["body"]["code"], "native_session_exit_unknown");
+        assert_eq!(items[0]["body"]["details"], data);
+        assert_eq!(items[0]["body"]["blocks"][0]["kind"], "error");
+        assert_eq!(items[0]["body"]["blocks"][0]["payload"]["body_ref"], true);
+    }
+
+    #[test]
+    fn omp_session_exits_classify_native_kinds_without_losing_details() {
+        for (data, expected_code) in [
+            (json!({"kind":"signal","reason":"sigterm"}), None),
+            (json!({"kind":"signal","reason":"sigint"}), None),
+            (json!({"kind":"signal","reason":"sighup"}), None),
+            (json!({"kind":"normal","reason":"dispose"}), None),
+            (json!({"kind":"normal","reason":"manual"}), None),
+            (
+                json!({"kind":"process_exit","reason":"exit","exitCode":0}),
+                None,
+            ),
+            (json!({"kind":"exit","reason":"exit","code":0}), None),
+            (
+                json!({"kind":"fatal","reason":"uncaught_exception"}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"fatal","reason":"unhandled_rejection"}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"uncaughtException","reason":"exception"}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"unhandledRejection","reason":"rejection"}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"crash","reason":"crash"}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"normal","reason":"uncaughtException"}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"signal","reason":"unhandledRejection"}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"process_exit","reason":"exit","exitCode":1}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"exit","reason":"exit","code":2}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"normal","reason":"exit","exitCode":1}),
+                Some("native_session_exit_fatal"),
+            ),
+            (
+                json!({"kind":"process_exit","reason":"exit"}),
+                Some("native_session_exit_unknown"),
+            ),
+            (
+                json!({"kind":"signal","reason":"future-signal"}),
+                Some("native_session_exit_unknown"),
+            ),
+            (
+                json!({"kind":"future-kind","reason":"sigterm"}),
+                Some("native_session_exit_unknown"),
+            ),
+            (
+                json!({"reason":"dispose"}),
+                Some("native_session_exit_unknown"),
+            ),
+            (json!({"kind":"normal"}), None),
+            (
+                json!({"kind":null,"reason":{"future":true}}),
+                Some("native_session_exit_unknown"),
+            ),
+        ] {
+            let mut data = data;
+            data["pendingToolCalls"] =
+                json!([{"toolName":"ask","args":{"future":[false,null,42]}}]);
+            data["future"] = json!({"native":"unchanged"});
+            let mut items = Vec::new();
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({"type":"custom","customType":"session_exit","data":data}),
+                0,
+                "",
+                &mut items,
+            );
+            let entry = &items[0];
+            assert_eq!(entry["role"], "system", "{data}");
+            let block = &entry["body"]["blocks"][0];
+            assert_eq!(block["payload"]["body_ref"], true, "{data}");
+            assert_eq!(block["payload"]["raw"]["data"], data);
+            if data["kind"].is_string() && data["reason"].is_string() {
+                assert_eq!(block["view"]["type"], "session_exit");
+                assert_eq!(block["view"]["kind"], data["kind"]);
+                assert_eq!(block["view"]["reason"], data["reason"]);
+            } else {
+                assert!(block.get("view").is_none(), "{data}");
+            }
+            if let Some(code) = expected_code {
+                assert_eq!(entry["type"], "error", "{data}");
+                assert_eq!(entry["body"]["code"], code, "{data}");
+                assert_eq!(entry["body"]["retryable"], false, "{data}");
+                assert_eq!(entry["body"]["details"], data);
+                assert_eq!(block["kind"], "error", "{data}");
+            } else {
+                assert_eq!(entry["type"], "status", "{data}");
+                assert_eq!(entry["body"]["status"], "cancelled", "{data}");
+                let detail: Value =
+                    serde_json::from_str(entry["body"]["detail"].as_str().unwrap()).unwrap();
+                assert_eq!(detail, data);
+                assert_eq!(block["kind"], "status", "{data}");
+            }
+        }
+    }
+
+    #[test]
+    fn omp_assistant_outcomes_preserve_exact_diagnostics_and_retry_recovery() {
+        for stop in ["error", "aborted", "length", "future native stop\n\u{1b}"] {
+            let message = json!({
+                "role":"assistant","content":[],
+                "stopReason":stop,"errorMessage":format!("provider\n\u{1b}{}", "x".repeat(32_768)),
+                "errorStatus":"future-status","errorId":{"provider":99},
+                "retryRecovery":{"attempt":2,"future":[false,null,"unchanged"]},
+            });
+            let mut items = Vec::new();
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({
+                    "type":"message","message":message
+                }),
+                0,
+                "",
+                &mut items,
+            );
+            let errors = items
+                .iter()
+                .flat_map(|entry| entry["body"]["blocks"].as_array().into_iter().flatten())
+                .filter(|block| block["source_type"] == "omp/assistant_error")
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{stop}");
+            assert!(
+                items.iter().all(|entry| entry["type"] != "error"),
+                "assistant stop {stop} must not also produce a system error entry"
+            );
+            assert_eq!(
+                items.iter()
+                    .flat_map(|entry| entry["body"]["blocks"].as_array().into_iter().flatten())
+                    .filter(|block| block["kind"] == "error")
+                    .count(),
+                1,
+                "exactly one error block for assistant stop {stop}"
+            );
+            let error = errors[0];
+            let view = &error["view"];
+            assert_eq!(view["type"], "assistant_error");
+            assert_eq!(view["presentation"], "full");
+            assert_eq!(view["stop_reason"], message["stopReason"]);
+            assert_eq!(view["message"], message["errorMessage"]);
+            for key in [
+                "stopReason",
+                "errorMessage",
+                "errorStatus",
+                "errorId",
+                "retryRecovery",
+            ] {
+                assert_eq!(view["native"][key], message[key], "{stop}/{key}");
+            }
+            assert_eq!(error["kind"], "error");
+            assert_eq!(error["payload"], json!({"body_ref":true}));
+        }
+    }
+
+    #[test]
+    fn omp_length_and_unknown_stops_render_without_error_messages() {
+        for stop in ["length", "future-stop"] {
+            let view = omp_assistant_error_view(&json!({"stopReason": stop})).unwrap();
+            assert_eq!(view["presentation"], "full");
+            assert_eq!(view["is_error"], true);
+            assert_eq!(view["native"]["stopReason"], stop);
+            assert!(!view["label"].as_str().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn omp_outcome_owner_reads_preserve_full_native_records_and_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("outcomes.jsonl");
+        let records = [
+            json!({"type":"message","message":{
+                "role":"assistant","content":[],"stopReason":"error",
+                "errorMessage":"provider diagnostic\n".repeat(4096),
+                "errorStatus":429,"errorId":"native-id",
+                "retryRecovery":{"attempt":2,"reason":"recorded retry"}
+            },"future":"record metadata"}),
+            json!({"type":"custom","customType":"session_exit","data":{
+                "kind":"fatal","reason":"native process reason\n".repeat(4096),
+                "pendingToolCalls":[{"toolCallId":"","args":{"future":true}}]
+            }}),
+        ];
+        fs::write(&path, format!("{}\n{}\n", records[0], records[1])).unwrap();
+        let session = transcript_session(ExternalDriver::Omp, &path);
+        let timeline = normalized_timeline(&session).unwrap();
+        for record in &records {
+            assert!(
+                timeline
+                    .iter()
+                    .flat_map(|entry| entry["body"]["blocks"].as_array().into_iter().flatten())
+                    .any(|block| block["kind"] == "source_record"
+                        && block["payload"]["raw"] == *record)
+            );
+        }
+        let error = timeline
+            .iter()
+            .find(|entry| entry["body"]["blocks"][0]["source_type"] == "omp/assistant_error")
+            .unwrap();
+        assert_eq!(
+            error["body"]["blocks"][0]["view"]["message"],
+            records[0]["message"]["errorMessage"]
+        );
+        let exit = timeline
+            .iter()
+            .find(|entry| entry["body"]["code"] == "native_session_exit_fatal")
+            .unwrap();
+        assert_eq!(exit["body"]["details"], records[1]["data"]);
+        for entry in [error, exit] {
+            let locator = serde_json::from_value(entry["_source"].clone()).unwrap();
+            let fetched = normalized_record(&session, &locator).unwrap();
+            assert!(
+                fetched
+                    .iter()
+                    .any(|item| item["id"] == entry["id"] && item["body"] == entry["body"])
+            );
         }
     }
 
@@ -5920,6 +6369,18 @@ mod tests {
             }
             let mut items = Vec::new();
             normalize_omp(ExternalDriver::Omp, &record, 0, "", &mut items);
+            assert!(
+                items.iter().all(|entry| entry["type"] != "error"),
+                "no separate system error entry for {fields}"
+            );
+            assert_eq!(
+                items.iter()
+                    .flat_map(|entry| entry["body"]["blocks"].as_array().into_iter().flatten())
+                    .filter(|block| block["kind"] == "error")
+                    .count(),
+                usize::from(expected.is_some()),
+                "silent aborts and user interrupts emit no error block: {fields}"
+            );
             match expected {
                 None => assert_eq!(items.len(), 1, "no error block for {fields}"),
                 Some(label) => {

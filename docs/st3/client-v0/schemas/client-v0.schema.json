@@ -1776,6 +1776,10 @@
         "is_error": {"type": "boolean"}, "label": {"type": "string"}, "message": {"type": "string"},
         "stop_reason": {"type": "string"}, "error_id": {"type": "integer"},
         "api": {"type": "string"}, "provider": {"type": "string"}, "model": {"type": "string"},
+        "native": {
+          "type": "object", "additionalProperties": {},
+          "description": "Exact native assistant stopReason, errorMessage, errorStatus, errorId and retryRecovery diagnostics, including arbitrary structured/null and future values."
+        },
         "retry": {
           "type": "object", "additionalProperties": false,
           "properties": {

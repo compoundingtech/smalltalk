@@ -374,3 +374,19 @@ one existing collections socket. The first `replace:true` frame contains the new
 entries, subject to the existing 1 MiB frame limit, with `has_more` when older content exists.
 Older content remains available through the existing 200-entry timeline pages and owner
 content chunks. Subsequent `replace:false` frames carry new or revised entries by ID.
+
+Native assistant stop outcomes use the shared `assistant_error` block and harness
+presentation rules: superseded attempts, silent aborts and user interrupts render
+nothing; recovered attempts show a compact note and terminal failures render in full.
+The view retains the exact native `stopReason`, `errorMessage`, `retryRecovery`,
+`errorStatus` and `errorId` under `native`, alongside the presentation projection.
+Native source records remain available through owner reads.
+
+Session exits preserve the complete checkpoint, including `pendingToolCalls`,
+arguments/intent and unknown fields. Only transport size and paging limits apply,
+with visible truncation markers and owner continuations for exact full values.
+Outcomes are read from the owner machine, not stored in the database.
+Recognized exits use the existing `cancelled` status value — the process stopped
+before the turn finished; the recorded kind, reason and exit code stay in `detail` —
+so a planned stop is neither a completed turn nor an error, with no new
+client-visible vocabulary. Fatal and unknown exits remain diagnostic errors.

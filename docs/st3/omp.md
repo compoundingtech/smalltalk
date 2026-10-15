@@ -184,6 +184,58 @@ outbox is unavailable, unforwarded `timeline`, `context`, and `turn` frames prod
 diagnostic. The managed route does not perform the standalone channel's pre-compaction context
 recovery stub.
 
+## Native replay outcomes
+
+Native exceptional assistant stop metadata is retained independently of content, including empty
+turns. Routine `stop` and `toolUse` do not add redundant completion/waiting entries.
+Assistant outcomes use the shared `assistant_error` block on an assistant content entry,
+not a second system error entry. Its view applies the harness's presentation rules:
+superseded attempts, silent aborts and user interrupts render nothing; recovered attempts
+show a compact note; terminal failures render in full. `length` reports a possibly
+incomplete answer, and unknown stop reasons remain visible even without an error message.
+The view's `native` object retains exact `stopReason`, `errorMessage`, `errorStatus`,
+`errorId` and `retryRecovery` values whenever supplied, including future structured fields.
+The presentation `message` keeps the original diagnostic, while `label` supplies the
+resolved display text. Persisted retry markers determine presentation; replay does not
+infer retry continuation from messages or process exits.
+
+Native `custom/session_exit` checkpoints are classified from their `data.kind` and
+`data.reason`, without inferring the outcome of a turn or pending tools:
+
+| Native exit | Timeline entry |
+| --- | --- |
+| `normal` (including `dispose` and `manual`); `signal` with `sigterm`, `sigint` or `sighup` | `status: cancelled` |
+| `process_exit` or `exit` with explicit numeric `exitCode` (or `code`) zero | `status: cancelled` |
+| `fatal`, `crash`, `uncaughtException` / `uncaught_exception`, or `unhandledRejection` / `unhandled_rejection` | `error`, code `native_session_exit_fatal` |
+| Recognized normal/signal/process-exit kinds with a fatal reason or a nonzero exit code | `error`, code `native_session_exit_fatal` |
+| Unknown/missing kinds, unfamiliar signals, or process exits without a known exit code | `error`, code `native_session_exit_unknown` |
+
+OMP's native kinds are `normal`, `signal`, `fatal` and `process_exit`. Its fatal reasons
+are `uncaught_exception` and `unhandled_rejection`; camel-case forms are also recognized.
+The native `process_exit` / `exit` checkpoint currently omits the process code, so its
+outcome stays unknown unless a numeric code is supplied. Unknown kinds remain unknown
+even if their reason looks like a normal signal.
+
+Recognized stops use the existing status entry and `status` block with `{body_ref:true}`;
+the body has `status: cancelled` and `detail` containing the complete native `data` serialized
+as JSON — including the recorded kind, reason (the signal) and exit code. `cancelled` is the
+existing timeline vocabulary: the process stopped before the turn finished. It is neither a
+successfully completed turn nor an error, and it does not infer who or what stopped the
+process. Fatal and unknown stops use a system error entry and `error` block with
+`{body_ref:true}`, `retryable: false` and the complete native `data` in `details`.
+Both retain exact kind, reason, pending-tool arguments/intent and future fields.
+A process exit proves neither user cancellation, tool completion nor the outcome of
+the next process.
+
+Visible assistant views and session exits preserve diagnostics, pending-tool arguments/intent
+and unknown fields. Parsed records also retain the complete native record in an internal
+`source_record` block; malformed input retains its original bytes as `raw_text`.
+Transport size and paging limits bound responses; size truncation is visibly marked,
+and owner continuations recover the exact full values. These outcomes are read from the
+owner machine, not stored in the database. Assistant visibility follows the harness rules
+above in the normalizer; source records remain available through owner reads.
+A `cancelled` exit status describes process lifecycle, not a successfully finished turn.
+
 ## Interrupted ask bridge
 
 Native session continuation belongs to the shared driver mechanism: the daemon names a relaunch's

@@ -392,6 +392,30 @@ test('normalized conversation fallbacks and open block payloads survive schema r
     assert.deepEqual(Schema.encodeSync(Rich.TimelineBlock)(decoded), block);
 });
 
+test('assistant error views preserve exact native diagnostics in both decoder modes', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = {
+        type: 'assistant_error', status: 'failed', presentation: 'full',
+        is_error: true, label: 'native diagnostic', message: 'native diagnostic',
+        native: {
+            stopReason: 'future-stop', errorMessage: 'native\n\u001bdiagnostic',
+            errorStatus: { future: [false, null, 429] }, errorId: null,
+            retryRecovery: { attempt: 2, future: ['unchanged'] },
+            future: { retained: true },
+        },
+    };
+    for (const mode of ['strict', 'tolerant']) {
+        const decoded = Rich.decodeUnknownSync(Rich.TimelineViewAssistantError, mode)(wire);
+        assert.deepEqual(Schema.encodeSync(Rich.TimelineViewAssistantError)(decoded), wire);
+        const { native, ...legacy } = wire;
+        assert.deepEqual(
+            Schema.encodeSync(Rich.TimelineViewAssistantError)(
+                Rich.decodeUnknownSync(Rich.TimelineViewAssistantError, mode)(legacy)),
+            legacy,
+        );
+    }
+});
+
 
 test('relay omission fixture keeps absent fields, nullable values, and unknown bodies', async () => {
     const [{ Schema }, Rich] = await modules;
