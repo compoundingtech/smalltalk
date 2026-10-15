@@ -1017,11 +1017,12 @@ fn ts_type(value: &Value) -> Result<String> {
         return Ok(constant.to_string());
     }
     if let Some(items) = value.get("enum").and_then(Value::as_array) {
-        return Ok(items
-            .iter()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join(" | "));
+        let cases = items.iter().map(Value::to_string).collect::<Vec<_>>();
+        // One case per line from the same size as the schema cases, so two additions merge.
+        if cases.len() >= rich::ONE_PER_LINE_FROM {
+            return Ok(format!("\n  {}\n", cases.join("\n  | ")));
+        }
+        return Ok(cases.join(" | "));
     }
     for union in ["oneOf", "anyOf"] {
         if let Some(items) = value.get(union).and_then(Value::as_array) {
@@ -1387,6 +1388,51 @@ mod tests {
             "st3-client-codegen-{}-{nonce}-{name}",
             std::process::id()
         ))
+    }
+
+    /// Two changes adding different cases to one enum conflict if the enum is one line, in the
+    /// schema and in every generated file; from `ONE_PER_LINE_FROM` cases each has its own line.
+    #[test]
+    fn large_enums_are_one_case_per_line_in_the_schema_and_the_generated_typescript() -> Result<()> {
+        let many = rich::ONE_PER_LINE_FROM;
+        let schema_text = include_str!("../../../docs/st3/client-v0/schemas/client-v0.schema.json");
+        for line in schema_text.lines() {
+            if let Some(start) = line.find("\"enum\": [") {
+                let list = line[start..].split(']').next().unwrap_or_default();
+                assert!(
+                    list.matches("\", \"").count() + 1 < many,
+                    "an enum of {many} or more cases shares one line: {}",
+                    &line[..line.len().min(120)]
+                );
+            }
+        }
+        let operations: Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/schemas/operations.json"
+        ))?;
+        let schema: Value = serde_json::from_str(schema_text)?;
+        let models = typescript_models(&schema, &operations, &contract_constants(&operations)?)?;
+        let rich = rich::models(&schema)?;
+        for line in models.lines() {
+            assert!(
+                line.matches("\" | \"").count() + 1 < many,
+                "Models.generated.ts puts {many} or more enum cases on one line: {}",
+                &line[..line.len().min(120)]
+            );
+        }
+        for line in rich.lines() {
+            for opener in ["openEnum([", "Schema.Literals(["] {
+                if let Some(start) = line.find(opener) {
+                    let list = line[start..].split(']').next().unwrap_or_default();
+                    assert!(
+                        list.matches(',').count() + 1 < many,
+                        "Schema.generated.ts puts {many} or more enum cases on one line: {}",
+                        &line[..line.len().min(120)]
+                    );
+                }
+            }
+        }
+        assert!(models.contains("export type ErrorCode = (\n  \"recipient-retired\"\n  | "));
+        Ok(())
     }
 
     #[test]
