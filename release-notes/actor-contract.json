@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Publish the CLI actor syntax as a generated, versioned contract and report effective instance and state directory on request.",
+  "replay": {"status": "none", "detail": "No claim replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No authority rule or command behavior change."},
+  "compatibility": {"status": "changed", "detail": "Adds st actor-contract --json and optional --effective output. Existing CLI commands, wire APIs and actor defaults are unchanged. The new syntax contract does not grant person authority."},
+  "downtime": {"status": "none", "detail": "No service interruption required."},
+  "manual": {"status": "none", "detail": "Operators may read the new contract instead of maintaining a command list. Operator policy and authority checks remain in place."},
+  "recovery": {"status": "none", "detail": "No runtime recovery change."}
+}

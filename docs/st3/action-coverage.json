@@ -421,6 +421,16 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st actor-contract",
+      "description": "Print the generated CLI actor contract and optional effective instance paths",
+      "tests": [
+        "crates/st3/tests/actor_contract.rs::actor_contract_prints_without_daemon_or_config",
+        "crates/st3/tests/actor_contract.rs::actor_contract_effective_uses_real_config_resolution",
+        "crates/st3/tests/actor_contract.rs::actor_contract_effective_uses_selected_instance"
+      ],
+      "verification": "real CLI with a private home; no daemon; configured state directory and selected instance"
+    },
+    {
       "command": "st admission override",
       "description": "Explicitly allow an installed exact harness build with a recorded reason",
       "tests": [

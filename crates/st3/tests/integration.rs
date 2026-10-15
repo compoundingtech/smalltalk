@@ -8,6 +8,7 @@
 mod ci_test_paths;
 
 mod action_coverage;
+mod actor_contract;
 mod adhoc_work;
 mod agents_restart;
 mod authored_resume;
