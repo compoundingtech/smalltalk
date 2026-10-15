@@ -350,9 +350,9 @@ fn refresh_watches(
         }
     }
     for (path, identity) in desired {
-        if !watched.contains_key(&path) {
-            watch.watch(&path, RecursiveMode::NonRecursive)?;
-            watched.insert(path, identity);
+        if let std::collections::btree_map::Entry::Vacant(entry) = watched.entry(path) {
+            watch.watch(entry.key(), RecursiveMode::NonRecursive)?;
+            entry.insert(identity);
         }
     }
     Ok(())
