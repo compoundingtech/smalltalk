@@ -43,6 +43,19 @@ BASE = 'main'
 CHILD = None
 
 
+SELECTING = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR',
+                  'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_QUARANTINE_PATH', 'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_GRAFT_FILE',
+                  'GIT_SHALLOW_FILE', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
+                  'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE')
+
+
+def clean_environment(**extra):
+    """The environment for what this hook starts: without the variables that select a repository or an identity (git exports GIT_DIR
+    and friends to a hook; the checks make their own repositories and must not reach the caller's through them, st2#3014). Transport
+    and credential variables (GIT_SSH_COMMAND, GIT_ASKPASS, GIT_CONFIG_*, ...) stay: the notes push needs them."""
+    return dict({k: v for k, v in os.environ.items() if not (k in SELECTING or k.startswith('GIT_PUSH_OPTION'))}, **extra)
+
+
 def say(message):
     print(f'evidence: {message}', file=sys.stderr)
 
@@ -99,6 +112,7 @@ def hook(argv):
         say('NOT signing (ST_SKIP_EVIDENCE=1); the pull request will run in CI')
         return 0
     head = git('rev-parse', 'HEAD').stdout.strip()
+    top = git('rev-parse', '--show-toplevel').stdout.strip() or os.getcwd()
     pushed = []
     for line in sys.stdin:
         fields = line.split()
@@ -132,7 +146,7 @@ def hook(argv):
         return 0
     try:
         status = subprocess.run([sys.executable, str(script), '--status', '--base', base], capture_output=True, text=True,
-                                timeout=positive('ST_EVIDENCE_STATUS_TIMEOUT', STATUS_LIMIT))
+                                cwd=top, env=clean_environment(), timeout=positive('ST_EVIDENCE_STATUS_TIMEOUT', STATUS_LIMIT))
     except subprocess.TimeoutExpired:
         say('could not tell whether the tree is covered in time (a slow fetch?); not signing, the pull request will run in CI')
         return 0
@@ -155,7 +169,7 @@ def hook(argv):
     # Its own process group, so stopping it stops the nix and pnpm processes under it too.
     sink = open(log, 'ab') if log else sys.stderr
     CHILD = subprocess.Popen([sys.executable, str(script), '--base', base, '--push', remote, '--time-limit', str(limit)],
-                             env=dict(os.environ, ST_EVIDENCE_IN_HOOK='1'), stdout=sink, stderr=sink if log else None,
+                             cwd=top, env=clean_environment(ST_EVIDENCE_IN_HOOK='1'), stdout=sink, stderr=sink if log else None,
                              start_new_session=True)
     try:
         CHILD.wait(timeout=wait)

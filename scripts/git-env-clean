@@ -1,0 +1,32 @@
+# Source me: `. scripts/git-env-clean`.
+#
+# git exports GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE and more to hooks and aliases (GIT_DIR whenever the push is made from a linked
+# worktree, which every agent seat uses). A script that then runs `git -C other ...` or makes a fresh temporary repository still
+# acts on the CALLER's repository, because GIT_DIR wins over -C and over the working directory (st2#3014: the pre-push evidence hook
+# ran the repository's fixture tests that way and they committed on the caller's branches, rewrote its identity and pushed).
+#
+# Drops the variables that SELECT a repository or an identity. Transport and credential variables (GIT_SSH_COMMAND, GIT_ASKPASS,
+# GIT_TERMINAL_PROMPT, GIT_HTTP_*, GIT_CONFIG_*) are kept: the notes push needs them and they do not name a repository.
+#
+# Uses only `export -p` (a builtin in every bash build, printing `declare -x NAME=` or, in POSIX mode, `export NAME=`; `compgen` is missing from the non-interactive bash of a nix shell, which made
+# the first version of this file a silent no-op there) and checks its own result: a failed scrub stops the caller.
+_git_env_selecting='GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE GIT_SHALLOW_FILE GIT_INTERNAL_SUPER_PREFIX GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE'
+_git_env_remaining() {
+  local name
+  for name in $(export -p | sed -n -e 's/^declare -x \(GIT_[A-Za-z0-9_]*\)[= ].*/\1/p' -e 's/^export \(GIT_[A-Za-z0-9_]*\)[= ].*/\1/p'); do
+    case " $_git_env_selecting " in
+      *" $name "*) printf '%s\n' "$name" ;;
+      *) case "$name" in GIT_PUSH_OPTION*) printf '%s\n' "$name" ;; esac ;;
+    esac
+  done
+}
+for _git_env_name in $(_git_env_remaining); do
+  unset "$_git_env_name" 2>/dev/null || true
+done
+_git_env_left=$(_git_env_remaining)
+if [ -n "$_git_env_left" ]; then
+  printf 'git-env-clean: could not drop %s; refusing to continue with a repository-selecting variable set\n' "$(printf '%s' "$_git_env_left" | tr '\n' ' ')" >&2
+  return 1 2>/dev/null || exit 1
+fi
+unset _git_env_selecting _git_env_name _git_env_left
+unset -f _git_env_remaining

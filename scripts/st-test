@@ -57,6 +57,24 @@ class Failure(Exception):
     pass
 
 
+SELECTING = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR',
+                  'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_QUARANTINE_PATH', 'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_GRAFT_FILE',
+                  'GIT_SHALLOW_FILE', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
+                  'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE')
+
+
+def selecting(name):
+    """A variable that names a repository or an identity: git exports them to a hook, and a check that kept them would act on the
+    caller's repository. Transport and credential variables (GIT_SSH_COMMAND, GIT_ASKPASS, GIT_CONFIG_*, ...) are not here."""
+    return name in SELECTING or name.startswith('GIT_PUSH_OPTION')
+
+
+def scrub_git_environment():
+    """Drop the repository- and identity-selecting GIT_* variables (st2#3014); the notes push keeps its transport variables."""
+    for name in [name for name in os.environ if selecting(name)]:
+        del os.environ[name]
+
+
 def git(*args, cwd=None, env=None, check=True, stdin=None):
     done = subprocess.run(['git', *args], cwd=cwd, capture_output=True, input=stdin,
                           env=dict(os.environ, **(env or {})))
@@ -138,6 +156,7 @@ def repository_of(remote):
 
 
 def main(argv):
+    scrub_git_environment()
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--check', action='append', default=[], metavar='NAME', help='only this check (repeatable)')
     parser.add_argument('--base', default='origin/main', help='the accepted base (default origin/main)')

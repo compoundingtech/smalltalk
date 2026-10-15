@@ -81,11 +81,11 @@ class StTest(unittest.TestCase):
         git(self.work, 'add', '.')
         git(self.work, 'commit', '-q', '-m', f'{name} {content}')
 
-    def run_st_test(self, *args, command=None):
+    def run_st_test(self, *args, command=None, extra_env=None):
         if command is not None:
             st_test.LOCAL['demo'] = command
         out, err = io.StringIO(), io.StringIO()
-        env = dict(GIT_ENV, HOME=str(self.home), EVIDENCE_SIGN_NOW=DATE)
+        env = dict(GIT_ENV, HOME=str(self.home), EVIDENCE_SIGN_NOW=DATE, **(extra_env or {}))
         cwd = os.getcwd()
         os.chdir(self.work)
         try:
@@ -252,6 +252,33 @@ class StTest(unittest.TestCase):
         done = subprocess.run([sys.executable, str(ROOT / 'scripts/st-test'), '--check', 'genie-freshness', '--base', 'origin/main'],
                               capture_output=True, text=True, cwd=self.work, env=dict(env, PATH='/nonexistent'))
         self.assertEqual(done.returncode, 1, done.stderr)  # the check could not run its command: a failed check, not a refusal
+
+    def test_a_check_cannot_reach_the_callers_repository_through_a_leaked_git_environment(self):
+        """st2#3014: git exports GIT_DIR to a hook run from a linked worktree; a check that makes its own repository and uses
+        `git -C` would otherwise act on the caller's."""
+        self.commit('b.txt', 'two')
+        linked = Path(self.tmp.name) / 'linked'
+        git(self.work, 'worktree', 'add', '-q', str(linked), '-b', 'linked', 'feature')
+        victim_config = (self.work / '.git/config').read_text()
+        victim_refs = git(self.work, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads', 'refs/tags')
+        script = ('d=$(mktemp -d) && git -C "$d" init -q && git -C "$d" config user.name Evil && git -C "$d" config user.email e@e.invalid '
+                  '&& git -C "$d" commit -q --allow-empty -m initial && git -C "$d" checkout -q -b accepted-main && git -C "$d" commit -q --allow-empty -m author')
+        leaked = {'GIT_DIR': str(self.work / '.git/worktrees/linked'), 'GIT_WORK_TREE': str(linked), 'GIT_INDEX_FILE': str(self.work / '.git/worktrees/linked/index')}
+        code, out, err = self.run_st_test('--check', 'demo', command=['sh', '-c', script], extra_env=leaked)
+        self.assertEqual(code, 0, err + out)
+        self.assertEqual((self.work / '.git/config').read_text(), victim_config)
+        self.assertEqual(git(self.work, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads', 'refs/tags'), victim_refs)
+        self.assertNotIn('Evil', (self.work / '.git/config').read_text())
+        self.assertEqual(git(self.work, 'branch', '--list', 'accepted-main'), '')
+
+    def test_scrub_git_environment_drops_the_selecting_variables_and_keeps_the_transport_ones(self):
+        with mock.patch.dict(os.environ, {'GIT_DIR': '/x', 'GIT_AUTHOR_NAME': 'a', 'GIT_WORK_TREE': '/y', 'GIT_PUSH_OPTION_COUNT': '1',
+                                          'GIT_SSH_COMMAND': 'ssh', 'GIT_ASKPASS': 'z', 'GIT_CONFIG_COUNT': '1', 'KEPT': 'yes'}):
+            st_test.scrub_git_environment()
+            self.assertEqual({k: os.environ[k] for k in ('GIT_SSH_COMMAND', 'GIT_ASKPASS', 'GIT_CONFIG_COUNT', 'KEPT')},
+                             {'GIT_SSH_COMMAND': 'ssh', 'GIT_ASKPASS': 'z', 'GIT_CONFIG_COUNT': '1', 'KEPT': 'yes'})
+            for name in ('GIT_DIR', 'GIT_AUTHOR_NAME', 'GIT_WORK_TREE', 'GIT_PUSH_OPTION_COUNT'):
+                self.assertNotIn(name, os.environ)
 
     def test_a_base_that_looks_like_a_git_option_is_refused(self):
         self.commit('b.txt', 'two')

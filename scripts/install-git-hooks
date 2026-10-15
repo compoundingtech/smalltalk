@@ -33,6 +33,23 @@ cat > "$hook.tmp" <<'STUB'
 # st-evidence-prepush: written by scripts/install-git-hooks
 # Never blocks a push. Runs the base branch's copy of scripts/evidence-prepush, never the pushed tree's.
 remote=${1:-origin}
+# git exports GIT_DIR and friends to a hook: note where we are, drop the variables that select a repository or an identity, and let git
+# find the repository from the working directory again, so nothing started below can reach the caller's repository through them
+# (st2#3014). Only `export -p` is used (no compgen: missing from the non-interactive bash of a nix shell), and a scrub that did not work
+# skips the hook rather than carry on with GIT_DIR set.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+selecting=' GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE GIT_SHALLOW_FILE GIT_INTERNAL_SUPER_PREFIX GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE '
+remaining() {
+  for name in $(export -p | sed -n -e 's/^declare -x \(GIT_[A-Za-z0-9_]*\)[= ].*/\1/p' -e 's/^export \(GIT_[A-Za-z0-9_]*\)[= ].*/\1/p'); do
+    case "$selecting" in *" $name "*) echo "$name" ;; *) case "$name" in GIT_PUSH_OPTION*) echo "$name" ;; esac ;; esac
+  done
+}
+for name in $(remaining); do unset "$name" 2>/dev/null || true; done
+if [ -n "$(remaining)" ]; then
+  echo "evidence: could not drop the git environment of the hook; not signing" >&2
+  exit 0
+fi
+cd "$top" || exit 0
 git rev-parse -q --verify "refs/remotes/$remote/main" >/dev/null 2>&1 || exit 0
 work=$(mktemp -d 2>/dev/null) || exit 0
 trap 'rm -rf "$work"' EXIT

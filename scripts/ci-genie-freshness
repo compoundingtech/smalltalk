@@ -3,6 +3,8 @@
 # CI runs it in the genie shell; `checks.genie-freshness` runs it in a derivation. One list, so
 # the two cannot drift. It needs git, python3, tar, jq, zstd, ssh-keygen and `genie`, and no network.
 set -euo pipefail
+# Run from a git hook or alias this would see the caller's GIT_DIR, and every fixture test below would act on the caller's repository.
+. "$(dirname "$0")/git-env-clean"
 cd "$(dirname "$0")/.."
 
 python3 scripts/ci-fractal-web-licenses-test
