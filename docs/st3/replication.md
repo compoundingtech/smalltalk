@@ -71,6 +71,28 @@ A keyed worker signs batches beyond its last processed batch, including envelope
 unkeyed process already sealed at startup. Signature requests recover missing signatures after
 an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
 
+Sealing prepares each chunk of local batches on a read transaction before it takes the writer.
+A chunk is at most 64 batches and 16 MiB of payload: a batch that would take it past 16 MiB
+starts the next chunk, and only a first batch larger than that is sealed alone. Preparation reads
+each batch's claims and the blobs they name, signs each claim that has no stored signature,
+encodes and hashes the envelope and its records, and signs each envelope with the member key.
+Under the writer, sealing reads again what it prepared from:
+- the chunk's unsealed batches and their claims;
+- which named blobs are stored;
+- each claim's stored signature;
+- the member key and the fleet id;
+- for the claims it signed, the key, principal, principal acted for and chain the keyring would
+  sign them with now. This is read in one view that no keyring change overlapped, once per
+  distinct signer input (a key grant's issuer and issuer key, and the claim's actor), not once
+  per claim.
+
+Only then does it write the prepared rows. If any of these changed, it writes nothing and
+prepares the chunk again off the writer. Keys added or replaced for principals the chunk's claims
+are not signed as do not count as a change. Claims and blobs are compared by id and hash, which
+name their content. A blob that is not stored when a batch is sealed stays out of its envelope,
+as before. This moves signing and encoding off the writer but does not bound the hold: the
+rereads and writes still grow with the chunk's claims and bytes.
+
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
 across isolated stores. `every_persistent_table_has_a_projection_scope` rejects unclassified

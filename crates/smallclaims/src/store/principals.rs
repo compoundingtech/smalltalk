@@ -578,6 +578,53 @@ pub struct Unsealed<'a> {
     pub accepted_at_unix_ms: u128,
 }
 
+/// All `claim_signer` reads of a claim besides the keyring: the issuer and issuer key of the
+/// grant it makes, when it is a key grant, and its actor. Claims with equal inputs are signed by
+/// the same signer.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SignerInput {
+    grant: Option<(String, String)>,
+    actor: Option<String>,
+}
+
+impl SignerInput {
+    pub(crate) fn of(claim: &Unsealed<'_>) -> Self {
+        let grant = if claim.kind == KEY_GRANTED {
+            claim
+                .body
+                .get("fields")
+                .and_then(KeyGrant::from_fields)
+                .map(|grant| (grant.issuer, grant.issuer_key))
+        } else {
+            None
+        };
+        Self {
+            grant,
+            actor: claim.actor.map(str::to_owned),
+        }
+    }
+}
+
+/// The key a claim is signed with, the principal it signs as, the principal it acts for and the
+/// delegation chain from its key: what a claim signature records about its signer.
+pub(crate) struct ClaimSigner {
+    pub(crate) key: Arc<crate::fleet::MemberKey>,
+    pub(crate) signer: String,
+    pub(crate) on_behalf: Option<String>,
+    pub(crate) chain: Vec<String>,
+}
+
+impl ClaimSigner {
+    /// Whether `signature` names this signer: the same key, principal, principal acted for and
+    /// chain. Two signatures by the same signer differ only in nonce, and so in signature bytes.
+    pub(crate) fn signed(&self, signature: &ClaimSignature) -> bool {
+        signature.key == self.key.public()
+            && signature.signer == self.signer
+            && signature.on_behalf == self.on_behalf
+            && signature.chain == self.chain
+    }
+}
+
 /// What a verdict recheck found.
 #[derive(Clone, Debug, Serialize)]
 pub struct VerdictMismatch {
@@ -911,52 +958,70 @@ impl Store {
     /// principal this node holds a key for with that key, anything else by the node on the
     /// writer's behalf. `None` without a node key.
     pub(crate) fn sign_unsealed(&self, claim: &Unsealed<'_>) -> Option<ClaimSignature> {
-        let node = self.keyring.node()?;
+        let chosen = self.claim_signer(claim)?;
         let content = content_digest(claim.subject, claim.kind, claim.actor, claim.body);
         let signed_at = u64::try_from(claim.accepted_at_unix_ms).unwrap_or(u64::MAX);
-        let node_subject = self.node_subject();
-        if claim.kind == KEY_GRANTED
-            && let Some(grant) = claim.body.get("fields").and_then(KeyGrant::from_fields)
-        {
-            if grant.issuer == node_subject && grant.issuer_key == node.public() {
-                return Some(ClaimSignature::sign(
-                    &node,
-                    &content,
-                    &node_subject,
-                    None,
-                    Vec::new(),
-                    signed_at,
-                ));
-            }
-            if let Some(issuer) = self.keyring.by_public(&grant.issuer_key)
-                && issuer.principal == grant.issuer
-            {
-                return Some(ClaimSignature::sign(
-                    &issuer.key,
-                    &content,
-                    &issuer.principal,
-                    None,
-                    issuer.chain,
-                    signed_at,
-                ));
-            }
-        }
-        if let Some(actor) = claim.actor
-            && let Some(held) = self.keyring.signing(actor)
-        {
-            return Some(ClaimSignature::sign(
-                &held.key, &content, actor, None, held.chain, signed_at,
-            ));
-        }
-        let on_behalf = claim.actor.filter(|actor| *actor != node_subject);
         Some(ClaimSignature::sign(
-            &node,
+            &chosen.key,
             &content,
-            &node_subject,
-            on_behalf,
-            Vec::new(),
+            &chosen.signer,
+            chosen.on_behalf.as_deref(),
+            chosen.chain,
             signed_at,
         ))
+    }
+
+    /// Who `sign_unsealed` signs `claim` as, read from the keyring without signing. `None`
+    /// without a node key.
+    pub(crate) fn claim_signer(&self, claim: &Unsealed<'_>) -> Option<ClaimSigner> {
+        self.claim_signer_for(&SignerInput::of(claim))
+    }
+
+    /// Who `sign_unsealed` signs a claim with these inputs as. `None` without a node key.
+    pub(crate) fn claim_signer_for(&self, input: &SignerInput) -> Option<ClaimSigner> {
+        let node = self.keyring.node()?;
+        let node_subject = self.node_subject();
+        if let Some((issuer, issuer_key)) = &input.grant {
+            if *issuer == node_subject && issuer_key == node.public() {
+                return Some(ClaimSigner {
+                    key: node,
+                    signer: node_subject,
+                    on_behalf: None,
+                    chain: Vec::new(),
+                });
+            }
+            if let Some(held) = self.keyring.by_public(issuer_key)
+                && held.principal == *issuer
+            {
+                return Some(ClaimSigner {
+                    key: held.key,
+                    signer: held.principal,
+                    on_behalf: None,
+                    chain: held.chain,
+                });
+            }
+        }
+        if let Some(actor) = input.actor.as_deref()
+            && let Some(held) = self.keyring.signing(actor)
+        {
+            return Some(ClaimSigner {
+                key: held.key,
+                signer: actor.to_owned(),
+                on_behalf: None,
+                chain: held.chain,
+            });
+        }
+        let on_behalf = input
+            .actor
+            .as_deref()
+            .filter(|actor| *actor != node_subject)
+            .map(str::to_owned);
+        Some(ClaimSigner {
+            key: node,
+            signer: node_subject,
+            on_behalf,
+            chain: Vec::new(),
+        })
     }
 
     /// Whether a pass has anything to judge: a newly signed claim, or a queued one. Two probes

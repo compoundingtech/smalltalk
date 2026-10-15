@@ -2243,7 +2243,10 @@ fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
     use smallclaims::sqlite::WriterJob;
     use std::sync::atomic::Ordering;
     const FLEET: &str = "5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12";
-    let store = Store::open_memory("seal-queue-node").unwrap();
+    // Sealing prepares the next chunk on a read connection while the queued write runs. A
+    // shared-memory store answers that contention with SQLITE_LOCKED, so this uses a file.
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Store::open(&scratch.path().join("claims.sqlite3"), "seal-queue-node").unwrap();
     store.bind_fleet(FLEET).unwrap();
     let key = Arc::new(MemberKey::generate().unwrap().0);
     store.set_member_key(Some(key.clone())).unwrap();
