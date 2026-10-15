@@ -987,6 +987,43 @@
         "failure": { "type": ["string", "null"] }
       }
     },
+    "AgentPresentation": {
+      "type": "object",
+      "required": ["state", "group", "because", "now", "next", "queued"],
+      "properties": {
+        "state": { "enum": ["needs_you", "needs_login", "fault", "working", "compacting", "idle", "starting", "down", "stopped", "retired", "unknown"], "description": "The agent state word, by its fixtures/clients/words.json id." },
+        "group": { "enum": ["needs_you", "needs_login", "fault", "working", "idle", "stopped", "retired"], "description": "The agents list group. Sessions st found running but did not start are not agent rows." },
+        "because": { "type": ["string", "null"], "description": "Why it needs someone, in plain words, for the fault, needs_you, needs_login and down states." },
+        "now": { "oneOf": [{ "$ref": "#/$defs/AgentPresentationNow" }, { "type": "null" }] },
+        "next": { "type": "array", "maxItems": 5, "items": { "$ref": "#/$defs/AgentPresentationWork" }, "description": "Up to five queued steps, next first." },
+        "queued": { "type": "integer", "minimum": 0, "description": "How many steps are queued in all." }
+      }
+    },
+    "AgentPresentationWork": {
+      "type": "object",
+      "required": ["step", "mission", "path", "label"],
+      "properties": {
+        "step": { "$ref": "#/$defs/StepRunId" },
+        "mission": { "$ref": "#/$defs/Id" },
+        "path": { "type": "string" },
+        "title": { "type": ["string", "null"] },
+        "label": { "type": "string", "description": "mission › path, with the mission named without its mission/ prefix." }
+      }
+    },
+    "AgentPresentationNow": {
+      "allOf": [
+        { "$ref": "#/$defs/AgentPresentationWork" },
+        {
+          "type": "object",
+          "required": ["since"],
+          "properties": {
+            "goal": { "type": ["string", "null"] },
+            "since": { "$ref": "#/$defs/Timestamp", "description": "When it took the step." },
+            "holder_down_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+          }
+        }
+      ]
+    },
     "WorkLabel": {
       "type": "object",
       "required": ["id", "mission_id", "mission_run_id", "path", "state", "since"],
@@ -1086,6 +1123,7 @@
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },
             "todo": { "oneOf": [{ "$ref": "#/$defs/AgentTodo" }, { "type": "null" }], "description": "Latest accepted harness todo snapshot and claim provenance; null if none was observed. Stale observations remain visible." },
+            "presentation": { "$ref": "#/$defs/AgentPresentation", "description": "st's presentation of this agent: its state word, list group, why it needs someone, and what it holds and has queued. Clients read it instead of deriving their own (docs/clients/ui-contract.md, Agent). Absent on older daemons." },
             "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/StepRunId" } },
             "active_work_count": { "type": "integer", "minimum": 0 },
             "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },

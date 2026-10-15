@@ -2883,6 +2883,8 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     }));
     capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
     capabilities.push(json!({"id":"conversation-blocks", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    // Agent rows carry st's presentation (docs/clients/ui-contract.md, Agent).
+    capabilities.push(json!({"id":"presentation", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities
 }
 
@@ -12498,6 +12500,15 @@ mission "queue-parity" state="ready" {
         assert_eq!(observed.load(Ordering::SeqCst), 1);
         socket.close(None).await.unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn a_daemon_serving_presentations_advertises_them() {
+        assert!(capabilities(&ClientSession::local(None).unwrap()).iter().any(|capability| {
+            capability["id"] == "presentation"
+                && capability["version"] == 1
+                && capability["state"] == "granted"
+        }));
     }
 
     #[tokio::test]

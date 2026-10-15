@@ -200,6 +200,13 @@ updates and another person's attention changes. Core list/filter/get behavior
 is unchanged. Summary freshness is carried by its snapshot fence; equal counts
 retain their prior row timestamp so an unchanged count emits no delta.
 
+## Presentations
+
+Optional capability `presentation` version 1 says agent rows carry `presentation`: st's state
+word, list group, why the agent needs someone, and what it holds and has queued (see
+[the UI contract](../../clients/ui-contract.md#agent)). Older daemons omit both. A row that
+lacks it shows the state st reports, marked as coming from an older st; clients derive nothing.
+
 ## Screen inventories
 
 Optional capability `inventory-collections` version 1 advertises six additional

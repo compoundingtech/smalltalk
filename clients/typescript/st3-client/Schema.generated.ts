@@ -553,6 +553,52 @@ export const AgentLifecycle = /*#__PURE__*/ (() => openEnum(["standing","owner",
 export type AgentLifecycle = typeof AgentLifecycle.Type
 export type AgentLifecycleEncoded = typeof AgentLifecycle.Encoded
 
+export const StepRunId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:step-run)/[^\\s]+$", "u"), "step-run").annotate({ identifier: "StepRunId" }))()
+export type StepRunId = typeof StepRunId.Type
+export type StepRunIdEncoded = typeof StepRunId.Encoded
+
+export const AgentPresentationNow = /*#__PURE__*/ (() => Schema.Struct({
+  "goal": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "holder_down_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  /** mission › path, with the mission named without its mission/ prefix. */
+  "label": Schema.String.annotate({ description: "mission › path, with the mission named without its mission/ prefix." }),
+  "mission": Id,
+  "path": Schema.String,
+  /** When it took the step. */
+  "since": Timestamp,
+  "step": StepRunId,
+  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+}).annotate({ identifier: "AgentPresentationNow" }))()
+export type AgentPresentationNow = typeof AgentPresentationNow.Type
+export type AgentPresentationNowEncoded = typeof AgentPresentationNow.Encoded
+
+export const AgentPresentationWork = /*#__PURE__*/ (() => Schema.Struct({
+  /** mission › path, with the mission named without its mission/ prefix. */
+  "label": Schema.String.annotate({ description: "mission › path, with the mission named without its mission/ prefix." }),
+  "mission": Id,
+  "path": Schema.String,
+  "step": StepRunId,
+  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+}).annotate({ identifier: "AgentPresentationWork" }))()
+export type AgentPresentationWork = typeof AgentPresentationWork.Type
+export type AgentPresentationWorkEncoded = typeof AgentPresentationWork.Encoded
+
+export const AgentPresentation = /*#__PURE__*/ (() => Schema.Struct({
+  /** Why it needs someone, in plain words, for the fault, needs_you, needs_login and down states. */
+  "because": Schema.OptionFromNullOr(Schema.String).annotate({ description: "Why it needs someone, in plain words, for the fault, needs_you, needs_login and down states." }),
+  /** The agents list group. Sessions st found running but did not start are not agent rows. */
+  "group": Schema.Literals(["needs_you","needs_login","fault","working","idle","stopped","retired"]).annotate({ description: "The agents list group. Sessions st found running but did not start are not agent rows." }),
+  /** Up to five queued steps, next first. */
+  "next": Schema.Array(AgentPresentationWork).check(Schema.isMaxLength(5)).annotate({ description: "Up to five queued steps, next first." }),
+  "now": Schema.OptionFromNullOr(AgentPresentationNow),
+  /** How many steps are queued in all. */
+  "queued": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).annotate({ description: "How many steps are queued in all." }),
+  /** The agent state word, by its fixtures/clients/words.json id. */
+  "state": Schema.Literals(["needs_you","needs_login","fault","working","compacting","idle","starting","down","stopped","retired","unknown"]).annotate({ description: "The agent state word, by its fixtures/clients/words.json id." })
+}).annotate({ identifier: "AgentPresentation" }))()
+export type AgentPresentation = typeof AgentPresentation.Type
+export type AgentPresentationEncoded = typeof AgentPresentation.Encoded
+
 /** Whether the daemon can currently reach the agent runtime. */
 export const AgentReachability = /*#__PURE__*/ (() => openEnum(["local","remote","unreachable","unknown","reachable","indeterminate"]).annotate({ identifier: "AgentReachability", description: "Whether the daemon can currently reach the agent runtime." }))()
 export type AgentReachability = typeof AgentReachability.Type
@@ -681,10 +727,6 @@ export const RuntimeId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:runtime
 export type RuntimeId = typeof RuntimeId.Type
 export type RuntimeIdEncoded = typeof RuntimeId.Encoded
 
-export const StepRunId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:step-run)/[^\\s]+$", "u"), "step-run").annotate({ identifier: "StepRunId" }))()
-export type StepRunId = typeof StepRunId.Type
-export type StepRunIdEncoded = typeof StepRunId.Encoded
-
 export const UsageContext = /*#__PURE__*/ (() => Schema.Struct({
   "compactions": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "last_compaction_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationMillisRange), wholeUnits(1)))),
@@ -777,6 +819,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "observation": optionalKey(Schema.Literals(["current","stale","missing"])).annotate({ description: "Stale after 90 seconds without a new observation; missing when this runtime has no observation." }),
   "operational": optionalKey(Operational),
   "owner_run_id": Schema.OptionFromOptionalNullOr(MissionRunId, NULL_NONE),
+  /** st's presentation of this agent: its state word, list group, why it needs someone, and what it holds and has queued. Clients read it instead of deriving their own (docs/clients/ui-contract.md, Agent). Absent on older daemons. */
+  "presentation": optionalKey(AgentPresentation),
   "queued_work_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "reachability": AgentReachability,
   /** Diagnostic harness reason, not a machine-readable verdict. */

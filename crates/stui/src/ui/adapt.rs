@@ -653,66 +653,29 @@ fn step_progress(missions: &[Mission], step: &str) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// The state st serves for an agent (`presentation.state`, a words.json id). A daemon too old
+/// to serve one leaves it unknown; the client keeps no derivation of its own.
+fn agent_state(agent: &st3_client::Agent) -> AgentState {
+    match agent.presentation.as_ref().map(|p| p.state.as_str()) {
+        Some("needs_you") => AgentState::NeedsYou,
+        Some("needs_login") => AgentState::NeedsLogin,
+        Some("fault") => AgentState::Fault,
+        Some("working") => AgentState::Working,
+        Some("compacting") => AgentState::Compacting,
+        Some("idle") => AgentState::Idle,
+        Some("starting") => AgentState::Starting,
+        Some("down") => AgentState::Down,
+        Some("stopped") => AgentState::Stopped,
+        Some("retired") => AgentState::Retired,
+        _ => AgentState::Unknown,
+    }
+}
+
 fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
     let mut agents = model
         .agents()
         .map(|agent| {
-            let state = match (agent.state.as_str(), agent.harness_state.as_deref()) {
-                ("retired", _) => AgentState::Retired,
-                _ if agent.fault.is_some() => AgentState::Fault,
-                // A seat whose message path stopped polling or cannot hand off takes no
-                // messages, however ready its harness looks. An `outdated` path still delivers.
-                _ if agent
-                    .delivery
-                    .as_ref()
-                    .is_some_and(|delivery| delivery.state == "stale") =>
-                {
-                    AgentState::Fault
-                }
-                ("failed", _) => AgentState::Fault,
-                // st decides a seat with no session is down, since when; no app re-derives it.
-                ("down", _) => AgentState::Down,
-                // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
-                // its host fixes it, not a restart (Nathan, 2026-10-04).
-                // st's additive detail names the known error outright; the legacy `unauthenticated`
-                // harness state below says the same to clients that predate it.
-                ("waiting", _) if agent.harness_error_state.as_deref() == Some("needs-login") => {
-                    AgentState::NeedsLogin
-                }
-                ("waiting", Some("unauthenticated" | "needs-login")) => AgentState::NeedsLogin,
-                ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
-                    AgentState::NeedsLogin
-                }
-                ("running", _) if agent.activity.as_deref() == Some("compacting") => {
-                    AgentState::Compacting
-                }
-                ("running", Some("working")) => AgentState::Working,
-                ("running", _) => AgentState::Idle,
-                ("waiting", Some("ready" | "working" | "idle"))
-                    if agent.blocked_on.as_deref() == Some("human") =>
-                {
-                    AgentState::NeedsYou
-                }
-                // Blocked on its st channel is the seat's to fix (its mail is held), not the
-                // person's: answering it cannot unblock it (Nathan, 2026-10-06: "why does Stui
-                // show up as needs you?").
-                ("waiting", Some("blocked")) if agent.blocked_on.as_deref() == Some("channel") => {
-                    AgentState::Fault
-                }
-                ("waiting", Some("blocked")) => AgentState::NeedsYou,
-                // st withdraws an idle claim it has not heard renewed lately: the harness reads
-                // "indeterminate" and the seat "waiting", though it is up and reachable. That is an
-                // idle seat nobody has spoken to, not one starting (Nathan, 2026-10-05).
-                ("waiting", Some("indeterminate"))
-                    if agent.observation.as_deref() == Some("stale")
-                        && matches!(agent.reachability.as_str(), "reachable" | "local") =>
-                {
-                    AgentState::Idle
-                }
-                ("waiting" | "starting" | "desired", _) => AgentState::Starting,
-                ("stopped", _) => AgentState::Stopped,
-                _ => AgentState::Unknown,
-            };
+            let state = agent_state(agent);
             let host = agent
                 .host_id
                 .as_deref()
@@ -781,29 +744,12 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                         .and_then(Value::as_str)
                         .filter(|effort| !effort.is_empty())
                         .map(str::to_owned),
-                    fault: agent.fault.clone().or_else(|| {
-                        agent.down_since.as_deref().filter(|_| agent.state == "down")
-                            .map(|since| format!("No running session since {since}"))
-                    }).or_else(|| {
-                        agent.delivery.as_ref()
-                            .filter(|delivery| delivery.state == "stale")
-                            .and_then(|delivery| delivery.reason.clone())
-                            .filter(|reason| reason.starts_with("delivery-control-unavailable:"))
-                    }).or_else(|| {
-                        (agent.state == "waiting"
-                            && agent.harness_state.as_deref() == Some("blocked")
-                            && agent.blocked_on.as_deref() == Some("channel"))
-                        .then(|| {
-                            format!(
-                                "Its st channel is not attached, so its mail is held{}",
-                                agent
-                                    .reason
-                                    .as_deref()
-                                    .map(|reason| format!(" ({reason})"))
-                                    .unwrap_or_default()
-                            )
-                        })
-                    }),
+                    // st says why a broken or down agent needs someone.
+                    fault: agent
+                        .presentation
+                        .as_ref()
+                        .filter(|presentation| matches!(presentation.state.as_str(), "fault" | "down"))
+                        .and_then(|presentation| presentation.because.clone()),
                     under: agent.under.first().map(|relation| {
                         model
                             .agents()
@@ -822,6 +768,11 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                         age: subagent.started_at.as_deref().map(age).unwrap_or_default(),
                     })
                     .collect(),
+                // An st too old to serve a presentation: show the state it reports.
+                reported: agent
+                    .presentation
+                    .is_none()
+                    .then(|| agent.state.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -857,6 +808,7 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
             details: AgentDetails::default(),
             terminal: false,
             subagents: Vec::new(),
+            reported: None,
         }
     }));
     agents
@@ -1762,11 +1714,21 @@ mod tests {
         }
     }
 
+    /// A collection window as st serves it: an agent row carries the presentation st adds.
     fn window(items: Vec<Value>) -> crate::model::Collection {
         crate::model::Collection {
             items: items
                 .into_iter()
-                .map(|item| serde_json::from_value(item).unwrap())
+                .map(|mut item| {
+                    if item["kind"] == "agent" && item.get("presentation").is_none() {
+                        let facts =
+                            <st3_ui_model::agents::Facts as serde::Deserialize>::deserialize(&item)
+                                .unwrap();
+                        item["presentation"] =
+                            serde_json::to_value(st3_ui_model::agents::present(&facts)).unwrap();
+                    }
+                    serde_json::from_value(item).unwrap()
+                })
                 .collect(),
             snapshot: Some(st3_client::Snapshot {
                 id: "snapshot/1".into(),
@@ -2169,6 +2131,29 @@ mod tests {
         // Signed in again on the same run: it is simply idle, with nothing to restart.
         model.agents = window(vec![resource("running", "idle", None)]);
         assert_eq!(agents(&model, &[])[0].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn an_older_st_without_presentations_shows_the_state_it_reports() {
+        let mut model = Model::default();
+        // An explicit null: st served no presentation for this row.
+        model.agents = window(vec![serde_json::json!({
+            "id": "agent/example/old", "kind": "agent", "revision": "r1",
+            "updated_at": "2026-10-14T09:00:00Z", "name": "example/old", "state": "running",
+            "reachability": "local", "harness_state": "working", "runtime_ids": [], "under": [],
+            "presentation": null,
+        })]);
+        let seat = &agents(&model, &[])[0];
+        assert_eq!((seat.state, seat.reported.as_deref()), (AgentState::Unknown, Some("running")));
+        assert_eq!(super::super::screens::agent_shown_word(seat), "running · older st");
+        let world = world(&model, "person/avery", &Extras::default());
+        let legend = super::super::screens::agents_list(&world, "⠋", 80)
+            .legend
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(legend.contains("This host's st is older"), "{legend}");
     }
 
     #[test]

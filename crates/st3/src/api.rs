@@ -2810,12 +2810,13 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
     })
 }
 
-/// Live presentation of already folded cards: freshness, delivery presence and subagents.
 /// The card's `reason` while rival hosts both claim a seat's runtime. A sentence, not a code:
 /// clients may print it as it is.
 pub(crate) const AUTHORITY_INDETERMINATE_REASON: &str =
     "st cannot tell which host runs this agent; its processes may be running";
 
+/// Live presentation of already folded cards: freshness, delivery presence, subagents, and the
+/// agent presentation that reads them (docs/clients/ui-contract.md, Agent).
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     crate::otel::roster_phase("card_presentation", || -> anyhow::Result<()> {
         let local_host = client_host_id(store.origin());
@@ -2855,6 +2856,14 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
             }
             overlay_down(item, launch_since, report_age_ms, reported.as_deref(), client_now_ms() as u64);
             overlay_delivery_presence(item, &local_host);
+            // The presentation reads the facts settled just above, so it is settled with them. A
+            // row it cannot read goes without one; it never fails the read for every client.
+            match st3_ui_model::agents::Facts::deserialize(&*item) {
+                Ok(facts) => {
+                    item["presentation"] = serde_json::to_value(st3_ui_model::agents::present(&facts))?;
+                }
+                Err(error) => eprintln!("st3: WARN agent {} has no presentation: {error}", item["id"]),
+            }
         }
         overlay_subagents(store, items)?;
         Ok(())
@@ -27732,6 +27741,13 @@ mission "agent-auth" state="ready" {
         assert_eq!(resources[0]["observation"], "current");
         assert!(resources[0]["since"].is_string());
         assert!(resources[0].get("_status_source").is_none());
+        // st serves its presentation of the seat, read from the facts settled above.
+        assert_eq!(resources[0]["presentation"]["state"], "needs_login");
+        assert_eq!(resources[0]["presentation"]["group"], "needs_login");
+        assert_eq!(
+            resources[0]["presentation"]["because"],
+            "Its harness is not logged in to its provider"
+        );
     }
 
     #[tokio::test]

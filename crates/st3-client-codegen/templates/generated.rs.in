@@ -1068,6 +1068,43 @@ pub struct MissionWake {
     #[serde(default)]
     pub failure: Option<String>,
 }
+/// st's presentation of an agent (docs/clients/ui-contract.md, Agent). Words are
+/// fixtures/clients/words.json ids.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AgentPresentation {
+    pub state: String,
+    pub group: String,
+    #[serde(default)]
+    pub because: Option<String>,
+    #[serde(default)]
+    pub now: Option<AgentPresentationNow>,
+    #[serde(default)]
+    pub next: Vec<AgentPresentationWork>,
+    #[serde(default)]
+    pub queued: u64,
+}
+/// A step an agent holds or has queued, named for display.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AgentPresentationWork {
+    pub step: String,
+    pub mission: String,
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `mission › path`.
+    pub label: String,
+}
+/// What an agent holds now.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AgentPresentationNow {
+    #[serde(flatten)]
+    pub work: AgentPresentationWork,
+    #[serde(default)]
+    pub goal: Option<String>,
+    pub since: String,
+    #[serde(default)]
+    pub holder_down_since: Option<String>,
+}
 /// A step named for display: its mission, run, path, title and first goal.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct WorkLabel {
@@ -1187,6 +1224,9 @@ pub struct Agent {
     pub current_session_id: Option<String>,
     #[serde(default)]
     pub todo: Option<AgentTodo>,
+    /// st's presentation of this agent; absent from older daemons.
+    #[serde(default)]
+    pub presentation: Option<AgentPresentation>,
     #[serde(default)]
     pub current_work_ids: Vec<String>,
     #[serde(default)]
