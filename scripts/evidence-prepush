@@ -60,6 +60,20 @@ def say(message):
     print(f'evidence: {message}', file=sys.stderr)
 
 
+def say_once(name, message):
+    """Say `message` the first time on this machine and stay quiet after: the hook never blocks, and the same line on every
+    push of every branch only teaches people to stop reading what it prints."""
+    marker = Path.home() / '.local/state/st3/evidence-prepush' / f'noticed-{name}'
+    if marker.exists():
+        return
+    say(message)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(message + '\n')
+    except OSError:
+        pass  # cannot remember: it will say it again, which is harmless
+
+
 def git(*args):
     return subprocess.run(['git', *args], capture_output=True, text=True)
 
@@ -136,8 +150,10 @@ def hook(argv):
         say('uncommitted changes to tracked files: not signing (the note is for the committed tree)')
         return 0
     if not os.environ.get('EVIDENCE_SIGNER') and not (Path.home() / '.config/st/evidence-sign.json').exists():
-        say('no signing key is set up on this machine (run scripts/evidence-keygen --name ALIAS and list its line in '
-            '.st/evidence-keys); not signing, the pull request will run in CI')
+        say_once('no-signer', 'no signing key is set up on this machine (run scripts/evidence-keygen --name ALIAS and list its line in '
+                 '.st/evidence-keys); not signing, the pull request will run in CI. On a machine that stays without a signer, hosted '
+                 'CI at the exact head is the proof: push with ST_SKIP_EVIDENCE=1 and say so in the pull request. This is said once '
+                 'per machine.')
         return 0
     base = f'{remote}/{BASE}'
     if not signer_listed(base):

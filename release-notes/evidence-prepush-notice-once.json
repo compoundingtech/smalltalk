@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The pre-push evidence hook says once per machine that no signing key is set up, instead of on every push",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes; this changes a developer-machine hook message and AGENTS.md."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digests change."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. The hook still never blocks a push."},
+  "downtime": {"status": "none", "detail": "No upgrade downtime."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No recovery procedure; reverting restores the repeated message."}
+}

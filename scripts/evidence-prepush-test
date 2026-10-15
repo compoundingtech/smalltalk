@@ -211,6 +211,28 @@ class Hook(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.assertTrue(self.remote_has('refs/heads/feature'))
 
+    def test_the_missing_signing_key_is_said_once_per_machine_and_the_next_pushes_are_quiet(self):
+        (self.home / '.config/st/evidence-sign.json').unlink()
+        first = self.push()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('scripts/evidence-keygen', first.stderr)
+        self.assertIn('ST_SKIP_EVIDENCE=1', first.stderr)
+        self.assertIn('once per machine', first.stderr)
+        git(self.work, 'commit', '-q', '--allow-empty', '-m', 'again')
+        second = self.push()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn('evidence-keygen', second.stderr)
+        self.assertNotIn('evidence:', second.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue(self.remote_has('refs/heads/feature'))
+        # A key that appears later is used again: the notice is only about the missing key.
+        (self.home / '.config/st/evidence-sign.json').write_text(json.dumps({'signer': 'host/box'}))
+        git(self.work, 'commit', '-q', '--allow-empty', '-m', 'with a key')
+        third = self.push()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertNotIn('no signing key', third.stderr)
+        self.assertEqual([c['argv'][0] for c in self.calls()][:1], ['--status'])
+
     def test_tags_notes_deletes_and_the_base_branch_are_untouched_and_silent(self):
         git(self.work, 'tag', 'v1')
         self.untouched(self.push('v1'), 'refs/tags/v1')
