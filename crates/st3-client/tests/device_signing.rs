@@ -20,7 +20,7 @@ use smallclaims::principal::{FIELDS_FORMAT, Verdict, fields_signing_bytes};
 use st3::api::AppState;
 use st3::store::Store;
 use st3_client::{
-    Client, ClientError, DeviceSignature, Fence, MessageSendParameters, PairingBegin,
+    Client, ClientError, DeviceSignature, Fence, MessageSendParameters, PersonPairingBegin,
     PairingComplete,
 };
 use tokio::sync::{Notify, watch};
@@ -246,14 +246,11 @@ async fn pinned_read_only_pairing_verifies_the_root_without_enrolling_a_signing_
     let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
     wait_for_socket(&socket).await;
     let local = Client::unix_as(&socket, PERSON);
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Pinned display".into(),
-            person_id: PERSON.into(),
-            full_control: None,
-            scopes: Some(vec!["read.projections".into()]),
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Pinned display".into(),
+    person_id: PERSON.into(),
+    full_control: None,
+    scopes: Some(vec!["read.projections".into()]), })
         .await
         .unwrap()
         .value;
@@ -329,14 +326,11 @@ async fn a_pre_pin_cli_completes_against_the_current_daemon() {
     let app = st3::api::fabric_router(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     for signs in [true, false] {
-        let challenge = local
-            .pairing_begin(&PairingBegin {
-                api_version: st3_client::API_VERSION.into(),
-                device_name: "Older CLI".into(),
-                person_id: PERSON.into(),
-                full_control: signs.then_some(true),
-                scopes: None,
-            })
+        let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+        device_name: "Older CLI".into(),
+        person_id: PERSON.into(),
+        full_control: signs.then_some(true),
+        scopes: None, })
             .await
             .unwrap()
             .value;
@@ -411,7 +405,7 @@ async fn pre_pin_response_shapes_work_for_pinned_messages_and_explicitly_unpinne
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let profile = root.path().join("client/devices.json");
     for (signs, unpinned) in [(true, false), (false, false), (false, true)] {
-        let challenge = local.pairing_begin(&PairingBegin { api_version: st3_client::API_VERSION.into(), device_name: "Earlier member".into(), person_id: PERSON.into(), full_control: signs.then_some(true), scopes: None }).await.unwrap().value;
+        let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(), device_name: "Earlier member".into(), person_id: PERSON.into(), full_control: signs.then_some(true), scopes: None }).await.unwrap().value;
         let previous = std::fs::read(&profile).ok();
         let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
         let result = complete_with_options(&profile, &base, &challenge.pairing_id, &challenge.code, key,
@@ -574,14 +568,11 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
                 SigningKey::generate(algorithm).unwrap()
             };
             let public = key.public_key().unwrap();
-            let challenge = local
-                .pairing_begin(&PairingBegin {
-                    api_version: st3_client::API_VERSION.into(),
-                    device_name: "CLI device".into(),
-                    person_id: PERSON.into(),
-                    full_control: Some(true),
-                    scopes: None,
-                })
+            let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+            device_name: "CLI device".into(),
+            person_id: PERSON.into(),
+            full_control: Some(true),
+            scopes: None, })
                 .await
                 .unwrap()
                 .value;
@@ -789,14 +780,11 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
     // without losing its previous working device or exposing either credential/private key.
     // An older member's refusal or missing advertisement must never receive the code.
     for forbidden_capabilities in [false, true] {
-        let challenge = local
-            .pairing_begin(&PairingBegin {
-                api_version: st3_client::API_VERSION.into(),
-                device_name: "Preflight device".into(),
-                person_id: PERSON.into(),
-                full_control: Some(true),
-                scopes: None,
-            })
+        let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+        device_name: "Preflight device".into(),
+        person_id: PERSON.into(),
+        full_control: Some(true),
+        scopes: None, })
             .await
             .unwrap()
             .value;
@@ -866,14 +854,11 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
         "tampered-proof",
         "secret-in-malformed-proof",
     ] {
-        let challenge = local
-            .pairing_begin(&PairingBegin {
-                api_version: st3_client::API_VERSION.into(),
-                device_name: "Proxy regression".into(),
-                person_id: PERSON.into(),
-                full_control: Some(true),
-                scopes: None,
-            })
+        let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+        device_name: "Proxy regression".into(),
+        person_id: PERSON.into(),
+        full_control: Some(true),
+        scopes: None, })
             .await
             .unwrap()
             .value;
@@ -995,14 +980,11 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
     // A local commit failure after remote success must retain the previous key and credential.
     // The member's consumed code is a separate outcome, not a client-side rollback.
     let saved = std::fs::read(&path).unwrap();
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Unwritable device".into(),
-            person_id: PERSON.into(),
-            full_control: Some(true),
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Unwritable device".into(),
+    person_id: PERSON.into(),
+    full_control: Some(true),
+    scopes: None, })
         .await
         .unwrap()
         .value;
@@ -1084,18 +1066,15 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
     blocked_server.abort();
     let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
     let public = key.public_key().unwrap();
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Hall display".into(),
-            person_id: PERSON.into(),
-            full_control: None,
-            scopes: Some(vec![
-                "read.projections".into(),
-                "read.glasses".into(),
-                "terminal.read".into(),
-            ]),
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Hall display".into(),
+    person_id: PERSON.into(),
+    full_control: None,
+    scopes: Some(vec![
+        "read.projections".into(),
+        "read.glasses".into(),
+        "terminal.read".into(),
+    ]), })
         .await
         .unwrap()
         .value;
@@ -1202,14 +1181,11 @@ async fn refused_attacker_key_is_revoked_and_code_remains_usable_for_a_fresh_key
     let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
     wait_for_socket(&socket).await;
     let local = Client::unix_as(&socket, PERSON);
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Failed first attempt".into(),
-            person_id: PERSON.into(),
-            full_control: Some(true),
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Failed first attempt".into(),
+    person_id: PERSON.into(),
+    full_control: Some(true),
+    scopes: None, })
         .await
         .unwrap()
         .value;
@@ -1229,16 +1205,13 @@ async fn refused_attacker_key_is_revoked_and_code_remains_usable_for_a_fresh_key
         )
         .unwrap();
     let attacker = Device::new().public();
-    let refused = Client::fabric_pairing(&base)
-        .pairing_complete(
-            &challenge.pairing_id,
-            &PairingComplete {
-                api_version: st3_client::API_VERSION.into(),
-                code: challenge.code.clone(),
-                device_public_key: attacker.clone(),
-                key_storage: Some("software".into()),
-            },
-        )
+    let refused = Client::fabric_pairing(&base).pairing_complete_person(&challenge.pairing_id,
+    &PairingComplete {
+        api_version: st3_client::API_VERSION.into(),
+        code: challenge.code.clone(),
+        device_public_key: attacker.clone(),
+        key_storage: Some("software".into()),
+    },)
         .await;
     assert!(refused.is_err());
     let grants = state
@@ -1286,16 +1259,13 @@ async fn refused_attacker_key_is_revoked_and_code_remains_usable_for_a_fresh_key
         .write()
         .execute_batch("DROP TRIGGER refuse_pairing_commit")
         .unwrap();
-    let reused_key = Client::fabric_pairing(&base)
-        .pairing_complete(
-            &challenge.pairing_id,
-            &PairingComplete {
-                api_version: st3_client::API_VERSION.into(),
-                code: challenge.code.clone(),
-                device_public_key: attacker.clone(),
-                key_storage: Some("software".into()),
-            },
-        )
+    let reused_key = Client::fabric_pairing(&base).pairing_complete_person(&challenge.pairing_id,
+    &PairingComplete {
+        api_version: st3_client::API_VERSION.into(),
+        code: challenge.code.clone(),
+        device_public_key: attacker.clone(),
+        key_storage: Some("software".into()),
+    },)
         .await
         .unwrap_err();
     assert!(reused_key.to_string().contains("key was revoked"));
@@ -1341,14 +1311,11 @@ async fn missing_sealed_root_proof_does_not_consume_code_or_create_a_bearer() {
     let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
     wait_for_socket(&socket).await;
     let local = Client::unix_as(&socket, PERSON);
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Historical proof".into(),
-            person_id: PERSON.into(),
-            full_control: Some(true),
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Historical proof".into(),
+    person_id: PERSON.into(),
+    full_control: Some(true),
+    scopes: None, })
         .await
         .unwrap()
         .value;
@@ -1432,14 +1399,11 @@ async fn simultaneous_completions_consume_once_and_enroll_only_the_winning_key()
     let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
     wait_for_socket(&socket).await;
     let local = Client::unix_as(&socket, PERSON);
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Concurrent device".into(),
-            person_id: PERSON.into(),
-            full_control: Some(true),
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Concurrent device".into(),
+    person_id: PERSON.into(),
+    full_control: Some(true),
+    scopes: None, })
         .await
         .unwrap()
         .value;
@@ -1458,8 +1422,8 @@ async fn simultaneous_completions_consume_once_and_enroll_only_the_winning_key()
     let first_request = request(Device::new().public());
     let second_request = request(Device::new().public());
     let (a, b) = tokio::join!(
-        first.pairing_complete(&challenge.pairing_id, &first_request),
-        second.pairing_complete(&challenge.pairing_id, &second_request),
+        first.pairing_complete_person(&challenge.pairing_id, &first_request),
+        second.pairing_complete_person(&challenge.pairing_id, &second_request),
     );
     assert_ne!(a.is_ok(), b.is_ok());
     let (winner, key, refused) = match (a, b) {
@@ -1510,6 +1474,7 @@ fn state(root: &Path) -> AppState {
         ))
         .unwrap();
     AppState {
+        owning_person: None,
         store: Arc::new(store),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,
@@ -1591,26 +1556,20 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
 
     // The phone pairs with its own key and learns the chain it signs with.
     let phone = Device::new();
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Avery's phone".into(),
-            person_id: PERSON.into(),
-            full_control: Some(true),
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Avery's phone".into(),
+    person_id: PERSON.into(),
+    full_control: Some(true),
+    scopes: None, })
         .await
         .unwrap();
-    let paired = Client::fabric_pairing(&base)
-        .pairing_complete(
-            &challenge.value.pairing_id,
-            &PairingComplete {
-                api_version: st3_client::API_VERSION.into(),
-                code: challenge.value.code,
-                device_public_key: phone.public(),
-                key_storage: Some("secure-enclave".into()),
-            },
-        )
+    let paired = Client::fabric_pairing(&base).pairing_complete_person(&challenge.value.pairing_id,
+    &PairingComplete {
+        api_version: st3_client::API_VERSION.into(),
+        code: challenge.value.code,
+        device_public_key: phone.public(),
+        key_storage: Some("secure-enclave".into()),
+    },)
         .await
         .unwrap()
         .value;
@@ -1632,26 +1591,20 @@ async fn a_message_signed_on_a_device_is_verified_and_attributed_to_its_person()
 
     // A device paired only to read gets no signing key.
     let viewer = Device::new();
-    let limited = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Hall display".into(),
-            person_id: PERSON.into(),
-            full_control: None,
-            scopes: None,
-        })
+    let limited = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Hall display".into(),
+    person_id: PERSON.into(),
+    full_control: None,
+    scopes: None, })
         .await
         .unwrap();
-    let display = Client::fabric_pairing(&base)
-        .pairing_complete(
-            &limited.value.pairing_id,
-            &PairingComplete {
-                api_version: st3_client::API_VERSION.into(),
-                code: limited.value.code,
-                device_public_key: viewer.public(),
-                key_storage: None,
-            },
-        )
+    let display = Client::fabric_pairing(&base).pairing_complete_person(&limited.value.pairing_id,
+    &PairingComplete {
+        api_version: st3_client::API_VERSION.into(),
+        code: limited.value.code,
+        device_public_key: viewer.public(),
+        key_storage: None,
+    },)
         .await
         .unwrap()
         .value;

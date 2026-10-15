@@ -142,6 +142,7 @@ mod socket_tests {
             st3::store::Store::open(&root.path().join("graph.db"), "resource-read-test").unwrap(),
         );
         let state = st3::api::AppState {
+            owning_person: None,
             store: store.clone(),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: tokio::sync::watch::channel(0_u64).0,

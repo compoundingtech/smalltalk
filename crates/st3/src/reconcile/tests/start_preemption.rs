@@ -1762,6 +1762,7 @@ async fn native_returned_pty_error_retains_unknown_and_visible_open_count() {
     assert!(fixture.runtime.snapshot_ptys().unwrap().is_empty());
     let state = fixture.root.path().join("state");
     let app = crate::api::router(crate::api::AppState {
+        owning_person: None,
         store: fixture.store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: tokio::sync::watch::channel(0).0,

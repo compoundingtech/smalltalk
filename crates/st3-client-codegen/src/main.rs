@@ -158,6 +158,22 @@ fn action_method(action: &str) -> String {
     action.replace(['.', '-'], "_")
 }
 
+/// Assistant read operations: `(projection route suffix, query model, response model)`.
+/// Each one is a single proof-carrying GET; no generic page/list renderer may claim it.
+fn assistant_read(read: &Value) -> Result<Option<(&str, &str, &str)>> {
+    let path = read["path"].as_str().context("read path")?;
+    let Some(projection) = path.strip_prefix("/v1/client/assistant/") else {
+        return Ok(None);
+    };
+    let id = read["id"].as_str().context("read id")?;
+    if id != format!("assistant.{projection}") || read["proof_header"] != "x-st3-scg-read-authorization" {
+        bail!("assistant read `{id}` must be `assistant.<projection>` and carry the SCG read proof header");
+    }
+    let request = read["query_model"].as_str().with_context(|| format!("assistant read `{id}` has no query_model"))?;
+    let response = read["response"].as_str().context("read response")?;
+    Ok(Some((projection, request, response)))
+}
+
 fn rust_action_constructors(actions: &serde_json::Map<String, Value>) -> Result<String> {
     let mut out = String::new();
     for (action, definition) in actions {
@@ -203,7 +219,9 @@ fn rust_operation_methods(
             writeln!(out, "    pub async fn arrangements_get(&self, person_name: &str, uuid: &str) -> Result<Envelope<Arrangement>, ClientError> {{ self.get(&format!(\"/v1/client/arrangements/{{}}/{{}}\", percent_encode(person_name), percent_encode(uuid))).await }}")?;
             continue;
         }
-        if id == "capabilities.get" {
+        if let Some((projection, request, response)) = assistant_read(read)? {
+            writeln!(out, "    pub async fn {method}(&self, params: &{request}, proof: &ScgReadAuthorization) -> Result<Envelope<{response}>, ClientError> {{ self.assistant_read(\"{projection}\", params, proof).await }}")?;
+        } else if id == "capabilities.get" {
             writeln!(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
@@ -363,7 +381,9 @@ fn swift_operation_methods(
             writeln!(out, "    public func arrangementsGet(personName: String, uuid: String) async throws -> Envelope<Arrangement> {{ try await get(\"v1/client/arrangements/\\(Self.routedSessionID(personName))/\\(Self.routedSessionID(uuid))\") }}")?;
             continue;
         }
-        if matches!(
+        if let Some((projection, request, response)) = assistant_read(read)? {
+            writeln!(out, "    public func {method}(_ params: {request}, proof: ScgReadAuthorization) async throws -> Envelope<{response}> {{ try await assistantRead(\"{projection}\", params, proof: proof) }}")?;
+        } else if matches!(
             id,
             "capabilities.get"
                 | "timeline.list"
@@ -541,6 +561,29 @@ fn validate_model(
     if model.is_null() {
         bail!("client schema has no `{definition}` definition");
     }
+    // Reference-only oneOf branches are untagged unions: their members own the
+    // existing wire shape, rather than acquiring a synthetic discriminator.
+    if let Some(branches) = model["oneOf"]
+        .as_array()
+        .filter(|branches| branches.iter().all(|branch| branch["$ref"].is_string()))
+    {
+        let rust_block = struct_block(rust, &format!("pub enum {rust_name} {{"))?;
+        let swift_block = struct_block(swift, &format!("public enum {swift_name}:"))?;
+        for branch in branches {
+            let member = branch["$ref"]
+                .as_str()
+                .and_then(|reference| reference.rsplit('/').next())
+                .with_context(|| format!("union `{definition}` requires named reference branches"))?;
+            // Large Rust members are boxed to keep the enum small.
+            let rust_member = rust_block.contains(&format!("({member})"))
+                || rust_block.contains(&format!("(Box<{member}>)"));
+            if !rust_member || !swift_block.contains(&format!("({member})")) {
+                bail!("union `{definition}` omits member `{member}`");
+            }
+            validate_model(schema, member, member, member, rust, swift)?;
+        }
+        return Ok(());
+    }
     let properties = schema_properties(model)
         .with_context(|| format!("client schema `{definition}` has no properties"))?;
     let rust_block = struct_block(rust, &format!("pub struct {rust_name} {{"))?;
@@ -689,6 +732,24 @@ fn validate_surfaces(
         "PairingChallenge",
         "PairingComplete",
         "PairedSession",
+        "AssistantGrant",
+        "AssistantGrantPolicy",
+        "AssistantReadTrust",
+        "AssistantReadTrustRequest",
+        "AssistantSummaryRequest",
+        "AssistantPageRequest",
+        "AssistantContentRequest",
+        "ScgReadAuthorization",
+        "ScgReadAuthorizationPayload",
+        "AssistantSummary",
+        "AssistantAttentionItem",
+        "AssistantMissionItem",
+        "AssistantAgentItem",
+        "AssistantAttentionPage",
+        "AssistantMissionPage",
+        "AssistantAgentPage",
+        "AssistantContentRange",
+        "AssistantContentPage",
         "TerminalAttachment",
         "TerminalScreen",
         "TerminalLine",
@@ -1006,6 +1067,9 @@ fn lower_camel(value: &str) -> String {
 }
 
 fn ts_type(value: &Value) -> Result<String> {
+    if let Some(allowed) = value.as_bool() {
+        return Ok(if allowed { "unknown" } else { "never" }.into());
+    }
     if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
         return Ok(reference
             .rsplit('/')
@@ -1025,14 +1089,16 @@ fn ts_type(value: &Value) -> Result<String> {
     }
     for union in ["oneOf", "anyOf"] {
         if let Some(items) = value.get(union).and_then(Value::as_array) {
-            return Ok(format!(
-                "({})",
-                items
-                    .iter()
-                    .map(ts_type)
-                    .collect::<Result<Vec<_>>>()?
-                    .join(" | ")
-            ));
+            let members = format!("({})", items.iter().map(ts_type).collect::<Result<Vec<_>>>()?.join(" | "));
+            if value.get("properties").is_some() || value.get("allOf").is_some() {
+                let mut base = value.clone();
+                base.as_object_mut().context("union schema")?.remove(union);
+                let base = ts_type(&base)?;
+                if base != "unknown" && !base.is_empty() {
+                    return Ok(format!("{base} & {members}"));
+                }
+            }
+            return Ok(members);
         }
     }
     if let Some(types) = value.get("type").and_then(Value::as_array) {
@@ -1257,6 +1323,10 @@ fn typescript_operation_methods(
         if id == "capabilities.get" {
             continue;
         }
+        if let Some((projection, request, response)) = assistant_read(read)? {
+            writeln!(out, "    async {method}(params: {request}, proof: ScgReadAuthorization): Promise<EnvelopeOf<{response}>> {{ return this.assistantRead<{response}>('{projection}', params, proof); }}")?;
+            continue;
+        }
         let route = if path.contains("{id}") {
             path.replace("{id}", "${encodeURIComponent(routedId(id))}")
         } else {
@@ -1377,6 +1447,35 @@ fn typescript_operation_methods(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn untagged_union_validation_checks_every_named_member() {
+        let schema = serde_json::json!({ "$defs": {
+            "Pair": { "oneOf": [{ "$ref": "#/$defs/Person" }, { "$ref": "#/$defs/Assistant" }] },
+            "Person": { "type": "object", "properties": { "person_id": { "type": "string" } } },
+            "Assistant": { "type": "object", "properties": { "principal": { "type": "string" } } }
+        } });
+        let rust = "pub enum Pair { Person(Person), Assistant(Assistant) }\npub struct Person { pub person_id: String }\npub struct Assistant { pub principal: String }";
+        let swift = "public enum Pair: Codable { case person(Person), assistant(Assistant) }\npublic struct Person: Codable { let personID: String }\npublic struct Assistant: Codable { let principal: String }";
+        validate_model(&schema, "Pair", "Pair", "Pair", rust, swift).unwrap();
+        assert!(validate_model(&schema, "Pair", "Pair", "Pair", &rust.replace("pub principal:", "pub wrong:"), swift).is_err());
+    }
+
+    #[test]
+    fn typescript_inline_unions_retain_common_fields_and_forbidden_keys() {
+        let schema = serde_json::json!({
+            "type": "object", "required": ["kind"],
+            "properties": { "kind": { "type": "string" } },
+            "oneOf": [
+                { "properties": { "person_id": { "type": "string" } } },
+                { "properties": { "person_id": false } }
+            ]
+        });
+        let rendered = ts_type(&schema).unwrap();
+        assert!(rendered.contains("kind: string"));
+        assert!(rendered.contains("person_id?: never"));
+        assert!(rendered.contains(" & "));
+    }
 
     fn temporary_output(name: &str) -> PathBuf {
         let nonce = SystemTime::now()

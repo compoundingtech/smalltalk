@@ -152,6 +152,6 @@ pub(super) async fn import_message(
     }
     request.tags.push(format!("adapter:{actor}"));
     let receipt =
-        accept_message_receipt_with_upload_owner(&state, request, None, None, Some(actor))?;
+        accept_message_receipt_with_upload_owner(&state, request, None, None, Some(actor), None)?;
     Ok(Json(json!(receipt.message)))
 }

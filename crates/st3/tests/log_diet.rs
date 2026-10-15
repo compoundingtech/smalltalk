@@ -153,6 +153,7 @@ impl Daemon {
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = AppState {
+            owning_person: None,
             store: store.clone(),
             notify: notify.clone(),
             event_notify: watch::channel(0_u64).0,

@@ -15,6 +15,7 @@ impl Drop for ScratchRawPty {
 
 fn raw_app(root: &Path, node: &str) -> crate::api::AppState {
     crate::api::AppState {
+        owning_person: None,
         store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
         notify: Arc::new(tokio::sync::Notify::new()),
         event_notify: watch::channel(0_u64).0,

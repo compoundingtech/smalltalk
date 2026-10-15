@@ -837,6 +837,11 @@ impl Store {
             .collect()
     }
     pub fn reply_custom_subject(&self, request: &ReplyRequest) -> Result<ClaimRecord, St3Error> {
+        self.reply_custom_subject_authorized(request, None)
+    }
+
+    pub(crate) fn reply_custom_subject_authorized(&self, request: &ReplyRequest,
+        authorization: Option<&super::assistant_write::AssistantWriteAuthorization>) -> Result<ClaimRecord, St3Error> {
         validate_actor(&request.actor)?;
         if request.idempotency_key.is_empty() || request.idempotency_key.len() > 256 {
             return Err(fail("reply needs a bounded idempotency key"));
@@ -845,6 +850,9 @@ impl Store {
         let key = canonical_hash(&("custom.reply", &request.actor, &request.idempotency_key))
             .map_err(internal)?;
         self.connection.batched(|tx|->Result<ClaimRecord,St3Error>{
+            if let Some(authorization) = authorization {
+                super::assistant_write::authorize(tx, &self.origin, authorization)?;
+            }
             let prior=claims(tx,&request.subject).map_err(internal)?.into_iter().filter(|c|c.body.pointer("/_custom_reply/key")==Some(&json!(key))).collect::<Vec<_>>();
             if let Some(c)=prior.first() {
                 if prior.iter().any(|c|c.body.pointer("/_custom_reply/digest")!=Some(&json!(digest))) { return Err(St3Error::new("idempotency-conflict","reply key identifies competing requests")); }

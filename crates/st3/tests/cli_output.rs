@@ -243,6 +243,7 @@ mission "orchid" state="ready" {
     .unwrap();
     store.apply_internal(&intent, "cli-output-fixture").unwrap();
     let state = AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

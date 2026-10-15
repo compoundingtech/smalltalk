@@ -55,12 +55,13 @@ impl Context {
         smallclaims::read_budget::check().map_err(ApiError::bad)?;
         let started = Instant::now();
         let mut diagnostic = crate::relay_trace::span(crate::relay_trace::Phase::Envelope);
-        let status = response.status();
+        let mut status = response.status();
         let (mut parts, body) = response.into_parts();
         let snapshot = parts
             .extensions
             .remove::<ClientSnapshot>()
             .or_else(|| self.client_snapshot.clone());
+        let assistant_read = parts.extensions.remove::<client_v0::assistant::ReadReceipt>();
         // Retain the envelope's existing request deadline while awaiting body frames.
         // Drop the actual collection future on expiry, including on forwarded reads.
         // No reader loan surrounds this wait or the synchronous codec below.
@@ -90,7 +91,7 @@ impl Context {
         };
         smallclaims::read_budget::check().map_err(ApiError::bad)?;
         let serialize = || self.encode(status, snapshot, bytes);
-        let encoded = match self.server.as_ref().filter(|_| self.roster) {
+        let mut encoded = match self.server.as_ref().filter(|_| self.roster) {
             Some(server) => {
                 let _server = server.enter();
                 crate::otel::roster_scope(|| crate::otel::roster_phase("serialization", serialize))
@@ -98,6 +99,29 @@ impl Context {
             None => serialize(),
         };
         smallclaims::read_budget::check().map_err(ApiError::bad)?;
+        if status.is_success() && let Some(receipt) = assistant_read {
+            let within_budget = encoded.len <= receipt.max_response_bytes;
+            let framed = to_bytes(encoded.body, usize::MAX).await
+                .map_err(ApiError::internal)?;
+            let authorization = client_v0::assistant::finish_read(
+                &self.state, &receipt, &framed, within_budget,
+            ).await;
+            if !within_budget || authorization.is_err() {
+                let error = authorization.err().unwrap_or_else(|| ApiError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "response-budget-exceeded".into(),
+                    message: "the entire assistant response envelope exceeds its approved byte budget".into(),
+                    details: Box::default(),
+                });
+                status = error.status;
+                parts.status = error.status;
+                encoded = self.encode(error.status, None, Ok(serde_json::to_vec(
+                    &json!({"code":error.code,"message":error.message}),
+                ).map_err(ApiError::internal)?.into()));
+            } else {
+                encoded.body = Body::from(framed);
+            }
+        }
         if let Some(trace) = crate::relay_trace::current() {
             trace.response(&self.request_id);
         }

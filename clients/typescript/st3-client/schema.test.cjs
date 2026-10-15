@@ -4,6 +4,43 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('pairing challenge object siblings constrain every union branch in both decode modes', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const assistantEnvelope = require('../../../docs/st3/client-v0/fixtures/assistant-pairing-challenge.json');
+    const capabilities = require('../../../docs/st3/client-v0/fixtures/capabilities.json');
+    const person = {
+        kind: 'pairing-challenge', pairing_id: 'pairing/person', code: 'ABCDEFGH',
+        expires_at: assistantEnvelope.value.expires_at,
+    };
+    for (const mode of ['tolerant', 'strict']) {
+        const challenge = Rich.decodeUnknownSync(Rich.PairingChallenge, mode);
+        const envelope = Rich.decodeUnknownSync(Rich.Envelope, mode);
+        for (const wire of [person, { ...person, grant_kind: 'person' }, assistantEnvelope.value]) {
+            const encoded = Schema.encodeSync(Rich.PairingChallenge)(challenge(wire));
+            assert.equal(encoded.kind, wire.kind);
+            assert.equal(encoded.pairing_id, wire.pairing_id);
+            assert.equal(encoded.code, wire.code);
+            assert.equal(encoded.expires_at, new Date(wire.expires_at).toISOString());
+            assert.equal(envelope({ ...assistantEnvelope, value: wire }).value.kind, 'pairing-challenge');
+            for (const key of ['kind', 'pairing_id', 'code', 'expires_at']) {
+                const missing = { ...wire };
+                delete missing[key];
+                assert.throws(() => challenge(missing), `${mode}: missing ${key}`);
+            }
+            for (const invalid of [{ kind: 'capabilities' }, { code: 'invalid' }, { expires_at: 'invalid' }]) {
+                assert.throws(() => challenge({ ...wire, ...invalid }));
+            }
+        }
+        assert.equal(envelope(capabilities).value.kind, 'capabilities');
+        assert.throws(() => challenge(capabilities.value));
+        assert.throws(() => challenge({ ...person, grant_id: assistantEnvelope.value.grant_id }));
+        assert.throws(() => challenge({ ...assistantEnvelope.value, person_root_fingerprint: `sha256:${'A'.repeat(43)}` }));
+    }
+    const future = { ...person, future_field: true };
+    assert.equal(Rich.decodeUnknownSync(Rich.PairingChallenge)(future).kind, 'pairing-challenge');
+    assert.throws(() => Rich.decodeUnknownSync(Rich.PairingChallenge, 'strict')(future));
+});
+
 test('queued mission deadlines decode null and admission timestamps', async () => {
     const [{ Option, Schema }, Rich] = await modules;
     const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');

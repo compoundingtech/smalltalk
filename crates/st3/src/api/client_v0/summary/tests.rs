@@ -111,7 +111,7 @@ fn native_summary_one_small_typed_row_and_authorized_person_scope() {
         StatusCode::FORBIDDEN
     );
     assert!(
-        capabilities(&session)
+        capabilities(&state, &session)
             .iter()
             .any(|c| c["id"] == "summary" && c["version"] == 1 && c["state"] == "granted")
     );

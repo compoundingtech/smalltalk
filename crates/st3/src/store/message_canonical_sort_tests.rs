@@ -74,7 +74,7 @@ fn message(subject: &str, index: usize) -> MessageView {
             sha256: format!("{index:064x}"), media_type: "text/plain".into(),
             name: Some(format!("attachment-{index}.txt")), size: index as u64,
             origin: "host/fixture".into(),
-        }], body_ref: None, body_bytes: None, body_origin: None, created_index: index as u64,
+        }], body_ref: None, body_bytes: None, body_origin: None, sender_class: None, assistant_grant_id: None, created_index: index as u64,
     }
 }
 

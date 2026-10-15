@@ -611,6 +611,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, AppState, ClientSession) {
         let root = tempfile::tempdir().unwrap();
         let state = AppState {
+            owning_person: None,
             store: Arc::new(Store::open_memory("lease-owner").unwrap()),
             notify: Arc::new(Notify::new()),
             event_notify: watch::channel(0).0,

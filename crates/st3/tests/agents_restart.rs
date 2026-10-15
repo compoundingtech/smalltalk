@@ -265,6 +265,7 @@ impl Fixture {
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
         let state = AppState {
+            owning_person: None,
             store: store.clone(),
             notify,
             event_notify: watch::channel(0).0,

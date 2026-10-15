@@ -83,6 +83,17 @@ impl Screen {
         value.insert("next_sequence".into(), self.sequence().into());
         Value::Object(value)
     }
+
+    /// The text of each screen line, borrowed from the shared screen, for a reader that
+    /// returns only a bounded prefix and must not render the whole screen value.
+    pub(super) fn line_texts(&self) -> impl Iterator<Item = &str> {
+        self.body
+            .get("lines")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|line| line.get("text").and_then(Value::as_str).unwrap_or_default())
+    }
 }
 
 type WatchKey = (PathBuf, String);

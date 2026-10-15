@@ -183,8 +183,32 @@ public actor St3Client {
     /// Diagnostic local acceptance: no graph receipt or snapshot fence.
     public func observationsReport(_ report: ObservationReport) async throws -> ObservationResponse { try await post("v1/client/observations", report) }
 
-    public func beginPairing(deviceName: String, personID: String) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", PairingBegin(apiVersion: st3ClientAPIVersion, deviceName: deviceName, personID: personID)) }
+    public func beginPairing(deviceName: String, personID: String) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", PersonPairingBegin(apiVersion: st3ClientAPIVersion, deviceName: deviceName, personID: personID)) }
+    public func beginPairing(_ request: PairingBegin) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", request) }
     public func completePairing(pairingID: String, code: String, devicePublicKey: String) async throws -> Envelope<PairedSession> { try await post("v1/client/pairings/\(pairingID.replacingOccurrences(of: "pairing/", with: ""))/complete", PairingComplete(apiVersion: st3ClientAPIVersion, code: code, devicePublicKey: devicePublicKey)) }
+    public func assistantGrant(_ id: String) async throws -> Envelope<AssistantGrant> { try await get("v1/client/assistant/grants/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id)") }
+    public func assistantGrantRevoke(_ id: String) async throws -> Envelope<AssistantGrant> { try await post("v1/client/assistant/grants/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id)/revoke", [String: String]()) }
+    public func assistantGrantPolicy(_ id: String, _ policy: AssistantGrantPolicy) async throws -> Envelope<AssistantGrant> { try await post("v1/client/assistant/grants/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id)/policy", policy) }
+    public func assistantGrantReadTrust(_ id: String, _ trust: AssistantReadTrustRequest) async throws -> Envelope<AssistantGrant> { try await post("v1/client/assistant/grants/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id)/read-trust", trust) }
+    /// One approval-once assistant read. The proof must already name this projection, these exact decoded
+    /// query parameters and this response budget; the client never signs, retries or widens the budget.
+    private func assistantRead<Params: Encodable, T: Decodable & Sendable>(_ projection: String, _ params: Params, proof: ScgReadAuthorization) async throws -> T {
+        guard let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(params)) as? [String: Any] else { throw AssistantReadRejected(reason: "assistant parameters must be an object") }
+        var parameters: [String: String] = [:]
+        for (name, value) in object {
+            if let value = value as? String { parameters[name] = value }
+            else if let value = value as? NSNumber, value.int64Value >= 0, value.stringValue == String(value.uint64Value) { parameters[name] = value.stringValue }
+            else { throw AssistantReadRejected(reason: "assistant parameters must be scalar strings or unsigned integers") }
+        }
+        guard proof.payload.projection.rawValue == projection else { throw AssistantReadRejected(reason: "assistant proof names a different projection") }
+        guard proof.payload.parameters == parameters else { throw AssistantReadRejected(reason: "assistant proof parameters differ from the request query") }
+        // An omitted budget means the grant pin's default, which the signed proof already names.
+        let budget = proof.payload.maxResponseBytes
+        guard (1...st3MaxAssistantResponseBytes).contains(budget), parameters["max_response_bytes"].map({ $0 == String(budget) }) ?? true else { throw AssistantReadRejected(reason: "assistant response budget must match the proof and stay within 1...16384") }
+        let header = try JSONEncoder().encode(proof).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        let query = parameters.keys.sorted().map { URLQueryItem(name: $0, value: parameters[$0]) }
+        return try await request("v1/client/assistant/\(projection)", query: query, method: "GET", body: nil, readAuthorization: (header, budget))
+    }
     public func terminalScreen(_ id: String) async throws -> Envelope<TerminalScreen> { try await get("v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/screen") }
     public func agentQueue(_ id: String) async throws -> Envelope<AgentQueue> { try await get("v1/client/agent-queues/\(id)") }
     /// Open the terminal stream one `terminal.attach` capability allows. Each element is a whole
@@ -247,15 +271,17 @@ public actor St3Client {
 
     private func get<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem] = []) async throws -> T { try await request(path, query: query, method: "GET", body: Optional<Data>.none) }
     private func post<T: Decodable & Sendable, Body: Encodable>(_ path: String, _ body: Body) async throws -> T { try await request(path, query: [], method: "POST", body: try JSONEncoder().encode(body)) }
-    private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?, idempotencyKey: String? = nil, contentType: String = "application/json") async throws -> T {
+    private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?, idempotencyKey: String? = nil, contentType: String = "application/json", readAuthorization: (header: String, budget: Int)? = nil) async throws -> T {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!; let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")); components.percentEncodedPath = "/" + ([basePath, path].filter { !$0.isEmpty }.joined(separator: "/")); if !query.isEmpty { components.queryItems = query }
         // Query parameters are decoded as form data by the server, where an unescaped "+" is a space.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         var request = URLRequest(url: components.url!); request.setValue("custom-subjects.v1, conversation-blocks.v1", forHTTPHeaderField: "x-st3-features"); request.httpMethod = method; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
+        if let readAuthorization { request.setValue(readAuthorization.header, forHTTPHeaderField: "x-st3-scg-read-authorization") }
         applyTraceContext(to: &request)
         let (data, response) = try await session.data(for: request); let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if let readAuthorization, data.count > readAuthorization.budget { throw AssistantReadRejected(reason: "assistant response exceeded max_response_bytes") }
         if !(200..<300).contains(status) { throw try JSONDecoder().decode(ErrorEnvelope.self, from: data) }
         return try JSONDecoder().decode(T.self, from: data)
     }
@@ -266,3 +292,11 @@ public actor St3Client {
         return innerID.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
     }
 }
+
+/// Assistant read budgets bound the entire JSON envelope, inclusive (`operations.json` limits).
+public let st3DefaultAssistantResponseBytes = 4096
+public let st3MaxAssistantResponseBytes = 16384
+
+/// A local refusal before or after an assistant read: the proof does not bind this exact request, or the
+/// answer exceeded its budget. It is never retried.
+public struct AssistantReadRejected: Error, Sendable, Equatable { public let reason: String }

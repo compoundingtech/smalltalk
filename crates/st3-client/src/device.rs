@@ -2,7 +2,7 @@
 //! This is client state, never a graph replica or a peer configuration.
 mod grant_proof;
 pub(crate) mod transport;
-use crate::{Client, DeviceSignature, MessageSendParameters, PairedSession, PairingComplete};
+use crate::{AssistantPairedSession, AssistantPrincipal, Client, DeviceSignature, MessageSendParameters, PersonPairedSession, PairingComplete};
 use anyhow::{Context as _, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::{
@@ -171,7 +171,7 @@ pub struct Device {
     /// Trust supplied separately from the code on the trusted pairing machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_root_fingerprint: Option<String>,
-    pub session: PairedSession,
+    pub session: PersonPairedSession,
     /// Old observer and legacy stui profiles have no signing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<SigningKey>,
@@ -380,33 +380,119 @@ impl Profile {
 
     fn save_in(&self, path: &Path, parent: &File) -> Result<()> {
         self.person()?;
-        ensure!(
-            parent.metadata()?.permissions().mode() & 0o200 != 0,
-            "Device profile directory is not writable"
-        );
-        let mut temporary = tempfile::NamedTempFile::new_in(
-            path.parent()
-                .context("Device profile needs a parent directory")?,
-        )?;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
-        serde_json::to_writer(&mut temporary, self)?;
-        temporary.flush()?;
-        temporary.as_file().sync_all()?;
-        // Fail before committing if this filesystem cannot sync the containing directory.
-        parent.sync_all()?;
-        temporary.persist(path).map_err(|error| error.error)?;
-        // The atomic commit succeeded. A later sync failure cannot undo it and must not be
-        // reported as a failed completion that supposedly left the previous grant untouched.
-        let _ = parent.sync_all();
-        Ok(())
+        save_private(self, path, parent)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let (parent, _lock) = prepare(path)?;
         self.save_in(path, &parent)
     }
+}
+
+/// External assistant credentials live separately from person device delegation.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantDevice {
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_public_http: bool,
+    pub session: AssistantPairedSession,
+    pub signing_key: SigningKey,
+}
+
+impl std::fmt::Debug for AssistantDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssistantDevice")
+            .field("endpoint", &self.endpoint)
+            .field("device_id", &self.session.device_id)
+            .field("grant_id", &self.session.grant.id)
+            .field("signing_key", &self.signing_key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AssistantDevice {
+    pub fn client(&self) -> Result<Client> {
+        let endpoint = validate_endpoint_with_http_policy(&self.endpoint, self.allow_public_http)?;
+        let mut client = Client::fabric_loopback(&endpoint, &self.session.credential);
+        client.http = transport::client(&endpoint, self.allow_public_http)?;
+        // Never install the assistant key as a person message-signing device.
+        Ok(client)
+    }
+
+    fn validate(&mut self) -> Result<()> {
+        self.endpoint = validate_endpoint_with_http_policy(&self.endpoint, self.allow_public_http)?;
+        let grant = &self.session.grant;
+        // The selected gateway returns the member-sealed issuer. Check its concrete person
+        // shape, not a deployment identity; assistant keys never require person grant proofs.
+        let issuer = grant.issuer.strip_prefix("person/");
+        ensure!(
+            self.session.kind == "assistant-paired-session"
+                && self.session.api_version == crate::API_VERSION
+                && self.session.principal == AssistantPrincipal::Chatgpt
+                && self.session.credential.len() >= 32
+                && self.session.device_id == grant.device_id
+                && self.session.principal == grant.principal
+                && self.session.sender_class == grant.sender_class
+                && self.session.session_actor == grant.session_actor
+                && grant.session_actor == format!("assistant/chatgpt/session/{}", grant.id)
+                && self.session.scopes == grant.scopes
+                && self.session.expires_at == grant.expires_at
+                && issuer.is_some_and(|person| {
+                    !person.is_empty()
+                        && !person.contains('/')
+                        && !person.chars().any(char::is_whitespace)
+                })
+                && grant.kind == "assistant-grant"
+                && grant.policy_revision >= 1
+                && grant.disclosure_consent
+                && !grant.consent_evidence.trim().is_empty()
+                && grant.consent_evidence.len() <= 512
+                && grant.recipient_allowlist.iter().all(|id| id.starts_with("agent/") && !id.chars().any(char::is_whitespace))
+                && !grant.revoked,
+            "Invalid assistant session or grant"
+        );
+        let key_id = format!("{:x}", Sha256::digest(self.signing_key.public_key()?.as_bytes()));
+        ensure!(key_id == grant.key_id, "Assistant grant key does not match the local key");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantProfile {
+    pub devices: Vec<AssistantDevice>,
+}
+
+impl AssistantProfile {
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let Some(file) = open_private(path)? else { return Ok(None); };
+        ensure!(file.metadata()?.len() <= 1024 * 1024, "Assistant profile is too large");
+        let mut profile: Self = serde_json::from_reader(file).context("Read assistant profile")?;
+        for device in &mut profile.devices { device.validate()?; }
+        Ok(Some(profile))
+    }
+
+    pub fn clients(&self) -> Result<Vec<Client>> {
+        self.devices.iter().map(AssistantDevice::client).collect()
+    }
+}
+
+fn save_private(value: &impl Serialize, path: &Path, parent: &File) -> Result<()> {
+    ensure!(
+        parent.metadata()?.permissions().mode() & 0o200 != 0,
+        "Device profile directory is not writable"
+    );
+    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().context("Device profile needs a parent directory")?)?;
+    temporary.as_file().set_permissions(fs::Permissions::from_mode(0o600))?;
+    serde_json::to_writer(&mut temporary, value)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    parent.sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    // The atomic commit succeeded; a later directory sync cannot undo it.
+    let _ = parent.sync_all();
+    Ok(())
 }
 
 fn open_private(path: &Path) -> Result<Option<File>> {
@@ -485,6 +571,49 @@ pub fn profile_path() -> Result<PathBuf> {
     ensure!(base.is_absolute(), "The config directory must be absolute");
     // Preserve the existing stui location: both entrypoints now use this profile.
     Ok(base.join("st3/stui-devices.json"))
+}
+
+pub fn assistant_profile_path() -> Result<PathBuf> {
+    Ok(profile_path()?.with_file_name("assistant-devices.json"))
+}
+
+/// Consume an assistant challenge into its own private profile, never a person chain.
+/// Trust the returned member-sealed issuer only from the selected gateway completion;
+/// this path neither delegates person authority nor verifies a person signing chain.
+pub async fn complete_assistant(
+    path: &Path,
+    endpoint: &str,
+    pairing_id: &str,
+    code: &str,
+    key: SigningKey,
+    allow_public_http: bool,
+) -> Result<AssistantDevice> {
+    let endpoint = validate_endpoint_with_http_policy(endpoint, allow_public_http)?;
+    ensure!(!code.trim().is_empty(), "A pairing code is required");
+    key.prove(pairing_id, code.trim())?;
+    let public = key.public_key()?;
+    let (parent, _lock) = prepare(path)?;
+    let mut profile = AssistantProfile::load(path)?.unwrap_or_default();
+    let mut client = Client::fabric_pairing(&endpoint);
+    client.http = transport::client(&endpoint, allow_public_http)?;
+    let session: crate::Envelope<AssistantPairedSession> = client.post(
+        &format!("/v1/client/pairings/{}/complete", crate::percent_encode(pairing_id.trim_start_matches("pairing/"))),
+        &PairingComplete {
+            api_version: crate::API_VERSION.into(),
+            code: code.trim().into(),
+            device_public_key: public,
+            key_storage: Some("software".into()),
+        },
+    ).await.context("Complete assistant pairing")?;
+    let mut device = AssistantDevice { endpoint, allow_public_http, session: session.value, signing_key: key };
+    let committed = (|| -> Result<()> {
+        device.validate()?;
+        profile.devices.retain(|existing| existing.endpoint != device.endpoint);
+        profile.devices.push(device.clone());
+        save_private(&profile, path, &parent)
+    })();
+    committed.context("The server consumed the assistant pairing code, but local completion failed. Inspect and revoke the new assistant grant on the trusted member before pairing again; the previous profile was retained")?;
+    Ok(device)
 }
 
 pub fn validate_endpoint(endpoint: &str) -> Result<String> {
@@ -661,16 +790,13 @@ pub async fn complete_with_options(
                 })),
         "Member does not support verifiable device grants; upgrade it before retrying. The pairing code was not submitted"
     );
-    let session = client
-        .pairing_complete(
-            pairing_id,
-            &PairingComplete {
-                api_version: crate::API_VERSION.into(),
-                code: code.trim().into(),
-                device_public_key: public.clone(),
-                key_storage: Some("software".into()),
-            },
-        )
+    let session = client.pairing_complete_person(pairing_id,
+    &PairingComplete {
+        api_version: crate::API_VERSION.into(),
+        code: code.trim().into(),
+        device_public_key: public.clone(),
+        key_storage: Some("software".into()),
+    },)
         .await
         .context("Complete device pairing")?
         .value;
@@ -843,6 +969,41 @@ mod tests {
     use serde_json::Value;
 
     #[test]
+    fn assistant_session_issuer_is_a_concrete_person_not_a_fixed_deployment_owner() {
+        let paired: crate::Envelope<AssistantPairedSession> = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/assistant-pairing.json"
+        ))
+        .unwrap();
+        let signing_key = SigningKey::generate(KeyAlgorithm::Ed25519).unwrap();
+        let mut device = AssistantDevice {
+            endpoint: "https://member.example".into(),
+            allow_public_http: false,
+            session: paired.value,
+            signing_key,
+        };
+        device.session.grant.key_id = format!(
+            "{:x}",
+            Sha256::digest(device.signing_key.public_key().unwrap().as_bytes())
+        );
+        for issuer in ["person/operator", "person/other"] {
+            device.session.grant.issuer = issuer.into();
+            device.validate().unwrap();
+        }
+        for issuer in [
+            "",
+            "person/",
+            "person/operator/session/example",
+            "agent/operator",
+            "assistant/chatgpt",
+            "person/operator name",
+            "person/operator\n",
+        ] {
+            device.session.grant.issuer = issuer.into();
+            assert!(device.validate().is_err(), "Accepted invalid issuer {issuer:?}");
+        }
+    }
+
+    #[test]
     fn shared_signer_matches_the_protocol_vectors_and_keeps_secrets_out_of_debug() {
         let vectors: Value = serde_json::from_str(include_str!(
             "../../../fixtures/clients/device-signing-v1.json"
@@ -858,18 +1019,16 @@ mod tests {
                 endpoint: "https://member.example".into(),
                 allow_public_http: false,
                 person_root_fingerprint: None,
-                session: PairedSession {
-                    kind: "paired-session".into(),
-                    device_id: "device/vector".into(),
-                    person_id: case["signer"].as_str().unwrap().into(),
-                    session_actor: "person/avery/session/vector".into(),
-                    credential: "test-only-bearer-000000000000000000000".into(),
-                    scopes: vec!["control.messages".into()],
-                    expires_at: "2026-11-01T00:00:00Z".into(),
-                    device_key_chain: serde_json::from_value(case["chain"].clone()).unwrap(),
-                    device_key_proofs: Vec::new(),
-                    person_root_key_proof: None,
-                },
+                session: PersonPairedSession { kind: "paired-session".into(),
+                device_id: "device/vector".into(),
+                person_id: case["signer"].as_str().unwrap().into(),
+                session_actor: "person/avery/session/vector".into(),
+                credential: "test-only-bearer-000000000000000000000".into(),
+                scopes: vec!["control.messages".into()],
+                expires_at: "2026-11-01T00:00:00Z".into(),
+                device_key_chain: serde_json::from_value(case["chain"].clone()).unwrap(),
+                device_key_proofs: Vec::new(),
+                person_root_key_proof: None, },
                 signing_key: Some(key.clone()),
             };
             let fields = &case["fields"];

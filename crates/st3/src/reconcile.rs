@@ -17124,6 +17124,8 @@ pub(crate) fn append_work_wake_message(
         body_ref: None,
         body_bytes: None,
         body_origin: None,
+        sender_class: None,
+        assistant_grant_id: None,
         created_index: store
             .latest_claim(&format!("message/{message_id}"), Some("message.sent"))?
             .map(|claim| claim.store_index)
@@ -41109,6 +41111,8 @@ mission "ios-proof-blocked" state="ready" {
             body_ref: None,
             body_bytes: None,
             body_origin: None,
+            sender_class: None,
+            assistant_grant_id: None,
             created_index: 1,
             attachments: Vec::new(),
         };
@@ -41135,6 +41139,8 @@ mission "ios-proof-blocked" state="ready" {
             body_ref: None,
             body_bytes: None,
             body_origin: None,
+            sender_class: None,
+            assistant_grant_id: None,
             created_index: 1,
             attachments: Vec::new(),
         };
@@ -41170,6 +41176,8 @@ mission "ios-proof-blocked" state="ready" {
             body_ref: None,
             body_bytes: None,
             body_origin: None,
+            sender_class: None,
+            assistant_grant_id: None,
             created_index: 1,
             attachments: Vec::new(),
         };

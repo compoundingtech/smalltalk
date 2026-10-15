@@ -909,6 +909,28 @@ pub(crate) fn normalized_record(
     session: &ExternalSession,
     locator: &NativeLocator,
 ) -> Result<Vec<Value>> {
+    normalized_record_bounded(session, locator, MAX_TIMELINE_BYTES as usize)
+}
+
+/// A native record larger than the caller's read budget. The record is refused before its
+/// body is allocated or normalized; callers never fall back to an unbounded read.
+#[derive(Debug)]
+pub(crate) struct RecordBudgetExceeded;
+
+impl std::fmt::Display for RecordBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("native record exceeds the bounded read budget")
+    }
+}
+
+impl std::error::Error for RecordBudgetExceeded {}
+
+/// `normalized_record` within `max_bytes` of native record bytes.
+pub(crate) fn normalized_record_bounded(
+    session: &ExternalSession,
+    locator: &NativeLocator,
+    max_bytes: usize,
+) -> Result<Vec<Value>> {
     let mut items = Vec::new();
     match locator {
         NativeLocator::Jsonl {
@@ -920,9 +942,12 @@ pub(crate) fn normalized_record(
             line_index,
         } => {
             anyhow::ensure!(
-                session.driver != ExternalDriver::OpenCode && *length <= MAX_TIMELINE_BYTES,
+                session.driver != ExternalDriver::OpenCode,
                 "invalid native locator"
             );
+            if *length > max_bytes as u64 {
+                return Err(RecordBudgetExceeded.into());
+            }
             let mut file = File::open(&session.transcript)?;
             file.seek(SeekFrom::Start(*offset))?;
             let mut bytes = Vec::new();
@@ -974,6 +999,7 @@ pub(crate) fn normalized_record(
                 params![message_row, session.native_id],
                 |row| {
                     sqlite_row_guard(row, &[0, 1, 2])?;
+                    sqlite_row_budget(row, &[0, 1, 2], max_bytes)?;
                     Ok((
                         sqlite_bytes(row, 0)?,
                         row.get::<_, Option<i64>>(1).ok().flatten(),
@@ -991,6 +1017,7 @@ pub(crate) fn normalized_record(
                 params![part_row, session.native_id, message_row],
                 |row| {
                     sqlite_row_guard(row, &[0, 1])?;
+                    sqlite_row_budget(row, &[0, 1], max_bytes.saturating_sub(message_id.len() + encoded.len()))?;
                     Ok((sqlite_bytes(row, 0)?, sqlite_bytes(row, 1)?))
                 },
             )?;
@@ -1029,6 +1056,7 @@ pub(crate) fn normalized_record(
                 params![message_row, session.native_id],
                 |row| {
                     sqlite_row_guard(row, &[0, 1, 2])?;
+                    sqlite_row_budget(row, &[0, 1, 2], max_bytes)?;
                     Ok((
                         sqlite_bytes(row, 0)?,
                         sqlite_bytes(row, 1)?,
@@ -3313,6 +3341,17 @@ fn sqlite_row_guard(row: &rusqlite::Row<'_>, columns: &[usize]) -> rusqlite::Res
             Box::new(std::io::Error::other(
                 "native SQLite row exceeds the 32 MiB owner-read bound",
             )),
+        ));
+    }
+    Ok(())
+}
+
+fn sqlite_row_budget(row: &rusqlite::Row<'_>, columns: &[usize], max_bytes: usize) -> rusqlite::Result<()> {
+    if sqlite_row_bytes(row, columns)? > max_bytes {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            columns[0],
+            row.get_ref(columns[0])?.data_type(),
+            Box::new(RecordBudgetExceeded),
         ));
     }
     Ok(())

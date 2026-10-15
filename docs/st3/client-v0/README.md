@@ -1159,7 +1159,7 @@ The coverage query reads interval bounds only; it does not materialize older tra
 
 ## Pairing and remote access
 
-Pairing is device-to-person. Its begin request names the concrete initiating `person/*` identity and
+Person pairing is device-to-person. Its begin request names the concrete initiating `person/*` identity and
 is accepted only on the trusted local Unix API; the daemon persists that person as the delegator.
 The response shows a short-lived single-use code and pairing ID. A remote device reaches the
 loopback gateway through Fabric, proves the code, supplies its public key, and receives a scoped
@@ -1180,6 +1180,105 @@ must use `st devices --as person/alex pair --full-control "Alex iPhone"` on the 
 socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
 effect for every subsequent request, including a new bounded terminal WebSocket exchange.
+
+### External assistant grants
+
+External assistants use a separate, closed principal namespace, never person delegation.
+See [External assistants](../external-assistants.md) for the staged A/B contract and dormant
+future send/kill requirements. No live issuance is authorized by merging this implementation.
+
+`PairingBegin` and `PairedSession` are disjoint untagged unions of person and assistant variants. Person
+wire fields and historical claims are unchanged; typed person clients use `PersonPairingBegin`
+and `PersonPairedSession`. Assistant begin names only `assistant/chatgpt`, seals explicit
+assistant read scopes, requires disclosure consent and its evidence, and uses the same
+five-minute single-use challenge. Grant duration defaults to one hour and cannot exceed
+30 days; it is independent of challenge expiry. Completion returns `assistant-paired-session`,
+not a person session, and never creates a person signing chain. Assistant credentials and keys
+are retained in a separate owner-only client profile.
+
+Only the daemon's configured owning person through the trusted-local CLI over the Unix API
+may issue, inspect, renew, revoke, or change assistant grants. Missing owner configuration
+fails closed. Deployment owner identity is external configuration, never a hardcoded public
+identity; public examples and tests use `person/operator`. Management routes are
+`GET /v1/client/assistant/grants/{id}`, `POST .../{id}/revoke`, and `POST .../{id}/policy`.
+Responses use the normal snapshot envelope with an `AssistantGrant` value. Policy updates
+increment the policy revision. The standalone ChatGPT adapter requires
+`minimal_read_mode=caller-bound-allow`: the scoped bearer grant and its disclosure consent
+authorize reads without a per-read signature or approval key. Grant projections include exact
+scope, consent, issuer as a concrete `PersonId` and revoked status, never the bearer or credential
+digest. `key_id` is the public-key SHA-256 digest. The owner may configure exact agent recipient
+IDs and `write.assistant.messages` / `write.assistant.custom-reply` scopes for low-risk writes.
+
+The issuer is sealed from the configured owner at trusted-local begin and preserved through
+gateway completion; remote callers cannot select or replace it. Assistant clients validate
+the issuer's concrete person shape from that gateway response without person grant proofs
+or a fixed named-owner check. The baseline fixture scopes are exactly
+`read.assistant.summary`, `read.assistant.attention`, `read.assistant.missions`, and
+`read.assistant.agents`; disclosure consent and non-empty `consent_evidence` (1-512 bytes, the recorded owner consent) remain required.
+
+Pairing completion, authenticated assistant requests, renewal/policy change and revocation
+must reach the authoritative grant-issuer member. A replicated claim on another member
+cannot establish current revocation/policy authority or permit cross-member proof replay.
+Only the configured owner's trusted-local inventory includes assistant device rows; these
+carry principal, sender class and grant metadata, without a synthetic `person_id`.
+Capability discovery advertises `assistant.grants.v1` to the trusted-local configured owner
+and does not substitute ordinary person grants on older servers.
+
+The original slice-B proof-gated mode remains a legacy branch capability; the standalone
+adapter does not use it, does not send its proof header, and has no SCG dependency.
+In consent-at-grant mode, the same six scoped reads authorize against the current grant on
+every request and revalidate it immediately before returning the response. Envelope budgets
+default to 4096 bytes with a 16384-byte ceiling. Over-budget responses return an explicit
+`response-budget-exceeded` error, mapped by MCP to `incomplete`, never silently clipped data.
+
+The adapter uses `attention-rich`, `missions-rich`, `agents-rich` and `attention-content`
+under `/v1/client/assistant/`. Rich pages include titles and alert question/options/evidence;
+the exact-alert reader binds an owner alert ID and episode. `POST .../propose` accepts only
+closed typed actions. `work.done` creates a daemon-owned structured owner ask whose digest
+binds the whole request, including alert ID, episode, option, fence and idempotency key. The
+owner answers with `st work done <approval-id> --as person/ada --answer approve --episode ...`;
+an identical MCP retry executes through the existing fenced, idempotent action path.
+`message.send` is low-risk: it requires its explicit grant scope and an exact owner-allowlisted
+agent recipient. Its non-read-only tool annotation asks ChatGPT to show a confirmation card;
+the daemon does not treat the advisory card as execution authorization or create another
+st approval. `custom.reply` is likewise grant-scoped at the daemon boundary.
+
+Execution carries the original assistant grant and policy revision through typed action dispatch.
+The message append, person-answer transaction, and custom-reply transaction recheck the
+authoritative grant, revocation, expiry, exact scope, policy revision, recipient, and owner
+approval where required. Revocation or recipient removal between handler preflight and the
+writer transaction denies the synchronous send without appending a message claim.
+
+`crates/st-chatgpt` uses official `rmcp` 3.5.1 for both stateless Streamable HTTP and stdio.
+Both transports use the same seven closed tools and paired-only `st3-client.sock` gateway.
+The adapter holds only a scoped bearer, never an approval key. The current HTTP frontend is
+loopback/no-auth for the recorded personal-tunnel dogfood exception; OAuth is the next
+frontend-auth boundary and does not alter tool arguments or daemon grants. No generic command
+runner, daemon-control socket, or terminal scraping is exposed. `GET /mcp` is 405; unknown
+paths return an empty 404.
+
+The flake's `packages.st-chatgpt` builds only the adapter executable with the shared locked
+Cargo dependencies. Run `nix build .#st-chatgpt` from a checkout, or
+`nix build github:compoundingtech/smalltalk/<commit>#st-chatgpt` at a published commit.
+The shared `checks.st3` suite includes the adapter's Rust tests.
+
+Rerun the scratch exercise (no live daemon or ChatGPT application is touched):
+
+```sh
+nix develop -c bash -c 'export CARGO_TARGET_DIR=tmp/target; cargo run -p st3-client-codegen && cargo build -j 2 -p st-chatgpt -p st3 --features st3/test-support --bin st-chatgpt --bin st3 --example chatgpt_fixture && cargo test -j 2 -p st-chatgpt && cargo test -j 2 -p st3 --test assistant_native && python3 scripts/chatgpt-prototype-e2e.py'
+```
+
+The script starts the repository API harness with its own persistent store, paired gateway,
+and invented `person/ada` owner; it writes evidence to `tmp/chatgpt-e2e-results.json` and
+terminates its processes. Real ChatGPT access remains human-gated: start the Secure MCP Tunnel
+with the intended personal Platform org/workspace association, then create the dev-mode app.
+The scripted race cases use a scheduling gate compiled only with `test-support`, installed
+by the isolated fixture. Normal and release daemon builds contain no gate. The Rust crate
+tests cover tool schemas, input validation, credential permissions, tunnel HTTP responses,
+and daemon API/transaction authorization independently of the script.
+
+
+### Person declaration access
 
 Agent declarations are a separate, sensitive read: `GET /v1/client/agent-declarations/{id}`
 returns the currently applied desired tree, its canonical KDL v2 text, exact revision ID, and
@@ -1456,7 +1555,7 @@ Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe
 `cursor-gap`, `page-cursor-expired`, `projection-detail-too-large`,
 `projection-detail-invalid-source`, `rate-limited`, `runtime-not-local`,
 `runtime-authority-indeterminate`, `remote-unavailable`, `terminal-unavailable`, `terminal-ended`,
-and `internal`.
+`response-budget-exceeded` (HTTP 413), `content-not-text` (HTTP 422), and `internal`.
 
 Revoking a pairing from a non-issuer returns HTTP 409 with `code: issuer-required`,
 `retryable: false`, and `details.issuer_host_id` naming the authoritative issuer.
@@ -1487,7 +1586,8 @@ branch. Consumers accept future strings without changing their wire value. `Reso
 `UnknownResource`, which preserves a future kind's valid header and arbitrary payload. Its kind
 exclusion prevents malformed known resources from falling through that branch. The generated raw
 Rust, Swift, and TypeScript `Resource` types model known kinds only, so TypeScript keeps
-discriminant narrowing on `kind`.
+discriminant narrowing on `kind`. A plain-string `not: { pattern }` excludes a family of values,
+such as the native collections that `Page.collection` leaves to their dedicated page types.
 
 Daemon conformance uses a strict test-only view of the same schema: it closes composed resource
 fields, tightens open enums to known values, and removes `UnknownResource`. Consumer tolerance
