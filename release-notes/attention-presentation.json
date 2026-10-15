@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Attention rows carry st's presentation (Now group, card, who Chat about this reaches, who raised it, the step it holds), computed by the attention refresher",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites. Attention rows gain an optional presentation object (AttentionPresentation in client-v0.schema.json); the generated clients gain its types."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The field is additive and optional, under the presentation capability, version 1. Clients are unchanged in this release and keep deriving their own cards; they read the presentation in later releases. A daemon without the published attention list (ST3_ATTENTION_LIST=off) serves rows without one."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work or expected interruption. The attention refresher presents each row when it folds the list, and presents the published rows again only when the agents roster changes something they read (an agent's label, a step's claimant, a mission's agents): one step-path read per held step and no attention fold. Reads copy the published presentation by row id."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or swap-back restrictions."
+  }
+}

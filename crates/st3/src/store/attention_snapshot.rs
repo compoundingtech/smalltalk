@@ -17,6 +17,16 @@ const PERSON_STEPS_QUERY: &str = "SELECT subject FROM step_runs
     AND status IN ('ready','pending') AND (?1 IS NULL OR assignee=?1) ORDER BY subject";
 
 impl Store {
+    /// A step's name within its mission, while st has the step.
+    pub(crate) fn step_path(&self, step: &str) -> Result<Option<String>> {
+        Ok(self
+            .readers
+            .get()
+            .prepare_cached("SELECT step_path FROM step_runs WHERE subject=?1")?
+            .query_row([step], |row| row.get(0))
+            .optional()?)
+    }
+
     /// The person-attention collection at `now`, with the first instant after `now` at which
     /// the unchanged collection changes.
     ///

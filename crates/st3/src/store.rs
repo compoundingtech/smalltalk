@@ -3864,6 +3864,11 @@ impl Store {
         self.smalltalk.agent_roster_published.subscribe()
     }
 
+    /// The revision `subscribe_agent_roster` follows, now.
+    pub(crate) fn agent_roster_revision(&self) -> u64 {
+        *self.smalltalk.agent_roster_published.borrow()
+    }
+
     /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
     /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
     fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
