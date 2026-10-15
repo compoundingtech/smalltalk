@@ -152,7 +152,7 @@ The real OMP 18.4.4 title bakeoff is reproducible without prompts, credentials o
 
 ```sh
 python3 scripts/st3-omp-labels-eval/run /path/to/omp-18.4.4 \
-  crates/st3/hooks/omp-channel.ts /tmp/omp-labels-result.json
+  crates/st3-daemon/hooks/omp-channel.ts /tmp/omp-labels-result.json
 ```
 
 It uses an isolated profile and a loopback-only dummy model. The actual extension receives full
