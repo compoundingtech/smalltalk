@@ -161,6 +161,13 @@ assert.equal(routeLabel({ kind: 'none', fellBack: false, why: '' }), 'Not connec
   state.waits.at(-1).resolve(); await again;
 }
 
+// The fabric-only setting also governs an absent target, before any network attempt.
+{
+  const selected = selectRoute('fabric', false, 'https://gateway.example', { phase: 'off' }, false);
+  assert.equal(selected.baseUrl, null);
+  assert.match(selected.issue, /No fabric target/);
+}
+
 // ---- A failed fabric is tried again by itself, so a phone that fell back to a saved route it cannot reach
 // ---- does not stay there until it is killed (Nathan, 2026-10-13: "reconnecting over and over ... killed it, it connected").
 {

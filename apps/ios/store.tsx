@@ -6,7 +6,7 @@ import * as Crypto from 'expo-crypto';
 import { submitAnswer } from './answer';
 import { resendMessage, sendMessage, type SendOutcome } from './messageSend';
 import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type Arrangement, type ArrangementOperation, type Runtime, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type ResourceObservation, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
-import { keepClosed, personAnswer, promptAnswers, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, signedMessageFields, isLongMessage, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
+import { TerminalRouteMemory, keepClosed, personAnswer, promptAnswers, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, signedMessageFields, isLongMessage, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
 import { REPAIR_WARNING, validatePairingTrust, verifyPairing } from './pairingProof';
@@ -16,6 +16,7 @@ import { rememberBounded } from './boundedCache';
 import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from './terminalControls';
 import { sendFences } from './sendFence';
 import { Feed } from './feed';
+import { ownerTerminalRouting } from './ownerTerminalBridge';
 import { quality, localDrafts } from './qualityNative';
 import { nativeCollectionSocket } from './modules/st-collections';
 import { FabricCarrier, routeLabel, selectRoute, type CarrierChoice, type FabricSnapshot, type Route } from './carrier';
@@ -385,10 +386,15 @@ function useAppStore(proof?: FabricProfile) {
     } catch (e) { if (current()) setError(errorText(e)); }
   }, [client]);
 
+  const ownerFailures = useRef({ credential: clientCredential, memory: new TerminalRouteMemory() });
+  if (ownerFailures.current.credential !== clientCredential) ownerFailures.current = { credential: clientCredential, memory: new TerminalRouteMemory() };
+  const terminalOptions = useRef({ built: fabricBuilt, fallback: fallbackOn, target: fabricTarget, route: selected.route });
+  terminalOptions.current = { built: fabricBuilt, fallback: fallbackOn, target: fabricTarget, route: selected.route };
+
   // One collections socket per paired gateway and credential keeps attention, missions, and agents
   // current. It closes in the background and opens fresh, snapshots first, in the foreground.
   useEffect(() => {
-    if (!client || !credential) { if (!credential) setStatus('setup'); return; }
+    if (!client || !credential || !clientCredential) { if (!credential) setStatus('setup'); return; }
     const generation = cacheGeneration.current;
     let active = true;
     let connection = 0;
@@ -450,12 +456,19 @@ function useAppStore(proof?: FabricProfile) {
       // The next focused mission screen follows again and replaces them with a snapshot.
       onConversationFrame: (rows, replace) => { if (current()) proofRef.current?.record('conversation', { rows, replace }); },
       onTiming: (target, ms) => { if (current() && !proofRef.current) observations.observe(target, ms); },
-    }, foreground.current, actionId, undefined, undefined, false, undefined, nativeCollectionSocket);
+    }, foreground.current, actionId, undefined, undefined, false, undefined, nativeCollectionSocket, ownerTerminalRouting({
+      gatewayUrl: connectUrl, credential: clientCredential,
+      clientName: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD),
+      built: () => terminalOptions.current.built,
+      fallback: () => terminalOptions.current.fallback,
+      memory: ownerFailures.current.memory,
+      gatewayFabric: () => terminalOptions.current.route.kind === 'fabric' ? terminalOptions.current.target : null,
+    }));
     // Paired: connecting from here on, even while the app waits to be active before it dials.
     setStatus(previous => previous === 'setup' ? 'connecting' : previous);
     setFeed(opened);
     return () => { active = false; opened.close(); setFeed(held => held === opened ? null : held); };
-  }, [client, credential, loadCapabilities, observations, carrier]);
+  }, [client, credential, clientCredential, loadCapabilities, observations, carrier]);
   // No client yet: either nothing is paired, fabric is opening, or neither route can be used.
   useEffect(() => {
     if (client || proof) return;
@@ -964,31 +977,35 @@ function useAppStore(proof?: FabricProfile) {
     },
     /** Each input takes a fresh terminal fence and refuses a changed runtime incarnation. */
     async terminalInput(terminalId: string, incarnation: string, mode: 'line' | 'key' | 'raw', value: string) {
-      if (!client) throw new Error('not connected');
+      if (!client || !feed) throw new Error('not connected');
+      const selected = feed.terminalControl(terminalId, incarnation);
+      const terminalClient = selected?.client ?? client;
       // Typed keys need no screen fence, and an agent's spinner moves the screen faster than a read
       // and a send can race it (Nathan, 2026-10-06: nothing typed ever arrived). So one request,
       // on the snapshot the windows last showed (any earlier one of this host is accepted), fenced
       // by the incarnation only. An st that still asks for the screen's sequence says so, and the
       // old way is used.
-      if ((mode === 'raw' || mode === 'key') && lastSnapshot.current) {
+      if ((mode === 'raw' || mode === 'key') && (selected?.snapshot ?? lastSnapshot.current)) {
         const id = actionId();
         try {
-          await client.terminalInput({ id, idempotency_key: id, fence: { snapshot_id: lastSnapshot.current, subject_revisions: {}, runtime_incarnation: incarnation } as TerminalFence, parameters: { terminal_id: terminalId, mode, value } });
+          await terminalClient.terminalInput({ id, idempotency_key: id, fence: { snapshot_id: selected?.snapshot ?? lastSnapshot.current, subject_revisions: {}, runtime_incarnation: incarnation } as TerminalFence, parameters: { terminal_id: terminalId, mode, value } });
           return;
-        } catch (error) { if (!wantsScreenSequence(error)) throw error; }
+        } catch (error) { if (!wantsScreenSequence(error)) { feed?.terminalControlFailed(error); throw error; } }
       }
-      await withFreshTerminalFence(client, terminalId, incarnation, terminalFence => {
+      await withFreshTerminalFence(terminalClient, terminalId, incarnation, terminalFence => {
         const id = actionId();
-        return client.terminalInput({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, mode, value } });
-      });
+        return terminalClient.terminalInput({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, mode, value } });
+      }).catch(error => { feed?.terminalControlFailed(error); throw error; });
     },
     /** Sizes the terminal to the phone; whoever attaches next may size it again. */
     async terminalResize(terminalId: string, incarnation: string, rows: number, columns: number) {
-      if (!client) throw new Error('not connected');
-      await withFreshTerminalFence(client, terminalId, incarnation, terminalFence => {
+      if (!client || !feed) throw new Error('not connected');
+      const selected = feed.terminalControl(terminalId, incarnation);
+      const terminalClient = selected?.client ?? client;
+      await withFreshTerminalFence(terminalClient, terminalId, incarnation, terminalFence => {
         const id = actionId();
-        return client.terminalResize({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, rows, columns } });
-      });
+        return terminalClient.terminalResize({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, rows, columns } });
+      }).catch(error => { feed?.terminalControlFailed(error); throw error; });
     },
     /** The page of a session's timeline before `oldest`, continuing from `older`'s cursor. */
     async olderTimeline(sessionId: string, older: Older, oldest: TimelineEntry | undefined) {

@@ -202,8 +202,8 @@ function CarrierSection() {
     <ListRow
       glyph={carrierInfo.fallback ? '●' : '○'}
       glyphColor={carrierInfo.fallback ? theme.green : theme.overlay1}
-      title={`Fall back to the saved gateway · ${carrierInfo.fallback ? 'on' : 'off'}`}
-      second="when fabric cannot connect or the member refuses it"
+      title={carrierInfo.fallback ? 'Fall back through the daemon · on' : 'Fabric only, no fallback'}
+      second="terminal routes and carrier on this phone; failure reasons stay visible"
       onPress={() => void actions.setFabricFallback(!carrierInfo.fallback)}
     />
     <View style={{ paddingHorizontal: 12, gap: 4 }}>

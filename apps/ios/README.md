@@ -119,3 +119,14 @@ graph subject. Session and PTY IDs only navigate; placements require stable grap
 
 Opening a resource detail also reads its exact subject with the existing prefix filter,
 including subjects beyond the catalog windows.
+
+A followed terminal can open a second Fabric target for its current owner's paired
+client service while the gateway feed continues serving the app's other windows.
+Its header says `Fabric to HOST` or `via the daemon (Fabric: REASON)`, matching stui.
+Fleet's carrier fallback setting defaults on and also governs terminal attachment;
+turning it off requires Fabric and shows a named failure instead of opening through
+the gateway. The setting stays on this device. The four-second direct attempt includes
+owner metadata, dialing, attachment and the first screen. Owner network failures are
+remembered for sixty seconds; terminal/person refusals are checked again on each open.
+Both routes retain the same terminal incarnation across foreground, carrier changes
+and reattachment, and input uses the client and snapshot that issued the screen.

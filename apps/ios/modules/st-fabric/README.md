@@ -84,3 +84,24 @@ ST3_FABRIC=1 pnpm run pods
 ```
 
 This local preparation uses `com.compoundingtech.smalltalk.fabricproof` and its own URL scheme, so installation does not replace the ordinary app. Its proof link starts `com.compoundingtech.smalltalk.fabricproof://fabric-proof`. The generated local override forces Debug bundling and selects `ST3_FABRIC_OFFLINE_DEBUG=1`; Metro then omits only Expo's devtools message socket, which rejects embedded Debug bundles. Native and JavaScript Debug guards stay enabled; Release still rejects the carrier. Signing and provisioning remain local.
+
+### Independent terminal owner target
+
+`openTarget` returns an opaque handle and a fresh fixed-target loopback URL.
+`closeTarget(handle)` closes only that listener and its sessions; `targetStats(handle)`
+filters diagnostics to that target. Legacy `dial`/`stop` continue to own the gateway
+target. There are at most two targets, each with the existing 16-session bound.
+Targets with the same identity and path mode share one iroh endpoint, preventing
+simultaneous listeners from competing for discovery of the same phone identity.
+Background and module destruction close all targets. Network-change events reach
+all active endpoints. No tunnel resumption or mutation replay is added.
+
+The Linux `owner_bridge` example drives the exact Swift FFI as JSON lines for the
+isolated daemon-pair proof. Build it with `cargo build --example owner_bridge` in
+this crate. The daemon test `terminal_route_phone_client_isolated_owner_pair` is
+ignored by default and requires `FABRIC_BIN` pinned to `0.2.41+84c3208`,
+`OWNER_BRIDGE_BIN`, Node with the app's dependencies, and `pty`. It creates private
+stores, a terminal, pairing and grants, runs the phone's TypeScript routing class,
+and prints attachment-open and first streamed screen times for cold/warm owner and
+gateway routes. Cold direct creates the endpoint/listener; warm direct reuses it.
+All processes and stores are isolated from member daemons and configuration.

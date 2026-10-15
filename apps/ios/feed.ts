@@ -1,4 +1,5 @@
 import { applyWindow, isTransientCode, plainError, plainMessage, type Agent, type Arrangement, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { RoutedTerminalFollow, type TerminalClient, type TerminalRouting } from './terminalRoute';
 import type { InventoryName } from '@smalltalk/st3-views';
 import { InventoryFeed, type InventoryHandlers } from './inventoryFeed';
 import type { HeartbeatSocketFactory } from './collectionSocket';
@@ -111,7 +112,7 @@ export class Feed {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private stream: CollectionStream | undefined;
   private windows: Partial<Record<FeedWindow, CollectionWindow>> = {};
-  private terminal: TerminalFollow | undefined;
+  private terminal: TerminalFollow | RoutedTerminalFollow | undefined;
   private conversation: { target: string; handlers: ConversationHandlers; failures: number; timer?: ReturnType<typeof setTimeout> } | undefined;
   private glasses: { handlers: GlassesHandlers; window?: CollectionWindow } | undefined;
   private arrangements: { person: string; handlers: ArrangementsHandlers; window?: CollectionWindow } | undefined;
@@ -135,7 +136,7 @@ export class Feed {
   private readonly newActionId: () => string;
   private readonly retryDelaysMs: readonly number[];
 
-  constructor(client: Client, handlers: FeedHandlers, foreground: Foreground, newActionId: () => string, retryDelaysMs: readonly number[] = RETRY_DELAYS_MS, reportAfterMs = 1000, followMissions = true, missionsGraceMs = 30_000, private readonly socket?: HeartbeatSocketFactory) {
+  constructor(client: Client, handlers: FeedHandlers, foreground: Foreground, newActionId: () => string, retryDelaysMs: readonly number[] = RETRY_DELAYS_MS, reportAfterMs = 1000, followMissions = true, missionsGraceMs = 30_000, private readonly socket?: HeartbeatSocketFactory, private readonly terminalRouting?: TerminalRouting) {
     this.inventory = new InventoryFeed(missionsGraceMs);
     this.reportAfterMs = reportAfterMs;
     this.missionsGraceMs = missionsGraceMs;
@@ -178,10 +179,23 @@ export class Feed {
       if (!timed) { timed = true; this.handlers.onTiming?.('ios-terminal-open', Date.now() - began); }
       handlers.onScreen(screen);
     } };
-    const follow = new TerminalFollow(this.client, terminalId, timedHandlers, this.newActionId, this.retryDelaysMs, () => this.stream, () => { if (this.terminal === follow) this.terminal = undefined; });
+    const released = () => { if (this.terminal === follow) this.terminal = undefined; };
+    const follow: TerminalFollow | RoutedTerminalFollow = this.terminalRouting
+      ? new RoutedTerminalFollow(this.client as TerminalClient, terminalId, timedHandlers, this.newActionId, () => this.stream, this.terminalRouting, () => this.foreground.active, released, this.retryDelaysMs, this.socket)
+      : new TerminalFollow(this.client, terminalId, timedHandlers, this.newActionId, this.retryDelaysMs, () => this.stream, released);
     this.terminal = follow;
-    if (this.stream) void follow.attach();
+    if (this.stream || this.terminalRouting && this.foreground.active) void follow.attach();
     return { close: () => follow.close() };
+  }
+
+  /** Controls take their snapshot and client from the same terminal route as the screen. */
+  terminalControl(id: string, incarnation: string) {
+    if (this.terminal instanceof RoutedTerminalFollow) return this.terminal.control(id, incarnation);
+    if (this.terminalRouting) throw new Error('The terminal route is not ready; keys were not sent');
+    return null;
+  }
+  terminalControlFailed(error: unknown): void {
+    if (this.terminal instanceof RoutedTerminalFollow) void this.terminal.controlFailed(error);
   }
 
   /** Follow the conversation of an agent or a session; a second call replaces the first. */
@@ -411,7 +425,7 @@ export class Feed {
         }
       }
     } else if (frame.kind === 'screen') {
-      if (id === TERMINAL) this.terminal?.screen(frame.value);
+      if (id === TERMINAL) this.terminal?.screen(frame.value, frame.snapshot);
     } else if (frame.kind === 'conversation') {
       if (id === CONVERSATION && this.conversation) {
         this.conversation.failures = 0;
@@ -489,6 +503,7 @@ class TerminalFollow {
     this.client = client;
     this.terminalId = terminalId;
     this.handlers = handlers;
+    this.incarnation = handlers.expectedIncarnation ?? '';
     this.newActionId = newActionId;
     this.retryDelaysMs = retryDelaysMs;
     this.stream = stream;
@@ -531,10 +546,11 @@ class TerminalFollow {
     }
   }
 
-  screen(screen: TerminalScreen): void {
+  screen(screen: TerminalScreen, _snapshot?: Snapshot): void {
     if (this.closed) return;
     if (screen.runtime_incarnation !== this.incarnation) { this.stop(TERMINAL_RESTARTED); return; }
     this.failures = 0;
+    this.handlers.onReady?.(true);
     this.handlers.onIssue('');
     this.handlers.onScreen(screen);
   }
@@ -573,6 +589,7 @@ class TerminalFollow {
   }
 
   private cancel(): void {
+    this.handlers.onReady?.(false);
     this.attempt++;
     clearTimeout(this.timer);
     this.timer = undefined;

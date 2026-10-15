@@ -267,6 +267,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn conversation_content_chunk(&self, id: &str, reference: &str, offset: u64) -> Result<Envelope<ConversationContentChunk>, ClientError> {{ self.get(&format!(\"/v1/client/conversations/{{}}/content/{{}}/chunk?offset={{offset}}\", percent_encode_segment(id), percent_encode_segment(reference))).await }}"
             )?;
+        } else if id == "terminal.route" {
+            writeln!(
+                out,
+                "    pub async fn terminal_route(&self, terminal_id: &str) -> Result<Envelope<TerminalRoute>, ClientError> {{ self.get(&format!(\"/v1/client/terminals/{{}}/route\", percent_encode(terminal_id))).await }}"
+            )?;
         } else if id == "terminal.screen" {
             writeln!(
                 out,
@@ -376,6 +381,11 @@ fn swift_operation_methods(
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "terminal.route" {
+            writeln!(
+                out,
+                "    public func terminalRoute(id: String) async throws -> Envelope<TerminalRoute> {{ try await get(\"v1/client/terminals/\\(Self.routedSessionID(id))/route\") }}"
+            )?;
         } else if id == "conversation-content.chunk" {
             writeln!(
                 out,
@@ -694,6 +704,8 @@ fn validate_surfaces(
         "PairedSession",
         "TerminalAttachment",
         "TerminalScreen",
+        "TerminalRoute",
+        "TerminalFabricRoute",
         "TerminalLine",
         "TerminalRun",
         "TerminalModes",
@@ -1352,7 +1364,7 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}"
             )?;
-        } else if id == "timeline.list" || id == "terminal.screen" || id.ends_with(".get") {
+        } else if id == "timeline.list" || id == "terminal.screen" || id == "terminal.route" || id.ends_with(".get") {
             let query_suffix = if id == "timeline.list" {
                 " + query(options)"
             } else {

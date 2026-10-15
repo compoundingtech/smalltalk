@@ -6,7 +6,7 @@ import type {
     Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
+    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TerminalRoute, TimelinePage,
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
@@ -486,6 +486,7 @@ export class St3Client {
     async conversationContentChunk(id: string, reference: string, offset = 0): Promise<EnvelopeOf<ConversationContentChunk>> { return this.get(`/v1/client/conversations/${encodeURIComponent(id)}/content/${encodeURIComponent(reference)}/chunk` + query({offset})); }
     async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
     async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
+    async terminalRoute(id: string): Promise<EnvelopeOf<TerminalRoute>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/route`); }
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
     async arrangementsList(person: string, options: PageOptions = {}): Promise<EnvelopeOf<ArrangementPage>> { return this.get('/v1/client/arrangements' + query({ person, ...options })); }
     async arrangementsGet(personName: string, uuid: string): Promise<EnvelopeOf<Arrangement>> { return this.get(`/v1/client/arrangements/${encodeURIComponent(personName)}/${encodeURIComponent(uuid)}`); }

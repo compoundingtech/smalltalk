@@ -2071,6 +2071,16 @@ impl Client {
     ) -> Result<Envelope<EventPage>, ClientError> {
         self.events_internal(after, limit, wait_ms).await
     }
+    pub async fn terminal_route(
+        &self,
+        terminal_id: &str,
+    ) -> Result<Envelope<TerminalRoute>, ClientError> {
+        self.get(&format!(
+            "/v1/client/terminals/{}/route",
+            percent_encode(terminal_id)
+        ))
+        .await
+    }
     pub async fn terminal_screen(
         &self,
         terminal_id: &str,

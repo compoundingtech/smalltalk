@@ -11972,11 +11972,13 @@ impl Store {
     pub(crate) fn runtime_authority(&self, subject: &str) -> Result<Option<RuntimeAuthority>> {
         smallclaims::touched::note_read(|| subject.to_owned());
 
-        let connection = self.readers.get();
-        // Eligibility, inherited fields and unknown claims must share one snapshot: a rival
-        // arriving between SELECTs must not be paired with the earlier single origin.
-        let connection = connection.unchecked_transaction()?;
-        Self::runtime_authority_on(&connection, subject)
+        // Join an existing request snapshot, or pin one for this authority read. Starting an
+        // unchecked transaction here would BEGIN again on a request's already pinned reader.
+        // Eligibility, inherited fields and unknown claims must share the same cut.
+        self.read_snapshot(|_| {
+            let connection = self.readers.get();
+            Self::runtime_authority_on(&connection, subject)
+        })
     }
 
     /// Runtime fences inside an existing read or committed-write snapshot.

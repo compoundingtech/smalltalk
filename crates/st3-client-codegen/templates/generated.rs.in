@@ -3042,6 +3042,19 @@ pub struct TerminalModes {
     pub kitty_keyboard: Option<u32>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TerminalFabricRoute {
+    pub node: String,
+    pub service: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TerminalRoute {
+    pub terminal_id: String,
+    pub runtime_incarnation: String,
+    pub owner_host_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<TerminalFabricRoute>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalScreen {
     pub kind: String,
     pub terminal_id: String,

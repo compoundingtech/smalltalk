@@ -421,3 +421,15 @@ test('phone observation schema keeps histogram pairs and live-share as separate 
         [{...report.samples[1],carrier:'unknown'}],
     ]) assert.throws(()=>decode({...report,samples}));
 });
+
+test('terminal route metadata accepts an absent Fabric service and rejects arbitrary services', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const base = { terminal_id: 'terminal/agent/demo/worker', runtime_incarnation: 'runtime:one', owner_host_id: 'host/owner-a' };
+    const decode = Rich.decodeUnknownSync(Rich.TerminalRoute, 'strict');
+    assert.deepEqual(Schema.encodeSync(Rich.TerminalRoute)(decode(base)), base);
+    const value = { ...base, fabric: { node: 'a'.repeat(64), service: 'st3/client/demo-fleet' } };
+    assert.deepEqual(Schema.encodeSync(Rich.TerminalRoute)(decode(value)), value);
+    assert.throws(() => decode({ ...base, runtime_incarnation: '' }));
+    assert.throws(() => decode({ ...value, fabric: { ...value.fabric, service: 'st3/pty/demo-fleet' } }));
+    assert.throws(() => decode({ ...value, fabric: { ...value.fabric, node: 'not-a-node' } }));
+});

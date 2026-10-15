@@ -18,7 +18,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum PathMode {
     #[default]
@@ -28,7 +28,6 @@ pub enum PathMode {
 }
 
 pub struct Bridge {
-    pub endpoint: Endpoint,
     pub url: String,
     pub node: String,
     cancel: CancellationToken,
@@ -41,20 +40,37 @@ impl Bridge {
         Self::start_with_mode(key, target, service, PathMode::Auto).await
     }
 
+    #[cfg(test)]
     pub async fn start_with_mode(
         key: SecretKey,
         target: EndpointAddr,
         service: String,
         mode: PathMode,
     ) -> Result<Self> {
-        validate_service(&service)?;
+        let endpoint = Self::endpoint(key, mode).await?;
+        Self::start_on(endpoint, target, service, "standalone".into(), true).await
+    }
+
+    pub async fn endpoint(key: SecretKey, mode: PathMode) -> Result<Endpoint> {
         let builder = Endpoint::builder(presets::N0).secret_key(key);
         let builder = match mode {
             PathMode::Auto => builder,
             PathMode::Direct => builder.clear_relay_transports(),
             PathMode::Relay => builder.clear_ip_transports(),
         };
-        let endpoint = builder.bind().await?;
+        Ok(builder.bind().await?)
+    }
+
+    /// One fixed target listener. App-managed targets share an endpoint; only the manager may
+    /// close that endpoint after its last target stops.
+    pub async fn start_on(
+        endpoint: Endpoint,
+        target: EndpointAddr,
+        service: String,
+        handle: String,
+        close_endpoint: bool,
+    ) -> Result<Self> {
+        validate_service(&service)?;
         let node = endpoint.id().to_string();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let url = format!("http://{}", listener.local_addr()?);
@@ -76,19 +92,21 @@ impl Bridge {
                         let target = target.clone();
                         let service = service.clone();
                         let stopped = stopped.clone();
+                        let handle = handle.clone();
                         sessions.spawn(async move {
                             let _permit = permit;
-                            let _ = tunnel(endpoint, target, service, local, stopped).await;
+                            let _ = tunnel(endpoint, target, service, local, stopped, &handle).await;
                         });
                     }
                 }
             }
             // Every tunnel owns its cleanup; cancel and join before closing the endpoint.
             while sessions.join_next().await.is_some() {}
-            owned_endpoint.close().await;
+            if close_endpoint {
+                owned_endpoint.close().await;
+            }
         });
         Ok(Self {
-            endpoint,
             url,
             node,
             cancel,
@@ -119,8 +137,9 @@ async fn tunnel(
     service: String,
     local: TcpStream,
     cancel: CancellationToken,
+    handle: &str,
 ) -> Result<()> {
-    let attempt = diagnostics::started();
+    let attempt = diagnostics::started(handle);
     let started = Instant::now();
     let connected = tokio::select! {
         _ = cancel.cancelled() => { diagnostics::ended(attempt, "cancelled", None); return Ok(()) },
@@ -801,10 +820,16 @@ mod tests {
                     "{response}"
                 );
             } else {
-                assert!(
-                    status.contains(" 401 ") || status.contains(" 403 "),
-                    "{response}"
+                assert_eq!(status.split_whitespace().nth(1), Some("403"), "{response}");
+                let denied: serde_json::Value = serde_json::from_str(body)?;
+                assert_eq!(denied["api_version"], "st3.client.v0");
+                assert_eq!(denied["error_version"], "st3.client.error.v0");
+                assert_eq!(denied["code"], "forbidden");
+                assert_eq!(
+                    denied["message"],
+                    "the Fabric-loopback client credential is required"
                 );
+                assert_eq!(denied["retryable"], false);
             }
         }
         bridge.stop().await;

@@ -4510,3 +4510,7 @@ mod tests {
 
 #[cfg(test)]
 mod timeline_relay_tests;
+
+#[cfg(test)]
+#[path = "peer_owner_terminal_proof.rs"]
+mod owner_terminal_proof;

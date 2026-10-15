@@ -286,8 +286,8 @@ export function selectRoute(choice: CarrierChoice, fallback: boolean, saved: str
     return saved ? { baseUrl: saved, route: savedRoute(saved, false, ''), pending: false, issue: '' } : { baseUrl: null, route: { kind: 'none', fellBack: false, why: '' }, pending: false, issue: '' };
   }
   if (!hasTarget) {
-    const why = 'No fabric target is saved, so the saved gateway is used';
-    return saved ? { baseUrl: saved, route: savedRoute(saved, true, why), pending: false, issue: '' } : { baseUrl: null, route: { kind: 'none', fellBack: false, why: '' }, pending: false, issue: why };
+    const why = fallback ? 'No fabric target is saved, so the saved gateway is used' : 'No fabric target is saved (fabric only, no fallback)';
+    return fallback && saved ? { baseUrl: saved, route: savedRoute(saved, true, why), pending: false, issue: '' } : { baseUrl: null, route: { kind: 'none', fellBack: false, why: '' }, pending: false, issue: why };
   }
   switch (fabric.phase) {
     case 'ready':

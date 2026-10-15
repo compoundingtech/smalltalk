@@ -185,6 +185,7 @@
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
+            { "$ref": "#/$defs/TerminalRoute" },
             { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
             { "$ref": "#/$defs/UsagePeriod" },
@@ -2436,6 +2437,50 @@
         "mouse_tracking": { "enum": ["none", "click", "drag", "motion"] },
         "mouse_encoding": { "enum": ["default", "utf8", "sgr"] },
         "kitty_keyboard": { "type": "integer", "minimum": 0, "description": "Active Kitty keyboard protocol enhancement flags as a bitmask." }
+      }
+    },
+    "TerminalRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "terminal_id",
+        "runtime_incarnation",
+        "owner_host_id"
+      ],
+      "properties": {
+        "terminal_id": {
+          "$ref": "#/$defs/TerminalId"
+        },
+        "runtime_incarnation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_host_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fabric": {
+          "$ref": "#/$defs/TerminalFabricRoute"
+        }
+      }
+    },
+    "TerminalFabricRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node",
+        "service"
+      ],
+      "properties": {
+        "node": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "service": {
+          "type": "string",
+          "pattern": "^st3/client/[^\\s]+$",
+          "maxLength": 255
+        }
       }
     },
     "TerminalScreen": {

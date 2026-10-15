@@ -6,6 +6,7 @@ use std::time::Instant;
 
 struct Attempt {
     id: u64,
+    target: String,
     elapsed_ms: Option<u64>,
     path: &'static str,
     result: &'static str,
@@ -16,7 +17,7 @@ struct Attempt {
 static ATTEMPTS: Mutex<Vec<Attempt>> = Mutex::new(Vec::new());
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
 
-pub fn started() -> u64 {
+pub fn started(target: &str) -> u64 {
     ORIGIN.get_or_init(Instant::now);
     let mut attempts = ATTEMPTS.lock().expect("measurements");
     let id = attempts.last().map_or(1, |a| a.id + 1);
@@ -29,6 +30,7 @@ pub fn started() -> u64 {
     }
     attempts.push(Attempt {
         id,
+        target: target.into(),
         elapsed_ms: None,
         path: "unknown",
         result: "connecting",
@@ -88,9 +90,14 @@ pub fn ended(id: u64, result: &'static str, code: Option<String>) {
     }
 }
 
+#[cfg(test)]
 pub fn snapshot() -> Value {
+    snapshot_for(None)
+}
+
+pub fn snapshot_for(target: Option<&str>) -> Value {
     let mut attempts = ATTEMPTS.lock().expect("measurements");
-    let entries: Vec<_> = attempts.iter_mut().map(|a| {
+    let entries: Vec<_> = attempts.iter_mut().filter(|a| target.is_none_or(|target| a.target == target)).map(|a| {
         let mut rtt_ms = None;
         if let Some(c) = a.connection.as_ref().and_then(WeakConnectionHandle::upgrade) {
             a.path = path(&c);

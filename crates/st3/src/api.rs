@@ -670,6 +670,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/client/pairings/{id}/complete",
             post(client_v0::pairing_complete),
         )
+        .route("/v1/client/terminals/{id}/route", get(client_v0::terminal_route))
         .route(
             "/v1/client/terminals/{id}/screen",
             get(client_v0::terminal_screen),

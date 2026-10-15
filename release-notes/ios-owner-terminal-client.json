@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The phone follows a terminal through its owning member's paired Fabric client service, with a visible daemon fallback and a local fabric-only setting",
+  "replay": { "status": "none", "detail": "No replay, backfill or stored transcript change. Uncertain input is never resent on another route." },
+  "schema": { "status": "changed", "detail": "Adds the optional terminal.route read operation and TerminalRoute/TerminalFabricRoute models to client v0. Generated Rust, Swift and TypeScript clients carry the new contract digest. Existing requests, terminal frames, actions and fences are unchanged." },
+  "rules": { "status": "none", "detail": "The owner authenticates the existing paired credential and rechecks terminal.read and terminal.control. Metadata requires terminal.read and does not contact the owner. Attachment capabilities and snapshot fences remain local to their issuing member." },
+  "compatibility": { "status": "changed", "detail": "Older gateways, builds without native Fabric, absent grants and all failed direct attempts use the saved daemon path by default, showing the cause. The per-device carrier fallback setting can require Fabric only. Both routes retain the same subject and runtime incarnation; reconnect never substitutes a restarted terminal. Owner-level network failures are remembered for 60 seconds." },
+  "downtime": { "status": "none", "detail": "Ordinary rolling deployment; no startup conversion." },
+  "manual": { "status": "none", "detail": "No automatic host grant or configuration change. Existing phone grants for st3/client/FLEET_ID are required on each owner; operations manages them. The native bridge keeps at most two independently closed targets with 16 sessions per listener." },
+  "recovery": { "status": "none", "detail": "No durable recovery change. Foreground recreates transports while retaining the terminal incarnation; background closes the native targets." }
+}

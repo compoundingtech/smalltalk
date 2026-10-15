@@ -2073,3 +2073,20 @@ as waiting records until upgrade; see [rolling upgrades](../replication.md#rolli
 
 
 `agent.retire` permanently retires the identity at its declaring host. It requires `{ "agent": "agent/example/worker", "reason": "Work finished" }`, a selected desired claim ID in `fence.runtime_desired_revision`, and a stable idempotency key. Optional `runtime_incarnation` fences a selected process. Rust provides `agent_retire`; Swift and TypeScript provide `agentRetire`. See [terminal retirement](../agent-retirement.md) for the coordinated registry rollout and locally known retirement rule. Fresh sends to a known retired agent return 409 `recipient-retired` with `applied: "none"` and a typed `details.refusal.variant: "Retired"`. Exact accepted retries return their receipt; a lost reply remains unconfirmed. `lifecycle-unavailable` concerns incomplete/conflicting local evidence, never an offline owner alone.
+
+### Optional terminal owner route
+
+`GET /v1/client/terminals/{id}/route` requires `terminal.read`. Its ordinary envelope
+contains `TerminalRoute`: `terminal_id`, `runtime_incarnation`, `owner_host_id`,
+and optional `fabric: { node, service }`. The service is `st3/client/FLEET_ID`.
+The descriptor and envelope snapshot come from one graph read, selecting the current
+runtime owner and its sealed current membership. This read does not dial the owner.
+Absent or ambiguous owner Fabric advertisements omit `fabric`.
+
+A paired client may use this authenticated descriptor to reach the owner's ordinary
+client service. It must keep the terminal subject and incarnation, authenticate with
+the same delegated credential, and obtain that owner's attachment capability and
+snapshot fences. A gateway capability or snapshot does not authorize an owner request.
+The owner independently enforces `terminal.read` and `terminal.control`.
+Older daemons may return not-found for this optional endpoint; the existing gateway
+terminal API remains available with its original fences.

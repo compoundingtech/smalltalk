@@ -8795,6 +8795,56 @@ async fn terminal_facts(state: &AppState, id: &str) -> Option<Value> {
     .flatten()
 }
 
+/// Optional paired-client metadata from one graph cut. This read does not need a live relay
+/// to the owner; the phone can try the owner's client service when the gateway relay is down.
+pub(super) async fn terminal_route(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "terminal.read")?;
+    let (snapshot, value) = blocking_store(move || {
+        state.store.clone().read_snapshot(|index| {
+            Ok(terminal_route_at(&state, &id).map(|value| (client_snapshot_at(&state, index), value)))
+        })
+    }).await??;
+    Ok((Extension(snapshot), Json(value)))
+}
+
+fn terminal_route_at(state: &AppState, id: &str) -> Result<Value, ApiError> {
+    let selected = state.store.runtime_authority(&terminal_subject(id)).map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("the terminal has no selected runtime"))?;
+    let fields = selected.actual.as_ref().map(|actual| actual.get("fields").unwrap_or(actual))
+        .ok_or_else(|| ApiError::not_found("the terminal has no runtime"))?;
+    if fields["status"] != "running" || fields["terminal"] != true {
+        return Err(ApiError::not_found("the selected runtime has no running terminal"));
+    }
+    let incarnation = fields["incarnation_id"].as_str().filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::not_found("the terminal has no incarnation"))?;
+    let origin = selected.actual_origin.as_deref()
+        .ok_or_else(|| terminal_unavailable("the terminal owner is unknown"))?;
+    let mut value = json!({"terminal_id": client_detail_id("terminal", id),
+        "runtime_incarnation": incarnation, "owner_host_id": client_host_id(origin)});
+    if let Some(fleet_id) = &state.fleet_id {
+        let membership = state.store.fleet_view_sealed().map_err(ApiError::internal)?;
+        let owners: Vec<_> = membership.members.iter()
+            .filter(|member| member.name == origin && member.state == "current").collect();
+        if let [owner] = owners.as_slice() {
+            let nodes: std::collections::BTreeSet<_> = owner.endpoints.iter()
+                .filter(|endpoint| endpoint["transport"] == "fabric")
+                .filter_map(|endpoint| endpoint["node"].as_str())
+                .filter(|node| node.len() == 64 && node.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .map(str::to_ascii_lowercase)
+                .collect();
+            if let Some(node) = nodes.iter().next().filter(|_| nodes.len() == 1) {
+                value["fabric"] = json!({"node": node.to_ascii_lowercase(),
+                    "service": format!("st3/client/{fleet_id}")});
+            }
+        }
+    }
+    Ok(value)
+}
+
 pub(super) async fn terminal_screen(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
@@ -12179,6 +12229,94 @@ mod published_attention_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_route_fixture(root: &Path) -> AppState {
+        let mut state = test_state_named(root, "owner-a");
+        let fleet = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        let key = Arc::new(crate::fleet::MemberKey::generate().unwrap().0);
+        state.store.bind_fleet(fleet).unwrap();
+        state.store.pin_fleet_anchor(key.public()).unwrap();
+        state.store.set_member_key(Some(key.clone())).unwrap();
+        state.store.admit_fleet_anchor(fleet, key.public(), "listening").unwrap();
+        state.fleet_id = Some(fleet.into());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/demo/worker".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"demo-worker",
+                "incarnation_id":"runtime:one", "terminal":true})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn terminal_route_is_an_optional_read_only_snapshot_without_a_relay() {
+        let root = tempfile::tempdir().unwrap();
+        let state = terminal_route_fixture(root.path());
+        let node = "a".repeat(64);
+        state.store.publish_fleet_endpoints("listening", &[json!({"transport":"fabric", "node":node})], "test").unwrap();
+        let mut session = ClientSession::local(None).unwrap();
+        let (Extension(snapshot), Json(value)) = terminal_route(State(state.clone()), Extension(session.clone()),
+            AxumPath("agent/demo/worker".into())).await.unwrap();
+        assert_eq!(value["terminal_id"], "terminal/agent/demo/worker");
+        assert_eq!(value["runtime_incarnation"], "runtime:one");
+        assert_eq!(value["owner_host_id"], "host/owner-a");
+        assert_eq!(value["fabric"], json!({"node":node, "service":format!("st3/client/{}", state.fleet_id.as_ref().unwrap())}));
+        let typed: st3_client::TerminalRoute = serde_json::from_value(value).unwrap();
+        assert_eq!(typed.runtime_incarnation, "runtime:one");
+        assert_eq!(snapshot.store_index, state.store.index().unwrap());
+        assert!(state.client_relay.is_none(), "metadata never contacts the terminal owner");
+        assert!(!session.scopes.contains("terminal.control"));
+        session.scopes.remove("terminal.read");
+        let denied = terminal_route(State(state), Extension(session), AxumPath("agent/demo/worker".into())).await.unwrap_err();
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        assert_eq!(denied.code, "forbidden");
+        assert_eq!(denied.message, "the authenticated client session is not granted `terminal.read`");
+    }
+
+    #[tokio::test]
+    async fn terminal_route_omits_an_absent_or_ambiguous_fabric_target() {
+        let root = tempfile::tempdir().unwrap();
+        let state = terminal_route_fixture(root.path());
+        assert!(terminal_route_at(&state, "agent/demo/worker").unwrap().get("fabric").is_none());
+        state.store.publish_fleet_endpoints("listening", &[
+            json!({"transport":"fabric", "node":"a".repeat(64)}),
+            json!({"transport":"fabric", "node":"A".repeat(64)}),
+        ], "test").unwrap();
+        assert_eq!(terminal_route_at(&state, "agent/demo/worker").unwrap()["fabric"]["node"], "a".repeat(64));
+        state.store.publish_fleet_endpoints("listening", &[
+            json!({"transport":"fabric", "node":"a".repeat(64)}),
+            json!({"transport":"fabric", "node":"b".repeat(64)}),
+        ], "test").unwrap();
+        assert!(terminal_route_at(&state, "agent/demo/worker").unwrap().get("fabric").is_none());
+        assert_eq!(terminal_route_at(&state, "agent/missing").unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn terminal_route_over_fabric_requires_the_normal_paired_credential() {
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let app = super::super::fabric_router(terminal_route_fixture(root.path()));
+        for (credential, reason) in [
+            (None, "the Fabric-loopback client credential is required"),
+            (Some("Bearer unknown-test-credential"), "the client credential is unknown or expired"),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri("/v1/client/terminals/agent%2Fdemo%2Fworker/route");
+            if let Some(credential) = credential {
+                request = request.header(axum::http::header::AUTHORIZATION, credential);
+            }
+            let response = app.clone().oneshot(request.body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+            let denied: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(denied["api_version"], "st3.client.v0");
+            assert_eq!(denied["error_version"], "st3.client.error.v0");
+            assert_eq!(denied["code"], "forbidden");
+            assert_eq!(denied["message"], reason);
+            assert_eq!(denied["retryable"], false);
+            assert!(denied.get("value").is_none(), "no owner descriptor is disclosed: {denied}");
+        }
+    }
 
     #[tokio::test]
     async fn request_latency_keeps_scope_and_routes_with_a_memory_only_cost_snapshot() {

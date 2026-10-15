@@ -742,6 +742,10 @@ const PROBES: &[Probe] = &[
         "/v1/client/subscriptions/{subscription}",
     ),
     get("GET /v1/client/terminals", "/v1/client/terminals"),
+    get(
+        "GET /v1/client/terminals/{id}/route",
+        "/v1/client/terminals/{seat}/route",
+    ),
     get("GET /v1/client/operations", "/v1/client/operations"),
     get(
         "GET /v1/client/operations/{*id}",
@@ -2111,6 +2115,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
         running.subject = seat.clone();
         running.actor = Some(seat);
         running.fields.insert("status".into(), json!("running"));
+        running.fields.insert("terminal".into(), json!(true));
         running
             .fields
             .insert("incarnation_id".into(), json!(SEAT_RUNTIME));
@@ -2119,6 +2124,22 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
     let mut fixture = fixture(&person, &client, subjects).await;
     fixture.items.insert("usage_since", usage_window.0.to_string());
     fixture.items.insert("usage_until", usage_window.1.to_string());
+    // Measure a successful owner descriptor, including sealed endpoint selection, without
+    // contacting a live PTY or relay. A missing terminal would measure only the error path.
+    let fabric_node = "c".repeat(64);
+    store.publish_fleet_endpoints("listening", &[
+        json!({"transport":"fabric", "node":fabric_node}),
+    ], "cost-terminal-route").unwrap();
+    let terminal_route: Value = person
+        .get(&fixture.fill("/v1/client/terminals/{seat}/route", 0))
+        .await
+        .expect("the terminal route cost probe must resolve a running owner");
+    assert_eq!(terminal_route["terminal_id"], format!("terminal/{}", fixture.subjects.seats[0]));
+    assert_eq!(terminal_route["runtime_incarnation"], SEAT_RUNTIME);
+    assert_eq!(terminal_route["owner_host_id"], format!("host/{NODE}"));
+    assert_eq!(terminal_route["fabric"], json!({
+        "node":fabric_node, "service":format!("st3/client/{FLEET}"),
+    }));
     fixture.items.insert(
         "event_after",
         store.event_bounds().unwrap().0.saturating_sub(1).to_string(),
@@ -2370,6 +2391,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
         let cost = Cost {
             error: cost.error.filter(|error| {
                 probe.route.starts_with("GET /v1/client/arrangements")
+                    || probe.route == "GET /v1/client/terminals/{id}/route"
                     || (!error.contains("not-found") && !error.contains("404"))
             }),
             ..cost

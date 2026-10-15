@@ -627,3 +627,15 @@ test('phone observation command retries identical tagged intervals and accepts w
     assert.equal(calls[0].init.body,calls[1].init.body);
     assert.deepEqual(JSON.parse(calls[0].init.body),report);
 });
+
+test('terminalRoute encodes the selected subject and authenticates only the metadata read', async () => {
+    const route = { terminal_id: 'terminal/agent/demo/worker', runtime_incarnation: 'runtime:one', owner_host_id: 'host/owner-a', fabric: { node: 'a'.repeat(64), service: 'st3/client/demo-fleet' } };
+    const calls = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'test-credential', fetchImpl: async (url, init) => {
+        calls.push([String(url), init]); return response(String(url).endsWith('/capabilities') ? capabilityFixture : envelope(route));
+    } });
+    assert.deepEqual((await client.terminalRoute(route.terminal_id)).value, route);
+    assert.equal(calls[1][0], 'https://example.test/v1/client/terminals/terminal%2Fagent%2Fdemo%2Fworker/route');
+    assert.equal(calls[1][1].headers.Authorization, 'Bearer test-credential');
+    assert.equal(calls[1][1].method, 'GET');
+});

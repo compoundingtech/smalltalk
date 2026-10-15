@@ -15,6 +15,13 @@ public final class StFabricModule: Module {
     AsyncFunction("stats") { () -> String in
       throw Exception(name: "FabricDisabled", description: "This build does not link the fabric carrier")
     }
+    AsyncFunction("openTarget") { (_: String, _: String, _: String?, _: String) -> String in
+      throw Exception(name: "FabricDisabled", description: "This build does not link the fabric carrier")
+    }
+    AsyncFunction("closeTarget") { (_: String) in }
+    AsyncFunction("targetStats") { (_: String) -> String in
+      throw Exception(name: "FabricDisabled", description: "This build does not link the fabric carrier")
+    }
     AsyncFunction("stop") {}
   }
 }

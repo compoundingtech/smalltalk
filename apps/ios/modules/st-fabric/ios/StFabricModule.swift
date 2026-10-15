@@ -20,13 +20,20 @@ public class StFabricModule: Module {
     AsyncFunction("dial") { (node: String, service: String, address: String?, mode: String) -> [String: Any] in
       try self.bridge.dial(node: node, service: service, address: address, mode: mode, queue: self.queue)
     }.runOnQueue(queue)
+    AsyncFunction("openTarget") { (node: String, service: String, address: String?, mode: String) -> [String: Any] in
+      try self.bridge.dial(node: node, service: service, address: address, mode: mode, queue: self.queue, independent: true)
+    }.runOnQueue(queue)
+    AsyncFunction("closeTarget") { (handle: String) in self.bridge.closeTarget(handle) }.runOnQueue(queue)
+    AsyncFunction("targetStats") { (handle: String) -> [String: Any] in
+      try handle.withCString { try self.bridge.response(st_fabric_target_stats($0)) }
+    }.runOnQueue(queue)
     AsyncFunction("stats") { () -> [String: Any] in
       try self.bridge.stats()
     }.runOnQueue(queue)
     AsyncFunction("stop") { () in
       self.bridge.stop()
     }.runOnQueue(queue)
-    OnAppEntersBackground { self.queue.async { self.bridge.stop() } }
+    OnAppEntersBackground { self.queue.async { self.bridge.stopAll() } }
     OnDestroy { self.queue.async { self.bridge.destroy() } }
   }
 }
@@ -54,7 +61,7 @@ private final class FabricBridge {
     self.monitor = monitor
   }
 
-  func destroy() { stop() }
+  func destroy() { stopAll() }
 
   func identity() throws -> [String: Any] {
     let secret = try loadOrCreateKey()
@@ -63,7 +70,7 @@ private final class FabricBridge {
     }
   }
 
-  func dial(node: String, service: String, address: String?, mode: String, queue: DispatchQueue) throws -> [String: Any] {
+  func dial(node: String, service: String, address: String?, mode: String, queue: DispatchQueue, independent: Bool = false) throws -> [String: Any] {
     observePaths(on: queue)
     let secret = try loadOrCreateKey()
     var target: [String: Any] = ["node": node, "service": service, "mode": mode]
@@ -76,7 +83,9 @@ private final class FabricBridge {
     }
     return try secret.withUnsafeBytes { bytes in
       try json.withCString { request in
-        try response(st_fabric_dial(bytes.bindMemory(to: UInt8.self).baseAddress, secret.count, request))
+        try response(independent
+          ? st_fabric_open_target(bytes.bindMemory(to: UInt8.self).baseAddress, secret.count, request)
+          : st_fabric_dial(bytes.bindMemory(to: UInt8.self).baseAddress, secret.count, request))
       }
     }
   }
@@ -100,11 +109,26 @@ private final class FabricBridge {
     return result
   }
 
+  private func stopMonitoringIfIdle() {
+    if st_fabric_target_count() == 0 {
+      monitor?.cancel()
+      monitor = nil
+    }
+  }
+
+  func closeTarget(_ handle: String) {
+    handle.withCString { st_fabric_string_free(st_fabric_close_target($0)) }
+    stopMonitoringIfIdle()
+  }
+
   func stop() {
-    monitor?.cancel()
-    monitor = nil
-    let result = st_fabric_stop()
-    st_fabric_string_free(result)
+    st_fabric_string_free(st_fabric_stop())
+    stopMonitoringIfIdle()
+  }
+
+  func stopAll() {
+    st_fabric_string_free(st_fabric_stop_all())
+    stopMonitoringIfIdle()
   }
 
   private func loadOrCreateKey() throws -> Data {
@@ -142,7 +166,7 @@ private final class FabricBridge {
     return secret
   }
 
-  private func response(_ pointer: UnsafeMutablePointer<CChar>?) throws -> [String: Any] {
+  func response(_ pointer: UnsafeMutablePointer<CChar>?) throws -> [String: Any] {
     guard let pointer else { throw Exception(name: "FabricNative", description: "Fabric did not return a result") }
     defer { st_fabric_string_free(pointer) }
     let data = Data(String(cString: pointer).utf8)

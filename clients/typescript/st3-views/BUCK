@@ -20,6 +20,7 @@ package_view(
         "requestView.ts": "requestView.ts",
         "sessionView.ts": "sessionView.ts",
         "slo.ts": "slo.ts",
+        "terminalRoute.ts": "terminalRoute.ts",
         "time.ts": "time.ts",
         "tsconfig.json": "tsconfig.json",
     },
