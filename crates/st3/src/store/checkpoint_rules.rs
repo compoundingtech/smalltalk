@@ -34,7 +34,8 @@ pub(crate) use staged::plan_staged;
 /// than an hour older than their account group's newest, other than each seat's newest. The
 /// proof compares the account fold across every seat. It also keeps only the newest
 /// `runtime.reconcile-decision` of each decision key.
-pub const RULES_VERSION: u32 = 15;
+/// Version 16 includes selected rollup costs and complete, single-currency legacy costs in usage proofs.
+pub const RULES_VERSION: u32 = 16;
 
 /// Usage rollups keep their hourly history for this long before the cut, so a usage period that
 /// ends within it is exact to the hour. Before it, each rollup series keeps only its newest
@@ -71,6 +72,7 @@ sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
 graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
 replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
+reader-usage=rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas,cost-complete-single-currency
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";

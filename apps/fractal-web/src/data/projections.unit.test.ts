@@ -233,7 +233,7 @@ test('agent roster preserves usage scope, requested checkout, workspace and huma
   const usage = {
     total_tokens: 123, input_tokens: 80, output_tokens: 43, cached_tokens: 20,
     cache_write_tokens: 5, cost: 0.12, currency: 'USD', incarnation_count: 2,
-    aggregation: 'cumulative-per-incarnation-else-response-deltas' as const,
+    aggregation: 'rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas' as const,
   }
   const observed = decodeUnknownSync(Agent, 'strict')({
     kind: 'agent', id: 'agent/facts', name: 'Facts', runtime_ids: [],
@@ -267,7 +267,7 @@ test('usage without cost remains known token evidence without fabricated spend',
     kind: 'agent', id: 'agent/tokens', name: 'Tokens', runtime_ids: [],
     reachability: 'reachable', state: 'running', revision: '1', updated_at: '2026-10-04T12:00:00.000Z',
     usage: { total_tokens: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0,
-      incarnation_count: 1, aggregation: 'cumulative-per-incarnation-else-response-deltas' },
+      incarnation_count: 1, aggregation: 'rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas' },
   } satisfies AgentEncoded)
   const projected = fleetFromAgents([observed]).agents[0]!
   expect(projected.usage._tag).toBe('Known')
@@ -280,7 +280,7 @@ test('usage without cost remains known token evidence without fabricated spend',
 
 test('roster fact changes update the row while structurally equal usage and checkout retain identity', () => {
   const usage = { total_tokens: 10, input_tokens: 8, output_tokens: 2, cached_tokens: 0,
-    incarnation_count: 1, aggregation: 'cumulative-per-incarnation-else-response-deltas' as const }
+    incarnation_count: 1, aggregation: 'rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas' as const }
   const wire = {
     kind: 'agent' as const, id: 'agent/facts', name: 'Facts', runtime_ids: [],
     reachability: 'reachable' as const, state: 'running' as const, revision: '1',

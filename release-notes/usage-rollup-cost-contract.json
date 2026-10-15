@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Agent usage summaries include selected rollup costs only when all contributing costs are known and use one currency.",
+  "replay": {"status": "changed", "detail": "Usage readers include selected rollup costs and require complete single-currency costs. Claim replay and arrangement rebuild behavior stay unchanged."},
+  "schema": {"status": "none", "detail": "No persisted tables, indexes or projection layouts change."},
+  "rules": {"status": "changed", "transitions": [[15, 16]], "detail": "Checkpoint rules change from 15 to 16 and include the usage-reader cost contract in the rules digest. The existing arrangement proof and replay identity are retained. Mixed rules digests cannot seal a new shared checkpoint."},
+  "compatibility": {"status": "changed", "detail": "UsageSummary.aggregation is now rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas. Older clients cannot decode this new literal. All in-repo apps and the daemon move in one deploy; do not mix older apps with the new daemon."},
+  "downtime": {"status": "unknown", "detail": "Restart-to-API and restart-to-health times have not been measured for this change."},
+  "manual": {"status": "changed", "detail": "Deploy the apps and daemon together. All checkpoint participants must use matching rules before new shared checkpoint sealing can continue."},
+  "recovery": {"status": "changed", "detail": "Roll forward to matching app and daemon builds. A rollback must move the apps and daemon together; mixed client literals are not supported."}
+}

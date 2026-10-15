@@ -322,7 +322,7 @@ fn session_usage_context_decodes_through_flattened_resource() {
             "cost": null,
             "currency": null,
             "incarnation_count": 2,
-            "aggregation": "response-deltas",
+            "aggregation": "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas",
             "context": {
                 "used_tokens": 800,
                 "window_tokens": 200000,

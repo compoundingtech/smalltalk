@@ -12,7 +12,7 @@ import recording from './subjectReadPort.gateway.fixtures.json' with { type: 'js
 const query: TraceQuery = { native_session_id: 'native-example', range: '7d', bucket: '15m' }
 const unknown = { _tag: 'Unknown', reason: 'not-observed' } as const
 const summary = Native.decodeUnknownSync(Native.UsageSummary)({
-  aggregation: 'cumulative-per-incarnation-else-response-deltas',
+  aggregation: 'rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas',
   incarnation_count: 2, input_tokens: 101, output_tokens: 21, cached_tokens: 7,
   total_tokens: 122, cost: 1.25, currency: 'USD',
   context: { observed_at_unix_ms: 1000, used_tokens: 12, window_tokens: 100, compactions: 2 },
