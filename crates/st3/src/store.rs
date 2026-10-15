@@ -33362,8 +33362,9 @@ fn enrich_step_nudge_at(
     Ok(())
 }
 
-/// Copies the worker's latest progress summary and its completion summary for the
-/// current attempt from the work claims, so views can show them without a history read.
+/// Reads the current attempt's summaries, following revision carry links back to
+/// the cutover snapshot. Successor reports supersede inherited reports, while a
+/// new attempt cannot inherit the predecessor attempt's notes.
 fn enrich_step_summaries_at(
     connection: &Connection,
     view: &mut StepRunView,
@@ -33371,57 +33372,80 @@ fn enrich_step_summaries_at(
 ) -> rusqlite::Result<()> {
     let mut statement = connection.prepare_cached(&canonical_sql(
         "SELECT kind, body, accepted_at_unix_ms FROM claims
-         WHERE subject=?1 AND kind IN ('work.progress','work.submitted')
-         ORDER BY CANONICAL_ASC(claims)",
+         WHERE subject=?1 AND kind IN ('work.progress','work.submitted','step-run.carried')
+         ORDER BY CANONICAL_DESC(claims)",
     ))?;
-    let events = statement
-        .query_map([&view.subject], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
     view.progress_summary = None;
     view.progress_at_unix_ms = None;
     view.completion_summary = None;
     view.submitted_incarnation = None;
-    for (kind, body, accepted) in events {
-        let accepted = accepted.parse::<u128>().unwrap_or(0);
-        if accepted > snapshot_unix_ms {
+    let mut submitted = false;
+    let mut subject = view.subject.clone();
+    let mut snapshot = snapshot_unix_ms;
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(subject.clone()) {
+            // Replicated carry links can form a cycle. Keep the reports already
+            // read and stop at the repeated subject, without following it again.
             break;
         }
-        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
-        let fields = body.get("fields").unwrap_or(&body);
-        if fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(view.attempt)) {
-            continue;
-        }
-        if fields.get("handoff_acknowledged").is_some() {
-            continue;
-        }
-        if kind == "work.submitted" {
-            // Bind only this attempt's submission, including reports without a summary.
-            // Legacy claims carry no submitting incarnation; the cleared lease is no proof.
-            view.submitted_incarnation = fields
-                .get("submitted_incarnation")
+        let mut predecessor = None;
+        let mut events = statement.query([&subject])?;
+        while let Some(row) = events.next()? {
+            let kind = row.get::<_, String>(0)?;
+            let body = row.get::<_, String>(1)?;
+            let accepted = row.get::<_, String>(2)?.parse::<u128>().unwrap_or(0);
+            if accepted > snapshot {
+                continue;
+            }
+            let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            let fields = body.get("fields").unwrap_or(&body);
+            if fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(view.attempt)) {
+                continue;
+            }
+            if kind == "step-run.carried" {
+                if predecessor.is_none() {
+                    predecessor = fields
+                        .get("source_step_run")
+                        .and_then(Value::as_str)
+                        .map(|source| (source.to_owned(), accepted));
+                }
+                continue;
+            }
+            if fields.get("handoff_acknowledged").is_some() {
+                continue;
+            }
+            if kind == "work.submitted" && !submitted {
+                // A newer submission without an incarnation must not borrow an older one.
+                submitted = true;
+                view.submitted_incarnation = fields
+                    .get("submitted_incarnation")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            let Some(summary) = fields
+                .get("summary")
                 .and_then(Value::as_str)
-                .map(str::to_owned);
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+            else {
+                continue;
+            };
+            if kind == "work.progress" && view.progress_summary.is_none() {
+                view.progress_summary = Some(summary.to_owned());
+                view.progress_at_unix_ms = Some(accepted);
+            } else if kind == "work.submitted" && view.completion_summary.is_none() {
+                view.completion_summary = Some(summary.to_owned());
+            }
         }
-        let Some(summary) = fields
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|summary| !summary.is_empty())
-        else {
-            continue;
+        if view.progress_summary.is_some() && view.completion_summary.is_some() && submitted {
+            break;
+        }
+        let Some((source, cutover)) = predecessor else {
+            break;
         };
-        if kind == "work.progress" {
-            view.progress_summary = Some(summary.to_owned());
-            view.progress_at_unix_ms = Some(accepted);
-        } else {
-            view.completion_summary = Some(summary.to_owned());
-        }
+        subject = source;
+        snapshot = cutover;
     }
     Ok(())
 }
@@ -54870,6 +54894,316 @@ version 2
             evidence: Vec::new(),
             idempotency_key: key.into(),
         }
+    }
+
+    #[test]
+    fn revise_notes_carry_progress_for_active_and_completed_steps() {
+        let store = Store::open_memory("node").unwrap();
+        let source = CARRY_SOURCE.replace(
+            "step \"other\"",
+            "step \"done\" { assigned-to \"agent/worker\"; goal \"Finish the work.\" }\n    step \"other\"",
+        );
+        publish_carry(&store, &source, "notes-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "notes-run".into(),
+            })
+            .unwrap();
+        let step = |run: &MissionRunView, path: &str| {
+            run.steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .clone()
+        };
+        let report = |subject: &str, action: &str, key: &str, summary: &str| {
+            let mut request = carry_request("one", key);
+            request.summary = Some(summary.into());
+            store.work_action(subject, action, &request).unwrap()
+        };
+        let done = step(&run, "done").subject;
+        store.set_step_state(&done, "ready", None).unwrap();
+        report(&done, "claim", "notes-claim-done", "Starting");
+        report(&done, "progress", "notes-done", "Decision: keep the result");
+        report(&done, "complete", "notes-complete", "The result is ready");
+        store.set_step_state(&done, "completed", None).unwrap();
+        let work = step(&run, "work").subject;
+        store.set_step_state(&work, "ready", None).unwrap();
+        report(&work, "claim", "notes-claim-work", "Starting");
+        report(&work, "progress", "notes-work", "Checking the result");
+        let original = store.mission_run(&run.subject).unwrap().unwrap();
+        let mut current = original.clone();
+        for revision in 2..=3 {
+            let next = publish_carry(
+                &store,
+                &source.replace("Use the first goal.", &format!("Use goal {revision}.")),
+                &format!("notes-publish-{revision}"),
+            );
+            current = store
+                .adopt_mission_revision(
+                    &run.id,
+                    &next,
+                    "person/requester",
+                    "adjust the other step",
+                    &format!("notes-revise-{revision}"),
+                )
+                .unwrap();
+            for path in ["work", "done"] {
+                let before = step(&original, path);
+                let after = step(&current, path);
+                assert_ne!(before.subject, after.subject);
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.progress_summary, before.progress_summary, "{path}");
+                assert_eq!(
+                    after.progress_at_unix_ms, before.progress_at_unix_ms,
+                    "{path}"
+                );
+                assert_eq!(
+                    after.completion_summary, before.completion_summary,
+                    "{path}"
+                );
+                assert_eq!(
+                    after.submitted_incarnation, before.submitted_incarnation,
+                    "{path}"
+                );
+            }
+        }
+        let carried = step(&current, "work");
+        let updated = report(
+            &carried.subject,
+            "progress",
+            "notes-new-progress",
+            "The check passed",
+        );
+        assert_eq!(
+            updated.progress_summary.as_deref(),
+            Some("The check passed")
+        );
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("node", &store.export_replication(0).unwrap())
+            .unwrap();
+        for path in ["work", "done"] {
+            let expected = store
+                .step_run(&step(&current, path).subject)
+                .unwrap()
+                .unwrap();
+            let replicated = target.step_run(&expected.subject).unwrap().unwrap();
+            assert_eq!(replicated.progress_summary, expected.progress_summary);
+            assert_eq!(replicated.progress_at_unix_ms, expected.progress_at_unix_ms);
+            assert_eq!(replicated.completion_summary, expected.completion_summary);
+        }
+        store
+            .set_step_state(&carried.subject, "failed", Some("try again"))
+            .unwrap();
+        store
+            .retry_step(&carried.subject, "a new attempt", 0)
+            .unwrap();
+        let retried = store.step_run(&carried.subject).unwrap().unwrap();
+        assert_eq!(
+            retried.progress_summary, None,
+            "carried notes belong to attempt 1"
+        );
+        assert_eq!(retried.completion_summary, None);
+    }
+
+    #[test]
+    fn revise_notes_inheritance_uses_the_cutover_snapshot() {
+        let store = Store::open_memory("node").unwrap();
+        publish_carry(&store, CARRY_SOURCE, "snapshot-notes-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "snapshot-notes-run".into(),
+            })
+            .unwrap();
+        let source = &run.steps[0].subject;
+        let mut successor = run.steps[1].clone();
+        let append = |subject: &str, kind: &str, at: &str, fields: Value| {
+            let claim = store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some("agent/node.worker".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            // Deterministic fixture times avoid depending on wall-clock tick boundaries.
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE claims SET accepted_at_unix_ms=?2 WHERE id=?1",
+                    params![claim.id, at],
+                )
+                .unwrap();
+        };
+        append(
+            source,
+            "work.progress",
+            "100",
+            json!({"attempt": 1, "summary": "Before cutover"}),
+        );
+        append(
+            source,
+            "work.submitted",
+            "110",
+            json!({"attempt": 1, "summary": "Finished", "submitted_incarnation": "one"}),
+        );
+        append(
+            &successor.subject,
+            "step-run.carried",
+            "200",
+            json!({"attempt": 1, "source_step_run": source}),
+        );
+        append(
+            source,
+            "work.progress",
+            "300",
+            json!({"attempt": 1, "summary": "After cutover"}),
+        );
+        append(
+            &successor.subject,
+            "work.progress",
+            "400",
+            json!({"attempt": 1, "summary": "Successor note"}),
+        );
+        let connection = store.readers.get();
+        enrich_step_summaries_at(&connection, &mut successor, 250).unwrap();
+        assert_eq!(
+            successor.progress_summary.as_deref(),
+            Some("Before cutover")
+        );
+        assert_eq!(successor.progress_at_unix_ms, Some(100));
+        assert_eq!(successor.completion_summary.as_deref(), Some("Finished"));
+        assert_eq!(successor.submitted_incarnation.as_deref(), Some("one"));
+        enrich_step_summaries_at(&connection, &mut successor, 500).unwrap();
+        assert_eq!(
+            successor.progress_summary.as_deref(),
+            Some("Successor note")
+        );
+        assert_eq!(successor.progress_at_unix_ms, Some(400));
+        successor.attempt = 2;
+        enrich_step_summaries_at(&connection, &mut successor, 500).unwrap();
+        assert_eq!(successor.progress_summary, None);
+        assert_eq!(successor.completion_summary, None);
+        assert_eq!(successor.submitted_incarnation, None);
+    }
+
+    #[test]
+    fn revise_notes_replicated_carries_choose_the_newest_link_and_stop_at_cycles() {
+        let store = Store::open_memory("node").unwrap();
+        publish_carry(&store, CARRY_SOURCE, "replicated-notes-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "replicated-notes-run".into(),
+            })
+            .unwrap();
+        let peer = Store::open_memory("peer").unwrap();
+        peer.import_replication("node", &store.export_replication(0).unwrap())
+            .unwrap();
+        let older = &run.steps[0].subject;
+        let newer = format!("{older}-newer");
+        let mut successor = run.steps[1].clone();
+        let append = |store: &Store, subject: &str, kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some("agent/node.worker".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let older_note = append(
+            &store,
+            older,
+            "work.progress",
+            json!({"attempt": 1, "summary": "Older lineage"}),
+        );
+        let older_link = append(
+            &store,
+            &successor.subject,
+            "step-run.carried",
+            json!({"attempt": 1, "source_step_run": older}),
+        );
+        let newer_note = append(
+            &peer,
+            &newer,
+            "work.progress",
+            json!({"attempt": 1, "summary": "Newer lineage"}),
+        );
+        let newer_link = append(
+            &peer,
+            &successor.subject,
+            "step-run.carried",
+            json!({"attempt": 1, "source_step_run": newer}),
+        );
+        let cycle = append(
+            &peer,
+            &newer,
+            "step-run.carried",
+            json!({"attempt": 1, "source_step_run": successor.subject}),
+        );
+        store
+            .import_replication("peer", &peer.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            store
+                .claims_for(&successor.subject, Some("step-run.carried"))
+                .unwrap()
+                .len(),
+            2
+        );
+        // Set deterministic snapshot times after replication has preserved both
+        // concurrent links. Equal cutover times make the cycle reachable.
+        for (claim, at) in [
+            (older_note, "100"),
+            (older_link, "200"),
+            (newer_note, "150"),
+            (newer_link, "250"),
+            (cycle, "250"),
+        ] {
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE claims SET accepted_at_unix_ms=?2 WHERE id=?1",
+                    params![claim.id, at],
+                )
+                .unwrap();
+        }
+        let connection = store.readers.get();
+        enrich_step_summaries_at(&connection, &mut successor, 225).unwrap();
+        assert_eq!(successor.progress_summary.as_deref(), Some("Older lineage"));
+        enrich_step_summaries_at(&connection, &mut successor, 300).unwrap();
+        assert_eq!(successor.progress_summary.as_deref(), Some("Newer lineage"));
+        assert_eq!(successor.progress_at_unix_ms, Some(150));
+        assert_eq!(successor.completion_summary, None);
+        assert_eq!(successor.submitted_incarnation, None);
     }
 
     #[test]

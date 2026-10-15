@@ -947,6 +947,218 @@ mission "example/work" state="ready" {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revise_notes_cli_carries_notes_through_two_revisions_and_retry() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut daemon = Daemon::new().await;
+    daemon.worker();
+    let source = |goal: &str| {
+        format!(
+            r#"version 2
+mission "example/notes" state="ready" {{
+  goal "Preserve the owner's notes."
+  step "done" {{ assigned-to "agent/example/worker"; goal "Deliver the result." }}
+  step "active" {{ assigned-to "agent/example/worker"; goal "Check the result."; retry {{ attempts 2 }} }}
+  step "other" {{ assigned-to "agent/example/worker"; goal {goal:?} }}
+}}
+"#
+        )
+    };
+    daemon.apply(&source("First goal."), "notes-mission");
+    let run = daemon.start("example/notes", "notes-run");
+    let step = |run: &st3::model::MissionRunView, path: &str| {
+        run.steps
+            .iter()
+            .find(|step| step.step == path)
+            .unwrap()
+            .clone()
+    };
+    let done = step(&run, "done").subject;
+    daemon.store().set_step_state(&done, "ready", None).unwrap();
+    for (action, summary) in [
+        ("claim", "Starting"),
+        ("progress", "Decision: retain the result"),
+        ("complete", "Delivered the result"),
+    ] {
+        cli_value(
+            daemon
+                .cli(
+                    WORKER,
+                    &[
+                        "work",
+                        action,
+                        &done,
+                        "--as",
+                        WORKER,
+                        "--incarnation",
+                        "4242:fixture",
+                        "--summary",
+                        summary,
+                    ],
+                )
+                .await,
+        );
+    }
+    // This fixture simulates the reconciler accepting a worker's submitted result.
+    daemon
+        .store()
+        .set_step_state(&done, "completed", None)
+        .unwrap();
+    let active = step(&run, "active").subject;
+    daemon
+        .store()
+        .set_step_state(&active, "ready", None)
+        .unwrap();
+    for (action, summary) in [
+        ("claim", "Starting"),
+        ("progress", "Checking the result"),
+        ("release", "Let the next incarnation continue"),
+        ("claim", "Continuing"),
+    ] {
+        cli_value(
+            daemon
+                .cli(
+                    WORKER,
+                    &[
+                        "work",
+                        action,
+                        &active,
+                        "--as",
+                        WORKER,
+                        "--incarnation",
+                        "4242:fixture",
+                        "--summary",
+                        summary,
+                    ],
+                )
+                .await,
+        );
+    }
+    let original: st3::model::MissionRunView = serde_json::from_value(cli_value(
+        daemon
+            .cli(PERSON, &["missions", "show", &run.subject])
+            .await,
+    ))
+    .unwrap();
+    assert_eq!(step(&original, "active").status, "claimed");
+    assert_eq!(step(&original, "done").status, "completed");
+    let file = daemon.root.path().join("notes-revision.kdl");
+    let mut current = original.clone();
+    for revision in 2..=3 {
+        std::fs::write(&file, source(&format!("Goal {revision}."))).unwrap();
+        cli_value(
+            daemon
+                .cli(
+                    PERSON,
+                    &[
+                        "work",
+                        "revise",
+                        &run.subject,
+                        file.to_str().unwrap(),
+                        "--as",
+                        PERSON,
+                        "--reason",
+                        "Adjust the other step",
+                    ],
+                )
+                .await,
+        );
+        daemon.restart().await;
+        current = serde_json::from_value(cli_value(
+            daemon
+                .cli(PERSON, &["missions", "show", &run.subject])
+                .await,
+        ))
+        .unwrap();
+        for path in ["active", "done"] {
+            let before = step(&original, path);
+            let after = step(&current, path);
+            assert_ne!(after.subject, before.subject);
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.progress_summary, before.progress_summary, "{path}");
+            assert_eq!(
+                after.progress_at_unix_ms, before.progress_at_unix_ms,
+                "{path}"
+            );
+            assert_eq!(
+                after.completion_summary, before.completion_summary,
+                "{path}"
+            );
+        }
+    }
+    let done = step(&current, "done");
+    let refused = daemon
+        .cli(
+            WORKER,
+            &[
+                "work",
+                "progress",
+                &done.subject,
+                "--as",
+                WORKER,
+                "--incarnation",
+                "4242:fixture",
+                "--summary",
+                "Decision: archive the result",
+            ],
+        )
+        .await;
+    assert!(
+        !refused.status.success(),
+        "completed progress must remain refused"
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already completed"));
+    let active = step(&current, "active");
+    cli_value(
+        daemon
+            .cli(
+                WORKER,
+                &[
+                    "work",
+                    "fail",
+                    &active.subject,
+                    "--as",
+                    WORKER,
+                    "--incarnation",
+                    "4242:fixture",
+                    "--reason",
+                    "A new attempt is needed",
+                ],
+            )
+            .await,
+    );
+    cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "work",
+                    "retry",
+                    &active.subject,
+                    "--as",
+                    PERSON,
+                    "--reason",
+                    "Start a fresh attempt",
+                ],
+            )
+            .await,
+    );
+    daemon.restart().await;
+    let retried: st3::model::MissionRunView = serde_json::from_value(cli_value(
+        daemon
+            .cli(PERSON, &["missions", "show", &run.subject])
+            .await,
+    ))
+    .unwrap();
+    let retried = step(&retried, "active");
+    assert_eq!(retried.attempt, 2);
+    assert_eq!(retried.progress_summary, None);
+    assert_eq!(retried.progress_at_unix_ms, None);
+    assert_eq!(retried.completion_summary, None);
+}
+
 /// Reconcile declarations and agentless human gates; these cases launch no processes.
 struct NoRuntime;
 impl st3::reconcile::RuntimeControl for NoRuntime {
