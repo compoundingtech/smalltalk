@@ -532,7 +532,8 @@ impl Runtime for SmalltalkRuntime {
 /// at once rather than on the next read.
 const AGENT_ROSTER_READ_LATELY: std::time::Duration = std::time::Duration::from_secs(300);
 
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.person-directive-notes.v1";
+const SHARED_PROJECTION_LAYOUT: &str =
+    "st3.shared-projections.person-directive-notes.forward-compat.v1";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {

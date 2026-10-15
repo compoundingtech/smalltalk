@@ -230,6 +230,19 @@ Notes inform and never grant approval, gate verdicts, delegation, or person-ask 
 
 Publication requires anchored membership and `features.person_directive_note=1` on the latest own-origin `daemon.started` for every active member. Known unfenced legacy writers also prevent publication. Advertisements cannot prove discovery of every legacy peer: fence legacy peers from replication before enabling notes.
 
+## Arrangement operation vocabulary
+
+Replication retains unknown operation tags and unknown placement subject families as retryable `unknown-claim-field` records. Local edits still refuse them with `invalid-arrangement-operations` and `invalid-subject-reference`. Supported operation tags, included in this registry's digest:
+
+- `create`
+- `rename`
+- `folder.create`
+- `folder.rename`
+- `folder.move`
+- `folder.delete`
+- `subject.place`
+- `retire`
+
 ## Harness todo snapshots
 
 `harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.
