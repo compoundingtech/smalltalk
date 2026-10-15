@@ -1,6 +1,6 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
-import { Tabs, TabList, Tab, TabPanel, Button as AriaButton, Link, DialogTrigger, ModalOverlay, Modal, Heading, Dialog } from 'react-aria-components'
+import { Tabs, TabPanel, Button as AriaButton, Link, DialogTrigger, ModalOverlay, Modal, Heading, Dialog, Menu, MenuItem, MenuTrigger, Popover } from 'react-aria-components'
 import { useSeparator } from 'react-aria'
 import { RegistryContext, RegistryProvider, useAtomSet, useAtomValue } from '@effect/atom-react'
 import {
@@ -18,6 +18,7 @@ import {
 import { lightThemeWithoutStatus, lightStatusTheme } from '../composition-theme'
 import { Icon } from '../composition/Icons'
 import { Tooltip } from '../composition/Controls'
+import { TabStrip, paneTabItem } from './TabStrip'
 import { Transcript } from '../composition/Transcript'
 import { DiffPanel, type DiffRevealRequest } from '../composition/DiffPanel'
 import { EmbraceRuntimeProvider } from '../EmbraceRuntime'
@@ -48,7 +49,7 @@ import { AgentDropSurface } from './AgentDropSurface'
 import { agentPaneKey, openAgentAtPath, type AgentPlacement } from './agent-drag'
 import { RenderProfiler } from '../perf/RenderProfiler'
 import { developmentMeasurements, incrDebug } from '../perf/measurement'
-import { usePaneLayer, PaneLayer, PaneSlot, PaneSlotsProvider, PaneCloseContext, usePaneSlotKey } from './PaneLayer'
+import { usePaneLayer, PaneLayer, PaneSlot, PaneSlotsProvider, PaneCloseContext, PaneHeaderSlot, usePaneSlotKey } from './PaneLayer'
 import { WorkbenchPresentationContext, type WorkbenchAppearance, type WorkbenchPaneDetails } from './workbench-appearance'
 
 
@@ -263,24 +264,6 @@ function SplitNode({ node, path, layout, workspaceId, resources, renderPane, hid
   )
 }
 
-/** A tab strip only becomes a scroll container while its tabs really overflow; a hugging strip stays out of the way of the pane's own scroller. */
-function attachTabOverflow(list: HTMLElement | null) {
-  if (list === null) return
-  const fit = () => {
-    const scrolls = list.scrollWidth > list.clientWidth + 1
-    list.style.overflowX = scrolls ? 'auto' : 'visible'
-    list.style.overflowY = scrolls ? 'hidden' : 'visible'
-  }
-  const schedule = () => queueMicrotask(fit)
-  const resize = new ResizeObserver(schedule)
-  const changes = new MutationObserver(schedule)
-  resize.observe(list)
-  changes.observe(list, { childList: true, characterData: true, subtree: true })
-  fit()
-  document.fonts?.ready.then(schedule)
-  requestAnimationFrame(() => requestAnimationFrame(schedule))
-  return () => { resize.disconnect(); changes.disconnect() }
-}
 
 /** Tab group: React Aria tabs, closable, with split-right / split-below and new-pane actions. */
 function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTabBar, onPaneSelect, onLayoutChange }: NodeProps & { node: TabGroupLayout }) {
@@ -356,19 +339,32 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
   }
 
   const activePane = node.tabs.find(tab => paneKey(tab) === active) ?? node.tabs[0]!
+  const newThread = () => { const pane = nextThreadPane(); change(addTabAtPath(layout.current, path, pane)); select(paneKey(pane)) }
+  const splitActive = (side: 'right' | 'below') => change(splitGroupAtPath(layout.current, path, side, { uri: 'about:blank' }))
   const tabs = (
-    <div onKeyDown={event => { if (event.key === 'Delete' && (event.target as HTMLElement).closest('[role="tab"]')) { event.preventDefault(); close(active) } }} {...stylex.props(styles.groupHead, appearance?.chrome === 'P1' && styles.inlineTabs, appearance?.chrome === 'P3' && node.tabs.length === 1 && styles.tabsHidden)}>
-      <TabList ref={attachTabOverflow} {...stylex.props(styles.tabList)}>
-        {node.tabs.map(tab => {
-          const key = paneKey(tab)
-          return <Tab key={key} id={key} {...stylex.props(styles.tab, key === active && styles.tabOn)}><span {...stylex.props(styles.tabLabel)}>{describePane?.(tab).title ?? paneTitle(tab)}</span></Tab>
-        })}
-      </TabList>
+    <div data-pane-header onKeyDown={event => { if (event.key === 'Delete' && (event.target as HTMLElement).closest('[role="tab"]')) { event.preventDefault(); close(active) } }} {...stylex.props(styles.groupHead, appearance?.chrome === 'P1' && styles.inlineTabs, appearance?.chrome === 'P3' && node.tabs.length === 1 && styles.tabsHidden)}>
+      <TabStrip items={node.tabs.map(tab => paneTabItem(tab, describePane?.(tab).title ?? paneTitle(tab)))} selectedKey={active} />
+      {appearance && <div {...stylex.props(styles.headerAccessory)}><PaneHeaderSlot path={path} reserveDetails={node.tabs.some(tab => tab.view === 'details')} /></div>}
       {!appearance && <div {...stylex.props(styles.groupActions)}>
-        <AriaButton aria-label={`Close ${paneTitle(activePane)}`} onPress={() => close(paneKey(activePane))} {...stylex.props(styles.ghostMd)}><Icon name="x" /></AriaButton>
-        <AriaButton aria-label="New thread pane" onPress={() => { const pane = nextThreadPane(); change(addTabAtPath(layout.current, path, pane)); select(paneKey(pane)) }} {...stylex.props(styles.ghostMd)}><Icon name="plus" /></AriaButton>
-        <AriaButton aria-label="Split right" onPress={() => change(splitGroupAtPath(layout.current, path, 'right', { uri: 'about:blank' }))} {...stylex.props(styles.ghostMd)}><Icon name="panel" /></AriaButton>
-        <AriaButton aria-label="Split below" onPress={() => change(splitGroupAtPath(layout.current, path, 'below', { uri: 'about:blank' }))} {...stylex.props(styles.ghostMd)}><Icon name="drawer" /></AriaButton>
+        <PaneHeaderSlot path={path} reserveDetails={node.tabs.some(tab => tab.view === 'details')} />
+        <div {...stylex.props(styles.groupButtons)}>
+          <AriaButton aria-label={`Close ${paneTitle(activePane)}`} onPress={() => close(paneKey(activePane))} {...stylex.props(styles.ghostMd)}><Icon name="x" /></AriaButton>
+          <AriaButton aria-label="New thread pane" onPress={newThread} {...stylex.props(styles.ghostMd)}><Icon name="plus" /></AriaButton>
+          <AriaButton aria-label="Split right" onPress={() => splitActive('right')} {...stylex.props(styles.ghostMd)}><Icon name="panel" /></AriaButton>
+          <AriaButton aria-label="Split below" onPress={() => splitActive('below')} {...stylex.props(styles.ghostMd)}><Icon name="drawer" /></AriaButton>
+        </div>
+        {/* A narrow header keeps its title and pane status: the group actions fold into one menu. */}
+        <MenuTrigger>
+          <AriaButton aria-label="Pane actions" {...stylex.props(styles.ghostMd, styles.groupMenuButton)}><Icon name="chevron-down" /></AriaButton>
+          <Popover placement="bottom end" {...stylex.props(styles.groupMenuPopover)}>
+            <Menu aria-label="Pane actions" onAction={key => { if (key === 'close') close(paneKey(activePane)); else if (key === 'new') newThread(); else splitActive(key === 'split-right' ? 'right' : 'below') }} {...stylex.props(styles.groupMenu)}>
+              <MenuItem id="close" {...stylex.props(styles.groupMenuItem)}>{`Close ${paneTitle(activePane)}`}</MenuItem>
+              <MenuItem id="new" {...stylex.props(styles.groupMenuItem)}>New thread pane</MenuItem>
+              <MenuItem id="split-right" {...stylex.props(styles.groupMenuItem)}>Split right</MenuItem>
+              <MenuItem id="split-below" {...stylex.props(styles.groupMenuItem)}>Split below</MenuItem>
+            </Menu>
+          </Popover>
+        </MenuTrigger>
       </div>}
     </div>
   )
@@ -415,7 +411,7 @@ function TabGroupNode({ node, path, layout, workspaceId, resources, hideSingleTa
         : appearance?.chrome === 'P1'
           ? <GroupHeader pane={activePane} titleInTab onOpenDiff={() => onOpenDiff?.()} resources={resources}>{tabs}</GroupHeader>
           : <>{tabs}{appearance && <GroupHeader pane={activePane} titleInTab={appearance.chrome !== 'P3' || node.tabs.length > 1} onOpenDiff={() => onOpenDiff?.()} resources={resources} />}</>}
-      <TabPanel id={active} {...stylex.props(styles.tabPanel)}>
+      <TabPanel key={active} id={active} {...stylex.props(styles.tabPanel)}>
         <PaneSlot pane={activePane} path={path} />
       </TabPanel>
     </Tabs>
@@ -551,9 +547,11 @@ const styles = stylex.create({
   separatorBase: { position: 'relative', zIndex: 1, flexShrink: 0, touchAction: 'none', backgroundColor: bd.borderStrong, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: ac.primary, outlineOffset: `calc(-1 * ${g.focusOffset})` } },
   separatorV: { width: g.hairline, alignSelf: 'stretch', cursor: 'col-resize', '::after': { content: '""', position: 'absolute', insetInline: `calc(-1 * ${g.separatorHitSlop})`, insetBlock: 0 } },
   separatorH: { height: g.hairline, width: '100%', cursor: 'row-resize', '::after': { content: '""', position: 'absolute', insetInline: 0, insetBlock: `calc(-1 * ${g.separatorHitSlop})` } },
-  group: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' },
-  groupHead: { display: 'flex', alignItems: 'center', gap: s.xs, paddingInline: s.sm, minHeight: g.controlLg, flexShrink: 0, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: bd.border },
-  inlineTabs: { minHeight: 0, borderBottomWidth: 0, paddingInline: 0, flex: '0 1 auto', minWidth: 0 },
+  group: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'hidden', containerType: 'inline-size', containerName: 'pane-mount' },
+  // Fixed in every pane state: pane status lives in this row and never changes its height.
+  groupHead: { display: 'flex', alignItems: 'center', gap: s.xs, paddingInline: s.sm, height: g.controlLg, minHeight: g.controlLg, flexShrink: 0, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: bd.border, containerType: 'inline-size', containerName: 'pane-header' },
+  inlineTabs: { height: 'auto', minHeight: 0, borderBottomWidth: 0, paddingInline: 0, flex: '0 1 auto', minWidth: 0, containerType: 'normal' },
+  headerAccessory: { marginInlineStart: 'auto', display: 'flex', alignItems: 'center', flexShrink: 0, alignSelf: 'stretch' },
   tabsHidden: { display: 'none' },
   paneHeader: { display: 'flex', alignItems: 'center', gap: s.sm, height: g.band, boxSizing: 'border-box', flexShrink: 0, paddingInline: s.lg, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: bd.border, minWidth: 0 },
   headerIdentity: { display: 'flex', alignItems: 'center', gap: s.sm, flex: '1 1 0', minWidth: 0 },
@@ -575,11 +573,13 @@ const styles = stylex.create({
   // a pointer-opened dialog would otherwise leave without a ring.
   dialogButton: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', height: g.controlMd, width: 'auto', paddingInline: s.md, flexShrink: 0, whiteSpace: 'nowrap', fontSize: t.metaSize, fontFamily: t.fontSans, lineHeight: t.metaLeading, borderWidth: g.hairline, borderStyle: 'solid', borderColor: bd.borderStrong, borderRadius: r.control, backgroundColor: sf.controlFill, color: tx.fg, cursor: 'pointer', ':hover': { backgroundColor: sf.rowHover }, ':focus': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: ac.primary, outlineOffset: g.hairline } },
   destructive: { color: st.dangerFg, borderColor: st.danger, ':hover': { color: st.dangerFg, backgroundColor: st.dangerMuted } },
-  tabList: { display: 'flex', alignItems: 'center', gap: s.xs2, flexGrow: 0, minWidth: 0, maxWidth: '100%' },
-  tab: { height: g.controlSm, maxWidth: g.tabMax, display: 'inline-flex', alignItems: 'center', gap: s.xs2, paddingInline: s.sm, borderWidth: 0, backgroundColor: sf.transparent, color: tx.fgMuted, borderRadius: r.control, fontSize: t.metaSize, lineHeight: t.metaLeading, cursor: 'pointer', ':hover': { color: tx.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: ac.primary, outlineOffset: g.focusOffset } },
-  tabOn: { backgroundColor: sf.washSubtle, color: tx.fg },
-  tabLabel: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   groupActions: { marginInlineStart: 'auto', display: 'flex', alignItems: 'center', gap: s.xs2, flexShrink: 0 },
+  // Header content widths below 280px (240px panes and narrower) fold the four group actions into one menu.
+  groupButtons: { display: { default: 'flex', '@container pane-header (width < 280px)': 'none' }, alignItems: 'center', gap: s.xs2 },
+  groupMenuButton: { display: { default: 'none', '@container pane-header (width < 280px)': 'inline-flex' }, width: g.controlSm, height: g.controlSm, flexShrink: 0 },
+  groupMenuPopover: { backgroundColor: sf.raised, color: tx.fg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: bd.border, borderRadius: r.md },
+  groupMenu: { display: 'flex', flexDirection: 'column', padding: s.xs2, outlineStyle: 'none', fontFamily: t.fontSans, fontSize: t.metaSize },
+  groupMenuItem: { paddingInline: s.sm, paddingBlock: s.xs, borderRadius: r.sm, color: tx.fg, cursor: 'pointer', outlineStyle: 'none', ':focus': { backgroundColor: sf.rowHover } },
   ghostMd: { width: g.controlMd, height: g.controlMd, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: sf.transparent, color: tx.fgMuted, borderRadius: r.control, cursor: 'pointer', ':hover': { backgroundColor: sf.rowHover, color: tx.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: ac.primary, outlineOffset: g.focusOffset } },
   tabPanel: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'hidden', outlineStyle: 'none' },
   pane: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' },

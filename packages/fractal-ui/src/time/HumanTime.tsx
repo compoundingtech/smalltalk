@@ -5,10 +5,10 @@ import { useHover } from 'react-aria'
 import { geometryNumbers } from '../assistant-ui/composition-tokens.stylex'
 import { tooltipStyles } from '../assistant-ui/composition/Controls'
 import { ThemePortal } from '../assistant-ui/taste/ThemePortal'
-import { formatClock, formatDay, formatDayValue, formatDuration, formatExact, formatExactDay, formatRelative, type HumanTimeZone } from './human-time'
+import { formatClock, formatDay, formatDayValue, formatDuration, formatExact, formatExactDay, formatRelative, nextCivilChange, nextDurationChange, nextRelativeChange, type HumanTimeZone } from './human-time'
 import { useClockLabel, useHumanTimeZone } from './clock'
 
-export { HumanClockProvider, fixedClock, systemClock, useClockLabel, useHumanTimeZone, type HumanClock } from './clock'
+export { HumanClockProvider, createSystemClock, fixedClock, systemClock, useClockLabel, useClockTime, useClockWake, useHumanTimeZone, type ClockDue, type ClockHost, type HumanClock } from './clock'
 
 type TimeKind = 'relative' | 'clock' | 'elapsed' | 'day'
 interface HumanTimeProps {
@@ -32,12 +32,15 @@ interface HumanTimeProps {
 const labelFor = (kind: TimeKind, at: number, now: number, zone: HumanTimeZone, maxUnits: 1 | 2): string =>
   kind === 'day' ? formatDay(at, now, zone) : kind === 'clock' ? formatClock(at, now, zone) : kind === 'elapsed' ? formatDuration(now - at, { maxUnits }) : formatRelative(at, now, zone)
 
+const nextFor = (kind: TimeKind, at: number, now: number, maxUnits: 1 | 2): number | undefined =>
+  kind === 'day' || kind === 'clock' ? nextCivilChange(now) : kind === 'elapsed' ? nextDurationChange(at, now, { maxUnits }) : nextRelativeChange(at, now)
+
 /**
  * A self-updating time label (leaf clock). Renders `<time>` with the machine instant, the readable
  * label, and the exact local timestamp as accessible description and optional tooltip.
  */
 export const HumanTime = React.memo(function HumanTime({ at, kind = 'relative', maxUnits = 2, prefix = '', suffix = '', tooltip = true, style, ...aria }: HumanTimeProps) {
-  const label = useClockLabel((now, zone) => labelFor(kind, at, now, zone, maxUnits))
+  const label = useClockLabel((now, zone) => labelFor(kind, at, now, zone, maxUnits), now => Number.isFinite(at) ? nextFor(kind, at, now, maxUnits) : undefined)
   const zone = useHumanTimeZone()
   const exact = Number.isFinite(at) ? kind === 'day' ? formatExactDay(at, zone) : formatExact(at, zone) : undefined
   const exactText = exact === undefined ? undefined : kind === 'elapsed' ? `Since ${exact}` : exact

@@ -1,8 +1,8 @@
 import { Context, Exit, Option, Tracer } from 'effect'
 import type { SyncStatus } from '@st3/sdk/effect'
 
-export const uxSpanNames = ['wf.ux.reload', 'wf.ux.switch', 'wf.ux.switch.data_ready', 'wf.ux.first_frame', 'wf.sync.transition', 'wf.ux.send_echo'] as const
-export const uxAttributeNames = ['wf.ux.budget_ms', 'wf.ux.budget_phase', 'wf.ux.budget_met', 'wf.ux.shell_ms', 'wf.ux.roster_after_shell_ms', 'wf.ux.cache', 'wf.ux.slot_count', 'wf.ux.data_ready_ms', 'wf.ux.painted', 'wf.ux.outcome', 'wf.subscription.kind', 'wf.sync.from', 'wf.sync.to', 'wf.sync.stage', 'wf.sync.previous_ms', 'wf.sync.reconnect_ms'] as const
+export const uxSpanNames = ['wf.ux.open', 'wf.ux.open.phase', 'wf.ux.reload', 'wf.ux.switch', 'wf.ux.switch.data_ready', 'wf.ux.first_frame', 'wf.sync.transition', 'wf.ux.send_echo'] as const
+export const uxAttributeNames = ['wf.ux.surface', 'wf.ux.budget_ms', 'wf.ux.budget_phase', 'wf.ux.budget_met', 'wf.ux.shell_ms', 'wf.ux.roster_after_shell_ms', 'wf.ux.cache', 'wf.ux.slot_count', 'wf.ux.data_ready_ms', 'wf.ux.painted', 'wf.ux.outcome', 'wf.subscription.kind', 'wf.sync.from', 'wf.sync.to', 'wf.sync.stage', 'wf.sync.previous_ms', 'wf.sync.reconnect_ms'] as const
 
 /** Browser-visible completion, not a React render or a data-arrival timestamp. */
 export const afterNextPaint = (callback: () => void): (() => void) => {
@@ -29,8 +29,14 @@ interface Operation {
   readonly start: number
   readonly finish: (outcome: 'painted' | 'timeout' | 'superseded' | 'disposed' | 'observed') => void
 }
+export interface OpenOperation {
+  readonly phase: (name: string, attrs?: Readonly<Record<string, unknown>>) => void
+  readonly contentCommitted: () => () => void
+  readonly cancel: () => void
+}
 export interface UxTelemetry {
   readonly activeSpan: () => Tracer.Span | undefined
+  readonly beginOpen: (options: { readonly surface: 'resources' | 'terminal' }) => OpenOperation
   readonly traceContext: () => { readonly traceparent: string } | undefined
   readonly shellCommitted: () => () => void
   readonly rosterCommitted: () => () => void
@@ -45,11 +51,12 @@ export interface UxTelemetry {
 }
 
 /** Always-sampled, bounded roots. Identifiers remain only in local matching state, never attributes. */
-export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOrigin = performance.timeOrigin, paint = afterNextPaint, deadlineMs = 30_000, onFirstPaint }: {
+export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOrigin = performance.timeOrigin, paint = afterNextPaint, measure = (name, options) => { performance.measure(name, options) }, deadlineMs = 30_000, onFirstPaint }: {
   readonly tracer: () => Tracer.Tracer
   readonly now?: () => number
   readonly timeOrigin?: number
   readonly paint?: (callback: () => void) => () => void
+  readonly measure?: (name: string, options: { readonly start: number; readonly end: number }) => void
   readonly deadlineMs?: number
   /** Starts deferred transport only after the committed shell or observed roster is painted. */
   readonly onFirstPaint?: () => void
@@ -57,7 +64,7 @@ export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOri
   const nanos = (ms: number) => BigInt(Math.round((timeOrigin + ms) * 1_000_000))
   const operations = new Set<Operation>()
   const paints = new Set<() => void>()
-  const start = (name: string, label: string, attributes: Readonly<Record<string, unknown>>, startMs = now(), parent?: Tracer.Span): Operation => {
+  const start = (name: string, label: string, attributes: Readonly<Record<string, unknown>>, startMs = now(), parent?: Tracer.Span, measureName?: string): Operation => {
     const span = tracer().span({ name, parent: Option.fromUndefinedOr(parent), annotations: Context.empty(), links: [], startTime: nanos(startMs), kind: 'internal', root: parent === undefined, sampled: true })
     span.attribute('span.label', label)
     for (const [key, value] of Object.entries(attributes)) span.attribute(key, value)
@@ -69,6 +76,7 @@ export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOri
       operations.delete(operation)
       span.attribute('wf.ux.outcome', outcome)
       span.end(nanos(now()), Exit.void)
+      if (measureName !== undefined) measure(measureName, { start: startMs, end: now() })
     } }
     const timer = setTimeout(() => operation.finish('timeout'), deadlineMs)
     operations.add(operation)
@@ -98,9 +106,32 @@ export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOri
     reload.finish('painted')
   }
   let switching: { readonly ref: string; readonly root: Operation; readonly data: Operation } | undefined
+  const opens = new Map<'resources' | 'terminal', Operation>()
   const sync = new WeakMap<object, { readonly status: string; readonly since: number; readonly reconnectSince?: number }>()
   const current = () => switching !== undefined && operations.has(switching.root) ? switching.root.span : operations.has(reload) ? reload.span : undefined
   return {
+    beginOpen: ({ surface }) => {
+      opens.get(surface)?.finish('superseded')
+      const budget = surface === 'resources' ? 100 : 300
+      const name = `wf.ux.open.${surface}`
+      const root = start('wf.ux.open', surface, { 'wf.ux.surface': surface, 'wf.ux.budget_ms': budget, 'wf.ux.painted': false }, now(), undefined, name)
+      opens.set(surface, root)
+      const phases = new Set<string>()
+      return {
+        phase: (phase, attrs = {}) => {
+          if (!operations.has(root) || phases.has(phase)) return
+          phases.add(phase)
+          start('wf.ux.open.phase', phase, { 'wf.ux.surface': surface, ...attrs }, root.start, root.span, `${name}.${phase}`).finish('observed')
+        },
+        contentCommitted: () => onPaint(() => {
+          if (!operations.has(root)) return
+          root.span.attribute('wf.ux.painted', true)
+          root.span.attribute('wf.ux.budget_met', now() - root.start < budget)
+          root.finish('painted')
+        }),
+        cancel: () => root.finish('disposed'),
+      }
+    },
     activeSpan: current,
     traceContext: () => { const span = current(); return span === undefined ? undefined : { traceparent: `00-${span.traceId}-${span.spanId}-${span.sampled ? '01' : '00'}` } },
     shellCommitted: () => onPaint(() => { shellAt ??= now(); reload.span.attribute('wf.ux.shell_ms', shellAt); finishReload(); onFirstPaint?.() }),

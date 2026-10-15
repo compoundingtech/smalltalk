@@ -20,12 +20,44 @@ const harness = () => {
   let at = 0
   const paints = new Set<() => void>()
   const ready = vi.fn()
-  const ux = makeUxTelemetry({ tracer: () => tracer, now: () => at, timeOrigin: 0, paint: (callback) => { paints.add(callback); return () => { paints.delete(callback) } }, onFirstPaint: ready })
-  return { ux, ready, snapshot: () => { vi.advanceTimersByTime(250); return ring.getSnapshot() }, ended, time: (value: number) => { at = value }, paint: () => { const callbacks = [...paints]; paints.clear(); for (const callback of callbacks) callback() } }
+  const measure = vi.fn()
+  const ux = makeUxTelemetry({ tracer: () => tracer, now: () => at, timeOrigin: 0, measure, paint: (callback) => { paints.add(callback); return () => { paints.delete(callback) } }, onFirstPaint: ready })
+  return { ux, measure, ready, snapshot: () => { vi.advanceTimersByTime(250); return ring.getSnapshot() }, ended, time: (value: number) => { at = value }, paint: () => { const callbacks = [...paints]; paints.clear(); for (const callback of callbacks) callback() } }
 }
 
 afterEach(() => vi.useRealTimers())
 describe('bounded perceived UX', () => {
+  it.each([['resources', 100], ['terminal', 300]] as const)('measures %s phases once from intent and ends only after content paint', (surface, budget) => {
+    const h = harness()
+    h.time(10)
+    const open = h.ux.beginOpen({ surface })
+    h.time(25); open.phase('shell')
+    h.time(30); open.phase('shell')
+    open.phase('data', { 'wf.ux.cache': 'retained' })
+    open.contentCommitted()
+    expect(h.ended.filter(span => span.name === 'wf.ux.open')).toHaveLength(0)
+    h.time(50); h.paint()
+    expect(h.snapshot().spans.filter(span => span.name === 'wf.ux.open.phase')).toHaveLength(2)
+    expect(h.snapshot().spans.at(-1)).toMatchObject({ name: 'wf.ux.open', durationMs: 40, attributes: { 'wf.ux.surface': surface, 'wf.ux.budget_ms': budget, 'wf.ux.budget_met': true, 'wf.ux.painted': true } })
+    expect(h.ended[0]?.parent).toMatchObject({ value: { spanId: h.ended[2]?.spanId } })
+    expect(h.measure.mock.calls).toEqual([
+      [`wf.ux.open.${surface}.shell`, { start: 10, end: 25 }],
+      [`wf.ux.open.${surface}.data`, { start: 10, end: 30 }],
+      [`wf.ux.open.${surface}`, { start: 10, end: 50 }],
+    ])
+    h.ux.dispose()
+  })
+  it('supersedes only the same surface and ignores cancelled paints and late phases', () => {
+    const h = harness()
+    const first = h.ux.beginOpen({ surface: 'resources' })
+    first.contentCommitted()
+    const terminal = h.ux.beginOpen({ surface: 'terminal' })
+    const next = h.ux.beginOpen({ surface: 'resources' })
+    first.phase('late'); terminal.cancel(); next.cancel()
+    h.paint()
+    expect(h.snapshot().spans.map(span => span.attributes['wf.ux.outcome'])).toEqual(['superseded', 'disposed', 'disposed'])
+    h.ux.dispose()
+  })
   it.each(['shellCommitted', 'rosterCommitted'] as const)('does not release startup transport until %s has painted', (commit) => {
     const h = harness()
     expect(h.ux.activeSpan()).toBeDefined()

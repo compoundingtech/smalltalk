@@ -5,11 +5,12 @@ import { EmbraceComposer } from '../../../../packages/fractal-ui/src/assistant-u
 import { EmbraceRuntimeProvider } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx'
 import { Transcript } from '../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx'
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
-import { useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useNow } from '../data/react.tsx'
+import { useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useObservedNow } from '../data/react.tsx'
+import { earliestChange } from '@smalltalk/fractal-ui/human-time/format'
+import { syncLineNextChange } from '@smalltalk/fractal-ui/assistant-ui/sync-status'
 import { createConversationTranscript, openableImageUrl, transcriptObservedAt, transcriptSyncStatus, type ConversationTranscriptState } from './conversationTranscript.ts'
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
-import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import { DOCUMENT_REF } from '../documents/document-port.ts'
 import { documentReferences } from '../documents/DocumentLink.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
@@ -102,8 +103,15 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
   readonly state: ConversationTranscriptState
 }) {
   const source = useDataSource()
-  const now = useNow()
   const observation = useConversationSync(agentRef)
+  const runningStart = state._tag === 'Observed' ? Date.parse(state.turns.findLast(turn => turn.work.running)?.work.startedAt ?? '') : NaN
+  const now = useObservedNow(now => {
+    const unit = now - runningStart < 3_600_000 ? 1000 : 60_000
+    return earliestChange(now, [
+      observation === undefined ? undefined : syncLineNextChange({ status: transcriptSyncStatus(observation, feed, now), label: 'conversation', now, observedAt: transcriptObservedAt(observation, now) }),
+      Number.isFinite(runningStart) ? runningStart > now ? runningStart : runningStart + (Math.floor((now - runningStart) / unit) + 1) * unit : undefined,
+    ])
+  }).now
   const grants = useGrants()
   const [refusal, setRefusal] = React.useState<SendRefusal>()
   const binding = composerSendBinding({
@@ -151,7 +159,6 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
       {...(state._tag === 'Observed' && state.emptyState !== undefined ? { emptyState: state.emptyState } : {})}
     />
     </div>
-    <LiveAgentTodos agentRef={agentRef} />
     {/* An unreadable conversation keeps its composer and draft; the binding names why sending waits. */}
     <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, paddingBottom: spaceVars.lg }}>
       <EmbraceComposer variant="C1" readingColumn disabledReason={binding.disabledReason} />

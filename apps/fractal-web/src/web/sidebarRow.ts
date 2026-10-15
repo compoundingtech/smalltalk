@@ -1,5 +1,6 @@
 import type { SidebarAgentRowData, SidebarAgentStatus } from '@smalltalk/fractal-ui/assistant-ui'
 import type { Agent } from '../data/source.ts'
+import { earliestChange, nextDurationChange } from '@smalltalk/fractal-ui/human-time/format'
 
 /** Presentation of one actual roster observation. No per-row reads or inferred usage. */
 export const sidebarRow = ({ agent, stale, now }: {
@@ -26,3 +27,8 @@ export const sidebarRow = ({ agent, stale, now }: {
     lastTurn: lastActivityAt === undefined ? { _tag: 'Unknown' } : { _tag: 'Known', kind: 'activity', at: lastActivityAt },
   }
 }
+
+/** Compact ages change at their displayed unit; future observation fences wake when reached. */
+export const sidebarRowNextChange = (agent: Agent, now: number): number | undefined =>
+  earliestChange(now, [agent.statusSince, agent.lastActivityAt._tag === 'Known' ? agent.lastActivityAt.value : undefined].flatMap(at =>
+    at === undefined ? [] : [at, nextDurationChange(at, now, { maxUnits: 1 })]))

@@ -1,47 +1,86 @@
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
 import * as stylex from '@stylexjs/stylex'
-import { useAtom, useAtomValue } from '@effect/atom-react'
+import { RegistryContext, useAtom, useAtomValue } from '@effect/atom-react'
 import * as Atom from 'effect/reactivity/Atom'
 import { DateTime } from 'effect'
 // Deep import: the assistant-ui barrel would pull the transcript graph into the eager shell.
 import { Icon as CompositionIcon } from '../../../../packages/fractal-ui/src/assistant-ui/composition/Icons.tsx'
+import { SidePanel } from '../../../../packages/fractal-ui/src/assistant-ui/composition/SidePanel.tsx'
 import { colorVars as c, typeVars as t, spaceVars as s } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
-import { compactTime } from '../../../../packages/fractal-ui/src/assistant-ui/sidebar/model.ts'
-import { useDataSource, useNow } from '../data/react.tsx'
-import { unavailable, waiting, type Feed } from '../data/source.ts'
+import { HumanTime } from '@smalltalk/fractal-ui/human-time'
+import { useDataSource } from '../data/react.tsx'
+import { unavailable, waiting, type DataSource, type Feed } from '../data/source.ts'
+import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import { resourceState, resourceTitle, type ResourcePage } from '../resources/agent/model.ts'
 import { systemEventsPreference } from './conversationPreferences.ts'
+import type { OpenOperation, UxTelemetry } from '../telemetry/ux.ts'
 
 const unsupportedResources = Atom.make<Feed<ResourcePage>>(unavailable({ reason: 'unsupported', detail: '' }))
 const unopenedResources = Atom.make<Feed<ResourcePage>>(waiting)
 
+interface ResourceAtoms {
+  readonly resources: (ref: string) => Atom.Atom<Feed<ResourcePage>>
+  readonly queue: DataSource['subjectReads']['agentQueue']['feed']
+}
+const resourceAtomsBySource = new WeakMap<DataSource, ResourceAtoms>()
+
+/** Retain authoritative reads only after explicit intent, never merely selecting an agent. */
+export const retainedResourceAtoms = (source: DataSource): ResourceAtoms => {
+  let atoms = resourceAtomsBySource.get(source)
+  if (atoms === undefined) {
+    atoms = {
+      resources: Atom.family((ref: string) => Atom.make(get => get(source.resources?.byAgent(ref) ?? unsupportedResources)).pipe(Atom.setIdleTTL('60 seconds'))),
+      queue: Atom.family((ref: string) => Atom.make(get => get(source.subjectReads.agentQueue.feed(ref))).pipe(Atom.setIdleTTL('60 seconds'))),
+    }
+    resourceAtomsBySource.set(source, atoms)
+  }
+  return atoms
+}
+
 /** Native conversation controls, retained from the former ConversationDetail header portal. */
-export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: string }) => {
+export const ConversationHeaderActions = ({ agentRef, ux }: { readonly agentRef: string; readonly ux?: UxTelemetry }) => {
   const source = useDataSource()
+  const registry = React.useContext(RegistryContext)
+  const atoms = retainedResourceAtoms(source)
+  const prefetch = () => {
+    registry.mount(atoms.resources(agentRef))()
+    registry.mount(atoms.queue(agentRef))()
+  }
   const [showSystemEvents, setShowSystemEvents] = useAtom(systemEventsPreference)
   const [resourcesOpen, setResourcesOpen] = React.useState(false)
-  // A closed inspector has no read demand. Otherwise each switch starts discovery plus a
-  // resource read and keeps its 15-second poll alive despite showing no resources.
+  const [opening, setOpening] = React.useState<OpenOperation>()
+  const [cache, setCache] = React.useState<'retained' | 'cold'>('cold')
+  const onOpenChange = (open: boolean) => {
+    if (open) {
+      setCache(registry.get(atoms.resources(agentRef))._tag === 'Observed' ? 'retained' : 'cold')
+      setOpening(ux?.beginOpen({ surface: 'resources' }))
+    }
+    else { opening?.cancel(); setOpening(undefined) }
+    setResourcesOpen(open)
+  }
+  const shellCommit = React.useCallback((node: HTMLElement | null) => {
+    if (node === null || opening === undefined) return
+    opening.phase('shell')
+    return () => opening.cancel()
+  }, [opening])
+  const panelId = React.useId()
+  /** Closing releases UI demand, but the intent-created wrapper retains its poll for 60 seconds. */
   const resources = useAtomValue(source.resources === undefined ? unsupportedResources
-    : resourcesOpen ? source.resources.byAgent(agentRef) : unopenedResources)
+    : resourcesOpen ? atoms.resources(agentRef) : unopenedResources)
   const reasonId = React.useId()
   const disabledReason = resources._tag === 'Unavailable'
     ? resources.reason === 'ungranted' ? 'Read access to agent resources has not been granted.'
       : resources.reason === 'unsupported' ? 'This connection does not support agent resources.' : undefined
     : undefined
+  // A non-modal complementary panel: opening it never inerts or hides the workspace, so the click
+  // commits the panel in the same frame instead of restyling the whole app.
   return <div {...stylex.props(styles.actions)}>
-    <Aria.DialogTrigger isOpen={resourcesOpen} onOpenChange={setResourcesOpen}>
-      <Aria.Button aria-label="Resources" aria-expanded={resourcesOpen} isDisabled={disabledReason !== undefined} aria-describedby={disabledReason === undefined ? undefined : reasonId} {...stylex.props(styles.button)}><CompositionIcon name="folder" />Resources</Aria.Button>
-      <Aria.ModalOverlay isDismissable {...stylex.props(styles.overlay)}>
-        <Aria.Modal {...stylex.props(styles.modal)}>
-          <Aria.Dialog aria-label="Agent resources" {...stylex.props(styles.dialog)}>
-            <header {...stylex.props(styles.heading)}><strong>Resources</strong><Aria.Button aria-label="Close resources" onPress={() => setResourcesOpen(false)} {...stylex.props(styles.button)}>Close resources</Aria.Button></header>
-            <ResourceContents agentRef={agentRef} resources={resources} />
-          </Aria.Dialog>
-        </Aria.Modal>
-      </Aria.ModalOverlay>
-    </Aria.DialogTrigger>
+    <Aria.Button aria-label="Resources" aria-expanded={resourcesOpen} aria-controls={resourcesOpen ? panelId : undefined} onHoverStart={prefetch} onFocus={prefetch} onPressStart={prefetch} onPress={() => onOpenChange(!resourcesOpen)} isDisabled={disabledReason !== undefined} aria-describedby={disabledReason === undefined ? undefined : reasonId} {...stylex.props(styles.button, styles.resourcesButton)}><CompositionIcon name="folder" /><span {...stylex.props(styles.resourcesLabel)}>Resources</span></Aria.Button>
+    {resourcesOpen ? <SidePanel ref={shellCommit} id={panelId} aria-label="Agent resources" onClose={() => onOpenChange(false)}>
+      <header {...stylex.props(styles.heading)}><strong>Resources</strong><Aria.Button aria-label="Close resources" onPress={() => onOpenChange(false)} {...stylex.props(styles.button)}>Close resources</Aria.Button></header>
+      <ResourceContents agentRef={agentRef} resources={resources} opening={opening} cache={cache} />
+    </SidePanel> : null}
     {disabledReason === undefined ? null : <span id={reasonId} {...stylex.props(styles.reason)}>{disabledReason}</span>}
     <Aria.MenuTrigger>
       <Aria.Button aria-label="Conversation menu" {...stylex.props(styles.button)}><CompositionIcon name="gear" /></Aria.Button>
@@ -54,14 +93,24 @@ export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: str
   </div>
 }
 
-const ResourceContents = ({ agentRef, resources }: {
+const ResourceContents = ({ agentRef, resources, opening, cache }: {
   readonly agentRef: string
   readonly resources: Feed<ResourcePage>
+  readonly opening?: OpenOperation
+  readonly cache: 'retained' | 'cold'
 }) => {
   const source = useDataSource()
-  const queue = useAtomValue(source.subjectReads.agentQueue.feed(agentRef))
-  const now = useNow()
+  const queue = useAtomValue(retainedResourceAtoms(source).queue(agentRef))
+  React.useLayoutEffect(() => {
+    if (resources._tag !== 'Waiting') opening?.phase('data', { 'wf.ux.cache': cache })
+    if (queue._tag !== 'Waiting') opening?.phase('queue')
+    if (resources._tag !== 'Waiting' && queue._tag !== 'Waiting') return opening?.contentCommitted()
+  }, [opening, cache, resources._tag, queue._tag])
   return <div {...stylex.props(styles.contents)}>
+    <section aria-label="Todos">
+      <h2 {...stylex.props(styles.sectionTitle)}>Todos</h2>
+      <LiveAgentTodos agentRef={agentRef} placement="resources" />
+    </section>
     <section aria-label="Agent queue">
       <h2 {...stylex.props(styles.sectionTitle)}>Agent queue</h2>
       {queue._tag !== 'Observed' ? <ReadNotice feed={queue} label="Agent queue" /> : <>
@@ -77,10 +126,9 @@ const ResourceContents = ({ agentRef, resources }: {
         {resources.freshness === 'stale' ? <p role="status">Showing the last verified resources while reconnecting.</p> : null}
         {resources.value.items.length === 0 ? <p>No resources observed for this agent.</p> : <ul {...stylex.props(styles.list)}>{resources.value.items.map(resource => {
           const state = resourceState(resource)
-          const observedAt = DateTime.formatIso(resource.observed_at)
           return <li key={resource.id} {...stylex.props(styles.resource)}>
             <div {...stylex.props(styles.resourceHeading)}><span {...stylex.props(styles.resourceTitle)}>{resourceTitle(resource)}</span>{state === undefined ? null : <span {...stylex.props(styles.resourceState)}>{state.replaceAll('_', ' ')}</span>}</div>
-            <div {...stylex.props(styles.resourceMetadata)}><span>{resource.kind}</span><time dateTime={observedAt} title={observedAt} aria-label={`Resource observed ${observedAt}`}>{compactTime({ at: DateTime.toEpochMillis(resource.observed_at), now })} ago</time></div>
+            <div {...stylex.props(styles.resourceMetadata)}><span>{resource.kind}</span><HumanTime at={DateTime.toEpochMillis(resource.observed_at)} kind="relative" aria-label="Resource observed" /></div>
           </li>
         })}</ul>}
         {resources.value.pagingError === undefined ? null : <p role="status" data-wf-resource-paging="failed">More resources could not be loaded; refresh to try again.</p>}
@@ -97,12 +145,11 @@ const ReadNotice = ({ feed, label }: { readonly feed: Exclude<Feed<unknown>, { r
 const styles = stylex.create({
   actions: { display: 'flex', alignItems: 'center', gap: s.md },
   button: { display: 'inline-flex', alignItems: 'center', gap: s.xs, padding: '4px 8px', borderWidth: 0, borderRadius: 6, backgroundColor: 'transparent', color: c.fgMuted, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outline: `2px solid ${c.primary}` }, ':disabled': { opacity: 0.5, cursor: 'default' } },
+  resourcesButton: { justifyContent: 'center', width: { default: 28, '@media (min-width: 640px)': 'auto' }, paddingInline: { default: 0, '@media (min-width: 640px)': s.md } },
+  resourcesLabel: { display: { default: 'none', '@media (min-width: 640px)': 'inline' } },
   reason: { fontSize: t.denseSize, color: c.fgMuted },
-  overlay: { position: 'fixed', inset: 0, zIndex: 100, display: 'flex', justifyContent: 'flex-end', backgroundColor: 'rgba(0, 0, 0, 0.4)' },
-  modal: { width: 380, maxWidth: 'calc(100vw - 24px)', height: '100%', backgroundColor: c.raised, color: c.fg, fontFamily: t.fontSans, fontSize: t.metaSize },
-  dialog: { display: 'flex', flexDirection: 'column', height: '100%', outline: 'none' },
+  contents: { flex: '1 1 0', minHeight: 0, padding: s.lg, overflowY: 'auto' },
   heading: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: s.lg, borderBottom: `1px solid ${c.border}` },
-  contents: { padding: s.lg, overflowY: 'auto' },
   sectionTitle: { fontSize: t.uiSize, marginBlock: s.md },
   list: { listStyle: 'none', padding: 0 },
   resource: { padding: s.md, color: c.fg, border: `1px solid ${c.border}`, borderRadius: 6 },

@@ -4,7 +4,7 @@ import { DateTime, Option } from 'effect'
 import * as React from 'react'
 
 import { scale, tokens } from '../../ui-compat/tokens.stylex.ts'
-import { geometryVars as g, spaceVars as s } from '../../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
+import { colorVars as c, geometryVars as g, spaceVars as s } from '../../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 
 import { useDataSource } from '../../data/react.tsx'
 import { agentTodosAtom, type TodoState } from './model.ts'
@@ -17,6 +17,7 @@ const occurrenceKey = ({ counts, parts }: { counts: Map<string, number>; parts: 
 }
 
 const styles = stylex.create({
+  resources: { color: 'inherit', fontSize: '0.75rem' },
   pinned: {
     width: '100%',
     minWidth: 0,
@@ -72,7 +73,7 @@ const styles = stylex.create({
   list: { listStyle: 'none', margin: 0, padding: 0 },
   task: { display: 'flex', gap: s.md, paddingBlock: scale.space1, lineHeight: 1.5 },
   content: { minWidth: 0, overflowWrap: 'anywhere' },
-  done: { color: tokens['--ds-gray-900'] },
+  done: { color: c.fg },
   status: { color: tokens['--ds-gray-900'], width: 16, flexShrink: 0, textAlign: 'center' },
   active: { color: tokens['--ds-blue-900'] },
   note: {
@@ -103,14 +104,17 @@ const statusMarks = { pending: '○', in_progress: '◉', completed: '✓', bloc
 export const AgentTodos = ({
   state,
   detail = false,
+  placement = 'pinned',
 }: {
   readonly state: TodoState
   readonly detail?: boolean
+  /** `resources`: a section of the Resources view; it names every state instead of hiding unobserved ones. */
+  readonly placement?: 'pinned' | 'resources'
 }): React.ReactNode => {
   if (state._tag !== 'Observed') {
-    if (!detail) return null
+    if (!detail && placement !== 'resources') return null
     return (
-      <p role="status" {...stylex.props(styles.detail)}>
+      <p role="status" {...stylex.props(placement === 'resources' ? styles.resources : styles.detail)}>
         {state._tag === 'Waiting'
           ? 'Waiting for todo observations…'
           : state._tag === 'Unavailable'
@@ -119,7 +123,8 @@ export const AgentTodos = ({
       </p>
     )
   }
-  const { todo, completed, total, phase, stale } = state
+  const { todo, completed, total, phase, binding } = state
+  const stale = binding === 'stale'
   const snapshot = todo.snapshot
   const label =
     phase?.name ??
@@ -191,7 +196,7 @@ export const AgentTodos = ({
       <div {...stylex.props(styles.provenance)}>
         <p {...stylex.props(styles.note)}>
           Source: fact.todo · {snapshot.harness} / {snapshot.source_op} ·{' '}
-          {stale ? 'stale snapshot' : 'current binding'}
+          {binding === 'pending' ? 'binding verification pending' : stale ? 'stale snapshot' : 'current binding'}
         </p>
         <p {...stylex.props(styles.note)}>
           Observed{' '}
@@ -212,14 +217,14 @@ export const AgentTodos = ({
       <h2 {...stylex.props(styles.heading)}>
         <span>Todos · {label}</span>
         <span {...stylex.props(styles.count)}>
-          {completed}/{total} completed{stale ? ' · Stale' : ''}
+          {completed}/{total} completed{binding === 'pending' ? ' · Pending' : stale ? ' · Stale' : ''}
         </span>
       </h2>
       {list}
     </section>
   ) : (
-    <div {...stylex.props(styles.pinned)}>
-      <details aria-label="Harness todos" {...stylex.props(styles.strip)}>
+    <div {...stylex.props(placement === 'resources' ? styles.resources : styles.pinned)}>
+      <details aria-label="Harness todos" {...stylex.props(placement === 'pinned' && styles.strip)}>
         <summary {...stylex.props(styles.summary)}>
           <span {...stylex.props(styles.summaryRow)}>
             <span title={label} {...stylex.props(styles.phase)}>
@@ -232,7 +237,7 @@ export const AgentTodos = ({
               {completed}/{total}
             </span>
             <span {...stylex.props(styles.source, stale && styles.stale)}>
-              {stale ? 'Stale · ' : ''}
+              {binding === 'pending' ? 'Pending · ' : stale ? 'Stale · ' : ''}
               {snapshot.harness}
               {snapshot.truncated ? ' · Partial' : ''}
             </span>
@@ -248,11 +253,13 @@ export const AgentTodos = ({
 export const LiveAgentTodos = ({
   agentRef,
   detail = false,
+  placement,
 }: {
   readonly agentRef: string
   readonly detail?: boolean
+  readonly placement?: 'pinned' | 'resources'
 }): React.ReactNode => {
   const source = useDataSource()
   const state = useAtomValue(agentTodosAtom({ source, agentRef }))
-  return <AgentTodos state={state} detail={detail} />
+  return <AgentTodos state={state} detail={detail} {...(placement === undefined ? {} : { placement })} />
 }

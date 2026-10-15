@@ -119,6 +119,56 @@ export const formatClock = (at: number, now: number, zone: HumanTimeZone = {}): 
   return days === 0 ? formatClockTime(at, zone) : days > 0 && days < 7 ? weekdayClock(at, zone) : formatDate(at, now, zone)
 }
 
+/** The first instant after `now` that lies a whole number of `unit`s from `anchor`. */
+const nextStep = (anchor: number, now: number, unit: number): number => anchor + (Math.floor((now - anchor) / unit) + 1) * unit
+/** The smallest unit formatDuration shows; sub-second spans show seconds. */
+const smallestShown = (span: number, maxUnits: 1 | 2): number => {
+  const first = units.findIndex(([, size]) => span >= size)
+  return first === -1 ? SECOND : units[Math.min(units.length - 1, first + maxUnits - 1)]?.[1] ?? SECOND
+}
+
+/** Civil-day labels wake at quarter hours, covering modern zones' midnight boundaries. */
+export const nextCivilChange = (now: number): number | undefined =>
+  Number.isFinite(now) ? nextStep(0, now, 15 * MINUTE) : undefined
+
+/** The next step of the smallest unit formatDuration(now - at) displays. */
+export const nextDurationChange = (at: number, now: number, { maxUnits = 2 }: { readonly maxUnits?: 1 | 2 } = {}): number | undefined => {
+  if (!Number.isFinite(at) || !Number.isFinite(now)) return undefined
+  const elapsed = now - at
+  if (elapsed < SECOND) return at + SECOND
+  return nextStep(at, now, smallestShown(elapsed, maxUnits))
+}
+
+/** The next step of a countdown; undefined once its target has passed. */
+export const nextCountdownChange = (at: number, now: number, { maxUnits = 2 }: { readonly maxUnits?: 1 | 2 } = {}): number | undefined => {
+  if (!Number.isFinite(at) || !Number.isFinite(now) || at <= now) return undefined
+  const remaining = at - now
+  const shown = smallestShown(remaining, maxUnits)
+  return at - Math.floor(remaining / shown) * shown + 1
+}
+
+/** The earliest candidate strictly after now. */
+export const earliestChange = (now: number, candidates: Iterable<number | undefined>): number | undefined => {
+  let next: number | undefined
+  for (const at of candidates) if (at !== undefined && Number.isFinite(at) && at > now && (next === undefined || at < next)) next = at
+  return next
+}
+
+/** The next relative-label step; minute-granular text wakes once a minute. */
+export const nextRelativeChange = (at: number, now: number): number | undefined => {
+  if (!Number.isFinite(at) || !Number.isFinite(now)) return undefined
+  const delta = now - at
+  if (delta < -30 * SECOND) {
+    const ahead = -delta
+    if (ahead >= 7 * DAY) return Math.min(at - 7 * DAY + 1, nextStep(0, now, 15 * MINUTE))
+    const shown = smallestShown(Math.floor((ahead + SECOND - 1) / SECOND) * SECOND, ahead < DAY ? 1 : 2)
+    return nextStep(at + SECOND, now, shown)
+  }
+  if (delta < MINUTE) return at + MINUTE
+  if (delta < HOUR) return nextStep(at, now, MINUTE)
+  return Math.min(nextStep(at, now, HOUR), nextStep(0, now, 15 * MINUTE))
+}
+
 /** The exact local timestamp with zone, for tooltips and accessible descriptions. */
 export const formatExact = (at: number, zone: HumanTimeZone = {}): string =>
   Number.isFinite(at)

@@ -116,6 +116,107 @@ The build records `rev`, `dirty`, `commitTs` and `buildTs` from git. The bundle 
 the host serves them at `/build-identity.json`. That response names the exact commit that is
 running.
 
+## Fractal web Details
+
+The live agent inspector lazily mounts the kit's production `DetailsPane` inside a
+measured Workbench tab group. Details is the default tab; Changes retains its
+successful-tool captures and loaded-transcript-window scope. The public composition
+supplies native observations only. Host contributions may add independently scoped
+descendant observations without replacing native session accounting.
+
+Overview identity, mission, status-since and managed-session elapsed are separate
+facts. Elapsed freezes at the managed session's end and is wall time, not active
+work. Session age continues from `Session.started_at`, with that provenance in its
+label. Native incarnation launch age is unreported: it is not inferred from the
+managed session start. Context uses the same reported occupancy projection as the
+sidebar; cumulative tokens are not a context numerator. Main-session money carries
+its returned native usage interval. Cumulative tokens come from `Agent.usage.total_tokens`,
+span the agent's observed incarnations and have an explicitly unreported accumulation
+window; they remain visible without a proven current native root. Descendant money
+keeps its independent provider-reported window. Missing series, timestamps,
+attribution and grants remain explicit rather than becoming zero or fixtures.
+Session starts that equal the producer snapshot's `created_at` or the session update
+timestamp, or drift forward within the same session incarnation, cannot establish
+duration. This comparison never uses the client's display clock. Rejected/earliest
+starts are remembered per source, agent, session and incarnation across Details mounts;
+an earlier corrected start or a distinct incarnation can establish duration. Unknown
+duration values expose the actual guard reason rather than a fabricated age.
+The source retains a context-observation fence across an incarnation transition, even
+when the new row omits occupancy. Context, model and compaction claims remain unknown
+until a strictly newer occupancy observation arrives; cumulative token totals alone
+cannot restore them.
+Elapsed and age each stay pending until the session first read settles. A shared
+timing guard reason appears once, without duplicating it beneath both values.
+
+Selected native-root attribution requires a current-incarnation binding plus matching
+native usage rows. `UsageRow` does not expose its grouping incarnation ID; a unique
+row alone is not proof of the current root. Without an explicit matching binding,
+root-scoped facts remain unavailable while unrelated native observations stay visible.
+Declaration reads request redacted values only; public code exposes binding kinds
+and counts without paths, reference targets, environment values or command arguments.
+The latest declaration is selected by agent, and its own declaration revision is
+displayed. `Agent.revision` belongs to the projection namespace, so it keys observation
+refresh but is never sent as a declaration-history revision.
+An optional protected host contribution can render the declared workspace,
+repository/base/branch and redacted binding targets. Neither projection claims
+observed checkout success or repository state. Metadata without a native navigation
+target opens a read-only dialog rather than fabricating a routable subject.
+Reported spend-window descriptions wrap at narrow pane widths without shortening
+their scope or provenance; monetary amounts keep their intrinsic width.
+The kit's E3 policy hides empty and unavailable resource bodies; unavailable categories
+are named once in its compact “Not supplied” line with keyboard provenance tooltips.
+User-hidden categories are omitted. Known zero traced or observed st subagent counts
+remain visible evidence, distinct from an unknown count.
+The Subagents heading uses the reported traced-session total for both zero and
+positive counts, never the capped retained list length; unknown totals have no badge.
+Inclusive ledger totals and native self amounts are independently sourced and
+windowed observations, not a reconciled monetary split. Their difference never
+establishes descendant spend, including when the ledger reports zero descendants.
+First-read resource sections remain pending until their relevant feed settles; they
+are not included in “Not supplied” while loading. Settled absence is still explicit.
+Native root prerequisites carry their own acquisition state: a still-loading agent
+or usage-period read is not evidence that no verified native root exists. Only a
+settled missing identity/root is unavailable; loading never authorizes a provider read.
+Matching last-good descendant observations survive transient read failures and paused
+native freshness as retained/stale, labelled with the age of the last successful client
+read (not producer observation time). A paused native fence never authorizes another
+provider read; denial, root/host/incarnation replacement or a different source cannot
+reuse the old value.
+Retained-read error copy is separated from the coverage sentence with punctuation.
+Traced cards expose the reported role/label, known model and full native session identity
+before Open; generic reported roles remain generic, and missing kinds are not invented.
+An omitted role remains explicit as “role unreported” before the full session identity.
+Attention preserves main's sidebar union of waiting status and observed attention
+subjects; it does not introduce a separate sidebar policy. Terminal resources reuse the observed runtime's native navigation
+reference. Missions / queue mounts the same selected-agent queue reader as Resources;
+grant refusal removes values, while stale retained queues are labelled last observed.
+
+Details readers acquire demand only for the visible tab. The tab group's local
+layout registry does not replace the application's data registry. Section variants
+remain independently supplied swap points; the deployed defaults are
+O2 / C3 / S2 / R1 / E3, not approval of exploration alternatives.
+Passive agent-row hover tooltips do not own pointer events over the sidebar divider;
+the explicit reported-details popover remains interactive.
+
+The conversation header's Resources control opens the kit's non-modal `SidePanel`, a
+labelled complementary region rather than a dialog: the workspace is never inerted or
+hidden. The trigger names the panel with `aria-controls`, and Escape or Close resources
+closes it and returns focus to the trigger. The panel renders under the owning scheme
+root. Below 640 px the Resources trigger keeps its accessible name but shows only the
+folder icon; wider headers also show the text label. Todos is its first section; a missing
+harness snapshot is named rather than shown as an empty list. Hover, focus and press start
+prefetch the resource and queue reads.
+Closing releases UI demand, while the intent-created read keeps polling for 60 seconds
+so a reopen shows the retained observation.
+
+Live time labels share a visibility-aware deadline clock instead of a global 1 Hz
+render cadence. Each view schedules its next displayed duration/age or synchronization
+threshold; hidden pages arm no timer and catch up once on return. Native Details keeps
+main's existing formatting and observation guards. Atom-side invalidation runs once
+per wall minute, retaining the pending minute until its callback fires. Fixture `now`
+atoms remain externally driven. Conversation presentation time freezes on transport
+loss without changing the source's independent freshness verdict.
+
 ## Fractal web transcript switch paint
 
 The conversation pane reports `ux.transcriptCommitted(ref)` only after its scoped DOM
