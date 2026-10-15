@@ -33,6 +33,7 @@ pub mod evidence;
 pub(crate) mod external_sessions;
 pub(crate) mod native_views;
 pub(crate) mod conversation_header;
+pub(crate) mod conversation_delivery;
 pub(crate) mod subagent_sessions;
 pub mod fleet;
 /// Silent messages are stored and readable without waking the recipient.

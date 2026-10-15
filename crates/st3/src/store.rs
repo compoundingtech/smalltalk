@@ -201,6 +201,7 @@ mod agent_messages;
 mod coordination;
 pub mod agent_view;
 mod conversation_reads;
+mod conversation_deliveries;
 mod usage_period;
 mod runtime;
 pub(crate) mod published_views;
@@ -872,6 +873,37 @@ BEGIN
     INSERT INTO message_index(subject, created_index, closed)
     SELECT subject, MIN(store_index), MAX(kind = 'message.closed')
     FROM claims WHERE subject = OLD.subject GROUP BY subject;
+END;
+
+-- Qualified native identities attached to a newly appended mailbox consumption
+-- receipt in its existing writer savepoint. This is owner-local receipt provenance,
+-- not a replicated claim or transcript payload. There is no historical backfill.
+CREATE TABLE IF NOT EXISTS local_native_delivery_receipts_v2 (
+    claim_id TEXT PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+    claim_hash TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    store_index INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS local_native_delivery_identity_v2
+ON local_native_delivery_receipts_v2(session_id, native_id, actor, origin, store_index);
+CREATE INDEX IF NOT EXISTS local_native_delivery_owner_cut_v2
+ON local_native_delivery_receipts_v2(actor, store_index);
+-- A changed, repaired or deleted physical claim no longer carries the original proof.
+-- No trigger reconstructs or guesses a native identity from a claim body.
+CREATE TRIGGER IF NOT EXISTS local_native_delivery_update_v2
+AFTER UPDATE OF id, subject, kind, actor, origin, body ON claims
+WHEN OLD.id IS NOT NEW.id OR OLD.subject IS NOT NEW.subject OR OLD.kind IS NOT NEW.kind
+  OR OLD.actor IS NOT NEW.actor OR OLD.origin IS NOT NEW.origin OR OLD.body IS NOT NEW.body
+BEGIN
+    DELETE FROM local_native_delivery_receipts_v2 WHERE claim_id=OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS local_native_delivery_delete_v2 AFTER DELETE ON claims
+WHEN OLD.kind='message.read'
+BEGIN
+    DELETE FROM local_native_delivery_receipts_v2 WHERE claim_id=OLD.id;
 END;
 
 CREATE TABLE IF NOT EXISTS capabilities (
@@ -11366,6 +11398,34 @@ impl Store {
         fence: &crate::mailbox::Fence,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         self.append_claim_fenced_outcome(input, Some(fence))
+    }
+
+    /// Called only inside the native lease/authority guard. Metadata commits with
+    /// the first new read receipt; replay/settlement never adds or changes a binding.
+    pub(crate) fn append_native_mailbox_receipt_outcome(
+        &self,
+        input: &ClaimInput,
+        fence: &crate::mailbox::Fence,
+        native: Option<&crate::conversation_delivery::NativeReceipt>,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        if native.is_some_and(|native| !native.valid() || input.kind != "message.read") {
+            return Err(St3Error::new(
+                "invalid-native-receipt",
+                "native proof needs a read receipt",
+            ));
+        }
+        append_claim_with_commit_context(
+            &self.graph,
+            input,
+            Some(fence),
+            None,
+            None,
+            None,
+            ClaimCommitContext {
+                native_receipt: native,
+                ..Default::default()
+            },
+        )
     }
 
     pub(crate) fn append_claim_fenced_outcome(
@@ -60096,6 +60156,7 @@ struct ClaimCommitContext<'a> {
     signature: Option<&'a str>,
     // Only retire_agent supplies the declaration, owner and rollout admission together.
     retirement_writer: bool,
+    native_receipt: Option<&'a crate::conversation_delivery::NativeReceipt>,
 }
 
 fn append_claim_with_commit_context(
@@ -60394,6 +60455,15 @@ fn append_claim_with_commit_context(
             })()?;
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
+            }
+            if outcome.1 && let Some(native) = context.native_receipt {
+                transaction.execute(
+                    "INSERT INTO local_native_delivery_receipts_v2
+                     (claim_id,claim_hash,session_id,native_id,actor,origin,store_index) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![outcome.0.id, crate::conversation_delivery::receipt_fingerprint(&outcome.0.subject,
+                        input.actor.as_deref().unwrap_or_default(), &graph.origin, &outcome.0.body).map_err(internal)?,
+                        native.session_id,native.message_id,input.actor,graph.origin,outcome.0.store_index],
+                ).map_err(internal)?;
             }
             if context.signature.is_some() {
                 // An idempotent repeat does not append/consume a signature. Remove its

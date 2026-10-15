@@ -119,6 +119,7 @@ pub(super) mod resources;
 pub(super) mod search;
 pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
+mod conversation_delivery;
 mod collection_windows;
 mod inventory;
 #[cfg(test)]
@@ -2739,6 +2740,7 @@ pub(super) struct ClientSession {
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
     pub(super) conversation_blocks: bool,
+    pub(super) conversation_delivery_links: bool,
     scopes: std::collections::BTreeSet<String>,
 }
 
@@ -2753,6 +2755,7 @@ impl ClientSession {
             transport,
             custom_forms: true,
             conversation_blocks: false,
+            conversation_delivery_links: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -2788,6 +2791,7 @@ impl ClientSession {
                 transport: "unix",
                 custom_forms,
                 conversation_blocks: false,
+                conversation_delivery_links: false,
                 scopes: ["read.projections", "terminal.read"]
                     .into_iter()
                     .map(str::to_owned)
@@ -2804,6 +2808,7 @@ impl ClientSession {
             transport: "unix",
             custom_forms,
             conversation_blocks: false,
+            conversation_delivery_links: false,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
@@ -2817,6 +2822,7 @@ impl ClientSession {
             transport: "fabric-loopback",
             custom_forms: false,
             conversation_blocks: false,
+            conversation_delivery_links: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -2882,6 +2888,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         json!({ "id": action, "version": 0, "state": state })
     }));
     capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
+    capabilities.push(json!({"id":"conversation-delivery-links", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"conversation-blocks", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities
 }
@@ -2942,6 +2949,10 @@ pub(super) fn authenticate(
                 .split(',')
                 .any(|feature| feature.trim() == "conversation-blocks.v1")
         });
+    let conversation_delivery_links = request.headers().get("x-st3-features")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|feature|
+            feature.trim() == "conversation-delivery-links.v1"));
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
@@ -2951,6 +2962,7 @@ pub(super) fn authenticate(
             let mut session = ClientSession::local(person)?;
             session.custom_forms = custom_forms;
             session.conversation_blocks = conversation_blocks;
+            session.conversation_delivery_links = conversation_delivery_links;
             return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
@@ -2984,6 +2996,7 @@ pub(super) fn authenticate(
     };
     let mut session = paired_client_session(state, paired, transport, custom_forms)?;
     session.conversation_blocks = conversation_blocks;
+    session.conversation_delivery_links = conversation_delivery_links;
     if request.method() == axum::http::Method::GET {
         let scope = if request
             .uri()
@@ -3038,6 +3051,7 @@ fn paired_client_session(
         transport,
         custom_forms,
         conversation_blocks: false,
+        conversation_delivery_links: false,
         scopes,
     })
 }
@@ -3062,6 +3076,7 @@ fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<Clien
     }).ok_or_else(|| forbidden("the client session grant is absent"))?;
     let mut current = paired_client_session(state, paired, session.transport, session.custom_forms)?;
     current.conversation_blocks = session.conversation_blocks;
+    current.conversation_delivery_links = session.conversation_delivery_links;
     if current.authority_actor != session.authority_actor {
         return Err(forbidden("the client session authority changed"));
     }
@@ -5735,7 +5750,7 @@ fn native_timeline_page(
     query: &ClientListQuery,
     mut items: Vec<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let order = native_timeline_order(state, snapshot, session_id)?;
+    let (order, _) = native_timeline_order(state, snapshot, session_id)?;
     let mut keyed: Vec<_> = items.drain(..)
         .map(|item| {
             let key = crate::external_sessions::timeline_key(&item, 0);
@@ -5776,14 +5791,16 @@ fn native_timeline_order(
     state: &AppState,
     snapshot: &ClientSnapshot,
     session_id: &str,
-) -> Result<crate::external_sessions::TimelineOrder, ApiError> {
-    Ok(if super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
-        .map_err(ApiError::internal)?.is_some()
-    {
+) -> Result<(crate::external_sessions::TimelineOrder, Option<String>), ApiError> {
+    let owner = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
+        .map_err(ApiError::internal)?
+        .map(|managed| managed.0);
+    let order = if owner.is_some() {
         crate::external_sessions::TimelineOrder::TimestampSequence
     } else {
         crate::external_sessions::TimelineOrder::Sequence
-    })
+    };
+    Ok((order, owner))
 }
 
 pub(super) const NATIVE_PAGE_CURSOR_PREFIX: &str = "page/native/";
@@ -5887,7 +5904,7 @@ fn native_slice_page_at_generation(
     let preparation = crate::profile::span("conversation/native-preparation");
     let cursor = query.cursor.as_deref().map(decode_native_page_cursor).transpose()?;
     let source_basis = conversation_blocks::basis(source)?;
-    let order = native_timeline_order(state, snapshot, session_id)?;
+    let (order, receipt_owner) = native_timeline_order(state, snapshot, session_id)?;
     let order_name = match order {
         crate::external_sessions::TimelineOrder::Sequence => "sequence",
         crate::external_sessions::TimelineOrder::TimestampSequence => "timestamp-sequence",
@@ -6001,6 +6018,9 @@ fn native_slice_page_at_generation(
     // A page never outgrows what a paired reader can take from a remote owner (its reads are
     // capped at 1 MiB): a seat with very large entries gets a shorter newest page and a cursor
     // for the rest, not a refusal that leaves its conversation unreadable.
+    let receipt_source = crate::external_sessions::external_session_id(source.driver, &source.native_id);
+    conversation_delivery::annotate(state, snapshot, session, &receipt_source, receipt_owner.as_deref(),
+        items.iter_mut().map(|(item, _)| item))?;
     has_more |= bound_page_bytes(&mut items, TIMELINE_PAGE_BYTE_BUDGET);
     let next_cursor = if has_more {
         let boundary = items.last()
@@ -6501,6 +6521,7 @@ pub(super) fn timeline_value(
             .as_deref()
             .and_then(|cursor| offset_continuation_header(state, session, &session_id, snapshot, cursor));
         for item in &mut page.items {
+            if !session.conversation_delivery_links && let Some(item) = item.as_object_mut() { item.remove("delivers"); }
             if !session.conversation_blocks && let Some(body) = item["body"].as_object_mut() {
                 body.remove("blocks");
             }
@@ -7198,6 +7219,14 @@ fn conversation_read_now_unbounded(
         let owner = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
             .map(|managed| managed.0);
+        if session.conversation_delivery_links && native_replay
+            && let Some(owner) = owner.as_deref()
+            && state.store.conversation_delivery_changed(owner, store_index, snapshot.store_index)
+                .map_err(ApiError::internal)?
+        {
+            return Err(conversation_replay_gap(session_id, "delivery-link-changed",
+                "a native consumption receipt changed; refresh the conversation page"));
+        }
         // Native pages contain native records and Small Talk messages, not the driver's
         // mirrored harness.timeline entries. Requiring those IDs in a native page creates
         // a false gap on every observation, even when the native transcript is unchanged.
@@ -22372,6 +22401,7 @@ mission "example/zero-run" state="ready" {
             transport: "paired",
             custom_forms: false,
             conversation_blocks: false,
+            conversation_delivery_links: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
         let mut remote_request = request.clone();

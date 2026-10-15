@@ -446,6 +446,21 @@ test('phone observation schema keeps histogram pairs and live-share as separate 
     ]) assert.throws(()=>decode({...report,samples}));
 });
 
+
+test('native delivery links are optional message references and round trip', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const items = require('../../../docs/st3/client-v0/fixtures/timeline-delivery-links.json').value.items;
+    for (const entry of items) {
+        const typed = Rich.decodeUnknownSync(Rich.TimelineEntry, 'strict')(entry);
+        assert.deepEqual(Schema.encodeSync(Rich.TimelineEntry)(typed), {
+            ...entry, timestamp: new Date(entry.timestamp).toISOString(),
+        });
+    }
+    for (const delivers of [null, 'native-user-1', 'agent/fixture', 'message/with space']) {
+        assert.throws(() => Rich.decodeUnknownSync(Rich.TimelineEntry, 'strict')({ ...items[0], delivers }));
+    }
+});
+
 test('exchange carrier additions preserve legacy absence and future carrier values', async () => {
     const [{ Schema }, Rich] = await modules;
     const wire = { host_id: 'host/birch', peer_only_envelopes: 5, local_only_envelopes: 0, last_exchange_at: null, estimated_catch_up_seconds: null, diverged_since: null };

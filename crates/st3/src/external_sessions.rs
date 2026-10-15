@@ -2971,7 +2971,7 @@ fn process_fingerprint(pid: u32, started_at_unix_ms: u128, command: &str) -> Str
     format!("{pid}:{started_at_unix_ms}:{}", digest(command))
 }
 
-fn external_session_id(driver: ExternalDriver, native_id: &str) -> String {
+pub(crate) fn external_session_id(driver: ExternalDriver, native_id: &str) -> String {
     format!(
         "session/external-{}",
         &digest(&format!("{}:{native_id}", driver.as_str()))[..24]

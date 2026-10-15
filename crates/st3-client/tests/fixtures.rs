@@ -596,3 +596,25 @@ fn relay_omission_fixture_round_trips_without_inventing_nonnullable_fields() {
     let typed: ConversationChanges = serde_json::from_value(changes.clone()).unwrap();
     assert_eq!(serde_json::to_value(typed).unwrap(), changes);
 }
+
+#[path = "support/legacy_delivery_entry.rs"]
+mod legacy_delivery_entry;
+
+#[test]
+fn delivery_link_round_trip_survives_the_typed_owner_relay_and_old_codec_ignores_it() {
+    let bytes = fixture("timeline-delivery-links.json");
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let typed: Envelope<TimelinePage> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(typed.value.items[0].delivers.as_deref(), Some("message/fixture-delivery"));
+    assert!(typed.value.items[1].delivers.is_none());
+    assert_eq!(serde_json::to_value(&typed).unwrap(), raw);
+    let changes = serde_json::json!({"kind":"conversation-changes", "session_id":raw["value"]["session_id"],
+        "items":raw["value"]["items"], "next_cursor":"conversation-cursor/delivery/next"});
+    let typed: ConversationChanges = serde_json::from_value(changes.clone()).unwrap();
+    assert_eq!(serde_json::to_value(typed).unwrap(), changes);
+    for item in raw["value"]["items"].as_array().unwrap() {
+        let old: legacy_delivery_entry::TimelineEntry = serde_json::from_value(item.clone()).unwrap();
+        let mut expected = item.clone(); expected.as_object_mut().unwrap().remove("delivers");
+        assert_eq!(serde_json::to_value(old).unwrap(), expected);
+    }
+}
