@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The evidence signer checks the owner and mode of the git and ssh-keygen files it runs, passes them an explicit environment, and refuses to start when the loader or interpreter was told to load code",
+  "replay": {"status": "none", "detail": "No graph, claim or storage change; one CI script and its tests."},
+  "schema": {"status": "none", "detail": "No schema change. The signed record and the JSON request are unchanged."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. A host whose git or ssh-keygen file is not root-owned, or whose environment sets LD_PRELOAD, LD_AUDIT, DYLD_INSERT_LIBRARIES, GCONV_PATH, NLSPATH, PYTHONPATH, PYTHONSTARTUP or PYTHONHOME, now gets a refusal and no note; the signing steps are fail-soft, so no required check changes."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "none", "detail": "No operator action. A launcher that runs the signer with privilege must still scrub the environment and fix the interpreter and the signer file's ownership itself; this change does not do that."},
+  "recovery": {"status": "none", "detail": "Revert the change; nothing it writes persists."}
+}

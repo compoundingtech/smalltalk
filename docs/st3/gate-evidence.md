@@ -365,6 +365,22 @@ record as before. `scripts/evidence-publish` then also writes `refs/notes/eviden
 for every accepted record (pass or fail, one ref per record, never replaced) so a gate can find the records of
 another tree with the same inputs by one prefix fetch. The ref is only an index; a record is still accepted only
 by its signature, exact command, required inputs and tier.
+Signer launch controls (`scripts/evidence-sign`): each resolved git and ssh-keygen file must be a regular executable file owned
+by root and closed to group and others, in addition to the directory rules, and the signer runs that resolved file, not the
+link it found. git and ssh-keygen are the only programs the script starts itself; the helper programs git starts come from git's
+own installation, which the launcher's pinned git provides and this script does not enumerate, and the interpreter is the
+launcher's concern too. A file in the Nix store is judged like the store directory: it is content-addressed, so the rule is no write bit and not who
+owns it (inside a Nix build sandbox root-owned store files show as owned by nobody, and the first version of this rule failed the
+sandboxed genie-freshness check for exactly that reason). Outside the store the owner must be root. git and ssh-keygen receive only PATH (the
+signer's own), LC_ALL, HOME, TMPDIR and git settings the signer sets itself (no system or global git configuration; HOME
+and TMPDIR are passed as given, so for a privileged integration only the fixed trusted launcher or profile may supply them,
+and passing them proves nothing about an arbitrary inherited path; the "no global git configuration" setting needs Git 2.32 or
+newer, and the script does not check the version: the fixed launcher or install manifest that supplies the pinned git must);
+and the signer refuses to start when LD_PRELOAD, LD_AUDIT, DYLD_INSERT_LIBRARIES, GCONV_PATH, NLSPATH, PYTHONPATH,
+PYTHONSTARTUP or PYTHONHOME is set. The refusal is a tripwire, not a repair: the interpreter has started before the script
+runs. Scrubbing the environment, running a root-owned interpreter in isolated mode and fixing the ownership of the signer
+file and its directories belong to the launcher, and neither this change nor the CI helper does them. The same-user
+and passwordless-sudo gaps below are unchanged.
 
 Accepted gap: code under test in a job that holds the key can read it. That now includes every pull
 request from this repository: its author controls the workflow file the run executes, so a person or agent with

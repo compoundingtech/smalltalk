@@ -13,7 +13,7 @@ for test in \
   ci-test-archive-test ci-evidence-source-test check-ci-test-paths ci-queue-watch-test \
   check-main-ci-test ci-perf-cache-test ci-perf-slot-test ci-perf-scope-test \
   ci-cache-audit-test ci-fractal-web-test ci-evidence-observe-test evidence-verify-test st-test-test evidence-prepush-test evidence-wrap-test ci-evidence-signing-test evidence-publish-test \
-  ci-evidence-gate-test; do
+  ci-evidence-gate-test evidence-sign-hardening-test; do
   python3 "scripts/$test"
 done
 genie --check
