@@ -699,7 +699,7 @@ export type UsageContext = typeof UsageContext.Type
 export type UsageContextEncoded = typeof UsageContext.Encoded
 
 export const UsageSummary = /*#__PURE__*/ (() => Schema.Struct({
-  "aggregation": Schema.Literal("cumulative-per-incarnation-else-response-deltas"),
+  "aggregation": Schema.Literals(["cumulative-per-incarnation-else-response-deltas","rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas"]),
   "cache_write_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "cached_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "context": optionalKey(UsageContext),

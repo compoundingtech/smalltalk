@@ -6,6 +6,31 @@ import FoundationNetworking
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testUsageAggregationSchemaLiteralsDecode() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/schemas/client-v0.schema.json"))
+        let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let definitions = try XCTUnwrap(schema["$defs"] as? [String: Any])
+        let summary = try XCTUnwrap(definitions["UsageSummary"] as? [String: Any])
+        let properties = try XCTUnwrap(summary["properties"] as? [String: Any])
+        let aggregation = try XCTUnwrap(properties["aggregation"] as? [String: Any])
+        let literals = try XCTUnwrap(aggregation["enum"] as? [String])
+        XCTAssertEqual(literals, [
+            "cumulative-per-incarnation-else-response-deltas",
+            "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas",
+        ])
+        for literal in literals {
+            let wire: [String: Any] = [
+                "total_tokens": 1200, "input_tokens": 900, "output_tokens": 300,
+                "cached_tokens": 100, "incarnation_count": 2, "aggregation": literal,
+            ]
+            let decoded = try JSONDecoder().decode(UsageSummary.self,
+                from: JSONSerialization.data(withJSONObject: wire))
+            XCTAssertEqual(decoded.aggregation, literal)
+        }
+    }
+
     func testQueuedMissionDeadlineAcceptsNullAndAdmissionTimestamp() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

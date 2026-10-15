@@ -4,6 +4,33 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('both usage aggregation literals keep agent rows through the generated schema', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const contract = require('../../../docs/st3/client-v0/schemas/client-v0.schema.json');
+    const literals = contract.$defs.UsageSummary.properties.aggregation.enum;
+    assert.deepEqual(literals, [
+        'cumulative-per-incarnation-else-response-deltas',
+        'rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas',
+    ]);
+    for (const mode of ['tolerant', 'strict']) {
+        const decode = Rich.decodeUnknownSync(Rich.Agent, mode);
+        for (const aggregation of literals) {
+            const wire = {
+                id: 'agent/example/worker', kind: 'agent', name: 'Worker',
+                reachability: 'local', revision: '1', runtime_ids: [], state: 'waiting',
+                updated_at: '2024-02-29T00:00:00.000Z',
+                usage: {
+                    total_tokens: 1200, input_tokens: 900, output_tokens: 300,
+                    cached_tokens: 100, incarnation_count: 2, aggregation,
+                },
+            };
+            const result = Schema.encodeSync(Rich.Agent)(decode(wire));
+            assert.equal(result.id, wire.id);
+            assert.deepEqual(result.usage, wire.usage);
+        }
+    }
+});
+
 test('queued mission deadlines decode null and admission timestamps', async () => {
     const [{ Option, Schema }, Rich] = await modules;
     const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');
