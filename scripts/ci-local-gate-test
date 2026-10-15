@@ -162,14 +162,28 @@ class Shim(unittest.TestCase):
 
 class Slot(unittest.TestCase):
     def test_a_stage_runs_inside_one_stage_slot_ticket_and_runs_itself_directly(self):
-        command = gate.slot_command('linux-clippy', '/home/u/.local/bin', 'origin/main')
-        self.assertEqual(command[:4], ['/home/u/.local/bin/cargo', '--stage-slot', 'ci-local-gate-linux-clippy', '--'])
-        self.assertEqual(command[-5:], ['--direct', '--stage', 'linux-clippy', '--base', 'origin/main'])
+        command = gate.slot_command('linux-clippy', '/home/u/.local/bin', 'origin/main', 2)
+        self.assertEqual(command[:4], ['/home/u/.local/bin/cargo', '--stage-slot', 'ci-local-gate-linux-clippy-2', '--'])
+        self.assertEqual(command[-7:], ['--direct', '--stage', 'linux-clippy', '--step', '2', '--base', 'origin/main'])
         self.assertTrue(command[5].endswith('ci-local-gate'))
 
     def test_direct_never_writes_facts_and_the_light_stage_takes_no_slot(self):
         self.assertEqual(gate.main(['--direct', '--facts', '/dev/null'], table={}), 2)
         self.assertEqual(gate.LIGHT, ('upgrade-impact',))
+
+
+class Steps(unittest.TestCase):
+    def test_only_the_first_shard_proves_the_inventory_and_every_test_shard_installs_the_built_hooks_first(self):
+        plan = gate.stages('BASE')
+        proofs = [name for name, steps in plan.items() if any(c[-1] == 'scripts/ci-test-partitions' for c, _ in steps)]
+        self.assertEqual(proofs, ['linux-tests'])
+        for name in ('linux-tests', 'linux-tests-shard-2', 'linux-tests-shard-3', 'linux-tests-shard-4'):
+            self.assertEqual(plan[name][0][0][-2:], ['bash', 'scripts/ci-install-built-hooks'][-2:], name)
+            self.assertEqual(plan[name][-1][0][-3:], ['bash', 'scripts/ci-linux', 'tests'][-3:], name)
+
+    def test_the_kvm_probe_takes_no_ticket_and_the_vm_tests_do(self):
+        steps = gate.stages('BASE')['isolation-vm']
+        self.assertEqual([gate.heavy_step(command) for command, _ in steps], [True, False, True])
 
 
 class SlotRun(unittest.TestCase):
@@ -196,8 +210,8 @@ class SlotRun(unittest.TestCase):
         self.fake_cargo(0)
         self.assertEqual(self.run_main('--stage', 'linux-clippy'), 0)
         line, = self.log.read_text().splitlines()
-        self.assertTrue(line.startswith('--stage-slot ci-local-gate-linux-clippy -- '), line)
-        self.assertIn('--direct --stage linux-clippy --base origin/main', line)
+        self.assertTrue(line.startswith('--stage-slot ci-local-gate-linux-clippy-0 -- '), line)
+        self.assertIn('--direct --stage linux-clippy --step 0 --base origin/main', line)
 
     def test_a_failing_stage_and_a_stage_stopped_by_the_host_limit_are_failures(self):
         for code in (1, gate.STAGE_LIMIT_EXIT):

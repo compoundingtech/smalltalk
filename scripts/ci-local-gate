@@ -10,10 +10,10 @@ deliberate difference: CI builds the test archive in one job and the shard jobs 
 place (`ci-nextest run --no-run`, then the four partitions of the merge-queue run), so no GitHub artifact is needed.
 A test proves every command below appears in the generated workflow, so the two cannot drift apart.
 On a host whose cargo shim lives at $HOME/.local/bin/cargo (build admission, a builds slice) the dev shell's cargo is run through
-that shim, so the compile is queued and sliced like any other, and each stage that builds runs inside ONE ticket of the shim's
-stage slot (`cargo --stage-slot LABEL -- ...`, one stage at a time, stopped after the host's stage limit): the same compile, only
-queued once per stage instead of once per cargo command. A stage the host stops (40 minutes today, exit 124) is reported as a failure;
-a stage that needs longer must be split. A shim without the stage form is detected (its file names `--stage-slot`) and the stage runs the
+that shim, so the compile is queued and sliced like any other, and each step that builds runs inside ONE ticket of the shim's
+stage slot (`cargo --stage-slot LABEL -- ...`, one at a time, stopped after the host's stage limit): the same compile, only
+queued once per stage instead of once per cargo command. A step the host stops (40 minutes today, exit 124) is reported as a failure;
+a step that needs longer must be split (each step has its own ticket and its own limit). A shim without the stage form is detected (its file names `--stage-slot`) and the stage runs the
 old way, in this process. Done at run time; not a CI command.
 
 Every stage runs even after a failure (a failing record is information); --fail-fast stops at the first and writes
@@ -53,8 +53,11 @@ mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
 
 def stages(base):
     """name -> list of (argv, extra environment). The argv strings are the ones the CI jobs run."""
-    tests = lambda name: [(NIX + ['python3', 'scripts/ci-test-partitions'], {'CI_TEST_PARTITION': SHARDS[name]}),
-                          (NIX + ['bash', 'scripts/ci-linux', 'tests'], {'CI_TEST_PARTITION': SHARDS[name]})]
+    hooks = (NIX + ['bash', 'scripts/ci-install-built-hooks'], {})
+    proof = lambda name: (NIX + ['python3', 'scripts/ci-test-partitions'], {'CI_TEST_PARTITION': SHARDS[name]})
+    run = lambda name: (NIX + ['bash', 'scripts/ci-linux', 'tests'], {'CI_TEST_PARTITION': SHARDS[name]})
+    # Only the first shard proves that the shards form the complete inventory (CI runs that step in linux-tests alone).
+    tests = lambda name: [hooks, proof(name), run(name)] if name == 'linux-tests' else [hooks, run(name)]
     return {
         'upgrade-impact': [(['python3', 'scripts/release_notes_test.py'], {}),
                            (['python3', 'scripts/check-release-impact', '--base', base, '--source', MERGE], {})],
@@ -65,10 +68,8 @@ def stages(base):
         'linux-tests-shard-4': tests('linux-tests-shard-4'),
         'linux-clippy': [(NIX + ['bash', 'scripts/ci-linux', 'clippy'], {'CLIPPY_BASE_SHA': base})],
         'linux-fleet-compat': [(NIX + ['bash', 'scripts/ci-linux', 'fleet-compat'], {})],
-        'mail-redelivery-canaries': [(NIX + ['bash', 'scripts/ci-install-built-hooks'], {}),
-                                     (NIX + ['bash', 'scripts/ci-linux', 'mail-redelivery-canaries'], {})],
-        'isolation-vm': [(NIX + ['bash', 'scripts/ci-install-built-hooks'], {}),
-                         (['bash', '-c', KVM_PROBE], {}), (['bash', '-c', VM_TESTS], {})],
+        'mail-redelivery-canaries': [hooks, (NIX + ['bash', 'scripts/ci-linux', 'mail-redelivery-canaries'], {})],
+        'isolation-vm': [hooks, (['bash', '-c', KVM_PROBE], {}), (['bash', '-c', VM_TESTS], {})],
     }
 
 
@@ -96,13 +97,19 @@ def has_stage_slot(shim_dir):
         return False
 
 
-def slot_command(name, shim_dir, base):
-    """Run one whole stage inside ONE host build-queue ticket: `cargo --stage-slot LABEL -- COMMAND` queues once, and the cargo
-    commands inside run without queueing again (each in its own builds.slice scope); the stage is stopped after the host's
-    stage limit (40 minutes). The command is this script, running the stage directly. Without this a stage that runs several
-    cargo commands queues, at the back, for every one of them."""
-    return [str(Path(shim_dir) / 'cargo'), '--stage-slot', f'ci-local-gate-{name}', '--',
-            sys.executable, str(Path(__file__).resolve()), '--direct', '--stage', name, '--base', base]
+def slot_command(name, shim_dir, base, step=0):
+    """Run one step of a stage inside ONE host build-queue ticket: `cargo --stage-slot LABEL -- COMMAND` queues once, and the cargo
+    commands inside run without queueing again (each in its own builds.slice scope); the host stops a slot after its limit (40
+    minutes today, exit 124). One ticket per STEP, not per cargo command (a stage that ran several re-queued, at the back, for
+    each) and not per stage (the test partition's inventory proof alone takes about 30 minutes locally and would leave the
+    tests no time). The command is this script, running that step directly."""
+    return [str(Path(shim_dir) / 'cargo'), '--stage-slot', f'ci-local-gate-{name}-{step}', '--',
+            sys.executable, str(Path(__file__).resolve()), '--direct', '--stage', name, '--step', str(step), '--base', base]
+
+
+def heavy_step(command):
+    """False for a step that builds nothing (the KVM probe): it needs no ticket."""
+    return not (command[:2] == ['bash', '-c'] and 'nix build' not in command[2])
 
 
 def merge_commit(base, env):
@@ -175,6 +182,7 @@ def main(argv, table=None, setup=None, shim=None):
     parser.add_argument('--facts', metavar='FILE', help='write the aggregate facts here')
     parser.add_argument('--fail-fast', action='store_true')
     parser.add_argument('--direct', action='store_true', help='run the chosen stages in this process, without the host stage slot (what the slot itself runs)')
+    parser.add_argument('--step', type=int, help='with --direct: only this step (0-based) of the one chosen stage')
     parser.add_argument('--dry-run', action='store_true', help='print the plan and stop')
     args = parser.parse_args(argv)
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9._/-]*', args.base):
@@ -215,8 +223,14 @@ def main(argv, table=None, setup=None, shim=None):
             started = time.monotonic()
             code = 0
             if slotted and (table is None or shim) and not args.direct and name not in LIGHT:
-                # One ticket for the whole stage; the stage runs this script again, directly, inside it.
-                code = subprocess.run(slot_command(name, shim_dir, args.base), env=dict(environment, HOME=real_home)).returncode
+                # One ticket per step; the step runs this script again, directly, inside it. A light step takes none.
+                for index, (command, extra) in enumerate(plan[name]):
+                    if heavy_step(command):
+                        code = subprocess.run(slot_command(name, shim_dir, args.base, index), env=dict(environment, HOME=real_home)).returncode
+                    else:
+                        code = subprocess.run(command, env=dict(environment, **extra)).returncode
+                    if code != 0:
+                        break
                 results[name] = 'success' if code == 0 else 'failure'
                 failed = failed or code != 0
                 print(f'ci-local-gate: {name} {results[name]} in {round(time.monotonic() - started)}s', file=sys.stderr)
@@ -226,7 +240,10 @@ def main(argv, table=None, setup=None, shim=None):
             if table is None and name not in LIGHT and not shared:
                 environment.update(shared_environment(environment))
                 shared.append(True)
-            for command, extra in plan[name]:
+            steps = list(enumerate(plan[name]))
+            if args.direct and args.step is not None:
+                steps = [pair for pair in steps if pair[0] == args.step]
+            for _, (command, extra) in steps:
                 if MERGE in command:
                     command = [merge_commit(args.base, environment) if part == MERGE else part for part in command]
                 code = subprocess.run(admitted(command, shim_dir if table is None else None), env=dict(environment, **extra)).returncode
