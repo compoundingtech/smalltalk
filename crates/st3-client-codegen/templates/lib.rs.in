@@ -865,6 +865,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         | ErrorCode::ProjectionDetailInvalidSource
         | ErrorCode::AttentionMigrated
         | ErrorCode::IssuerRequired
+        | ErrorCode::SuspendAuthoredSessionSelection
         | ErrorCode::RuntimeNotLocal
         | ErrorCode::ArrangementExists
         | ErrorCode::ArrangementFolderExists

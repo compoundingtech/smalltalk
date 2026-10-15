@@ -1607,6 +1607,237 @@ async fn suspension_requests_survive_stale_incarnations_and_restarts() {
     );
 }
 
+/// #2286: reject an authored selector before writing a suspension, regardless of whether
+/// the selected transcript exists. Both public mutation routes use the same preflight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspend_refuses_authored_selection_without_writes() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for transcript_exists in [false, true] {
+        let mut daemon = Daemon::new().await;
+        let transcript = daemon.root.path().join("native-copper.jsonl");
+        if transcript_exists {
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"session\",\"id\":\"native-copper\"}\n",
+            )
+            .unwrap();
+        }
+        daemon.apply(&format!(
+            "version 2\nagent \"example/worker\" {{ host {NODE:?}; workspace {:?}; harness \"omp\" {{ args \"--resume\" {:?}; }} }}\n",
+            daemon.root.path().display().to_string(), transcript.display().to_string()
+        ), "authored-worker");
+        daemon.claim(
+            WORKER,
+            "runtime.observed",
+            json!({"status": "running", "runtime_id": "worker", "incarnation_id": "4242:fixture"}),
+        );
+        daemon.claim(WORKER, "harness.session-file", json!({"harness": "omp", "session_id": "native-copper", "agent": WORKER, "incarnation_id": "4242:fixture", "status": "active"}));
+        daemon.claim(WORKER, "harness.observed", json!({"state": "idle", "incarnation_id": "4242:fixture", "quiescent": true, "blocking": []}));
+        for _ in 0..2 {
+            let before = daemon.store().index().unwrap();
+            let refused = daemon
+                .transport()
+                .post::<_, Value>(
+                    "/v1/agents/suspend",
+                    &json!({
+                        "subject": WORKER, "actor": PERSON, "idempotency_key": "authored-rest"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st3::client::api_error_code(&refused),
+                Some("suspend-authored-session-selection")
+            );
+            assert_eq!(st3::client::http_status(&refused), Some(422));
+            assert!(refused.to_string().contains("--resume"), "{refused}");
+            assert_eq!(daemon.store().index().unwrap(), before);
+            let mut fence = daemon.fence(PERSON).await;
+            fence.runtime_desired_revision = daemon.store().selected_desired_token(WORKER).unwrap();
+            fence.runtime_incarnation = Some("4242:fixture".into());
+            let refused = dispatch(
+                &daemon.client(PERSON),
+                "agent.suspend",
+                "authored-suspend-action-request",
+                fence,
+                json!({"agent": WORKER}),
+            )
+            .await
+            .unwrap_err();
+            let ClientError::Api(code, message, envelope) = refused else {
+                panic!("{refused}")
+            };
+            assert_eq!(code, ErrorCode::SuspendAuthoredSessionSelection, "{message}");
+            assert!(message.contains("--resume"), "{message}");
+            assert_eq!(envelope.details["selector"], "--resume");
+            assert!(!envelope.retryable);
+            assert_eq!(daemon.store().index().unwrap(), before);
+            assert!(
+                st3::suspension::current(daemon.store(), WORKER)
+                    .unwrap()
+                    .is_none()
+            );
+            let running = daemon.store().status(Some(WORKER)).unwrap();
+            assert_eq!(
+                st3::model::projected_actual_status(running.subjects[0].actual.as_ref()),
+                Some("running")
+            );
+            daemon.restart().await;
+        }
+    }
+}
+
+/// Recreate a hold accepted by an older daemon and exercise the documented exit over the CLI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_authored_suspension_exits_with_stop_then_start() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let daemon = Daemon::new().await;
+    let transcript = daemon.root.path().join("native-copper.jsonl");
+    let contents = "{\"type\":\"session\",\"id\":\"authored-copper\"}\n";
+    std::fs::write(&transcript, contents).unwrap();
+    daemon.apply(&format!(
+        "version 2\nagent \"example/worker\" {{ host {NODE:?}; workspace {:?}; harness \"omp\" {{ args \"--resume\" {:?}; }} }}\n",
+        daemon.root.path().display().to_string(), transcript.display().to_string()
+    ), "legacy-authored-worker");
+    let declaration = daemon
+        .store()
+        .agent_declaration(WORKER, None)
+        .unwrap()
+        .unwrap();
+    let suspended = daemon
+        .store()
+        .append_claim(&ClaimInput {
+            subject: WORKER.into(),
+            kind: "runtime.action.requested".into(),
+            actor: Some(PERSON.into()),
+            fields: serde_json::from_value(
+                json!({"action": "suspend", "incarnation_id": "4242:fixture"}),
+            )
+            .unwrap(),
+            evidence: vec![declaration.0.clone()],
+            expected_subject: None,
+            idempotency_key: Some(format!("agent-suspend:{WORKER}:legacy-suspend")),
+        })
+        .unwrap();
+    // A retry of a suspend accepted before this preflight was installed still returns its
+    // original claim. It must bypass today's authored-selector and running-state refusals.
+    let before_retry = daemon.store().index().unwrap();
+    let retried: st3::model::ClaimRecord = daemon
+        .transport()
+        .post(
+            "/v1/agents/suspend",
+            &json!({
+                "subject": WORKER, "actor": PERSON, "idempotency_key": "legacy-suspend"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.id, suspended.id);
+    assert_eq!(retried.body, suspended.body);
+    assert_eq!(daemon.store().index().unwrap(), before_retry);
+    for (key, phase) in [
+        (
+            st3::suspension::suspend_snapshot_key(&suspended.id),
+            "snapshotting",
+        ),
+        (
+            st3::suspension::suspend_completed_key(&suspended.id),
+            "suspended",
+        ),
+    ] {
+        daemon.store().append_claim(&ClaimInput {
+            subject: WORKER.into(), kind: "runtime.action.succeeded".into(), actor: Some(PERSON.into()),
+            fields: serde_json::from_value(json!({"action": "suspend", "operation_status": phase, "harness": "omp", "native_session_id": "kept-copper"})).unwrap(),
+            evidence: vec![suspended.id.clone()], expected_subject: None, idempotency_key: Some(key),
+        }).unwrap();
+    }
+    cli_value(
+        daemon
+            .cli(PERSON, &["agents", "start", WORKER, "--as", PERSON])
+            .await,
+    );
+    assert_eq!(
+        st3::suspension::current(daemon.store(), WORKER)
+            .unwrap()
+            .unwrap()
+            .phase,
+        "suspended"
+    );
+    let refused = daemon
+        .transport()
+        .post::<_, Value>(
+            "/v1/agents/restart",
+            &json!({
+                "subject": WORKER, "actor": PERSON, "idempotency_key": "legacy-restart"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        st3::client::api_error_code(&refused),
+        Some("restart-suspended")
+    );
+    let message = refused.to_string();
+    assert!(
+        message.contains("st agents stop") && message.contains("st agents start"),
+        "{message}"
+    );
+    assert!(
+        message.contains("without preserving the suspended session"),
+        "{message}"
+    );
+    cli_value(
+        daemon
+            .cli(PERSON, &["agents", "stop", WORKER, "--as", PERSON])
+            .await,
+    );
+    assert!(
+        st3::suspension::current(daemon.store(), WORKER)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        daemon
+            .store()
+            .selected_desired_kind(WORKER)
+            .unwrap()
+            .as_deref(),
+        Some("stop")
+    );
+    cli_value(
+        daemon
+            .cli(PERSON, &["agents", "start", WORKER, "--as", PERSON])
+            .await,
+    );
+    assert_eq!(
+        daemon
+            .store()
+            .selected_desired_kind(WORKER)
+            .unwrap()
+            .as_deref(),
+        Some("agent")
+    );
+    assert!(
+        st3::suspension::current(daemon.store(), WORKER)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        daemon
+            .store()
+            .agent_declaration(WORKER, None)
+            .unwrap()
+            .unwrap()
+            .1,
+        declaration.1
+    );
+    assert_eq!(std::fs::read_to_string(transcript).unwrap(), contents);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_actions_refuse_before_and_after_restart_without_writes() {
     if st3::test_support::supervise_test() {

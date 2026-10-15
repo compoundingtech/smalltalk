@@ -16,6 +16,8 @@ for (const retired of ['Home', 'Agents', 'Missions', 'Chat', 'Control', 'Usage',
 assert.deepEqual(parseDevLink(`${scheme}session?id=session/abc&terminal=terminal/t`), { kind: 'session', id: 'session/abc', terminal: 'terminal/t' });
 assert.deepEqual(parseDevLink(`${scheme}agent?id=agent/example/stui`), { kind: 'agent', id: 'agent/example/stui' });
 assert.deepEqual(parseDevLink(`${scheme}mission?id=mission/x`), { kind: 'mission', id: 'mission/x' });
+assert.deepEqual(parseDevLink(`${scheme}attention?id=attention/gate`), { kind: 'attention', id: 'attention/gate' });
+assert.equal(parseDevLink(`${scheme}attention?id=mission/x`), null);
 assert.equal(parseDevLink(`${scheme}session?id=agent/x`), null);
 assert.equal(parseDevLink('not a url'), null);
 for (const tab of TABS) assert.equal(tabLabel(tab), tab);

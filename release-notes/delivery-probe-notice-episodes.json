@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep one delivery-probe outage notice and real-read recovery per persisted route episode across presence flaps and restarts.",
+  "replay": {"status": "none", "detail": "No graph replay. Existing saved ambiguous alert bodies and attention IDs retain exact retry semantics; already cleared historical alerts are not reconstructed."},
+  "schema": {"status": "none", "detail": "No daemon database schema or replicated report format change. Local probe state lazily adds one episode and at most two clear intents per configured route."},
+  "rules": {"status": "none", "detail": "No claim vocabulary, admission, checkpoint or retention rule changes. Only an actual correct-recipient read ends a notification episode."},
+  "compatibility": {"status": "changed", "detail": "Offline still pauses without failure or fabricated recovery. Resuming or refreshing a probe does not send another outage notice for the same episode. Saved request keys and bodies stay stable after ambiguous responses. Older probes ignore the new local episode fields and may reintroduce flap duplicates after downgrade."},
+  "manual": {"status": "none", "detail": "No manual state conversion. Actual installation requires the reviewed source and probe configuration pins."},
+  "recovery": {"status": "none", "detail": "Recipient reads clear the current episode; delivered, closed, wrong-actor reads and exchanges do not. Pending sends and consumed receipts remain durable."},
+  "downtime": {"status": "unknown", "detail": "Probe rollout is separate from this source change; no host or probe restart performed and no installed-source cause or native-runtime qualification claimed."}
+}

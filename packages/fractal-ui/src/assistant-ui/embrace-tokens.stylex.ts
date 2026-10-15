@@ -1,15 +1,17 @@
 import * as stylex from '@stylexjs/stylex'
-import { textVars, statusVars } from './composition-tokens.stylex'
 
 // Neutral defaults retain V1; the full-app exploration opts into token themes.
 // Group rule: one createTheme group per DOM path. Nested partial themes of the
 // same group reset unspecified vars to these defaults, so direction themes are
 // split across disjoint groups (palette/accent/transcript/composer/density/chrome).
+// Defaults resolve on :root, where the composition text/status vars hold their dark defaults, so an alias
+// such as `good: textVars.fgSoft` froze the light palette at the dark ink. The light defaults are concrete
+// (composition light fgSoft and diffAddTint); `darkTheme` keeps the aliases on its own themed element.
 export const tokens = stylex.defineVars({
   canvas: '#fafafa', panel: '#ffffff', recess: '#f3f3f3', ink: '#202020',
   muted: '#626262', line: '#d6d6d6', accent: '#303030', onAccent: '#ffffff',
-  selection: '#e6e6e6', good: textVars.fgSoft, warning: '#805510', danger: '#a42b36',
-  added: statusVars.diffAddTint, removed: '#f8e8e9',
+  selection: '#e6e6e6', good: 'rgba(39, 39, 42, 0.82)', warning: '#805510', danger: '#a42b36',
+  added: '#4269df', removed: '#f8e8e9',
 })
 
 /** Accent lives on its own group so a hue picker never re-resolves the palette. */

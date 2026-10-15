@@ -1573,10 +1573,9 @@ fn wrapperless_token(payload: &serde_json::Value) -> Option<String> {
 /// [`observe_writer`] selects: the wrapper's exported token when a wrapper launched this seat,
 /// otherwise Claude's own session id under the wrapperless prefix.
 ///
-/// The claim half of that selection is deliberately absent. `incarnation` on this record is
-/// PROVENANCE and is never consulted as a fence (HC-R15), so there is nothing here to claim —
-/// which is also why the status-line tee, which is not a hook and has no session boundary, can
-/// share the selection without sharing the takeover.
+/// This helper selects a token without claiming ownership. Native observation outboxes require
+/// it to match the current harness-state owner. Legacy context files retain provenance without
+/// fencing (HC-R15). The status-line tee shares this selection without taking over a session.
 fn context_writer(
     agent_dir: &Path,
     identity: &str,

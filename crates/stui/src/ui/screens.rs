@@ -12,6 +12,28 @@ use ratatui::text::{Line, Span};
 
 /// What Home says when nothing needs the person; setup's first-run test waits for it.
 pub const HOME_IDLE_TEXT: &str = "No alerts right now.";
+/// What Home and the alerts list say instead of "none" while the alerts they would show may be
+/// missing or old: st is catching up with a peer, or stopped serving the list or its live stream.
+pub const HOME_UNKNOWN_TEXT: &str = "No alerts known — this view is out of date.";
+
+/// Whether the alerts shown (or their absence) can be out of date, and why.
+fn alerts_out_of_date(world: &World) -> Option<String> {
+    let stale: Vec<&str> = world
+        .stale
+        .iter()
+        .map(String::as_str)
+        .filter(|why| why.starts_with("Attention") || why.starts_with("live stream"))
+        .collect();
+    if world.behind.is_empty() && stale.is_empty() {
+        return None;
+    }
+    let mut why = Vec::new();
+    if !world.behind.is_empty() {
+        why.push(format!("catching up: {}", world.behind.join("; ")));
+    }
+    why.extend(stale.iter().map(|why| (*why).to_owned()));
+    Some(why.join("; "))
+}
 
 /// The tabs everyone sees. Worktrees stays hidden until the graph models worktrees: its screens
 /// only have invented data to show (Nathan, 2026-09-28).
@@ -253,7 +275,11 @@ pub fn home_list(
         state: state_of(
             &world.attention,
             "Checking for alerts…",
-            "No alerts.",
+            if alerts_out_of_date(world).is_some() {
+                "No alerts known — out of date."
+            } else {
+                "No alerts."
+            },
         ),
         legend: legend(&[
             ("◆", theme::PERSON, "decide"),
@@ -738,10 +764,18 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             ),
             Load::Ready(_) => {
                 doc.blank();
-                doc.line(Line::from(vec![
-                    span("✓ ", theme::strong(theme::GREEN)),
-                    span(HOME_IDLE_TEXT, theme::bold()),
-                ]));
+                if let Some(why) = alerts_out_of_date(world) {
+                    doc.line(Line::from(vec![
+                        span("◐ ", theme::strong(theme::YELLOW)),
+                        span(HOME_UNKNOWN_TEXT, theme::bold()),
+                    ]));
+                    doc.wrap(&[run(why, theme::dim())], width);
+                } else {
+                    doc.line(Line::from(vec![
+                        span("✓ ", theme::strong(theme::GREEN)),
+                        span(HOME_IDLE_TEXT, theme::bold()),
+                    ]));
+                }
                 doc.blank();
                 doc.wrap(
                     &[run(

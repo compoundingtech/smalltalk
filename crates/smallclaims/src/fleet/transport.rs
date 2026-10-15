@@ -203,17 +203,29 @@ struct Finished {
 }
 
 async fn run_raw(program: &Path, arguments: &[&str]) -> Result<Finished> {
-    let output = tokio::time::timeout(
-        COMMAND_TIMEOUT,
-        tokio::process::Command::new(program)
-            .args(arguments)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .with_context(|| format!("{} {} timed out", program.display(), arguments.join(" ")))?
-    .with_context(|| format!("run {}", program.display()))?;
+    // Exec fails with "text file busy" while another process still holds the program open for
+    // writing: Fabric replaced by `fabric update`, or a file a sibling fork has not yet let go
+    // of. It clears within moments, so wait it out a few times instead of failing the call.
+    let mut busy = 0;
+    let output = loop {
+        let attempt = tokio::time::timeout(
+            COMMAND_TIMEOUT,
+            tokio::process::Command::new(program)
+                .args(arguments)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .with_context(|| format!("{} {} timed out", program.display(), arguments.join(" ")))?;
+        match attempt {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 5 => {
+                busy += 1;
+                tokio::time::sleep(Duration::from_millis(20 * busy)).await;
+            }
+            other => break other.with_context(|| format!("run {}", program.display()))?,
+        }
+    };
     Ok(Finished {
         success: output.status.success(),
         code: output.status.code(),
@@ -266,9 +278,9 @@ async fn run(program: &Path, arguments: &[&str]) -> Result<String> {
 }
 
 /// Fabric builds older than 0.2.41 have no `--json` and no error codes: they print the
-/// address or path alone and say a refusal only in words on stderr. This is the single place
-/// st still reads those words, and it turns them into the same [`FabricError`] a current
-/// build prints, so nothing downstream matches text.
+/// address, path, NodeID or tab-separated peer rows alone and say a refusal only in words on
+/// stderr. This is the single place st still reads that text, and it turns a refusal into the
+/// same [`FabricError`] a current build prints, so nothing downstream matches text.
 ///
 /// Remove this module, and `Ok(None)` from [`run_json`], once no fleet member runs Fabric
 /// older than 0.2.41. A member updates Fabric with `fabric update`, which is how a fleet
@@ -285,14 +297,35 @@ mod legacy {
         ("node is not in fabric allow-list", "peer_not_in_allow_list"),
     ];
 
+    /// `fabric peers` rows: a NodeID, the local name (possibly empty), and the peer's grants.
+    pub(super) fn parse_peers(printed: &str) -> Vec<(String, String)> {
+        printed
+            .lines()
+            .filter_map(|line| {
+                let mut columns = line.split('\t');
+                let node = columns.next()?.trim();
+                let name = columns.next().unwrap_or_default().trim();
+                (!node.is_empty()).then(|| (node.to_owned(), name.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The code the old words stand for, for a refusal said only in prose.
+    pub(super) fn refusal_code(text: &str) -> Option<&'static str> {
+        REFUSALS
+            .iter()
+            .find(|(words, _)| text.contains(words))
+            .map(|(_, code)| *code)
+    }
+
     pub(super) async fn run_dial(program: &Path, arguments: &[&str]) -> Result<String> {
         run(program, arguments).await.map_err(|error| {
             let Some(failure) = error.downcast_ref::<CommandFailure>() else {
                 return error;
             };
-            match REFUSALS.iter().find(|(words, _)| failure.0.contains(words)) {
-                Some((_, code)) => anyhow::Error::new(FabricError {
-                    code: (*code).into(),
+            match refusal_code(&failure.0) {
+                Some(code) => anyhow::Error::new(FabricError {
+                    code: code.into(),
                     class: FabricErrorClass::Refusal,
                     message: failure.0.clone(),
                     peer: None,
@@ -307,19 +340,6 @@ mod legacy {
 /// The addresses `tailscale ip` reports.
 pub async fn tailscale_addresses(tailscale: &Path) -> Result<Vec<IpAddr>> {
     Ok(parse_tailscale_ips(&run(tailscale, &["ip"]).await?))
-}
-
-/// `fabric peers` rows: a NodeID, the local name (possibly empty), and the peer's grants.
-fn parse_fabric_peers(printed: &str) -> Vec<(String, String)> {
-    printed
-        .lines()
-        .filter_map(|line| {
-            let mut columns = line.split('\t');
-            let node = columns.next()?.trim();
-            let name = columns.next().unwrap_or_default().trim();
-            (!node.is_empty()).then(|| (node.to_owned(), name.to_owned()))
-        })
-        .collect()
 }
 
 /// The default Fabric protocol for a fleet, so a throwaway fleet never collides with another.
@@ -362,7 +382,10 @@ impl Fabric {
 
     /// This machine's Fabric NodeID.
     pub async fn id(&self) -> Result<String> {
-        let id = run(&self.program, &["id"]).await?.trim().to_owned();
+        let id = match run_json(&self.program, &["id"]).await? {
+            Some(value) => value["id"].as_str().unwrap_or_default().to_owned(),
+            None => run(&self.program, &["id"]).await?.trim().to_owned(),
+        };
         anyhow::ensure!(!id.is_empty(), "fabric id printed nothing");
         Ok(id)
     }
@@ -403,7 +426,45 @@ impl Fabric {
 
     /// The trusted peers in Fabric's `peers.toml`, as NodeID and local name.
     pub async fn peers(&self) -> Result<Vec<(String, String)>> {
-        Ok(parse_fabric_peers(&run(&self.program, &["peers"]).await?))
+        let Some(value) = run_json(&self.program, &["peers"]).await? else {
+            return Ok(legacy::parse_peers(&run(&self.program, &["peers"]).await?));
+        };
+        let peers = value["peers"]
+            .as_array()
+            .context("fabric peers printed no peers")?;
+        Ok(peers
+            .iter()
+            .filter_map(|peer| {
+                let node = peer["node"].as_str().filter(|node| !node.is_empty())?;
+                Some((
+                    node.to_owned(),
+                    peer["name"].as_str().unwrap_or_default().to_owned(),
+                ))
+            })
+            .collect())
+    }
+
+    /// Whether the peer's Fabric refuses this machine for `protocol`, asked with a fresh
+    /// `fabric probe --json`. `dial` never connects, so a refusal reaches st only as a tunnel
+    /// that closes; the probe is what names it. `None` when the probe was answered by anything
+    /// else (supported, a fault, a timeout, an unknown peer) or could not be run.
+    pub async fn refusal(&self, node: &str, protocol: &str) -> Option<FabricGrantRefusal> {
+        let finished = run_raw(&self.program, &["probe", node, protocol, "--json"])
+            .await
+            .ok()?;
+        let answer: Value = serde_json::from_str(finished.stdout.trim()).ok()?;
+        // Fabric 0.2.41 puts `code` and `class` beside `outcome`; older builds only the
+        // words in `error`.
+        let code = match answer.get("class").and_then(Value::as_str) {
+            Some("refusal") => answer.get("code")?.as_str()?.to_owned(),
+            Some(_) => return None,
+            None => legacy::refusal_code(answer.get("error")?.as_str()?)?.to_owned(),
+        };
+        Some(FabricGrantRefusal {
+            node: node.into(),
+            protocol: protocol.into(),
+            code,
+        })
     }
 
     /// Ask Fabric for a local Unix socket that tunnels to a peer's exposed protocol and return
@@ -468,6 +529,36 @@ pub enum Route {
     Http(String),
     /// A Fabric peer and protocol; the worker dials a local tunnel for it.
     Fabric { node: String, protocol: String },
+}
+
+impl Route {
+    /// Classify the actual dial route, including config overrides. A Fabric tunnel's
+    /// ephemeral loopback URL must never be classified as a loopback carrier.
+    pub fn carrier(&self) -> crate::replication::ReplicationCarrier {
+        use crate::replication::ReplicationCarrier;
+        match self {
+            Self::Fabric { .. } => ReplicationCarrier::Fabric,
+            Self::Http(url) => {
+                let host = reqwest::Url::parse(url).ok().and_then(|url| {
+                    url.host_str()
+                        .map(|host| host.trim_matches(['[', ']']).to_owned())
+                });
+                match host.as_deref() {
+                    Some(host) if host.eq_ignore_ascii_case("localhost") => {
+                        ReplicationCarrier::Loopback
+                    }
+                    Some(host) => match host.parse::<IpAddr>() {
+                        Ok(address) if address.is_loopback() => ReplicationCarrier::Loopback,
+                        Ok(address) if is_tailnet_address(&address) => {
+                            ReplicationCarrier::Tailscale
+                        }
+                        _ => ReplicationCarrier::Unknown,
+                    },
+                    None => ReplicationCarrier::Unknown,
+                }
+            }
+        }
+    }
 }
 
 /// A lasting peer route. HTTP stays on loopback or the encrypted tailnet; Fabric names
@@ -572,6 +663,32 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
+    fn carrier_comes_from_the_dial_route_including_overrides() {
+        use crate::replication::ReplicationCarrier;
+        for (route, carrier) in [
+            ("http://127.0.0.1:4000", ReplicationCarrier::Loopback),
+            ("http://[::1]:4000", ReplicationCarrier::Loopback),
+            ("http://localhost:4000", ReplicationCarrier::Loopback),
+            ("http://100.101.102.103:4000", ReplicationCarrier::Tailscale),
+            (
+                "http://[fd7a:115c:a1e0::1]:4000",
+                ReplicationCarrier::Tailscale,
+            ),
+            ("fabric://birch/st3-peer-v1", ReplicationCarrier::Fabric),
+        ] {
+            assert_eq!(parse_route(route).unwrap().carrier(), carrier, "{route}");
+        }
+        assert_eq!(
+            Route::Http("http://example.invalid:4000".into()).carrier(),
+            ReplicationCarrier::Unknown
+        );
+        assert_eq!(
+            Route::Http("malformed".into()).carrier(),
+            ReplicationCarrier::Unknown
+        );
+    }
+
+    #[test]
     fn tailnet_ranges_are_exact() {
         for inside in ["100.64.0.1", "100.127.255.254", "fd7a:115c:a1e0::1"] {
             assert!(is_tailnet_address(&inside.parse().unwrap()), "{inside}");
@@ -647,7 +764,7 @@ mod tests {
         let fabric = Fabric::new(shim(
             root.path(),
             &format!(
-                "echo \"$@\" >> {log}\ncase \"$1\" in id) echo node-a;; dial) echo '{{\"address\":\"127.0.0.1:45678\"}}';; *) ;; esac",
+                "echo \"$@\" >> {log}\ncase \"$1\" in id) echo '{{\"id\":\"node-a\"}}';; dial) echo '{{\"address\":\"127.0.0.1:45678\"}}';; *) ;; esac",
                 log = log.display()
             ),
         ));
@@ -664,7 +781,7 @@ mod tests {
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
             calls,
-            "id\ndial node-b st3/fleet/x --tcp 127.0.0.1:0 --json\n\
+            "id --json\ndial node-b st3/fleet/x --tcp 127.0.0.1:0 --json\n\
              expose st3/fleet/x --tcp 127.0.0.1:31313\nunexpose st3/fleet/x\n"
         );
 
@@ -689,13 +806,13 @@ mod tests {
 
     #[tokio::test]
     async fn every_fabric_refusal_code_is_a_grant_refusal() {
-        let root = tempfile::tempdir().unwrap();
         // The last code is invented: Fabric adds codes, and its class is what st reads.
         for code in [
             "peer_not_permitted_for_service",
             "peer_not_in_allow_list",
             "invented_future_refusal",
         ] {
+            let root = tempfile::tempdir().unwrap();
             let error = fails_with(root.path(), code, "refusal", 77)
                 .dial("invented-leaf", "st3-peer-v1")
                 .await
@@ -711,7 +828,6 @@ mod tests {
 
     #[tokio::test]
     async fn every_fabric_fault_code_is_a_fabric_error_and_not_a_refusal() {
-        let root = tempfile::tempdir().unwrap();
         // The shim's stderr carries the old refusal words on purpose: with `--json` they are
         // free text for people, and the class decides.
         for (code, class, expected) in [
@@ -733,6 +849,7 @@ mod tests {
                 FabricErrorClass::Fault,
             ),
         ] {
+            let root = tempfile::tempdir().unwrap();
             let status = if class == "usage" { 2 } else { 69 };
             let error = fails_with(root.path(), code, class, status)
                 .dial("invented-leaf", "st3-peer-v1")
@@ -785,6 +902,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_older_fabric_without_json_still_names_itself_and_lists_its_peers() {
+        let root = tempfile::tempdir().unwrap();
+        let fabric = old_build(
+            root.path(),
+            "case \"$1\" in id) echo node-a;; \
+             peers) printf 'node-b\\tBox\\techo,st3/pty/x\\nnode-c\\t\\techo\\n';; esac",
+        );
+        assert_eq!(fabric.id().await.unwrap(), "node-a");
+        assert_eq!(
+            fabric.peers().await.unwrap(),
+            vec![
+                ("node-b".to_owned(), "Box".to_owned()),
+                ("node-c".to_owned(), String::new()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn id_and_peers_report_fabric_failures_by_code() {
+        let root = tempfile::tempdir().unwrap();
+        let down = fails_with(root.path(), "daemon_not_running", "fault", 69);
+        for error in [
+            down.id().await.unwrap_err(),
+            down.peers().await.unwrap_err(),
+        ] {
+            let fault = error.downcast_ref::<FabricError>().unwrap();
+            assert_eq!(fault.code, "daemon_not_running");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let empty = Fabric::new(shim(root.path(), "echo '{\"id\":\"\"}'"));
+        assert!(empty.id().await.is_err());
+    }
+
+    #[tokio::test]
     async fn an_older_fabric_without_json_still_dials_and_still_tells_a_refusal_from_a_fault() {
         let root = tempfile::tempdir().unwrap();
         let works = old_build(root.path(), "echo 127.0.0.1:45678");
@@ -799,6 +950,7 @@ mod tests {
             ),
             ("node is not in fabric allow-list", "peer_not_in_allow_list"),
         ] {
+            let root = tempfile::tempdir().unwrap();
             let refused = old_build(root.path(), &format!("echo '{words}' >&2; exit 1"));
             let error = refused
                 .dial("invented-leaf", "st3-peer-v1")
@@ -807,6 +959,7 @@ mod tests {
             let refusal = error.downcast_ref::<FabricGrantRefusal>().unwrap();
             assert_eq!(refusal.code, code);
         }
+        let root = tempfile::tempdir().unwrap();
         let away = old_build(root.path(), "echo 'peer offline' >&2; exit 1");
         assert!(
             !away
@@ -817,6 +970,94 @@ mod tests {
         );
     }
 
+    /// A shim answering `probe` with `stdout` and `status`, and failing any other command.
+    fn probes_with(root: &Path, stdout: &str, status: u8) -> Fabric {
+        Fabric::new(shim(
+            root,
+            &format!("case \"$1\" in probe) echo '{stdout}'; exit {status};; *) exit 1;; esac"),
+        ))
+    }
+
+    fn answer(outcome: &str, code: &str, class: &str, error: &str) -> String {
+        let quoted = |text: &str| {
+            if text.is_empty() {
+                "null".to_owned()
+            } else {
+                format!("\"{text}\"")
+            }
+        };
+        format!(
+            "{{\"peer\":\"invented-leaf\",\"peer_id\":\"abc\",\"protocol\":\"st3-peer-v1\",\
+             \"outcome\":\"{outcome}\",\"round_trip_micros\":null,\"transport\":null,\
+             \"error\":{},\"code\":{},\"class\":{}}}",
+            quoted(error),
+            quoted(code),
+            quoted(class)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_probe_names_a_refusal_by_its_code_and_nothing_else_is_one() {
+        for (stdout, status, expected) in [
+            (answer("unreachable", "peer_not_permitted_for_service", "refusal", "x"), 2, Some("peer_not_permitted_for_service")),
+            (answer("unreachable", "peer_not_in_allow_list", "refusal", "x"), 2, Some("peer_not_in_allow_list")),
+            (answer("unreachable", "invented_future_refusal", "refusal", "x"), 2, Some("invented_future_refusal")),
+            (answer("supported", "", "", ""), 0, None),
+            (answer("timeout", "timeout", "fault", "x"), 3, None),
+            (answer("unsupported", "service_not_exposed", "fault", "x"), 1, None),
+            // The prose is a refusal's words, but the code says fault, so the class decides.
+            (answer("unreachable", "unreachable", "fault", "peer not permitted for service"), 2, None),
+            (r#"{"error":{"code":"unknown_peer","class":"fault","message":"m","peer":"ghost","service":null}}"#.to_owned(), 64, None),
+            (String::new(), 64, None),
+            ("not json".to_owned(), 0, None),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let found = probes_with(root.path(), &stdout, status)
+                .refusal("invented-leaf", "st3-peer-v1")
+                .await;
+            assert_eq!(
+                found.as_ref().map(|refusal| refusal.code.as_str()),
+                expected,
+                "{stdout}"
+            );
+            if let Some(refusal) = found {
+                assert_eq!((refusal.node.as_str(), refusal.protocol.as_str()), ("invented-leaf", "st3-peer-v1"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_from_an_older_fabric_is_read_by_its_words() {
+        for (error, expected) in [
+            (
+                "peer not permitted for service \\\"st3-peer-v1\\\"",
+                Some("peer_not_permitted_for_service"),
+            ),
+            (
+                "node is not in fabric allow-list",
+                Some("peer_not_in_allow_list"),
+            ),
+            ("connection reset", None),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            // No `code` or `class` keys at all, as before Fabric 0.2.41.
+            let stdout =
+                format!(r#"{{"peer":"invented-leaf","outcome":"unreachable","error":"{error}"}}"#);
+            let found = probes_with(root.path(), &stdout, 2)
+                .refusal("invented-leaf", "st3-peer-v1")
+                .await;
+            assert_eq!(
+                found.as_ref().map(|refusal| refusal.code.as_str()),
+                expected,
+                "{error}"
+            );
+        }
+        // A Fabric with no `probe` at all is not a refusal either.
+        let root = tempfile::tempdir().unwrap();
+        let none = Fabric::new(shim(root.path(), "exit 2"));
+        assert!(none.refusal("invented-leaf", "p").await.is_none());
+    }
+
     #[tokio::test]
     async fn a_pty_route_exposes_a_socket_and_dials_a_unix_socket() {
         let root = tempfile::tempdir().unwrap();
@@ -825,7 +1066,7 @@ mod tests {
             root.path(),
             &format!(
                 "echo \"$@\" >> {log}\ncase \"$1\" in \
-                 peers) printf 'node-b\\tBox\\techo,st3/pty/x\\nnode-c\\t\\techo\\n';; \
+                 peers) echo '{{\"peers\":[{{\"node\":\"node-b\",\"name\":\"Box\",\"allow\":[\"echo\",\"st3/pty/x\"]}},{{\"node\":\"node-c\",\"name\":null,\"allow\":[\"echo\"]}}]}}';; \
                  dial) echo '{{\"socket\":\"/run/fabric/dials/node-b.sock\"}}';; *) ;; esac",
                 log = log.display()
             ),
@@ -853,7 +1094,7 @@ mod tests {
         assert_eq!(
             calls,
             "expose st3/pty/x --socket /run/st/terminals.sock\n\
-             expose st3/pty/x --exec -- /bin/st terminals serve-fabric\npeers\n\
+             expose st3/pty/x --exec -- /bin/st terminals serve-fabric\npeers --json\n\
              dial node-b st3/pty/x --json\n"
         );
 

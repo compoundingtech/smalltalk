@@ -94,8 +94,15 @@ struct Screen {
     parser: Processor,
     /// Why the session is over, once it is.
     ended: Option<String>,
-    /// When the stream dropped while the program still ran, so stui can attach again.
-    dropped_at: Option<Instant>,
+    /// Why the stream dropped while the program still ran, until it attaches again.
+    lost: Option<String>,
+    /// When stui next tries to attach again; `None` while a try is under way or nothing is lost.
+    retry_at: Option<Instant>,
+    /// Tries to attach again since the stream last stayed attached: each waits twice as long
+    /// as the one before, up to `RETRY_MAX`.
+    tries: u32,
+    /// When the stream last attached: one that stayed a while starts the waits over.
+    attached_at: Option<Instant>,
     /// Whether the first screen has arrived.
     attached: bool,
     /// When output last arrived, so stui can draw more often while it flows.
@@ -122,7 +129,10 @@ impl Screen {
             term: Term::new(config, &size, requests.clone()),
             parser: Processor::new(),
             ended: None,
-            dropped_at: None,
+            lost: None,
+            retry_at: None,
+            tries: 0,
+            attached_at: None,
             attached: false,
             output_at: None,
             requests,
@@ -209,23 +219,56 @@ impl NativeTerminal {
         {
             let mut screen = self.lock();
             screen.ended = None;
-            screen.dropped_at = None;
+            screen.retry_at = None;
             screen.attached = false;
         }
         let input = start(stream, name, size, &self.screen);
         *self.input.lock().unwrap_or_else(|error| error.into_inner()) = input;
     }
 
-    /// When the stream dropped while the program still ran.
-    pub(crate) fn dropped(&self) -> Option<Instant> {
-        self.lock().dropped_at
+    /// Why the stream dropped while the program still ran, until it attaches again.
+    pub(crate) fn lost(&self) -> Option<String> {
+        self.lock().lost.clone()
+    }
+
+    /// How a lost stream is getting back: the tries so far, and when the next one is (`None`
+    /// while one is under way).
+    pub(crate) fn reconnecting(&self) -> Option<(u32, Option<Instant>)> {
+        let screen = self.lock();
+        screen.lost.as_ref()?;
+        Some((screen.tries, screen.retry_at))
+    }
+
+    /// Whether a lost stream's next try is due; it is then under way, and is not due again until
+    /// `reconnect` or `retry_failed` says how it went. Each try waits longer than the last, so a
+    /// link that stays down costs one try a while, never a loop.
+    pub(crate) fn take_reattach(&self) -> bool {
+        let mut screen = self.lock();
+        if screen.retry_at.is_some_and(|at| Instant::now() >= at) {
+            screen.retry_at = None;
+            screen.tries += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A try to attach again could not reach the session: wait longer, then try again.
+    pub(crate) fn retry_failed(&self, reason: String) {
+        let mut screen = self.lock();
+        if screen.ended.is_some() {
+            return;
+        }
+        screen.lost = Some(reason);
+        screen.retry_at = Some(Instant::now() + retry_delay(screen.tries));
     }
 
     /// The reconnect failed for good: say why, and stop trying.
     pub(crate) fn give_up(&self, reason: String) {
         let mut screen = self.lock();
         screen.ended = Some(reason);
-        screen.dropped_at = None;
+        screen.lost = None;
+        screen.retry_at = None;
     }
 
     fn send(&self, input: Input) {
@@ -629,13 +672,29 @@ fn start(
     input
 }
 
+/// The longest wait between tries to attach a lost stream again.
+const RETRY_MAX: Duration = Duration::from_secs(32);
+
+/// The wait before the try after `tries` tries: one second, then twice the last, up to
+/// `RETRY_MAX`.
+pub(crate) fn retry_delay(tries: u32) -> Duration {
+    Duration::from_secs(1 << tries.min(5)).min(RETRY_MAX)
+}
+
 /// The stream is gone but the program may still run: say so, and let stui attach again.
 fn dropped(screen: &mut Screen, reason: String) {
-    if screen.dropped_at.is_none() {
+    if screen.lost.is_none() {
         super::slo::METRICS.add("dead_terminal_tabs", 1);
     }
-    screen.ended = Some(format!("{reason}; attaching again…"));
-    screen.dropped_at = Some(Instant::now());
+    // A stream that attached and stayed is a new loss; one that dropped at once is the same one.
+    if screen
+        .attached_at
+        .is_some_and(|at| at.elapsed() >= RETRY_MAX)
+    {
+        screen.tries = 0;
+    }
+    screen.lost = Some(reason);
+    screen.retry_at = Some(Instant::now() + retry_delay(screen.tries));
 }
 
 /// The attach thread: ATTACH at `size`, then feed what the session sends into the screen and
@@ -674,6 +733,8 @@ fn run(
         protocol.write(&replay);
         screen.feed(&replay);
         screen.attached = true;
+        screen.lost = None;
+        screen.attached_at = Some(Instant::now());
     }
     loop {
         loop {
@@ -733,6 +794,7 @@ fn run(
                     columns: screen.term.columns() as u16,
                 };
                 let requests = screen.requests.clone();
+                let (tries, attached_at) = (screen.tries, screen.attached_at);
                 let cell = protocol.cell_size();
                 protocol = TerminalActor::new(size.rows, size.columns, HISTORY);
                 protocol.enable_graphics(pty_terminal::GraphicsOptions {
@@ -741,6 +803,8 @@ fn run(
                 });
                 protocol.write(&bytes);
                 *screen = Screen::new(size, requests);
+                screen.tries = tries;
+                screen.attached_at = attached_at;
                 screen.attached = true;
                 screen.feed(&bytes);
             }
@@ -1092,6 +1156,13 @@ mod tests {
     }
 
     #[test]
+    fn tries_to_attach_again_wait_longer_each_time_and_never_more_than_the_most() {
+        let waits: Vec<u64> = (0..8).map(|tries| retry_delay(tries).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 32, 32]);
+        assert_eq!(retry_delay(u32::MAX), RETRY_MAX);
+    }
+
+    #[test]
     fn protocol_modes_control_key_encoding() {
         let mut term = TerminalActor::new(24, 80, 0);
         let encode = |term: &TerminalActor, code, modifiers| {
@@ -1151,16 +1222,28 @@ mod tests {
         wait(&|| shown(&terminal).contains("old 9"));
         // The stream drops; the program did not exit.
         drop(daemon);
-        wait(&|| terminal.dropped().is_some());
-        assert!(terminal.ended().unwrap().contains("attaching again"));
+        wait(&|| terminal.lost().is_some());
+        // Lost is not ended: the program still runs, and stui says it is getting back to it.
+        assert!(terminal.ended().is_none());
+        assert_eq!(terminal.reconnecting().unwrap().0, 0);
+        assert!(!terminal.take_reattach(), "the first try waits a second");
+        // A try that cannot reach the session waits twice as long before the next.
+        std::thread::sleep(retry_delay(0));
+        assert!(terminal.take_reattach());
+        assert!(!terminal.take_reattach(), "one try at a time");
+        terminal.retry_failed("unreachable".into());
+        let (tries, next) = terminal.reconnecting().unwrap();
+        assert_eq!(tries, 1);
+        assert!(next.unwrap() > Instant::now() + Duration::from_millis(1500));
+        assert_eq!(terminal.lost().as_deref(), Some("unreachable"));
         let (stui, mut daemon) = UnixStream::pair().unwrap();
         terminal.reconnect(stui, "test");
         let _ = daemon.read(&mut bytes).unwrap();
         daemon
             .write_all(&encode_packet(MessageType::Screen, b"new\r\n"))
             .unwrap();
-        wait(&|| shown(&terminal).contains("new") && terminal.ended().is_none());
-        assert!(terminal.dropped().is_none());
+        wait(&|| shown(&terminal).contains("new") && terminal.lost().is_none());
+        assert!(terminal.ended().is_none() && terminal.reconnecting().is_none());
         // What scrolled off before the drop is still there to scroll back to.
         terminal.wheel(
             20,

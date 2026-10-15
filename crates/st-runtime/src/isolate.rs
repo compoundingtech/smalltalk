@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
+mod retirement;
+pub use retirement::{CgroupEnding, ScopeRetirementProof, end_scope_with_proof};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
     Scope,

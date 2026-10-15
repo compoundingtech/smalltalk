@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Avoid claim-history enumeration in runtime roster reads",
+  "replay": { "status": "none", "detail": "Existing claims and projections are read unchanged. No replay is required." },
+  "schema": { "status": "none", "detail": "No stored schema changes." },
+  "rules": { "status": "none", "detail": "Runtime resources retain canonical status authority but do not compute unused claim vectors or session summaries. Full, summary, runtime and agent-card reductions have independent cache entries, all invalidated when views are forgotten or repaired. Status reduction modes appear as named SQL profile phases. Machine lists reuse the runtime optimization but still project the complete roster before applying their response limit; actual-observation folds remain history-dependent." },
+  "compatibility": { "status": "none", "detail": "Public status vectors, runtime resources, pinned snapshots and cancellation semantics are unchanged." },
+  "downtime": { "status": "none", "detail": "No downtime is required." },
+  "manual": { "status": "none", "detail": "No manual migration is required." },
+  "recovery": { "status": "none", "detail": "Older binaries can read the unchanged claims." }
+}

@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Prove a stalled fixture dumps evidence, fails, and is reaped by its guardian."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = Path(__file__).resolve().parent
+
+
+@unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux guardian proof")
+class DiagnosticsTests(unittest.TestCase):
+    def run_fixture(self, root, code):
+        env = dict(os.environ)
+        for key in ("ST_AGENT", "ST3_SUBJECT"):
+            env.pop(key, None)
+        return subprocess.run([
+            sys.executable, str(HERE / "st3_test_process.py"), "--",
+            sys.executable, str(HERE / "st3_fleet_leave_diagnostics.py"),
+            "--seconds", "2", "--root", str(root), "--",
+            sys.executable, "-c", code,
+        ], env=env, capture_output=True, text=True, timeout=10)
+
+    def test_timeout_dumps_live_tree_phase_trace_and_reaps_detached_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = '''
+import json, os, subprocess, sys, time
+from pathlib import Path
+root = Path(os.environ['SMALLTALK_FLEET_LEAVE_DIAGNOSTICS'])
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'],
+                         start_new_session=True)
+(root / 'a').mkdir()
+(root / 'a/daemon.stderr.log').write_text('retained daemon trace\\n')
+(root / 'phase.txt').write_text('fleet leave CLI on b')
+(root / 'pids.json').write_text(json.dumps([os.getpid(), child.pid]))
+time.sleep(600)
+'''
+            result = self.run_fixture(root, code)
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertIn("test exceeded 2s", result.stderr)
+            self.assertIn("fleet leave CLI on b", result.stderr)
+            self.assertIn("retained daemon trace", result.stderr)
+            self.assertIn("owned process tree (before cleanup)", result.stderr)
+            for pid in json.loads((root / "pids.json").read_text()):
+                self.assertIn(f'"pid": {pid}', result.stderr)
+                self.assertFalse(Path(f"/proc/{pid}").exists(), f"owned child {pid} leaked")
+
+    def test_success_and_ordinary_failure_keep_the_child_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for status in (0, 7):
+                result = self.run_fixture(Path(directory), f"raise SystemExit({status})")
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual("diagnostic failure" in result.stderr, status != 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

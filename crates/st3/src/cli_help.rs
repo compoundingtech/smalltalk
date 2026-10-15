@@ -45,6 +45,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "doctor",
             "admission",
             "rules",
+            "tiles",
             "repair",
             "uninstall",
         ],
@@ -145,6 +146,9 @@ pub(super) fn agent_state(
         "down" => "Down — st sees no running session for the agent; `st agents show` says since when.".into(),
         "suspended" => {
             "Suspended — the agent stopped at a quiet moment; `st agents resume` brings back its session.".into()
+        }
+        "waiting" if reachability == "indeterminate" => {
+            "Unknown — st cannot tell which host runs this agent; its processes may be running. `st terminals` says the same until the claims agree.".into()
         }
         "waiting" if reachability != "reachable" => {
             "Still starting — the agent process cannot currently be reached.".into()
@@ -395,6 +399,17 @@ mod tests {
     fn an_unreachable_agent_does_not_imply_a_login_prompt() {
         let state = agent_state("waiting", Some("ready"), None, "unreachable");
         assert!(state.contains("cannot currently be reached"));
+    }
+
+    #[test]
+    fn an_agent_on_an_undecided_host_says_st_cannot_tell() {
+        let state = agent_state("waiting", Some("indeterminate"), None, "indeterminate");
+        assert!(state.contains("cannot tell which host runs this agent"));
+        assert!(!state.contains("Still starting"));
+        assert!(!state.contains("Waiting for you"));
+        for other in ["unreachable", "remote", "unknown"] {
+            assert!(agent_state("waiting", Some("ready"), None, other).starts_with("Still starting"), "{other}");
+        }
     }
 
     #[test]

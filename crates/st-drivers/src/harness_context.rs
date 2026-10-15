@@ -510,8 +510,9 @@ impl Writer {
         })
     }
 
-    /// Adopt the session's incarnation token, so sibling writer processes of one session agree on
-    /// the provenance they publish. Provenance only: nothing is fenced on it.
+    /// Adopt the session's incarnation token so sibling writers publish the same provenance.
+    /// Native observation outboxes require this token to match the current harness-state owner;
+    /// legacy context files retain provenance without fencing.
     pub fn with_session(mut self, token: impl Into<String>) -> Self {
         self.session = token.into();
         self

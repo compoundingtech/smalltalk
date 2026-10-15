@@ -54,7 +54,7 @@ for wrong in [shards[:3], shards+[set()], [set(),*shards[1:]],
 with tempfile.TemporaryDirectory() as temp:
     scratch = Path(temp)
     cargo = scratch / "cargo"
-    cargo.write_text('#!/usr/bin/env python3\nimport json, os, sys\nif sys.argv[1:2] == ["metadata"]: print(json.dumps({"workspace_members": [], "packages": []})); sys.exit(0)\nwith open(os.environ["CALLS"], "a") as stream: stream.write(json.dumps(sys.argv[1:]) + "\\n")\nsys.exit(1 if "--workspace" in sys.argv else 0)\n')
+    cargo.write_text('#!' + sys.executable + '\nimport json, os, sys\nif sys.argv[1:2] == ["metadata"]: print(json.dumps({"workspace_members": [], "packages": []})); sys.exit(0)\nwith open(os.environ["CALLS"], "a") as stream: stream.write(json.dumps(sys.argv[1:]) + "\\n")\nsys.exit(1 if "--workspace" in sys.argv else 0)\n')
     cargo.chmod(0o755)
     for action, extra, shard in [(action, extra, shard) for action,extra in [("run", []), ("run", ["--no-run"]), ("list", ["--message-format", "json"])] for shard in ("hash:2/2", "hash:1/4", "hash:2/4", "hash:3/4", "hash:4/4")]:
         calls = scratch / "calls"
@@ -76,7 +76,7 @@ with tempfile.TemporaryDirectory() as temp:
     metadata = scratch / 'extracted/workspace/target/nextest/cargo-metadata.json'
     metadata.parent.mkdir(parents=True)
     metadata.write_text(json.dumps({"workspace_members": [], "packages": []}))
-    cargo.write_text('#!/usr/bin/env python3\nimport json, os, sys\nif sys.argv[1:2] == ["metadata"]: print(json.dumps({"workspace_members": [], "packages": []})); sys.exit(0)\nwith open(os.environ["CALLS"], "a") as stream: stream.write(json.dumps(sys.argv[1:]) + "\\n")\nsys.exit(1 if "/workspace/" in " ".join(sys.argv) else 0)\n')
+    cargo.write_text('#!' + sys.executable + '\nimport json, os, sys\nif sys.argv[1:2] == ["metadata"]: print(json.dumps({"workspace_members": [], "packages": []})); sys.exit(0)\nwith open(os.environ["CALLS"], "a") as stream: stream.write(json.dumps(sys.argv[1:]) + "\\n")\nsys.exit(1 if "/workspace/" in " ".join(sys.argv) else 0)\n')
     result = subprocess.run(['bash', 'scripts/ci-nextest', 'run'], cwd=root, env=env, capture_output=True)
     commands = [json.loads(line) for line in calls.read_text().splitlines() if json.loads(line)[0] == "nextest"]
     assert result.returncode == 1 and len(commands) == 1

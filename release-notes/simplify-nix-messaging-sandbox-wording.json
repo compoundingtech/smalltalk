@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Describe where the Nix messaging compatibility binary is resolved inside the sandbox.",
+  "replay": {
+    "status": "none",
+    "detail": "none"
+  },
+  "schema": {
+    "status": "none",
+    "detail": "none"
+  },
+  "rules": {
+    "status": "none",
+    "detail": "none"
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "none"
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "none"
+  },
+  "manual": {
+    "status": "none",
+    "detail": "none"
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "none"
+  }
+}

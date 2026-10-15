@@ -1504,8 +1504,18 @@ mod retry_tests {
         })
         .await
         .expect("a refused Fabric route must not block the HTTP fallback");
+        use crate::replication::ReplicationCarrier;
+        let (success, failure) = stores[1].replication_peer_transport("cobalt");
+        assert_eq!(success.unwrap().carrier, ReplicationCarrier::Loopback);
+        let failed_fabric = failure.unwrap();
+        assert_eq!(failed_fabric.carrier, ReplicationCarrier::Fabric);
+        assert_eq!(failed_fabric.fabric_route.as_deref(), Some("unknown"));
         // A changed membership route is usable immediately, despite the grant cooldown.
-        let before_route_change = stores[1].replication_peer_last_success("cobalt").unwrap();
+        let before_route_change = stores[1]
+            .replication_peer_transport("cobalt")
+            .0
+            .unwrap()
+            .at_unix_ms;
         std::fs::write(&grant, addresses[2].to_string()).unwrap();
         routes[2].send_replace(vec![Route::Fabric {
             node: "cobalt-new-route".into(),
@@ -1513,14 +1523,15 @@ mod retry_tests {
         }]);
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
+                // An incoming exchange can advance last-seen before the changed route
+                // completes. Wait for this dial's own carrier evidence, not reachability.
                 if stores[1]
-                    .replication_status(true, Some(fleet_id), &["cobalt".into()])
-                    .unwrap()
-                    .peers[0]
-                    .status
-                    == "up"
-                    && stores[1].replication_peer_last_success("cobalt").unwrap()
-                        > before_route_change
+                    .replication_peer_transport("cobalt")
+                    .0
+                    .is_some_and(|record| {
+                        record.carrier == ReplicationCarrier::Fabric
+                            && record.at_unix_ms > before_route_change
+                    })
                 {
                     return;
                 }
@@ -1529,9 +1540,133 @@ mod retry_tests {
         })
         .await
         .expect("a changed route must interrupt the refusal cooldown");
+        let (success, failure) = stores[1].replication_peer_transport("cobalt");
+        let fabric_success = success.unwrap();
+        assert_eq!(
+            fabric_success.carrier,
+            ReplicationCarrier::Fabric,
+            "the tunnel URL is loopback, the carrier is Fabric"
+        );
+        assert_eq!(fabric_success.fabric_route.as_deref(), Some("unknown"));
+        assert_eq!(
+            failure,
+            Some(failed_fabric),
+            "later success retains the earlier failed route"
+        );
+
         for task in tasks {
             task.abort();
             let _ = task.await;
+        }
+    }
+
+    /// `fabric dial` never connects, so a member's refusal reaches the worker as a tunnel that
+    /// closes. The worker then asks `fabric probe --json`, and only a refusal class puts the
+    /// route to sleep.
+    #[tokio::test]
+    async fn a_tunnel_that_closes_is_a_refusal_only_when_the_probe_says_so() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fleet_id = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let auth = FleetAuth::test(fleet_id, &[37; 32]);
+        let answer = |outcome: &str, code: &str, class: &str| {
+            format!(
+                "{{\"peer\":\"amber\",\"outcome\":\"{outcome}\",\"error\":\"fabric:{code} words\",\"code\":\"{code}\",\"class\":\"{class}\"}}"
+            )
+        };
+        for (probe, refused) in [
+            (
+                answer("unreachable", "peer_not_permitted_for_service", "refusal"),
+                true,
+            ),
+            (
+                answer("unreachable", "peer_not_in_allow_list", "refusal"),
+                true,
+            ),
+            (answer("unreachable", "unreachable", "fault"), false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(plain_open(&root.path().join("indigo.db"), "indigo").unwrap());
+            store.bind_fleet(fleet_id).unwrap();
+            // A tunnel that accepts and closes at once, as a refused one does.
+            let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = dead.local_addr().unwrap();
+            let closer = tokio::spawn(async move {
+                loop {
+                    let _ = dead.accept().await;
+                }
+            });
+            let probes = root.path().join("probes");
+            let program = root.path().join("fabric");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  dial) echo '{{\"address\":\"{address}\"}}';;\n  probe) echo \"$2\" >> '{}'; echo '{probe}'; exit 2;;\nesac\n",
+                    probes.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut context = FleetContext::legacy(["amber".into()].into());
+            context.fabric = Some(Fabric::new(program));
+            let (_routes, receiver) = watch::channel(vec![Route::Fabric {
+                node: "amber".into(),
+                protocol: "st3-peer-v1".into(),
+            }]);
+            let wake = watch::channel(0).0;
+            let worker = tokio::spawn(dial_peer(
+                Local(store.clone()),
+                "indigo".into(),
+                "amber".into(),
+                receiver,
+                auth.clone(),
+                context,
+                wake.subscribe(),
+            ));
+            // Wait until the worker has asked Fabric what the closed tunnel meant.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while std::fs::read_to_string(&probes)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{probe}: the probe was never asked"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let peer = store
+                .replication_status(true, Some(fleet_id), &["amber".into()])
+                .unwrap()
+                .peers
+                .remove(0);
+            let failed = peer
+                .last_failed_exchange
+                .as_ref()
+                .expect("the closed Fabric tunnel records its attempted carrier");
+            assert_eq!(failed.carrier, crate::replication::ReplicationCarrier::Fabric, "{probe}");
+            assert_eq!(failed.fabric_route.as_deref(), Some("unknown"), "{probe}");
+            assert!(peer.last_successful_exchange.is_none(), "{probe}");
+            if refused {
+                assert_eq!(peer.status, "refused", "{probe}");
+                assert!(peer.last_error.is_none());
+                assert!(
+                    peer.refusal_reason
+                        .as_ref()
+                        .unwrap()
+                        .contains("that member's Fabric grants")
+                );
+                // Asleep: more time passes and the probe is not asked again.
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let asked = std::fs::read_to_string(&probes).unwrap().lines().count();
+                assert_eq!(asked, 1, "{probe}");
+            } else {
+                assert_ne!(peer.status, "refused", "{probe}");
+                assert!(peer.refusal_reason.is_none(), "{probe}");
+            }
+            worker.abort();
+            closer.abort();
         }
     }
 
@@ -2032,10 +2167,11 @@ impl Backend for SlowExport {
         fleet_id: &str,
         exchange: &ReplicationExchange,
         round_trip: Option<Duration>,
+        carrier: crate::replication::ReplicationCarrier,
     ) -> Result<ReplicationReceiveResponse> {
         let result = self
             .local
-            .receive(peer, fleet_id, exchange, round_trip)
+            .receive(peer, fleet_id, exchange, round_trip, carrier)
             .await?;
         self.receives
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2065,8 +2201,16 @@ impl Backend for SlowExport {
     async fn fleet_view(&self) -> Result<FleetView> {
         self.local.fleet_view().await
     }
-    async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
-        self.local.record_failure(peer, status, error).await
+    async fn record_failure(
+        &self,
+        peer: &str,
+        status: &str,
+        error: &str,
+        carrier: Option<crate::replication::ReplicationCarrier>,
+    ) -> Result<()> {
+        self.local
+            .record_failure(peer, status, error, carrier)
+            .await
     }
 }
 
@@ -2217,7 +2361,7 @@ async fn slow_export_returns_signed_overload_and_preserves_interrupted_receipt()
     );
     assert_eq!(backend.receives.load(Ordering::Relaxed), 1);
     Local(left.clone())
-        .receive("cedar", fleet_id, &answer, None)
+        .receive("cedar", fleet_id, &answer, None, Default::default())
         .await
         .unwrap();
     for store in [&left, &right] {

@@ -1,5 +1,11 @@
 # Git change reads
 
+> **Status: on hold, do not use yet (Nathan, 2026-10-14).** All changes-in-git work is on hold. Nothing in
+> this document is in use, enabled anywhere, or a supported workflow. The feature stays off by default, no
+> commit in this repository carries a change id trailer or marker, and no write command, route, pilot or
+> Change-Id convention is approved. Do not enable the `[changes]` configuration. The read-only code stays
+> in place unused until the work is explicitly resumed.
+
 `st changes list`, `show` and explicit `sync` use configured Git transport and the
 node-local graph index. They use no GitHub API. The existing PR workflow remains
 available when Git or its designated reader is unavailable.

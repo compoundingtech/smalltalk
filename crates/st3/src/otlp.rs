@@ -137,7 +137,7 @@ impl OtlpExporter {
             self.send(&self.traces_url, &traces).await?;
         }
         let store = store.clone();
-        tokio::task::spawn_blocking(move || store.set_otlp_export_cursor(last)).await??;
+        store.connection.write_workers().spawn_blocking(move || store.set_otlp_export_cursor(last)).await??;
         Ok(ExportOutcome {
             exported: batch.len(),
             skipped,

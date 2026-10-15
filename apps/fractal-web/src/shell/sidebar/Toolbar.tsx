@@ -164,7 +164,7 @@ export const SidebarToolbar = ({
       <div ref={search}>
         <Input
           aria-label="Search agents and folders"
-          aria-description="Use machine:dev3 or host:dev3,dev5 to filter by host; combine with search text."
+          aria-description="Use machine:synthetic-138/1 or host:synthetic-138/1,synthetic-138/2 to filter by host; combine with search text."
           placeholder="Search agents…  /"
           size="sm"
           value={filters.query}

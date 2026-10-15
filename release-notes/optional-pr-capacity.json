@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Stop automatic optional Performance and Nix PR runs to reduce CI queue demand; retain main Performance, scheduled and manual runs, and Nix tag builds.",
+  "replay": {
+    "status": "none",
+    "detail": "No runtime replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No runtime authority changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Required Workspace CI tests and deterministic cost checks are unchanged. Existing queued runs retain their original workflow; no cancellation or rerun is included."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Workflow source change only."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Restoring PR triggers needs source review and a capacity decision; optional jobs remain available by manual dispatch."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Revert this workflow change to restore automatic PR triggers."
+  }
+}

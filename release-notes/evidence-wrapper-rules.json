@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add wrapper-kind rules for linux-gate and mail-redelivery-canaries to the evidence skip policy",
+  "replay": {"status": "none", "detail": "No daemon replay change."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change; two entries in a policy file read from the accepted base."},
+  "rules": {"status": "none", "detail": "No required check, daemon rule or main landing change. The gate still decides only; no job consumes the decision."},
+  "compatibility": {"status": "none", "detail": "Policy data only; existing observed rules are unchanged."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "Nothing to do."},
+  "recovery": {"status": "none", "detail": "Removing the two wrapper entries restores observed-only acceptance."}
+}

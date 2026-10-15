@@ -16,11 +16,12 @@ import { describe, expect, it, vi } from 'vitest'
 // Node tests stub only the CSS runtime (see ConversationPane tests). This stub keeps the one
 // fact under test observable: each style a component applies through stylex.props becomes a
 // `stylex:<key>` class, and a key missing from stylex.create applies nothing.
-vi.mock('@stylexjs/stylex', () => {
+vi.mock('@stylexjs/stylex', async () => {
   type Applied = string | false | null | undefined | readonly Applied[]
   const classNames = (style: Applied): readonly string[] =>
     typeof style === 'string' ? [style] : Array.isArray(style) ? style.flatMap(classNames) : []
   return {
+    ...await import('../testStylex.ts'),
     create: (styles: Readonly<Record<string, unknown>>) =>
       Object.fromEntries(
         Object.entries(styles).map(([key, style]) => [
@@ -28,9 +29,6 @@ vi.mock('@stylexjs/stylex', () => {
           typeof style === 'function' ? () => `stylex:${key}` : `stylex:${key}`,
         ]),
       ),
-    defineVars: (variables: unknown) => variables,
-    createTheme: () => ({}),
-    keyframes: () => 'test-animation',
     props: (...styles: readonly Applied[]) => ({ className: classNames(styles).join(' ') }),
   }
 })

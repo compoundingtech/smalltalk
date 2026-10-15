@@ -1752,9 +1752,23 @@ fn allocator_reclamation_follows_checkpoint_plan_view_and_proof_errors_once() {
     assert_eq!(after.1 - before.1, u64::from(cfg!(all(target_os = "linux", target_env = "gnu"))));
 
     let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    let staged = store.checkpoint_staged_set(cut, None, &scratch.path().join("plan")).unwrap();
+    let staged_path = staged.path.clone();
+    let captured = store.checkpoint_plan_view_from_staged(cut, staged, scratch.path()).unwrap();
+    assert!(!staged_path.exists(), "successful proof removes its dry-run staging file");
+    assert_eq!(serde_json::to_value(&captured).unwrap(), serde_json::to_value(&view).unwrap());
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
+        "the separately scheduled captured plan retains its outer reclamation boundary");
     let plan = plan_drops(&sealed);
     let blocked = scratch.path().join("not-a-directory");
     std::fs::write(&blocked, b"occupied").unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    let staged = store.checkpoint_staged_set(cut, None, &scratch.path().join("plan")).unwrap();
+    let staged_path = staged.path.clone();
+    assert!(store.checkpoint_plan_view_from_staged(cut, staged, &blocked).is_err());
+    assert!(!staged_path.exists(), "failed proof removes its dry-run staging file");
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1);
     let before = allocator_reclaim_stats_for_test();
     assert!(store.prove_checkpoint_plan(&sealed, &plan, &blocked).is_err());
     assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
@@ -1766,6 +1780,35 @@ fn allocator_reclamation_follows_checkpoint_plan_view_and_proof_errors_once() {
     assert!(prove_on_copy(&invalid, &sealed, &plan).is_err());
     assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
         "failed direct proof also finishes once");
+}
+
+#[test]
+fn staged_plan_finishes_without_borrowing_a_held_live_writer() {
+    let store = Store::open_memory("alder").unwrap();
+    write_history(&store);
+    let scratch = tempfile::tempdir().unwrap();
+    let cut = now_ms() + 1_000;
+    let staged = store.checkpoint_staged_set(cut, None, &scratch.path().join("plan")).unwrap();
+    let staged_path = staged.path.clone();
+    let writer = store.connection.write();
+    std::thread::scope(|scope| {
+        let (done, result) = std::sync::mpsc::channel();
+        let working = &store;
+        let scratch = scratch.path();
+        let proof = scope.spawn(move || {
+            // Test builds normally compare to the full in-memory capture as well.
+            // Exercise only the production staged phase while the live writer is held.
+            let view = smallclaims::store::checkpoint_staging::without_reference_plan(||
+                working.checkpoint_plan_view_from_staged(cut, staged, scratch));
+            let _ = done.send(view);
+        });
+        let completed = result.recv_timeout(std::time::Duration::from_secs(5));
+        drop(writer); // Always free a wrongly borrowed writer before joining/asserting.
+        proof.join().unwrap();
+        let view = completed.expect("staged planning/proof borrowed the live writer").unwrap();
+        assert!(view.proof.passed);
+    });
+    assert!(!staged_path.exists());
 }
 
 #[test]

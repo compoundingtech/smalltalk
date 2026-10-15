@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Replace the superseded fleet design with a current membership reference",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation-only consolidation of current fleet join, trust, acceptance, transport and lifecycle behavior. Preserve existing Fabric and dial-helper migration anchors; no membership protocol, admission, storage or runtime change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation-only consolidation of current fleet join, trust, acceptance, transport and lifecycle behavior. Preserve existing Fabric and dial-helper migration anchors; no membership protocol, admission, storage or runtime change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation-only consolidation of current fleet join, trust, acceptance, transport and lifecycle behavior. Preserve existing Fabric and dial-helper migration anchors; no membership protocol, admission, storage or runtime change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation-only consolidation of current fleet join, trust, acceptance, transport and lifecycle behavior. Preserve existing Fabric and dial-helper migration anchors; no membership protocol, admission, storage or runtime change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation-only consolidation of current fleet join, trust, acceptance, transport and lifecycle behavior. Preserve existing Fabric and dial-helper migration anchors; no membership protocol, admission, storage or runtime change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation-only consolidation of current fleet join, trust, acceptance, transport and lifecycle behavior. Preserve existing Fabric and dial-helper migration anchors; no membership protocol, admission, storage or runtime change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation-only consolidation of current fleet join, trust, acceptance, transport and lifecycle behavior. Preserve existing Fabric and dial-helper migration anchors; no membership protocol, admission, storage or runtime change."
+  }
+}

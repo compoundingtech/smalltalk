@@ -423,7 +423,7 @@ fn native_follow_resynchronizes_a_real_window_gap_without_any_claim_change() {
                 assert_eq!(delta["items"].as_array().unwrap().len(), 2);
                 assert!(!has_stored_availability_notice(&delta));
             }
-            let (authoritative, _, native) = conversation_first_page_at_generation(
+            let (authoritative, _, native, _) = conversation_first_page_at_generation(
                 &fixture.state,
                 &new_client_snapshot(&fixture.state),
                 &session,
@@ -539,7 +539,7 @@ fn native_pages_exclude_stored_availability_notices_and_truncation_entries() {
         delta["items"].as_array().unwrap().is_empty(),
         "there was no native notice to remove or mirrored truncation entry to append"
     );
-    let (after, _, native) = conversation_first_page_at_generation(
+    let (after, _, native, _) = conversation_first_page_at_generation(
         &fixture.state,
         &new_client_snapshot(&fixture.state),
         &session,

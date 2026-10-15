@@ -328,8 +328,8 @@ pub(crate) struct CodexTurnError {
     reason: driver_diagnostic::Reason,
     /// The word the observed-state record shows a reader. One word, from a closed set.
     word: &'static str,
-    /// Codex's own `willRetry`. `true` means no `turn/completed` is coming until the retries are
-    /// spent, so this error is the only evidence the seat is not progressing.
+    /// Codex's `willRetry` on this typed cause. A same-turn generic final `other` error leaves
+    /// this evidence standing; a new typed error or positive recovery replaces it.
     will_retry: bool,
 }
 
@@ -460,8 +460,8 @@ impl CodexObservedState {
         match self {
             CodexObservedState::AwaitingStatus => None,
             CodexObservedState::Idle => Some(observation(Activity::Idle, BlockedOn::None)),
-            // Capacity is retryable in the same session, while authentication and system errors
-            // end this harness incarnation.
+            // Capacity is retryable in the same session. Authentication and generic system
+            // errors end the incarnation; delivery's typed turn evidence can refine system errors.
             CodexObservedState::TerminalError {
                 reason: CodexTerminalError::ProviderCapacity,
             } => Some(observation(Activity::Idle, BlockedOn::None).with_reason("providerCapacity")),
@@ -997,7 +997,7 @@ impl CodexInboxDelivery {
     /// contradiction of the latest observation.
     #[cfg(test)]
     fn observe_harness(&mut self, observed: &CodexObservedState) {
-        self.publish_harness(observed.harness_observation());
+        self.publish_harness(observed, observed.harness_observation());
     }
 
     /// Publish the projection of the control state, as [`Self::observe_harness`] does, with the
@@ -1009,17 +1009,21 @@ impl CodexInboxDelivery {
             self.harness_writer.interrupt();
         }
         self.approval_request = request;
-        self.publish_harness(state.harness_observation());
+        self.publish_harness(&state.observed, state.harness_observation());
     }
 
-    fn publish_harness(&mut self, observation: Option<harness_state::Observation>) {
+    fn publish_harness(
+        &mut self,
+        observed: &CodexObservedState,
+        observation: Option<harness_state::Observation>,
+    ) {
         match observation {
             Some(mut observation) => {
                 if let Some(accepted) = self.provider_auth_edge.take() {
                     observation.provider_auth = Some(accepted);
                     self.harness_writer.interrupt();
                 }
-                self.publish_observation(self.name_turn_error(observation));
+                self.publish_observation(self.name_turn_error(observed, observation));
             }
             None => {
                 // Evidence lost: stop heartbeating, drop anything pending (it predates the gap),
@@ -1182,9 +1186,9 @@ impl CodexInboxDelivery {
 
     /// Let a standing turn error name itself in the observed record.
     ///
-    /// The delivery-relevant [`CodexObservedState`] is untouched by this: `Held` stays exactly the
-    /// complement of steerable (decision 0001), so nothing here can make a seat unreachable. What
-    /// changes is the one field a reader looks at to find out why a seat is not moving.
+    /// The delivery-relevant [`CodexObservedState`] is untouched: a hold still blocks delivery,
+    /// and a terminal turn still permits `turn/start`. Once a retryable connection turn is proven
+    /// ended, its thread can accept another turn, so the incarnation remains idle with its cause.
     ///
     /// The rule is that the CAUSE outranks the ACTIVITY. `active` with no reason, `ended` with the
     /// bare word `systemError`, and every hold reason describe what kind of work the thread
@@ -1194,9 +1198,10 @@ impl CodexInboxDelivery {
     /// the same failure's more specific cause from a stage of its own.
     fn name_turn_error(
         &self,
-        observation: harness_state::Observation,
+        observed: &CodexObservedState,
+        mut observation: harness_state::Observation,
     ) -> harness_state::Observation {
-        use crate::harness_state::BlockedOn;
+        use crate::harness_state::{Activity, BlockedOn};
         let Some(error) = self.turn_error.as_ref() else {
             return observation;
         };
@@ -1204,6 +1209,19 @@ impl CodexInboxDelivery {
             || observation.reason.as_deref() == Some("providerAuth")
         {
             return observation;
+        }
+        // `systemError` describes the failed turn, not the app-server's lifetime. A typed
+        // retryable connection failure can start a new turn on the same thread (Codex 0.160.1).
+        // While Codex still owns an active retry or a hold, leave the activity alone.
+        if matches!(
+            observed,
+            CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
+            }
+        ) && error.reason == driver_diagnostic::Reason::TurnConnection
+            && error.will_retry
+        {
+            observation.state = Activity::Idle;
         }
         observation.with_reason(error.word)
     }
@@ -1255,17 +1273,30 @@ impl CodexInboxDelivery {
                     // where the same rejection arrives with the turn's own typed result.
                     return false;
                 };
-                self.turn_error = Some(CodexTurnError {
-                    turn_id: turn_id.to_string(),
-                    reason,
-                    word,
-                    will_retry,
-                });
-                self.diagnostics.publish(
-                    driver_diagnostic::Stage::Turn,
-                    reason,
-                    driver_diagnostic::Source::TurnError,
-                );
+                // Codex 0.160.1 reduces an exhausted responseStreamDisconnected retry to
+                // `other` on its final error notification. That generic frame does not refute
+                // the same turn's typed connection cause or make the thread unusable. Keep the
+                // original evidence; a different turn or a new typed error replaces it normally.
+                let preserves_connection = codex_word == "other"
+                    && !will_retry
+                    && self.turn_error.as_ref().is_some_and(|prior| {
+                        prior.turn_id == turn_id
+                            && prior.reason == driver_diagnostic::Reason::TurnConnection
+                            && prior.will_retry
+                    });
+                if !preserves_connection {
+                    self.turn_error = Some(CodexTurnError {
+                        turn_id: turn_id.to_string(),
+                        reason,
+                        word,
+                        will_retry,
+                    });
+                    self.diagnostics.publish(
+                        driver_diagnostic::Stage::Turn,
+                        reason,
+                        driver_diagnostic::Source::TurnError,
+                    );
+                }
                 // The record carries a closed vocabulary a consumer can branch on. The log
                 // carries Codex's own word beside it, so an operator reading the wrapper log
                 // learns the exact cause even when this build classified it as `unclassified` —
@@ -1955,7 +1986,8 @@ fn should_track_timeline_usage(message: &Value, active_turn_id: Option<&str>) ->
         .is_some_and(|turn_id| active_turn_id == Some(turn_id))
 }
 
-fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &str) -> String {
+/// The same native client identity used for delivery receipts and conversation echo correlation.
+pub fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &str) -> String {
     let mut hash = Sha256::new();
     let graph_message = filename.starts_with("message/");
     hash.update(if graph_message {

@@ -26,6 +26,7 @@ mod claude_channel_install;
 mod claude_hooks;
 mod claude_statusline;
 mod codex_hooks;
+mod conflict_census;
 mod doctor;
 mod eval_run_e2e;
 mod eval_up;

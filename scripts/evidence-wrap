@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Run one check once on this machine and ask the signer to record it as an evidence note.
+
+  scripts/evidence-wrap --check linux-gate [--change-id github:OWNER/REPO#N] [--push origin] -- COMMAND...
+
+Run it from a clean checkout of the exact commit you are about to push. It runs COMMAND once
+(output streams to your terminal), then sends the signer the facts it measured: the commit,
+the command, its exit code, the sha256 of its exact output and an environment fingerprint
+(flake.lock, the dev shell derivation, this script's own bytes, the system, the attempt). The
+signer (scripts/evidence-sign, behind a sekrets grant; this script never sees the key)
+recomputes the tree and flake.lock itself and signs. A failing command is recorded too: a
+failure is a record, not a missing record.
+
+The note is imported as refs/notes/evidence/<record> in this checkout. With --push REMOTE it
+is also pushed, after scripts/evidence-verify accepts it. CI finds a note by its tree, so it
+only helps when the commit you push has the tree CI will test (a branch current with main).
+
+With --aggregate FILE nothing is run: FILE is JSON {"command": [...], "exit_code": N, "output": ANY,
+"inputs": {name: string}} written by a job that summarizes other jobs (an aggregate gate). The
+output digest is the sha256 of the canonical JSON of "output" (sorted keys, no spaces), and the
+extra inputs are recorded next to the environment fingerprint. The note then says only what that
+job knows, and the command names it as an aggregate.
+
+With --out DIR the note is not imported or pushed: DIR/<record>.pack (the git objects) and
+DIR/<record>.json (record, check, tree, commit, tier, exit code) are written for a later job to
+publish. A job on a shallow checkout uses this, because the server refuses a push from one.
+In --aggregate mode a dirty workspace does not stop the signature (the job has already run its
+tests); it is recorded as the input workspace_clean instead.
+
+With EVIDENCE_PUSH_TOKEN set, --push uses it as an HTTP authorization header (never printed).
+
+Take this script from the accepted base (main), not from the change under test.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_SIGNER = ['st', 'sekrets', '--', 'evidence-sign']
+
+
+class Failure(Exception):
+    pass
+
+
+def git(*args, stdin=None, check=True, env_extra=None):
+    # Runs with the signing HOME in a job whose checkout holds code under test: no GIT_* variable of
+    # the job reaches git, and the checkout's fsmonitor, hooks and pager cannot name a program.
+    clean = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', *args],
+                          input=stdin, capture_output=True, timeout=600,
+                          env=dict(clean, GIT_NO_REPLACE_OBJECTS='1', GIT_TERMINAL_PROMPT='0', LC_ALL='C', **(env_extra or {})))
+    if check and done.returncode != 0:
+        raise Failure(f'git {args[0]} failed: {done.stderr.decode(errors="replace").strip()[-500:]}')
+    return done
+
+
+def dirty():
+    return git('status', '--porcelain').stdout.decode().strip()
+
+
+def tracked_dirty():
+    """Tracked files that differ from the commit. Untracked and ignored files do not count (by design:
+    build output lives there, so the note says 'tested' about a state that can differ from the tree it names
+    only by files outside the tree).
+
+    `git status` can be told to ignore a tracked file (assume-unchanged, skip-worktree), so the index flags
+    are read too: every tracked file must be tagged `H`."""
+    changed = git('status', '--porcelain', '--untracked-files=no').stdout.decode().strip()
+    hidden = [line for line in git('ls-files', '-v').stdout.decode().splitlines() if line[:2] != 'H ']
+    return changed or ('index flags hide changes: ' + ', '.join(hidden[:3]) if hidden else '')
+
+
+def toolchain_digest(override):
+    if override:
+        return override
+    system = subprocess.run(['nix', 'eval', '--impure', '--raw', '--expr', 'builtins.currentSystem'],
+                            capture_output=True, text=True)
+    drv = subprocess.run(['nix', 'eval', '--raw', '--no-update-lock-file',
+                          f'.#devShells.{system.stdout.strip()}.default.drvPath'], capture_output=True, text=True)
+    if system.returncode or drv.returncode or not drv.stdout.startswith('/'):
+        raise Failure('could not name the dev shell derivation (pass --toolchain-sha256 to override): '
+                      + (drv.stderr or system.stderr).strip()[-300:])
+    return hashlib.sha256(drv.stdout.strip().encode()).hexdigest()
+
+
+def run_command(command):
+    digest = hashlib.sha256()
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for chunk in iter(lambda: process.stdout.read(65536), b''):
+        digest.update(chunk)
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+    return process.wait(), digest.hexdigest()
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--check', required=True, help='the required check this command stands for')
+    parser.add_argument('--change-id')
+    parser.add_argument('--attempt', default='1')
+    parser.add_argument('--signer', default=os.environ.get('EVIDENCE_SIGNER') or json.dumps(DEFAULT_SIGNER),
+                        help='JSON argument vector of the signer (default: $EVIDENCE_SIGNER, else sekrets)')
+    parser.add_argument('--toolchain-sha256', help='skip the nix evaluation and record this digest')
+    parser.add_argument('--keys', help='allowed-signers file for the local verification (default: .st/evidence-keys on --keys-from)')
+    parser.add_argument('--keys-from', default='origin/main')
+    parser.add_argument('--verifier', default=str(HERE / 'evidence-verify'))
+    parser.add_argument('--push', metavar='REMOTE')
+    parser.add_argument('--aggregate', metavar='FILE', help='record the facts in FILE instead of running a command')
+    parser.add_argument('--out', metavar='DIR', help='write the pack and a summary here instead of importing and pushing')
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ['--'] else args.command
+    if bool(command) == bool(args.aggregate):
+        parser.error('give either the command after -- or --aggregate FILE')
+
+    try:
+        top = git('rev-parse', '--show-toplevel').stdout.decode().strip()
+        os.chdir(top)
+        clean = not dirty()
+        if not clean and not args.aggregate:
+            raise Failure('the checkout is not clean: commit or remove changes first, the note is for the committed tree')
+        commit = git('rev-parse', 'HEAD').stdout.decode().strip()
+        tree = git('rev-parse', 'HEAD^{tree}').stdout.decode().strip()
+        lock = git('show', 'HEAD:flake.lock').stdout
+        system = subprocess.run(['uname', '-sm'], capture_output=True, text=True).stdout.split()
+        inputs = {
+            'flake_lock_sha256': hashlib.sha256(lock).hexdigest(),
+            'toolchain_sha256': toolchain_digest(args.toolchain_sha256),
+            'wrapper_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            'system': f'{system[1]}-{system[0]}'.lower() if len(system) == 2 else 'unknown',
+            'attempt': args.attempt,
+        }
+        if args.aggregate:
+            facts = json.loads(Path(args.aggregate).read_text())
+            known = {'command', 'exit_code', 'output', 'output_sha256', 'inputs'}
+            if set(facts) - known or not {'command', 'exit_code'} <= set(facts) or ('output' in facts) == ('output_sha256' in facts):
+                raise Failure('--aggregate FILE must hold command, exit_code, exactly one of output or output_sha256, and optionally inputs')
+            command, exit_code = facts['command'], facts['exit_code']
+            output_sha256 = facts.get('output_sha256') or hashlib.sha256(
+                json.dumps(facts['output'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            inputs.update(facts.get('inputs', {}))
+            # The job ran code under test in this checkout and the note names HEAD's tree. If that code
+            # changed a tracked file, the tree that was tested is not the tree being signed.
+            detail = tracked_dirty()
+            if detail:
+                raise Failure('tracked files differ from the commit, so the tree that was tested is not the one named; nothing was signed ('
+                              + detail.splitlines()[0][:200] + ')')
+            inputs['workspace_clean'] = 'true'  # tracked files are exactly the commit's
+            inputs['untracked_files'] = 'false' if clean else 'true'
+        else:
+            exit_code, output_sha256 = run_command(command)
+        if git('rev-parse', 'HEAD').stdout.decode().strip() != commit or (tracked_dirty() if args.aggregate else dirty()):
+            raise Failure('the checkout changed while the command ran; nothing was signed')
+        request = {'commit': commit, 'check': args.check, 'command': command, 'exit_code': exit_code,
+                   'output_sha256': output_sha256, 'change_id': args.change_id or f'local:{commit}', 'inputs': inputs}
+        signer = json.loads(args.signer)
+        done = subprocess.run(signer, input=json.dumps(request).encode(), capture_output=True, timeout=300)
+        if done.returncode != 0:
+            raise Failure('the signer refused: ' + done.stderr.decode(errors='replace').strip()[-500:])
+        answer = json.loads(done.stdout)
+        record = answer['record']
+        if answer.get('commit') != commit or answer.get('tree') != tree or answer.get('tier') != 'full':
+            raise Failure('the signer answered for a different commit, tree or tier')
+        if args.out:
+            out = Path(args.out)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f'{record}.pack').write_bytes(base64.b64decode(answer['object_pack_base64'], validate=True))
+            summary = {'record': record, 'check': args.check, 'tree': tree, 'commit': commit, 'tier': answer['tier'], 'exit_code': exit_code}
+            (out / f'{record}.json').write_text(json.dumps(summary))
+            print(json.dumps(summary, indent=2), file=sys.stderr)
+            return 0 if exit_code == 0 else exit_code
+        git('index-pack', '--stdin', stdin=base64.b64decode(answer['object_pack_base64'], validate=True))
+        ref = f'refs/notes/evidence/{record}'
+        if not git('for-each-ref', '--format=%(objectname)', ref).stdout.strip():
+            git('update-ref', ref, record, '0' * len(record))
+        result = {'record': record, 'ref': ref, 'tree': tree, 'check': args.check, 'exit_code': exit_code,
+                  'verified': False, 'pushed': False}
+        if exit_code == 0 and Path(args.verifier).exists():
+            keys = ['--keys', args.keys] if args.keys else None
+            if keys is None:
+                shown = git('show', f'{args.keys_from}:.st/evidence-keys', check=False)
+                if shown.returncode == 0:
+                    path = Path(os.environ.get('TMPDIR', '/tmp')) / f'evidence-keys-{os.getpid()}'
+                    path.write_bytes(shown.stdout)
+                    keys = ['--keys', str(path)]
+            if keys:
+                checked = subprocess.run([sys.executable, args.verifier, '--repo', '.', '--tree', tree,
+                                          '--check', args.check, *keys], capture_output=True)
+                result['verified'] = checked.returncode == 0
+                if checked.returncode != 0:
+                    result['verification'] = checked.stdout.decode(errors='replace')[-500:]
+        if args.push:
+            if exit_code == 0 and not result['verified']:
+                raise Failure('not pushing: the note did not verify locally')
+            token = os.environ.get('EVIDENCE_PUSH_TOKEN', '')
+            # The token travels in the environment, not in an argument any process listing would show.
+            extra = {}
+            if token:
+                header = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
+                extra = {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'http.extraheader',
+                         'GIT_CONFIG_VALUE_0': f'Authorization: Basic {header}'}
+            pushed = git('push', '--quiet', args.push, f'{ref}:{ref}', check=False, env_extra=extra)
+            if pushed.returncode != 0:
+                text = pushed.stderr.decode(errors='replace').replace(token, '***') if token else pushed.stderr.decode(errors='replace')
+                raise Failure(f'push failed: {text.strip()[-500:]}')
+            result['pushed'] = True
+        print(json.dumps(result, indent=2), file=sys.stderr)
+        return 0 if exit_code == 0 else exit_code
+    except (Failure, KeyError, ValueError, OSError, subprocess.SubprocessError) as error:
+        print(f'evidence-wrap: {error}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

@@ -686,7 +686,7 @@ mod tests {
             &fabric,
             format!(
                 "#!/bin/sh\necho \"$@\" >> '{calls}'\ncase \"$1\" in\n  \
-                 peers) printf '{OWNER_NODE}\\t{name}\\tst3/pty/{FLEET_ID}\\n';;\n  \
+                 peers) echo '{{\"peers\":[{{\"node\":\"{OWNER_NODE}\",\"name\":\"{name}\",\"allow\":[\"st3/pty/{FLEET_ID}\"]}}]}}';;\n  \
                  dial) echo '{{\"socket\":\"{tunnel}\"}}';;\n  *) exit 1;;\nesac\n",
                 calls = root.join("fabric-calls").display(),
                 tunnel = tunnel.display(),
@@ -1082,11 +1082,11 @@ mod tests {
     async fn fabric_failures_keep_the_cause_visible_and_obey_both_policies() {
         use std::os::unix::fs::PermissionsExt as _;
         for (index, (script, cause)) in [
-            ("peers) exit 0;; dial) exit 1;;", "no Fabric node"),
-            ("peers) printf 'node\\towner-matrix-1\\tservice\\n';; dial) echo '{\"error\":{\"code\":\"peer_not_permitted_for_service\",\"class\":\"refusal\",\"message\":\"missing grant\",\"peer\":null,\"service\":null}}'; exit 77;;", "missing grant"),
-            ("peers) printf 'node\\towner-matrix-2\\tservice\\n';; dial) echo '{\"error\":{\"code\":\"internal\",\"class\":\"fault\",\"message\":\"dial failed\",\"peer\":null,\"service\":null}}'; exit 69;;", "dial failed"),
-            ("peers) printf 'node\\towner-matrix-3\\tservice\\n';; dial) echo '{\"error\":{\"code\":\"service_unavailable\",\"class\":\"fault\",\"message\":\"tunnel failed\",\"peer\":null,\"service\":null}}'; exit 69;;", "tunnel failed"),
-            ("peers) printf 'node\\towner-matrix-4\\tservice\\n';; dial) sleep 8;;", "within 4 s"),
+            ("peers) echo '{\"peers\":[]}';; dial) exit 1;;", "no Fabric node"),
+            ("peers) echo '{\"peers\":[{\"node\":\"node\",\"name\":\"owner-matrix-1\",\"allow\":[\"service\"]}]}';; dial) echo '{\"error\":{\"code\":\"peer_not_permitted_for_service\",\"class\":\"refusal\",\"message\":\"missing grant\",\"peer\":null,\"service\":null}}'; exit 77;;", "missing grant"),
+            ("peers) echo '{\"peers\":[{\"node\":\"node\",\"name\":\"owner-matrix-2\",\"allow\":[\"service\"]}]}';; dial) echo '{\"error\":{\"code\":\"internal\",\"class\":\"fault\",\"message\":\"dial failed\",\"peer\":null,\"service\":null}}'; exit 69;;", "dial failed"),
+            ("peers) echo '{\"peers\":[{\"node\":\"node\",\"name\":\"owner-matrix-3\",\"allow\":[\"service\"]}]}';; dial) echo '{\"error\":{\"code\":\"service_unavailable\",\"class\":\"fault\",\"message\":\"tunnel failed\",\"peer\":null,\"service\":null}}'; exit 69;;", "tunnel failed"),
+            ("peers) echo '{\"peers\":[{\"node\":\"node\",\"name\":\"owner-matrix-4\",\"allow\":[\"service\"]}]}';; dial) sleep 8;;", "within 4 s"),
         ].into_iter().enumerate() {
             let root = tempfile::tempdir().unwrap();
             let owner = format!("owner-matrix-{index}");

@@ -22,6 +22,10 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
+    /// When st last stopped answering, kept until it answers again. A restart of st (a deploy,
+    /// an update) is a gap of seconds, so the screen says it is reconnecting for the first
+    /// `OFFLINE_GRACE` and calls the link offline only after that. Unset means long ago.
+    pub offline_since: Option<std::time::Instant>,
     /// Why the live stream to st is being replaced while st itself answers.
     pub degraded: Option<String>,
     /// Why a window has not loaded though st was asked (its source is not ready, or refused),
@@ -127,13 +131,32 @@ fn missions(model: &Model) -> Vec<Mission> {
     )
 }
 
+/// How long st may stay silent before the screen calls the link offline, not reconnecting.
+pub const OFFLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `OFFLINE_GRACE`, unless `STUI_OFFLINE_GRACE_MS` says otherwise. Only the end-to-end tests set it,
+/// so they need not wait a minute to see the offline word.
+pub fn offline_grace() -> std::time::Duration {
+    static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        std::env::var("STUI_OFFLINE_GRACE_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(OFFLINE_GRACE)
+    })
+}
+
 pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
-    let link = if extras.offline.is_some() {
+    let restarting = extras
+        .offline_since
+        .is_some_and(|since| since.elapsed() < offline_grace());
+    let link = if extras.offline.is_some() && !restarting {
         Link::Offline(match &model.last_connected {
-            Some(at) => format!("Last connected at {at} · reconnecting · r retry now"),
-            None => "No member reachable · reconnecting · r retry now".into(),
+            Some(at) => format!("Last connected at {at} · reconnecting · Ctrl+R retry now"),
+            None => "No member reachable · reconnecting · Ctrl+R retry now".into(),
         })
-    } else if extras.live {
+    } else if extras.live && extras.offline.is_none() {
         Link::Live
     } else {
         Link::Connecting
@@ -159,6 +182,13 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         .filter(|peer| peer.diverged_since.is_some())
         .map(|peer| peer.host_id.trim_start_matches("host/").to_owned())
         .collect();
+    let behind = model
+        .sync_notice()
+        .into_iter()
+        .flat_map(|sync| &sync.peers)
+        .filter(|peer| peer.diverged_since.is_none() && peer.peer_only_envelopes > 0)
+        .map(|peer| peer.summary())
+        .collect();
     let loaded_windows = [
         ("Attention", model.now.snapshot.is_some()),
         ("Agents", model.agents.snapshot.is_some()),
@@ -183,6 +213,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         link,
         diverged,
         stale,
+        behind,
         missions_followed: extras.missions_followed,
         settled: extras.attention_live && extras.agents_live,
         active_missions: extras.summary.as_ref().map(|summary| summary.active_missions as usize),
@@ -1778,6 +1809,60 @@ mod tests {
             truncated: false,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_peer_with_newer_records_is_behind_and_a_diverged_one_is_not() {
+        let peer = |host: &str, missing: u64, diverged: bool| st3_client::SyncPeer {
+            last_successful_exchange: None,
+            last_failed_exchange: None,
+            host_id: host.into(),
+            peer_only_envelopes: missing,
+            local_only_envelopes: 0,
+            last_exchange_at: None,
+            estimated_catch_up_seconds: Some(840),
+            diverged_since: diverged.then(|| "2026-09-29T10:00:00Z".into()),
+        };
+        let mut model = Model::default();
+        let mut attention = window(Vec::new());
+        attention.sync = Some(st3_client::SyncNotice {
+            state: "catching-up".into(),
+            peers: vec![peer("host/harbor", 26_820, false), peer("host/quay", 0, false)],
+        });
+        model.now = attention;
+        let shown = world(&model, "person/avery", &Extras::default());
+        assert_eq!(shown.behind.len(), 1, "{:?}", shown.behind);
+        assert!(shown.behind[0].starts_with("harbor has 26,820 envelopes"), "{:?}", shown.behind);
+        assert!(shown.diverged.is_empty());
+
+        let mut attention = window(Vec::new());
+        attention.sync = Some(st3_client::SyncNotice {
+            state: "diverged".into(),
+            peers: vec![peer("host/harbor", 5, true)],
+        });
+        model.now = attention;
+        let shown = world(&model, "person/avery", &Extras::default());
+        assert!(shown.behind.is_empty());
+        assert_eq!(shown.diverged, vec!["harbor".to_owned()]);
+    }
+
+    #[test]
+    fn st_silent_for_seconds_is_reconnecting_and_offline_only_after_the_grace() {
+        let model = Model::default();
+        let silent = |ago: std::time::Duration| Extras {
+            offline: Some("st stopped answering".into()),
+            offline_since: Some(std::time::Instant::now() - ago),
+            ..Extras::default()
+        };
+        // A restart for an update: seconds, not offline.
+        assert!(matches!(
+            world(&model, "person/avery", &silent(std::time::Duration::from_secs(5))).link,
+            Link::Connecting
+        ));
+        assert!(matches!(
+            world(&model, "person/avery", &silent(OFFLINE_GRACE + std::time::Duration::from_secs(1))).link,
+            Link::Offline(_)
+        ));
     }
 
     #[test]

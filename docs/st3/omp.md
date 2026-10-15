@@ -184,6 +184,58 @@ outbox is unavailable, unforwarded `timeline`, `context`, and `turn` frames prod
 diagnostic. The managed route does not perform the standalone channel's pre-compaction context
 recovery stub.
 
+## Native replay outcomes
+
+Native exceptional assistant stop metadata is retained independently of content, including empty
+turns. Routine `stop` and `toolUse` do not add redundant completion/waiting entries.
+Assistant outcomes use the shared `assistant_error` block on an assistant content entry,
+not a second system error entry. Its view applies the harness's presentation rules:
+superseded attempts, silent aborts and user interrupts render nothing; recovered attempts
+show a compact note; terminal failures render in full. `length` reports a possibly
+incomplete answer, and unknown stop reasons remain visible even without an error message.
+The view's `native` object retains exact `stopReason`, `errorMessage`, `errorStatus`,
+`errorId` and `retryRecovery` values whenever supplied, including future structured fields.
+The presentation `message` keeps the original diagnostic, while `label` supplies the
+resolved display text. Persisted retry markers determine presentation; replay does not
+infer retry continuation from messages or process exits.
+
+Native `custom/session_exit` checkpoints are classified from their `data.kind` and
+`data.reason`, without inferring the outcome of a turn or pending tools:
+
+| Native exit | Timeline entry |
+| --- | --- |
+| `normal` (including `dispose` and `manual`); `signal` with `sigterm`, `sigint` or `sighup` | `status: cancelled` |
+| `process_exit` or `exit` with explicit numeric `exitCode` (or `code`) zero | `status: cancelled` |
+| `fatal`, `crash`, `uncaughtException` / `uncaught_exception`, or `unhandledRejection` / `unhandled_rejection` | `error`, code `native_session_exit_fatal` |
+| Recognized normal/signal/process-exit kinds with a fatal reason or a nonzero exit code | `error`, code `native_session_exit_fatal` |
+| Unknown/missing kinds, unfamiliar signals, or process exits without a known exit code | `error`, code `native_session_exit_unknown` |
+
+OMP's native kinds are `normal`, `signal`, `fatal` and `process_exit`. Its fatal reasons
+are `uncaught_exception` and `unhandled_rejection`; camel-case forms are also recognized.
+The native `process_exit` / `exit` checkpoint currently omits the process code, so its
+outcome stays unknown unless a numeric code is supplied. Unknown kinds remain unknown
+even if their reason looks like a normal signal.
+
+Recognized stops use the existing status entry and `status` block with `{body_ref:true}`;
+the body has `status: cancelled` and `detail` containing the complete native `data` serialized
+as JSON — including the recorded kind, reason (the signal) and exit code. `cancelled` is the
+existing timeline vocabulary: the process stopped before the turn finished. It is neither a
+successfully completed turn nor an error, and it does not infer who or what stopped the
+process. Fatal and unknown stops use a system error entry and `error` block with
+`{body_ref:true}`, `retryable: false` and the complete native `data` in `details`.
+Both retain exact kind, reason, pending-tool arguments/intent and future fields.
+A process exit proves neither user cancellation, tool completion nor the outcome of
+the next process.
+
+Visible assistant views and session exits preserve diagnostics, pending-tool arguments/intent
+and unknown fields. Parsed records also retain the complete native record in an internal
+`source_record` block; malformed input retains its original bytes as `raw_text`.
+Transport size and paging limits bound responses; size truncation is visibly marked,
+and owner continuations recover the exact full values. These outcomes are read from the
+owner machine, not stored in the database. Assistant visibility follows the harness rules
+above in the normalizer; source records remain available through owner reads.
+A `cancelled` exit status describes process lifecycle, not a successfully finished turn.
+
 ## Interrupted ask bridge
 
 Native session continuation belongs to the shared driver mechanism: the daemon names a relaunch's
@@ -196,21 +248,27 @@ there is no bridge; it never chooses a transcript or session itself.
 OMP 18.4.10 needs a temporary, token-free recovery bridge for an open `ask` picker:
 `arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge`
 ([migration registry](https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf)).
-When the selected transcript has an unresolved last ask, st first runs a bounded RPC heal pass
-with closed stdin, then launches the interactive session with `ST3_OMP_PENDING_ASK` naming its
-pending toolCall id. `--no-extensions` disables discovery, but a fleet launcher can still prepend
-explicit `-e` extensions. The heal clears `PTY_SESSION`, `PTY_ROOT`, `PTY_SESSION_DIR`, and inherited
+When the selected transcript has an unresolved last ask, st admits the exact installed OMP build
+and the same shipped extension selected by interactive launch before running a bounded RPC heal
+pass with closed stdin. Admission may run isolated extension probes; an unchanged exact identity
+reuses its measured result. Interactive launch repeats admission before its own fork, then receives
+`ST3_OMP_PENDING_ASK` naming the pending toolCall id. `--no-extensions` disables discovery, but a
+fleet launcher can still prepend explicit `-e` extensions. The heal clears `PTY_SESSION`,
+`PTY_ROOT`, `PTY_SESSION_DIR`, and inherited
 `ST3_*`, `ST2_*`, and `ST_*` environment variables (except the launcher's required `ST_AGENT`
 identity) so those extensions cannot reach the seat's PTY or st channel. The bridge's transcript
-read logs I/O failures, fails open, and decodes bytes lossily; read, heal, retry, or diagnostic
-failures do not stop native continuation.
+read logs I/O failures, fails open, decodes bytes lossily, and skips malformed JSONL lines while
+continuing to inspect later valid entries. Read, heal, retry, or diagnostic failures do not stop
+native continuation; an unadmitted OMP build still prevents launch through the driver's gate.
 The extension holds mailbox delivery, waits for its ready frame and first idle, and requests one
 raw F5 from the Rust channel. For OMP's native interrupted result, the same toolCall id, questions,
 and options reopen without a model turn or human action. Channel readiness resumes when that ask
 starts again, or after a 120-second timeout with a diagnostic. Both exits send `delivery_ready`
 to release the Rust channel's first-idle delivery gate independently of activity. A reopened
 picker remains blocked on the person and ordinary mail stays outside OMP until it resolves.
-Shared native continuation does not depend on the bridge.
+Its existing state-frame `reason` names the reopened toolCall id
+(`reopened interrupted ask <toolCallId>`), alongside `ask: "question"`, so clients can explain
+what the seat is waiting on. Shared native continuation does not depend on the bridge.
 
 The contraction criterion is behavioral, not a version equality assertion. The standalone
 `crates/st3/fixtures/omp-resume/native-reopen-probe.py` copies its adjacent public canary fixture into

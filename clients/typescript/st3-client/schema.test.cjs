@@ -392,6 +392,30 @@ test('normalized conversation fallbacks and open block payloads survive schema r
     assert.deepEqual(Schema.encodeSync(Rich.TimelineBlock)(decoded), block);
 });
 
+test('assistant error views preserve exact native diagnostics in both decoder modes', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = {
+        type: 'assistant_error', status: 'failed', presentation: 'full',
+        is_error: true, label: 'native diagnostic', message: 'native diagnostic',
+        native: {
+            stopReason: 'future-stop', errorMessage: 'native\n\u001bdiagnostic',
+            errorStatus: { future: [false, null, 429] }, errorId: null,
+            retryRecovery: { attempt: 2, future: ['unchanged'] },
+            future: { retained: true },
+        },
+    };
+    for (const mode of ['strict', 'tolerant']) {
+        const decoded = Rich.decodeUnknownSync(Rich.TimelineViewAssistantError, mode)(wire);
+        assert.deepEqual(Schema.encodeSync(Rich.TimelineViewAssistantError)(decoded), wire);
+        const { native, ...legacy } = wire;
+        assert.deepEqual(
+            Schema.encodeSync(Rich.TimelineViewAssistantError)(
+                Rich.decodeUnknownSync(Rich.TimelineViewAssistantError, mode)(legacy)),
+            legacy,
+        );
+    }
+});
+
 
 test('relay omission fixture keeps absent fields, nullable values, and unknown bodies', async () => {
     const [{ Schema }, Rich] = await modules;
@@ -420,4 +444,20 @@ test('phone observation schema keeps histogram pairs and live-share as separate 
         [{...report.samples[1],kind:'latency'}],
         [{...report.samples[1],carrier:'unknown'}],
     ]) assert.throws(()=>decode({...report,samples}));
+});
+
+test('exchange carrier additions preserve legacy absence and future carrier values', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = { host_id: 'host/birch', peer_only_envelopes: 5, local_only_envelopes: 0, last_exchange_at: null, estimated_catch_up_seconds: null, diverged_since: null };
+    const decode = Rich.decodeUnknownSync(Rich.SyncPeer, 'strict');
+    assert.deepEqual(Schema.encodeSync(Rich.SyncPeer)(decode(wire)), wire);
+    const observed = {
+        ...wire,
+        last_successful_exchange: { at: '2026-10-13T12:00:00.000Z', carrier: 'loopback' },
+        last_failed_exchange: { at: '2026-10-13T11:59:00.000Z', carrier: 'fabric', fabric_route: 'unknown' },
+    };
+    assert.deepEqual(Schema.encodeSync(Rich.SyncPeer)(decode(observed)), observed);
+    const future = { ...observed, last_successful_exchange: { ...observed.last_successful_exchange, carrier: 'future-carrier' } };
+    assert.deepEqual(Schema.encodeSync(Rich.SyncPeer)(decode(future)), future);
+    assert.throws(() => decode({ ...observed, last_failed_exchange: { carrier: 'fabric' } }));
 });

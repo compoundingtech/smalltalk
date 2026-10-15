@@ -27,3 +27,16 @@ the screen after refusing it with Esc, a Bash command running (the input box
 stays on screen while Claude works), the Write tool's create-file dialog and the
 screen after refusing it, an AskUserQuestion prompt, the plan-mode approval
 dialog, and the folder trust dialog.
+
+claude-mcp-server.txt: Claude Code 2.1.296 in a 120-column PTY on 2026-10-13,
+started in a trusted scratch workspace whose .mcp.json names one invented
+server, probe-echo. No hook event fired while it was up (78 s observed);
+SessionStart followed only after Esc.
+
+claude-theme.txt: Claude Code 2.1.296 with an empty CLAUDE_CONFIG_DIR on
+2026-10-13: the first-run text-style picker, which precedes "Select login
+method:". Blank lines removed.
+
+codex-trust.txt: the verbatim retained rows of the Codex CLI 0.145.0 trust
+selection captured on 2026-08-04 (see CAPTURED_CODEX_TRUST_SELECTION in
+src/ding/tests.rs); the working-directory row is omitted there too.

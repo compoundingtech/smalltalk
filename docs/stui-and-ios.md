@@ -17,7 +17,7 @@ The terminal UI opens a space with tabs and splits. **Ctrl+S** shows or hides th
 - **Missions** shows each run's steps, progress, waiting reason, and who is working on it.
 - **Usage** shows observed tokens, estimated cost, and account limits. Click **$ usage** in the top bar (widen the terminal if needed); **b** changes grouping and **p** changes the period.
 
-In an agent's conversation, **Ctrl+]** attaches its live terminal. Finish harness login or trust prompts there; **Ctrl+\\** detaches back to the conversation. Detach before using the terminal UI's navigation keys. **Ctrl+Q** quits the terminal UI; the daemon, agents, and their work keep running. See the [terminal client reference](../crates/stui/README.md) for more controls.
+Opening an agent attaches its live terminal; **Ctrl+\\** shows its conversation, and **Ctrl+]** attaches the terminal again. Finish harness login or trust prompts there. An agent without a terminal opens its conversation. To open agents on their conversation instead, choose **Conversation first** in **Ctrl+K**; the choice stays on this device. Alerts for the agent show on top of its terminal: click to see and answer them, while every key still goes to the terminal. If the connection drops, the terminal says it is reconnecting and why, and attaches again by itself. Detach before using the terminal UI's navigation keys. **Ctrl+Q** quits the terminal UI; the daemon, agents, and their work keep running. See the [terminal client reference](../crates/stui/README.md) for more controls.
 
 ### Connect from another machine
 

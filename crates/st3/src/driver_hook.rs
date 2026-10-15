@@ -192,7 +192,7 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
     let endpoint = match env.var("ST3_ENDPOINT") {
         Some(endpoint) => crate::client::Endpoint::parse(endpoint),
         None => {
-            crate::client::Endpoint::Unix(crate::config::Config::load_unvalidated(None)?.socket)
+            crate::client::Endpoint::Unix(crate::config::Config::load_client_unvalidated(None)?.0.socket)
         }
     };
     let subject = env
@@ -330,6 +330,14 @@ fn claude_observe(
         answer_permission_from_st(env, &identity, &paths.agent_dir, &raw);
         return 0;
     }
+    if event == "Stop" {
+        report_denials(env, &identity, &paths.agent_dir, &raw);
+        return 0;
+    }
+    if event == "PreToolUse" {
+        allow_approved_call(env, &identity, &paths.agent_dir, &raw);
+        return 0;
+    }
     if !session_start {
         return 0;
     }
@@ -339,9 +347,11 @@ fn claude_observe(
     }
 }
 
-/// How long a permission hook waits for a person's answer from a client. Claude shows its own
-/// dialog meanwhile, and an answer there wins at once, so the wait only bounds the hook.
-const PROMPT_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long a permission hook waits for a person's answer from a client: exactly as long as st
+/// offers one, so an answer given from a client is never recorded after its hook has gone. Claude
+/// shows its own dialog meanwhile, and an answer there wins at once, so the wait only bounds the hook.
+const PROMPT_ANSWER_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(crate::store::CLAUDE_PROMPT_ANSWER_WAIT_MS as u64);
 const PROMPT_ANSWER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Let a person answer a Claude permission prompt from a client. The hook waits while Claude
@@ -361,7 +371,7 @@ fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, agent_dir: &Path
     }
     let endpoint = match env.var("ST3_ENDPOINT") {
         Some(endpoint) => crate::client::Endpoint::parse(endpoint),
-        None => match crate::config::Config::load_unvalidated(None) {
+        None => match crate::config::Config::load_client_unvalidated(None).map(|(config, _)| config) {
             Ok(config) => crate::client::Endpoint::Unix(config.socket),
             Err(_) => return,
         },
@@ -411,6 +421,146 @@ fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, agent_dir: &Path
         println!("{output}");
     }
 }
+
+/// This seat's daemon client, and the seat's subject, for a hook that talks to st.
+fn hook_client(
+    env: &dyn HookEnv,
+    identity: &str,
+) -> Option<(tokio::runtime::Runtime, crate::client::Client, String)> {
+    let endpoint = match env.var("ST3_ENDPOINT") {
+        Some(endpoint) => crate::client::Endpoint::parse(endpoint),
+        None => crate::client::Endpoint::Unix(crate::config::Config::load_client_unvalidated(None).ok()?.0.socket),
+    };
+    let subject = env
+        .var("ST3_SUBJECT")
+        .or_else(|| env.var("ST_AGENT"))
+        .unwrap_or_else(|| format!("agent/{identity}"));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    Some((runtime, crate::client::Client::new(endpoint), subject))
+}
+
+/// Raise each call Claude's auto mode classifier denied since the last turn as an alert for the
+/// seat's person (see `st_drivers::claude_denials`): its tool, the classifier's reason, and the
+/// call's id in the seat's conversation, never its input. Fails open: a turn's end is never held.
+fn report_denials(env: &dyn HookEnv, identity: &str, agent_dir: &Path, raw: &str) {
+    let payload: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    let (Some(session), Some(transcript)) = (
+        payload.get("session_id").and_then(Value::as_str),
+        payload.get("transcript_path").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    // Only the session's own transcript, as Claude names it.
+    let transcript = Path::new(transcript);
+    if !transcript.is_absolute()
+        || transcript.extension().is_none_or(|extension| extension != "jsonl")
+        || transcript.file_stem().is_none_or(|stem| stem != session)
+    {
+        return;
+    }
+    let denials = match st_drivers::claude_denials::new_denials(agent_dir, session, transcript) {
+        Ok(denials) if !denials.is_empty() => denials,
+        Ok(_) => return,
+        Err(error) => {
+            eprintln!("st: Claude's denied calls were not read: {error:#}");
+            return;
+        }
+    };
+    let Some((runtime, client, subject)) = hook_client(env, identity) else {
+        return;
+    };
+    for denial in denials {
+        let claim = crate::model::ClaimInput {
+            subject: subject.clone(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(subject.clone()),
+            fields: BTreeMap::from([
+                ("severity".into(), Value::String("warning".into())),
+                ("status".into(), Value::String(denial.tool.clone())),
+                ("code".into(), Value::String(PERMISSION_DENIED_CODE.into())),
+                ("reason".into(), Value::String(denial.reason.clone())),
+                ("driver".into(), Value::String("claude".into())),
+                ("session_id".into(), Value::String(session.into())),
+                (
+                    "matched_line".into(),
+                    Value::String(serde_json::json!({"call_id": denial.call_id}).to_string()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("claude-permission-denied:{subject}:{}", denial.call_id)),
+        };
+        let posted = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.post::<_, crate::model::ClaimRecord>("/v1/claims", &claim),
+            )
+            .await
+        });
+        match posted {
+            Ok(Ok(record)) => {
+                if let Err(error) =
+                    st_drivers::claude_denials::raised(agent_dir, &denial.call_id, &record.id)
+                {
+                    eprintln!("st: a denied call's alert was not remembered: {error:#}");
+                }
+            }
+            Ok(Err(error)) => eprintln!("st: a denied call was not raised: {error:#}"),
+            Err(_) => eprintln!("st: a denied call was not raised: the st daemon did not answer"),
+        }
+    }
+}
+
+/// Let a call through that Claude's classifier denied and the seat's person then allowed: once
+/// for that exact call, or for its kind on this seat. Claude takes a `PreToolUse` decision of
+/// `allow` before its classifier runs. St is asked only while a denial waits on an answer.
+fn allow_approved_call(env: &dyn HookEnv, identity: &str, agent_dir: &Path, raw: &str) {
+    let payload: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    let Some(tool) = payload.get("tool_name").and_then(Value::as_str) else {
+        return;
+    };
+    let input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
+    let mut client = None;
+    let approved = st_drivers::claude_denials::approved(agent_dir, tool, &input, |claim| {
+        if client.is_none() {
+            client = Some(hook_client(env, identity)?);
+        }
+        let (runtime, client, subject) = client.as_ref()?;
+        let path = format!(
+            "/v1/harness-prompts/answer?agent={}&episode={}",
+            urlencoding::encode(subject),
+            urlencoding::encode(claim)
+        );
+        runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.get::<crate::store::PromptAnswer>(&path),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+            })
+            .and_then(|answer| answer.answer)
+    });
+    match approved {
+        Ok(true) => println!(
+            "{}",
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "The seat's person allowed this from st after auto mode denied it."}})
+        ),
+        Ok(false) => {}
+        Err(error) => eprintln!("st: an allowed call was not checked: {error:#}"),
+    }
+}
+
+/// The diagnostic code of a call Claude's auto mode classifier denied.
+pub(crate) const PERMISSION_DENIED_CODE: &str = "permission-denied";
 
 /// Poll `state` until the prompt is answered (its answer), gone, or `wait` runs out (none).
 fn wait_for_prompt_answer(
@@ -464,9 +614,18 @@ fn question_labels(
 /// Claude's `PermissionRequest` hook output for a person's answer to the prompt `payload` opened.
 /// A question's answer is its choices, which Claude takes as the tool's `answers` beside the
 /// questions it asked; a question refused is declined.
+///
+/// A plan is refused through the hook, and Claude keeps planning with that as feedback; it is
+/// approved with the dialog's own keys, since a hook's allow does not approve a plan (measured on
+/// Claude Code 2.1.296), so an approval prints nothing here.
 fn permission_decision(answer: &str, payload: &Value) -> Option<String> {
-    let question = payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion");
+    let tool = payload.get("tool_name").and_then(Value::as_str);
+    let question = tool == Some("AskUserQuestion");
     let decision = match answer {
+        "deny" if tool == Some("ExitPlanMode") => serde_json::json!({
+            "behavior": "deny",
+            "message": "The person did not approve this plan from st. Keep planning, and ask them what to change if it is not clear."}),
+        _ if tool == Some("ExitPlanMode") => return None,
         "deny" if question => serde_json::json!({
             "behavior": "deny", "message": "The person declined to answer this from st."}),
         "deny" => serde_json::json!({"behavior": "deny", "message": "The person denied this from st."}),
@@ -539,7 +698,7 @@ pub fn post_diagnostic(env: &dyn HookEnv, diagnostic: &Diagnostic) -> Result<()>
     let endpoint = match env.var("ST3_ENDPOINT") {
         Some(endpoint) => crate::client::Endpoint::parse(endpoint),
         None => {
-            crate::client::Endpoint::Unix(crate::config::Config::load_unvalidated(None)?.socket)
+            crate::client::Endpoint::Unix(crate::config::Config::load_client_unvalidated(None)?.0.socket)
         }
     };
     let claim = crate::model::ClaimInput {
@@ -939,6 +1098,64 @@ mod tests {
         assert!(super::permission_decision(r#"{"2":[0]}"#, &asked).is_none());
         // Every question of the call is answered, or none is: never a partial answer.
         assert!(super::permission_decision(r#"{"0":[1]}"#, &asked).is_none());
+    }
+
+    /// A plan is refused through the hook, which Claude reads as feedback and keeps planning; an
+    /// approval prints nothing, because the reconciler presses the dialog's own keys (a hook's
+    /// allow does not approve a plan on Claude Code 2.1.296).
+    #[test]
+    fn a_plan_is_refused_through_the_hook_and_approved_with_its_keys() {
+        let plan = serde_json::json!({"tool_name": "ExitPlanMode",
+            "tool_input": {"plan": "1. Create hello.txt"}});
+        let refused: Value =
+            serde_json::from_str(&super::permission_decision("deny", &plan).unwrap()).unwrap();
+        assert_eq!(refused["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(super::permission_decision("approve", &plan).is_none());
+        assert!(super::permission_decision("allow", &plan).is_none());
+    }
+
+    #[test]
+    fn an_answer_after_permission_hook_expiry_does_not_release_native_human_hold() {
+        use crate::store::{NativePromptState, Store};
+        let store = Store::open_memory("node").unwrap();
+        let seat = "agent/node.worker";
+        let append = |kind: &str, fields: Value, key: Option<String>| {
+            store.append_claim(&crate::model::ClaimInput {
+                subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                expected_subject: None, idempotency_key: key,
+            }).unwrap()
+        };
+        append("runtime.observed", serde_json::json!({
+            "status":"running", "incarnation_id":"current"
+        }), None);
+        let asked = append("harness.observed", serde_json::json!({
+            "state":"working", "driver":"claude", "incarnation_id":"current",
+            "blocked_on":"human", "ask":"permission", "reason":"Bash",
+            "ownership_sequence":1, "transition_sequence":3
+        }), None);
+        assert_eq!(super::wait_for_prompt_answer(
+            || Some(store.native_prompt_state(seat, 1, 3).unwrap()),
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+        ), None);
+        // The polling hook has returned without a decision. An answer can still
+        // arrive in Smalltalk, but there is no hook left to apply it to Claude.
+        append("harness.diagnostic", serde_json::json!({
+            "code":"native-prompt-answered", "status":"allow",
+            "driver":"claude", "incarnation_id":"current"
+        }), Some(format!("native-prompt-answer:{}", asked.id)));
+        assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Answered { answer: "allow".into() });
+        assert_eq!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.as_deref(),
+            Some("human"));
+        // Only positive native closure releases mail and sender status.
+        append("harness.diagnostic", serde_json::json!({
+            "code":"native-prompt-gone", "status":"resolved",
+            "driver":"claude", "incarnation_id":"current"
+        }), Some(crate::store::native_prompt_gone_key(&asked.id)));
+        assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone);
+        assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
     }
 
     #[test]

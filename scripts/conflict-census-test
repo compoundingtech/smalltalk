@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Exercise the conflict census on a throwaway repository with invented files."""
+import os
+import runpy
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+CENSUS = runpy.run_path(str(Path(__file__).with_name('conflict-census')))
+
+
+# No global or system configuration, so a developer's git settings cannot change the outcome.
+ENV = {**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+
+
+def git(repo, *args):
+    subprocess.run(('git', '-C', str(repo), '-c', 'user.name=Census Test',
+                    '-c', 'user.email=census@example.invalid', *args),
+                   check=True, capture_output=True, text=True, env=ENV)
+
+
+def write(repo, name, text):
+    path = Path(repo, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    git(repo, 'add', name)
+
+
+class ConflictCensus(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.dir.name)
+        git(self.repo, 'init', '-q', '-b', 'main')
+        write(self.repo, 'gen/table.txt', 'digest 0\none\ntwo\n')
+        write(self.repo, 'src/lib.txt', 'a\nb\nc\n')
+        write(self.repo, 'notes/plain.txt', 'x\n')
+        git(self.repo, 'commit', '-q', '-m', 'base')
+        self.base = 'main'
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def branch(self, name, files):
+        git(self.repo, 'checkout', '-q', '-b', name, 'main')
+        for path, text in files.items():
+            write(self.repo, path, text)
+        git(self.repo, 'commit', '-q', '-m', name)
+        git(self.repo, 'checkout', '-q', 'main')
+
+    def census(self, refs):
+        # conflicts() runs git in the current directory.
+        import os
+        old = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            return CENSUS['conflicts'](self.base, refs)
+        finally:
+            os.chdir(old)
+
+    def test_two_prs_rewriting_one_line_conflict_and_a_disjoint_pr_does_not(self):
+        self.branch('first', {'gen/table.txt': 'digest 1\none\ntwo\n'})
+        self.branch('second', {'gen/table.txt': 'digest 2\none\ntwo\n'})
+        self.branch('apart', {'notes/plain.txt': 'y\n'})
+        git(self.repo, 'checkout', '-q', 'main')
+        git(self.repo, 'merge', '-q', '--no-ff', '-m', 'land first', 'first')
+        conflicted, files, hunks = self.census({1: 'second', 2: 'apart', 3: 'first'})
+        self.assertEqual(conflicted, {1: ['gen/table.txt']})
+        self.assertEqual(files['gen/table.txt'], 1)
+        self.assertEqual(hunks['gen/table.txt'], 1)
+
+    def test_adjacent_entries_on_separate_lines_do_not_conflict(self):
+        self.branch('adds-top', {'src/lib.txt': 'a0\na\nb\nc\n'})
+        self.branch('adds-bottom', {'src/lib.txt': 'a\nb\nc\nd\n'})
+        git(self.repo, 'merge', '-q', '--no-ff', '-m', 'land', 'adds-top')
+        self.assertEqual(self.census({1: 'adds-bottom'})[0], {})
+
+    def test_generated_patterns_follow_gitattributes_globs(self):
+        rx = CENSUS['glob_regex']
+        self.assertTrue(rx('clients/typescript/st3-client/*.generated.ts')
+                        .match('clients/typescript/st3-client/Models.generated.ts'))
+        self.assertTrue(rx('fixtures/scenarios/**').match('fixtures/scenarios/huge/a.json'))
+        self.assertTrue(rx('*.generated.ts').match('deep/dir/x.generated.ts'))
+        self.assertFalse(rx('crates/st3-client/src/lib.rs').match('crates/st3/src/lib.rs'))
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -8,10 +8,14 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use st3::api::AppState;
-use st3::model::{ClaimRecord, MemberSpec, MissionRunRequest};
+use st3::model::{ClaimInput, ClaimRecord, MemberSpec, MissionRunRequest};
 use st3::reconcile::{Reconciler, RuntimeControl, RuntimeObservation};
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
+
+/// How long a planned restart waits for a handoff in this process. The deadline tests keep it short;
+/// the acknowledgement tests set it long so a slow pass cannot reach it.
+static PREPARE_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(400);
 
 /// Only this fixture's runtimes exist here; no shared seats or daemons are touched.
 #[derive(Default)]
@@ -183,7 +187,10 @@ impl Fixture {
                 "restart-test".into(),
                 notify.clone(),
             )
-            .skipping_unneeded(true),
+            .skipping_unneeded(true)
+            .with_restart_prepare_deadline(Duration::from_millis(
+                PREPARE_DEADLINE_MS.load(std::sync::atomic::Ordering::SeqCst),
+            )),
         );
         let member = format!(
             r#"agent "example/worker" {{
@@ -2470,4 +2477,368 @@ async fn a_seat_writes_and_reads_its_handoff_through_the_cli() {
         .list_documents(Some("doc/agents/example/worker/handoff"), true, 10)
         .unwrap();
     assert_eq!(versions.len(), 2, "{versions:?}");
+}
+
+/// The seat's harness is up and ready on `incarnation`, so a planned restart has someone to ask.
+fn mark_ready(fixture: &Fixture, subject: &str, incarnation: &str) {
+    fixture
+        .store
+        .append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "harness.observed".into(),
+            actor: Some(subject.into()),
+            fields: std::collections::BTreeMap::from([
+                ("state".into(), json!("ready")),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!(incarnation)),
+            ]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some(format!("ready:{subject}:{incarnation}")),
+        })
+        .unwrap();
+}
+
+fn pass(fixture: &Fixture, passes: usize) {
+    for _ in 0..passes {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
+}
+
+fn prepare_messages(fixture: &Fixture, subject: &str) -> Vec<st3::model::MessageView> {
+    fixture
+        .store
+        .messages(Some(subject), true)
+        .unwrap()
+        .into_iter()
+        .filter(|message| {
+            message
+                .tags
+                .iter()
+                .any(|tag| tag.starts_with(st3::handoff::PREPARE_TAG_PREFIX))
+        })
+        .collect()
+}
+
+fn prepare_decisions(fixture: &Fixture, subject: &str) -> Vec<String> {
+    fixture
+        .store
+        .claims_for(subject, Some("runtime.reconcile-decision"))
+        .unwrap()
+        .into_iter()
+        .filter(|claim| claim.body["fields"]["key"] == "restart-prepare")
+        .map(|claim| claim.body["fields"]["decision"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requested_restart_waits_for_the_seats_handoff() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    PREPARE_DEADLINE_MS.store(600_000, std::sync::atomic::Ordering::SeqCst);
+    let (fixture, subject) = Fixture::new(false).await;
+    let handoff = st3::handoff::document_name(&subject).unwrap();
+    // A handoff from before the request does not acknowledge it.
+    fixture
+        .store
+        .put_document(&handoff, b"An old handoff.", &None, "old")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    mark_ready(&fixture, &subject, "fixture:1");
+    fixture.request(&subject, "restart-1").await;
+    pass(&fixture, 4);
+    assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+    let messages = prepare_messages(&fixture, &subject);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].from, "daemon/runtime");
+    assert_eq!(messages[0].title.as_deref(), Some("Prepare for restart"));
+    assert!(messages[0].content.contains("st agents handoff write"));
+    assert!(st3::silent::always_wakes(&messages[0].from, &messages[0].tags));
+
+    // Writing the handoff acknowledges it, and the seat is restarted.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let current = fixture
+        .store
+        .list_documents(Some(&handoff), false, 1)
+        .unwrap()
+        .first()
+        .map(|version| version.binding_claim_id.clone());
+    fixture
+        .store
+        .put_document(&handoff, b"PR 12 is open; wait for review.", &current, "new")
+        .unwrap();
+    pass(&fixture, 4);
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+    assert_eq!(prepare_decisions(&fixture, &subject), ["prepare", "ready"]);
+    assert_eq!(prepare_messages(&fixture, &subject).len(), 1, "one request, one message");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seat_that_never_answers_is_restarted_at_the_deadline() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let (fixture, subject) = Fixture::new(false).await;
+    mark_ready(&fixture, &subject, "fixture:1");
+    fixture.request(&subject, "restart-1").await;
+    pass(&fixture, 3);
+    assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    pass(&fixture, 4);
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+    assert_eq!(
+        prepare_decisions(&fixture, &subject),
+        ["prepare", "deadline-passed"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_acknowledges_a_handoff_that_is_already_current() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    PREPARE_DEADLINE_MS.store(600_000, std::sync::atomic::Ordering::SeqCst);
+    let (fixture, subject) = Fixture::new(false).await;
+    mark_ready(&fixture, &subject, "fixture:1");
+    fixture.request(&subject, "restart-1").await;
+    pass(&fixture, 3);
+    assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+    // Another seat saying this one is ready does not cut its wait short.
+    fixture
+        .store
+        .append_claim(&ClaimInput {
+            subject: st3::handoff::ready_subject(&subject),
+            kind: st3::handoff::READY_KIND.into(),
+            actor: Some("agent/example/other".into()),
+            fields: std::collections::BTreeMap::from([("agent".into(), json!(subject))]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some("restart-ready:forged".into()),
+        })
+        .unwrap();
+    pass(&fixture, 3);
+    assert!(
+        fixture.runtime.stops.lock().unwrap().is_empty(),
+        "another seat's readiness claim is not this seat's"
+    );
+    let socket = fixture.root.path().join("st3.sock");
+    let said = succeeded(
+        &st(&socket, &["agents", "handoff", "ready", "--as", &subject]).await,
+    );
+    assert!(said.contains("is ready to restart"), "{said}");
+    pass(&fixture, 4);
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    assert_eq!(prepare_decisions(&fixture, &subject), ["prepare", "ready"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declaration_change_prepares_a_running_seat_before_restarting_it() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let (fixture, subject) = Fixture::new(false).await;
+    let socket = fixture.root.path().join("st3.sock");
+    mark_ready(&fixture, &subject, "fixture:1");
+    let elsewhere = fixture.root.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    succeeded(
+        &st(
+            &socket,
+            &[
+                "agents",
+                "start",
+                &subject,
+                "--workspace",
+                elsewhere.to_str().unwrap(),
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await,
+    );
+    pass(&fixture, 4);
+    assert!(
+        fixture.runtime.stops.lock().unwrap().is_empty(),
+        "the seat is asked before it is stopped"
+    );
+    let messages = prepare_messages(&fixture, &subject);
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].content.contains("workspace"), "{}", messages[0].content);
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    pass(&fixture, 4);
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    let starts = fixture.runtime.starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].workspace, elsewhere.to_str().unwrap());
+}
+
+/// The seat opens a piece of work, claims it on `incarnation`, and records how far it got.
+async fn work_in_progress(fixture: &Fixture, subject: &str, incarnation: &str) -> String {
+    let socket = fixture.root.path().join("st3.sock");
+    let opened: Value = serde_json::from_str(&succeeded(
+        &st(
+            &socket,
+            &[
+                "--json",
+                "work",
+                "start",
+                "Port the parser",
+                "--as",
+                subject,
+                "--idempotency-key",
+                "port-the-parser",
+            ],
+        )
+        .await,
+    ))
+    .unwrap();
+    let step = opened["subject"].as_str().unwrap().to_owned();
+    for args in [
+        vec!["work", "claim", &step, "--as", subject, "--incarnation", incarnation],
+        vec![
+            "work",
+            "progress",
+            &step,
+            "--as",
+            subject,
+            "--incarnation",
+            incarnation,
+            "--summary",
+            "Halfway: the lexer is ported, the retry test is next",
+            "--evidence",
+            "file:fixture",
+        ],
+    ] {
+        succeeded(&st(&socket, &args).await);
+    }
+    step
+}
+
+fn write_handoff(fixture: &Fixture, subject: &str, text: &str, key: &str) {
+    let name = st3::handoff::document_name(subject).unwrap();
+    let current = fixture
+        .store
+        .list_documents(Some(&name), false, 1)
+        .unwrap()
+        .first()
+        .map(|version| version.binding_claim_id.clone());
+    fixture
+        .store
+        .put_document(&name, text.as_bytes(), &current, key)
+        .unwrap();
+}
+
+/// The first message the session after a restart sees, and what it must hold for the session to
+/// carry on without anyone pointing it at its work.
+fn session_start(fixture: &Fixture, subject: &str, incarnation: &str) -> st3::model::MessageView {
+    let tag = format!("{}{incarnation}", st3::handoff::SESSION_START_TAG_PREFIX);
+    let mut found = fixture
+        .store
+        .messages(Some(subject), true)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.tags.contains(&tag))
+        .collect::<Vec<_>>();
+    assert_eq!(found.len(), 1, "one session-start message for {incarnation}: {found:?}");
+    let message = found.remove(0);
+    assert_eq!(message.from, "daemon/runtime");
+    assert!(st3::silent::always_wakes(&message.from, &message.tags));
+    message
+}
+
+/// A seat moved to another model mid-step is asked for its handoff first, and the session after it
+/// starts with the handoff and the step it was in the middle of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seat_moved_to_another_model_mid_step_resumes_from_its_handoff() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    PREPARE_DEADLINE_MS.store(600_000, std::sync::atomic::Ordering::SeqCst);
+    let (fixture, subject) = Fixture::claude(Shape::TopLevel, "always").await;
+    let socket = fixture.root.path().join("st3.sock");
+    mark_ready(&fixture, &subject, "fixture:1");
+    pass(&fixture, 3);
+    let step = work_in_progress(&fixture, &subject, "fixture:1").await;
+
+    succeeded(
+        &st(
+            &socket,
+            &["agents", "start", &subject, "--model", "another-model", "--as", "person/avery"],
+        )
+        .await,
+    );
+    pass(&fixture, 4);
+    assert!(
+        fixture.runtime.stops.lock().unwrap().is_empty(),
+        "the seat is asked for its handoff before it is stopped"
+    );
+    assert_eq!(prepare_messages(&fixture, &subject).len(), 1);
+
+    write_handoff(
+        &fixture,
+        &subject,
+        "Branch agent/parser, PR 12 open and waiting on review. Next: the retry test.",
+        "handoff-model-move",
+    );
+    pass(&fixture, 4);
+    assert_eq!(*fixture.runtime.stops.lock().unwrap(), ["fixture:1"]);
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+    assert_eq!(prepare_decisions(&fixture, &subject), ["prepare", "ready"]);
+
+    // The replacement session becomes ready and is sent where its predecessor was.
+    mark_ready(&fixture, &subject, "fixture:2");
+    pass(&fixture, 3);
+    let message = session_start(&fixture, &subject, "fixture:2");
+    for expected in [
+        "Branch agent/parser, PR 12 open and waiting on review. Next: the retry test.",
+        step.as_str(),
+        "Port the parser",
+        "Halfway: the lexer is ported, the retry test is next",
+    ] {
+        assert!(message.content.contains(expected), "{expected}\n{}", message.content);
+    }
+}
+
+/// A seat killed without warning is never asked, so the session after it starts with the last
+/// handoff it wrote and the step as the graph holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seat_killed_without_warning_resumes_from_what_it_wrote_before() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let (fixture, subject) = Fixture::claude(Shape::TopLevel, "always").await;
+    mark_ready(&fixture, &subject, "fixture:1");
+    pass(&fixture, 3);
+    let step = work_in_progress(&fixture, &subject, "fixture:1").await;
+    write_handoff(
+        &fixture,
+        &subject,
+        "Branch agent/parser, PR 12 open and waiting on review. Next: the retry test.",
+        "handoff-before-kill",
+    );
+
+    hang_up(&fixture);
+    pass(&fixture, 4);
+    assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2);
+    assert!(
+        prepare_messages(&fixture, &subject).is_empty(),
+        "nobody was asked: the seat was gone"
+    );
+
+    mark_ready(&fixture, &subject, "fixture:2");
+    pass(&fixture, 3);
+    let message = session_start(&fixture, &subject, "fixture:2");
+    for expected in [
+        "Branch agent/parser, PR 12 open and waiting on review. Next: the retry test.",
+        step.as_str(),
+        "Halfway: the lexer is ported, the retry test is next",
+    ] {
+        assert!(message.content.contains(expected), "{expected}\n{}", message.content);
+    }
+    // Replays and further passes send nothing more.
+    pass(&fixture, 3);
+    session_start(&fixture, &subject, "fixture:2");
 }

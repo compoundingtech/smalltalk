@@ -7,13 +7,7 @@ import { DataSourceProvider } from '../data/react.tsx'
 import { WorkspaceBody } from './LiveAgentWorkspace.tsx'
 import { retainPane, workspaceView, type RetainedPane } from './workspaceView.ts'
 
-vi.mock('@stylexjs/stylex', () => ({
-  create: (styles: unknown) => styles,
-  defineVars: (variables: unknown) => variables,
-  createTheme: () => ({}),
-  keyframes: () => 'test-animation',
-  props: () => ({}),
-}))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 describe('workspace body', () => {
   it('renders the terminal as a drawer beside the shown thread', () => {
@@ -30,6 +24,12 @@ describe('workspace body', () => {
   it('states that any other non-thread view is unavailable', () => {
     const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: 'agent/fixture/one', rosterRefs: ['agent/fixture/one'], view: workspaceView({ ref: 'monitor/quota' }), agentName: 'Fixture', onOpenTool: vi.fn() }))
     expect(html).toMatch(/View unavailable\./)
+  })
+  it('opens the Missions screen from its tab', () => {
+    expect(workspaceView({ ref: 'missions' })).toEqual({ _tag: 'Missions' })
+    const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: '', rosterRefs: [], view: workspaceView({ ref: 'missions' }), agentName: 'Fixture', onOpenTool: vi.fn() }))
+    expect(html).toMatch(/Loading missions…/)
+    expect(html).not.toMatch(/Choose an agent/)
   })
   it('opens a document subject, by name or exact reference, as a document view', () => {
     expect(workspaceView({ ref: 'doc/garden-notes' })).toEqual({ _tag: 'Document', ref: 'doc/garden-notes' })

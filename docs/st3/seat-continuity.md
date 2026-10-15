@@ -37,6 +37,30 @@ and branches it owns, what it waits on, the next steps, and anything it started 
 step's progress notes cover the step; the handoff covers the seat. A seat killed without warning
 leaves only what it wrote before, so it keeps the handoff current as it works.
 
+## Before a planned restart
+
+A planned restart is one st chooses to make while the seat is up: an operator's or agent's
+`st agents restart`, a pool switch to another account at a limit, or a declaration change (an
+account, model, workspace or launch change) applied to a running seat. Before st stops the seat it
+sends it a "Prepare for restart" message from `daemon/runtime` with a deadline (two minutes), and
+waits. The message carries the reserved tag `st3-restart-prepare:REQUEST`, so it wakes the seat.
+
+The seat writes its handoff, which acknowledges the request, or runs `st agents handoff ready` when
+the handoff it has is already current. St stops the seat at the acknowledgement or at the deadline,
+whichever comes first, and records which: `runtime.reconcile-decision` claims with key
+`restart-prepare` say `prepare`, then `ready` or `deadline-passed`. A handoff written before the
+request does not acknowledge it. A readiness claim counts only when its recorded actor is the seat; as
+with other claims the actor is what the caller asserted, so this keeps out accidents and other seats,
+not a determined local caller. The handoff document is the stronger acknowledgement: the daemon
+lets only the seat itself write it.
+
+`st agents restart AGENT --now` skips the wait, for a seat that cannot answer (it records `operation: restart-now` on the request). Scripts that restart stub seats use it.
+
+A seat that is not up and ready, such as one that has exited, is blocked at a prompt or is logged
+out, has nobody to ask, so its restart goes ahead at once. A seat that stops answering (a pool seat
+at its limit, for example) costs the deadline, not more. Crashes, `agents stop`, suspend and
+mission `fresh-context` resets are not planned restarts and send nothing.
+
 ## What a new incarnation is sent
 
 When a seat's new incarnation becomes ready, the daemon sends it one message from `daemon/runtime`,
@@ -63,5 +87,7 @@ session already knows what it describes.
 ## Tests
 
 - `crates/st3/src/handoff.rs`: naming, write authority, and what the message renders.
+- `tests/agents_restart.rs`: a requested restart waits for the handoff, goes ahead at the deadline,
+  and a declaration change prepares first.
 - `reconcile::tests::a_new_incarnation_is_first_sent_the_handoff_its_seat_left`: the first
   incarnation is told nothing, its replacement is told once, and an empty seat is told nothing.

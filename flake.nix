@@ -1162,6 +1162,34 @@
           touch "$out"
         '';
 
+        # The `genie-freshness` required check as a sandboxed derivation: the CI scripts' own tests
+        # and `genie --check` over the exact flake source. It has no network and no `.git`, so
+        # the one test that needs a repository gets a throwaway one (its commit ID is an opaque
+        # value there) and `tar` is declared for the cache test.
+        checks.genie-freshness = pkgs.runCommand "genie-freshness-${version}" {
+          nativeBuildInputs = [
+            effect-utils.packages.${system}.genie
+            pkgs.git
+            pkgs.gnutar
+            pkgs.jq
+            pkgs.openssh
+            pkgs.python3
+            pkgs.zstd
+          ];
+        } ''
+          export HOME=$(mktemp -d)
+          cp -r ${self} source
+          chmod -R u+w source
+          cd source
+          mkdir -p repos
+          ln -sfn ${effect-utils} repos/effect-utils
+          git init --quiet
+          git add -A
+          git -c user.name=nix -c user.email=nix@localhost commit --quiet -m source
+          bash scripts/ci-genie-freshness
+          touch "$out"
+        '';
+
         # Smoke test that the built binary actually runs and its command tree is
         # wired, independent of the in-tree `cargo test`.
         checks.help = pkgs.runCommand "st2-help-${version}" { } ''
@@ -1284,6 +1312,10 @@
             if [ "''${GITHUB_ACTIONS:-}" = true ]; then
               source ${./scripts/ci-cargo-tools-env} || exit $?
               export RUSTC_WRAPPER=${ciRustcWrapper}/bin/ci-rustc-wrapper
+            fi
+            # Pushing a branch signs its checks first when they have no evidence yet (scripts/evidence-prepush).
+            if [ -z "''${GITHUB_ACTIONS:-}" ] && [ -z "''${CI:-}" ] && [ -x ./scripts/install-git-hooks ]; then
+              ./scripts/install-git-hooks || echo "scripts/install-git-hooks failed: pushes will not sign evidence" >&2
             fi
           '';
         };

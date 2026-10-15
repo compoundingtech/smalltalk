@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Preserve completed child run and generation timestamps when a parent finishes, so replicated projections agree with the originating member.",
+  "replay": { "status": "changed", "detail": "Terminal cascades now stamp only runs and generations whose status changes. Step cancellation reason refinements preserve the existing cancellation time. Replaying unchanged claims therefore preserves earlier child completion times instead of replacing them with a parent completion time. No automatic replay is added." },
+  "schema": { "status": "none", "detail": "No table, index, trigger or migration changes." },
+  "rules": { "status": "none", "detail": "No claim validation, authority, checkpoint rules or retention changes." },
+  "compatibility": { "status": "changed", "detail": "No wire format changes. Older members can still project different child timestamps until upgraded because they retain the unconditional cascade stamp." },
+  "downtime": { "status": "none", "detail": "No interruption beyond the ordinary daemon restart." },
+  "manual": { "status": "changed", "detail": "Upgrade all members for consistent cascade projection. Existing incorrectly stamped rows need the existing projection rebuild or heal procedure; this change does not rewrite stored rows on opening." },
+  "recovery": { "status": "none", "detail": "The store format is unchanged. An older binary remains readable but can reintroduce the timestamp divergence." }
+}

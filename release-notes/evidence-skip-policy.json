@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add a repository skip policy for the evidence gate and make the gate decide skip or run; nothing is skipped yet",
+  "replay": {"status": "none", "detail": "No daemon replay change."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change; the policy is a new file read from the accepted base."},
+  "rules": {"status": "none", "detail": "No required check, daemon rule or main landing change. The gate jobs are not required, nothing needs them, and they do not yet skip anything."},
+  "compatibility": {"status": "none", "detail": "The verifier gains --policy-from and the gate prints a decision line; existing calls behave as before."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "changed", "detail": "The central evidence workflow pin needs its usual rotation because fleet.yml changed."},
+  "recovery": {"status": "none", "detail": "Reverting removes the policy and returns the gate to reporting only."}
+}

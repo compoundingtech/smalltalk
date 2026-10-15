@@ -55,6 +55,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case notFound, forbidden, unsupportedCapability, validationFailed, idempotencyConflict
     case attentionMigrated
     case issuerRequired
+    case suspendAuthoredSessionSelection
     case arrangementExists
     case arrangementFolderExists, arrangementRetired, arrangementLimit, arrangementFolderDeleted
     case arrangementCycle, arrangementBodyTooLarge, arrangementOwnerForbidden
@@ -75,6 +76,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "unsupported-capability": .unsupportedCapability; case "validation-failed": .validationFailed
         case "idempotency-conflict": .idempotencyConflict; case "stale-fence": .staleFence
         case "issuer-required": .issuerRequired
+        case "suspend-authored-session-selection": .suspendAuthoredSessionSelection
         case "arrangement-exists": .arrangementExists
         case "arrangement-folder-exists": .arrangementFolderExists
         case "arrangement-retired": .arrangementRetired; case "arrangement-limit": .arrangementLimit
@@ -104,6 +106,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .unsupportedCapability: "unsupported-capability"; case .validationFailed: "validation-failed"
         case .idempotencyConflict: "idempotency-conflict"; case .staleFence: "stale-fence"
         case .issuerRequired: "issuer-required"
+        case .suspendAuthoredSessionSelection: "suspend-authored-session-selection"
         case .arrangementExists: "arrangement-exists"
         case .arrangementFolderExists: "arrangement-folder-exists"
         case .arrangementRetired: "arrangement-retired"; case .arrangementLimit: "arrangement-limit"
@@ -460,7 +463,8 @@ public struct ResourcesPage: Codable, Sendable {
 public struct ResourcePage: Codable, Sendable { public let kind: String; public let collection: String; public let filters: [String: String]; public let items: [Resource]; public let page: PageInfo; public let sync: SyncNotice?; public let replicated: ReplicatedNotice? }
 public struct ReplicatedNotice: Codable, Sendable { public let ownerHostID: String; public let source: String; public let complete: Bool; public let state: String; public let reason: String?; enum CodingKeys: String, CodingKey { case ownerHostID = "owner_host_id", source, complete, state, reason } }
 public struct SyncNotice: Codable, Sendable { public let state: String; public let peers: [SyncPeer] }
-public struct SyncPeer: Codable, Sendable { public let hostID: String; public let peerOnlyEnvelopes, localOnlyEnvelopes: UInt64; public let lastExchangeAt: String?; public let estimatedCatchUpSeconds: UInt64?; public let divergedSince: String?; enum CodingKeys: String, CodingKey { case hostID = "host_id", peerOnlyEnvelopes = "peer_only_envelopes", localOnlyEnvelopes = "local_only_envelopes", lastExchangeAt = "last_exchange_at", estimatedCatchUpSeconds = "estimated_catch_up_seconds", divergedSince = "diverged_since" } }
+public struct ExchangeTransport: Codable, Sendable { public let at: String; public let carrier: String; public let fabricRoute: String?; enum CodingKeys: String, CodingKey { case at, carrier, fabricRoute = "fabric_route" } }
+public struct SyncPeer: Codable, Sendable { public let lastSuccessfulExchange, lastFailedExchange: ExchangeTransport?; public let hostID: String; public let peerOnlyEnvelopes, localOnlyEnvelopes: UInt64; public let lastExchangeAt: String?; public let estimatedCatchUpSeconds: UInt64?; public let divergedSince: String?; enum CodingKeys: String, CodingKey { case lastSuccessfulExchange = "last_successful_exchange", lastFailedExchange = "last_failed_exchange", hostID = "host_id", peerOnlyEnvelopes = "peer_only_envelopes", localOnlyEnvelopes = "local_only_envelopes", lastExchangeAt = "last_exchange_at", estimatedCatchUpSeconds = "estimated_catch_up_seconds", divergedSince = "diverged_since" } }
 
 public enum TimelineRole: String, Codable, Sendable { case system, user, assistant, tool }
 public enum TimelineType: String, Codable, Sendable { case message, content, toolCall = "tool_call", toolResult = "tool_result", status, error, usage, redaction, truncation }

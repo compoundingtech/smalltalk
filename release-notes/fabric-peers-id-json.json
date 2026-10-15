@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "st reads `fabric id` and `fabric peers` as JSON, and reports their failures by Fabric error code instead of by stderr text.",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "st runs `fabric id --json` and `fabric peers --json`. A Fabric older than 0.2.41 rejects `--json` with exit 2 and no output; st then runs the command again without it and reads the old text. That fallback stays until no fleet member runs a Fabric older than 0.2.41; members update with `fabric update`. No wire change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover."}
+}

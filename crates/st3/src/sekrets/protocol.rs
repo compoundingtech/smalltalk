@@ -174,6 +174,11 @@ pub enum CallerView {
         node: String,
         person: String,
     },
+    /// A root-enrolled system service. It can only run explicitly granted commands.
+    Program {
+        program: String,
+        person: String,
+    },
     /// A process of a known person's Unix user that is neither in a login session nor attested.
     Unidentified {
         person: String,
@@ -187,6 +192,7 @@ impl CallerView {
             Self::Person { person } => Some(person),
             Self::Agent { agent, .. } => Some(agent),
             Self::Host { node, .. } => Some(node),
+            Self::Program { program, .. } => Some(program),
             Self::Unidentified { .. } => None,
         }
     }

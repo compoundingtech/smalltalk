@@ -73,10 +73,10 @@ use GitHub-hosted `ubuntu-latest`, keeping lightweight checks off reserved build
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-By default, required merge-group producers, the first two test shards, supporting Rust jobs, canaries and VM jobs use `ci1-priority` on either host. Merge shards 3 and 4 use the common `ci1-merge` role. An overflowed group uses its one selected Namespace profile for all these jobs.
+By default, required merge-group producers, the first two test shards, supporting Rust jobs, canaries and VM jobs use `ci1-priority` on either host. Merge shards 3 and 4 use the common `ci1-merge` role. An overflowed group uses the existing Namespace 8x16 shape for build/test stages and the existing KVM profile for isolation-vm. Both label forms retain priority 1 and the same run affinity; every consumer still uses its own exact-source producer archive.
 A GitHub-hosted picker reads the common group3 role census; unavailable metadata retains the
 existing priority role. GitHub chooses the physical host. The PR opt-in variable never disables merge picking.
-With `CI_MERGE_OVERFLOW` unset or off, they wait for owned capacity. Overflow uses the existing Namespace profile only when that switch is on and the qualified census is below its admission minimum.
+Merge overflow is enabled by default. `CI_MERGE_OVERFLOW=off` restores the owned-only admission policy. A positive complete runner census below the admission minimum selects Namespace; missing or malformed runner metadata retains the owned role.
 Main, tag and manual Linux releases use the same owned priority lane; release PR validation
 uses Namespace priority 2, preserving the self-hosted fork boundary. Native Mac releases and
 installer checks use standard GitHub-hosted `macos-15` (ARM64); Linux installer/assembly/publish
@@ -483,9 +483,11 @@ workflow-level path filters. `linux-gate` does not depend on them.
 
 - `fractal-web-changes` always runs, with a one-minute timeout and no checkout. Its
   embedded `scripts/ci-fractal-web-changes` fetches both commits explicitly without
-  blobs and diffs PR base/head SHAs from their merge base, or a merge group's
-  `base_sha..head_sha`. `--no-renames` counts both sides of a rename. Missing or malformed
-  SHAs, failed fetches and failed diffs fail closed; `workflow_dispatch` forces execution.
+  blobs and diffs PR base/head SHAs from their merge base, a merge group's
+  `base_sha..head_sha`, or a push's `before..after` (the whole pushed range, not just
+  the final commit). `--no-renames` counts both sides of a rename. Missing or malformed
+  SHAs, failed fetches and failed diffs conservatively select every web lane, including
+  kit plays, with a warning; `workflow_dispatch` also forces all lanes.
   Relevant paths are `apps/fractal-web/**`, `packages/fractal-ui/**`,
   `clients/typescript/st3-views/**`, `clients/typescript/st3-scenarios/**` and `fixtures/**`.
   Within `clients/typescript/st3-client`, only the consumed export graph (`index.ts`,
@@ -518,7 +520,11 @@ workflow-level path filters. `linux-gate` does not depend on them.
   fixtures that must trip both failures, and controls (quoted URLs with parentheses,
   faces declared by the entry's stylesheet) that must pass.
   App, UI kit, Storybook, browser and performance lanes join the script with the
-  packages that add them.
+  packages that add them. The detector separately emits `kit-inputs`: app-only changes
+  skip kit play-index contracts, Storybook and strict browser plays; kit source,
+  its transitive workspace dependencies, lock/toolchain and CI-input changes run them.
+  This selection is the same for PRs, merge groups and pushes. Main pushes currently
+  run Main upkeep's dependency-cache warmer, not a duplicate Workspace CI execution.
 - `fractal-web` is always emitted (`if: always()`), with a one-minute timeout. Its
   embedded `scripts/ci-fractal-web-gate` passes only when detection succeeded and
   either no relevant paths changed and execution was skipped, or execution succeeded.
@@ -527,6 +533,23 @@ workflow-level path filters. `linux-gate` does not depend on them.
 
 `scripts/ci-fractal-web-test`, run by `genie-freshness`, covers detection, fail-closed
 paths, the gate truth table and generated job shape.
+
+The strict kit play lane runs every indexed story at both 440/1440 widths and
+dark/light schemes, with up to six workers bounded by available CPUs. Each worker
+reuses a Chromium context and its HTTP asset cache for the job's immutable build;
+each case still gets a fresh page. Before a new case, the worker closes all prior
+pages/popups, clears cookies and permissions, and clears every origin-storage type
+for all observed HTTP(S) origins. Cookie/quota audits and a first-document
+local/session-storage audit reject residual state. Case-internal navigation may
+retain its own state; it is never inherited by another case.
+
+`kit-play-isolation.browser-test.mjs` runs in the same kit-input-gated CI lane before
+the full play matrix. It exercises storage/service-worker/popup isolation, concurrent
+worker independence, retained HTTP asset caching, and failing-story/leaked-state
+negative controls against real Chromium. The matrix receipt retains story/case/worker
+counts and per-case seconds and adds reset, page-creation, guard, navigation-to-DOM,
+post-DOM readiness, assertion and close timings. The strict lifecycle assertions,
+story-identity checks, matrix size and job timeout are unchanged.
 
 Run SDK tests with their own `vitest.config.ts`, not the parent app's narrower test patterns.
 The rejected-mission diagnostic proof checks its fixture against the generated decoder:
@@ -578,15 +601,54 @@ of `CI1_RUNNERS`; by default this is `ci1-priority` on either physical host.
 Existing running work is not preempted;
 the host controller must retain its release/merge-first classification and bounded reservations.
 `CI_MERGE_CI1` and `CI_MERGE_NAMESPACE_PROFILE` no longer redirect required merge jobs.
-`CI_MERGE_OVERFLOW=on` lets a merge group use the existing Linux Namespace
-profile when a valid group-3 census has fewer than `CI_MERGE_MIN_IDLE` idle
-priority runners (default three, for the initial producer, Clippy and fleet
-compatibility jobs). All required jobs follow the same picker output, with
-Namespace priority 1 and affinity to that run. An unset switch keeps the owned
-priority lane. Invalid metadata, an invalid minimum or run ID, and missing
-credentials retain that lane; they do not establish saturation. Priority PRs
-and releases keep their reservations. This changes admission capacity, not
-tests, required contexts, timeouts, cache provenance or resource caps.
+The picker measures capacity again for each new run rather than depending on an
+hourly manual switch. `CI_MERGE_OVERFLOW` defaults to `on`; `off` is the rollback.
+A complete group-3 census with fewer than `CI_MERGE_MIN_IDLE` idle priority
+runners (default three for producer, Clippy and compatibility) selects Namespace.
+It also takes an advisory snapshot of queued and in-progress repository runs:
+oldest queued job age by requested owned/Namespace label, not a billing or
+provider-wide capacity measurement. When owned work is over five minutes old
+and Namespace's oldest queue is at least a minute shorter, a merge overflows
+rather than adding work to the older owned queue. Ordinary PRs prefer Namespace
+when its queue is at least a minute shorter; when Namespace backs up they can
+use distinct positively idle general workers on either host. Reserved priority
+and merge-only roles never become ordinary PR fallback slots.
+
+The advisory read is bounded to 24 live runs, 100 jobs per run, 40 seconds total
+and eight seconds per request, using only the job's repository token with
+`actions:read`. Each charged advisory request first checks the token's free
+`rate_limit` endpoint and refuses the snapshot below a reserve of 300 requests;
+a missing or malformed balance is UNKNOWN too. Idle-role decisions that cannot
+benefit from queue data skip it entirely, as do priority release pickers.
+The reserve is a non-atomic safety margin shared with concurrent repository
+jobs, not an exclusive quota reservation. At the observed 07:30–08:30Z rate,
+33 Workspace runs/hour is a conservative picker upper bound (draft/skipped
+pickers included): 33 × 26 = 858 extra core requests/hour worst case out of
+1,000; merge groups alone were 7 × 26 = 182. That is why the guard, early exit
+and bounded reads are necessary rather than treating 26 calls as cheap. Incomplete counts, changed run/attempt/head, invalid data, API
+failure or a larger live inventory makes the advisory view UNKNOWN and logs
+that limitation; it never holds jobs. The existing idle-role policy then
+applies. No polling loop, dispatch, rerun, label write or admission lock occurs.
+Concurrent pickers can see the same snapshot and overshoot a pool; this is advisory admission, not an atomic reservation. Use CI_MERGE_OVERFLOW=off to restore owned-only merges. Queue age is not an assigned start wait. A complete runner view is required to
+infer saturation; an unavailable org reader still retains the owned role.
+
+Overflow build/test jobs use the established 8x16 shape; isolation-vm alone
+uses the KVM profile through `ci1_profile`. This avoids serializing all stages
+behind the smaller VM-profile limit. Profiles keep inline run-id controls;
+shape labels keep the separate namespace-features run-id label. Priority PRs
+and releases retain their existing policy. The provisioned PR fair-share cap
+remains a separate inactive-until-qualified change; these observations do not
+invent that profile or enforce a live count limit.
+
+Already-created GitHub jobs keep their requested labels, so this admission
+policy affects new decisions and does not migrate or restart queued work.
+Nix's optional persistent-store workflow is disabled on the shared pool,
+including schedule and manual jobs; release-tag triggers are removed. Its
+persistent-Cargo-home/cache proof cannot be moved to an unqualified ephemeral
+image by changing a label. Restore it only through a reviewed dedicated
+persistent-store placement, preserving exact native qualification and cache
+semantics. Cancelled partial proofs remain incomplete rather than passes.
+
 Genie, TypeScript and the aggregate remain on GitHub-hosted Ubuntu.
 The declared ci1 pool is five general workers (including one reserved priority worker) and one
 merge worker, with dynamic label lending. The current source run used `ci1-5` with
@@ -826,9 +888,17 @@ ST_LOAD_GATE=1 ST_LOAD_HOG=1 ST_LOAD_HOG_REPORT=out nix develop .#perf -c cargo 
 nix develop .#perf -c bash scripts/ci-perf load-hog   # the same, in the perf slot on hetz2
 ```
 
-It is a step of its own and no required check until its numbers are stable. "Without the hog" is
+The Performance workflow runs it as the `perf-load-hog` job, with `continue-on-error` and its table
+in the step summary and the `perf-load-hog-logs` artifact. It runs on pushes to main and manual
+dispatch, not on pull requests: it takes a second performance runner for up to 45 minutes. It is
+no required check until its numbers are stable. "Without the hog" is
 the host's load as it was: on a shared host that is not an idle machine, and the report gives the
 load average. Keep a Mac's load average under 10 outside the test window.
+
+`perf-load-hog-macos` runs the same stage on a macOS runner under `taskpolicy -b`, by manual dispatch
+only, and keeps the compiled test binary in the `perf-load-hog-macos` artifact. A Mac of the fleet
+runs that binary (`ST_LOAD_GATE=1 ST_LOAD_HOG=1 ./perf_load-macos-arm64 a_seat_priority_hog --nocapture`);
+nothing is built on a Mac.
 
 #### Measuring a change on hetz2: the perf slot
 
@@ -1203,3 +1273,22 @@ shards run every one of them, as do the wrapper path's runs, so nothing is dropp
 The check fails if an entry no longer names exactly one test (the list has gone stale) and if any
 unlisted test fails. Do not add an entry to hide a failing test; add it only when the sandbox cannot
 provide what the test needs, and say what.
+
+
+CI test-build artifact consumers retain a private partial ZIP between the existing
+two bounded transfer attempts. Each attempt gets at most 600 seconds, within a
+shared 1200-second transfer budget. Storage receives no GitHub token: the job
+token authenticates only the artifact redirect request to GitHub. A resumed
+response must be HTTP 206 with the exact requested offset, final byte and total
+matching the authenticated artifact size. HTTP 200 replaces the partial rather
+than appending. Range or integrity mismatches discard the partial; extraction
+still requires the whole ZIP digest, member CRCs and successful producer's
+manifest/file hashes, followed by the existing source/tool identity check.
+
+The step logs the authenticated artifact size, requested offset, bytes received,
+retained bytes, response status and elapsed seconds per attempt, with progress
+every 30 seconds while bytes arrive. A stalled read is bounded by the attempt
+deadline. Signed storage URLs, credentials and raw HTTP errors are excluded.
+Final failure removes the private partial and starts no tests. These diagnostics
+distinguish a zero-byte stall from an interrupted transfer; transport recovery
+does not waive a failed gate or authorize a workflow rerun.

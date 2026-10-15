@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "summary": "Classify inherited main storage and rules transitions in PR1877 semantic integration",
+  "replay": {
+    "status": "none",
+    "detail": "Canonical projection catch-up still completes before requests are accepted."
+  },
+  "schema": {
+    "status": "changed",
+    "transitions": [
+      [
+        17,
+        18
+      ],
+      [
+        18,
+        19
+      ],
+      [
+        17,
+        19
+      ]
+    ],
+    "detail": "The semantic merge adopts current main storage17 to19; it adds no migration of its own. Inherited checkpoint-memory17-to18 adds checkpoint_capture_epoch and guarded capture frontiers; inherited reconcile-start-preemption18-to19 adds runtime-start operation/evidence tables and admission indexes with retained launch evidence. See those existing fragments for their complete limits. Older binaries reject19; binary replacement does not undo these additive tables or retained evidence."
+  },
+  "rules": {
+    "status": "changed",
+    "transitions": [
+      [
+        14,
+        15
+      ]
+    ],
+    "detail": "The semantic merge inherits main rules15 from retention-account-limits-rule.json: harness.limits and per-key reconcile decisions alter the retention digest. Checkpoint sealing/verification requires all participating members on15; no new rule is added by socket reservation."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Socket paths and discovery exist before store initialization, but listen and request acceptance remain after readiness. Startup clients retain connection refusal and the existing daemon-starting phase diagnostics. No queued initialization requests or client deadline changes. A per-address advisory lock protects bound-but-not-listening addresses and is retained during serving."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Connection refusal and established-stream disconnects remain until initialization completes. Original early-listen connection-time measurements do not apply to this semantic port. No new startup latency or interruption budget is measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "No socket configuration or manual SQL is introduced. This old PR integration adopts main storage19/rules15; preserve the normal coordinated fleet upgrade and forward-only database safety. Reservation sidecars are included in ordinary stopped-daemon uninstall."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Roll forward through the existing main storage/rules upgrade route. Older17/18 binaries do not qualify rollback from19. Reservation file locks release on process exit but their files remain until ordinary stopped-daemon uninstall; no database state is erased by binary replacement."
+  },
+  "commits": [
+    "d4e8c09d6d81b7c10d1db77f9323b9f0b52f2f4a"
+  ]
+}

@@ -388,3 +388,37 @@ nextest setting, production table/trigger/library/Runtime/factory/worker or
 authority/lifetime proof is added, and all earlier controls and ceilings remain
 unchanged. Metadata growth remains adverse and the original strict page has
 zero statement headroom; any current-main failure must retain its actual tuple.
+
+## Two-consumer journal outer rollback (fixture only)
+
+One appended control calls the production `Installer::prune_journal` inside an
+existing managed background writer transaction, with two distinct installed
+prefix roots at A=32 and B=16. The library alone selects the cutoff and deletes
+journal references; the single-consumer image-prune helper is not called.
+An owned within-transaction witness must contain the byte-identical original
+references 17..32 and their independently summed row/byte counters, while both
+consumers' complete root/job/coverage/output states stay unchanged. A no-op
+prune cannot satisfy the changed-rowset and changed-counter assertions.
+
+Separate checked WAL readers must see the original committed state while that
+transaction is open. After explicit successful rollback and an idle-writer
+assertion, the physical writer loan ends before fresh readers compare all
+source/native/image/journal/counter state and both complete consumer states.
+The owned changed witness survives rollback. Payload width validation is a
+post-copy oracle bound, not production pre-copy eligibility. There are no
+sleeps, timing assertions, callbacks or hook replacements.
+
+A predetermined committing arm then removes 16 references; a second prune must
+remove zero while B is still at 16. B consumes the original retained references
+to reach 32 and matches native-derived ID/subject/kind/digest output with A;
+only then may the final 16 references be pruned. All 32 images remain unchanged.
+Any transaction/check/rollback error fails the control without a fallback.
+
+The new name is UNRUN at source authoring. This covers successful outer rollback
+only after hosted qualification. Two-consumer refused COMMIT, crash/reopen,
+image reclamation, whole-prune accounting and unsafe-cleanup containment remain
+unverified, alongside source authority/lifetime and production adoption. All
+previous controls, helpers, strict/growth/crash bodies, limits and nextest
+settings remain unchanged. The original strict page has zero statement
+headroom and eight characterized growth pages remain over 128; no old work or
+crash receipt qualifies this new two-consumer path.

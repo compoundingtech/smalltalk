@@ -424,7 +424,7 @@ fn record_session_end(
     }
 }
 
-fn channel_extension_set(kind: &HarnessKind, runtime_id: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn channel_extension_set(kind: &HarnessKind, runtime_id: &str) -> Result<std::path::PathBuf> {
     // st3 publishes a marked set with its environment substitutions applied. Admission and
     // the live launch must select that same asset rather than looking for an st2-only receipt.
     let exported = if std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push") {

@@ -107,6 +107,192 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.monitor.lock.close()
         self.directory.cleanup()
 
+    async def test_notice_episode_survives_same_nonce_flaps_restart_and_new_probe_cycles(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        episode = dict(original["notice_episode"])
+        for _ in range(3):
+            self.monitor.api.online = False
+            await self.monitor.route(self.target)
+            self.assertEqual(self.monitor.report()["routes"][0]["status"], "last-seen")
+            self.assertFalse(self.alert_posts("delivery-probe-recovery"))
+            self.restart_monitor()
+            self.monitor.api.online = True
+            await self.monitor.route(self.target)
+            current = self.monitor.state["routes"][self.target]
+            self.assertEqual(current["nonce"], original["nonce"])
+            self.monitor.measuring[self.target] -= 61_000_000_000
+            await self.monitor.route(self.target)
+        current = self.monitor.state["routes"][self.target]
+        current["started_at_unix_ms"] -= self.monitor.interval
+        self.monitor.persist()
+        await self.monitor.route(self.target)
+        current = self.monitor.state["routes"][self.target]
+        self.assertNotEqual(current["nonce"], original["nonce"])
+        self.assertEqual(current["notice_episode"]["message"], episode["message"])
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.assertEqual(len(self.alert_posts("delivery-probe-alert")), 1)
+        self.assertEqual(len(self.alert_posts("delivery-probe-paused")), 1)
+        self.monitor.api.records = [{"kind": "message.delivered", "actor": self.target},
+                                    {"kind": "message.read", "actor": "agent/wrong"}]
+        await self.monitor.route(self.target)
+        self.assertFalse(self.alert_posts("delivery-probe-recovery"))
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        await self.monitor.route(self.target)
+        await self.monitor.route(self.target)
+        self.assertEqual(len(self.alert_posts("delivery-probe-recovery")), 1)
+        self.assertNotIn("notice_episode", current)
+        self.assertEqual(len(self.alert_posts("delivery-probe-alert")), 1)
+
+    async def test_same_nonce_flaps_do_not_repeat_outage_notice(self):
+        for agent_notice in (False, True):
+            with self.subTest(agent_notice=agent_notice):
+                self.monitor.state["routes"] = {}
+                self.monitor.api = FakeApi()
+                if agent_notice:
+                    self.config["alert_agent"] = "agent/operations/amber"
+                self.monitor.persist()
+                self.restart_monitor()
+                await self.monitor.route(self.target)
+                original = self.monitor.state["routes"][self.target]
+                for _ in range(3):
+                    self.monitor.measuring[self.target] -= 61_000_000_000
+                    await self.monitor.route(self.target)
+                    self.monitor.api.online = False
+                    await self.monitor.route(self.target)
+                    self.restart_monitor()
+                    self.monitor.api.online = True
+                    await self.monitor.route(self.target)
+                current = self.monitor.state["routes"][self.target]
+                self.assertEqual(current["message"], original["message"])
+                self.assertEqual(current["nonce"], original["nonce"])
+                notices = (self.alert_posts("delivery-probe-alert") if agent_notice else
+                           [body for path, body in self.monitor.api.posts if path == "/v1/work/ask"])
+                self.assertEqual(len(notices), 1)
+                self.assertFalse(self.alert_posts("delivery-probe-recovery"))
+
+    async def test_paused_notice_and_recovery_retry_exact_bodies_after_ambiguous_responses(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        post = self.monitor.api.post
+        lost = {"delivery-probe-paused", "delivery-probe-recovery"}
+        async def lost_once(path, body):
+            result = await post(path, body)
+            tags = set(body.get("tags", [])) & lost
+            if tags:
+                lost.difference_update(tags)
+                raise TimeoutError("committed; response lost")
+            return result
+        self.monitor.api.post = lost_once
+        self.monitor.api.online = False
+        with self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        pauses = self.alert_posts("delivery-probe-paused")
+        self.assertEqual(len(pauses), 2)
+        self.assertEqual(pauses[0], pauses[1])
+        self.monitor.api.online = True
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        with self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.restart_monitor()
+        # A different clock/message interval cannot mutate a committed recovery intent.
+        self.monitor.state["routes"][self.target]["next_at_unix_ms"] = 0
+        await self.monitor.route(self.target)
+        recoveries = self.alert_posts("delivery-probe-recovery")
+        self.assertEqual(len(recoveries), 2)
+        self.assertEqual(recoveries[0], recoveries[1])
+        self.assertEqual(len(self.alert_posts("delivery-probe-alert")), 1)
+        self.assertNotIn("notice_episode", self.monitor.state["routes"][self.target])
+
+    async def test_reviewer_episode_cancel_retries_and_read_is_the_only_reset(self):
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]
+        notice = next(body for path, body in self.monitor.api.posts if path == "/v1/work/ask")
+        post = self.monitor.api.post
+        lost = True
+        async def lost_cancel(path, body):
+            nonlocal lost
+            result = await post(path, body)
+            if path == "/v1/work/cancel-ask" and lost:
+                lost = False
+                raise TimeoutError("cancel committed; response lost")
+            return result
+        self.monitor.api.post = lost_cancel
+        self.monitor.api.online = False
+        with self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        cancels = [body for path, body in self.monitor.api.posts if path == "/v1/work/cancel-ask"]
+        self.assertEqual(cancels[0], cancels[1])
+        for _ in range(2):
+            self.monitor.api.online = True
+            await self.monitor.route(self.target)
+            self.monitor.measuring[self.target] -= 61_000_000_000
+            await self.monitor.route(self.target)
+            self.monitor.api.online = False
+            await self.monitor.route(self.target)
+            self.restart_monitor()
+        self.assertEqual(sum(path == "/v1/work/ask" for path, _ in self.monitor.api.posts), 1)
+        self.monitor.api.online = True
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        await self.monitor.route(self.target)
+        current = self.monitor.state["routes"][self.target]
+        self.assertTrue(current["late"], "same pending message retains its measured deadline miss")
+        self.assertGreater(current["latency_ms"], self.monitor.deadline)
+        self.assertNotIn("notice_episode", current)
+        cancels = [body for path, body in self.monitor.api.posts if path == "/v1/work/cancel-ask"]
+        self.assertEqual(len(cancels), 3)
+        self.assertIn("recovered", cancels[-1]["idempotency_key"])
+        self.monitor.api.records = []
+        current["next_at_unix_ms"] = 0
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        asks = [body for path, body in self.monitor.api.posts if path == "/v1/work/ask"]
+        self.assertEqual(len(asks), 2)
+        self.assertNotEqual(asks[-1]["idempotency_key"], notice["idempotency_key"])
+        self.assertNotEqual(self.monitor.state["routes"][self.target]["nonce"], original["nonce"])
+
+    async def test_active_legacy_notice_migrates_lazily_without_new_notice(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        route = self.monitor.state["routes"][self.target]
+        alert = dict(route["agent_alert"])
+        route.pop("notice_episode")
+        self.monitor.persist()
+        self.restart_monitor()
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.restart_monitor()
+        self.monitor.api.online = True
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        route = self.monitor.state["routes"][self.target]
+        self.assertEqual(route["notice_episode"]["agent_alert"], alert)
+        self.assertEqual(len(self.alert_posts("delivery-probe-alert")), 1)
+        self.assertEqual(set(route["notice_episode"]["clears"]), {"absent"})
+        self.assertEqual(self.monitor.state["receipts"], {})
+
     async def test_channel_stderr_flood_keeps_native_stdout_and_exit_context(self):
         child = Path(self.directory.name) / "channel"
         child.write_text("#!" + sys.executable + "\n" +
@@ -765,7 +951,8 @@ class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
                    "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
             if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
                 env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
-            nodes = [faults.Node(directory, host, BINARY, env, binary_directory) for host in ("amber", "cobalt")]
+            # The fault eval's default phase bound for node startup and each CLI call.
+            nodes = [faults.Node(directory, host, BINARY, env, binary_directory, 60) for host in ("amber", "cobalt")]
             if publication_gap:
                 # Hold the launcher's return after the real PTY is published. The
                 # native channel can already see its local incarnation while the

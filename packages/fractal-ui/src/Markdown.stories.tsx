@@ -3,6 +3,8 @@ import * as stylex from '@stylexjs/stylex'
 import { flushSync } from 'react-dom'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { Button } from 'react-aria-components'
+import { expect, userEvent, waitFor, within } from 'storybook/test'
+import { EmbraceMarkdownPreview } from './assistant-ui/EmbraceToolPreview'
 import { Markdown, ResourceChip, completeStreamingTail, type InlineResource } from './assistant-ui/composition/Markdown'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme } from './assistant-ui/composition-theme'
@@ -265,9 +267,37 @@ export const CopyFailure: Story = {
   },
 }
 
+/** C27/E04–E12: the input boundary forwards foreground ink, while default seat Prose stays soft. */
+function InputInkCanvas({ scheme = 'dark', narrow = false }: { scheme?: 'dark' | 'light'; narrow?: boolean }) {
+  const [foreground, setForeground] = React.useState(true)
+  const [revision, rerender] = React.useState(0)
+  return <main data-revision={revision} {...stylex.props(styles.canvas, ...baselineTheme, scheme === 'light' && lightTheme)}>
+    <div {...stylex.props(styles.toolbar)}><Button onPress={() => rerender(value => value + 1)}>Rerender input</Button><Button onPress={() => setForeground(false)}>Show soft control</Button><Button onPress={() => setForeground(true)}>Restore input</Button></div>
+    <section {...stylex.props(styles.lane, narrow && styles.inputNarrow)}><EmbraceMarkdownPreview tone={foreground ? 'foreground' : 'default'} markdown={'The input anchors this turn.\n\n- Review the retained snapshot.\n\n| Fact | Value |\n| --- | --- |\n| Snapshot | Retained |'} /></section>
+  </main>
+}
+export const InputForegroundDark1440: Story = { render: args => <InputInkCanvas scheme={args.scheme} />, play: async ({ canvasElement, args }) => {
+  const canvas = within(canvasElement)
+  await userEvent.click(canvas.getByRole('button', { name: 'Rerender input' }))
+  await waitFor(() => expect(canvasElement.querySelector('main')).toHaveAttribute('data-revision', '1'))
+  const expected = args.scheme === 'light' ? 'rgb(39, 39, 42)' : 'rgb(245, 245, 245)'
+  const paints = () => [...canvasElement.querySelectorAll<HTMLElement>('[data-testid="markdown"] p, [data-testid="markdown"] li, [data-testid="markdown"] table')].map(element => getComputedStyle(element).color)
+  await expect(paints()).toEqual([expected, expected, expected])
+  await userEvent.click(canvas.getByRole('button', { name: 'Show soft control' }))
+  await waitFor(() => expect(canvas.getByTestId('markdown')).toHaveAttribute('data-tone', 'default'))
+  await expect(paints().every(color => color !== expected)).toBe(true)
+  await userEvent.click(canvas.getByRole('button', { name: 'Restore input' }))
+  await waitFor(() => expect(canvas.getByTestId('markdown')).toHaveAttribute('data-tone', 'foreground'))
+  await expect(paints()).toEqual([expected, expected, expected])
+} }
+export const InputForegroundLight1440: Story = { ...InputForegroundDark1440, args: { scheme: 'light' } }
+export const InputForegroundDark440: Story = { ...InputForegroundDark1440, render: args => <InputInkCanvas scheme={args.scheme} narrow /> }
+export const InputForegroundLight440: Story = { ...InputForegroundDark440, args: { scheme: 'light' } }
+
 const styles = stylex.create({
   canvas: { minHeight: '100vh', boxSizing: 'border-box', padding: s.xl, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading },
   lane: { width: '100%', maxWidth: g.lane, minWidth: 0, marginInline: 'auto' },
+  inputNarrow: { maxWidth: g.polishNarrow },
   toolbar: { display: 'flex', alignItems: 'center', gap: s.md, marginBlockEnd: s.lg },
   button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary }, ':disabled': { color: ink.fgMuted, cursor: 'default' } },
   heading: { marginBlock: s.lg, fontSize: t.headingSize, lineHeight: t.headingLeading },

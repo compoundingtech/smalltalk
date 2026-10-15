@@ -7,9 +7,9 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::client::Client;
-use crate::config::Config;
-use crate::model::{
+use st3::client::Client;
+use st3::config::Config;
+use st3::model::{
     ApplyRequest, ApplyResponse, DocumentListResponse, DocumentPutRequest, IntentInput,
     MissionRequest, MissionResponse, MissionRunView, StatusResponse,
 };
@@ -33,6 +33,8 @@ fn client(config: &Config) -> Result<Client> {
 }
 
 /// Count every historical run, including completed and cancelled runs on another member.
+// Not called in the binary; it was a public library function.
+#[allow(dead_code)]
 pub async fn has_run(config: &Config) -> Result<bool> {
     has_run_on(&client(config)?).await
 }
@@ -47,10 +49,10 @@ async fn has_run_on(client: &Client) -> Result<bool> {
             .context("onboarding history has no run count")?
             > 0),
         // The named mission has no overview yet: nothing has run.
-        Err(error) if crate::client::is_not_found(&error) => Ok(false),
+        Err(error) if st3::client::is_not_found(&error) => Ok(false),
         // An older daemon without the overview route cannot say, and guessing "never" would
         // start a second onboarding on an install that already finished one.
-        Err(error) if crate::client::is_missing_route(&error) => Err(error.context(
+        Err(error) if st3::client::is_missing_route(&error) => Err(error.context(
             "the running daemon is older than this st and cannot say whether onboarding already ran; restart it, or run st setup --onboarding to begin explicitly",
         )),
         Err(error) => Err(error),
@@ -88,7 +90,7 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
         .await?;
     let hash = hex::encode(Sha256::digest(GUIDE.as_bytes()));
     if !versions.items.iter().any(|version| version.hash == hash) {
-        let _: crate::model::DocumentVersion = client
+        let _: st3::model::DocumentVersion = client
             .post(
                 "/v1/documents",
                 &DocumentPutRequest {
@@ -104,7 +106,7 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
             .await?;
     }
     let mission_source = ONBOARDING.replace("@GUIDE@", &format!("doc/st/guide@{hash}"));
-    let parsed = crate::parse_intent(&mission_source, &config.node)?;
+    let parsed = st3::parse_intent(&mission_source, &config.node)?;
     let revision = &parsed
         .missions
         .get(MISSION)
@@ -163,7 +165,7 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
             .insert(ASSISTANT_SUBJECT.into(), expected);
     }
     if let Err(error) = apply(&client, definition_preview, config).await {
-        if !rerun && crate::client::http_status(&error) == Some(409) {
+        if !rerun && st3::client::http_status(&error) == Some(409) {
             return declaration_changed(false);
         }
         return Err(error);
@@ -185,9 +187,9 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
     let token = current
         .desired_token
         .context("the built-in Smalltalk Assistant has no declaration")?;
-    let claim: crate::model::ClaimRecord = client.get(&format!("/v1/claims/by-id/{token}")).await?;
-    let desired: crate::model::DesiredSubject = serde_json::from_value(claim.body)?;
-    let mut agent = crate::graph::render_desired_node(&desired.desired)?;
+    let claim: st3::model::ClaimRecord = client.get(&format!("/v1/claims/by-id/{token}")).await?;
+    let desired: st3::model::DesiredSubject = serde_json::from_value(claim.body)?;
+    let mut agent = st3::graph::render_desired_node(&desired.desired)?;
     // Typed harnesses require a body even when the provider has no default flags.
     if let Some(body) = agent.children_mut()
         && let Some(harness) = body.get_mut("harness")
@@ -213,7 +215,7 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
     let result = apply(&client, preview, config).await;
     if let Err(error) = result {
         // A concurrent first setup may have won the same named run's publication fence.
-        if !rerun && crate::client::http_status(&error) == Some(409) {
+        if !rerun && st3::client::http_status(&error) == Some(409) {
             return declaration_changed(false);
         }
         return Err(error);
@@ -235,7 +237,7 @@ fn declaration_changed(rerun: bool) -> Result<Option<String>> {
     Ok(None)
 }
 
-async fn assistant_status(client: &Client) -> Result<Option<crate::model::SubjectStatus>> {
+async fn assistant_status(client: &Client) -> Result<Option<st3::model::SubjectStatus>> {
     let status: StatusResponse = client.get("/v1/status?subject=agent%2Fst%2Fassistant").await?;
     Ok(status
         .subjects
@@ -277,7 +279,7 @@ fn declarations(
         remove_at_run_end: None,
     };
     let mut document: KdlDocument =
-        crate::creation::agent_document(&args, &workspace.to_string_lossy(), false, None)
+        st3::creation::agent_document(&args, &workspace.to_string_lossy(), false, None)
             .parse()?;
     let mut display_name = KdlNode::new("name");
     display_name.entries_mut().push(KdlEntry::new(ASSISTANT_NAME));
@@ -358,7 +360,7 @@ mod tests {
             "keep the bundled guide bounded"
         );
         let guide = hex::encode(sha2::Sha256::digest(super::GUIDE.as_bytes()));
-        let mission = crate::parse_intent(
+        let mission = st3::parse_intent(
             &super::ONBOARDING.replace("@GUIDE@", &format!("doc/st/guide@{guide}")),
             "studio",
         )
@@ -369,7 +371,7 @@ mod tests {
                 .contains(&format!("doc/st/guide@{guide}"))
         );
         let revision = &mission.missions[super::MISSION].revision;
-        for harness in crate::environment::HARNESSES {
+        for harness in st3::environment::HARNESSES {
             let source = super::declarations(
                 harness,
                 std::path::Path::new("/work/st-assistant"),
@@ -378,7 +380,7 @@ mod tests {
                 "person/ada",
             )
             .unwrap();
-            let intent = crate::parse_intent(&source, "studio").unwrap();
+            let intent = st3::parse_intent(&source, "studio").unwrap();
             assert!(intent.subjects.contains_key(super::ASSISTANT_SUBJECT));
             assert!(!source.contains("model "));
             assert!(source.contains("name \"Smalltalk Assistant\""));

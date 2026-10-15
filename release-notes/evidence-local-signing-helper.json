@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add the key-handling helper and the aggregate mode for a CI job that signs its own result",
+  "replay": {
+    "status": "none",
+    "detail": "Runtime claims and replay behavior are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, schema version or claim registration changes; notes use the existing v1 evidence format with more recorded inputs."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint and admission rule versions are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Scripts and tests only; nothing runs in CI until a workflow calls them."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon interruption or restart is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting removes the scripts; published notes are inert data."
+  }
+}

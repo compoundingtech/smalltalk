@@ -60,7 +60,7 @@ pub mod maintenance;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod malloc_trim;
 pub(crate) mod memory;
-pub(crate) mod read_cache;
+pub mod read_cache;
 pub mod mission;
 pub mod model;
 /// A driver relaunches its harness on the native session a suspended seat resumes.
@@ -103,9 +103,6 @@ pub mod seat_queue;
 /// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
 pub mod sekrets;
 pub mod service;
-/// First-run configuration and human-only daemon startup.
-pub mod setup;
-pub mod onboarding;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod slo;
@@ -124,6 +121,8 @@ pub mod test_support;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
 pub mod terminal_binding;
+/// Runs each agent as its own Unix user, in its own namespaces and root-owned cgroup.
+pub mod tiles;
 
 pub use graph::{parse_intent, validate_mission_runtimes};
 pub use model::{NormalizedIntent, St3Error};

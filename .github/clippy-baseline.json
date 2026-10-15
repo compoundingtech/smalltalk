@@ -43,8 +43,7 @@
       "clippy::manual_is_multiple_of": 1
     },
     "st3-client-codegen": {
-      "clippy::useless_format": 2,
-      "unused_variables": 1
+      "clippy::useless_format": 2
     },
     "st3-feed": {
       "clippy::filter_map_bool_then": 1,

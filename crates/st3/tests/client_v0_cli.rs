@@ -4712,3 +4712,225 @@ mission "orchid-actor" state="ready" {
     }
     server.abort();
 }
+
+#[test]
+fn client_config_warns_once_on_stderr_and_doctor_lists_unknown_without_polluting_json() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let config_root = root.path().join("config");
+    // Make build-tools independently PASS so only the config warning can make
+    // strict doctor fail; none of these marker executables may be invoked.
+    let bin = root.path().join("tools");
+    std::fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(
+        st_runtime::resolve_executable("env", &std::env::vars().collect()).unwrap(),
+        bin.join("env"),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    for tool in ["cargo", "rustc", "sccache", "git", "nix", "mold"] {
+        let path = bin.join(tool);
+        std::fs::write(&path, "#!/bin/sh\nexit 33\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(
+        root.path().join(".bash_profile"),
+        format!("export PATH='{}'\n", bin.display()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(config_root.join("st3")).unwrap();
+    std::fs::write(config_root.join("st3/config.toml"),
+        "node = 'fixture'\nseat_priority = 'normal'\nfuture_root = 'never-print-this'\n[github]\nfuture_nested = 'also-private'\n").unwrap();
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
+        .env_remove("ST_AGENT")
+        .env_remove("ST_MISSION_RUN")
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .args(["--json", "doctor", "--developer"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = json["checks"].as_array().unwrap();
+    assert_eq!(
+        checks
+            .iter()
+            .find(|row| row["name"] == "build-tools")
+            .unwrap()["status"],
+        "pass"
+    );
+    let check = checks
+        .iter()
+        .find(|row| row["name"] == "client-config")
+        .unwrap();
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains("[\"future_root\"]"));
+    assert!(message.contains("[\"github\"][\"future_nested\"]"));
+    assert_eq!(json["status"], "warn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("ignoring unknown client config keys:")
+            .count(),
+        1
+    );
+    for text in [stderr.as_ref(), message] {
+        assert!(!text.contains("never-print-this"));
+        assert!(!text.contains("also-private"));
+    }
+    let strict = st3::test_support::command(test_bin!("st3-fixture"))
+        .env_remove("ST_AGENT")
+        .env_remove("ST_MISSION_RUN")
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .args(["--json", "doctor", "--developer", "--strict"])
+        .output()
+        .unwrap();
+    assert!(
+        !strict.status.success(),
+        "strict doctor must fail on ignored config keys"
+    );
+    let strict_json: Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(strict_json["status"], "warn");
+    assert!(
+        strict_json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "client-config")
+    );
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("strict mode"));
+    std::fs::write(
+        config_root.join("st3/config.toml"),
+        "node = 'fixture'\nseat_priority = 'normal'\n",
+    )
+    .unwrap();
+    let valid = st3::test_support::command(test_bin!("st3-fixture"))
+        .env_remove("ST_AGENT")
+        .env_remove("ST_MISSION_RUN")
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .args(["--json", "doctor", "--developer", "--strict"])
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "strict doctor must succeed after the unknown keys are removed: {valid:?}"
+    );
+    let valid_json: Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(valid_json["status"], "pass");
+    assert!(
+        !String::from_utf8_lossy(&valid.stderr).contains("ignoring unknown client config keys:")
+    );
+}
+
+#[test]
+fn setup_rejects_unknown_config_before_any_rewrite() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let original = b"# retain this text\nnode = 'fixture'\nfuture_root = 'fixture-secret'\n[github]\nfuture_nested = true\n";
+    std::fs::write(&path, original).unwrap();
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
+        .env_remove("ST_AGENT")
+        .env_remove("ST_MISSION_RUN")
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .args(["setup", "--config"])
+        .arg(&path)
+        .args([
+            "--yes",
+            "--start",
+            "false",
+            "--install",
+            "false",
+            "--service",
+            "false",
+            "--harness",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown field"));
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn local_state_commands_reject_unknown_config_before_using_default_state() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let config_root = root.path().join("config");
+    let state_root = root.path().join("state");
+    std::fs::create_dir_all(config_root.join("st3")).unwrap();
+    std::fs::create_dir_all(state_root.join("st3")).unwrap();
+    let marker = state_root.join("st3/keep-marker");
+    std::fs::write(&marker, b"unchanged default-state fixture").unwrap();
+    let path = config_root.join("st3/config.toml");
+    let original = b"node = 'fixture'\nstate_dr = '/fictional/wrong-state'\n";
+    std::fs::write(&path, original).unwrap();
+    let missing_binary = root.path().join("no-harness");
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["fleet", "status"],
+        // Even a guard regression is confined to a private dry run, never a host uninstall.
+        vec![
+            "uninstall",
+            "--dry-run",
+            "--no-service",
+            "--keep-binaries",
+            "--offline",
+        ],
+        vec![
+            "admission",
+            "revoke",
+            "omp",
+            "--binary",
+            missing_binary.to_str().unwrap(),
+        ],
+        vec!["service", "status"],
+    ];
+    for args in cases {
+        let output = st3::test_support::command(test_bin!("st3-fixture"))
+            .env_remove("ST_AGENT")
+            .env_remove("ST_MISSION_RUN")
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", &config_root)
+            .env("XDG_STATE_HOME", &state_root)
+            .env("ST3_ENDPOINT", root.path().join("missing.sock"))
+            .env("ST3_DAEMON_WAIT", "0")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("unknown field") && error.contains("state_dr"),
+            "{args:?}: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original, "{args:?}");
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"unchanged default-state fixture",
+            "{args:?}"
+        );
+        assert!(
+            !state_root
+                .join("st3/drivers/sessions/harness-admission")
+                .exists()
+        );
+    }
+}

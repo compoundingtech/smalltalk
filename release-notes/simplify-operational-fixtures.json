@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep operational inventories focused on current commands and projections",
+  "replay": {
+    "status": "none",
+    "detail": "Remove the historical command transition matrix and its dedicated assertion; retain current purposes, canonical roots, conformance and semantic regression fixtures. Update documentary CLI spelling and implementation status."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Remove the historical command transition matrix and its dedicated assertion; retain current purposes, canonical roots, conformance and semantic regression fixtures. Update documentary CLI spelling and implementation status."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Remove the historical command transition matrix and its dedicated assertion; retain current purposes, canonical roots, conformance and semantic regression fixtures. Update documentary CLI spelling and implementation status."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Remove the historical command transition matrix and its dedicated assertion; retain current purposes, canonical roots, conformance and semantic regression fixtures. Update documentary CLI spelling and implementation status."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Remove the historical command transition matrix and its dedicated assertion; retain current purposes, canonical roots, conformance and semantic regression fixtures. Update documentary CLI spelling and implementation status."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Remove the historical command transition matrix and its dedicated assertion; retain current purposes, canonical roots, conformance and semantic regression fixtures. Update documentary CLI spelling and implementation status."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Remove the historical command transition matrix and its dedicated assertion; retain current purposes, canonical roots, conformance and semantic regression fixtures. Update documentary CLI spelling and implementation status."
+  }
+}

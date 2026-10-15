@@ -4,7 +4,7 @@ import { useFocusEffect, useIsFocused } from '@react-navigation/native';
 import { offlinePresentation } from './projectionCache';
 import { useStore, type OnDemand } from './store';
 import { theme } from './theme';
-import { Banner, Button, T } from './ui';
+import { Banner, Button, T, useTextAppearance } from './ui';
 
 // What every screen's content shares: the connection, problems worth reading, and pull to refresh.
 // The navigation bar and tab bar above and below are native and styled only through their options.
@@ -19,6 +19,7 @@ function ageOf(ms: number): string | null {
 
 export function StatusLine() {
   const { status, hasSynced, gatewayHost, caps, snapshot, data, cachedAt } = useStore();
+  const appearance = useTextAppearance();
   // Not live, what is shown is st's last snapshot: say how old it is.
   const age = snapshot ? ageOf(Date.now() - Date.parse(snapshot.created_at)) : cachedAt ? ageOf(Date.now() - cachedAt) : null;
   const shown = age ? `showing data from ${age} ago` : 'showing last data';
@@ -28,9 +29,9 @@ export function StatusLine() {
     : ['○', theme.quiet, 'not paired'];
   const fresh = hasSynced && !data.attention.length && !data.agents.some(agent => agent.state === 'running' && agent.harness_state === 'working');
   return <View accessibilityLabel={`${word}${gatewayHost ? ` ${gatewayHost}` : ''}`} style={{ paddingHorizontal: 12, paddingTop: 6 }}>
-    <View style={{ flexDirection: 'row' }}>
+    <View style={appearance.system ? { gap: 4 } : { flexDirection: 'row' }}>
     <T color={color}>{glyph} {word}</T>
-    {gatewayHost ? <T dim numberOfLines={1} style={{ flex: 1 }}>  {gatewayHost}{caps?.session_actor ? ` · ${caps.session_actor.replace(/^person\//, '')}` : ''}</T> : null}
+    {gatewayHost ? <T dim numberOfLines={appearance.system ? undefined : 1} style={appearance.system ? undefined : { flex: 1 }}>  {gatewayHost}{caps?.session_actor ? ` · ${caps.session_actor.replace(/^person\//, '')}` : ''}</T> : null}
     </View>
     {fresh ? <T dim>nothing running yet · Now → New → New terminal</T> : null}
   </View>;
@@ -39,11 +40,12 @@ export function StatusLine() {
 /** Errors, load failures, and the offline state, each once, at the top of the content. */
 export function Banners() {
   const { error, setError, pairingIssue, setPairingIssue, loadErrors, status, hasSynced, connectionIssue, busy, actions } = useStore();
+  const appearance = useTextAppearance();
   const failed = Object.entries(loadErrors);
   return <View>
     {error ? <Banner text={error} onPress={() => setError('')} /> : null}
     {pairingIssue ? <Banner text={pairingIssue} onPress={() => setPairingIssue('')} /> : null}
-    {status === 'offline' ? <View style={{ backgroundColor: theme.mantle, paddingHorizontal: 12, paddingBottom: 8 }}>
+    {status === 'offline' ? <View style={{ backgroundColor: appearance.system ? appearance.colors.grouped : theme.mantle, paddingHorizontal: 12, paddingBottom: 8 }}>
       <Banner tone="warning" text={`${offlinePresentation(hasSynced).title}${connectionIssue ? ` · reconnecting on its own: ${connectionIssue}` : ''}`} />
       <Button label="reconnect now" onPress={() => actions.reconnect()} />
     </View> : null}

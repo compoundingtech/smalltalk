@@ -1,0 +1,11 @@
+{
+  "record": "1e964bae7dfb1dfef3b867bb065268348f5be265",
+  "commit": "59103b7d33ab6d0731338cfc2fa5ceff05d6788b",
+  "tree": "50c812835878aeb0750f596f03f1e1173ec16c3f",
+  "check": "linux-gate",
+  "signer": "fleet/dev",
+  "runner": "wrapper",
+  "tier": "full",
+  "exit_code": 0,
+  "flake_lock_sha256": "4754b7b13059879a37769526cb93ebd382f47c9a4579f0c6a34e49082e0be904"
+}

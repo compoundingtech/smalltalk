@@ -67,6 +67,9 @@ const styles = stylex.create({
     position: 'relative', padding: s.xl, display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0,
     backdropFilter: `blur(${g.blur})`,
   },
+  cold: { flexDirection: 'row', alignItems: 'center', padding: s.sm, gap: s.sm, borderRadius: r.full },
+  coldField: { flex: '1 1 0', minWidth: 0 },
+  coldInput: { minHeight: g.controlLg, maxHeight: g.controlLg },
   input: {
     display: 'block',
     width: '100%', boxSizing: 'border-box', minHeight: g.editorMin, maxHeight: g.editorMax,
@@ -93,6 +96,7 @@ const styles = stylex.create({
   help: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: text.fgMuted },
   helpVisibility: { display: 'none' },
   availableReason: { display: 'block' },
+  coldFooter: { flexShrink: 0 },
   cancelVisibility: { display: { default: 'inline-flex', ':disabled': 'none' } },
   warning: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: status.attention },
   button: {
@@ -302,13 +306,16 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
   const readOnly = disabledReason !== undefined || isDisabled
   const helpId = React.useId()
   const guidanceId = React.useId()
+  const reason = disabledReason ?? (isDisabled ? 'This conversation is read-only.' : undefined)
+  const guidance = reason ?? placeholder
   const canSend = useAuiState(s => s.composer.canSend)
   const runtimeText = useAuiState(s => s.composer.text)
+  const cold = readOnly && runtimeText === ''
   const composing = React.useRef(false)
   const { compact } = React.useContext(CompactComposerContext)
   return (
     <ComposerPrimitive.Root
-      {...stylex.props(styles.root, style)}
+      {...stylex.props(styles.root, style, cold && styles.cold)}
       onSubmit={event => { if (readOnly || onRequestSubmit !== undefined) event.preventDefault(); if (!readOnly) onRequestSubmit?.(false) }}
       onCompositionStartCapture={() => { composing.current = true }}
       onCompositionEndCapture={() => { composing.current = false }}
@@ -323,19 +330,19 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
         }
       }}
     >
-      <div {...stylex.props(styles.fieldWrap, fieldStyle)}>
-      {runtimeText === '' ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>{placeholder}</span> : null}
-      {input !== undefined ? input(inputStyle ?? styles.input, [helpId, runtimeText === '' ? guidanceId : undefined].filter(Boolean).join(' ')) : <ComposerPrimitive.Input
+      <div {...stylex.props(styles.fieldWrap, fieldStyle, cold && styles.coldField)}>
+      {runtimeText === '' ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>{guidance}</span> : null}
+      {input !== undefined ? input(cold ? [inputStyle ?? styles.input, styles.coldInput] : inputStyle ?? styles.input, [helpId, runtimeText === '' && reason === undefined ? guidanceId : undefined].filter(Boolean).join(' ')) : <ComposerPrimitive.Input
         aria-label={targetLabel === undefined ? 'Message' : `Message to ${targetLabel}`}
-        aria-describedby={[helpId, runtimeText === '' ? guidanceId : undefined].filter(Boolean).join(' ')}
+        aria-describedby={[helpId, runtimeText === '' && reason === undefined ? guidanceId : undefined].filter(Boolean).join(' ')}
         placeholder=""
         disabled={readOnly}
-        {...stylex.props(styles.input, inputStyle)}
+        {...stylex.props(styles.input, inputStyle, cold && styles.coldInput)}
       />}
       </div>
-      <div data-testid="composer-footer" {...stylex.props(styles.footer, footerStyle)}>
-        <div id={helpId} {...stylex.props(styles.help, styles.helpVisibility, (disabledReason !== undefined || isDisabled) && styles.availableReason)}>
-          {disabledReason ?? (isDisabled ? 'This conversation is read-only.' : targetLabel === undefined ? undefined : `To ${targetLabel}`)}
+      <div data-testid="composer-footer" {...stylex.props(styles.footer, footerStyle, cold && styles.coldFooter)}>
+        <div id={helpId} data-testid="composer-reason" {...stylex.props(styles.help, styles.helpVisibility, reason !== undefined && runtimeText !== '' && styles.availableReason)}>
+          {reason ?? (targetLabel === undefined ? undefined : `To ${targetLabel}`)}
         </div>
         {toolbar}
         <div {...stylex.props(styles.grow)} />
@@ -457,12 +464,13 @@ function TokenComposer({
     inputRef.current?.focus()
   }
   const isEmpty = draft.segments.every((segment) => segment.type === 'text' && segment.text === '')
+  const cold = readOnly && isEmpty && !hasAttachments
   const canSubmit = !readOnly && !sendDisabled && !tooLarge && (serialized.content !== '' || hasAttachments) && (!isRunning || canQueue)
 
   return (
     <ComposerPrimitive.Root
       ref={formRef}
-      {...stylex.props(styles.root, style)}
+      {...stylex.props(styles.root, style, cold && styles.cold)}
       onSubmit={(event) => { event.preventDefault(); if (!open) submit() }}
       onCompositionStartCapture={() => { composing.current = true }}
       onCompositionEndCapture={() => { composing.current = false }}
@@ -491,14 +499,14 @@ function TokenComposer({
       }}
     >
       <Autocomplete>
-        <div {...stylex.props(styles.fieldWrap, fieldStyle)}>
+        <div {...stylex.props(styles.fieldWrap, fieldStyle, cold && styles.coldField)}>
           {/* Input asChild/render still imposes a string value, target.value/selectionStart,
               HTMLTextAreaElement ref and setSelectionRange. RAC TokenInput is contenteditable
               with TokenFieldValue segment/caret state. It cannot implement that native contract.
               This is the real app TokenField inside Root, bridged explicitly to composer text. */}
           <TokenField<Draft>
             aria-label={targetLabel === undefined ? 'Message with mentions and commands' : `Message to ${targetLabel}`}
-            aria-describedby={[helpId, isEmpty ? guidanceId : undefined].filter(Boolean).join(' ')}
+            aria-describedby={[helpId, isEmpty && disabledReason === undefined && !isDisabled ? guidanceId : undefined].filter(Boolean).join(' ')}
             value={draft}
             onChange={(next) => {
               if (readOnly) return
@@ -521,10 +529,10 @@ function TokenComposer({
               }
             }}
           >
-            {isEmpty ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>{placeholder}</span> : null}
+            {isEmpty ? <span id={guidanceId} data-testid="composer-placeholder" {...stylex.props(styles.placeholder)}>{disabledReason ?? (isDisabled ? 'This conversation is read-only.' : placeholder)}</span> : null}
             <TokenInput<Draft>
               ref={inputRef}
-              className={() => stylex.props(styles.input, inputStyle).className ?? ''}
+              className={() => stylex.props(styles.input, inputStyle, cold && styles.coldInput).className ?? ''}
             >
               {(segment) => <Token className={({ isSelected }) => stylex.props(styles.token, isSelected && styles.selectedToken).className ?? ''}>
                 {segment.value === undefined ? segment.text : renderToken?.(segment.value) ??
@@ -550,13 +558,13 @@ function TokenComposer({
           </Popover> : null}
         </div>
       </Autocomplete>
-      <div id={helpId} {...stylex.props(styles.help, styles.helpVisibility, (disabledReason !== undefined || isDisabled) && styles.availableReason)}>
+      <div id={helpId} data-testid="composer-reason" {...stylex.props(styles.help, styles.helpVisibility, (disabledReason !== undefined || isDisabled) && !isEmpty && styles.availableReason)}>
         {disabledReason ?? (isDisabled ? 'This conversation is read-only.' :
           `${targetLabel === undefined ? '' : `To ${targetLabel} · `}Enter to ${variant === 'C3' && isRunning && canQueue ? 'queue' : 'send'} · Shift+Enter for a new line${variant === 'C3' ? ` · ↑ on empty recalls history${canCancel ? ' · Esc cancels' : ''}` : ''}`)}
       </div>
       {tooLarge ? <div role="status" {...stylex.props(styles.warning)}>Message exceeds the {maxContentBytes} byte inline limit. Your draft is kept; shorten it to send.</div> : null}
       {variant === 'C3' && isRunning && !canQueue ? <div {...stylex.props(styles.warning)}>This runtime does not support queuing. Cancel the active run before sending.</div> : null}
-      <div data-testid="composer-footer" {...stylex.props(styles.footer, footerStyle)}>
+      <div data-testid="composer-footer" {...stylex.props(styles.footer, footerStyle, cold && styles.coldFooter)}>
         {toolbar}
         <div {...stylex.props(styles.grow)} />
         {variant === 'C3' && toolbar === undefined ? <>

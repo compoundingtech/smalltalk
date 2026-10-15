@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add non-required shadow evidence-gate jobs that report whether a trusted note exists for each required check",
+  "replay": {"status": "none", "detail": "No daemon replay change."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change."},
+  "rules": {"status": "none", "detail": "No required check, daemon rule or main landing change. The jobs are not required, nothing needs them, and they never skip or fail a check."},
+  "compatibility": {"status": "none", "detail": "Five new non-required hosted jobs; existing jobs, names and outcomes are unchanged."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "changed", "detail": "The central evidence workflow pin needs its usual rotation because fleet.yml changed."},
+  "recovery": {"status": "none", "detail": "Reverting removes the jobs; no state is written."}
+}

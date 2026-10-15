@@ -221,9 +221,18 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     let early_log = std::fs::read_to_string(&log_path).unwrap();
     assert!(early_log.contains("st: projection full replay phase=startup/project-replication-backlog reason=missing-health"), "fallback must be logged before the replay finishes: {early_log}");
     assert!(!early_log.contains("st3: startup phases "), "{early_log}");
-    // Old clients receive an immediate kernel connection refusal, never an accepted but stalled
-    // request. Their existing outage retry policy remains available to long-lived drivers.
-    assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
+    // Both addresses exist early, but neither is listening or queueing a request
+    // while projection is uncommitted. Keep the main refusal/phase contract.
+    for path in [
+        &socket,
+        &root.join("run/client.sock"),
+        &root.join("state/run/st3.sock"),
+    ] {
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(std::fs::metadata(path).unwrap().file_type().is_socket());
+        let error = std::os::unix::net::UnixStream::connect(path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
     let started = Instant::now();
     let doctor = command(root).args(["doctor", "--json"]).output().unwrap();
     assert!(started.elapsed() < Duration::from_secs(5));

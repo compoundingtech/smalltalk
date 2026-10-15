@@ -1,5 +1,5 @@
-//! Shared RED metric set, per the interview Q5 decision recorded in
-//! `docs/vrs/06-observability/open-questions.md`.
+//! Shared bounded driver/hook metrics. st captures hook applications for its daemon exporter
+//! (docs/st3/observability.md); the st2 SDK policy remains in docs/vrs/06-observability/.
 //!
 //! Every label value comes from a bounded enum (`result`, `driver`, hook registry name +
 //! normalized event); identifiers never become metric labels — those live in span attributes.

@@ -1,5 +1,5 @@
 //! Classifying the `x-st3-client` header into the closed `st3.client.class` label vocabulary
-//! (docs/vrs/06-observability/spec.md: `cli`, `stui`, `fractal`, `web`, `replication-worker`,
+//! (docs/st3/observability.md: `cli`, `stui`, `fractal`, `web`, `replication-worker`,
 //! `omp-channel`, `hook`, plus `app`, `driver`, `peer`; `other` for unrecognized values).
 //!
 //! The header is a client's own name for itself ("stui 0.1.0+a0c135e3"); st lists it as
@@ -13,24 +13,24 @@
 //! | Header shape (lowercased token matched) | Class | Source |
 //! | --- | --- | --- |
 //! | `stui <version>` | `Stui` | crates/stui/src/version.rs:23-25 (`client_name()`), set at crates/stui/src/main.rs:663 |
-//! | `st <machine_version>`, `st agents ls`, `st attention ls`, `st conversations read` | `Cli` | crates/st3/src/main.rs (`st {machine_version}` and CLI subcommands) |
+//! | `st <machine_version>`, `st agents ls`, `st alerts ls`, `st conversations read` | `Cli` | crates/st3/src/main.rs (`st {machine_version}` and CLI subcommands) |
 //! | `st3 doctor` | `Cli` | crates/st3/src/main.rs (CLI command family) |
-//! | `fractal` | `Fractal` | reserved external client name; docs/vrs/06-observability/spec.md vocabulary |
-//! | `smalltalk-ios <version> (<build>)` | `App` | clients/swift/St3Client/Sources/St3Client/Client.swift:11-13, apps/ios/store.tsx:112, clients/typescript/st3-views/src/clientName.ts:2-4 |
-//! | `smalltalk-ide <version>` | `App` | clients/typescript/st3-views/src/clientName.ts:7 (test clientName.test.mjs:7), docs/clients/build-your-own.md:98 |
+//! | `fractal` | `Fractal` | reserved external client name; docs/st3/observability.md vocabulary |
+//! | `smalltalk-ios <version> (<build>)` | `App` | clients/swift/St3Client/Sources/St3Client/Client.swift:11-13, apps/ios/store.tsx:112, clients/typescript/st3-views/clientName.ts:2-4 |
+//! | `smalltalk-ide <version>` | `App` | clients/typescript/st3-views/clientName.ts:7 (test clientName.test.mjs:7), docs/clients/build-your-own.md:98 |
 //! | `smalltalk-example-tui <version>` | `App` | examples/client-tui via docs/clients/build-your-own.md:79 — the `smalltalk-` product family prefix |
 //! | `st3 replication-worker` | `ReplicationWorker` | crates/st3/src/service.rs (worker command), crates/st3/src/peer.rs (`run_worker`); reserved header shape |
 //! | `st3 driver omp-channel`, `agent/<seat> · st3 driver omp-channel` | `OmpChannel` | reserved channel header shape; `omp-channel` wins over the `driver` rule below |
 //! | `st3 driver omp`, `st3 driver codex`, `agent/<seat> · st3 driver <driver>` | `Driver` | crates/st3/src/external_sessions.rs (driver commands); synthetic seat prefixes exercise trailing-token matching |
 //! | `st3 driver-hook`, `claude-observe`, `claude-statusline`, any `hook` token | `Hook` | crates/st3/src/driver_hook.rs:22-25 (`HOOKS`, `SUBCOMMAND`), crates/st3/src/telemetry.rs:80 (`hook`); reserved — hooks reach the daemon through claims, not this header |
 //! | `peer`, `fabric`, `relay` tokens | `Peer` | crates/st3/src/peer.rs:51-68 (peer/client-read routes); reserved — peer traffic authenticates with fleet headers, not `x-st3-client` |
-//! | `web`, `browser` tokens | `Web` | reserved for browser clients only (docs/vrs/06-observability/spec.md:377 vocabulary); no producer today |
+//! | `web`, `browser` tokens | `Web` | reserved for browser clients only (docs/st3/observability.md vocabulary); no producer today |
 //! | `curl` | `Other` | ad-hoc client, deliberately not the CLI command family |
-//! | anything else present | `Other` | closed-vocabulary fallback (docs/vrs/06-observability/spec.md:372-373) |
+//! | anything else present | `Other` | closed-vocabulary fallback (docs/st3/observability.md) |
 //! | header absent, or blank after trim | `Unknown` | `client_name()` treats a blank header as absent (api/client_presence.rs:58-66) |
 
 /// The client classes telemetry counts, as the closed `st3.client.class` vocabulary.
-/// `as_str` values are the label strings registered in docs/vrs/06-observability/spec.md
+/// `as_str` values are the label strings registered in docs/st3/observability.md
 /// (hyphenated there, so kept hyphenated here rather than re-spelled).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClientClass {

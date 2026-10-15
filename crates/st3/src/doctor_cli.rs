@@ -5,6 +5,23 @@ use std::path::Path;
 use st3::client::{OutagePhase, daemon_unreachable};
 use st3::model::DoctorCheck;
 
+pub(super) fn client_config_check(unknown: &[String]) -> Option<DoctorCheck> {
+    (!unknown.is_empty()).then(|| DoctorCheck {
+        name: "client-config".into(),
+        status: "warn".into(),
+        message: st3::config::Config::unknown_client_keys_message(unknown),
+    })
+}
+
+/// A local warning can raise a pass, but must never hide an existing failure.
+pub(super) fn client_config_status(status: &str, has_unknown_keys: bool) -> &str {
+    if status == "pass" && has_unknown_keys {
+        "warn"
+    } else {
+        status
+    }
+}
+
 pub(super) fn developer_tools(environment: &BTreeMap<String, String>) -> DoctorCheck {
     let mut tools = vec!["cargo", "rustc", "sccache", "git", "nix"];
     if cfg!(target_os = "linux") {
@@ -49,4 +66,16 @@ pub(super) fn human_outage_message(error: &anyhow::Error) -> Option<String> {
         "the st daemon at {} is unavailable. Run `st` to open Smalltalk, or `st setup` to set up or start its background service, then retry this command",
         outage.endpoint()
     ))
+}
+
+#[cfg(test)]
+mod client_config_tests {
+    #[test]
+    fn unknown_config_warning_cannot_downgrade_a_failed_doctor_check() {
+        assert_eq!(super::client_config_status("fail", true), "fail");
+        assert_eq!(super::client_config_status("fail", false), "fail");
+        assert_eq!(super::client_config_status("warn", true), "warn");
+        assert_eq!(super::client_config_status("pass", true), "warn");
+        assert_eq!(super::client_config_status("pass", false), "pass");
+    }
 }

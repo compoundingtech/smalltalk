@@ -80,6 +80,9 @@ for workflow in sorted((root / '.github/workflows').glob('*.yml')):
         elif workflow.name == 'perf.yml' and 'name: Performance scope' in block:
             assert 'runs-on: ubuntu-latest' in block
             assert 'actions/checkout' not in block and 'nix develop' not in block and 'cargo test' not in block, 'scope must remain metadata-only'
+        elif workflow.name == 'perf.yml' and 'name: perf-load-hog-macos' in block:
+            # A manual macOS run that builds from a cold start: it restores and saves no caches.
+            assert 'actions/cache' not in block and 'ci-perf-cache' not in block, 'the macOS hog run keeps no cache'
         elif workflow.name == 'perf.yml':
             assert 'python3 scripts/ci-perf-cache restore' in block
         else:

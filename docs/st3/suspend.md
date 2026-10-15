@@ -19,6 +19,11 @@ declaration.
 
 ## When a seat can suspend
 
+Suspend first checks the declaration's native session arguments. An authored selector such as
+`--resume`, `--session`, or `-c` refuses with `suspend-authored-session-selection`, naming the
+selector in `details.selector`. Native resume would refuse that selector even if its transcript
+exists. This check reads no transcript, appends no claims, and leaves the seat running.
+
 A seat suspends only at a clean boundary. Core does not read harness state. Each driver adds
 `quiescent` and `blocking` to the `harness.observed` claims it already publishes, and core reads
 those two fields. Core adds its own blockers, so st refuses a suspend with a typed list of
@@ -64,6 +69,22 @@ a `native-resume-unavailable` diagnostic whose status is the reason: `transcript
 native session. A different session (`native-session-mismatch`), no session within three minutes
 (`native-session-unbound`), or an exit before binding fails the resume. After a failed resume the
 seat stays suspended on the same snapshot, with the code and reason.
+
+## Leaving an existing suspension when resume refuses
+
+Older daemons accepted suspends whose declaration already selects a session. If resume reports
+`authored-session-selection`, the exit is to stop the seat and then start it:
+
+```sh
+st agents stop agent/example/worker --as person/ada
+st agents start agent/example/worker --as person/ada
+```
+
+Stop ends the suspension. Start launches the declaration with its authored selector, such as
+`--resume TRANSCRIPT`. The session kept by suspend is no longer guaranteed: the authored selector
+chooses the conversation, which may differ from the suspended session. This exit does not delete
+the saved transcript, but it gives up suspend's promise to resume that exact session. A start
+without a stop leaves the suspension in place; restart refuses while it holds the seat.
 
 ## Phases
 

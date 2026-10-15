@@ -24,7 +24,7 @@ private final class CollectionSocket: NSObject, SRWebSocketDelegate {
     event("message", ["data": text])
   }
   @objc(webSocket:didReceivePingWithData:)
-  func receivedPing(_ webSocket: SRWebSocket, data: Data?) { event("ping") }
+  func webSocket(_ webSocket: SRWebSocket, didReceivePingWith data: Data?) { event("ping") }
   func webSocket(_ webSocket: SRWebSocket, didFailWithError error: Error) {
     event("error"); ended()
   }

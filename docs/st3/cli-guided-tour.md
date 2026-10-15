@@ -288,7 +288,7 @@ and the typed refusal reason in `agents show`.
 
 `agents handoff show AGENT` prints the document a seat left for its next session (see
 [seat continuity](seat-continuity.md)); it errors with `has written no handoff` for a seat that wrote
-none. `agents handoff write` is the seat's own mutation: run it only as that seat.
+none. `agents handoff write` and `agents handoff ready` are the seat's own mutations: run them only as that seat.
 
 `agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
 a new directory below that host's home and that the harness defaults match the fleet's existing

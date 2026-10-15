@@ -7,11 +7,8 @@ import { ConversationPaneFallback } from './ConversationPaneFallback.tsx'
 
 // Keep the real kit/runtime DOM. Expose StyleX's precompiled declarations as test metadata
 // so a changed header, lane or skeleton dimension is caught along with structural drift.
-vi.mock('@stylexjs/stylex', () => ({
-  create: (styles: unknown) => styles,
-  defineVars: (variables: unknown) => variables,
-  createTheme: () => ({}),
-  keyframes: () => 'test-animation',
+vi.mock('@stylexjs/stylex', async () => ({
+  ...await import('../testStylex.ts'),
   props: (...styles: unknown[]) => ({
     'data-test-layout': JSON.stringify(Object.fromEntries(styles.flatMap(style =>
       typeof style === 'object' && style !== null ? Object.entries(style) : [],

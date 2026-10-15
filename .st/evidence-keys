@@ -1,1 +1,3 @@
 fleet/ci namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG9EjmnSdYPfIhcSMp6gimuEp3HT1e96U88YwJpm0gem
+host/anvil namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM38UY5Mtu9ckGIh30AQn2yZWuxwDYo29/tvORWVuocZ
+host/forge namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKtGSZHvqXbj967xUVMoMAibmjgsUWf9JgQvUJQUFkdt

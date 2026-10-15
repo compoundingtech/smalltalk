@@ -82,6 +82,61 @@ fn refuse_authored(argv: &[String], flags: &[&str]) -> Result<(), Refusal> {
     }
 }
 
+/// Session selectors shared by native resume and its request-time preflight.
+fn selection_flags(driver: &str) -> &'static [&'static str] {
+    match driver {
+        "claude" => &[
+            "-c",
+            "--continue",
+            "-r",
+            "--resume",
+            "--session-id",
+            "--fork-session",
+            "--from-pr",
+            "--teleport",
+        ],
+        "pi" | "omp" => &[
+            "-c",
+            "--continue",
+            "-r",
+            "--resume",
+            "--session",
+            "--session-id",
+            "--fork",
+            "--no-session",
+        ],
+        "opencode" => &["-c", "--continue", "-s", "--session", "--fork"],
+        "codex" => &["resume", "fork"],
+        _ => &[],
+    }
+}
+
+fn codex_selection(argv: &[String]) -> Option<String> {
+    argv.iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .find(|argument| matches!(argument.as_str(), "resume" | "fork"))
+        .cloned()
+}
+
+/// Check only the declared argv, without reading a native transcript or requiring rollout
+/// support. This uses the same selectors that strict native resume refuses.
+pub fn authored_session_selection(member: &crate::model::MemberSpec) -> Option<String> {
+    let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+        return None;
+    };
+    let provider = argv
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(argv.as_slice(), |index| &argv[index + 1..]);
+    let driver = member.driver.as_deref()?;
+    if driver == "codex" {
+        codex_selection(provider)
+    } else {
+        authors_selection(provider, selection_flags(driver))
+    }
+}
+
 /// The normalized authored selector, independent of unrelated launch arguments.
 pub fn selection_scope(member: &crate::model::MemberSpec) -> Option<String> {
     let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
@@ -94,13 +149,7 @@ pub fn selection_scope(member: &crate::model::MemberSpec) -> Option<String> {
 
 pub fn selector_scope(driver: &str, argv: &[String]) -> Option<String> {
     use sha2::{Digest as _, Sha256};
-    let flags: &[&str] = match driver {
-        "claude" => &["-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "--from-pr", "--teleport"],
-        "pi" | "omp" => &["-c", "--continue", "-r", "--resume", "--session", "--session-id", "--fork", "--no-session"],
-        "opencode" => &["-c", "--continue", "-s", "--session", "--fork"],
-        "codex" => &["resume", "fork"],
-        _ => return None,
-    };
+    let flags = selection_flags(driver);
     let mut selected = Vec::new();
     let mut args = argv.iter().skip(1).take_while(|arg| arg.as_str() != "--").peekable();
     while let Some(arg) = args.next() {
@@ -155,34 +204,10 @@ pub fn rollout_support(member: &crate::model::MemberSpec) -> Result<(), Refusal>
         .position(|argument| argument == "--")
         .map_or(argv.as_slice(), |index| &argv[index + 1..]);
     match member.driver.as_deref() {
-        Some("claude") => refuse_authored(
-            provider,
-            &[
-                "-c",
-                "--continue",
-                "-r",
-                "--resume",
-                "--session-id",
-                "--fork-session",
-                "--from-pr",
-                "--teleport",
-            ],
-        ),
-        Some("pi" | "omp") => refuse_authored(
-            provider,
-            &[
-                "-c",
-                "--continue",
-                "-r",
-                "--resume",
-                "--session",
-                "--session-id",
-                "--fork",
-                "--no-session",
-            ],
-        ),
+        Some("claude") => refuse_authored(provider, selection_flags("claude")),
+        Some("pi" | "omp") => refuse_authored(provider, selection_flags("pi")),
         Some("opencode") => {
-            refuse_authored(provider, &["-c", "--continue", "-s", "--session", "--fork"])
+            refuse_authored(provider, selection_flags("opencode"))
         }
         Some("codex") => codex_check(provider, "rollout-preflight"),
         _ => Err(Refusal::new(
@@ -262,19 +287,7 @@ pub fn claude_argv(
     home: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
-    refuse_authored(
-        &argv,
-        &[
-            "-c",
-            "--continue",
-            "-r",
-            "--resume",
-            "--session-id",
-            "--fork-session",
-            "--from-pr",
-            "--teleport",
-        ],
-    )?;
+    refuse_authored(&argv, selection_flags("claude"))?;
     let home =
         home.ok_or_else(|| Refusal::new("transcript-missing", "Claude has no config directory"))?;
     let transcript = claude_transcript(home, workspace, id);
@@ -510,19 +523,7 @@ pub fn pi_family_argv(
     id: &str,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
-    refuse_authored(
-        &argv,
-        &[
-            "-c",
-            "--continue",
-            "-r",
-            "--resume",
-            "--session",
-            "--session-id",
-            "--fork",
-            "--no-session",
-        ],
-    )?;
+    refuse_authored(&argv, selection_flags("pi"))?;
     let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
@@ -552,7 +553,7 @@ pub fn opencode_argv(
     data_dir: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
-    refuse_authored(&argv, &["-c", "--continue", "-s", "--session", "--fork"])?;
+    refuse_authored(&argv, selection_flags("opencode"))?;
     if let Some(database) = data_dir
         .map(|dir| dir.join("opencode.db"))
         .filter(|path| path.is_file())
@@ -602,12 +603,7 @@ pub fn opencode_bound_session(agent_dir: &Path) -> Option<String> {
 /// rollouts, so it is not a precondition.
 pub fn codex_check(argv: &[String], id: &str) -> Result<(), Refusal> {
     valid_id(id)?;
-    if argv
-        .iter()
-        .skip(1)
-        .take_while(|argument| argument.as_str() != "--")
-        .any(|argument| matches!(argument.as_str(), "resume" | "fork"))
-    {
+    if codex_selection(argv).is_some() {
         return Err(Refusal::new(
             "authored-session-selection",
             "the seat declares its own Codex thread selection, so st cannot resume",
@@ -622,6 +618,46 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn suspend_preflight_names_selectors_in_typed_launches() {
+        for (driver, args, expected) in [
+            ("claude", "\"--continue\"", Some("--continue")),
+            (
+                "claude",
+                "\"--resume=native-copper\"",
+                Some("--resume=native-copper"),
+            ),
+            (
+                "pi",
+                "\"--session\" \"/missing-transcript\"",
+                Some("--session"),
+            ),
+            ("omp", "\"-c\"", Some("-c")),
+            ("omp", "\"--no-session\"", Some("--no-session")),
+            ("opencode", "\"-s\" \"native-copper\"", Some("-s")),
+            ("codex", "\"resume\" \"native-copper\"", Some("resume")),
+            ("codex", "\"fork\" \"native-copper\"", Some("fork")),
+            ("omp", "\"--model\" \"copper\"", None),
+            ("omp", "\"--\" \"--resume\"", None),
+            ("codex", "\"--\" \"resume\"", None),
+        ] {
+            let source = format!(
+                "version 2\nagent \"example\" {{ host \"amber\"; workspace \"/workspace\"; harness {driver:?} {{ args {args}; }} }}"
+            );
+            let member = crate::parse_intent(&source, "amber")
+                .unwrap()
+                .subjects
+                .into_values()
+                .find_map(|desired| desired.member)
+                .unwrap();
+            assert_eq!(
+                authored_session_selection(&member).as_deref(),
+                expected,
+                "{driver}: {args}"
+            );
+        }
     }
 
     #[cfg(unix)]

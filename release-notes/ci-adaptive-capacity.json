@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Choose merge overflow and PR placement from fresh capacity and queue observations; keep optional Nix off merge-serving workers.",
+  "replay": {
+    "status": "none",
+    "detail": "CI admission and optional workflow policy only; no daemon or persisted product-state change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI admission and optional workflow policy only; no daemon or persisted product-state change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI admission and optional workflow policy only; no daemon or persisted product-state change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI admission and optional workflow policy only; no daemon or persisted product-state change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI admission and optional workflow policy only; no daemon or persisted product-state change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Optional Nix schedule/manual jobs are disabled until a dedicated persistent-store pool is qualified; tag triggering is removed. Required jobs and exact-source archive checks remain unchanged."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "CI_MERGE_OVERFLOW=off restores owned-only merge admission. Queue-read errors retain idle-role routing; no rerun or live job-label migration occurs. Existing cancelled native partials remain incomplete."
+  }
+}

@@ -14,7 +14,8 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 [`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
-The contract digest is written once, in `crates/st3-client/src/contract.rs`. When generated
+No digest of the contract is committed: a line every schema change rewrites made any two of them
+conflict, and `--check` already fails when any generated file differs from its source. When generated
 client files conflict in a merge, resolve the schema and template files, take either side of every
 generated file (`git checkout --theirs -- clients crates/st3-client/src/contract.rs
 crates/st3-client/src/generated.rs`), and run the generator again; never edit generated files by
@@ -758,6 +759,38 @@ the normalized `tool_output` block's optional open `metadata`, preserving `wallT
 `tool_result` body metadata field; the complete native record remains unchanged in its
 `source_record` block. Legacy tool-result blocks inside message content remain supported and
 use the same block metadata shape.
+
+When a native user turn retains an exact delivery identity, the graph message and its content
+remain the canonical timeline entries; the native echo and its parts are suppressed. The graph
+entries keep their IDs, sequences, and `message_id` across pages, stream updates, and reconnects.
+The conversation cursor still advances past suppressed native entries. Correlation uses the
+existing delivery marker at the beginning of a user prompt, or a persisted native client ID
+bound to the exact thread and recipient. No content-text, adjacency, or queue-order matching is
+used. Extension-based harnesses retain both entries: exact correlation requires their delivery
+API to propagate a delivery token to the native user-message event.
+
+A transcript without a supported delivery identity retains both entries. This does not alter
+timeline ordering or sequence allocation, and no client idempotency-key field is exposed. If
+the native read sees a send beyond its graph snapshot, its echo is withheld until the next graph
+delta supplies the canonical rows. Post-snapshot client-ID reconciliation reads at most 256
+indexed conversation rows; if that window is exhausted without establishing correlation, the
+torn read requests a full conversation resync rather than guessing.
+Native keyset pages refill bounded batches after suppressing exact echoes, retaining their
+authenticated ordering boundary and source-generation fence. OPEN and change replay carry
+the suppressed native high-water without exposing the private correlation hint.
+A page examines at most 4096 native entries (the scan budget) while omitting echoes. Past the
+budget with visible entries it is a short page: fewer than `limit` items with `has_more: true`
+and its last visible entry as the boundary, so the next page reads on with a fresh budget. When
+that many consecutive entries are all suppressed echoes and none is visible, the read answers
+`page-cursor-expired` (HTTP 410, no `full_resync`) on a continuation, on the header's head read
+and on change replay; it is not `cursor-gap`, because reloading the newest page would meet the
+same prefix. OPEN keeps its established stored-timeline fallback in that case, and a following
+stream waits 1.5 s before it re-opens after such a refusal. While 4096 or more echoes sit at the head, each
+change to the conversation therefore costs one refused replay and one stored-timeline re-OPEN per
+1.5 s at most, until a visible entry is appended. A transcript with
+more than 4096 consecutive correlated delivery echoes therefore cannot be paged past by cursor,
+and while its newest 4096 entries are all echoes its native entries cannot be shown; this is an
+accepted, known limit.
 
 Native block `view` and `metadata` (including assistant text/reasoning metadata) use
 the same bounded open-value display convention on full reads and native keyset pages:
@@ -1955,6 +1988,9 @@ Assistant session errors add `TimelineViewAssistantError` with `status`,
 `superseded_by` with epoch-ms `timestamp`, `response_id`, `provider`, `model`).
 Recovery markers do not invent live retry state. Recovered errors start compact,
 retain original errors on expansion, and superseded errors are not drawn.
+The optional open `native` object preserves exact `stopReason`, `errorMessage`,
+`errorStatus`, `errorId` and `retryRecovery` values, including structured/null
+diagnostics and future fields, without changing the presentation projection.
 
 
 `read.projections` authorizes **raw native conversation content**, including full
@@ -2071,5 +2107,22 @@ matching, even when the expected incarnation is also missing. A summary is not r
 The optional claim field changes the registry digest. Older members keep new-field submissions
 as waiting records until upgrade; see [rolling upgrades](../replication.md#rolling-upgrades-and-waiting-claims).
 
-
 `agent.retire` permanently retires the identity at its declaring host. It requires `{ "agent": "agent/example/worker", "reason": "Work finished" }`, a selected desired claim ID in `fence.runtime_desired_revision`, and a stable idempotency key. Optional `runtime_incarnation` fences a selected process. Rust provides `agent_retire`; Swift and TypeScript provide `agentRetire`. See [terminal retirement](../agent-retirement.md) for the coordinated registry rollout and locally known retirement rule. Fresh sends to a known retired agent return 409 `recipient-retired` with `applied: "none"` and a typed `details.refusal.variant: "Retired"`. Exact accepted retries return their receipt; a lost reply remains unconfirmed. `lifecycle-unavailable` concerns incomplete/conflicting local evidence, never an offline owner alone.
+
+### Exchange carrier observations
+
+`SyncPeer` may include `last_successful_exchange` and `last_failed_exchange`, each
+an `ExchangeTransport` with `at` (ISO timestamp), `carrier` (an open string:
+`tailscale`, `fabric`, `loopback`, or `unknown` today), and optional `fabric_route`
+(`unknown` for Fabric today). They describe this serving host's last **locally initiated** exchange or attempt of
+each outcome, with its original timestamp, not replicated reachability or advertised
+endpoints. Success and failure records
+are independent: a successful fallback preserves the failed attempt's carrier.
+Incoming exchanges advance ordinary last-seen status and preserve the original
+outbound carrier record and timestamp; an inbound-only peer has no carrier record,
+which means evidence is unknown/unavailable. Fabric's loopback tunnel address cannot
+establish an incoming carrier. Restart clears these records, and probes never change
+them. Idle receipts outside the sync notice set do not notify client streams;
+repeated same-carrier failures likewise stay quiet when the graph is unchanged. Existing sync notice conditions
+remain the same. Older servers omit these optional fields; older clients ignore
+the additions. No API version, scope, operation or claim shape changes.

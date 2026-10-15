@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Let the evidence verifier name accepted record kinds, bind environment inputs to the tree and report attempts",
+  "replay": {"status": "none", "detail": "No daemon replay change; the script reads Git notes only."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change; record inputs stay an opaque string map."},
+  "rules": {"status": "none", "detail": "No daemon rule, required check or main landing change. Nothing calls the script yet."},
+  "compatibility": {"status": "none", "detail": "New optional flags and result fields on a script nothing calls; existing behavior is unchanged."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "Nothing to do."},
+  "recovery": {"status": "none", "detail": "Reverting removes the new flags."}
+}

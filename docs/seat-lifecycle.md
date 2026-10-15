@@ -39,6 +39,9 @@ held claims do not read full subject status for lease maintenance. Checking work
 status keeps resident seats cheap without extending the renewal period or weakening the
 incarnation check.
 
+A restart of a seat that is up and ready first asks it for its handoff and waits at most two minutes
+(`--now` skips the wait); see [seat handoff](st3/seat-continuity.md).
+
 A restarted seat that cannot continue its conversation (another account, another model, a crash)
 gets a first message with the handoff it left and the live state of its work. See
 [seat handoff](st3/seat-continuity.md); a seat writes its handoff with `st agents handoff write`.

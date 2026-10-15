@@ -186,7 +186,7 @@ impl LocalTarget {
     /// `--endpoint` in `words` wins over `ST3_ENDPOINT`, which wins over the configured socket.
     /// A non-Unix endpoint yields `None`: client-v0 lists need the trusted local socket.
     pub fn discover(words: &[String]) -> Option<Self> {
-        let config = st3::config::Config::load_unvalidated(None).ok()?;
+        let config = st3::config::Config::load_client_unvalidated(None).ok()?.0;
         let endpoint = endpoint_word(words).or_else(|| std::env::var("ST3_ENDPOINT").ok());
         let socket = match endpoint.map(st3::client::Endpoint::parse) {
             Some(st3::client::Endpoint::Unix(socket)) => socket,

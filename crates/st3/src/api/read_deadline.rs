@@ -503,6 +503,54 @@ where
         .map_err(WorkError::Join)?
 }
 
+/// Drive a mutation as admitted synchronous polls. A pending body, service, mutex or
+/// receipt wait returns both the blocking worker and its writer capacity. The owned
+/// future stays on the async task until its waker signals another poll. Mutations remain
+/// detached from the request waiter, as before; dependent nested writer work retains
+/// the shared permit until its actual completion.
+pub(super) fn spawn_mutation_handler<F, P, T>(
+    store: Arc<super::Store>,
+    future: F,
+    mut scope: P,
+) -> impl Future<Output = Result<T, WorkError>>
+where
+    F: Future<Output = T> + Send + 'static,
+    P: FnMut(Pin<&mut F>, &mut Context<'_>) -> Poll<T> + Send + 'static,
+    T: Send + 'static,
+{
+    struct Wake(tokio::sync::Notify);
+    impl std::task::Wake for Wake {
+        fn wake(self: Arc<Self>) { self.0.notify_one(); }
+        fn wake_by_ref(self: &Arc<Self>) { self.0.notify_one(); }
+    }
+    let task = tokio::spawn(async move {
+        let wake = Arc::new(Wake(tokio::sync::Notify::new()));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut future = Box::pin(future);
+        loop {
+            // No blocking parent parks while this admission is pending. Only a
+            // synchronous poll (or its dependent writer child) retains capacity.
+            let polling_store = store.clone();
+            let polling_waker = waker.clone();
+            let (result, returned_future, returned_scope) = store.connection.write_workers()
+                .spawn_blocking(move || {
+                    let mut cx = Context::from_waker(&polling_waker);
+                    let result = with_handler(|| with_store(Some(polling_store), || {
+                        read_budget::with(None, || scope(future.as_mut(), &mut cx))
+                    }));
+                    (result, future, scope)
+                }).await.map_err(WorkError::Join)?;
+            future = returned_future;
+            scope = returned_scope;
+            match result {
+                Poll::Ready(value) => return Ok(value),
+                Poll::Pending => wake.0.notified().await,
+            }
+        }
+    });
+    async move { task.await.map_err(WorkError::Join)? }
+}
+
 /// Propagate the read budget to every nested blocking task in the API. This wrapper has
 /// no effect on writes or on stream work started after the request's upgrade completes.
 #[track_caller]
@@ -511,20 +559,20 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn(work, true, None)
+    spawn(work, true, None, None)
 }
 
 #[track_caller]
-pub(super) fn spawn_handler<F, T>(roster: Option<tracing::Span>, work: F) -> impl Future<Output = Result<T, WorkError>>
+pub(super) fn spawn_handler<F, T>(roster: Option<tracing::Span>, writer: Option<Arc<super::Store>>, work: F) -> impl Future<Output = Result<T, WorkError>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn(move || with_handler(work), false, roster)
+    spawn(move || with_handler(work), false, roster, writer)
 }
 
 #[track_caller]
-fn spawn<F, T>(work: F, query: bool, roster: Option<tracing::Span>) -> impl Future<Output = Result<T, WorkError>>
+fn spawn<F, T>(work: F, query: bool, roster: Option<tracing::Span>, writer: Option<Arc<super::Store>>) -> impl Future<Output = Result<T, WorkError>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -540,7 +588,8 @@ where
     let diagnostic = crate::relay_trace::current();
     let diagnostic_admission = diagnostic.clone();
     let diagnostic_dispatch = diagnostic.clone();
-    let store = STORE.with(|slot| slot.borrow().clone());
+    let store = writer.clone().or_else(|| STORE.with(|slot| slot.borrow().clone()));
+    let inherited = store.as_ref().and_then(|store| store.connection.current_write_permit());
     let multithread = matches!(
         tokio::runtime::Handle::current().runtime_flavor(),
         tokio::runtime::RuntimeFlavor::MultiThread
@@ -607,13 +656,17 @@ where
             })
         })
         };
-        if roster.is_some() {
+        let roster_work = || if roster.is_some() {
             crate::otel::roster_scope(|| {
                 crate::otel::roster_worker_started(roster_submitted);
                 roster_work()
             })
         } else {
             roster_work()
+        };
+        match inherited {
+            Some(permit) => permit.run(roster_work),
+            None => roster_work(),
         }
     };
     let start_queue = move || {
@@ -625,7 +678,7 @@ where
         Inline(Result<T, WorkError>),
         Spawned(tokio::task::JoinHandle<Result<T, WorkError>>),
     }
-    // The marker is installed only by spawn_handler, never on an async runtime worker.
+    // The marker is installed only by handler dispatch, never on an async runtime worker.
     // Handlers loan their reader per poll, so nested wrappers on that thread reuse the
     // loan inline; a spawned child admits its own permit without holding the parent's.
     // Both paths retain the same read budget, reader lease and committed mutation result,
@@ -671,6 +724,16 @@ where
             tokio::task::spawn_blocking(move || run(Some(permit), diagnostic_queue))
                 .await
                 .map_err(WorkError::Join)?
+        }))
+    } else if let Some(store) = writer {
+        // Mutation admission precedes the blocking pool. Nested handler work shares this
+        // slot (inline on a multithread runtime, propagated to a current-thread child).
+        // As with existing writes, dropping the awaiting request does not cancel a mutation.
+        Task::Spawned(tokio::spawn(async move {
+            let permit = store.connection.admit_write().await;
+            let diagnostic_queue = start_queue();
+            tokio::task::spawn_blocking(move || permit.run(|| run(None, diagnostic_queue)))
+                .await.map_err(WorkError::Join)?
         }))
     } else {
         let diagnostic_queue = start_queue();
@@ -745,6 +808,247 @@ pub(super) fn error(error: &WorkError) -> Option<ApiError> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn writer_burst_keeps_reads_and_nested_acknowledgements_live() {
+        use axum::{Json, Router, middleware::from_fn_with_state, routing::{get, post}};
+        use tower::ServiceExt;
+        const LIMIT: usize = 2;
+        let root = tempfile::tempdir().unwrap();
+        let state = smallclaims::sqlite::with_write_limit_for_test(LIMIT, ||
+            super::super::tests::state(root.path()));
+        let writer = state.store.clone();
+        let reader = state.store.clone();
+        let hold = state.store.connection.write();
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let started = Arc::new(AtomicUsize::new(0));
+        let count = started.clone();
+        let app = Router::new()
+            .route("/v1/writer-probe", post(move || {
+                let (writer, entered, count) = (writer.clone(), entered.clone(), count.clone());
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    let answer = spawn_blocking(move || {
+                        assert!(writer.connection.current_write_permit().is_some(),
+                            "nested callbacks retain the outer handler's capacity");
+                        tokio::runtime::Handle::current().block_on(async {});
+                        writer.connection.batched(|transaction| {
+                            transaction.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('write-probe','committed')", [])
+                        }).unwrap().unwrap();
+                        42
+                    }).await.unwrap();
+                    Json(json!({"answer":answer}))
+                }
+            }))
+            .route("/v1/read-probe", get(move || {
+                let reader = reader.clone();
+                async move {
+                    let answer = spawn_blocking(move ||
+                        reader.readers.get().query_row("SELECT 7", [], |row| row.get::<_, u64>(0)).unwrap()
+                    ).await.unwrap();
+                    Json(json!({"answer":answer}))
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let mut requests = Vec::new();
+        for _ in 0..128 {
+            let app = app.clone();
+            requests.push(tokio::spawn(async move {
+                app.oneshot(request(Method::POST, "/v1/writer-probe")).await.unwrap()
+            }));
+        }
+        let saturated = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..LIMIT { entries.recv().await.unwrap(); }
+        }).await;
+        let read = tokio::time::timeout(Duration::from_secs(5),
+            app.oneshot(request(Method::GET, "/v1/read-probe"))).await;
+        let admitted = started.load(Ordering::SeqCst);
+        drop(hold); // Always release the writer before reporting a test failure.
+        let responses = tokio::time::timeout(Duration::from_secs(10), async {
+            for pending in requests {
+                assert_eq!(pending.await.unwrap().status(), StatusCode::OK);
+            }
+        }).await;
+        saturated.expect("admitted mutation handlers did not start");
+        assert_eq!(admitted, LIMIT, "queued mutation handlers entered blocking workers");
+        assert_eq!(read.expect("independent read capacity was starved").unwrap().status(), StatusCode::OK);
+        responses.expect("nested mutation acknowledgements deadlocked at the admission limit");
+        assert_eq!(started.load(Ordering::SeqCst), 128);
+        let value: String = state.store.readers.get().query_row(
+            "SELECT value FROM meta WHERE key='write-probe'", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, "committed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_admission_bounds_real_http_handlers_and_keeps_reads_live() {
+        writer_burst_keeps_reads_and_nested_acknowledgements_live().await;
+    }
+
+    #[tokio::test]
+    async fn current_thread_writer_handlers_share_capacity_with_nested_callbacks() {
+        writer_burst_keeps_reads_and_nested_acknowledgements_live().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_queued_mutation_waiter_keeps_its_completion_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let state = smallclaims::sqlite::with_write_limit_for_test(1, ||
+            super::super::tests::state(root.path()));
+        let held = state.store.connection.admit_write().await;
+        let writing = state.store.clone();
+        let (committed, completed) = tokio::sync::oneshot::channel();
+        let waiting = spawn_handler(None, Some(state.store.clone()), move || {
+            writing.connection.batched(|transaction| transaction.execute(
+                "INSERT INTO meta(key,value) VALUES('detached-write','committed')", [],
+            )).unwrap().unwrap();
+            committed.send(()).unwrap();
+        });
+        drop(waiting);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), completed).await.unwrap().unwrap();
+        let value: String = state.store.readers.get().query_row(
+            "SELECT value FROM meta WHERE key='detached-write'", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, "committed");
+    }
+
+    async fn thirty_two_parked_nonwriters_do_not_block_a_thirty_third_mutation(body_wait: bool) {
+        use axum::{Json, Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = smallclaims::sqlite::with_write_limit_for_test(32, ||
+            super::super::tests::state(root.path()));
+        let writing = state.store.clone();
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let slow_entry = entered.clone();
+        let app = Router::new()
+            .route("/v1/slow-service", post(move || {
+                let entered = slow_entry.clone();
+                let mut released = released.clone();
+                async move {
+                    entered.send(()).unwrap();
+                    released.wait_for(|released| *released).await.unwrap();
+                    Json(json!({"done":true}))
+                }
+            }))
+            .route("/v1/slow-body", post(|Json(_): Json<serde_json::Value>| async {
+                Json(json!({"done":true}))
+            }))
+            .route("/v1/later-mutation", post(move || {
+                let writing = writing.clone();
+                async move {
+                    assert!(writing.connection.current_write_permit().is_some());
+                    writing.connection.batched(|tx| tx.execute(
+                        "INSERT INTO meta(key,value) VALUES('liveness-proof','committed')", [],
+                    )).unwrap().unwrap();
+                    Json(json!({"written":true}))
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let mut requests = Vec::new();
+        let mut bodies = Vec::new();
+        for _ in 0..32 {
+            let app = app.clone();
+            let mut request = request(Method::POST,
+                if body_wait { "/v1/slow-body" } else { "/v1/slow-service" });
+            if body_wait {
+                let (send, mut receive) = tokio::sync::mpsc::unbounded_channel::<
+                    Result<axum::body::Bytes, std::io::Error>>();
+                bodies.push(send);
+                let mut entered = Some(entered.clone());
+                *request.body_mut() = Body::from_stream(futures_util::stream::poll_fn(move |cx| {
+                    if let Some(entered) = entered.take() { entered.send(()).unwrap(); }
+                    receive.poll_recv(cx)
+                }));
+                request.headers_mut().insert(axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"));
+            }
+            requests.push(tokio::spawn(async move { app.oneshot(request).await.unwrap() }));
+        }
+        let parked = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..32 { entries.recv().await.unwrap(); }
+        }).await;
+        let later = tokio::time::timeout(Duration::from_secs(5),
+            app.oneshot(request(Method::POST, "/v1/later-mutation"))).await;
+        // Release all parked requests before asserting, including on the old-handler failure.
+        release.send_replace(true);
+        for body in bodies { body.send(Ok(axum::body::Bytes::from_static(b"{}"))).unwrap(); }
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            for pending in requests { assert_eq!(pending.await.unwrap().status(), StatusCode::OK); }
+        }).await;
+        parked.expect("32 non-writing waits must actually be pending before the mutation starts");
+        finished.expect("parked requests did not finish after release");
+        assert_eq!(later.expect("parked non-writers retained all writer capacity").unwrap().status(), StatusCode::OK);
+        let committed: String = state.store.readers.get().query_row(
+            "SELECT value FROM meta WHERE key='liveness-proof'", [], |row| row.get(0)).unwrap();
+        assert_eq!(committed, "committed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn thirty_two_service_waits_release_writer_capacity_before_the_thirty_third_mutation() {
+        thirty_two_parked_nonwriters_do_not_block_a_thirty_third_mutation(false).await;
+    }
+
+    #[tokio::test]
+    async fn current_thread_service_waits_release_writer_capacity() {
+        thirty_two_parked_nonwriters_do_not_block_a_thirty_third_mutation(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn thirty_two_slow_post_bodies_release_writer_capacity_before_the_thirty_third_mutation() {
+        thirty_two_parked_nonwriters_do_not_block_a_thirty_third_mutation(true).await;
+    }
+
+    #[tokio::test]
+    async fn current_thread_slow_post_bodies_release_writer_capacity() {
+        thirty_two_parked_nonwriters_do_not_block_a_thirty_third_mutation(true).await;
+    }
+
+    async fn dropped_mutation_waiter_finishes_after_an_async_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let state = smallclaims::sqlite::with_write_limit_for_test(1, ||
+            super::super::tests::state(root.path()));
+        let store = state.store.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (committed, commit) = tokio::sync::oneshot::channel();
+        let mut handler = Box::pin(spawn_mutation_handler(state.store.clone(), async move {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+            assert!(store.connection.current_write_permit().is_some());
+            store.connection.batched(|tx| tx.execute(
+                "INSERT INTO meta(key,value) VALUES('detached-poll','committed')", [],
+            )).unwrap().unwrap();
+            committed.send(()).unwrap();
+        }, |mut future, cx| future.as_mut().poll(cx)));
+        assert!(futures_util::poll!(handler.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        drop(handler);
+        // The pending mutation released its only slot even though its waiter vanished.
+        drop(tokio::time::timeout(Duration::from_secs(5), state.store.connection.admit_write())
+            .await.unwrap());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), commit).await.unwrap().unwrap();
+        let value: String = state.store.readers.get().query_row(
+            "SELECT value FROM meta WHERE key='detached-poll'", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, "committed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_mutation_waiter_preserves_async_completion() {
+        dropped_mutation_waiter_finishes_after_an_async_wait().await;
+    }
+
+    #[tokio::test]
+    async fn current_thread_dropped_mutation_waiter_preserves_async_completion() {
+        dropped_mutation_waiter_finishes_after_an_async_wait().await;
+    }
 
     fn bounded_state(root: &std::path::Path, limit: usize) -> AppState {
         smallclaims::sqlite::with_read_limit_for_test(limit, || super::super::tests::state(root))
@@ -1355,7 +1659,7 @@ mod tests {
                 release.send(()).unwrap();
             });
             let writing = store.clone();
-            let result = spawn_handler(None, move || {
+            let result = spawn_handler(None, None, move || {
                 tokio::runtime::Handle::current().block_on(super::super::blocking_action(move || {
                     // A synchronous callback may need to wait for an async service itself.
                     tokio::runtime::Handle::current().block_on(async {});
@@ -1381,7 +1685,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn an_inline_read_keeps_its_deadline_without_cancelling_a_later_write() {
-        let result = spawn_handler(None, || {
+        let result = spawn_handler(None, None, || {
             let handle = tokio::runtime::Handle::current();
             let read = read_budget::with(Some(ReadBudget::new("/expired", Duration::ZERO)), || {
                 spawn_blocking(|| panic!("an expired read must not run"))
@@ -1397,7 +1701,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn inline_panics_keep_the_nested_error_boundary_and_handler_cleanup() {
-        let result = spawn_handler(None, || {
+        let result = spawn_handler(None, None, || {
             let handle = tokio::runtime::Handle::current();
             let failure = handle.block_on(spawn_blocking(|| panic!("nested callback")));
             assert!(matches!(failure, Err(WorkError::Panic)));

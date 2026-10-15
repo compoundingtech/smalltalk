@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -14,7 +15,8 @@ assert len(required) >= 19
 with tempfile.TemporaryDirectory() as directory:
     tmp = Path(directory)
     cargo = tmp / 'cargo'
-    cargo.write_text('''#!/usr/bin/env python3
+    # The interpreter path is explicit so the stand-in runs where /usr/bin/env does not exist (the Nix sandbox).
+    cargo.write_text('#!' + sys.executable + '''
 import json, os, sys
 from pathlib import Path
 with Path(os.environ['CARGO_CALLS']).open('a') as stream:

@@ -660,7 +660,7 @@ def claude_attachment(node, seats, mode):
     control = node.root / "ws/claude-channel-mode"
     control.write_text("missing-once" if mode == "missing" else mode)
     old = seats.incarnations["a"]
-    node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
     early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
                       "--subject", "early attachment probe", "--body", "mail immediately after restart")["subject"]
 
@@ -704,7 +704,7 @@ def claude_attachment(node, seats, mode):
             fail(f"channel recovery replayed a boot probe: {probe}")
     # Restart twice more and send within startup, while retaining the first probe's proof.
     for index in range(2):
-        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+        node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
         fresh = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
                           "--subject", f"immediate probe {index}", "--body", "early fresh mail")["subject"]
         seats.prove(f"channel-restart-{index}")
@@ -721,21 +721,28 @@ def claude_attachment(node, seats, mode):
 def claude_channel_parked(node, seats):
     """A permanently missing channel exhausts a durable budget and keeps mail held."""
     (node.root / "ws/claude-channel-mode").write_text("missing")
-    node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
     early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
                       "--subject", "parked attachment probe", "--body", "mail while unattached")["subject"]
     processes = until(
         lambda: replacement_processes(node, seat_subject("a"), seats.incarnations["a"]),
         seats.bound, "the replacement generation never supplied fresh seat processes")
     check_boundary(node, processes=processes)
-    until(lambda: parked(node, seat_subject("a")), 180, "permanent channel failure never parked")
-    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
-          10, "parked channel failure lost its visible reason")
 
     def attempts():
         claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=500") or {}).get("claims", [])
         return [row for row in claims if row.get("kind") == "runtime.action.requested"
                 and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+
+    # Each incarnation needs the driver's 20 s detection window, then the reconciler's
+    # 10/20/40 s backoff, then a restart: about 170 s in all before any load. Bound each
+    # recovery step on its own event, not the whole schedule by one wall-clock budget.
+    for attempt in range(1, 4):
+        until(lambda: len(attempts()) >= attempt, seats.bound,
+              f"channel recovery attempt {attempt} was never requested")
+    until(lambda: parked(node, seat_subject("a")), seats.bound, "permanent channel failure never parked")
+    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
+          10, "parked channel failure lost its visible reason")
 
     if len(attempts()) != 3:
         fail(f"channel failure used {len(attempts())} recovery attempts, expected three")
@@ -900,11 +907,11 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
     if name == "import":
         native, origin = node.import_selection
         prove_codex_import(node, seats, native, origin)
-        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval")
+        node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval")
         seats.prove("import-restart")
         prove_codex_import(node, seats, native, origin)
     elif name in ("restart", "access-auto", "access-bypass"):
-        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+        node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
         seats.prove("restart")
         continued_session(node, "restart")
     elif name == "daemon-restart":

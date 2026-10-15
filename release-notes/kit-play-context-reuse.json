@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Reuse isolated Chromium worker contexts for strict kit plays while retaining fresh pages, the complete viewport/theme matrix and strict lifecycle assertions.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "No application or API change. Kit CI retains immutable HTTP resources across cases but clears cookies, permissions and observed-origin storage before every fresh page, audits residual state, and exercises real-browser isolation and broken-story negative controls. All stories, viewport/theme cases and existing strict assertions remain required." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}

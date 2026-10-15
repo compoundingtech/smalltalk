@@ -471,6 +471,18 @@ fn run_with_required_resume(
     )
 }
 
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+/// Admit the same installed producer and shipped extension before the RPC heal touches a session.
+/// Interactive launch still admits its own fork after the asynchronous heal.
+pub fn verify_admission_for_heal(binary: &str) -> Result<()> {
+    use crate::driver_diagnostic::Driver;
+    let set = pi_family_session::channel_extension_set(&OMP_KIND, "interrupted-ask-heal")?;
+    let admission = crate::harness_admission::admit(binary, Driver::Omp, Some(&set.join(EXTENSION)));
+    anyhow::ensure!(admission.passed(), "{}", admission.explanation(Driver::Omp));
+    Ok(())
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
+
 /// Measure the installed producer and exact shipped extension before claiming the live seat.
 fn verify_supported_version(binary: &str, agent_dir: &Path, extension: &Path) -> Result<()> {
     use crate::driver_diagnostic::{Driver, Publisher};

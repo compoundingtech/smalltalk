@@ -17,6 +17,25 @@ use crate::store::Store;
 /// message was written for, so each fresh incarnation gets its own and a replay writes it once.
 pub const SESSION_START_TAG_PREFIX: &str = "st3-session-start:";
 
+/// The prefix of the reserved tag on a "prepare for restart" message, followed by the id of the
+/// claim that records the request and its deadline.
+pub const PREPARE_TAG_PREFIX: &str = "st3-restart-prepare:";
+
+/// The `operation` of a restart request that asks for no handoff first.
+pub const RESTART_NOW_OPERATION: &str = "restart-now";
+
+/// The claim kind with which a seat says its handoff is current and a restart may go ahead.
+pub const READY_KIND: &str = "custom.agent.restart-ready";
+
+/// The subject of a seat's readiness claims.
+pub fn ready_subject(agent: &str) -> String {
+    use sha2::Digest as _;
+    format!(
+        "custom/agent/restart-ready-{}",
+        hex::encode(sha2::Sha256::digest(agent.as_bytes()))
+    )
+}
+
 /// The most of a handoff a session-start message carries. A longer handoff is cut here and says
 /// where to read the rest.
 pub const MAX_HANDOFF_BYTES: usize = 16 * 1024;
@@ -117,6 +136,46 @@ pub fn gather(store: &Store, agent: &str) -> Result<Context> {
         work,
         mail,
     })
+}
+
+/// Whether the seat has written its handoff, or said it is ready, since `since_unix_ms`. A readiness
+/// claim counts only when its recorded actor is the seat itself; like other claims, the actor is what
+/// the caller asserted, so this keeps out accidents and other seats, not a determined local caller.
+pub fn acknowledged_since(store: &Store, agent: &str, since_unix_ms: u128) -> Result<bool> {
+    // A pass that skips what nothing changed must see either acknowledgement arrive.
+    smallclaims::touched::note_read(|| ready_subject(agent));
+    if let Some(name) = document_name(agent) {
+        smallclaims::touched::note_read(|| name);
+    }
+    if let Some(name) = document_name(agent)
+        && store
+            .list_documents(Some(&name), false, 1)?
+            .into_iter()
+            .any(|version| version.latest && version.created_at_unix_ms >= since_unix_ms)
+    {
+        return Ok(true);
+    }
+    Ok(store
+        .claims_for(&ready_subject(agent), Some(READY_KIND))?
+        .into_iter()
+        .any(|claim| {
+            claim.accepted_at_unix_ms >= since_unix_ms && claim.actor.as_deref() == Some(agent)
+        }))
+}
+
+/// The "prepare for restart" message: why, by when, and what to do.
+pub fn render_prepare(reason: &str, deadline_unix_ms: u128, now_unix_ms: u128) -> String {
+    let seconds = deadline_unix_ms.saturating_sub(now_unix_ms).div_ceil(1000);
+    format!(
+        "st is about to restart this seat: {reason}. It restarts as soon as you acknowledge, or in \
+         {seconds} s, whichever comes first, and the session after this one will not remember \
+         this conversation.\n\n\
+         Write your handoff now with `st agents handoff write --as \"$ST_AGENT\"` (stdin or a \
+         file): what you were doing, open pull requests and branches, what you wait on, the next \
+         steps, and anything running that you started. Writing it is the acknowledgement. If the \
+         handoff you already have is current, run `st agents handoff ready --as \"$ST_AGENT\"` \
+         instead. Take no new work in the meantime.\n"
+    )
 }
 
 fn last_progress_note(store: &Store, step: &str) -> Result<Option<(String, u128)>> {
@@ -353,6 +412,21 @@ mod tests {
         assert!(text.contains("last progress note, 1 min ago: tests pass locally"));
         assert!(text.contains("`message/1` from agent/garden/birch: Question"));
         assert!(text.contains("st agents handoff write"));
+    }
+
+    #[test]
+    fn the_prepare_message_says_why_when_and_how_to_acknowledge() {
+        let text = render_prepare("the declared model changed", 130_000, 10_000);
+        assert!(text.contains("the declared model changed"), "{text}");
+        assert!(text.contains("in 120 s"));
+        assert!(text.contains("st agents handoff write"));
+        assert!(text.contains("st agents handoff ready"));
+    }
+
+    #[test]
+    fn a_seats_readiness_claims_have_their_own_subject() {
+        assert_ne!(ready_subject("agent/garden/ash"), ready_subject("agent/garden/birch"));
+        assert!(ready_subject("agent/garden/ash").starts_with("custom/agent/restart-ready-"));
     }
 
     #[test]

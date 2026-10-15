@@ -1216,3 +1216,270 @@ fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
     );
     assert!(!log.to_string().contains("example-token"));
 }
+
+/// A second gateway over `fixture`'s store whose configuration names `people`, and whose tile
+/// registry has one tile, atlas, whose launcher-allocated user ID is `tile_uid`. Its socket.
+fn tile_gateway(fixture: &Fixture, people: &str, tile_uid: u32) -> PathBuf {
+    let socket = fixture.root.join(format!(
+        "run/tiles-{}.sock",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config: GatewayConfig = toml::from_str(&format!(
+        "socket = {socket:?}\nstore = {store:?}\npath = [{tools:?}, \"/usr/bin\", \"/bin\"]\n\
+         checkout_roots = [{checkouts:?}]\n[people]\n{people}",
+        store = fixture.store,
+        tools = fixture.tools,
+        checkouts = fixture.checkouts,
+    ))
+    .unwrap();
+    let registry = crate::tiles::registry::Registry::parse(&tile_registry(tile_uid))
+        .unwrap()
+        .with_uids(&format!("atlas = {tile_uid}\n"))
+        .unwrap();
+    let gateway = Arc::new(
+        Gateway::new(
+            config,
+            fixture.uid,
+            None,
+            Box::new(SharedKernel(Arc::clone(&fixture.kernel))),
+        )
+        .unwrap()
+        .with_tiles(move || Ok(Some(registry.clone()))),
+    );
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || gateway.serve_listener(listener));
+    socket
+}
+
+const TILE_AGENT: &str = "agent/fleet/fixture-web/atlas";
+
+/// A registry with one tile, whose launcher-allocated user ID is `uid`.
+fn tile_registry(uid: u32) -> String {
+    format!(
+        "uids = {{ first = {uid}, last = {uid} }}\n\
+         [tiles.atlas]\nagent = \"{TILE_AGENT}\"\nperson = \"person/ada\"\n"
+    )
+}
+
+#[test]
+fn a_tile_is_its_agent_by_the_kernels_word_alone() {
+    let fixture = Fixture::new();
+    // Ada, at her login session, makes a profile and grants it to the tile's agent.
+    fixture
+        .manage(Request::ProfileCreate {
+            profile: "ada/agent-gh".into(),
+            description: None,
+            policy: policy(&["gh-pr"], &[]),
+            default: false,
+        })
+        .unwrap();
+    fixture
+        .manage(Request::GrantAdd {
+            profile: "ada/agent-gh".into(),
+            to: TILE_AGENT.into(),
+            policy: policy(&["gh-pr"], &[]),
+            until_unix_ms: None,
+        })
+        .unwrap();
+    // This process's Unix user is now the tile's, and no person's.
+    let socket = tile_gateway(&fixture, "", fixture.uid);
+    let set = |cgroup: String| *fixture.kernel.cgroup.lock().unwrap() = cgroup;
+
+    set(crate::tiles::registry::tools_cgroup("atlas"));
+    let connection = Connection::open(&socket).unwrap();
+    assert_eq!(
+        connection.caller,
+        CallerView::Agent {
+            agent: TILE_AGENT.into(),
+            person: "person/ada".into(),
+        },
+        "no attestation was needed"
+    );
+    let usable = connection.manage(&Request::ProfileList).unwrap();
+    assert_eq!(usable[0]["profile"]["id"], "ada/agent-gh", "{usable}");
+    // A tile changes nothing a person owns.
+    let refused = connection.manage(&Request::ProfileCreate {
+        profile: "ada/other".into(),
+        description: None,
+        policy: policy(&["gh-pr"], &[]),
+        default: false,
+    });
+    assert!(format!("{:#}", refused.unwrap_err()).contains("is an agent"));
+
+    // A daemon's attestation, even a well-formed one for another agent, changes nothing.
+    let mut connection = Connection::open(&socket).unwrap();
+    let pid = std::process::id() as i32;
+    let statement = Statement {
+        version: STATEMENT_VERSION,
+        node: "host/example".into(),
+        person: "person/ada".into(),
+        agent: "agent/fleet/fixture-web/birch".into(),
+        revision: None,
+        cgroup: crate::tiles::registry::tools_cgroup("atlas"),
+        pid,
+        pid_start: identity::process_start(pid).unwrap(),
+        nonce: connection.nonce.clone(),
+        issued_at_unix_ms: super::store::now_unix_ms(),
+    };
+    let text = serde_json::to_string(&statement).unwrap();
+    let (key, _) = MemberKey::generate().unwrap();
+    connection
+        .hello(Some(Attestation {
+            signature: key.sign(&identity::signing_message(&text)),
+            statement: text,
+        }))
+        .unwrap();
+    assert_eq!(
+        connection.caller,
+        CallerView::Agent {
+            agent: TILE_AGENT.into(),
+            person: "person/ada".into(),
+        }
+    );
+
+    // The tile's user outside the tile's slice, in another tile's or in a login session, is
+    // no one, and may use nothing.
+    for cgroup in [
+        crate::tiles::registry::tools_cgroup("birch"),
+        format!("/user.slice/user-{}.slice/session-1.scope", fixture.uid),
+        format!(
+            "/user.slice/user-{0}.slice/user@{0}.service/app.slice/x.scope",
+            fixture.uid
+        ),
+    ] {
+        set(cgroup.clone());
+        let connection = Connection::open(&socket).unwrap();
+        assert!(
+            matches!(&connection.caller, CallerView::Unidentified { reason, .. } if reason.contains("outside the tile")),
+            "{cgroup}: {:?}",
+            connection.caller
+        );
+        assert_eq!(
+            connection.manage(&Request::ProfileList).unwrap(),
+            serde_json::json!([])
+        );
+    }
+}
+
+#[test]
+fn a_unix_user_that_is_both_a_person_and_a_tile_is_refused() {
+    let fixture = Fixture::new();
+    let socket = tile_gateway(
+        &fixture,
+        &format!("\"{}\" = \"person/ada\"\n", fixture.uid),
+        fixture.uid,
+    );
+    *fixture.kernel.cgroup.lock().unwrap() = crate::tiles::registry::tools_cgroup("atlas");
+    let refused = Connection::open(&socket).err().expect("refused");
+    assert!(
+        format!("{refused:#}").contains("both a person"),
+        "{refused:#}"
+    );
+    // Another tile's user is not this person: the person still calls from a login session.
+    let socket = tile_gateway(
+        &fixture,
+        &format!("\"{}\" = \"person/ada\"\n", fixture.uid),
+        fixture.uid + 1,
+    );
+    fixture.as_person();
+    assert_eq!(
+        Connection::open(&socket).unwrap().caller,
+        CallerView::Person {
+            person: "person/ada".into()
+        }
+    );
+}
+
+#[test]
+fn a_tiles_directory_is_never_bound_into_a_command() {
+    let fixture = Fixture::new();
+    fixture
+        .manage(Request::ProfileCreate {
+            profile: "ada/agent-gh".into(),
+            description: None,
+            policy: policy(&[], &["where here"]),
+            default: false,
+        })
+        .unwrap();
+    fixture
+        .manage(Request::GrantAdd {
+            profile: "ada/agent-gh".into(),
+            to: TILE_AGENT.into(),
+            policy: policy(&[], &["where here"]),
+            until_unix_ms: None,
+        })
+        .unwrap();
+    fixture.tool("where", "pwd");
+    let socket = tile_gateway(&fixture, "", fixture.uid);
+    *fixture.kernel.cgroup.lock().unwrap() = crate::tiles::registry::tools_cgroup("atlas");
+    // Even a directory under the checkout roots, which a seat's call would bind.
+    let cwd = fixture.checkout("tile-work");
+    let output = run(
+        Connection::open(&socket).unwrap(),
+        None,
+        &["where", "here"],
+        &cwd,
+    );
+    // A Nix build sandbox may expose `/` as a different UID. The gateway must
+    // refuse the tool before preparing a call when any ancestor is untrusted.
+    let tool_trust = super::sandbox::trusted_path(&fixture.tools.join("where"), fixture.uid);
+    // With trusted tools, the call is logged even when bubblewrap is unavailable.
+    let log = Connection::open(&socket)
+        .unwrap()
+        .manage(&Request::Log {
+            after: 0,
+            limit: 100,
+            wait_ms: 0,
+        })
+        .unwrap();
+    if std::env::var_os("NIX_BUILD_TOP").is_some()
+        && let Err(reason) = &tool_trust
+    {
+        let reason = format!("{reason:#}");
+        let error = output
+            .result
+            .as_ref()
+            .expect_err("an untrusted tool is refused");
+        assert!(format!("{error:#}").contains(&reason), "{error:#}");
+        let entries = log.as_array().unwrap();
+        assert!(
+            entries.iter().all(|entry| entry["event"] != "call"),
+            "{log}"
+        );
+        assert!(
+            entries.iter().any(|entry| {
+                entry["event"] == "refused"
+                    && entry["actor"] == TILE_AGENT
+                    && entry["detail"]["reason"] == reason
+            }),
+            "{log}"
+        );
+        eprintln!(
+            "tile directory execution coverage unavailable: tool trust prerequisite: {reason}"
+        );
+        return;
+    }
+    tool_trust.expect("outside a Nix build sandbox, the fixture tool must be trusted");
+    if sandbox_available() {
+        assert_eq!(output.result.as_ref().unwrap(), &0, "{}", output.stderr);
+        assert!(!output.stdout.contains("tile-work"), "{}", output.stdout);
+    }
+    let call = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["event"] == "call")
+        .unwrap_or_else(|| panic!("the call is logged: {log}"));
+    assert_eq!(call["actor"], TILE_AGENT);
+    assert_eq!(
+        call["detail"]["cwd"],
+        fixture
+            .store
+            .join("profiles/ada/agent-gh/home")
+            .display()
+            .to_string()
+    );
+}

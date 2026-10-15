@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Drop the GIT_* variables that select a repository or an identity in the pre-push evidence hook, st-test and ci-genie-freshness, with a shell scrub that works without compgen and checks itself, so fixture tests cannot act on the caller's repository",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this changes developer scripts, their tests and documentation only."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes. Every check stays enforce false."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No command, frame, scope or stored-format change in the product."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is required by this change; hosts that removed the installed hook after the incident get it back from the default development shell, now safe."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent product state changes or new swap-back restrictions."
+  }
+}

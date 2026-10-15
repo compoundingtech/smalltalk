@@ -16,6 +16,7 @@ mod binary_payloads;
 mod boot_canaries;
 mod broken_gates;
 mod claude_idle;
+mod claude_statusline;
 mod client_creation;
 mod client_glasses;
 mod client_presence;
@@ -103,6 +104,7 @@ mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;
 mod terminal_binding;
+mod tiles_root;
 mod version;
 mod typed_keys;
 

@@ -16,7 +16,7 @@ import { decodeConversationChunk } from '@st3/sdk/effect'
 import { LiveTimeline } from '../conversation/fromTimeline.ts'
 import { createConversationTranscript } from './conversationTranscript.ts'
 
-vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
 const queue = decodeUnknownSync(AgentQueue)({ agent_id: agent.id, current_work_ids: ['work/current'], kind: 'agent-queue', move_count: 0, moves: [], next_work_id: null, runs: [{ claimed_work_ids: [], joined_at: '2026-10-04T12:00:00.000Z', mission_run_id: 'mission-run/example', position: 1, ready_work_ids: ['work/ready'], run_state: 'running', state: 'ready', waiting_work_ids: [] }] })
@@ -59,7 +59,7 @@ describe('live header parity', () => {
   it('renders named Resources and Conversation controls in the owning header', async () => {
     const header = host.querySelector('[data-testid="thread-header"]')!
     const names = [...header.querySelectorAll('button')].map(node => node.getAttribute('aria-label') ?? node.textContent?.trim())
-    expect(names).toEqual(['Resources', 'Conversation menu', 'Toggle terminal drawer', 'Toggle right panel'])
+    expect(names).toEqual(['Actions for Example Agent', 'Resources', 'Conversation menu', 'Toggle terminal drawer', 'Toggle right panel'])
     await click('Conversation menu')
     const setting = document.querySelector('[role="menuitemcheckbox"]')
     expect(setting?.textContent).toContain('Show all system events')

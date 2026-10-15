@@ -14,6 +14,7 @@ const framesPath = path.join(dir, "frames.jsonl");
 // Lines appended here are what the channel sends the extension, as `message` frames do.
 const outboxPath = path.join(dir, "outbox.jsonl");
 const pidPath = path.join(dir, "channel-pids");
+const closedPath = path.join(dir, "closed-channel-pids");
 const delayedHelloPath = path.join(dir, "delay-hello");
 const recorder = path.join(dir, "recorder");
 fs.writeFileSync(
@@ -39,7 +40,10 @@ process.stdin.on("data", (chunk) => {
   record(chunk.slice(0, 7));
   record(chunk.slice(7));
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => {
+  fs.appendFileSync(${JSON.stringify(closedPath)}, process.pid + "\\n");
+  process.exit(0);
+});
 let sent = 0;
 setInterval(() => {
   let outbox = "";
@@ -70,6 +74,17 @@ assert.throws(() => completeFrames('{broken}\n'), SyntaxError);
 const readFrames = () => completeFrames(
   fs.existsSync(framesPath) ? fs.readFileSync(framesPath, "utf8") : "",
 );
+// Shutdown closes the pipe but does not await its recorder. Fence the next context's
+// baseline on EOF after all prior frames are recorded, rather than on a fixed sleep.
+const awaitRecorderDrain = async () => {
+  const deadline = Date.now() + 10000;
+  const count = (file) => fs.existsSync(file)
+    ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).length : 0;
+  while (count(closedPath) < count(pidPath)) {
+    assert.ok(Date.now() < deadline, "all prior channel recorders must drain before the next context");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
 
 process.env.ST_OMP_CHANNEL_BIN = recorder;
 process.env.ST_OMP_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
@@ -185,6 +200,7 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
   await handlers.get("session_compact")({ compactionEntry: { id: "86c8955c" } }, ctx);
   await handlers.get("session_before_compact")({}, ctx);
   await handlers.get("session_shutdown")({}, ctx);
+  await awaitRecorderDrain();
 }
 
 // Structured ask observation is correlated by toolCallId. An unrelated result must emit nothing
@@ -603,7 +619,6 @@ for (const newerBoundary of ["batch", "ask"]) {
   await handlers.get("agent_end")(successfulEnd, holdCtx);
   fs.rmSync(outboxPath, { force: true });
 }
-
 
 // A channel that dies during a hold must be replaced. The successor re-sends the unacknowledged
 // message; the retired channel's held copy must never be handed off or acknowledged.

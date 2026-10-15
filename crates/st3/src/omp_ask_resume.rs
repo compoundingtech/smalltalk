@@ -24,7 +24,9 @@ pub fn pending_ask(transcript: &str) -> Option<String> {
     let mut pending: Option<String> = None;
     let mut exited_with_pending_ask = false;
     for line in transcript.lines() {
-        let row: serde_json::Value = serde_json::from_str(line).ok()?;
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if row["type"] == "custom"
             && row["customType"] == "tool_execution_start"
             && row["data"]["toolName"] == "ask"
@@ -109,6 +111,7 @@ fn healing_command(
 }
 
 pub async fn heal(binary: &str, sessions: &Path, id: &str) -> Result<String> {
+    st_drivers::omp_session::verify_admission_for_heal(binary)?;
     let stdout = tempfile::NamedTempFile::new()?;
     let stderr = tempfile::NamedTempFile::new()?;
     let mut child = healing_command(binary, sessions, id, std::env::vars_os().map(|(key, _)| key))
@@ -198,6 +201,20 @@ mod tests {
     }
 
     #[test]
+    fn malformed_middle_line_preserves_pending_ask_and_later_answer() {
+        let transcript = concat!(
+            "{\"type\":\"custom\",\"customType\":\"tool_execution_start\",\"data\":{\"toolName\":\"ask\",\"toolCallId\":\"X\"}}\n",
+            "{malformed\n",
+            "{\"type\":\"custom\",\"customType\":\"session_exit\",\"data\":{\"pendingToolCalls\":[{\"toolCallId\":\"X\"}]}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"X\",\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"Ask input was cancelled\"}]}}\n",
+        );
+        assert_eq!(pending_ask(transcript).as_deref(), Some("X"));
+        assert!(pending_ask(&format!(
+            "{transcript}{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"Continue without the picker\"}}]}}}}\n"
+        )).is_none());
+    }
+
+    #[test]
     fn shutdown_cancellation_is_interrupted_but_person_cancellation_is_answered() {
         let fixture = include_str!("../fixtures/omp-resume/managed-stop-cancelled.jsonl");
         assert_eq!(
@@ -234,34 +251,98 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn isolated_heal_test(variable: &str, test: &str) -> Option<std::path::PathBuf> {
+        if let Some(root) = std::env::var_os(variable) {
+            return Some(root.into());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
+        let python = String::from_utf8(python.stdout).unwrap();
+        let source = root.path().join("omp.source");
+        fs::write(&source, format!("#!{}\n{}\n{}", python.trim(), r#"
+import os, pathlib, sys
+if '--resume' in sys.argv and 'ST_ADMISSION_TRACE' not in os.environ:
+    root = pathlib.Path(__file__).parent
+    (root / 'rpc-started').write_text('rpc\n')
+    if (root / 'rpc-failure').exists():
+        print('heal-rejected', file=sys.stderr)
+        sys.exit(23)
+    if sys.stdin.read():
+        sys.exit(17)
+    print('\n'.join(sys.argv[1:]))
+    print('stdin-eof', file=sys.stderr)
+    sys.exit(0)
+"#, include_str!("../../st-drivers/tests/fixtures/harness-admission/fake-omp.py"))).unwrap();
+        assert!(std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&source)
+            .arg(root.path().join("omp"))
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join("capture.json"),
+            include_bytes!("../../st-drivers/tests/fixtures/harness-admission/omp-18.1.22.json")).unwrap();
+        let hooks = root.path().join("hooks");
+        st_drivers::hooks::install_at(&hooks, false).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(variable, root.path())
+            .env("HOME", root.path().join("home"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("ST_HOOKS", hooks)
+            .env_remove("ST3_MAILBOX_TRANSPORT")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "the isolated child must run the requested test");
+        None
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn heal_runs_rpc_without_input_and_reports_child_failure() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let binary = root.path().join("omp-canary");
-        fs::write(&binary, "#!/bin/sh\nif read -r input; then exit 17; fi\nprintf '%s\\n' \"$@\"\nprintf 'stdin-eof\\n' >&2\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let captured = heal(binary.to_str().unwrap(), root.path(), "native-id")
-            .await
-            .unwrap();
-        assert_eq!(
-            captured,
-            format!(
-                "--session-dir\n{}\n--no-extensions\n--resume\nnative-id\n--mode\nrpc\nstdin-eof\n",
-                root.path().display()
-            )
-        );
-        fs::write(
-            &binary,
-            "#!/bin/sh\nprintf 'heal-rejected\\n' >&2\nexit 23\n",
-        )
-        .unwrap();
-        let error = heal(binary.to_str().unwrap(), root.path(), "native-id")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("23"));
-        assert!(error.contains("heal-rejected"));
+        let Some(root) = isolated_heal_test("ST_TEST_OMP_HEAL_RPC_ROOT",
+            "omp_ask_resume::tests::heal_runs_rpc_without_input_and_reports_child_failure") else { return };
+        let binary = root.join("omp");
+        let captured = heal(binary.to_str().unwrap(), &root, "native-id").await.unwrap();
+        assert_eq!(captured, format!(
+            "--session-dir\n{}\n--no-extensions\n--resume\nnative-id\n--mode\nrpc\nstdin-eof\n",
+            root.display()));
+        assert_eq!(fs::read_to_string(root.join("launches")).unwrap(), "probe\n");
+        fs::write(root.join("rpc-failure"), "").unwrap();
+        let error = heal(binary.to_str().unwrap(), &root, "native-id").await.unwrap_err().to_string();
+        assert!(error.contains("23"), "{error}");
+        assert!(error.contains("heal-rejected"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("launches")).unwrap(), "probe\n",
+            "the unchanged producer and extension reuse their exact admission");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unadmitted_build_cannot_heal_the_selected_transcript() {
+        let Some(root) = isolated_heal_test("ST_TEST_OMP_HEAL_ADMISSION_ROOT",
+            "omp_ask_resume::tests::an_unadmitted_build_cannot_heal_the_selected_transcript") else { return };
+        let transcript = root.join("selected.jsonl");
+        let original = include_str!("../fixtures/omp-resume/managed-stop-cancelled.jsonl");
+        fs::write(&transcript, original).unwrap();
+        let binary = root.join("omp");
+        heal(binary.to_str().unwrap(), &root, "selected").await.unwrap();
+        fs::remove_file(root.join("rpc-started")).unwrap();
+        let admitted = fs::read_to_string(&binary).unwrap();
+        fs::write(&binary, format!("{admitted}\n# changed exact producer build\n")).unwrap();
+        fs::write(root.join("malformed"), "").unwrap();
+        let error = heal(binary.to_str().unwrap(), &root, "selected").await.unwrap_err().to_string();
+        assert!(error.contains("admission failed"), "{error}");
+        assert!(!root.join("rpc-started").exists(), "a refused build must not start repair");
+        assert_eq!(fs::read_to_string(root.join("launches")).unwrap(), "probe\nprobe\n",
+            "a changed build must not reuse the previous exact admission");
+        assert_eq!(fs::read_to_string(transcript).unwrap(), original);
     }
 
     #[test]
@@ -293,7 +374,7 @@ mod tests {
         assert!(read_pending(&root.path().join("missing")).is_none());
         assert!(read_pending(root.path()).is_none());
         fs::write(&path, [start.as_bytes(), &[0xff]].concat()).unwrap();
-        assert!(read_pending(&path).is_none());
+        assert_eq!(read_pending(&path).as_deref(), Some("X"));
         fs::write(&path, format!("{{\"type\":\"session\",\"id\":\"selected\",\"label\":\"�\"}}\n{start}").as_bytes()).unwrap();
         let bytes = fs::read(&path).unwrap();
         let invalid = bytes.windows(3).position(|part| part == [0xef,0xbf,0xbd]).unwrap();

@@ -409,7 +409,7 @@ class Probe:
                 route.pop("previous_read", None)
                 self.measuring[target] = time.monotonic_ns()
             self.persist()
-        if route and route["status"] == "read" and (route.get("attention") or route.get("agent_alert") or route.get("reviewer_alert")):
+        if route and route["status"] == "read" and self.has_notice(route):
             # Finish a recovery whose response was lost before starting the next interval.
             await self.withdraw(route)
         # A recipient that boots or reconnects holds all earlier mail. An accepted overdue
@@ -421,7 +421,7 @@ class Probe:
             if route:
                 previous_read = ({key: route[key] for key in ("message", "latency_ms", "late")}
                                  if route.get("status") == "read" else route.get("previous_read"))
-            alerts = {key: route[key] for key in ("attention", "agent_alert", "reviewer_alert", "alert_warning")
+            alerts = {key: route[key] for key in ("attention", "agent_alert", "reviewer_alert", "alert_warning", "notice_episode")
                       if route and key in route}
             nonce = str(uuid.uuid4())
             key = f"delivery-probe:{self.actor}:{target}:{nonce}"
@@ -451,7 +451,7 @@ class Probe:
                 route["error"] = str(error)[:1000]
                 self.persist()
         if route["status"] == "read":
-            if route.get("attention") or route.get("agent_alert") or route.get("reviewer_alert"):
+            if self.has_notice(route):
                 await self.withdraw(route)
             return
         try:
@@ -467,6 +467,9 @@ class Probe:
         if target in self.measuring:
             elapsed = (time.monotonic_ns() - self.measuring[target]) // 1_000_000
         if read:
+            episode = route.get("notice_episode") or {}
+            if episode.get("message") == route["message"]:
+                elapsed = max(elapsed, episode.get("overdue_latency_ms", 0))
             route.update(status="read", read_at_unix_ms=read["accepted_at_unix_ms"],
                          observed_read_at_unix_ms=now_ms(), latency_ms=elapsed,
                          next_at_unix_ms=now_ms() + self.interval)
@@ -477,10 +480,15 @@ class Probe:
             self.event("read-observed", message=route["message"], latency_ms=elapsed, late=route["late"])
             await self.withdraw(route)
         elif elapsed >= self.deadline:
+            route["overdue_latency_ms"] = elapsed
             # Keep replaying an unaccepted send intent even after its deadline.
             if route["status"] not in ("overdue", "sending"):
                 route["status"] = "overdue"
                 self.persist()
+            # Absence may have withdrawn active attention, but it did not end the
+            # outage episode. Only a qualifying recipient read can do that.
+            if (route.get("notice_episode") or {}).get("notified"):
+                return
             if not route.get("attention"):
                 if route.get("agent_alert"):
                     await self.send_alert(route)
@@ -522,38 +530,60 @@ class Probe:
             return "driver is not running and ready"
         return None
 
+    def has_notice(self, route):
+        return any(route.get(key) for key in
+                   ("attention", "agent_alert", "reviewer_alert", "notice_episode"))
+
+    def notice_episode(self, route):
+        # Lazy, route-local migration: retain one episode, not a notice history or
+        # a scan of graph messages. Already persisted ambiguous bodies stay exact.
+        if "notice_episode" not in route:
+            episode = {key: route[key] for key in ("message", "nonce", "started_at_unix_ms")}
+            episode["overdue_latency_ms"] = route.get("overdue_latency_ms", 0)
+            if route.get("attention"):
+                episode["attention"] = route["attention"]
+                episode["notified"] = True
+            if route.get("agent_alert"):
+                episode["agent_alert"] = route["agent_alert"]
+            route["notice_episode"] = episode
+            self.persist()
+        return route["notice_episode"]
+
     async def send_reviewer_alert(self, route):
+        episode = self.notice_episode(route)
         if not route.get("reviewer_alert"):
             route["reviewer_alert"] = {
                 "actor": self.actor, "person": self.config["reviewer"],
-                "new_run": f"delivery-probe-{route['nonce']}",
+                "new_run": f"delivery-probe-{episode['nonce']}",
                 "title": f"Delivery probe {self.source} → {route['target']} has no read receipt",
-                "reason": (f"{route['message']} was not read within {self.deadline // 1000}s. "
+                "reason": (f"{episode['message']} was not read within {self.deadline // 1000}s. "
                            "The native probe sends fresh probes after its interval; a real read cancels this person step automatically. "
                            "Inspect the node's probe seat, replication and daemon."
                            + (" " + route["alert_warning"] if route.get("alert_warning") else "")),
-                "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
+                "idempotency_key": f"delivery-probe-overdue:{episode['message']}:{episode['started_at_unix_ms']}",
             }
             self.persist()
         attention = await self.api.post("/v1/work/ask", route["reviewer_alert"])
         route["attention"] = attention["subject"]
+        episode.update(attention=route["attention"], notified=True)
         route.pop("reviewer_alert")
         self.persist()
         self.event("attention", message=route["message"], attention=route["attention"])
 
     async def send_alert(self, route):
+        episode = self.notice_episode(route)
         if not route.get("agent_alert"):
             route["agent_alert"] = {
                 "from": self.actor, "to": self.alert_agent,
                 "title": f"Delivery probe {self.source} → {route['target']} has no read receipt",
-                "content": (f"Route {self.actor} → {route['to']}; nonce {route['nonce']}. "
-                            f"{route['message']} was not read within {self.deadline // 1000}s. "
+                "content": (f"Route {self.actor} → {route['to']}; nonce {episode['nonce']}. "
+                            f"{episode['message']} was not read within {self.deadline // 1000}s. "
                             "Report this route, nonce, message, missed deadline and any observed recovery to the alert owner. "
                             "Reporting does not require st doctor --json to return. "
                             "If Doctor timed out, report that timeout; do not repeat the call. "
                             "A Doctor timeout does not establish that the daemon stopped. "
                             "Fresh probes continue; a real recipient read sends a recovery note."),
-                "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
+                "idempotency_key": f"delivery-probe-overdue:{episode['message']}:{episode['started_at_unix_ms']}",
                 "tags": ["delivery-probe-alert"],
             }
             # Save the exact body before sending: a timeout can hide a committed alert.
@@ -561,10 +591,17 @@ class Probe:
         alert = route["agent_alert"]
         await self.api.post("/v1/messages", alert)
         route["attention"] = "message/" + hashlib.sha256(alert["idempotency_key"].encode()).hexdigest()[:16]
+        episode.update(attention=route["attention"], agent_alert=alert, notified=True)
         self.persist()
         self.event("attention", message=route["message"], attention=route["attention"])
 
     async def clear_alert(self, route, summary, key):
+        if not self.has_notice(route):
+            route.pop("alert_warning", None)
+            return
+        episode = self.notice_episode(route)
+        if key == "absent" and episode.get("paused"):
+            return
         if route.get("reviewer_alert"):
             await self.send_reviewer_alert(route)
         if route.pop("alert_warning", None):
@@ -573,32 +610,42 @@ class Probe:
             # Replay an uncertain alert before clearing it, even if recovery won the race.
             if not route.get("attention"):
                 await self.send_alert(route)
-            alert = route["agent_alert"]
-            await self.api.post("/v1/messages", {
+        subject = route.get("attention") or episode.get("attention")
+        alert = route.get("agent_alert") or episode.get("agent_alert")
+        # At most two exact clear intents per episode: paused and real-read recovery.
+        # Persist before POST so a changed clock, restart or flap cannot change a
+        # body whose response may have been lost after committing.
+        clears = episode.setdefault("clears", {})
+        if subject and key not in clears and alert:
+            clears[key] = {"path": "/v1/messages", "body": {
                 "from": self.actor, "to": alert["to"],
                 "title": f"Delivery probe {self.source} → {route['target']} " + ("recovered" if key == "recovered" else "paused"),
-                "content": f"Clears {route['attention']}. {summary}",
-                "idempotency_key": f"delivery-probe-{key}:{route['attention']}",
+                "content": f"Clears {subject}. {summary}",
+                "idempotency_key": f"delivery-probe-{key}:{subject}",
                 "tags": ["delivery-probe-recovery" if key == "recovered" else "delivery-probe-paused"],
-            })
-            route.pop("agent_alert")
-            route.pop("attention", None)
+            }}
             self.persist()
-            return
-        if route.get("attention"):
-            subject = route["attention"]
+        elif subject and key not in clears and subject.startswith("step-run/"):
+            clears[key] = {"path": "/v1/work/cancel-ask", "body": {
+                "subject": subject, "actor": self.actor, "summary": summary,
+                "idempotency_key": f"delivery-probe-{key}:{subject}",
+            }}
+            self.persist()
+        if key in clears:
+            request = clears[key]
             # Old versions stored legacy attention IDs. Those are historical audit data now.
-            if subject.startswith("step-run/"):
-                try:
-                    await self.api.post("/v1/work/cancel-ask", {
-                        "subject": subject, "actor": self.actor, "summary": summary,
-                        "idempotency_key": f"delivery-probe-{key}:{subject}",
-                    })
-                except ApiError as error:
-                    if error.code not in ("stale-fence", "missing-step-run"):
-                        raise
-            route.pop("attention", None)
-            self.persist()
+            try:
+                await self.api.post(request["path"], request["body"])
+            except ApiError as error:
+                if request["path"] != "/v1/work/cancel-ask" or error.code not in ("stale-fence", "missing-step-run"):
+                    raise
+        for field in ("agent_alert", "reviewer_alert", "attention"):
+            route.pop(field, None)
+        if key == "absent":
+            episode["paused"] = True
+        else:
+            route.pop("notice_episode", None)
+        self.persist()
 
     async def withdraw(self, route):
         await self.clear_alert(route,

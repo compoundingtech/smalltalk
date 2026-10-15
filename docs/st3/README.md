@@ -66,6 +66,8 @@ Use these documents for implementation details:
   with its own state, sockets, service names and harness accounts, and the uninstall that removes it.
 - [Sekrets](sekrets.md) explains the opt-in gateway that runs any CLI with a credential no seat
   can read: profiles, policies, grants, how it tells a seat from its person, and its sandbox.
+- [Tiles](tiles.md) explains how root runs an agent as its own Unix user, in its own namespaces
+  and root-owned cgroup: the registry, launch, cleanup, the endpoint, and what the tests prove.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits

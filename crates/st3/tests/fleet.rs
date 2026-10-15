@@ -202,6 +202,12 @@ impl Node {
         if let Some(shell) = std::env::var_os("SHELL") {
             command.env("SHELL", shell);
         }
+        if let Some(root) = std::env::var_os("SMALLTALK_FLEET_LEAVE_DIAGNOSTICS") {
+            command.env("RUST_LOG", "st3=trace,smallclaims=trace");
+            fs::write(Path::new(&root).join("command.json"), serde_json::to_vec(&json!({
+                "node": self.name, "operation": arguments.iter().take(2).collect::<Vec<_>>()
+            })).unwrap()).unwrap();
+        }
         for (key, value) in &self.env {
             command.env(key, value);
         }
@@ -2326,23 +2332,34 @@ async fn refusal_settings_writer_across_leave(stage: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn leave_drains_everything_before_it_leaves() {
-    if st3::test_support::supervise_test() {
+    if supervise_leave_with_diagnostics() {
         return;
     }
-    let root = tempfile::tempdir().unwrap();
-    let mut a = anchor(root.path(), "a").await;
-    let b = joined(root.path(), &a, "b", &[]).await;
+    let temporary_root = tempfile::tempdir().unwrap();
+    let root = std::env::var_os("SMALLTALK_FLEET_LEAVE_DIAGNOSTICS")
+        .map(PathBuf::from).unwrap_or_else(|| temporary_root.path().to_owned());
+    let phase = |stage: &str| fs::write(root.join("phase.txt"), stage).unwrap();
+    phase("create and start anchor a");
+    let mut a = anchor(&root, "a").await;
+    phase("invite, join and start b");
+    let b = joined(&root, &a, "b", &[]).await;
+    phase("wait for b listener");
     b.wait_listening().await;
+    phase("stop anchor a");
     a.stop();
     let mut expected = BTreeSet::new();
     // Written while the anchor is away, and more than an older peer's exchange carries (512),
     // so the anchor comes back catching up and defers projecting what it receives.
     for index in 0..700 {
+        phase(&format!("write note {index}/700 on b"));
         b.note(&format!("b-{index}")).await;
         expected.insert(format!("custom/fleet-test/b-{index}"));
     }
+    phase("restart anchor a");
     a.start().await;
+    phase("wait for a listener");
     a.wait_listening().await;
+    phase("fleet leave CLI on b (existing --wait 2m)");
     b.st_ok(&[
         "fleet",
         "leave",
@@ -2353,7 +2370,9 @@ async fn leave_drains_everything_before_it_leaves() {
         PERSON,
     ]);
     // Everything b wrote reached a before the leave, and the leave ended b.
+    phase("wait for all notes on a");
     wait_for_notes(&a, &expected, 10, &[&a, &b]).await;
+    phase("read a fleet status and assert b left");
     let members = a.st_json(&["fleet", "status"])["view"]["members"].clone();
     assert!(
         members.as_array().unwrap().iter().any(|member| {
@@ -2364,7 +2383,48 @@ async fn leave_drains_everything_before_it_leaves() {
     assert!(!b.state_dir().join("fleet").exists());
     assert!(b.state_dir().join("left-fleet.json").exists());
     // While leaving, b refused new writes; now it accepts them again, locally.
+    phase("write local-after-leave on b");
     b.note("local-after-leave").await;
+    phase("stop fixture b");
+    drop(b);
+    phase("stop fixture a");
+    drop(a);
+    phase("complete");
+}
+
+/// The deadline lives outside Rust: a blocked synchronous CLI or runtime teardown
+/// cannot keep it from dumping evidence and failing. The existing guardian owns cleanup.
+fn supervise_leave_with_diagnostics() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write as _;
+        let name = "fleet::leave_drains_everything_before_it_leaves";
+        if std::env::var("SMALLTALK_TEST_SUPERVISED").as_deref() == Ok(name) {
+            return false;
+        }
+        let scripts = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new("python3")
+            .arg(scripts.join("st3_test_process.py"))
+            .args(["--owner", &std::process::id().to_string(), "--", "python3"])
+            .arg(scripts.join("st3_fleet_leave_diagnostics.py"))
+            .args(["--seconds", "600", "--root"])
+            .arg(root.path())
+            .arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--include-ignored"])
+            .env_remove("ST_AGENT")
+            .env_remove("ST3_SUBJECT")
+            .env("SMALLTALK_TEST_SUPERVISED", name)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output().expect("launch bounded fleet leave guardian");
+        std::io::stdout().write_all(&output.stdout).unwrap();
+        std::io::stderr().write_all(&output.stderr).unwrap();
+        assert!(output.status.success(), "bounded fleet leave: {}", output.status);
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3158,7 +3218,7 @@ me="{node}-fabric-id"
 echo "$me $*" >> "$registry/calls"
 key() {{ echo "$1.$(echo "$2" | tr '/' '_')"; }}
 case "$1" in
-  id) echo "$me" ;;
+  id) echo "{{\"id\":\"$me\"}}" ;;
   addr) epoch=$(cat "$registry/epoch" 2>/dev/null || echo 0); echo "{{\"addrs\":[\"$epoch\"]}}" ;;
   expose) [ ! -f "$registry/fail-expose-$me" ] || {{ echo "exposure refused" >&2; exit 1; }}; echo "$4" > "$registry/$(key "$me" "$2")" ;;
   unexpose)

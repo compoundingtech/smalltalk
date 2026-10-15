@@ -453,6 +453,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st agents handoff ready",
+      "description": "Say this seat's handoff is current so a waiting restart can go ahead",
+      "tests": [
+        "crates/st3/tests/agents_restart.rs::ready_acknowledges_a_handoff_that_is_already_current"
+      ],
+      "verification": "real CLI over a private Unix socket; the restart waits, then stops the seat"
+    },
+    {
       "command": "st agents handoff show",
       "description": "Print a seat's latest handoff document",
       "tests": [
@@ -2121,6 +2129,40 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st tiles prepare",
+      "description": "Make a tile's directories, including the endpoint directory its supervisor serves, without starting it. Run as root, for example at boot",
+      "tests": [
+        "crates/st3/tests/tiles_root.rs::a_tile_acts_through_its_endpoint_only_as_its_own_agent"
+      ],
+      "verification": "root-only proofs on a real Linux host with launcher-allocated user IDs (ST_TILES_ROOT_TEST=1 tiles_root); not run in CI, which has no root"
+    },
+    {
+      "command": "st tiles remove",
+      "description": "End a tile, remove its state and directories, and give its user ID back. Run as root. Its registry entry stays; a later launch starts it afresh with a new user ID",
+      "tests": [
+        "crates/st3/tests/tiles_root.rs::the_launcher_allocates_each_tiles_user_id_and_gives_it_back"
+      ],
+      "verification": "root-only proofs on a real Linux host with launcher-allocated user IDs (ST_TILES_ROOT_TEST=1 tiles_root); not run in CI, which has no root"
+    },
+    {
+      "command": "st tiles run",
+      "description": "Run a command in a tile and wait for it. Run as root",
+      "tests": [
+        "crates/st3/tests/tiles_root.rs::a_tile_runs_as_its_own_user_seeing_nothing_of_the_host",
+        "crates/st3/tests/tiles_root.rs::sibling_tiles_cannot_reach_each_other_or_the_host",
+        "crates/st3/tests/tiles_root.rs::only_root_starts_a_tile_and_only_inside_its_unit"
+      ],
+      "verification": "root-only proofs on a real Linux host with launcher-allocated user IDs (ST_TILES_ROOT_TEST=1 tiles_root); not run in CI, which has no root"
+    },
+    {
+      "command": "st tiles stop",
+      "description": "End every process in a tile. Run as root",
+      "tests": [
+        "crates/st3/tests/tiles_root.rs::a_tile_ends_completely_however_its_launch_ends"
+      ],
+      "verification": "root-only proofs on a real Linux host with launcher-allocated user IDs (ST_TILES_ROOT_TEST=1 tiles_root); not run in CI, which has no root"
+    },
+    {
       "command": "st trace show",
       "description": "Show or follow bounded graph history",
       "tests": [
@@ -2749,10 +2791,10 @@
       "verification": "local palette/reducer; resulting daemon effects are listed separately"
     },
     {
-      "action": "ToggleTerminalFirst",
+      "action": "ToggleConversationFirst",
       "tests": [
-        "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
-        "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+        "crates/stui/src/ui/glass.rs::opening_an_agent_attaches_its_terminal_unless_this_device_chose_conversation_first",
+        "crates/stui/tests/support/attach_default.rs::attach_default_probe"
       ],
       "verification": "local palette/reducer; resulting daemon effects are listed separately"
     },

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Pin strict local-state command guards and preserve doctor failure severity",
+  "replay": {
+    "status": "none",
+    "detail": "No graph, projection, claim replay or startup readiness change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or config-version change; the shared strict Config schema is retained."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No replicated rule, checkpoint, authority, lease or lifecycle change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Client compatibility remains limited to endpoint reads; local-state fleet, uninstall, admission, service-status and Fabric discovery keep strict configuration loads. Doctor config warnings can raise pass to warn but cannot downgrade an existing failing check; failures still exit nonzero. No known type, config version, daemon authority or storage change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The parser change adds no daemon restart, migration or recovery work."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "After an install adds config keys, replace stale clients on session PATHs and coordinate restarting affected sessions so they use the installed build. Old deployed strict clients can fail for one more key-adding upgrade cycle; verify the session client and daemon source versions. No live session restart is performed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No native recovery or performance acceptance. New invented-fixture CLI guards verify strict rejection before default-state use; the existing client warning and setup-refusal boundaries remain. Real performance-load effects cannot be inferred from a cancelled job with unavailable logs."
+  }
+}

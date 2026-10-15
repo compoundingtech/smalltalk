@@ -21,7 +21,6 @@ const textVarsTheme = stylex.createTheme(textVars, {
   fg: '#f5f5f5',
   fgMuted: '#818181',
   fgSoft: 'rgba(245, 245, 245, 0.8)',
-  fgFaint: 'rgba(245, 245, 245, 0.52)',
   sidebarFgMuted: '#a3a3a3',
 })
 
@@ -31,6 +30,8 @@ const borderVarsTheme = stylex.createTheme(borderVars, {
   glassBorder: 'rgba(255, 255, 255, 0.05)',
   controlBorder: 'rgba(255, 255, 255, 0.025)',
   focusBorder: 'rgba(255, 255, 255, 0.08)',
+  rail: 'rgba(255, 255, 255, 0.1)',
+  railStrong: 'rgba(255, 255, 255, 0.12)',
 })
 
 const accentVarsTheme = stylex.createTheme(accentVars, {
@@ -61,7 +62,7 @@ const typeVarsTheme = stylex.createTheme(typeVars, {
   uiSize: '14px', uiLeading: '20px',
   metaSize: '12px', metaLeading: '16px',
   denseSize: '11px',
-  codeSize: '13px',
+  codeSize: '13px', codeLeading: '18px',
   bodySize: '14px', bodyLeading: '22.75px',
   weightMedium: '500',
   microSize: '10px', weightRegular: '400', weightSemibold: '600', weightBold: '700',
@@ -78,7 +79,6 @@ const radiusVarsTheme = stylex.createTheme(radiusVars, {
 const spaceVarsTheme = stylex.createTheme(spaceVars, {
   xs2: '2px', xs: '4px', sm: '6px', md: '8px', lg: '12px', xl: '16px', xxl: '20px',
   zero: '0', hairline: '1px', xxxs: '1px', row: '10px', section: '24px', control: '28px', panel: '32px',
-  proseGap: '10px',
 })
 
 const geometryVarsTheme = stylex.createTheme(geometryVars, {
@@ -95,7 +95,7 @@ const geometryVarsTheme = stylex.createTheme(geometryVars, {
   heroSize: '30px', heroLeading: '36px',
   tabMax: '144px', crumbMax: '160px',
   editorMin: '78px', editorMax: '208px', userClamp: '176px', previewMax: '256px',
-  toolIndent: '28px', gutter40: '40px', icon: '16px', status: '14px', statusPip: '6px', stop: '12px',
+  gutter40: '40px', icon: '16px', status: '14px', statusPip: '6px', stop: '12px',
   sidebarRow: '48px', sidebarNested: '32px', resourceCard: '40px', hairline: '1px', focusRing: '2px', blur: '16px',
   drawerMax: '600px', rowInset: '10px', scrollbar: '6px', caret: '1.5px',
   focusOffset: '1px', separatorHitSlop: '3px', specimenMax: '1400px', workshopMax: '1500px',

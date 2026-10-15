@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Mark the Git change list, show and sync reads as on hold and not for use",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation only; no replicated replay, claim kind or history scan."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation only; no schema, route or command changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation only; the feature stays off by default."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No behavior change for any client or daemon."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or migration."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Operators should not enable the changes configuration; nothing else to do."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover; the read side is unused."
+  }
+}

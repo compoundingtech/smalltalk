@@ -172,7 +172,7 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
             .unwrap();
         async move {
             backend
-                .receive("fern", fleet, &exchange, None)
+                .receive("fern", fleet, &exchange, None, Default::default())
                 .await
                 .unwrap()
         }
@@ -320,7 +320,7 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
             .export_replication_exchange(fleet, &ReplicationInventory::default())
             .unwrap();
         backend
-            .receive(names[other], fleet, &exchange, None)
+            .receive(names[other], fleet, &exchange, None, Default::default())
             .await
             .unwrap();
         assert!(
@@ -339,7 +339,7 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
             .unwrap()
             .len();
         backend
-            .receive(names[other], fleet, &exchange, None)
+            .receive(names[other], fleet, &exchange, None, Default::default())
             .await
             .unwrap();
         assert_eq!(

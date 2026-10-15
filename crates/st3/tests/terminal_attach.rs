@@ -706,7 +706,7 @@ fn fabric_shim(root: &Path, tunnel: Option<&Path>) {
         &fabric,
         format!(
             "#!/bin/sh\necho \"$@\" >> '{calls}'\ncase \"$1\" in\n  \
-             peers) printf '{OWNER_NODE}\\towner-node\\tst3/pty/{FLEET_ID}\\n';;\n  \
+             peers) echo '{{\"peers\":[{{\"node\":\"{OWNER_NODE}\",\"name\":\"owner-node\",\"allow\":[\"st3/pty/{FLEET_ID}\"]}}]}}';;\n  \
              dial) {dial};;\n  expose) echo exposed;;\n  *) exit 1;;\nesac\n",
             calls = root.join("fabric-calls").display(),
         ),

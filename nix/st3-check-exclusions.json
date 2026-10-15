@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "Tests that checks.st3 does not run because the Nix build sandbox cannot provide what they need. They still run in central CI (nextest, linux-tests shards) and on the wrapper path, so nothing is dropped, only moved. The check fails if an entry here no longer names exactly one test, or if any unlisted test fails. Every entry needs a reason and an owner.",
+  "about": "Tests that checks.st3 does not run because the Nix build sandbox cannot provide what they need. They still run in central CI (nextest, linux-tests shards) and on the wrapper path, so nothing is dropped, only moved. The check fails if an entry here no longer names exactly one test, or if any unlisted test fails. Every entry needs a reason and an owner. Running the check on a pull request head once Nix no longer starts on pull requests: `gh workflow run Nix --repo compoundingtech/smalltalk --ref BRANCH`, then take the run whose headSha is the head you mean (`gh run list --repo compoundingtech/smalltalk --workflow Nix --event workflow_dispatch --branch BRANCH --json databaseId,headSha,conclusion`). A result belongs to that exact commit only: dispatch again after every push, and never carry a result across commits.",
   "exclusions": [
     {
       "package": "st3",
@@ -209,6 +209,30 @@
       "reason": "The daemon captures the account's login-shell environment and the Nix build user has no login shell. For this test the cause is inferred, not printed: it fails at the same setup.rs helper with the same daemon exit status 2 as the listed setup tests, and the test output does not include setup-daemon.log.",
       "owner": "nix-evidence (mission fleet/factory/nix-evidence)",
       "runs_instead": "central CI linux-tests shards and the wrapper path"
+    },
+    {
+      "package": "st3",
+      "binary": "integration",
+      "test": "mission_cancellation::cancellation_stops_execs_and_waiting_gates_before_finally_finishes",
+      "reason": "Fails in the Nix build sandbox while it passes in central CI (linux-tests). Measured on main 24d78d71b: run alone in the sandbox at 1 and at 4 test threads, cancellation_stops_execs_and_waiting_gates_before_finally_finishes failed every time (39 s timeout waiting for the final gate). The step that never happens is the finally-step gate (final.pid) after 'missions cancel'; the mission_cancellation sibling tests that cancel without work in flight pass. Not load alone, and not systemd (the test stubs systemctl). Root cause in the sandbox not found; excluded rather than weakened.",
+      "owner": "nix-evidence (mission fleet/factory/nix-evidence)",
+      "runs_instead": "central CI linux-tests shards and the wrapper path"
+    },
+    {
+      "package": "st3",
+      "binary": "integration",
+      "test": "mission_cancellation::cancellation_adopts_and_stops_gate_processes_after_daemon_restart",
+      "reason": "Fails in the Nix build sandbox while it passes in central CI (linux-tests). Measured on main 24d78d71b: run alone in the sandbox at 1 and at 4 test threads, cancellation_adopts_and_stops_gate_processes_after_daemon_restart passed alone twice but failed in 2 of 3 full-suite Nix runs (same timeout). The step that never happens is the finally-step gate (final.pid) after 'missions cancel'; the mission_cancellation sibling tests that cancel without work in flight pass. Not load alone, and not systemd (the test stubs systemctl). Root cause in the sandbox not found; excluded rather than weakened.",
+      "owner": "nix-evidence (mission fleet/factory/nix-evidence)",
+      "runs_instead": "central CI linux-tests shards and the wrapper path"
+    },
+    {
+      "package": "st3",
+      "binary": "st3",
+      "test": "store::tombstones_tests::a_trim_never_makes_a_write_wait_long",
+      "reason": "Timing assertion (500 ms) failed once at 634 ms on a loaded Nix builder (Nix run 38598779882); cause unknown; the hosted re-measurement was cancelled while queued. Threshold unchanged. Issue: https://github.com/compoundingtech/smalltalk/issues/2896",
+      "owner": "db-size",
+      "runs_instead": "central CI linux-tests shards"
     }
   ]
 }

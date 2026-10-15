@@ -611,7 +611,7 @@ pub async fn transfer(
         }
     }
     payload.flush()?;
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    store.connection.write_workers().spawn_blocking(move || -> Result<()> {
         anyhow::ensure!(
             hex::encode(Sha256::digest(fs::read(payload.path())?)) == expected.unwrap().1,
             "snapshot digest differs"

@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Run scripts/evidence-keygen in a throwaway HOME: files, modes, the printed line, repeatability, refusals."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / 'scripts/evidence-keygen'
+
+
+class Keygen(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+
+    def keygen(self, *args, home=True, umask=None, env=None):
+        command = [sys.executable, '-I', str(SCRIPT), *args]
+        if home:
+            command += ['--home', str(self.home)]
+        return subprocess.run(command, capture_output=True, text=True, env=dict(env or os.environ, HOME=str(self.home)),
+                              preexec_fn=(lambda: os.umask(umask)) if umask is not None else None)
+
+    def test_it_makes_a_private_key_a_scratch_repository_and_the_signer_configuration(self):
+        done = self.keygen('--name', 'box-1')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        directory = self.home / '.config/st'
+        key = directory / 'evidence-sign-key'
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((directory / 'evidence-sign.json').stat().st_mode & 0o777, 0o600)
+        config = json.loads((directory / 'evidence-sign.json').read_text())
+        self.assertEqual(config, {'signer': 'host/box-1', 'ssh_key': str(key),
+                                  'scratch_repo': str(directory / 'evidence-sign-scratch.git')})
+        self.assertTrue((directory / 'evidence-sign-scratch.git/HEAD').exists())
+        # The configuration is exactly what scripts/evidence-sign accepts: the same keys, absolute paths.
+        self.assertTrue(all(Path(config[name]).is_absolute() for name in ('ssh_key', 'scratch_repo')))
+
+    def test_the_printed_line_is_the_public_key_in_the_allowed_signers_format_and_verifies_a_signature(self):
+        line = self.keygen('--name', 'box-1').stdout.strip()
+        fields = line.split(' ')
+        self.assertEqual((fields[0], fields[1], fields[2]), ('host/box-1', 'namespaces="git"', 'ssh-ed25519'))
+        self.assertEqual(len(fields), 4)
+        # The key list accepts it: sign a message and let ssh-keygen verify it against the printed line.
+        allowed = self.home / 'allowed'
+        allowed.write_text(line + '\n')
+        message = self.home / 'message'
+        message.write_text('hello')
+        key = self.home / '.config/st/evidence-sign-key'
+        subprocess.run(['ssh-keygen', '-Y', 'sign', '-q', '-f', str(key), '-n', 'git', str(message)], check=True, capture_output=True)
+        verified = subprocess.run(['ssh-keygen', '-Y', 'verify', '-f', str(allowed), '-I', 'host/box-1', '-n', 'git',
+                                   '-s', str(message) + '.sig'], input='hello', capture_output=True, text=True)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_running_it_again_prints_the_same_line_and_changes_nothing(self):
+        first = self.keygen('--name', 'box-1')
+        key = (self.home / '.config/st/evidence-sign-key').read_bytes()
+        second = self.keygen('--name', 'box-1')
+        self.assertEqual((second.returncode, second.stdout), (0, first.stdout))
+        self.assertEqual((self.home / '.config/st/evidence-sign-key').read_bytes(), key)
+
+    def test_it_refuses_to_replace_a_configuration_that_differs_and_a_bad_name(self):
+        self.assertEqual(self.keygen('--name', 'box-1').returncode, 0)
+        before = (self.home / '.config/st/evidence-sign.json').read_text()
+        done = self.keygen('--name', 'box-2')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('differs', done.stderr)
+        self.assertEqual((self.home / '.config/st/evidence-sign.json').read_text(), before)
+        for bad in ('Box', 'a/b', '', '-x', 'a b', 'x' * 41):
+            self.assertEqual(self.keygen(f'--name={bad}').returncode, 1, bad)
+
+    def test_the_modes_do_not_depend_on_the_callers_umask(self):
+        done = self.keygen('--name', 'box-1', umask=0o000)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        directory = self.home / '.config/st'
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.home / '.config').stat().st_mode & 0o077, 0)
+        for name in ('evidence-sign-key', 'evidence-sign.json'):
+            self.assertEqual((directory / name).stat().st_mode & 0o777, 0o600, name)
+
+    def test_a_symlink_where_the_directory_key_or_configuration_belongs_is_refused_and_nothing_follows_it(self):
+        elsewhere = self.home / 'elsewhere'
+        elsewhere.mkdir()
+        (self.home / '.config').mkdir()
+        (self.home / '.config/st').symlink_to(elsewhere)
+        done = self.keygen('--name', 'box-1')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('symlink', done.stderr)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        (self.home / '.config/st').unlink()
+        self.assertEqual(self.keygen('--name', 'box-1').returncode, 0)
+        directory = self.home / '.config/st'
+        for name in ('evidence-sign-key', 'evidence-sign.json'):
+            real = directory / name
+            moved = elsewhere / name
+            real.rename(moved)
+            real.symlink_to(moved)
+            before = moved.stat().st_mode
+            done = self.keygen('--name', 'box-1')
+            self.assertEqual(done.returncode, 1, name)
+            self.assertIn('symlink', done.stderr, name)
+            self.assertEqual(moved.stat().st_mode, before)
+            real.unlink()
+            moved.rename(real)
+
+    def test_an_existing_key_is_reused_only_as_what_it_is(self):
+        first = self.keygen('--name', 'box-1')
+        key = self.home / '.config/st/evidence-sign-key'
+        # A stale or planted .pub next to the key changes nothing: the line comes from the private key.
+        key.with_suffix('.pub').write_text('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlantedPlantedPlantedPlantedPlantedPlantedPlan planted\n')
+        self.assertEqual(self.keygen('--name', 'box-1').stdout, first.stdout)
+        # Group- or other-readable, or not a key at all: refused, not repaired.
+        key.chmod(0o644)
+        done = self.keygen('--name', 'box-1')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('mode 644', done.stderr)
+        self.assertEqual(key.stat().st_mode & 0o777, 0o644)  # not chmodded behind the user's back
+        key.chmod(0o600)
+        key.write_text('not a key\n')
+        self.assertEqual(self.keygen('--name', 'box-1').returncode, 1)
+
+    def test_home_must_be_absolute_and_this_accounts_unless_stated(self):
+        for bad in ('', 'relative/dir'):
+            done = subprocess.run([sys.executable, '-I', str(SCRIPT), '--name', 'box-1'], capture_output=True, text=True,
+                                  env=dict(os.environ, HOME=bad))
+            self.assertEqual(done.returncode, 1, bad)
+            self.assertIn('HOME must be set to an absolute path', done.stderr)
+        done = subprocess.run([sys.executable, '-I', str(SCRIPT), '--name', 'box-1'], capture_output=True, text=True,
+                              env={k: v for k, v in os.environ.items() if k != 'HOME'})
+        self.assertEqual(done.returncode, 1)
+        self.assertNotIn('Traceback', done.stderr)
+        done = subprocess.run([sys.executable, '-I', str(SCRIPT), '--name', 'box-1'], capture_output=True, text=True,
+                              env=dict(os.environ, HOME=str(self.home)))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("is not this account's home", done.stderr)
+        self.assertFalse((self.home / '.config').exists())
+        self.assertEqual(self.keygen('--name', 'box-1', '--home', 'relative', home=False).returncode, 1)
+
+    def test_the_name_is_required_so_a_real_host_name_is_never_printed_by_default(self):
+        done = self.keygen()
+        self.assertEqual(done.returncode, 2)
+        self.assertIn('--name', done.stderr)
+        self.assertFalse((self.home / '.config').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

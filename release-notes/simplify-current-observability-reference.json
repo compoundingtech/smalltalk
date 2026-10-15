@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "replay": {
+    "status": "none",
+    "detail": "Documentation and comments only: move the current st telemetry mechanism and accepted constraints out of the st2 reference, retain current metric/attribute mappings, clarify unimplemented integrations and measured-proof limits, and update production source pointers. No SDK, telemetry, budget, protocol or policy change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation and comments only: move the current st telemetry mechanism and accepted constraints out of the st2 reference, retain current metric/attribute mappings, clarify unimplemented integrations and measured-proof limits, and update production source pointers. No SDK, telemetry, budget, protocol or policy change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation and comments only: move the current st telemetry mechanism and accepted constraints out of the st2 reference, retain current metric/attribute mappings, clarify unimplemented integrations and measured-proof limits, and update production source pointers. No SDK, telemetry, budget, protocol or policy change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation and comments only: move the current st telemetry mechanism and accepted constraints out of the st2 reference, retain current metric/attribute mappings, clarify unimplemented integrations and measured-proof limits, and update production source pointers. No SDK, telemetry, budget, protocol or policy change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation and comments only: move the current st telemetry mechanism and accepted constraints out of the st2 reference, retain current metric/attribute mappings, clarify unimplemented integrations and measured-proof limits, and update production source pointers. No SDK, telemetry, budget, protocol or policy change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation and comments only: move the current st telemetry mechanism and accepted constraints out of the st2 reference, retain current metric/attribute mappings, clarify unimplemented integrations and measured-proof limits, and update production source pointers. No SDK, telemetry, budget, protocol or policy change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation and comments only: move the current st telemetry mechanism and accepted constraints out of the st2 reference, retain current metric/attribute mappings, clarify unimplemented integrations and measured-proof limits, and update production source pointers. No SDK, telemetry, budget, protocol or policy change."
+  },
+  "summary": "Give current st observability its own maintained reference"
+}

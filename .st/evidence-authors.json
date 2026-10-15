@@ -1,0 +1,36 @@
+{
+  "about": "Who may have a pull-request run signed with the CI key. Read from the BASE commit of the pull request, so a pull request cannot widen it. 'logins' are GitHub accounts: the account that opened the pull request, the account that first triggered the run and the account that re-ran it must all be listed (GitHub authenticates these). 'emails' are exact commit author and committer addresses (git author fields are free text, so they only catch a stray commit by someone else; Co-authored-by trailers are not read); 'noreply_logins' accept [ID+]LOGIN@users.noreply.github.com for those logins; 'committers_also' are extra committer-only addresses (GitHub's own web-edit committer). No globs. Forks are refused before this list is read.",
+  "logins": [
+    "myobie",
+    "schickling",
+    "schickling-assistant"
+  ],
+  "emails": [
+    "me@nathanherald.com",
+    "myobie@icloud.com",
+    "schickling.j@gmail.com",
+    "agent@smalltalk.invalid",
+    "speed@smalltalk.invalid",
+    "channel-recover-builder@agents.invalid",
+    "db-size-builder@agents.invalid",
+    "fleet-agent@example.invalid",
+    "release-builder@example.invalid",
+    "noreply@anthropic.com",
+    "codex@openai.com",
+    "ci-builder@users.noreply.github.com",
+    "phone-slo-builder@users.noreply.github.com",
+    "smalltalk-agent@users.noreply.github.com",
+    "smalltalk-builder@users.noreply.github.com",
+    "smalltalk-core@users.noreply.github.com",
+    "smalltalk-docs-st@users.noreply.github.com",
+    "smalltalk-platform@users.noreply.github.com"
+  ],
+  "noreply_logins": [
+    "myobie",
+    "schickling",
+    "schickling-assistant"
+  ],
+  "committers_also": [
+    "noreply@github.com"
+  ]
+}

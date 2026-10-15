@@ -342,6 +342,15 @@ impl Runtime for SmalltalkRuntime {
         classify_replicated_claim_with_registry(claim, self.claim_registry())
     }
 
+    fn classify_replicated_claim_unbound(
+        &self,
+        _batch: &ReplicaBatch,
+        claim: &ClaimRecord,
+    ) -> Option<Result<ReplicatedClaimAdmission, St3Error>> {
+        // The registry is this build's schema, fixed for the process.
+        Some(classify_replicated_claim_with_registry(claim, self.claim_registry()))
+    }
+
     fn append_claim(
         &self,
         store: &GraphStore,
@@ -420,6 +429,8 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner);
         cache.views.clear();
         cache.statuses.clear();
+        cache.summary_statuses.clear();
+        cache.runtime_statuses.clear();
         cache.card_statuses.clear();
         drop(cache);
         let mut owners = self.conversation_owners.lock().unwrap_or_else(PoisonError::into_inner);

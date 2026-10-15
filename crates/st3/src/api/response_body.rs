@@ -654,7 +654,7 @@ mod tests {
             smallclaims::read_budget::ReadBudget::new("/codec-control", Duration::from_millis(50));
         let runtime = tokio::runtime::Handle::current();
         let work = smallclaims::read_budget::with(Some(budget.clone()), || {
-            read_deadline::spawn_handler(None, move || {
+            read_deadline::spawn_handler(None, None, move || {
                 runtime.block_on(cx.wrap(response(StatusCode::OK, body)))
             })
         });
