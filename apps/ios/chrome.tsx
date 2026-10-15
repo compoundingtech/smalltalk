@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, RefreshControl, View, type FlatList, type ScrollView, type SectionList } from 'react-native';
 import { useFocusEffect, useIsFocused } from '@react-navigation/native';
+import { syncLine, syncView } from '@smalltalk/st3-views';
 import { offlinePresentation } from './projectionCache';
 import { useStore, type OnDemand } from './store';
 import { theme } from './theme';
@@ -39,9 +40,11 @@ export function StatusLine() {
 
 /** Errors, load failures, and the offline state, each once, at the top of the content. */
 export function Banners() {
-  const { error, setError, pairingIssue, setPairingIssue, loadErrors, status, hasSynced, connectionIssue, busy, actions } = useStore();
+  const { error, setError, pairingIssue, setPairingIssue, loadErrors, status, hasSynced, connectionIssue, busy, actions, sync } = useStore();
   const appearance = useTextAppearance();
   const failed = Object.entries(loadErrors);
+  // This phone shows what its host holds; while the host lacks records a peer has, that can be out of date.
+  const behind = status === 'online' ? syncLine(syncView(sync)) : undefined;
   return <View>
     {error ? <Banner text={error} onPress={() => setError('')} /> : null}
     {pairingIssue ? <Banner text={pairingIssue} onPress={() => setPairingIssue('')} /> : null}
@@ -49,6 +52,7 @@ export function Banners() {
       <Banner tone="warning" text={`${offlinePresentation(hasSynced).title}${connectionIssue ? ` · reconnecting on its own: ${connectionIssue}` : ''}`} />
       <Button label="reconnect now" onPress={() => actions.reconnect()} />
     </View> : null}
+    {behind ? <Banner tone="warning" text={behind} /> : null}
     {failed.length && status === 'online' ? <Banner tone="warning" text={`not loaded: ${failed.map(([key, message]) => `${key} (${message})`).join(' · ')}`} /> : null}
     {busy ? <ActivityIndicator color={theme.accent} style={{ paddingVertical: 4 }} /> : null}
   </View>;

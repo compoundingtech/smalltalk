@@ -16,6 +16,7 @@ import { rememberBounded } from './boundedCache';
 import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from './terminalControls';
 import { sendFences } from './sendFence';
 import { Feed } from './feed';
+import { watchSync, type SyncRead } from './syncWatch';
 import { quality, localDrafts } from './qualityNative';
 import { nativeCollectionSocket } from './modules/st-collections';
 import { FabricCarrier, routeLabel, selectRoute, type CarrierChoice, type FabricSnapshot, type Route } from './carrier';
@@ -133,6 +134,9 @@ function useAppStore(proof?: FabricProfile) {
   capsRef.current = caps;
   const [status, setStatus] = useState<Status>('setup');
   const [hasSynced, setHasSynced] = useState(false);
+  // The page `sync` notice (this host lacks records a peer holds): the socket's frames carry none, so a
+  // small page read supplies it while online. Unread is `undefined`, and level with its peers is `null`.
+  const [sync, setSync] = useState<SyncRead>(undefined);
   // Whether the missions window (followed only while a missions screen shows) has delivered its rows.
   const [missionsLoaded, setMissionsLoaded] = useState(false);
   const [error, setError] = useState(''), [pairingIssue, setPairingIssue] = useState(''), [busy, setBusy] = useState(false);
@@ -390,6 +394,12 @@ function useAppStore(proof?: FabricProfile) {
       setCaps(capability.value);
     } catch (e) { if (current()) setError(errorText(e)); }
   }, [client]);
+
+  useEffect(() => {
+    setSync(undefined);
+    if (!client || status !== 'online' || proofRef.current) return;
+    return watchSync(async () => (await client.attentionList({ limit: 1 })).value.sync ?? null, setSync);
+  }, [client, status]);
 
   // One collections socket per paired gateway and credential keeps attention, missions, and agents
   // current. It closes in the background and opens fresh, snapshots first, in the foreground.
@@ -1046,7 +1056,7 @@ function useAppStore(proof?: FabricProfile) {
   const canControlTerminal = caps?.capabilities.some(capability => capability.id === 'terminal.input' && capability.state === 'granted') ?? false;
 
   return {
-    actor: caps?.session_actor ?? cachedActor.current, cachedAt: cacheSavedAt.current, order, url, urlDraft, setUrlDraft, credential, data, truncated, loadErrors, feed, connectionIssue, caps, snapshot, status, hasSynced, missionsLoaded,
+    actor: caps?.session_actor ?? cachedActor.current, cachedAt: cacheSavedAt.current, order, url, urlDraft, setUrlDraft, credential, data, truncated, loadErrors, feed, connectionIssue, caps, snapshot, status, hasSynced, sync, missionsLoaded,
     error, setError, pairingIssue, setPairingIssue, pairDraft, busy, historicalSessions, conversationCache, draftCache, draftsReady, client,
     gatewayMachineId, gatewayHost, canControlTerminal, loadLists, watchLists, inventoryGranted, actions,
     saveDrafts: () => { if (!proof) void localDrafts.save(draftsOwner.current, draftCache.current); },
