@@ -6,6 +6,7 @@ import { expect, fireEvent, userEvent, waitFor, within } from 'storybook/test'
 import { Button, TokenFieldValue } from 'react-aria-components'
 import { ComposerSession, type ComposerLayout, type ComposerSessionProps, type MentionMode, type RunningBehavior, type TargetMode } from './assistant-ui/composer-session/ComposerSession'
 import { createComposerFixture, composerStates, fixtureEffortControls, type ComposerState, type ComposerTarget } from './assistant-ui/composer-session/composer-fixtures'
+import { tooltipFor } from './story-play'
 import { EmbraceComposer, EmbraceComposerToolbar } from './assistant-ui/EmbraceComposer'
 import { Composer } from './assistant-ui/composition/Composer'
 import { EmbraceRuntimeProvider, type ConversationRuntimeOptions } from './assistant-ui/EmbraceRuntime'
@@ -266,7 +267,7 @@ export const AllStates: Story = {
 }
 export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }
 
-/** Readout and picker tooltips: keyboard and pointer reach the full value once, without native titles. */
+/** Readout and picker tooltips: keyboard focus reaches the full value once, without native titles. */
 export const TargetTooltips: Story = {
   beforeEach: clearDrafts,
   args: { state: 'running' },
@@ -278,8 +279,7 @@ export const TargetTooltips: Story = {
     await expect(expected).toBe('Review agent for the composer migration · claude-opus-4')
     await userEvent.click(canvasElement.querySelector<HTMLElement>('[data-composer-frame="tooltip.K1"] [role="textbox"]')!)
     await tabTo(readout)
-    const tip = await page.findByRole('tooltip')
-    await expect(tip).toHaveTextContent(expected)
+    const tip = await tooltipFor(readout, expected)
     const viewport = canvasElement.ownerDocument.documentElement
     const bounds = tip.getBoundingClientRect()
     await expect(bounds.left >= 0 && bounds.top >= 0 && bounds.right <= viewport.clientWidth && bounds.bottom <= viewport.clientHeight).toBe(true)
@@ -289,16 +289,15 @@ export const TargetTooltips: Story = {
     await expect(readout.closest('[data-testid="composer-footer"]')!.querySelectorAll('[title]')).toHaveLength(0)
     await userEvent.keyboard('{Escape}')
     await waitFor(() => expect(page.queryByRole('tooltip')).toBeNull())
-    // RAC ignores restored hover in keyboard modality; start pointer checks
-    // with the same real textbox click used by the reviewed native gate.
+    // Keyboard focus opens each picker tooltip at once; a hover would wait out the open delay.
     await userEvent.click(canvasElement.querySelector<HTMLElement>('[data-composer-frame="tooltip.K3"] [role="textbox"]')!)
     for (const [name, value] of [['Select recipient', recipients[0].label], ['Select model', recipients[0].model]] as const) {
       const control = within(canvasElement.querySelector<HTMLElement>('[data-composer-frame="tooltip.K3"]')!).getByRole('button', { name: `${name}: ${value}` })
       const label = control.querySelector('[data-composer-picker-label]')?.textContent
-      await userEvent.hover(control)
-      await waitFor(() => expect(page.getByRole('tooltip')).toHaveTextContent(label ?? ''))
+      await tabTo(control)
+      await tooltipFor(control, label ?? '')
       await expect(control.querySelectorAll('[title]')).toHaveLength(0)
-      await userEvent.unhover(control)
+      await userEvent.keyboard('{Escape}')
       await waitFor(() => expect(page.queryByRole('tooltip')).toBeNull())
     }
   },
@@ -462,7 +461,7 @@ export const EffortUnsupported: Story = {
     await expect(canvas.getByRole('button', { name: 'Effort unsupported' })).toBeDisabled()
     await userEvent.click(textbox(canvasElement))
     await tabTo(canvas.getByRole('group', { name: 'Effort unsupported reason' }))
-    await expect(await within(canvasElement.ownerDocument.body).findByRole('tooltip')).toHaveTextContent('This harness does not support per-message effort.')
+    await tooltipFor(canvas.getByRole('group', { name: 'Effort unsupported reason' }), 'This harness does not support per-message effort.')
   },
 }
 export const EffortUnknown: Story = {
