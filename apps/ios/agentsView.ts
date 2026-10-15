@@ -8,7 +8,7 @@ import { harnessColor, theme } from './theme';
 // st found running but did not start listed last.
 
 // Declaration order is the sort order, as in stui's AgentState.
-export const AGENT_STATES = ['needs-you', 'needs-login', 'fault', 'working', 'compacting', 'idle', 'starting', 'down', 'stopped', 'retired', 'unknown'] as const;
+export const AGENT_STATES = ['needs-you', 'needs-login', 'fault', 'working', 'compacting', 'idle', 'starting', 'restarting', 'down', 'stopped', 'retired', 'unknown'] as const;
 export type AgentState = typeof AGENT_STATES[number];
 
 export type AgentRowView = {
@@ -81,6 +81,8 @@ export function agentState(agent: StateAgent): AgentState {
     case 'waiting': return agent.harness_error_state === 'needs-login' ? 'needs-login' : agent.harness_state === 'indeterminate' && agent.observation === 'stale' && (agent.reachability === 'reachable' || agent.reachability === 'local') ? 'idle' : agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
     case 'starting':
     case 'desired': return 'starting';
+    // st shows a declaration change replacing the incarnation for two minutes: on its way back.
+    case 'restarting': return 'restarting';
     case 'stopped': return 'stopped';
     default: return 'unknown';
   }
@@ -96,6 +98,7 @@ export function agentGlyph(state: AgentState, spinner = SPINNER): { glyph: strin
     case 'compacting': return { glyph: '◐', color: theme.working };
     case 'idle': return { glyph: '●', color: theme.idle };
     case 'starting': return { glyph: '◌', color: theme.waiting };
+    case 'restarting': return { glyph: '◌', color: theme.waiting };
     case 'down': return { glyph: '⊘', color: theme.fault };
     case 'stopped':
     case 'retired': return { glyph: '○', color: theme.quiet };
@@ -112,6 +115,7 @@ export function agentWord(state: AgentState): string {
     case 'compacting': return 'compacting';
     case 'idle': return 'idle';
     case 'starting': return 'starting';
+    case 'restarting': return 'restarting';
     case 'down': return 'down';
     case 'stopped': return 'stopped';
     case 'retired': return 'retired';
@@ -130,7 +134,8 @@ export function agentGroup(row: Pick<AgentRowView, 'state' | 'unmanaged'>): stri
     case 'working':
     case 'compacting': return 'working';
     case 'idle':
-    case 'starting': return 'idle';
+    case 'starting':
+    case 'restarting': return 'idle';
     case 'stopped':
     case 'unknown': return 'stopped';
     case 'retired': return 'retired';

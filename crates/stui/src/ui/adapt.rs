@@ -672,6 +672,9 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                 ("failed", _) => AgentState::Fault,
                 // st decides a seat with no session is down, since when; no app re-derives it.
                 ("down", _) => AgentState::Down,
+                // A declaration change is replacing the incarnation: st says so for two minutes,
+                // then reports the underlying state. Older builds fall to "not managed" here.
+                ("restarting", _) => AgentState::Restarting,
                 // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
                 // its host fixes it, not a restart (Nathan, 2026-10-04).
                 // st's additive detail names the known error outright; the legacy `unauthenticated`
@@ -2042,6 +2045,25 @@ mod tests {
         assert_eq!(agents(&model, &[])[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
         assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn a_seat_being_replaced_reads_restarting_and_a_state_it_does_not_know_stays_unmanaged() {
+        let mut model = Model::default();
+        let card = |name: &str, state: &str| serde_json::json!({
+            "id": format!("agent/example/{name}"), "kind": "agent", "revision": "r1",
+            "updated_at": "2026-10-12T12:29:00Z", "name": format!("example/{name}"),
+            "state": state, "reachability": "reachable", "harness_state": "ready",
+            "observation": "current", "runtime_ids": [], "under": [], "current_work": [],
+        });
+        model.agents = window(vec![card("replaced", "restarting"), card("future", "never-heard-of")]);
+        let seats = agents(&model, &[]);
+        let state = |name: &str| seats.iter().find(|seat| seat.id == format!("agent/example/{name}")).unwrap().state;
+        // Not "not managed" (what an unknown word reads) and not new ("starting").
+        assert_eq!(state("replaced"), AgentState::Restarting);
+        assert_eq!(super::super::screens::agent_word(AgentState::Restarting), "restarting");
+        // An unknown state string is still a card, never a decode failure.
+        assert_eq!(state("future"), AgentState::Unknown);
     }
 
     #[test]

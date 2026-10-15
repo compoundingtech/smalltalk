@@ -50,6 +50,29 @@ test.each([
   },
 )
 
+// The app decodes tolerantly: a state this build does not list (`restarting` until the generated
+// client names it) is a card with its raw word, not a decode failure.
+test('a seat being replaced reads restarting, and its status says so', () => {
+  const row = decodeUnknownSync(Agent)({
+    kind: 'agent',
+    id: 'agent/replaced',
+    name: 'Replaced',
+    host_id: 'host/example',
+    runtime_ids: [],
+    reachability: 'reachable',
+    state: 'restarting',
+    harness_state: 'indeterminate',
+    blocked_on: null,
+    fault: null,
+    revision: '1',
+    updated_at: '2026-10-04T12:00:00.000Z',
+  })
+  const agent = fleetFromAgents([row]).agents[0]
+  expect(agent?.state).toBe('restarting')
+  expect(agent?.status).toBe('restarting')
+  expect(agent?.activity).not.toBe('errored')
+})
+
 const row = decodeUnknownSync(
   Agent,
   'strict',

@@ -36,6 +36,11 @@
       "name": "starting"
     },
     {
+      "glyph": "◌",
+      "id": "restarting",
+      "name": "restarting"
+    },
+    {
       "glyph": "⊘",
       "id": "down",
       "name": "down"

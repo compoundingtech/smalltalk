@@ -102,6 +102,7 @@ pub fn words() -> Value {
         AgentState::Compacting,
         AgentState::Idle,
         AgentState::Starting,
+        AgentState::Restarting,
         AgentState::Down,
         AgentState::Stopped,
         AgentState::Retired,

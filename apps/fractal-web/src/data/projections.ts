@@ -36,6 +36,10 @@ const isConnected = (agent: St3.Agent) =>
   agent.reachability === 'remote' ||
   agent.reachability === 'reachable'
 
+// A state this build's client does not list arrives as `{ raw }`; its word still reads.
+const stateWord = (agent: St3.Agent): string =>
+  typeof agent.state === 'string' ? agent.state : agent.state.raw
+
 const activityOf = (agent: St3.Agent): Agent['activity'] => {
   if (agent.state === 'failed' || agent.state === 'down' || Option.isSome(agent.fault)) return 'errored'
   if (agent.state === 'waiting' || Option.getOrUndefined(agent.blocked_on) === 'human')
@@ -43,7 +47,7 @@ const activityOf = (agent: St3.Agent): Agent['activity'] => {
   const harnessState = Option.getOrUndefined(agent.harness_state)
   if (harnessState === 'working' || harnessState === 'waiting' || harnessState === 'idle')
     return harnessState
-  if (agent.state === 'running' || agent.state === 'starting') return 'working'
+  if (agent.state === 'running' || agent.state === 'starting' || stateWord(agent) === 'restarting') return 'working'
   return 'idle'
 }
 
@@ -55,13 +59,14 @@ const statusOf = (agent: St3.Agent): string => {
     (agent.state === 'down'
       ? `down · no session since ${Option.getOrUndefined(agent.down_since) ?? 'unknown'}`
       : undefined) ??
+    (stateWord(agent) === 'restarting' ? 'restarting' : undefined) ??
     (Option.getOrUndefined(agent.blocked_on) === 'human'
       ? `waiting for you${Option.match(agent.ask, { onNone: () => '', onSome: (ask) => ` (${ask})` })}`
       : undefined) ??
     title ??
     Option.getOrUndefined(agent.reason) ??
     Option.getOrUndefined(agent.harness_state) ??
-    (typeof agent.state === 'string' ? agent.state : agent.state.raw)
+    stateWord(agent)
   )
 }
 
@@ -101,7 +106,7 @@ const agentFromRow = (row: St3.Agent): Agent => {
     ...(harness === undefined ? {} : { harness }),
     activity: activityOf(row),
     status: statusOf(row),
-    state: typeof row.state === 'string' ? row.state : row.state.raw,
+    state: stateWord(row),
     ...(description === undefined ? {} : { description }),
     usage: fromOption(row.usage),
     checkout: fromOption(row.checkout),

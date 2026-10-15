@@ -100,6 +100,13 @@ assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observa
 assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: null, reachability: 'reachable', fault: null, delivery: null }), 'starting');
 assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'unreachable', fault: null, delivery: null }), 'starting');
 
+// A seat being replaced by a declaration change reads restarting, not starting and not unmanaged;
+// a state this build has never heard of is still a row.
+assert.equal(stateOf({ state: 'restarting', harness_state: 'ready', observation: 'current', reachability: 'reachable', fault: null, delivery: null }), 'restarting');
+assert.equal(agentWord('restarting'), 'restarting');
+assert.equal(agentGroup({ state: 'restarting', unmanaged: false }), 'idle');
+assert.equal(stateOf({ state: 'never-heard-of', harness_state: 'ready', fault: null, delivery: null }), 'unknown');
+
 // A seat with no session is down, whatever its stale harness says; st decides, the app only shows it.
 assert.equal(stateOf({ state: 'down', harness_state: 'indeterminate', observation: 'stale', reachability: 'reachable', fault: null, delivery: null }), 'down');
 assert.equal(agentWord('down'), 'down');

@@ -38,7 +38,7 @@ export const agentStatus = ({
           ? 'suspended'
           : agent.state === 'stopped' || agent.state === 'ended'
             ? 'ended'
-            : agent.state === 'desired' || agent.state === 'starting'
+            : agent.state === 'desired' || agent.state === 'starting' || agent.state === 'restarting'
               ? 'pending'
               : !agent.connected
                 ? 'offline'

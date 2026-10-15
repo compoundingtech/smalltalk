@@ -354,6 +354,9 @@ pub enum AgentState {
     Compacting,
     Idle,
     Starting,
+    /// A declaration change is replacing the running incarnation (st's `restarting` state, shown
+    /// for at most two minutes): the seat is on its way back, not new and not broken.
+    Restarting,
     /// Declared, with no running session after its launch window (st's `down` state): the
     /// details say since when. Never shown as starting or working.
     Down,

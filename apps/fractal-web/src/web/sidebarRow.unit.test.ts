@@ -32,7 +32,7 @@ describe('controlled native sidebar observations', () => {
     }
   })
   it('retains distinct native lifecycle states and freshness', () => {
-    for(const [state,status] of [['retired','retired'],['suspended','suspended'],['stopped','ended'],['starting','pending']] as const)
+    for(const [state,status] of [['retired','retired'],['suspended','suspended'],['stopped','ended'],['starting','pending'],['restarting','pending']] as const)
       expect(row({state}).status).toBe(status)
     expect(row({connected:false}).status).toBe('offline')
     expect(row({activity:'working'},true)).toMatchObject({status:'stale',freshness:'stale'})

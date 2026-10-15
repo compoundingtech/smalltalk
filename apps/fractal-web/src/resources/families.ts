@@ -81,7 +81,11 @@ export const WorkLabel = Schema.Struct({
 /** `st3.agent@1` — client-v0 `Agent` body (queue, delivery and usage trimmed). */
 export const AgentData = Schema.Struct({
   name: Schema.String,
-  state: Schema.Literals(['desired', 'starting', 'running', 'waiting', 'stopped', 'failed']),
+  // A state this build does not know (`restarting`, `down`) is a card, not a decode failure.
+  state: Schema.Union([
+    Schema.Literals(['desired', 'starting', 'restarting', 'running', 'waiting', 'down', 'stopped', 'failed', 'suspended']),
+    Schema.String,
+  ]),
   reachability: Schema.Literals(['local', 'remote', 'unreachable', 'unknown']),
   driver: Schema.String.pipe(nullable, optional),
   harness_state: Schema.String.pipe(nullable, optional),

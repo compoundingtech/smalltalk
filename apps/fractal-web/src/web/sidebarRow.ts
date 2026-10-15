@@ -8,13 +8,13 @@ export const sidebarRow = ({ agent, stale, now }: {
   const status: SidebarAgentStatus = stale ? 'stale' : agent.state === 'retired' ? 'retired'
     : agent.state === 'suspended' ? 'suspended'
     : agent.state === 'stopped' || agent.state === 'ended' ? 'ended'
-    : agent.state === 'desired' || agent.state === 'starting' ? 'pending'
+    : agent.state === 'desired' || agent.state === 'starting' || agent.state === 'restarting' ? 'pending'
     : !agent.connected ? 'offline' : agent.activity === 'errored' ? 'stale' : agent.activity
   const validTimestamp = (value: number | undefined) => value !== undefined && Number.isFinite(value) &&
     Number.isFinite(now) && value <= now && value >= 0 && value <= 8640000000000000 ? value : undefined
   const lastActivityAt = validTimestamp(agent.lastActivityAt._tag === 'Known' ? agent.lastActivityAt.value : undefined)
   const statusSince = validTimestamp(agent.statusSince)
-  const knownStatuses = ['idle', 'working', 'waiting', 'errored', 'retired', 'suspended', 'stopped', 'ended', 'desired', 'starting', 'offline']
+  const knownStatuses = ['idle', 'working', 'waiting', 'errored', 'retired', 'suspended', 'stopped', 'ended', 'desired', 'starting', 'restarting', 'offline']
   const statusLabel = knownStatuses.includes(agent.status) ? agent.status : 'Not observed'
   return {
     ref: agent.ref, id: agent.ref, title: agent.name, host: agent.host, status,

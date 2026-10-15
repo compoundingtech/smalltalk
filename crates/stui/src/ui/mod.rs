@@ -2720,10 +2720,11 @@ impl Ui {
                 let mut doc = Doc::new();
                 // A seat still starting has said nothing yet: one calm line, not an empty box.
                 doc.line(Line::from(Span::styled(
-                    if agent.state == AgentState::Starting {
+                    if matches!(agent.state, AgentState::Starting | AgentState::Restarting) {
                         format!(
-                            " {} Starting · the conversation appears as soon as the seat says something.",
-                            self.spinner()
+                            " {} {} · the conversation appears as soon as the seat says something.",
+                            self.spinner(),
+                            if agent.state == AgentState::Restarting { "Restarting" } else { "Starting" }
                         )
                     } else {
                         " No messages yet.".to_owned()
