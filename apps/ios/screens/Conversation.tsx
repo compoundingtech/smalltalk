@@ -9,7 +9,7 @@ import type { St3Client, TimelineEntry } from '../../../clients/typescript/st3-c
 import type { ConversationContentRef } from '../../../clients/typescript/st3-client';
 import { contentImageUri, contentJsonValue, fetchedConversationEntries, loadConversationContent } from '@smalltalk/st3-views';
 import { checkoutLabel } from '../launcher';
-import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
+import { agentGlyph, agentModel, agentName, agentReported, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
 import { Banners } from '../chrome';
 import { quality } from '../qualityNative';
 import rules from '../../../fixtures/clients/conversation-style.json';
@@ -483,7 +483,7 @@ function AgentStrip({ agent, onMission }: { agent: NonNullable<ReturnType<typeof
   const work = agent.current_work?.[0];
   return <View style={styles.strip}>
     <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-      <T bold color={color}>{glyph} </T><T bold>{agentName(agent)}</T><T color={color}>  {agentWord(state)}</T>
+      <T bold color={color}>{glyph} </T><T bold>{agentName(agent)}</T><T color={color}>  {agentReported(agent) ?? agentWord(state)}</T>
       <View style={{ flex: 1 }} />
       <T color={harnessColor(harness)}>{harness}</T><T dim>{agentModel(agent) ? ` · ${agentModel(agent)}` : ''} · {agent.host_id?.replace(/^host\//, '') ?? '?'}</T>
     </View>

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The phone reads each agent's state from st's presentation instead of deriving it",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "The phone reads Agent.presentation.state. Against a daemon that does not serve it, agents read as unknown rather than derived; upgrade daemons before the app. The daemon is unchanged."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or swap-back restrictions."}
+}
