@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite'
 import { execFileSync } from 'node:child_process'
 import react from '@vitejs/plugin-react'
-import { createStylexVitePlugins } from './scripts/stylex.mjs'
+import { createStylexVitePlugins, deferBuiltStylesheets } from './scripts/stylex.mjs'
 import { webfractalGateway } from './scripts/vite-gateway.mjs'
 import { extensionBuild } from './scripts/extensions-build.mjs'
 import { fractalContentSecurityPolicy } from './scripts/vite-csp.mjs'
@@ -42,6 +42,7 @@ export default defineConfig({
       externalPackages: ['@smalltalk/fractal-ui'],
       entries: [new URL('./src/web/main.tsx', import.meta.url).pathname],
     }),
+    deferBuiltStylesheets(),
     react(),
     webfractalGateway(),
     fractalCssAssets(),
