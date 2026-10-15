@@ -129,3 +129,4 @@ pub use model::{NormalizedIntent, St3Error};
 
 /// Shared authentication and transport for daemon GitHub callers.
 mod github_http;
+mod github_admission;

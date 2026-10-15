@@ -81,12 +81,18 @@ pub struct GithubConfig {
     /// A single-token file readable only by its owner.
     pub token_file: Option<PathBuf>,
     pub sekrets_profile: Option<String>,
+    /// Local observer request ceiling per resource/hour. Unset meters only until
+    /// current usage and freshness are qualified; Factory's proposed cap is1000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observer_requests_per_hour: Option<u32>,
 }
 
 impl GithubConfig {
     pub fn is_default(&self) -> bool { self == &Self::default() }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.observer_requests_per_hour.is_none_or(|cap| (1..=1000).contains(&cap)),
+            "github.observer_requests_per_hour must be1..1000 or omitted for meter-only");
         anyhow::ensure!(self.token_file.is_none() || self.sekrets_profile.is_none(),
             "github.token_file and github.sekrets_profile are mutually exclusive");
         if let Some(profile) = &self.sekrets_profile {
@@ -999,6 +1005,19 @@ mod tests {
     }
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn github_observer_admission_is_meter_only_until_explicitly_configured() {
+        let mut config=GithubConfig::default();
+        assert_eq!(config.observer_requests_per_hour,None);
+        assert!(config.validate().is_ok());
+        config.observer_requests_per_hour=Some(1000);
+        assert!(config.validate().is_ok());
+        config.observer_requests_per_hour=Some(0);
+        assert!(config.validate().is_err());
+        config.observer_requests_per_hour=Some(1001);
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn github_profile_is_opt_in_and_rejects_empty_configuration() {

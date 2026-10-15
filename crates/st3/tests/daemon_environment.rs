@@ -356,7 +356,7 @@ fn a_profile_configured_gate_uses_the_gateway_and_node_identity_without_local_cr
     let config = st3::config::Config {
         node: "fixture-node".into(), person: Some("person/fixture".into()),
         state_dir: root.path().join("node-state"),
-        github: st3::config::GithubConfig { sekrets_profile: Some("owner/daemon-gh".into()), token_file: None },
+        github: st3::config::GithubConfig { sekrets_profile: Some("owner/daemon-gh".into()), token_file: None, observer_requests_per_hour: None },
         ..Default::default()
     };
     let key = smallclaims::fleet::MemberKey::load_or_create(

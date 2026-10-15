@@ -40,7 +40,7 @@ const SETTLED_PULL_REQUEST_CHECK: Duration = Duration::from_secs(15 * 60);
 
 /// The least time between two GraphQL reads of one repository on this host, however often its
 /// observers poll and whatever they saw change. Only a refresh asks sooner.
-const PULL_REQUEST_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const PULL_REQUEST_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// The most comments and reviews each item keeps in `recent_comments`, newest last.
 pub(crate) const RECENT_COMMENTS: usize = 20;

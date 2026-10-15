@@ -499,6 +499,12 @@ pub(crate) async fn spend_as<F: Future>(observer: String, future: F) -> F::Outpu
     GITHUB_SPENDER.scope(observer, future).await
 }
 
+/// The reconciler supplies this task-local caller; shell variables and request
+/// headers cannot select an admission identity.
+pub(crate) fn github_spender() -> Option<String> {
+    GITHUB_SPENDER.try_with(Clone::clone).ok()
+}
+
 /// Requests sent outside any observation.
 const GITHUB_UNATTRIBUTED: &str = "unattributed";
 const HOUR_MS: u128 = 3_600_000;

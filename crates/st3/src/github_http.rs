@@ -293,6 +293,7 @@ pub(crate) fn configure(config: &crate::config::Config) -> Result<()> {
         );
         return Ok(());
     }
+    crate::github_admission::configure(config.state_dir.join("github-admission.json"), config.github.observer_requests_per_hour.map(|cap| cap as usize));
     SOURCE
         .set(Arc::new(config.clone()))
         .map_err(|_| anyhow::anyhow!("GitHub source was already configured"))
@@ -389,12 +390,30 @@ pub(crate) async fn lookup_github_token(environment: &BTreeMap<String, String>) 
     Ok(token.to_owned())
 }
 
+fn request_resource(path: &str) -> &'static str {
+    match path {
+        "/graphql" | "/api/graphql" => "graphql",
+        path if path.starts_with("/search/") || path.starts_with("/api/v3/search/") => "search",
+        _ => "core",
+    }
+}
+
 /// Send exactly once, including mutations. A 401 invalidates only the credential used here;
 /// another poll can acquire again after backoff. Never retry the original HTTP request.
 pub(crate) async fn send(
     request: reqwest::RequestBuilder,
     auth: &GithubAuth,
 ) -> Result<reqwest::Response> {
+    // Admission precedes both the credential-bearing local send and the
+    // authorized RPC. A failed send remains spent; there is no HTTP retry.
+    if let Some(config) = SOURCE.get() {
+        let resource = request.try_clone().and_then(|copy| copy.build().ok())
+            .map(|copy| request_resource(copy.url().path())).unwrap_or("core");
+        crate::github_admission::before_send(
+            config.state_dir.join("github-admission.json"),
+            crate::resource::github_spender(), resource.into(), config.github.observer_requests_per_hour.map(|cap| cap as usize),
+        ).await?;
+    }
     match auth {
         GithubAuth::Authorized { config, profile } => {
             send_authorized_with(
