@@ -1,6 +1,0 @@
-package st2:resource-provider@0.1.0;
-
-world github-pr-provider {
-  import compoundingtech:st2-github-pr/github-pr@0.1.0;
-  export provider-api;
-}
