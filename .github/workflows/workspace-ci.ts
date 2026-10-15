@@ -52,7 +52,7 @@ const ci1MinIdle = 1
 
 export const pickRunnerJob = {
   name: pickRunnerJobId,
-  if: "github.event_name == 'merge_group' || vars.CI1_RUNNERS == 'on'",
+  if: "github.event_name == 'merge_group' || vars.CI1_RUNNERS == 'on' || (github.event_name == 'pull_request' && vars.CI_PR_NAMESPACE_PROFILE != '')",
   // GitHub-hosted, so the choice never waits for either pool it chooses between.
   'runs-on': 'ubuntu-latest',
   'timeout-minutes': 3,
@@ -61,9 +61,26 @@ export const pickRunnerJob = {
     ci1: '${{ steps.pick.outputs.ci1 }}',
     ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
     ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
+    namespace_pr: '${{ steps.namespace.outputs.namespace_pr }}',
+    namespace_pr_optional: '${{ steps.namespace.outputs.namespace_pr_optional }}',
   },
   steps: [
     {
+      name: 'Select the provisioned PR profile unless this exact head is already queued',
+      id: 'namespace',
+      env: {
+        EVENT: '${{ github.event_name }}',
+        GH_REPO_TOKEN: '${{ github.token }}',
+        PR_NAMESPACE_PROFILE: '${{ vars.CI_PR_NAMESPACE_PROFILE }}',
+        PR_NUMBER: '${{ github.event.pull_request.number }}',
+        PR_HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
+        REPOSITORY: '${{ github.repository }}',
+        RUN_ID: '${{ github.run_id }}',
+      },
+      run: `python3 - <<'CI_PR_PROFILE'\n${readFileSync(new URL('../../scripts/ci-namespace-pr-profile', import.meta.url), 'utf8')}CI_PR_PROFILE\n`,
+    },
+    {
+      if: "github.event_name == 'merge_group' || vars.CI1_RUNNERS == 'on'",
       name: 'Keep reserved primary lanes and use idle general runners for tests and canaries',
       id: 'pick',
       env: {
@@ -88,7 +105,12 @@ export const pickRunnerJob = {
 export const priorityRunnerJob = {
   ...pickRunnerJob,
   if: "github.event_name != 'pull_request'",
-  steps: pickRunnerJob.steps.map(step => ({ ...step, env: { ...step.env, MODE: 'priority' } })),
+  outputs: {
+    ci1: '${{ steps.pick.outputs.ci1 }}',
+    ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
+    ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
+  },
+  steps: pickRunnerJob.steps.filter(step => step.id === 'pick').map(({ if: _if, ...step }) => ({ ...step, env: { ...step.env, MODE: 'priority' } })),
 } as const
 
 // Every required merge job follows one pool decision, including explicit overflow.
@@ -99,11 +121,11 @@ const pickedOr = (namespaceLabels: string, output = 'ci1') =>
 // Deployment and merge progress take precedence during saturation. Required PR
 // checks precede optional/manual work; local reservations remain unchanged.
 const workspaceJobPriority = "github.event_name == 'merge_group' && 1 || github.event_name == 'pull_request' && 2 || 3"
-// Set this repository variable only after a runner administrator has provisioned
-// the profile with the existing image/cache and left it capacity outside the PR pool.
-// An unset variable retains the existing shapes and Workspace priority policy.
+// CI_MERGE_NAMESPACE_PROFILE remains the independent merge overflow profile.
+// CI_PR_NAMESPACE_PROFILE is selected by the hosted step only after a successful
+// exact-head, not-queued lookup. Keep it unset until the PR profile is provisioned.
 const namespaceLabels = (labels: readonly string[]) =>
-  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, ${workspaceJobPriority})`
+  `github.event_name == 'pull_request' && needs.${pickRunnerJobId}.outputs.namespace_pr || github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, ${workspaceJobPriority})`
 /** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
   namespaceLabels(linuxStageRunner),
@@ -134,6 +156,10 @@ export const linuxRunsOn = pickedOr(
 /** Supporting merge jobs use the priority lane; supporting PR jobs use Namespace. */
 export const supportingLinuxRunsOn = `\${{ fromJSON(${mergeCi1Labels} || ${namespaceLabels(linuxRunner)}) }}`
 export const supportingStageRunsOn = `\${{ fromJSON(${mergeCi1Labels} || ${namespaceLabels(linuxStageRunner)}) }}`
+
+// Optional Workspace cost work shares the PR profile cap, at its existing lower priority.
+// Non-PR events retain their original shape and controls; merge-group exclusion is in fleet.
+export const performanceCostRunsOn = `\${{ fromJSON(github.event_name == 'pull_request' && needs.${pickRunnerJobId}.outputs.namespace_pr_optional || format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, github.event_name == 'merge_group' && 1 || 3)) }}`
 
 /** A job that needs `pick-runner` still runs when it was skipped (ci1 off). */
 export const afterPickRunner = { needs: [pickRunnerJobId], if: '${{ !cancelled() }}' } as const

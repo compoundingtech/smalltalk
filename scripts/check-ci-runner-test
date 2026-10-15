@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import textwrap
 import itertools
+import sys
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -16,7 +17,7 @@ workflow = (ROOT / ".github/workflows/fleet.yml").read_text()
 picker = workflow.split("  pick-runner:\n", 1)[1].split("  namespace-capacity:\n", 1)[0]
 assert "vars.CI1_RUNNERS == 'on'" in picker, "general PR picking remains opt-in"
 # Read this generated YAML block scalar without adding a YAML dependency to the CI shell.
-script = textwrap.dedent(picker.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
+script = textwrap.dedent(picker.split("      - if: ", 1)[1].split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
 bash = shutil.which("bash")
 assert bash, "runner selection tests require bash on PATH"
 
@@ -243,8 +244,10 @@ for job in ("linux-tests", "linux-tests-shard-2", "linux-tests-shard-3", "linux-
 assert "vars.CI1_MIN_IDLE || '1'" in picker, "use an idle general slot without requiring the entire pool"
 
 # Evaluate the generated runs-on expressions, not a second copy of the routing rule.
-def route(job, event, profile='', picked='', merge_ci1='', merge_picked='', partial_primary='', partial_mail=''):
+def route(job, event, profile='', picked='', merge_ci1='', merge_picked='', partial_primary='', partial_mail='', pr_profile='', pr_optional=''):
     expression = blocks[job].split('runs-on: ', 1)[1].splitlines()[0].strip().removeprefix('${{').removesuffix('}}').strip()
+    expression = expression.replace('needs.pick-runner.outputs.namespace_pr_optional', repr(pr_optional))
+    expression = expression.replace('needs.pick-runner.outputs.namespace_pr', repr(pr_profile))
     expression = expression.replace('needs.pick-runner.outputs.merge_ci1', repr(merge_picked))
     expression = expression.replace('needs.pick-runner.outputs.merge_primary', repr(partial_primary))
     expression = expression.replace('needs.pick-runner.outputs.merge_mail', repr(partial_mail))
@@ -288,7 +291,7 @@ print('passed: four merge shards preserve exact archive provenance, merge roles 
 
 assert 'runs-on: ubuntu-latest' in (ROOT / '.github/workflows/public-repo.yml').read_text()
 assert required_priority not in blocks['perf-cost'], 'optional cost must not join required PR priority'
-assert "job.priority=${{ github.event_name == 'merge_group' && 1 || 3 }}" in blocks['perf-cost']
+assert "github.event_name == 'merge_group' && 1 || 3" in blocks['perf-cost']
 print('passed: release/merge precede PR checks, then optional/manual; reservations, shapes and affinity preserved')
 
 # Exercise the actual generated step predicates, including restoring ordinary behavior.
@@ -327,3 +330,22 @@ for step in ('Download this run attempt’s successful test build', 'Verify sour
         assert 'CI_OUTAGE_FAST_QUEUE' not in tail.split('\n      - ', 1)[0], (step, 'required artifacts and evidence must remain available')
 print('passed: outage merge-group cache saves skip only while enabled; ordinary events, guards and artifacts unchanged')
 print("passed: bounded test shards, reserved primary lane, idle general slots, Namespace fallback, and required aggregation")
+
+# The native provider limit applies only to unqueued PR Namespace fallbacks.
+pr_labels = '["namespace-profile-smalltalk-pr-linux-x86-64;job.priority=2;github.run-id=123"]'
+pr_optional = pr_labels.replace('job.priority=2;', 'job.priority=3;')
+for job in ('linux-test-build', 'linux-clippy', 'linux-fleet-compat', 'isolation-vm',
+            'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
+    assert route(job, 'pull_request', pr_profile=pr_labels) == json.loads(pr_labels), job
+    for event in ('merge_group', 'push', 'workflow_dispatch', 'schedule'):
+        assert route(job, event, pr_profile=pr_labels) == route(job, event), (job, event)
+for job in ('linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
+    assert route(job, 'pull_request', picked='["ci1"]', pr_profile=pr_labels) == ['ci1'], job
+assert route('perf-cost', 'pull_request', pr_optional=pr_optional) == json.loads(pr_optional)
+for event in ('push', 'workflow_dispatch', 'schedule'):
+    assert route('perf-cost', event, pr_optional=pr_optional) == route('perf-cost', event)
+assert 'needs: [pick-runner]' in blocks['perf-cost']
+assert "!cancelled() && github.event_name != 'merge_group'" in blocks['perf-cost']
+assert "github.event_name == 'merge_group' || vars.CI1_RUNNERS == 'on'" in picker.split('      - if:',1)[1].split('name:',1)[0]
+subprocess.run([sys.executable, str(ROOT / 'scripts/ci-namespace-pr-profile-test')], check=True)
+print('passed: PR-only provisioned profile, unchanged owned/merge/non-PR routing and optional cost priority')
