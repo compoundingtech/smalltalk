@@ -76,7 +76,7 @@ class ModuleLayers(unittest.TestCase):
 
     def test_reexports_count_toward_their_module(self):
         self.write("crates/st3/src/c.rs", "use crate::parse_intent;\npub fn h() {}\n")
-        self.write("crates/st3/src/graph.rs", "pub fn parse_intent() {}\n")
+        self.write("crates/st3-daemon/src/graph.rs", "pub fn parse_intent() {}\n")
         modules, edges = ml.production_graph(str(self.root))
         self.assertEqual(edges["c"], {"graph": 1})
 
