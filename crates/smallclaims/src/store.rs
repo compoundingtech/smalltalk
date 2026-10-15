@@ -5809,10 +5809,7 @@ impl Store {
             let current_projection_generation = projection_digest::generation(&reader)?;
             let envelope_rowid = max_envelope_rowid(&reader)?;
             let inventory_generation = inventory_generation::current(&reader)?;
-            Ok(store
-                .replication_snapshot
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            Ok(crate::read_budget::lock_sync(&store.replication_snapshot)?
                 .as_ref()
                 .filter(|snapshot| {
                     snapshot.store_index == store_index
@@ -5827,10 +5824,7 @@ impl Store {
         if let Some(snapshot) = current(self)? {
             return Ok(snapshot);
         }
-        let _building = self
-            .replication_snapshot_build
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _building = crate::read_budget::lock_sync(&self.replication_snapshot_build)?;
         if let Some(snapshot) = current(self)? {
             return Ok(snapshot);
         }
@@ -5845,11 +5839,7 @@ impl Store {
         &self,
         connection: &Connection,
     ) -> Result<Arc<ReplicationSnapshot>> {
-        let previous = self
-            .replication_snapshot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let previous = crate::read_budget::lock_sync(&self.replication_snapshot)?.take();
         // The six-table digest stays on the legacy peer wire format. Its generation lets us
         // retain compatibility without rescanning those tables for unrelated source changes.
         let graph_generation = graph_generation(connection)?;
@@ -5910,6 +5900,7 @@ impl Store {
                 };
                 let mut touched = BTreeSet::new();
                 for (rowid, identity) in additions {
+                    crate::read_budget::check()?;
                     max_rowid = max_rowid.max(rowid);
                     touched.insert((
                         identity.writer.clone(),
@@ -5919,6 +5910,7 @@ impl Store {
                 }
                 // Only the ranges that gained an envelope need a new digest.
                 for (writer, start) in &touched {
+                    crate::read_budget::check()?;
                     let bucket = inventory.bucket(inventory.range(writer, *start));
                     match buckets.binary_search_by(|existing| {
                         (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), *start))
@@ -5952,7 +5944,9 @@ impl Store {
         } else {
             full(connection)?
         };
+        crate::read_budget::check()?;
         inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
+        crate::read_budget::check()?;
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
@@ -5988,10 +5982,7 @@ impl Store {
                     row.get(0)
                 })?,
         });
-        *self
-            .replication_snapshot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot.clone());
+        *crate::read_budget::lock_sync(&self.replication_snapshot)? = Some(snapshot.clone());
         Ok(snapshot)
     }
 

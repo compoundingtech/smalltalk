@@ -49,11 +49,17 @@ impl Origin {
             OriginLabel::Route(label) => KeyValue::new(key, label.to_string()),
         }
     }
+
+    pub(super) fn label(&self) -> &str {
+        match &self.0 {
+            OriginLabel::Static(label) => label,
+            OriginLabel::Route(label) => label,
+        }
+    }
 }
 
 /// `route` must come from the router's normalized MatchedPath, never the request URI.
 pub fn route_origin(method: &str, route: &str) -> Option<Origin> {
-    if !phase_spans_enabled() { return None; }
     if !matches!(method, "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "TRACE") {
         return Some(Origin::other());
     }
@@ -72,12 +78,11 @@ thread_local! {
 pub struct OriginScope(Option<Origin>);
 
 pub fn enter_origin(origin: Option<Origin>) -> Option<OriginScope> {
-    if !phase_spans_enabled() { return None; }
     Some(OriginScope(ORIGIN.with(|slot| slot.replace(origin))))
 }
 
 pub(crate) fn enter_task_origin(label: &'static str) -> Option<OriginScope> {
-    if !phase_spans_enabled() || ORIGIN.with(|slot| slot.borrow().is_some())
+    if ORIGIN.with(|slot| slot.borrow().is_some())
         || REQUEST.with(|slot| slot.borrow().as_ref().is_some_and(|request| request.origin.is_some())) {
         return None;
     }
@@ -85,7 +90,6 @@ pub(crate) fn enter_task_origin(label: &'static str) -> Option<OriginScope> {
 }
 
 pub(crate) fn current_origin() -> Option<Origin> {
-    if !phase_spans_enabled() { return None; }
     Some(ORIGIN.with(|slot| slot.borrow().clone())
         .or_else(|| REQUEST.with(|slot| slot.borrow().as_ref().and_then(|request| request.origin.clone())))
         .unwrap_or_else(Origin::other))
@@ -285,6 +289,7 @@ pub(super) struct Instruments {
     read_wait: Histogram<f64>,
     pub readers_opened: Counter<u64>,
     checkpoint: Histogram<f64>,
+    deferred: Counter<u64>,
 }
 
 fn duration(meter: &Meter, name: &'static str) -> Histogram<f64> {
@@ -316,6 +321,8 @@ impl Instruments {
                 .with_unit("{connection}")
                 .build(),
             checkpoint: duration(meter, "st.db.wal.checkpoint.duration"),
+            deferred: meter.u64_counter("st.db.wal.checkpoint.deferred")
+                .with_unit("{attempt}").build(),
         }
     }
 }
@@ -396,6 +403,9 @@ struct PoolObservation {
     counts: std::sync::Weak<super::ReaderCounts>,
     idle: std::sync::Weak<std::sync::Mutex<Vec<super::ReadConnection>>>,
     wal: Option<std::path::PathBuf>,
+    id: u64,
+    lag: u64,
+    deferred_since: Option<std::time::Instant>,
 }
 
 static POOLS: std::sync::Mutex<Vec<PoolObservation>> = std::sync::Mutex::new(Vec::new());
@@ -414,10 +424,54 @@ pub(super) fn register_pool(pool: &super::ReadPool) {
         counts: Arc::downgrade(&pool.counts),
         idle: Arc::downgrade(&pool.idle),
         wal,
+        id: pool.diagnostic_id,
+        lag: 0,
+        deferred_since: None,
     });
 }
 
+/// Called once for every physical checkpoint attempt. Errors leave the last known lag and
+/// deferral start intact; they are not evidence that a pinned WAL recovered.
+pub fn wal_checkpoint_observed(pool: &super::ReadPool, report: Option<&super::WalCheckpointReport>) {
+    let Some(report) = report else { return };
+    let deferred = report.frames > 0 && !report.recycled;
+    if deferred {
+        METRICS.deferred.add(1, SQLITE.as_slice());
+    }
+    let mut pools = POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(state) = pools.iter_mut().find(|state| state.id == pool.diagnostic_id) {
+        state.lag = u64::try_from(report.frames.saturating_sub(report.backfilled)).unwrap_or(0);
+        if deferred {
+            state.deferred_since.get_or_insert_with(std::time::Instant::now);
+        } else {
+            state.deferred_since = None;
+        }
+    }
+}
+
 fn register_gauges(meter: &Meter) {
+    meter.f64_observable_gauge("st.db.read.loan.oldest_age").with_unit("s")
+        .with_callback(|observer| {
+            for (origin, age) in super::read_lifetime::oldest_loans() {
+                observer.observe(age.as_secs_f64(), &[
+                    KeyValue::new("db.system.name", "sqlite"), origin.attribute("origin"),
+                ]);
+            }
+        }).build();
+    meter.u64_observable_gauge("st.db.wal.checkpoint.lag").with_unit("{frame}")
+        .with_callback(|observer| {
+            let pools = POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            observer.observe(pools.iter().filter(|pool| pool.counts.strong_count() > 0)
+                .map(|pool| pool.lag).sum(), SQLITE.as_slice());
+        }).build();
+    meter.f64_observable_gauge("st.db.wal.checkpoint.deferred_age").with_unit("s")
+        .with_callback(|observer| {
+            let pools = POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let age = pools.iter().filter(|pool| pool.counts.strong_count() > 0)
+                .filter_map(|pool| pool.deferred_since).map(|since| since.elapsed())
+                .max().unwrap_or_default();
+            observer.observe(age.as_secs_f64(), SQLITE.as_slice());
+        }).build();
     meter
         .u64_observable_gauge("st.db.readers.open")
         .with_unit("{connection}")

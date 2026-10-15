@@ -377,14 +377,38 @@ Duration buckets are
 | `st.db.readers.open` | Observable gauge | `{connection}` | —; current open readers |
 | `st.db.readers.idle` | Observable gauge | `{connection}` | —; current idle readers |
 | `st.db.readers.opened` | Counter | `{connection}` | —; readers opened |
+| `st.db.read.loan.oldest_age` | Observable gauge | `s` | `origin`; oldest live pooled connection loan per bounded route/task origin, not confirmed transaction age |
 | `st.db.wal.size` | Observable gauge | `By` | —; stat the main database's `-wal` file |
 | `st.db.wal.checkpoint.duration` | Histogram | `s` | `db.operation.name=checkpoint.truncate`; truncate checkpoint duration |
+| `st.db.wal.checkpoint.deferred` | Counter | `{attempt}` | —; physical checkpoint attempts with nonempty WAL not recycled |
+| `st.db.wal.checkpoint.lag` | Observable gauge | `{frame}` | —; last known WAL frames minus backfilled frames, summed across live pools |
+| `st.db.wal.checkpoint.deferred_age` | Observable gauge | `s` | —; age since the first consecutive deferred attempt, maximum across live pools |
 
-Every storage metric carries `db.system.name=sqlite`. These are the complete attribute
-sets: at most two combinations per instrument, with no paths, SQL, ids, or other
-unbounded attributes. Duration histograms use the seconds buckets above; batch size uses
+Every storage metric carries `db.system.name=sqlite`. Except for oldest-loan age,
+these are the complete attribute sets: at most two combinations per instrument.
+The loan gauge reuses the writer-origin vocabulary: normalized `METHOD MatchedPath`,
+the closed maintenance-task table, or `other`; never raw URIs, paths, SQL, or ids.
+Origin capture is independent of optional storage-phase tracing. Duration histograms use the seconds buckets above; batch size uses
 explicit boundaries `1`, `2`, `4`, `8`, `16`, `32`, `64`, `128`, `256`.
 Storage metrics are not sampled.
+
+Loan age covers a connection checkout, which may have no active transaction; it does
+not identify a WAL frame owner. An empty registry reports zero with origin `other`.
+Checkpoint lag is the most recent successful PASSIVE report, not a WAL file-size estimate.
+Deferral age continues between attempts and across errors (errors do not prove recovery);
+an empty or recycled WAL resets it. A fully backfilled WAL awaiting recycling has zero
+lag but can still have nonzero deferral age.
+
+Replication export (`POST /v1/internal/replication/export`) retains its bulk read deadline,
+but, like long-poll routes, has no handler-wide or nested blocking callback read loan.
+Sealing and verdict writer waits therefore retain no reader. The snapshot-build gate
+and snapshot-cache mutex waits check deadline/cancellation at most every 5 ms.
+Authoritative inventory, graph and projection inputs remain captured together by
+`sealed_replication_snapshot`'s explicit `read_snapshot`; payload/signature lookups
+use scoped read guards. No snapshot is released and reacquired halfway through a build.
+An expired export returns the existing `read-deadline` error, not a partial exchange;
+the peer retries without acknowledging a partial inventory or advancing its cursor.
+
 
 A scoped thread-local `Option<Arc<WriterWait>>` shares a request accumulator across
 handler, store, action, and API blocking sections. Two relaxed atomics sum writer ACK

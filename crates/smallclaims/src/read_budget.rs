@@ -255,6 +255,29 @@ pub(crate) fn interrupted() -> bool {
     check().is_err()
 }
 
+/// Bound a synchronous serialization wait by the current read deadline. Without a read
+/// budget retain the ordinary blocking/poison recovery behavior.
+pub(crate) fn lock_sync<T>(
+    mutex: &std::sync::Mutex<T>,
+) -> Result<std::sync::MutexGuard<'_, T>, crate::error::Error> {
+    let Some(budget) = current() else {
+        return Ok(mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    };
+    loop {
+        budget.check()?;
+        match mutex.try_lock() {
+            Ok(guard) => {
+                budget.check()?;
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(budget.remaining().min(Duration::from_millis(5)));
+            }
+        }
+    }
+}
+
 /// Wait for a store's asynchronous mutex from a blocking worker with the same cancellation
 /// and remaining deadline as reader admission. Mutex release or cancellation wakes the thread.
 pub(crate) fn lock<T>(

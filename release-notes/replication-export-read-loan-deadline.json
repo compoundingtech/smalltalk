@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bound replication export snapshot waits and expose reader age and WAL checkpoint deferral",
+  "replay": {"status": "none", "detail": "No replay changes."},
+  "schema": {"status": "none", "detail": "No durable schema or wire-format changes."},
+  "rules": {"status": "none", "detail": "Replication inventories and digests still use one consistent snapshot."},
+  "compatibility": {"status": "changed", "detail": "Export snapshot mutex waits now honor the existing read deadline and cancellation. Export no longer retains a handler-wide reader while waiting for sealing or verdict writes. Expired exports return the existing read-deadline error for peer retry, without a partial exchange. Storage telemetry adds oldest reader scope age by bounded origin, checkpoint deferral attempts, unbackfilled frame lag and deferral age."},
+  "downtime": {"status": "none", "detail": "Only the normal binary restart is required."},
+  "manual": {"status": "none", "detail": "No configuration changes are required."},
+  "recovery": {"status": "none", "detail": "Peers retry an expired export through the existing replication recovery path."}
+}
