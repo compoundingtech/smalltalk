@@ -816,6 +816,8 @@ pub fn run(context: Context) -> Result<()> {
                     // A permanent refusal is said once, without "retrying".
                     if !permanent {
                         ui.conversation_failed(&target, &message);
+                    } else {
+                        ui.stalled.remove(&target);
                     }
                     failed.insert(target, message);
                     changed = true;
@@ -1449,6 +1451,15 @@ pub fn run(context: Context) -> Result<()> {
                 Effect::LoadContent(key) => {
                     content_reads.enqueue(key);
                 }
+                Effect::RetryConversation { target } => {
+                    retry_conversation_open(
+                        target,
+                        &mut failed,
+                        &mut sessions_requested,
+                        &commands,
+                    );
+                    changed = true;
+                }
                 Effect::OpenTerminal { agent } => {
                     terminal_opens.insert(agent.clone(), Instant::now());
                     // The PTY session's own bytes, through st's raw stream to whichever host owns
@@ -2062,6 +2073,18 @@ fn retry_failed_opens(
     requested.retain(|id| !failed.contains_key(id) || wanted.contains(id));
 }
 
+/// A person's explicit retry clears both the feed failure and the one-shot session read.
+fn retry_conversation_open(
+    target: String,
+    failed: &mut BTreeMap<String, String>,
+    requested: &mut HashSet<String>,
+    commands: &tokio::sync::mpsc::UnboundedSender<Command>,
+) {
+    failed.remove(&target);
+    requested.remove(&target);
+    let _ = commands.send(Command::Resubscribe { target });
+}
+
 /// Entries per page read back: st's largest, so a long session takes few requests.
 const OLDER_PAGE: usize = 200;
 
@@ -2405,7 +2428,8 @@ async fn perform(
 ) -> Result<(String, Option<String>)> {
     match effect {
         // Glass writes and retries never reach here: the loop handles them itself.
-        Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } | Effect::LoadContent(_) => {
+        Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::RetryConversation { .. }
+        | Effect::Forget { .. } | Effect::LoadContent(_) => {
             Ok((String::new(), None))
         }
         Effect::EditArrangement(write) => {
@@ -3974,6 +3998,66 @@ mod tests {
                 "{reason}"
             ),
             other => panic!("expected one failure, not entries: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_conversation_hint_and_key_resubscribe_without_resending_messages() {
+        use super::super::{demo, glass, Hit};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for child in [false, true] {
+            let mut ui = Ui::new(demo::world());
+            ui.live = true;
+            ui.tab = 1;
+            let target = if child {
+                ui.glasses = Some(glass::Glasses::open(None, None));
+                ui.click(Hit::Pane(st3_conversation_ui::PaneIntent::Open(
+                    "session/tester-child".into(),
+                )));
+                "session/tester-child".to_owned()
+            } else {
+                ui.selected_id().unwrap()
+            };
+            let mut failed = BTreeMap::from([(target.clone(), "access refused".into())]);
+            let mut requested = HashSet::from([target.clone()]);
+            ui.world.conversations = conversations(
+                &Model::default(),
+                "person/ada",
+                &BTreeMap::new(),
+                &failed,
+                std::slice::from_ref(&target),
+            );
+            ui.effects.clear();
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| ui.render(frame)).unwrap();
+            let shown: String = terminal.backend().buffer().content.iter()
+                .map(ratatui::buffer::Cell::symbol).collect();
+            assert!(shown.contains("access refused"), "{shown}");
+            assert!(shown.contains("Ctrl+L · retry opening this conversation"), "{shown}");
+            assert!(!shown.contains("retrying") && !shown.contains("Trying again"), "{shown}");
+            assert!(ui.effects.is_empty(), "rendering a refusal never retries it");
+
+            ui.conversation_state.drafts.insert(target.clone(), "saved draft".into());
+            let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+            ui.key(key);
+            let effects = std::mem::take(&mut ui.effects);
+            let [Effect::RetryConversation { target: reopened }] = effects.as_slice() else {
+                panic!("opening is distinct from message resend: {effects:?}");
+            };
+            assert_eq!(reopened, &target);
+            assert!(matches!(ui.world.conversations[&target], Load::Loading));
+            assert!(!ui.stalled.contains_key(&target));
+            assert_eq!(ui.conversation_state.drafts[&target], "saved draft");
+            let (commands, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+            retry_conversation_open(reopened.clone(), &mut failed, &mut requested, &commands);
+            assert!(matches!(incoming.try_recv().unwrap(), Command::Resubscribe { target: sent } if sent == target));
+            assert!(!failed.contains_key(&target));
+            assert!(!requested.contains(&target));
+            ui.key(key);
+            assert!(ui.effects.is_empty(), "loading does not queue another explicit retry");
+            assert!(incoming.try_recv().is_err(), "no automatic retry is sent");
         }
     }
 

@@ -2013,6 +2013,10 @@ impl Ui {
             }
             // A usage tab names its group whatever the list groups by, so it draws from its key.
             Some(pane @ Pane::Usage(_)) => self.draw_pane(buf, content, &pane),
+            // A session has no sidebar agent selection: render the tab's subject directly.
+            Some(Pane::Agent(Some(id))) if id.starts_with("session/") => {
+                self.draw_pane(buf, content, &Pane::Agent(Some(id)))
+            }
             // A terminal tab that is not the attached one says so, rather than drawing whatever
             // stui's own tab has selected.
             Some(Pane::Terminal(id))
@@ -2089,6 +2093,8 @@ impl Ui {
     /// A pane whose subject st no longer lists. Unknown while its list is still loading.
     fn subject_gone(&self, pane: &Pane) -> bool {
         match pane {
+            // Saved and child sessions are not members of the agent inventory.
+            Pane::Agent(Some(id)) if id.starts_with("session/") => false,
             Pane::Terminal(id) if id.starts_with("terminal/") => false,
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world

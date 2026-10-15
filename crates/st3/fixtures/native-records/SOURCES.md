@@ -9,8 +9,9 @@ crossing unrelated types, roles and display flags between harnesses.
 `omp-parity.jsonl` is entirely synthetic. It covers every typed OMP tool call/output
 family, extension and bookkeeping view, hidden extensions, and assistant usage/context
 metadata. Field shapes follow native OMP records; no live conversation text is copied.
-Pi exercises the same normalizer and fixture. The task output names `ParityChild`
-for owner-local child-conversation linking.
+Pi exercises the same normalizer and fixture. The task output names
+`ParityChildConversationReview` (28 bytes) for owner-local child-conversation linking
+and the real child-click regression proof with a task name longer than 23 bytes.
 The todo snapshot uses the five native OMP statuses: `completed`, `pending`,
 `in_progress`, `blocked`, and `abandoned`; `done` is not an OMP todo status.
 

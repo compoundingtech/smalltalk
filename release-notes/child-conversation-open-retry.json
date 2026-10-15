@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Child conversations with descriptive task names open reliably, and stui offers a manual retry when opening a conversation fails.",
+  "replay": { "status": "none", "detail": "No claim replay or projection rebuild is required." },
+  "schema": { "status": "none", "detail": "No database schema or client-v0 wire schema changes." },
+  "rules": { "status": "none", "detail": "No checkpoint rules or fleet coordination requirements change." },
+  "compatibility": { "status": "none", "detail": "Conversation subscription correlation ids use bounded UUID v7 values while preserving the conversation routing prefix and full target subjects. Existing servers and their 128-byte id limit are unchanged." },
+  "downtime": { "status": "none", "detail": "No daemon restart or API interruption is required." },
+  "manual": { "status": "none", "detail": "No configuration change is required. Failed conversation opens offer an explicit retry without resending outgoing messages." },
+  "recovery": { "status": "none", "detail": "No stored state transition or new rollback step is introduced. Permanent history refusals remain excluded from automatic retry." }
+}

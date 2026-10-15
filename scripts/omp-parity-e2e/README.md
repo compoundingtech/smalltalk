@@ -45,7 +45,8 @@ terminal and daemon and removes isolation unless `--keep` was supplied.
   tool-start block is internal.
 - Model, context, cost, and todos header fields have transcript provenance,
   timestamp and value; their values are populated. A task result links
-  ParityChild to an `external-child` conversation.
+  ParityChildConversationReview (28 bytes, strictly longer than 23 bytes) to an
+  `external-child` conversation.
 - Must-fix audit details in API and shared TS rows: source subagent name/type,
   multiline assignment and parent context/contract; assistant failure and persisted
   retry recovery; bash cwd/timeout; grep/glob flags, native match/file counts and
@@ -91,7 +92,7 @@ terminal and daemon and removes isolation unless `--keep` was supplied.
 Ctrl+K opens the live palette; type the discovered full `session/...` id and
 Enter opens the saved conversation. Shift+O selects full conversation density;
 `o` opens all tool outputs; End follows the recent bash/subagent showcase.
-The child card's `open ParityChild` row is a left-button `PaneIntent::Open` hit,
+The child card's `open ParityChildConversationReview` row is a left-button `PaneIntent::Open` hit,
 not a keyboard focus/Enter binding. The harness finds that row in capture-pane
 and sends a real SGR mouse click at its coordinates. All waits poll for content
 with a deadline; there are no fixed startup sleeps.

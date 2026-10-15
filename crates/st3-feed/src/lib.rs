@@ -221,7 +221,7 @@ pub const MAX_CONVERSATIONS: usize = 3;
 /// A conversation being shown, on its own subscription.
 struct Conversing {
     target: String,
-    /// The subscription id, named after the target so a frame never lands on another one.
+    /// A bounded correlation id, unique to this opening and reused for its retries.
     id: String,
     /// When to subscribe again after a failure; `None` while subscribed.
     retry_at: Option<Instant>,
@@ -1084,7 +1084,7 @@ async fn follow(
 impl Conversing {
     fn new(target: String) -> Self {
         Self {
-            id: format!("{CONVERSATION}:{target}"),
+            id: format!("{CONVERSATION}:{}", uuid::Uuid::now_v7()),
             target,
             retry_at: None,
             failures: 0,
@@ -1270,6 +1270,25 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::{Notify, watch};
+
+    #[test]
+    fn conversation_ids_are_bounded_and_distinct_for_long_targets() {
+        let target = format!("session/{}", "descriptive-child-task".repeat(256));
+        let first = Conversing::new(target.clone());
+        let same_target = Conversing::new(target.clone());
+        let other_target = Conversing::new(format!("{target}-other"));
+        for current in [&first, &same_target, &other_target] {
+            assert!(current.id.len() <= 128);
+            let suffix = current.id.strip_prefix("conversation:").unwrap();
+            let uuid = uuid::Uuid::parse_str(suffix).unwrap();
+            assert_eq!(uuid.get_version_num(), 7);
+        }
+        assert_eq!(first.target, target);
+        assert_eq!(same_target.target, target);
+        assert_ne!(first.id, same_target.id);
+        assert_ne!(first.id, other_target.id);
+        assert_ne!(same_target.id, other_target.id);
+    }
 
     fn following() -> Option<Following> {
         Some(Following {

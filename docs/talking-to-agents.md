@@ -6,6 +6,12 @@ Messages are durable conversation. Missions track work and its result; [human re
 
 Run `st`, open **Agents**, and select `garden/worker`. Click the conversation composer, type, and press **Enter** to send. In v0.3.4, **c** opens the composer from the conversation. **Ctrl+K** finds an agent or mission; **Ctrl+H** opens Home, and **Ctrl+Q** quits. The conversation shows your Smalltalk messages alongside the harness's transcript and tool calls.
 
+If a conversation fails to open, its error card offers **Ctrl+L** to retry opening it
+without closing the tab. Leave the message box with **Esc** first. This retries only
+the focused conversation, not an outgoing message; **Ctrl+R** retains its separate
+message-resend and voice actions. A permanent refusal is not retried automatically:
+after access or availability changes, use **Ctrl+L** to ask again. Your draft is kept.
+
 On the phone, open **Agents**, select the worker, and use its composer. [Build and run the iOS app](ios-app.md) covers local installation first. A phone reads and acts through a paired member; it does not become a replica or run a seat. To begin pairing on your daemon machine:
 
 ```sh
