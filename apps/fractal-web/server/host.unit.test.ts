@@ -21,6 +21,12 @@ describe('tailnetAdmission', () => {
     expect(admit(request({ 'tailscale-user-login': 'cedar@example.com', host: 'atlas.example.ts.net:8443', origin }))).toBe(false)
   })
 
+  it('refuses a login header that carries more than one value', () => {
+    // Node joins a repeated header into one comma-separated value, so a forged copy next to the real one never matches.
+    for (const joined of ['river@example.com, cedar@example.com', 'cedar@example.com, river@example.com', 'river@example.com,river@example.com'])
+      expect(admit(request({ 'tailscale-user-login': joined, host: 'atlas.example.ts.net:8443', origin }))).toBe(false)
+  })
+
   it('refuses foreign origins and hosts', () => {
     for (const other of ['https://example.com', 'null', 'http://atlas.example.ts.net:8443', 'https://atlas.example.ts.net']) {
       expect(admit(request({ ...signedIn, host: 'atlas.example.ts.net:8443', origin: other }))).toBe(false)
