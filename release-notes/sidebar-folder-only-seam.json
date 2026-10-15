@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add shared Rust and React-free TypeScript folder-only sidebar projection and move preflight models",
+  "replay": {"status": "none", "detail": "No claim ingestion, replay or materialization code changes."},
+  "schema": {"status": "none", "detail": "No storage, database schema or arrangement format change; the seam reads existing version-1 arrangements."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordinated member upgrade changes."},
+  "compatibility": {"status": "none", "detail": "Adds opt-in source APIs to st3-ui-model and st3-views. No existing consumers are migrated and no wire, capability or harness contract changes."},
+  "downtime": {"status": "none", "detail": "No service behavior or additional interruption introduced."},
+  "manual": {"status": "none", "detail": "No installation, data migration or manual steps required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new recovery procedure."}
+}
