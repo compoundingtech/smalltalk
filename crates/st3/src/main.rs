@@ -20002,6 +20002,9 @@ struct NativeLoopState {
     claude_attachment_terminal: Option<ClaudeAttachmentTerminal>,
     #[serde(default)]
     claude_readiness_fallback: ClaudeReadinessFallback,
+    /// This image's own settle. A replacement image draws a new one, so it is never carried.
+    #[serde(skip)]
+    settle: ResumeSettle,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -20046,6 +20049,7 @@ async fn resume_native_driver(
         resume.subject
     );
     resume.loop_state.harness_record_started = true;
+    resume.loop_state.settle = ResumeSettle::resumed();
     let _ = write_driver_log(
         subject,
         &format!(
@@ -20082,6 +20086,49 @@ async fn resume_native_driver(
         task,
     )
     .await
+}
+
+/// When a driver may send the daemon what its seat's delivery does not need: its harness events,
+/// Claude attachment checks, native session, harness publications, subagents and work renewals.
+/// A deploy re-executes every driver in the seconds it restarts the daemon. A resumed driver waits
+/// a random share of [`st3::client::RESUME_SETTLE`], so the drivers do not all reach the new
+/// daemon's writer at once. Mail, receipts, delivery control and the provider's exit never wait.
+#[derive(Clone, Copy, Debug, Default)]
+struct ResumeSettle(Option<tokio::time::Instant>);
+
+impl ResumeSettle {
+    /// A launched driver has nothing to spread.
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn resumed() -> Self {
+        Self::after(st3::client::resume_settle_pause())
+    }
+
+    fn after(pause: Duration) -> Self {
+        Self(Some(tokio::time::Instant::now() + pause))
+    }
+
+    fn passed(&self) -> bool {
+        self.0
+            .is_none_or(|until| tokio::time::Instant::now() >= until)
+    }
+
+    async fn wait(&self) {
+        if let Some(until) = self.0 {
+            tokio::time::sleep_until(until).await;
+        }
+    }
+
+    /// When the driver starts checking the channel's attachment, so a resumed driver's wait does
+    /// not count toward the channel's 20 s to attach.
+    fn attach_started(&self) -> Instant {
+        let left = self.0.map_or(Duration::ZERO, |until| {
+            until.saturating_duration_since(tokio::time::Instant::now())
+        });
+        Instant::now() + left
+    }
 }
 
 /// Follows the installed st binary for a native driver. Once a replacement is ready, the driver
@@ -20200,6 +20247,7 @@ async fn drive_st2_native(
     mut loop_state: NativeLoopState,
     mut task: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
+    let settle = loop_state.settle;
     let NativePaths {
         session_dir,
         agent_dir,
@@ -20209,15 +20257,15 @@ async fn drive_st2_native(
     } = paths.clone();
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
-    let attach_started = Instant::now();
-    if driver == "claude" && mailbox.subscription.is_some()
+    let attach_started = settle.attach_started();
+    if driver == "claude" && mailbox.subscription.is_some() && settle.passed()
         && let Err(error) = check_claude_attachment(
             client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
         ).await
     {
         let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
     }
-    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
+    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?.settle(settle);
     loop_state.claude_readiness_fallback.native_state_seen |= observations.native_state_seen;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
@@ -20359,7 +20407,8 @@ async fn drive_st2_native(
                 return outcome;
             }
             _ = interval.tick(), if !completion_announced => {
-                if driver == "claude" && mailbox.subscription.is_some()
+                let settled = settle.passed();
+                if driver == "claude" && mailbox.subscription.is_some() && settled
                     && let Err(error) = check_claude_attachment(
                         client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
                     ).await
@@ -20370,7 +20419,7 @@ async fn drive_st2_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
 
-                if observations.retry_pending {
+                if observations.retry_due() {
                     match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
                         Ok(ended) => completion_announced |= ended,
                         Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
@@ -20378,7 +20427,7 @@ async fn drive_st2_native(
                     if completion_announced { continue; }
                 }
 
-                if driver == "claude" && mailbox.subscription.is_some() {
+                if driver == "claude" && mailbox.subscription.is_some() && settled {
                     match publish_claude_readiness_fallback(
                         client, &mailbox, &mut observations, &mut loop_state, current_unix_ms()? as u64,
                     ).await {
@@ -20424,7 +20473,7 @@ async fn drive_st2_native(
                     "opencode" => st3::native_resume::opencode_bound_session(&agent_dir),
                     _ => None,
                 };
-                if let Some(session) = bound
+                if let Some(session) = bound.filter(|_| settled)
                     && let Err(error) = report_native_session(
                         client,
                         subject,
@@ -20438,7 +20487,7 @@ async fn drive_st2_native(
                 {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
-                if driver == "claude"
+                if driver == "claude" && settled
                     && let Some(reason) = binding_watch.overdue(
                         &agent_dir,
                         provider_incarnation.as_deref(),
@@ -20521,7 +20570,7 @@ async fn drive_st2_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 let tick: Result<()> = async {
-                    if observations.enabled { return Ok(()) }
+                    if observations.enabled || !settled { return Ok(()) }
                     // The wrapper writes admission before claiming a new harness session. Wait
                     // for that claim so a predecessor's record cannot fence a successor.
                     if matches!(driver, "omp" | "opencode") && loop_state.harness_record_started {
@@ -20643,14 +20692,14 @@ async fn drive_st2_native(
                 if let Err(error) = tick {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
-                if let Some(subagents) = subagents.as_mut()
+                if let Some(subagents) = subagents.as_mut().filter(|_| settled)
                     && let Err(error) = subagents.tick(client).await
                 {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 replacement.check();
             }
-            _ = work_interval.tick(), if !completion_announced => {
+            _ = work_interval.tick(), if !completion_announced && settle.passed() => {
                 let tick: Result<()> = async {
                     if let Some(minute) = renewal_minute(subject)?
                         && renewed_minute != Some(minute)
@@ -20863,6 +20912,7 @@ struct NativeObservations {
     retry_pending: bool,
     initial_wake: bool,
     pipe: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
+    settle: ResumeSettle,
 }
 impl NativeObservations {
     fn start(dir: &Path, runtime: &str) -> Result<Self> {
@@ -20904,9 +20954,25 @@ impl NativeObservations {
             retry_pending: enabled,
             initial_wake: enabled,
             pipe,
+            settle: ResumeSettle::none(),
         })
     }
+    /// Hold every drain until `settle` passes. Hooks keep writing the outbox meanwhile; their
+    /// wakes go to a non-blocking pipe, so a held wake never blocks a hook.
+    fn settle(mut self, settle: ResumeSettle) -> Self {
+        self.settle = settle;
+        self
+    }
+    /// Whether a pending drain may go now.
+    fn retry_due(&self) -> bool {
+        self.retry_pending && self.settle.passed()
+    }
     async fn recv(&mut self) -> Result<()> {
+        if self.enabled && !self.settle.passed() {
+            self.settle.wait().await;
+            self.initial_wake = false;
+            return Ok(());
+        }
         if self.initial_wake {
             self.initial_wake = false;
             return Ok(());
@@ -23385,6 +23451,7 @@ async fn drive_codex_native(
     start: ProviderStart,
     mut loop_state: NativeLoopState,
 ) -> Result<()> {
+    let settle = loop_state.settle;
     let mut paths = if matches!(start, ProviderStart::Launch(
         _,
         // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -23431,7 +23498,7 @@ async fn drive_codex_native(
     let archive = st_drivers::message::archive_dir(&agent_dir);
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
-    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
+    let mut observations = NativeObservations::start(&agent_dir, &incarnation)?.settle(settle);
     if push_mailbox_enabled() {
         st_drivers::push_mailbox::register(&agent_dir);
     }
@@ -23582,7 +23649,7 @@ async fn drive_codex_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
 
-                if observations.retry_pending {
+                if observations.retry_due() {
                     match observations.drain_live(client, subject, "codex", &mut loop_state.ready).await {
                         Ok(ended) => completion_announced |= ended,
                         Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
@@ -23626,7 +23693,9 @@ async fn drive_codex_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 }
+                let settled = settle.passed();
                 let tick: Result<()> = async {
+                    if !settled { return Ok(()) }
                     if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))
                         .ok()
                         .is_some_and(|binding| Some(&binding) != prior_binding.as_ref())
@@ -23756,7 +23825,7 @@ async fn drive_codex_native(
                         &runtime_id,
                     ),
                 );
-                if let Err(error) = subagents.tick(client).await {
+                if settled && let Err(error) = subagents.tick(client).await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // Only a bound session can be adopted, so wait for the binding before following
@@ -23765,7 +23834,7 @@ async fn drive_codex_native(
                     replacement.check();
                 }
             }
-            _ = work_interval.tick(), if !completion_announced => {
+            _ = work_interval.tick(), if !completion_announced && settle.passed() => {
                 let tick: Result<()> = async {
                     if let Some(minute) = renewal_minute(subject)?
                         && renewed_minute != Some(minute)
@@ -28549,6 +28618,7 @@ mod tests {
                 claude_attachment_reconciled: false,
                 claude_attachment_terminal: None,
                 claude_readiness_fallback: ClaudeReadinessFallback::default(),
+                settle: ResumeSettle::resumed(),
             },
         };
         let back: DriverResume =
@@ -28565,6 +28635,8 @@ mod tests {
         );
         // A predecessor's harness record is only a startup fence; it never crosses an exec.
         assert!(back.loop_state.predecessor_harness_record.is_none());
+        // Nor does a settle: the replacement image draws its own.
+        assert!(back.loop_state.settle.0.is_none());
     }
 
     #[test]
@@ -33908,6 +33980,104 @@ mission "review" state="ready" {
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0], captured[1]);
         assert_eq!(store.local_observations_tail(100).unwrap().len(), 1);
+        server.abort();
+    }
+    /// A deploy re-executes every driver while the daemon restarts. A resumed driver keeps the
+    /// harness events its hooks write meanwhile in the outbox and sends them once its settle
+    /// passes, not in the new daemon's first instant. A launched driver sends them at once.
+    #[tokio::test]
+    async fn a_resumed_driver_sends_its_outbox_only_after_its_settle() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq =
+            st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a")
+                .unwrap();
+        let mut writer = st_drivers::harness_state::Writer::new(
+            root.path(),
+            "example/seat",
+            "claude",
+            Some("pty".into()),
+        )
+        .with_ownership("provider-a", seq);
+        let active = || {
+            st_drivers::harness_state::Observation::new(
+                st_drivers::harness_state::Activity::Active,
+                st_drivers::harness_state::BlockedOn::None,
+                st_drivers::harness_state::InputBuffer::Unknown,
+            )
+        };
+        writer.observe(active()).unwrap();
+        let posted = Arc::new(Mutex::new(Vec::<tokio::time::Instant>::new()));
+        let store = Arc::new(Store::open_memory("amber").unwrap());
+        let app = Router::new().route(
+            "/v1/harness-events",
+            post({
+                let posted = posted.clone();
+                move |Json(request): Json<st3::harness_events::Publication>| {
+                    let posted = posted.clone();
+                    let store = store.clone();
+                    async move {
+                        posted.lock().unwrap().push(tokio::time::Instant::now());
+                        let record = store.append_claim(&request.claim).unwrap();
+                        Json(json!({"api_version":"st3.v1","value":record}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(st3::client::Endpoint::Http(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pause = Duration::from_millis(600);
+        let settle = ResumeSettle::after(pause);
+        let until = tokio::time::Instant::now() + pause;
+        let mut observations = NativeObservations::start(root.path(), "runtime-a")
+            .unwrap()
+            .settle(settle);
+        assert!(!observations.retry_due());
+        // A hook writes while the driver settles; its wake does not end the wait.
+        writer
+            .observe(st_drivers::harness_state::Observation::new(
+                st_drivers::harness_state::Activity::Idle,
+                st_drivers::harness_state::BlockedOn::None,
+                st_drivers::harness_state::InputBuffer::Unknown,
+            ))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(pause / 2, observations.recv())
+                .await
+                .is_err(),
+            "a wake ended the settle early"
+        );
+        assert!(posted.lock().unwrap().is_empty());
+        observations.recv().await.unwrap();
+        assert!(tokio::time::Instant::now() >= until);
+        assert!(observations.retry_due());
+        let mut ready = false;
+        observations
+            .drain_live(&client, "agent/example/seat", "claude", &mut ready)
+            .await
+            .unwrap();
+        let first = posted.lock().unwrap().first().copied().unwrap();
+        assert!(first >= until, "an event went before the settle passed");
+        assert!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
+
+        writer.observe(active()).unwrap();
+        let mut launched = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        assert!(launched.retry_due());
+        tokio::time::timeout(Duration::from_millis(100), launched.recv())
+            .await
+            .expect("a launched driver drains at once")
+            .unwrap();
         server.abort();
     }
     #[tokio::test]

@@ -1266,6 +1266,24 @@ pub fn driver_retry_pause() -> Duration {
     jittered(Duration::from_secs(1))
 }
 
+/// The window over which drivers re-executed by one deploy spread what their seats' delivery does
+/// not need. At hetz2's 07:30:58Z restart, about 60 drivers sent their harness events, presence
+/// diagnostics and native sessions in the new daemon's first eight seconds. Those requests added
+/// about seven seconds of writer time to those eight, and write-acks queued behind them. Over 30
+/// seconds the same work takes under a quarter of the writer. Harness evidence stays fresh for 90
+/// seconds, so nothing ages out while a driver waits.
+pub const RESUME_SETTLE: Duration = Duration::from_secs(30);
+
+/// How long a driver re-executed into a new binary waits before it sends what its seat's delivery
+/// does not need: a random share of [`RESUME_SETTLE`].
+pub fn resume_settle_pause() -> Duration {
+    let mut share = [0_u8; 2];
+    if getrandom::fill(&mut share).is_err() {
+        return RESUME_SETTLE / 2;
+    }
+    RESUME_SETTLE.mul_f64(f64::from(u16::from_le_bytes(share)) / 65536.0)
+}
+
 /// Half to one and a half times `pause`. Every seat and command waiting out one daemon restart
 /// retries on the same doubling schedule; without a random share they would all reach the daemon
 /// in the same instant it starts to listen.
@@ -2024,6 +2042,15 @@ mod tests {
             (Duration::from_millis(500)..=Duration::from_millis(1500)).contains(pause)
         }));
         assert!(pauses.iter().collect::<std::collections::BTreeSet<_>>().len() > 8);
+    }
+
+    /// Drivers resumed by one deploy settle at different times across the whole window.
+    #[test]
+    fn resume_settles_are_spread_across_the_window() {
+        let pauses = (0..256).map(|_| resume_settle_pause()).collect::<Vec<_>>();
+        assert!(pauses.iter().all(|pause| *pause < RESUME_SETTLE));
+        assert!(pauses.iter().any(|pause| *pause < RESUME_SETTLE / 4));
+        assert!(pauses.iter().any(|pause| *pause > RESUME_SETTLE * 3 / 4));
     }
 
     #[tokio::test]
