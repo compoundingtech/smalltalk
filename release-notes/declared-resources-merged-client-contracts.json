@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh declared-resource clients and writer integration against the merged runtime",
+  "replay": {"status": "none", "detail": "This refresh does not change claim replay or the bounded declared-resource backfill algorithm."},
+  "schema": {"status": "none", "detail": "No additional database schema change is introduced by this refresh."},
+  "rules": {"status": "changed", "detail": "The merged shared-projection layout is st3.shared-projections.person-directive-notes-declared-resource-edges.v1. Older layouts still exchange claims but do not compare projection maps."},
+  "compatibility": {"status": "changed", "detail": "Regenerated Rust, Swift and TypeScript clients retain DeclaredResource, ResourceReferenceKind and ResourceReferenceResolution, and the optional resources fields on AgentResource and MissionResource, alongside the current main client fields. Synthesized URI declarations have no accountable person; backfill writer jobs use the current holder and enqueue metadata."},
+  "downtime": {"status": "unknown", "detail": "This refresh does not add restart work; merged-tree restart duration has not been measured."},
+  "manual": {"status": "none", "detail": "No manual declaration or data migration is required."},
+  "recovery": {"status": "unknown", "detail": "Backfill remains bounded and resumable with declaration-backed reads before completion. Binary swap-back has not been verified."}
+}

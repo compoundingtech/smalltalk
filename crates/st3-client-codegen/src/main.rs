@@ -671,6 +671,7 @@ fn validate_surfaces(
         "MissionRunSummary",
         "MissionStep",
         "MissionWake",
+        "DeclaredResource",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",

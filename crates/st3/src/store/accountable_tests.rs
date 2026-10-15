@@ -33,7 +33,7 @@ fn accountable_root_publication_requires_same_person_and_round_trips() {
         .unwrap();
     assert_eq!(claim.body["accountable"], PERSON);
     let (_, tree) = store.agent_declaration(ROOT, None).unwrap().unwrap();
-    let rendered = crate::graph::render_agent_desired_kdl(&tree).unwrap();
+    let rendered = crate::graph::render_agent_desired_kdl(&tree, &BTreeMap::new()).unwrap();
     assert_eq!(
         crate::graph::parse_internal_intent(&rendered, "alder")
             .unwrap()

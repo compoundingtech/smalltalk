@@ -120,6 +120,14 @@ pub(crate) struct AgentResourcesEntry {
 impl SmalltalkRuntime {
     fn finish_schema(&self, connection: &Connection, fresh: bool) -> Result<()> {
         runtime_starts::create_schema(connection)?;
+        resource_references::create_schema(connection)?;
+        // Legacy run stamps are projection metadata, not ownership of a shared URI.
+        connection.execute(
+            "UPDATE desired SET owner_run=NULL, owner_generation=NULL, owner_step=NULL
+             WHERE kind='resource' AND subject LIKE 'resource/uri/%'
+               AND (owner_run IS NOT NULL OR owner_generation IS NOT NULL OR owner_step IS NOT NULL)",
+            [],
+        )?;
         connection.execute_batch(git_changes::SCHEMA)?;
         retirements::create_selection_triggers(connection)?;
         usage_period::create_schema(connection)?;
@@ -293,6 +301,7 @@ impl Runtime for SmalltalkRuntime {
         agent_messages::open(transaction)?;
         arrangements::open(transaction)?;
         limits::open_limits(transaction)?;
+        resource_references::open(transaction, shared_memory)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -532,7 +541,7 @@ impl Runtime for SmalltalkRuntime {
 /// at once rather than on the next read.
 const AGENT_ROSTER_READ_LATELY: std::time::Duration = std::time::Duration::from_secs(300);
 
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.person-directive-notes.v1";
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.person-directive-notes-declared-resource-edges.v1";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {
