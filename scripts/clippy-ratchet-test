@@ -67,6 +67,21 @@ class Ratchet(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "baseline increased"):
             check(raised, raised, baseline({}))
 
+    def test_split_crate_may_take_warnings_from_its_origin_but_not_add_any(self):
+        old = baseline({"origin": {"lint-a": 3, "lint-b": 1}})
+        splits = {"part": "origin"}
+        moved = baseline({"origin": {"lint-a": 1}, "part": {"lint-a": 2, "lint-b": 1}})
+        check(moved, moved, old, splits)
+        more = baseline({"origin": {"lint-a": 1}, "part": {"lint-a": 3, "lint-b": 1}})
+        with self.assertRaisesRegex(ValueError, "baseline increased: origin: lint-a: 3 -> 4"):
+            check(more, more, old, splits)
+        with self.assertRaisesRegex(ValueError, "baseline increased"):
+            check(moved, moved, old)  # no declared split: counts cannot move between crates
+        # Once the base has the new crate, it is an ordinary crate again.
+        base_with_part = baseline({"origin": {"lint-a": 1}, "part": {"lint-a": 2, "lint-b": 1}})
+        with self.assertRaisesRegex(ValueError, "baseline increased: part: lint-a: 2 -> 3"):
+            check(more, more, base_with_part, splits)
+
     def test_removed_warning_requires_lower_baseline(self):
         old = baseline({"sample": {"lint-a": 2}})
         lowered = baseline({"sample": {"lint-a": 1}})
