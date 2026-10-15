@@ -56,8 +56,16 @@ fn text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// The prefix of the accounts a test makes, so a later run can remove what a killed run left.
-const PREFIX: &str = "sttfx";
+/// The prefix of the account a test makes, so a later run can remove what a killed run left. A
+/// host may declare its own fixture users (hetz2 has `sttfx1`..`sttfx32`), so it is not theirs.
+const PREFIX: &str = "sttiletest";
+
+/// Whether `user` is an account these tests made: the prefix, then a user ID in the test range.
+fn ours(user: &str) -> bool {
+    user.strip_prefix(PREFIX)
+        .and_then(|uid| uid.parse::<u32>().ok())
+        .is_some_and(|uid| (90_000..98_000).contains(&uid))
+}
 
 /// A tile and the user ID the launcher gave it, which is also its group ID.
 struct TileUser {
@@ -359,7 +367,7 @@ fn sweep() {
     for user in passwd
         .lines()
         .filter_map(|line| line.split(':').next())
-        .filter(|user| user.starts_with(PREFIX))
+        .filter(|user| ours(user))
     {
         let _ = sudo(["pkill", "-KILL", "-u", user]);
         let _ = sudo(["userdel", user]);
@@ -1016,6 +1024,7 @@ fn only_root_starts_a_tile_and_only_inside_its_unit() {
     );
     // An account that takes a tile's user ID would be the tile: the launch is refused.
     let account = format!("{PREFIX}{}", a.uid);
+    assert!(ours(&account));
     ok(sudo([
         "useradd",
         "--system",
