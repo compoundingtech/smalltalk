@@ -461,3 +461,41 @@ adoption remain deferred. All earlier prefixes, helpers, strict/growth/crash
 controls, limits and nextest settings are unchanged. The strict 128-statement
 ceiling still has zero headroom and eight growth pages remain over it; no
 old work/crash result qualifies this new path.
+
+## Mirrored installed-root journal cutoff (fixture only)
+
+One appended normal control reverses the fixed ordering: primary A is at 16,
+while follower B is at 32, over 32 original admissions and distinct installed
+namespaces. A's stored prefix-ready bit remains true, but current-source status
+and its current getter refuse. A's 16 expected ID/subject/kind/digest rows come
+from the original images' revisions joined to native rows, with native bodies
+canonicalized independently of produced output. B matches the full native
+oracle at 32. Complete physical root/job/coverage/output snapshots are retained.
+
+The actual production journal prune must remove 16 and then zero while A is
+still at 16. A B-only, MAX or source-head cutoff can hide behind the first call's
+16-row page cap but fails the second call. Together with the opposite ordering
+in the existing controls, this rejects either fixed-consumer choice; it is not
+a minimum proof for arbitrary consumer orderings, registry sizes or active jobs.
+Copied original references and their payload-byte sums define the entire pinned
+retention state; the oracle never passes a cutoff to the library. Both complete
+consumer states and all 32 original images must remain unchanged by pruning.
+
+Before A consumes the original remaining references, the test derives its full
+expected advanced state from the validated pinned state and native output.
+Only primary revision/generation, coverage and output may change; physical
+root bindings/status and the full job row are checked against their previous
+values. Source, journal payloads, image/lifetime counters, images, native rows
+and B's complete state stay fixed. Both current getters must then match the
+native oracle at 32 before the final 16+0 drain. The old equal-image/reference
+helpers are intentionally not used after journal-only pruning and remain
+unchanged. No advanced actual snapshot is accepted as its own oracle.
+
+The new name is UNRUN at source authoring. It adds no hook, copied minimum,
+production SQL, library/helper change, nextest setting, worker or activation.
+Image reclamation across two consumers, crash/reopen, whole-prune work/hold/CPU,
+failed-cleanup containment, source authority/lifetime/restore and production
+adoption remain deferred. Original strict/growth/crash controls and bounds are
+unchanged: the 128-statement strict page has zero headroom and eight growth
+pages remain adverse over that ceiling. No previous work or crash receipt
+qualifies the mirrored path, and oracle bounds are not pre-copy certification.

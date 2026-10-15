@@ -2974,3 +2974,142 @@ fn production_journal_prune_refused_commit_preserves_both_consumers() -> Result<
     assert_eq!(pair.state(JOURNAL_FOLLOWER)?, complete);
     Ok(())
 }
+
+#[test]
+fn production_journal_prune_mirrored_roots_preserve_slowest_primary_prefix() -> Result<()> {
+    let (_directory, pair) = JournalConsumers::fixture(true)?;
+    for n in 0..32 {
+        append(&pair.slice, &format!("note/journal-mirrored-{n:02}"))?;
+    }
+    pair.publish_live(VIEW)?;
+    pair.publish_live(JOURNAL_FOLLOWER)?;
+    pair.publish_live(JOURNAL_FOLLOWER)?;
+    let before = pair.slice.retention_state()?;
+    before.reconcile()?; // Valid before journal-only pruning; primary output is deliberately behind.
+    let slow = pair.state(VIEW)?;
+    let fast = pair.state(JOURNAL_FOLLOWER)?;
+    assert_eq!(before.source.0, 32);
+    assert!(before.source.1);
+    assert_eq!(before.journal.len(), 32);
+    assert_eq!(before.images.len(), 32);
+    assert_eq!(before.native.len(), 32);
+    assert_eq!(slow.root.1, 16);
+    assert!(slow.root.2 && slow.root.0.is_some());
+    assert!(slow.root.5.is_none());
+    assert_eq!(slow.coverage, Some(16));
+    assert_eq!(fast.root.1, 32);
+    assert!(fast.root.2 && fast.root.0.is_some());
+    assert_eq!(fast.coverage, Some(32));
+    assert_ne!(slow.root.0, fast.root.0);
+    assert!(
+        !pair
+            .slice
+            .read(|db| Ok(pair.slice.installer.status(db, VIEW)?.ready))?
+    );
+    assert!(pair.current_output(VIEW).is_err());
+
+    // Select the slow prefix by ORIGINAL image revisions, never by produced output.
+    let prefix_ids = before
+        .images
+        .iter()
+        .filter(|image| image.revision <= 16)
+        .map(|image| image.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(prefix_ids.len(), 16);
+    let prefix_native = before
+        .native
+        .iter()
+        .filter(|(id, _, _, _)| prefix_ids.contains(id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(prefix_native.len(), 16);
+    let prefix_output = expected_journal_output(&prefix_native)?;
+    let native = expected_journal_output(&before.native)?;
+    assert_eq!(slow.output, prefix_output);
+    assert_eq!(before.output, prefix_output);
+    assert_eq!(before.root, (16, true, slow.root.3, slow.root.4));
+    assert_eq!(before.coverage, 16);
+    assert_eq!(fast.output, native);
+    assert_eq!(pair.current_output(JOURNAL_FOLLOWER)?, native);
+    let remaining = before
+        .journal
+        .iter()
+        .filter(|reference| reference.revision > 16)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(remaining.len(), 16);
+    let pinned = expected_journal_after(&before, remaining)?;
+
+    // A no-op, wrong payload deletion, delete-only or decrement-only prune fails full equality.
+    assert_eq!(pair.prune_journal()?, 16);
+    assert_eq!(pair.slice.retention_state()?, pinned);
+    assert_eq!(pair.state(VIEW)?, slow);
+    assert_eq!(pair.state(JOURNAL_FOLLOWER)?, fast);
+    // A is STILL16: always-B/MAX/source-head32 hides behind the first call's page cap,
+    // but would wrongly delete the remaining16 here. Existing A32/B16 controls reject
+    // always-A; neither fixed ordering proves a minimum for arbitrary registries.
+    assert_eq!(pair.prune_journal()?, 0);
+    assert_eq!(pair.slice.retention_state()?, pinned);
+    assert_eq!(pair.state(VIEW)?, slow);
+    assert_eq!(pair.state(JOURNAL_FOLLOWER)?, fast);
+    assert!(pair.current_output(VIEW).is_err());
+    assert_eq!(pair.current_output(JOURNAL_FOLLOWER)?, native);
+
+    // Derive the complete expected advance BEFORE publishing, not from its actual result.
+    // Target::Live changes only root revision/generation, coverage and output; the job,
+    // status revision, namespace, bindings, source, images and retained payloads stay fixed.
+    let generation = slow
+        .root
+        .3
+        .checked_add(1)
+        .context("mirror generation overflow")?;
+    let mut expected_advanced = pinned.clone();
+    expected_advanced.root = (32, true, generation, slow.root.4);
+    expected_advanced.coverage = 32;
+    expected_advanced.output = native.clone();
+    let mut root_row = slow.root_row.clone();
+    // Exact Installer v1 physical layout: revision at6, generation at8 of11 columns.
+    assert_eq!(root_row.len(), 11);
+    assert_eq!(root_row[6], Sql::Integer(16));
+    assert_eq!(root_row[8], Sql::Integer(i64::try_from(slow.root.3)?));
+    root_row[6] = Sql::Integer(32);
+    root_row[8] = Sql::Integer(i64::try_from(generation)?);
+    let expected_primary = JournalConsumerState {
+        root: (
+            slow.root.0.clone(),
+            32,
+            true,
+            generation,
+            slow.root.4,
+            slow.root.5.clone(),
+        ),
+        job: slow.job.clone(),
+        coverage: Some(32),
+        output: native.clone(),
+        root_row,
+        job_row: slow.job_row.clone(),
+    };
+    pair.publish_live(VIEW)?; // Consume ORIGINAL retained references17..32.
+    // Images32/journal16 intentionally violates the old equal-prefix reconcile helper.
+    // Full independently derived equality instead checks every conserved component.
+    assert_eq!(pair.slice.retention_state()?, expected_advanced);
+    assert_eq!(pair.state(VIEW)?, expected_primary);
+    assert_eq!(pair.state(JOURNAL_FOLLOWER)?, fast);
+    assert_eq!(pair.current_output(VIEW)?, native);
+    assert_eq!(pair.current_output(JOURNAL_FOLLOWER)?, native);
+
+    // Only after independent complete state/cut checks may the remaining prefix drain.
+    let drained = expected_journal_after(&expected_advanced, vec![])?;
+    assert_eq!(pair.prune_journal()?, 16);
+    assert_eq!(pair.slice.retention_state()?, drained);
+    assert_eq!(pair.state(VIEW)?, expected_primary);
+    assert_eq!(pair.state(JOURNAL_FOLLOWER)?, fast);
+    assert_eq!(pair.prune_journal()?, 0);
+    assert_eq!(pair.slice.retention_state()?, drained);
+    assert_eq!(pair.state(VIEW)?, expected_primary);
+    assert_eq!(pair.state(JOURNAL_FOLLOWER)?, fast);
+    assert_eq!(pair.current_output(VIEW)?, native);
+    assert_eq!(pair.current_output(JOURNAL_FOLLOWER)?, native);
+    // Both full retention comparisons keep ALL32 original images and their counters.
+    Ok(())
+}
