@@ -107,6 +107,7 @@ fn daemon_pid(socket: &Path) -> Option<u32> {
     if cfg!(target_os = "linux") {
         return st3::startup::read(socket).map(|readiness| readiness.pid);
     }
+    #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd as _;
     let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
     let mut pid: libc::pid_t = 0;
