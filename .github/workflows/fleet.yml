@@ -1138,7 +1138,7 @@ jobs:
           done
       - name: Compile and archive each selected target group once
         shell: bash
-        run: nix develop -c python3 scripts/ci-test-archive build
+        run: 'nix develop -c bash -c ''python3 scripts/ci-build-memory before || echo "::warning::build memory baseline unavailable"; exec python3 scripts/ci-test-archive build'''
         id: archive
       - name: Publish this run attempt’s exact-source test archives
         id: upload
@@ -1184,6 +1184,21 @@ jobs:
           retention-days: 3
           if-no-files-found: error
           overwrite: true
+      - name: Report test-build memory after failure
+        env:
+          BUILD_STEP_OUTCOME: ${{ steps.archive.outcome }}
+        run: 'mkdir -p "$RUNNER_TEMP/ci-build-memory"; (free -m || echo "::warning::free unavailable") | tee "$RUNNER_TEMP/ci-build-memory/free.txt"; python3 scripts/ci-build-memory failure'
+        if: ${{ failure() && steps.archive.outcome == 'failure' }}
+        continue-on-error: true
+      - name: Retain failure memory evidence
+        if: ${{ failure() && steps.archive.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: "test-build-memory-${{ github.run_attempt }}"
+          path: "${{ runner.temp }}/ci-build-memory"
+          if-no-files-found: warn
+          retention-days: 3
       - name: Report job cache coverage
         if: always()
         shell: bash
