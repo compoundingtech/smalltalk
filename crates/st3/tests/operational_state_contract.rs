@@ -118,6 +118,37 @@ fn every_screen_model_has_one_cli_renderer_and_required_rendering_state() {
     assert_eq!(contract["parity"]["historical_default"], false);
 }
 
+/// Two changes to one list on one line conflict even when they add different entries, so each
+/// entry of the lists every command change edits sits on its own line.
+#[test]
+fn command_inventory_lists_keep_one_entry_per_line() {
+    let path = Path::new(test_env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/st3/operational-state/cli-commands.json");
+    let text = std::fs::read_to_string(path).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    for key in ["conformance", "purpose_fields", "canonical_roots"] {
+        let start = lines
+            .iter()
+            .position(|line| *line == format!("  \"{key}\": ["))
+            .unwrap_or_else(|| panic!("{key} must open a list that holds one entry per line"));
+        let entries = lines[start + 1..]
+            .iter()
+            .take_while(|line| !line.trim_start().starts_with(']'))
+            .collect::<Vec<_>>();
+        assert!(!entries.is_empty(), "{key} lists no entries");
+        for entry in entries {
+            let entry = entry.trim().trim_end_matches(',');
+            assert!(
+                entry.len() > 1
+                    && entry.starts_with('"')
+                    && entry.ends_with('"')
+                    && !entry[1..entry.len() - 1].contains('"'),
+                "{key} must hold one string per line, found {entry}"
+            );
+        }
+    }
+}
+
 #[test]
 fn command_inventory_has_complete_current_purposes() {
     let path = Path::new(test_env!("CARGO_MANIFEST_DIR"))
