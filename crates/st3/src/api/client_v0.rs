@@ -6000,8 +6000,8 @@ fn native_slice_page_at_generation(
     let _page_preparation = crate::profile::span("conversation/page-preparation");
     // A page never outgrows what a paired reader can take from a remote owner (its reads are
     // capped at 1 MiB): a seat with very large entries gets a shorter newest page and a cursor
-    // for the rest, not a refusal that leaves its conversation unreadable.
-    has_more |= bound_page_bytes(&mut items, TIMELINE_PAGE_BYTE_BUDGET);
+    // for the rest. A lone entry can exceed the target budget, but not the hard ceiling.
+    has_more |= bound_page_bytes(&mut items, TIMELINE_PAGE_BYTE_BUDGET)?;
     let next_cursor = if has_more {
         let boundary = items.last()
             .ok_or_else(|| ApiError::internal("native page has no boundary"))?.1.clone();
@@ -6038,20 +6038,36 @@ fn native_slice_page_at_generation(
 
 /// The most a timeline page's entries may serialize to, leaving room under a peer's 1 MiB cap on
 /// a remote client read for the envelope and the page header.
-const TIMELINE_PAGE_BYTE_BUDGET: usize = 768 * 1024;
+pub(super) const TIMELINE_PAGE_BYTE_BUDGET: usize = 768 * 1024;
 
-/// Keep the newest entries (first in `items`) whose serialized size fits `budget`, but always
-/// at least one. True when any were dropped, so the page continues from its new last entry.
-fn bound_page_bytes<K>(items: &mut Vec<(Value, K)>, budget: usize) -> bool {
-    let mut bytes = 0usize;
+/// Keep complete newest entries within the target budget. One larger entry may be served
+/// alone up to the hard response ceiling; continuation uses the actual last returned key.
+fn bound_page_bytes<K>(items: &mut Vec<(Value, K)>, budget: usize) -> Result<bool, ApiError> {
+    let mut bytes = 2usize; // JSON array delimiters.
     for index in 0..items.len() {
-        bytes = bytes.saturating_add(serde_json::to_vec(&items[index].0).map_or(0, |encoded| encoded.len()));
-        if bytes > budget && index > 0 {
+        let size = serde_json::to_vec(&items[index].0)
+            .map_err(ApiError::internal)?
+            .len();
+        bytes = bytes
+            .saturating_add(size)
+            .saturating_add(usize::from(index > 0));
+        if bytes > budget {
+            if index == 0 {
+                // A lone complete entry above the target is served alone, up to the hard ceiling.
+                if bytes > CLIENT_MAX_RESPONSE_BYTES - 128_000 {
+                    return Err(validation(
+                        "a timeline entry exceeds the client response limit",
+                    ));
+                }
+                let more = items.len() > 1;
+                items.truncate(1);
+                return Ok(more);
+            }
             items.truncate(index);
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// What st3 established about a managed seat's native transcript.
@@ -14765,16 +14781,29 @@ mission "queue-parity" state="ready" {
         let entry = |size: usize| (json!({"body": "x".repeat(size)}), ());
         // Newest first: 300 KB, 300 KB, 300 KB, 10 bytes. Three would not fit in 768 KiB.
         let mut items = vec![entry(300_000), entry(300_000), entry(300_000), entry(10)];
-        assert!(bound_page_bytes(&mut items, 768 * 1024));
+        assert!(bound_page_bytes(&mut items, 768 * 1024).unwrap());
         assert_eq!(items.len(), 2, "the two newest fit, the page continues from the second");
         // Everything fits: nothing is dropped.
         let mut small = vec![entry(10), entry(10)];
-        assert!(!bound_page_bytes(&mut small, 768 * 1024));
+        assert!(!bound_page_bytes(&mut small, 768 * 1024).unwrap());
         assert_eq!(small.len(), 2);
-        // One entry larger than the whole budget is still served, alone.
+        // Above the soft budget but below the hard ceiling: serve it alone and continue.
+        // 896 KiB fits; 900 KiB exceeds the exact 920,576-byte ceiling before JSON overhead.
+        let large = entry(896 * 1024);
+        let mut lone = vec![large.clone()];
+        assert!(!bound_page_bytes(&mut lone, 768 * 1024).unwrap());
+        assert_eq!(lone, vec![large.clone()]);
+        let mut followed = vec![large.clone(), entry(10)];
+        assert!(bound_page_bytes(&mut followed, 768 * 1024).unwrap());
+        assert_eq!(followed, vec![large]);
+        // A single entry beyond the hard ceiling refuses without skipping or mutation.
         let mut huge = vec![entry(2_000_000), entry(10)];
-        assert!(bound_page_bytes(&mut huge, 768 * 1024));
-        assert_eq!(huge.len(), 1);
+        let original = huge.clone();
+        assert_eq!(
+            bound_page_bytes(&mut huge, 768 * 1024).unwrap_err().code,
+            "validation-failed"
+        );
+        assert_eq!(huge, original);
     }
 
     #[test]
@@ -19520,6 +19549,79 @@ mission "example/zero-run" state="ready" {
             assert!(walked.len() < expected.len());
         }
         assert_eq!(walked, expected);
+    }
+
+    #[test]
+    fn omp_event_keyset_pages_keep_typed_views_and_walk_every_event_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "omp-envelope-pages");
+        let session_id = "session/omp-envelope-pages";
+        let path = root.path().join("omp-events.jsonl");
+        let mut transcript = String::new();
+        for index in 0..100 {
+            let record = json!({
+                "type":"custom_message", "customType":"notice", "attribution":"agent",
+                "content":"x".repeat(8000),
+                "details":{"from":"worker", "id":index, "message":"x".repeat(8000)},
+            });
+            transcript.push_str(&format!("{record}\n"));
+        }
+        std::fs::write(&path, transcript).unwrap();
+        let mut source = page_test_source(&path, session_id);
+        source.driver = crate::external_sessions::ExternalDriver::Omp;
+        let snapshot = new_client_snapshot(&state);
+        let mut session = ClientSession::local(Some("person/alex")).unwrap();
+        session.conversation_blocks = true;
+        let expected: std::collections::BTreeSet<_> =
+            conversation_blocks::read(&source, &session, session_id)
+                .unwrap()
+                .into_iter()
+                .map(|item| item["id"].as_str().unwrap().to_owned())
+                .collect();
+        let mut received = std::collections::BTreeSet::new();
+        let mut query = ClientListQuery {
+            limit: Some(100),
+            ..Default::default()
+        };
+        let mut previous_boundary = None;
+        let mut pages = 0;
+        loop {
+            let page = native_slice_page(&state, &snapshot, &session, session_id, &query, &source)
+                .unwrap()
+                .0;
+            assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+            let items = page["items"].as_array().unwrap();
+            assert!(!items.is_empty());
+            assert!(
+                items
+                    .windows(2)
+                    .all(|pair| pair[0]["sequence"].as_u64().unwrap()
+                        < pair[1]["sequence"].as_u64().unwrap())
+            );
+            if let Some(before) = previous_boundary {
+                assert!(items.last().unwrap()["sequence"].as_u64().unwrap() < before);
+            }
+            previous_boundary = items.first().unwrap()["sequence"].as_u64();
+            for item in items {
+                assert!(received.insert(item["id"].as_str().unwrap().to_owned()));
+                let block = &item["body"]["blocks"][0];
+                assert_eq!(block["kind"], "text");
+                assert_eq!(block["view"]["type"], "omp_event");
+                assert_eq!(block["view"]["content"], "x".repeat(8000));
+                assert_eq!(block["view"]["attribution"], "agent");
+            }
+            pages += 1;
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if query.cursor.is_none() {
+                break;
+            }
+            assert!(pages < 100);
+        }
+        assert!(
+            pages > 1,
+            "the byte budget, not count, must split this native page"
+        );
+        assert_eq!(received, expected);
     }
 
     #[test]
