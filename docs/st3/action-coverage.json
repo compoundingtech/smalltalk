@@ -2180,7 +2180,7 @@
     },
     {
       "command": "st ui",
-      "description": "Open the terminal interface with spaces or classic layout; plain st opens it for humans on two terminals",
+      "description": "Open the terminal interface in spaces; plain st opens it for humans on two terminals",
       "tests": [
         "crates/st3/src/main.rs::terminal_ui_arguments_and_help_match_the_documented_surface",
         "crates/st3/tests/typed_keys.rs::shifted_keys_are_typed_as_a_keyboard_protocol_terminal_sends_them",
@@ -2665,7 +2665,7 @@
     {
       "action": "simplify or expand tool detail",
       "tests": [
-        "crates/stui/src/ui/mod.rs::shift_o_simplifies_every_conversation_and_back"
+        "crates/stui/src/ui/mod.rs::ctrl_p_simplifies_every_conversation_and_back"
       ],
       "verification": "local UI state; no daemon mutation, restart fence not applicable"
     },
@@ -2763,6 +2763,13 @@
       "tests": [
         "crates/stui/src/ui/glass.rs::what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that",
         "crates/stui/src/ui/glass.rs::glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g"
+      ],
+      "verification": "local palette/reducer; resulting daemon effects are listed separately"
+    },
+    {
+      "action": "Usage",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::ctrl_k_opens_usage_and_the_fleet_list"
       ],
       "verification": "local palette/reducer; resulting daemon effects are listed separately"
     },

@@ -690,11 +690,12 @@ pub struct Args {
     #[arg(skip)]
     initial_subject: Option<String>,
     /// Open a named space instead of the last space used on this device.
-    #[arg(long, alias = "glass", conflicts_with = "classic")]
+    #[arg(long, alias = "glass")]
     pub space: Option<String>,
-    /// Use the layout from before spaces.
-    #[arg(long)]
-    pub classic: bool,
+    /// The layout from before spaces is gone. The flag stays hidden so an old script that
+    /// passes it is told what to run instead of failing to parse.
+    #[arg(long, hide = true)]
+    classic: bool,
     /// Show invented data without connecting to a daemon.
     #[arg(long)]
     pub demo: bool,
@@ -743,7 +744,6 @@ impl Args {
     fn render_args(&self) -> Vec<String> {
         let mut args = vec!["st ui".to_owned()];
         for (enabled, flag) in [
-            (self.classic, "--classic"),
             (self.demo, "--demo"),
             (self.local, "--local"),
             (self.client, "--client"),
@@ -771,9 +771,14 @@ impl Args {
     }
 }
 
+/// What `st ui --classic` says now that spaces are stui's only layout.
+const CLASSIC_GONE: &str =
+    "The classic layout is gone: run plain `st ui`, or `st ui --space NAME` to open a named space";
+
 /// Run the TUI before starting a CLI runtime. This owns its runtime and terminal guards,
 /// and sets the client name before any connection can initialize the shared name lock.
 pub fn run(options: Args) -> Result<()> {
+    anyhow::ensure!(!options.classic, CLASSIC_GONE);
     let process_started = std::time::Instant::now();
     if options.slo {
         ui::slo::print_history();
@@ -869,9 +874,9 @@ pub fn run(options: Args) -> Result<()> {
     runtime.spawn(feed::run_members_with_sidebar(
         clients,
         profile.is_some(),
-        ui::glass_request(&args).is_some(),
+        true,
         false,
-        ui::glass_request(&args).is_some().then(|| person.clone()).flatten(),
+        person.clone(),
         updates,
         command_receiver,
     ));
@@ -883,7 +888,7 @@ pub fn run(options: Args) -> Result<()> {
         person: person.unwrap_or_default(),
         cache_path,
         cached,
-        glass: ui::glass_request(&args),
+        space: ui::space_request(&args),
         open_timing,
         process_started,
         initial_subject: options.initial_subject.filter(|_| profile.is_none()),
@@ -895,6 +900,20 @@ pub fn run(options: Args) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn the_classic_layout_is_refused_with_what_to_run_instead() {
+        let error = run(Args {
+            classic: true,
+            ..Args::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("plain `st ui`") && error.contains("`st ui --space NAME`"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn the_timing_log_starts_with_the_wall_clock_instant_its_times_count_from() {

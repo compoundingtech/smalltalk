@@ -72,7 +72,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use screens::{Drafts, Item, ListState, Listing, TABS};
+use screens::{Drafts, Item, ListState, Listing};
 use st3_conversation_ui::pane::order;
 use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
@@ -365,7 +365,8 @@ const DRAFTS_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Ui {
     world: World,
-    tab: usize,
+    /// Each list's selection, by the section it lists (Now, Agents, Missions, Fleet, Usage,
+    /// Worktrees). Which list has the keys is never stored: `tab()` reads it off the screen.
     selected: [usize; 6],
     list_top: RefCell<[usize; 6]>,
     /// The selection each sidebar last scrolled into view. The wheel may scroll away from
@@ -383,7 +384,6 @@ pub struct Ui {
     flash: Option<(String, Instant)>,
     tick: u64,
     help: bool,
-    sidebar: bool,
     resource_sidebar: resource_sidebar::Sidebar,
     system: bool,
     frame: RefCell<FrameInfo>,
@@ -433,8 +433,11 @@ pub struct Ui {
     /// The agent details pane beside the conversation.
     /// Agents whose details pane is hidden beside their conversation; each agent its own.
     details_hidden: HashSet<String>,
-    /// The Missions tab shows the selected mission's whole declaration.
+    /// The focused mission shows its whole declaration in place of its card.
     kdl: bool,
+    /// The focus the message box was opened under: once another pane has the focus, typing
+    /// must not go on into a draft nobody can see.
+    focus_seen: (usize, Option<String>),
     /// Agents and Missions list as the graph's path tree instead of grouped by state.
     tree: bool,
     /// What the Usage tab groups by, and over how many hours.
@@ -468,11 +471,9 @@ pub struct Ui {
     drafts_backoff: Option<Instant>,
     /// The conversations whose alert band the person expanded; every other one is a single line.
     alerts_open: HashSet<String>,
-    /// `stui --glasses`: named glasses of tabs and split panes, and a palette, in place of the
-    /// sidebar layout.
-    pub(crate) glasses: Option<glass::Glasses>,
-    /// A directly opened session in the sidebar layout, independent of its agent list.
-    session_focus: Option<String>,
+    /// The spaces: named layouts of tabs and split panes, the Ctrl+S sidebar, the palette, and
+    /// Now and Usage floating over them. stui has no other layout.
+    pub(crate) glasses: glass::Glasses,
     /// The footer names this build (version, revision, age); off in tests, whose screens must
     /// not change with every commit.
     pub(crate) build: bool,
@@ -589,7 +590,7 @@ impl Ui {
     /// The caller records this only after terminal presentation succeeded.
     pub(crate) fn conversation_entry_visible(&self, target: &str) -> bool {
         if self.help || self.popover.is_some()
-            || self.glasses.as_ref().is_some_and(|glasses| glasses.palette_open())
+            || self.glasses.palette_open()
         {
             return false;
         }
@@ -605,12 +606,7 @@ impl Ui {
 
     fn quality_visible(&self) -> u8 {
         let frame = self.frame.borrow();
-        let mut visible =
-            if self.glasses.is_none() && frame.area.width >= 20 && frame.area.height >= 6 {
-                1
-            } else {
-                0
-            };
+        let mut visible = 0;
         for pane in &frame.panes {
             if !pane.entry_visible(pane.top, pane.total, &frame.covers) {
                 continue;
@@ -645,10 +641,7 @@ impl Ui {
     pub(crate) fn visible_messages(&self) -> HashSet<String> {
         if self.help
             || self.popover.is_some()
-            || self
-                .glasses
-                .as_ref()
-                .is_some_and(|glasses| glasses.palette_open())
+            || self.glasses.palette_open()
         {
             return HashSet::new();
         }
@@ -668,10 +661,7 @@ impl Ui {
     fn request_visible_content(&mut self) -> Option<content::Key> {
         if self.help
             || self.popover.is_some()
-            || self
-                .glasses
-                .as_ref()
-                .is_some_and(|glasses| glasses.palette_open())
+            || self.glasses.palette_open()
         {
             return None;
         }
@@ -714,7 +704,6 @@ impl Ui {
         resource_sidebar.observe(&world);
         Self {
             world,
-            tab: 0,
             selected: [0; 6],
             list_top: RefCell::new([0; 6]),
             list_follows: RefCell::new([None; 6]),
@@ -727,7 +716,6 @@ impl Ui {
             flash: None,
             tick: 0,
             help: false,
-            sidebar: true,
             resource_sidebar,
             system: false,
             frame: RefCell::new(FrameInfo::default()),
@@ -759,6 +747,7 @@ impl Ui {
             dictated: HashSet::new(),
             details_hidden: HashSet::new(),
             kdl: false,
+            focus_seen: (0, None),
             tree: false,
             usage_by: usage::By::default(),
             usage_hours: usage::PERIODS[0],
@@ -774,8 +763,8 @@ impl Ui {
             drafts_wrote: Instant::now(),
             drafts_backoff: None,
             alerts_open: HashSet::new(),
-            glasses: None,
-            session_focus: None,
+            // A space kept in memory only; the live loop and the demo open the device's own.
+            glasses: glass::Glasses::open(None, None),
             build: false,
             details_here: HashSet::new(),
             find: None,
@@ -798,7 +787,6 @@ impl Ui {
         }
     }
 
-    /// Replace the world, keeping each tab's selection on the same item.
     /// Note what the person did to an item from here, so its closing is not listed under Recently closed.
     pub(crate) fn note_acted(&mut self, effect: &Effect) {
         match effect {
@@ -857,13 +845,12 @@ impl Ui {
         }
     }
 
+    /// Replace the world, keeping each list's selection on the same item. Nothing here moves
+    /// the focus: Now stays open on what it showed, and the focused pane keeps its subject.
     pub fn set_world(&mut self, world: World) {
-        let tab = self.tab;
-        let mut chosen = Vec::new();
-        for index in 0..TABS.len() {
-            self.tab = index;
-            chosen.push(self.selected_id());
-        }
+        let chosen: Vec<Option<String>> = (0..self.selected.len())
+            .map(|index| self.list_selection(index))
+            .collect();
         // Only what was on screen from a live reading can have closed under the person's eyes;
         // a stored copy, or a reading before the first live one, is just replaced.
         let before = if matches!(self.world.link, Link::Live) {
@@ -875,40 +862,42 @@ impl Ui {
         if world.agents.ready().is_some_and(|agents| agents.is_empty())
             && world.missions.ready().is_some_and(|missions| missions.is_empty())
             && world.attention.ready().is_some_and(|attention| attention.is_empty())
-            && let Some(glasses) = self.glasses.as_mut()
-            && !glasses.sidebar.configured {
-            glasses.sidebar.shown = true;
+            && !self.glasses.sidebar.configured
+        {
+            self.glasses.sidebar.shown = true;
         }
         self.world = world;
         self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
-            self.tab = index;
             if let Some(id) = id
-                && let Some(position) = self.ids().iter().position(|candidate| *candidate == id)
+                && let Some(position) = self
+                    .listing_for(index, 40)
+                    .ids
+                    .iter()
+                    .position(|candidate| *candidate == id)
             {
                 self.selected[index] = position;
             }
         }
-        self.tab = tab;
-        if self.glasses.is_some() {
-            self.resync_focus();
-        }
+        // The selection followed its items; the person did not move, so a later look at the
+        // focus (st delivering the glasses again after a reconnect) must not close their box.
+        self.focus_seen = self.focus();
     }
 
-    /// The conversations to keep live, the focused one first: the selected agent's in the
-    /// sidebar layout; in a glass, every agent pane on screen, as many as st follows at once.
+    /// The conversations to keep live, the focused one first, then every agent pane on screen,
+    /// as many as st follows at once.
     pub(crate) fn live_conversations(&self) -> Vec<String> {
         let mut targets = Vec::new();
-        if self.tab == 1
+        // A person's own shell has no conversation to follow.
+        if self.tab() == 1
             && let Some(id) = self.selected_id()
+            && !id.starts_with("terminal/")
         {
             targets.push(id);
         }
-        if let Some(glasses) = &self.glasses {
-            for id in glasses.shown_agents() {
-                if !targets.contains(&id) {
-                    targets.push(id);
-                }
+        for id in self.glasses.shown_agents() {
+            if !targets.contains(&id) {
+                targets.push(id);
             }
         }
         targets.truncate(crate::feed::MAX_CONVERSATIONS);
@@ -1066,7 +1055,7 @@ impl Ui {
     /// terminal tab in front attaches (stui reopened with the tab saved, or a terminal that was
     /// let go), or turns back into the agent's conversation when the agent has no terminal.
     pub(crate) fn step_terminal_tabs(&mut self) {
-        if self.glasses.is_none() || self.home_open() {
+        if self.home_open() {
             return;
         }
         let Some(agents) = self.world.agents.ready() else {
@@ -1115,9 +1104,7 @@ impl Ui {
     pub(crate) fn usage_by_next(&mut self) {
         self.usage_by = self.usage_by.next();
         self.selected[4] = 0;
-        if let Some(glasses) = self.glasses.as_mut() {
-            glasses.sidebar.selected[4] = 0;
-        }
+        self.glasses.sidebar.selected[4] = 0;
     }
 
     /// Usage over the next period (a day, a week, thirty days); it is read again at once.
@@ -1131,29 +1118,8 @@ impl Ui {
         ));
     }
 
-    /// The period to read usage over while something on screen shows it, or `None`.
-    /// Whether the clients connected to this member show: the Fleet tab or a machine pane.
-    pub(crate) fn clients_wanted(&self) -> bool {
-        match &self.glasses {
-            Some(glasses) => glasses.shows_machine() || self.tab == 3,
-            None => self.tab == 3,
-        }
-    }
-
-    pub(crate) fn usage_wanted(&self) -> Option<u64> {
-        let shown = match &self.glasses {
-            Some(glasses) => glasses.shows_usage(),
-            None => self.tab == 4,
-        };
-        shown.then_some(self.usage_hours)
-    }
-
     pub(crate) fn inventories_wanted(&self) -> crate::feed::Inventories {
-        self.glasses.as_ref().map_or_else(|| crate::feed::Inventories {
-            clients: self.clients_wanted(), usage_hours: self.usage_wanted(),
-            machines: self.tab == 3, devices: self.tab == 3,
-            sessions: self.tab == 1 || self.tab == 3, terminals: false,
-        }, |glasses| glasses.inventories_wanted(self.tab, self.usage_hours))
+        self.glasses.inventories_wanted(self.tab(), self.usage_hours)
     }
 
     /// Details beside the conversation, or in its place when the pane is too narrow for both;
@@ -1206,7 +1172,7 @@ impl Ui {
     /// The agent whose message box has the keyboard: the selected agent while the Agents tab
     /// is the focused one.
     fn composing(&self, agent: &str) -> bool {
-        self.tab == 1 && self.selected_id().as_deref() == Some(agent)
+        self.tab() == 1 && self.selected_id().as_deref() == Some(agent)
     }
 
     /// Make the links drawn in `area` clickable: addresses written out, and markdown links by
@@ -1425,14 +1391,14 @@ impl Ui {
             return;
         }
         // A paste over an agent's conversation starts a message to it.
-        if !self.editing && self.tab == 1 && self.selected_id().is_some() {
+        if !self.editing && self.tab() == 1 && self.selected_id().is_some() {
             self.editing = true;
         }
         if !self.editing {
             return;
         }
         let Some(key) = self.draft_key() else { return };
-        if self.tab == 1
+        if self.tab() == 1
             && let Some(attachment) = attach::from_path(&text)
         {
             self.flash(format!("Attached {}", attachment.label()));
@@ -1511,7 +1477,6 @@ impl Ui {
     /// The managed agent whose conversation has the focus in a glass, when its message box is
     /// what typing reaches: not a terminal, a list, a card or an undeclared session.
     pub(crate) fn composing_agent(&self) -> Option<String> {
-        self.glasses.as_ref()?;
         let Some(Pane::Agent(Some(id))) = self.focused_pane() else {
             return None;
         };
@@ -1571,7 +1536,7 @@ impl Ui {
 
     /// The tab and the id selected in it.
     pub fn focus(&self) -> (usize, Option<String>) {
-        (self.tab, self.selected_id())
+        (self.tab(), self.selected_id())
     }
 
     fn spinner(&self) -> &'static str {
@@ -1579,7 +1544,7 @@ impl Ui {
     }
 
     fn listing(&self, width: usize) -> Listing {
-        self.listing_for(self.tab, width)
+        self.listing_for(self.tab(), width)
     }
 
     fn listing_for(&self, tab: usize, width: usize) -> Listing {
@@ -1599,13 +1564,37 @@ impl Ui {
         self.listing(40).ids
     }
 
-    fn selected_id(&self) -> Option<String> {
-        if self.tab == 1 && self.glasses.is_none() && self.session_focus.is_some() {
-            return self.session_focus.clone();
+    /// The section that has the keys, read off the screen and never stored: Now or Usage while
+    /// it floats over the space, else what the focused split shows (Now on an empty space).
+    pub(crate) fn tab(&self) -> usize {
+        if self.home_open() {
+            return if self.usage_open() { glass::USAGE_TAB } else { 0 };
         }
-        let ids = self.ids();
-        ids.get(self.selected[self.tab].min(ids.len().saturating_sub(1)))
+        match self.focused_pane() {
+            Some(Pane::List(tab)) => tab,
+            Some(Pane::NewMission) => 2,
+            Some(pane) => glass::pane_subject(&pane).map_or(0, |(tab, _)| tab),
+            None => 0,
+        }
+    }
+
+    /// The id selected in section `tab`'s list.
+    fn list_selection(&self, tab: usize) -> Option<String> {
+        let ids = self.listing_for(tab, 40).ids;
+        ids.get(self.selected[tab].min(ids.len().saturating_sub(1)))
             .cloned()
+    }
+
+    /// What the keys act on: the focused pane's own subject, or the selection in the list that
+    /// has the keys (Now's, over the space).
+    fn selected_id(&self) -> Option<String> {
+        if !self.home_open()
+            && let Some((_, Some(subject))) =
+                self.focused_pane().as_ref().and_then(glass::pane_subject)
+        {
+            return Some(subject);
+        }
+        self.list_selection(self.tab())
     }
 
     fn flash(&mut self, message: impl Into<String>) {
@@ -1666,7 +1655,7 @@ impl Ui {
     }
 
     fn draft_key(&self) -> Option<String> {
-        if self.tab == 1 {
+        if self.tab() == 1 {
             self.selected_id()
         } else {
             self.attention_focus()
@@ -1694,28 +1683,7 @@ impl Ui {
             );
             return;
         }
-        if self.glasses.is_some() {
-            self.render_glass(buf, area);
-        } else {
-            self.top_bar(buf, Rect { height: 1, ..area });
-            self.top_bar_border(buf, area);
-            self.draw_body(
-                buf,
-                Rect {
-                    y: area.y + 2,
-                    height: area.height - 3,
-                    ..area
-                },
-            );
-            self.footer(
-                buf,
-                Rect {
-                    y: area.y + area.height - 1,
-                    height: 1,
-                    ..area
-                },
-            );
-        }
+        self.render_glass(buf, area);
         if let Some(subject) = &self.popover {
             self.draw_popover(buf, area, subject);
         }
@@ -1746,10 +1714,10 @@ impl Ui {
         self.terminal_cursor.get().map(|cursor| cursor.style)
     }
 
-    /// The sidebar and the main area under the top bar.
+    /// Now (or Usage) as it floats over the space: its list beside the selected card.
     fn draw_body(&self, buf: &mut Buffer, body: Rect) {
         let area = body;
-        let side = if self.sidebar && area.width >= 70 {
+        let side = if area.width >= 70 {
             (area.width * 3 / 10).clamp(30, 46)
         } else {
             0
@@ -1759,7 +1727,7 @@ impl Ui {
                 width: side,
                 ..body
             };
-            self.draw_pane(buf, sidebar, &Pane::List(self.tab));
+            self.draw_pane(buf, sidebar, &Pane::List(self.tab()));
             for y in body.y..body.y + body.height {
                 buf[(area.x + side, y)]
                     .set_symbol("│")
@@ -1789,151 +1757,12 @@ impl Ui {
         self.frame.borrow_mut().hits.push((rect, hit));
     }
 
-    /// A soft, single-row edge between the top bar and the content in either layout.
+    /// A soft, single-row edge between the top bar and the content.
     fn top_bar_border(&self, buf: &mut Buffer, area: Rect) {
         for x in area.x..area.right() {
             buf[(x, area.y + 1)]
                 .set_symbol("─")
                 .set_style(theme::fg(theme::OVERLAY0).bg(theme::BASE));
-        }
-    }
-
-    fn top_bar(&self, buf: &mut Buffer, area: Rect) {
-        buf.set_style(area, Style::default().bg(theme::CRUST));
-        let mut x = area.x;
-        buf.set_stringn(
-            x,
-            area.y,
-            " ≡ st ",
-            6,
-            theme::strong(theme::ACCENT).bg(theme::CRUST),
-        );
-        self.hit(Rect { width: 6, ..area }, Hit::Key('s'));
-        x += 7;
-        for (index, name) in TABS.iter().enumerate() {
-            let badge = match index {
-                0 => self
-                    .world
-                    .attention
-                    .ready()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter(|item| !self.snoozed.contains(&item.id))
-                            .fold((0, false), |(total, blocking), item| {
-                                (total + 1, blocking || item.tier == Tier::Stopped)
-                            })
-                    })
-                    .filter(|(total, _)| *total > 0),
-                _ => None,
-            };
-            let label = format!(" {} {name} ", index + 1);
-            let selected = index == self.tab;
-            let style = if selected {
-                Style::default()
-                    .fg(theme::CRUST)
-                    .bg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::SUBTEXT0).bg(theme::CRUST)
-            };
-            let start = x;
-            buf.set_stringn(
-                x,
-                area.y,
-                &label,
-                area.width.saturating_sub(x) as usize,
-                style,
-            );
-            x += text::width(&label) as u16;
-            if let Some((count, blocking)) = badge {
-                let badge = if blocking {
-                    format!("◆{count} ")
-                } else {
-                    format!("{count} ")
-                };
-                buf.set_stringn(
-                    x,
-                    area.y,
-                    &badge,
-                    4,
-                    Style::default()
-                        .fg(if selected {
-                            theme::CRUST
-                        } else if blocking {
-                            theme::PERSON
-                        } else {
-                            theme::SUBTEXT0
-                        })
-                        .bg(if selected {
-                            theme::ACCENT
-                        } else {
-                            theme::CRUST
-                        })
-                        .add_modifier(Modifier::BOLD),
-                );
-                x += text::width(&badge) as u16;
-            }
-            if index == 5 {
-                // The graph has no worktrees yet; this tab shows invented data and says so.
-                buf.set_stringn(
-                    x,
-                    area.y,
-                    " demo ",
-                    6,
-                    Style::default()
-                        .fg(theme::CRUST)
-                        .bg(theme::YELLOW)
-                        .add_modifier(Modifier::BOLD),
-                );
-                x += 6;
-            }
-            self.hit(
-                Rect {
-                    x: start,
-                    width: x - start,
-                    ..area
-                },
-                Hit::Tab(index),
-            );
-            x += 1;
-        }
-        let (glyph, word, color) = match &self.world.link {
-            // Live, but showing a graph that exchanges cannot correct.
-            Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
-            Link::Live if !self.world.stale.is_empty() => ("◐", "stale", theme::YELLOW),
-            Link::Live => ("●", "live", theme::GREEN),
-            Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
-            Link::Offline(_) => ("○", "offline", theme::RED),
-        };
-        let person = self.world.person.trim_start_matches("person/");
-        let right = format!("{glyph} {word}  {} · {person} ", self.world.host);
-        let width = text::width(&right) as u16;
-        if x + width < area.x + area.width {
-            let start = area.x + area.width - width;
-            buf.set_stringn(
-                start,
-                area.y,
-                format!("{glyph} {word}"),
-                20,
-                Style::default().fg(color).bg(theme::CRUST),
-            );
-            let rest = format!("  {} · {person} ", self.world.host);
-            buf.set_stringn(
-                start + text::width(&format!("{glyph} {word}")) as u16,
-                area.y,
-                rest,
-                40,
-                Style::default().fg(theme::OVERLAY1).bg(theme::CRUST),
-            );
-            self.hit(
-                Rect {
-                    x: start,
-                    width: text::width(&format!("{glyph} {word}")) as u16,
-                    ..area
-                },
-                Hit::Connection,
-            );
         }
     }
 
@@ -1949,10 +1778,7 @@ impl Ui {
             );
             return;
         }
-        let sidebar = self
-            .glasses
-            .as_ref()
-            .is_some_and(|glasses| glasses.sidebar.shown && glasses.sidebar.focused);
+        let sidebar = self.glasses.sidebar.shown && self.glasses.sidebar.focused;
         let hints: Vec<(&str, &str)> = if sidebar && !self.editing {
             vec![
                 ("↑↓", "select"),
@@ -1988,7 +1814,7 @@ impl Ui {
                     ("ctrl+alt+r", "reset modes"),
                 ]
             }
-        } else if self.new_mission.is_some() && self.tab == 2 {
+        } else if self.new_mission.is_some() && self.tab() == 2 {
             vec![
                 ("tab", "next field"),
                 ("alt+enter", "new line"),
@@ -2005,33 +1831,15 @@ impl Ui {
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
-            // In a space the footer names only the keys that move around (Nathan, 2026-10-03);
-            // each pane's own keys are on the pane and in ? help.
-            if self.glasses.is_some() {
-                vec![
-                    ("ctrl+k", "open"),
-                    ("tab", "tabs"),
-                    ("alt+←→↑↓", "splits"),
-                    ("ctrl+w", "close"),
-                    ("?", "help"),
-                ]
-            } else {
-                let mut hints = vec![("1-5", "tabs"), ("↑↓", "select")];
-                match self.tab {
-                    0 => hints.extend([("keys", "on the card"), ("c", "write")]),
-                    1 => hints.extend([
-                        ("c", "message"),
-                        ("i", "details"),
-                        ("o", "expand tools"),
-                        ("end", "latest"),
-                        ("drag", "select + copy"),
-                    ]),
-                    2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
-                    _ => {}
-                }
-                hints.extend([("?", "help"), ("q", "quit")]);
-                hints
-            }
+            // The footer names only the keys that move around (Nathan, 2026-10-03); each
+            // pane's own keys are on the pane and in ? help.
+            vec![
+                ("ctrl+k", "open"),
+                ("tab", "tabs"),
+                ("alt+←→↑↓", "splits"),
+                ("ctrl+w", "close"),
+                ("?", "help"),
+            ]
         };
         // The build, always at the right edge; the hints give way to it.
         let build = self
@@ -2370,7 +2178,7 @@ impl Ui {
     /// The attention item the current screen acts on: the Home selection, or the decision
     /// embedded in the selected mission.
     fn attention_focus(&self) -> Option<String> {
-        match self.tab {
+        match self.tab() {
             0 => self.selected_id(),
             2 => self.mission_decision(&self.selected_id()?),
             _ => None,
@@ -2454,28 +2262,19 @@ impl Ui {
         }
     }
 
-    /// What the main area shows for the current tab and selection.
+    /// What the focused split draws: its own pane (a mission as its card or its declaration),
+    /// or Now or Usage while it floats over the space.
     fn main_pane(&self) -> Pane {
-        let id = self.selected_id();
-        match self.tab {
-            0 => Pane::Home(id),
-            // In spaces an attached terminal is its own tab's: another tab shows what it holds,
-            // and the terminal stays attached behind it (Nathan, 2026-10-02).
-            1 => match &self.terminal {
-                Some(view)
-                    if self.glasses.is_none()
-                        || self.focused_pane() == Some(Pane::Terminal(view.agent.clone())) =>
-                {
-                    Pane::Terminal(view.agent.clone())
-                }
-                _ => Pane::Agent(id),
-            },
-            2 if self.new_mission.is_some() => Pane::NewMission,
-            2 if self.kdl => Pane::Declaration(id),
-            2 => Pane::Mission(id),
-            3 => Pane::Machine(id.map(|name| format!("machine/{name}"))),
-            4 => Pane::Usage(id),
-            _ => Pane::Worktree(id),
+        if self.home_open() {
+            let id = self.selected_id();
+            return if self.usage_open() { Pane::Usage(id) } else { Pane::Home(id) };
+        }
+        match self.focused_pane() {
+            // A mission's k swaps its card and its whole declaration in the same tab.
+            Some(Pane::Mission(id)) if self.kdl => Pane::Declaration(id),
+            Some(Pane::Declaration(id)) if !self.kdl => Pane::Mission(id),
+            Some(pane) => pane,
+            None => Pane::Home(self.list_selection(0)),
         }
     }
 
@@ -2651,8 +2450,8 @@ impl Ui {
             theme::fg(theme::SURFACE0),
         );
         if !agent.unmanaged && (!narrow || self.composing(&agent.id)) {
-            // In a space, letters type: details is a chord.
-            let key = if self.glasses.is_some() { "ctrl+d" } else { "i" };
+            // Letters type: details is a chord.
+            let key = "ctrl+d";
             let label = if narrow {
                 format!(" {key} details ")
             } else if !self.details_hidden.contains(&agent.id) {
@@ -3571,15 +3370,7 @@ impl Ui {
         }
         if draft.is_empty() && !editing {
             let hint = if self.composing(&agent.id) {
-                format!(
-                    "Message {} · {}",
-                    agent.name,
-                    if self.glasses.is_some() {
-                        "type or click"
-                    } else {
-                        "c or click"
-                    }
-                )
+                format!("Message {} · type or click", agent.name)
             } else {
                 format!("Message {} · click", agent.name)
             };
@@ -3696,32 +3487,24 @@ impl Ui {
                 ("q", "quit"),
             ],
         );
-        if self.glasses.is_some() {
-            keys(
-                &mut left,
-                "spaces",
-                &[
-                    ("ctrl+t", "open something in a new tab"),
-                    ("ctrl+v  ctrl+x", "split right; split below"),
-                    ("ctrl+w", "close the tab"),
-                    ("[ ]  ctrl+pgup pgdn", "previous, next tab in the split"),
-                    (
-                        "alt+arrows",
-                        "move between splits; left of the first is the sidebar",
-                    ),
-                    ("ctrl+o", "zoom the split, and back"),
-                    ("ctrl+s", "show or hide the sidebar"),
-                    ("ctrl+g", "another space, or a new one"),
-                    ("1-5", "open the palette at a section"),
-                ],
-            );
-        } else {
-            keys(
-                &mut left,
-                "classic",
-                &[("1-5  tab", "switch tabs"), ("s", "hide or show the list")],
-            );
-        }
+        keys(
+            &mut left,
+            "spaces",
+            &[
+                ("ctrl+t", "open something in a new tab"),
+                ("ctrl+v  ctrl+x", "split right; split below"),
+                ("ctrl+w", "close the tab"),
+                ("[ ]  ctrl+pgup pgdn", "previous, next tab in the split"),
+                (
+                    "alt+arrows",
+                    "move between splits; left of the first is the sidebar",
+                ),
+                ("ctrl+o", "zoom the split, and back"),
+                ("ctrl+s", "show or hide the sidebar"),
+                ("ctrl+g", "another space, or a new one"),
+                ("1-5", "open the palette at a section"),
+            ],
+        );
         let mut right = Doc::new();
         keys(
             &mut right,
@@ -3746,7 +3529,7 @@ impl Ui {
         );
         keys(
             &mut right,
-            "a conversation (in a space, letters type; commands are chords)",
+            "a conversation (letters type; commands are chords)",
             &[
                 ("type", "any letter starts a message to the agent"),
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
@@ -3942,55 +3725,22 @@ impl Ui {
     }
 
     fn select(&mut self, index: usize) {
-        self.session_focus = None;
         self.answering = None;
         let count = self.ids().len();
         if count == 0 {
             return;
         }
-        self.selected[self.tab] = index.min(count - 1);
+        self.selected[self.tab()] = index.min(count - 1);
         self.editing = false;
         self.chat = None;
         self.confirm = None;
         self.conversation_state.selection = None;
     }
 
-    fn switch_tab(&mut self, tab: usize) {
-        self.session_focus = None;
-        self.answering = None;
-        self.tab = tab.min(TABS.len() - 1);
-        self.editing = false;
-        self.chat = None;
-        self.popover = None;
-        self.kdl = false;
-        self.confirm = None;
-        self.conversation_state.selection = None;
-    }
-
+    /// A subject opens as its own tab in the focused split, or is focused where it already is.
     fn open(&mut self, id: &str) {
-        // Inside a glass, a subject opens as its own tab rather than moving a sidebar.
-        if self.glasses.is_some()
-            && let Some(pane) = glass::pane_for(id)
-        {
+        if let Some(pane) = glass::pane_for(id) {
             self.open_in_glass(pane, glass::Open::Tab);
-            return;
-        }
-        let tab = if id.starts_with("attention/") {
-            0
-        } else if id.starts_with("mission/") {
-            2
-        } else if id.starts_with("machine/") {
-            3
-        } else {
-            1
-        };
-        self.switch_tab(tab);
-        if id.starts_with("session/") {
-            self.session_focus = Some(id.to_owned());
-            return;
-        }
-        if let Some(index) = self.ids().iter().position(|candidate| candidate == id) {
-            self.select(index);
         }
     }
 
@@ -4165,8 +3915,6 @@ impl Ui {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
-        if self.glasses.is_none() && self.resource_sidebar.focused && self.resource_sidebar_key(key) { return; }
-
         let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
         if self.terminal_hold.is_some() {
             if ctrl_t && key.kind != KeyEventKind::Press {
@@ -4476,7 +4224,7 @@ impl Ui {
                 // Ctrl+Y speaks into the input instead of typing.
                 KeyCode::Char('y') if control => self.start_voice(),
                 // Ctrl+V while writing to an agent attaches the clipboard's image.
-                KeyCode::Char('v') if control && self.tab == 1 => self.attach_clipboard(),
+                KeyCode::Char('v') if control && self.tab() == 1 => self.attach_clipboard(),
                 // Backspace in an empty box takes back the last image.
                 KeyCode::Backspace
                     if empty
@@ -4500,29 +4248,21 @@ impl Ui {
             }
             return;
         }
+        // The keys of what has them: Now's list and card over the space, or the focused pane.
+        // There are no sections to switch: a key never shows a list or card that is not open.
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            // Ctrl+H is Home; in a text box it stays backspace.
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.switch_tab(0)
-            }
             KeyCode::Char('?') => self.help = true,
-            // Without Ctrl: Ctrl+5 is how terminals send Ctrl+], which attaches.
-            KeyCode::Char(digit @ '1'..='5') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.switch_tab(digit as usize - '1' as usize)
-            }
-            KeyCode::Tab => self.switch_tab((self.tab + 1) % TABS.len()),
-            KeyCode::BackTab => self.switch_tab((self.tab + TABS.len() - 1) % TABS.len()),
-            KeyCode::Up if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.focus_tool(-1),
-            KeyCode::Down if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.focus_tool(1),
+            KeyCode::Up if self.tab() == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.focus_tool(-1),
+            KeyCode::Down if self.tab() == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.focus_tool(1),
             KeyCode::Up | KeyCode::Char('k') => {
-                self.select(self.selected[self.tab].saturating_sub(1))
+                self.select(self.selected[self.tab()].saturating_sub(1))
             }
             KeyCode::Down | KeyCode::Char('j')
-                if !(self.tab == 0 && self.current_kind() == Some("revision"))
+                if !(self.tab() == 0 && self.current_kind() == Some("revision"))
                     || key.code == KeyCode::Down =>
             {
-                self.select(self.selected[self.tab] + 1)
+                self.select(self.selected[self.tab()] + 1)
             }
             KeyCode::PageUp => self.scroll_main(-(self.page() as isize)),
             KeyCode::PageDown => self.scroll_main(self.page() as isize),
@@ -4531,35 +4271,33 @@ impl Ui {
                 self.follow_latest();
                 self.scroll_main(100_000);
             }
-            // Classic's list; in spaces only Ctrl+S has a sidebar.
-            KeyCode::Char('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
-            KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
-            KeyCode::Enter if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.toggle_focused_tool(),
-            KeyCode::Char('u') if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.toggle_focused_images(),
-            KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
+            KeyCode::Char('x') if self.tab() == 2 => self.system = !self.system,
+            KeyCode::Enter if self.tab() == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.toggle_focused_tool(),
+            KeyCode::Char('u') if self.tab() == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => self.toggle_focused_images(),
+            KeyCode::Char('o') if self.tab() == 1 => self.toggle_all_tools(),
             KeyCode::Char('O') => self.toggle_simple(),
-            KeyCode::Char('/') if self.tab == 1 => {
+            KeyCode::Char('/') if self.tab() == 1 => {
                 if let Some(agent) = self.selected_id() {
                     self.find_in(&agent, "");
                 }
             }
-            KeyCode::Char(letter @ ('r' | 'x')) if self.tab == 1 && self.live => {
+            KeyCode::Char(letter @ ('r' | 'x')) if self.tab() == 1 && self.live => {
                 match self.undelivered() {
                     Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
                     Some(entry) => self.effects.push(Effect::Forget { entry }),
                     None => {}
                 }
             }
-            KeyCode::Char('i') if self.tab == 1 => self.toggle_details(),
-            KeyCode::Char('b') if self.tab == 4 => self.usage_by_next(),
-            KeyCode::Char('p') if self.tab == 4 => self.usage_period_next(),
-            KeyCode::Char('t') if matches!(self.tab, 1 | 2) => {
+            KeyCode::Char('i') if self.tab() == 1 => self.toggle_details(),
+            KeyCode::Char('b') if self.tab() == 4 => self.usage_by_next(),
+            KeyCode::Char('p') if self.tab() == 4 => self.usage_period_next(),
+            KeyCode::Char('t') if matches!(self.tab(), 1 | 2) => {
                 let id = self.selected_id();
                 self.tree = !self.tree;
                 if let Some(index) =
                     id.and_then(|id| self.ids().iter().position(|candidate| *candidate == id))
                 {
-                    self.selected[self.tab] = index;
+                    self.selected[self.tab()] = index;
                 }
                 self.flash(if self.tree {
                     "Tree view · t for groups"
@@ -4570,14 +4308,12 @@ impl Ui {
             // Ctrl+] attaches the agent's terminal, beside Ctrl+\ that leaves it; terminals send
             // it as 0x1d, which crossterm reports as Ctrl+5. Enter was too easy to hit by mistake.
             KeyCode::Char(']' | '5')
-                if self.tab == 1 && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if self.tab() == 1 && key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 self.open_terminal()
             }
-            KeyCode::Char('n') if self.tab == 2 => {
-                self.new_mission = Some((Default::default(), 0));
-            }
-            KeyCode::Enter if self.tab == 2 => {
+            KeyCode::Char('n') if self.tab() == 2 => self.open_new_mission(),
+            KeyCode::Enter if self.tab() == 2 => {
                 if let Some(decision) = self.selected_id().and_then(|id| {
                     self.world
                         .missions
@@ -4657,12 +4393,10 @@ impl Ui {
     }
 
     fn content_conversation(&self) -> Option<String> {
-        if self.glasses.is_some() {
-            match self.focused_pane()? {
-                Pane::Agent(id) => id,
-                _ => None,
-            }
-        } else if self.tab == 1 { self.selected_id() } else { None }
+        match self.focused_pane()? {
+            Pane::Agent(id) => id,
+            _ => None,
+        }
     }
 
     fn focused_tool(&self, conversation: &str) -> Option<String> {
@@ -4774,7 +4508,7 @@ impl Ui {
     }
 
     fn action_key(&mut self, key: char) {
-        if self.tab == 2 {
+        if self.tab() == 2 {
             match key {
                 'k' => {
                     self.kdl = !self.kdl;
@@ -4791,7 +4525,7 @@ impl Ui {
                 _ => {}
             }
         }
-        match self.tab {
+        match self.tab() {
             0 | 2 if self.attention_focus().is_some() => {
                 let Some(kind) = self.current_kind() else {
                     return;
@@ -4810,7 +4544,7 @@ impl Ui {
                         if let Load::Ready(items) = &mut self.world.attention {
                             items.retain(|item| item.id != id);
                         }
-                        let index = self.selected[self.tab];
+                        let index = self.selected[self.tab()];
                         self.select(index);
                     } else {
                         self.flash("This was closed and stays under Recently closed until you clear it with x");
@@ -4925,15 +4659,10 @@ impl Ui {
             self.attach_terminal(&id);
             return;
         }
-        // In glasses it is the focused pane's own agent, never the list's selection, which can
-        // be another agent's.
-        let subject = if self.glasses.is_some() {
-            match self.focused_pane() {
-                Some(Pane::Agent(Some(id)) | Pane::Terminal(id)) => Some(id),
-                _ => None,
-            }
-        } else {
-            self.selected_id()
+        // The focused pane's own agent, never a list's selection, which can be another agent's.
+        let subject = match self.focused_pane() {
+            Some(Pane::Agent(Some(id)) | Pane::Terminal(id)) => Some(id),
+            _ => None,
         };
         let Some(agent) = subject.and_then(|id| {
             self.world
@@ -4949,23 +4678,19 @@ impl Ui {
             self.flash(format!("{} has no terminal to open", agent.name));
             return;
         }
-        // In glasses the agent's tab turns into its terminal, and Ctrl+\ turns it back.
-        if self.glasses.is_some() {
-            match self.focused_pane() {
-                Some(Pane::Terminal(id)) if id == agent.id => {}
-                // One tab for each thing: a terminal already open in a tab is focused, not
-                // opened a second time.
-                Some(Pane::Agent(Some(id))) if id == agent.id => {
-                    if self.shows_in_glass(&Pane::Terminal(agent.id.clone())) {
-                        self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab)
-                    } else {
-                        self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
-                    }
+        // The agent's tab turns into its terminal, and Ctrl+\ turns it back.
+        match self.focused_pane() {
+            Some(Pane::Terminal(id)) if id == agent.id => {}
+            // One tab for each thing: a terminal already open in a tab is focused, not opened
+            // a second time.
+            Some(Pane::Agent(Some(id))) if id == agent.id => {
+                if self.shows_in_glass(&Pane::Terminal(agent.id.clone())) {
+                    self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab)
+                } else {
+                    self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
                 }
-                _ => self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab),
             }
-            self.attach_terminal(&agent.id);
-            return;
+            _ => self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab),
         }
         self.attach_terminal(&agent.id);
     }
@@ -4985,13 +4710,12 @@ impl Ui {
         self.parked.iter_mut().find(|view| view.agent == agent)
     }
 
-    /// About to attach `agent`: in a glass another attached terminal stays attached behind its
-    /// own tab (Nathan, 2026-10-06: two terminals in two splits); elsewhere it is let go.
+    /// About to attach `agent`: another attached terminal stays attached behind its own tab
+    /// (Nathan, 2026-10-06: two terminals in two splits).
     pub(crate) fn park_for(&mut self, agent: &str) {
         self.parked.retain(|view| view.agent != agent);
         if let Some(old) = self.terminal.take()
             && old.agent != agent
-            && self.glasses.is_some()
         {
             self.parked.push(old);
         }
@@ -4999,7 +4723,7 @@ impl Ui {
 
     /// Put the terminal whose tab has focus in `terminal`, where keys and the mouse find it.
     pub(crate) fn sync_terminal_slot(&mut self) {
-        if self.glasses.is_none() || self.parked.is_empty() {
+        if self.parked.is_empty() {
             return;
         }
         let Some(Pane::Terminal(agent)) = self.focused_pane() else {
@@ -5095,16 +4819,12 @@ impl Ui {
     }
 
     /// st started the agent asked for here: its conversation replaces the form.
-    /// The new mission form: in a new tab of the focused split in a glass, on Missions otherwise.
+    /// The new mission form, in a new tab of the focused split.
     pub(crate) fn open_new_mission(&mut self) {
         if self.new_mission.is_none() {
             self.new_mission = Some((Default::default(), 0));
         }
-        if self.glasses.is_some() {
-            self.open_in_glass(Pane::NewMission, glass::Open::Tab);
-        } else {
-            self.switch_tab(2);
-        }
+        self.open_in_glass(Pane::NewMission, glass::Open::Tab);
     }
 
     /// Start a plain shell for the person, opened in a new tab once st has it.
@@ -5121,9 +4841,7 @@ impl Ui {
 
     /// st started a shell asked for here: it opens in a new tab, attached.
     pub(crate) fn terminal_started(&mut self, id: String) {
-        if self.glasses.is_some() {
-            self.open_in_glass(Pane::Terminal(id.clone()), glass::Open::Tab);
-        }
+        self.open_in_glass(Pane::Terminal(id.clone()), glass::Open::Tab);
         self.attach_terminal(&id);
     }
 
@@ -5293,7 +5011,7 @@ impl Ui {
 
     fn submit(&mut self) {
         let Some(id) = self.draft_key() else { return };
-        let images = if self.tab == 1 {
+        let images = if self.tab() == 1 {
             self.attachments.get(&id).cloned().unwrap_or_default()
         } else {
             Vec::new()
@@ -5324,7 +5042,7 @@ impl Ui {
         };
         // A message st will not take is not sent, and the box keeps it.
         if self.live
-            && self.tab == 1
+            && self.tab() == 1
             && let Some(limit) = self.message_limit
             && draft.len() > limit
         {
@@ -5349,11 +5067,10 @@ impl Ui {
                 draft.push_str(&attach::mention(&images));
             }
         }
-        // In a space a send leaves the box, since any letter opens it again (Nathan,
-        // 2026-10-03); the classic layout keeps it focused until Esc.
-        let leave_box = self.tab != 1 || self.composing_agent().is_some();
+        // A send leaves the box, since any letter opens it again (Nathan, 2026-10-03).
+        let leave_box = self.tab() != 1 || self.composing_agent().is_some();
         if self.live {
-            let effect = match self.tab {
+            let effect = match self.tab() {
                 1 => Some(Effect::Send {
                     agent: id.clone(),
                     in_reply_to: self.replies.remove(&id),
@@ -5439,7 +5156,7 @@ impl Ui {
             }
             return;
         }
-        match self.tab {
+        match self.tab() {
             1 => {
                 self.replies.remove(&id);
                 let name = self
@@ -5482,7 +5199,7 @@ impl Ui {
 
     /// The agent whose conversation is shown, by name, while it is working.
     fn working_agent(&self) -> Option<String> {
-        if self.tab != 1 || self.terminal_focused() {
+        if self.tab() != 1 || self.terminal_focused() {
             return None;
         }
         let id = self.selected_id()?;
@@ -5570,7 +5287,7 @@ impl Ui {
         }
         if action == 's' {
             // Stop the agent's turn: its harness gets Esc, as in its own TUI.
-            let Some(agent) = self.selected_id().filter(|_| self.tab == 1) else {
+            let Some(agent) = self.selected_id().filter(|_| self.tab() == 1) else {
                 return;
             };
             if self.live {
@@ -5596,7 +5313,7 @@ impl Ui {
             return;
         }
         if action == 'X' {
-            let Some(mission) = self.selected_id().filter(|_| self.tab == 2) else {
+            let Some(mission) = self.selected_id().filter(|_| self.tab() == 2) else {
                 return;
             };
             if self.live {
@@ -5711,7 +5428,7 @@ impl Ui {
                 }
             }
         }
-        if self.tab == 0 {
+        if self.tab() == 0 {
             self.select(self.selected[0]);
         }
         self.flash(format!("{message} · demo: nothing was sent"));
@@ -6150,7 +5867,6 @@ impl Ui {
                 self.open_palette(None, glass::Open::Tab);
             }
             Hit::PaletteChoice(index) => self.open_choice(Some(index), glass::Open::Here),
-            Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
             Hit::NewTerminal => self.open_new_terminal(),
             Hit::ResourceRow(index) => self.open_resource_row(index),
@@ -6161,23 +5877,19 @@ impl Ui {
             Hit::ResourceFilter => {
                 self.resource_sidebar.focused = true;
                 self.resource_sidebar.filtering = true;
-                if let Some(glasses) = self.glasses.as_mut() { glasses.sidebar.focused = true; }
+                self.glasses.sidebar.focused = true;
             }
             Hit::SidebarRow(index) => {
-                if let Some(glasses) = self.glasses.as_mut() {
-                    let sidebar = &mut glasses.sidebar;
-                    sidebar.selected[sidebar.section] = index;
-                }
+                let sidebar = &mut self.glasses.sidebar;
+                sidebar.selected[sidebar.section] = index;
                 self.open_from_sidebar();
             }
             Hit::Usage => self.toggle_usage(),
             Hit::Connection => self.show_connection(),
             Hit::Menu(action) => self.run_menu_action(action),
             Hit::SidebarSection(section) => {
-                if let Some(glasses) = self.glasses.as_mut() {
-                    glasses.sidebar.section = section;
-                    glasses.sidebar.focused = true;
-                }
+                self.glasses.sidebar.section = section;
+                self.glasses.sidebar.focused = true;
             }
             Hit::Actions(agent) => self.popover = Some(format!("actions:{agent}")),
             Hit::Key(key)
@@ -6206,7 +5918,6 @@ impl Ui {
                     *focus = (*focus + 1) % 4;
                 }
             }
-            Hit::Key('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
             // "↑↓ Another" while an answer is being chosen goes to the next one, round again.
             Hit::Key('a') if self.answering.is_some() => {
                 let count = self
@@ -6420,7 +6131,7 @@ impl Ui {
             }
             return;
         }
-        let viewing = (self.tab == 1)
+        let viewing = (self.tab() == 1)
             .then(|| {
                 let ids = screens::agent_order(&self.world)
                     .into_iter()
@@ -6658,8 +6369,8 @@ fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
 impl Guard {
     /// Take over the terminal, and start the watch that ends stui once its terminal is gone so
     /// a stuck read can never outlive it. `keys`: ask the terminal to report modifiers it
-    /// usually keeps, such as Cmd on macOS, where it can (kitty's keyboard protocol). Only
-    /// glasses ask, for Cmd+K.
+    /// usually keeps, such as Cmd on macOS, where it can (kitty's keyboard protocol). The
+    /// spaces ask, for Cmd+K; the setup checklist does not.
     fn enter(keys: bool) -> Result<Self> {
         crate::watch_terminal_hangup();
         enable_raw_mode()?;
@@ -6706,14 +6417,10 @@ impl Drop for Guard {
     }
 }
 
-/// Which space to open: `stui --space NAME` names one; otherwise the last one used on this
-/// device (`Some(None)`). Spaces are how stui works; `--classic` keeps the old layout for a
-/// while (`None`). The older `--glass` and `--glasses` still work.
-pub fn glass_request(args: &[String]) -> Option<Option<String>> {
-    if args.iter().any(|arg| arg == "--classic") {
-        return None;
-    }
-    Some(arg(args, "--space").or_else(|| arg(args, "--glass")))
+/// Which space to open: `stui --space NAME` names one; otherwise (`None`) the last one used on
+/// this device. The older `--glass` still works.
+pub fn space_request(args: &[String]) -> Option<String> {
+    arg(args, "--space").or_else(|| arg(args, "--glass"))
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -6728,18 +6435,14 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "--dump") {
         return dump(args);
     }
-    let glass = glass_request(args);
-    let _guard = Guard::enter(glass.is_some())?;
+    let _guard = Guard::enter(true)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let mut ui = Ui::new(demo::loading());
     ui.load_prefs();
-    // The demo keeps its glasses in memory only, and shows the sidebar as a new device does.
-    ui.glasses = glass.map(|name| {
-        let mut glasses = glass::Glasses::open(name, None);
-        glasses.sidebar.shown = true;
-        glasses
-    });
+    // The demo keeps its spaces in memory only, and shows the sidebar as a new device does.
+    ui.glasses = glass::Glasses::open(space_request(args), None);
+    ui.glasses.sidebar.shown = true;
     ui.demo = Some(Demo {
         started: Instant::now(),
         loaded: false,
@@ -6794,7 +6497,7 @@ fn dump(args: &[String]) -> Result<()> {
     } else {
         demo::world()
     });
-    ui.glasses = glass_request(args).map(|name| glass::Glasses::open(name, None));
+    ui.glasses = glass::Glasses::open(space_request(args), None);
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     // Keys: each character is a key; "\n" is Enter, "<esc>", "<end>", "<pgdn>", "<pgup>", "<down>";
     // "<c-k>" is Ctrl+K and "<a-1>" Alt+1.
@@ -6888,10 +6591,33 @@ fn dump(args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Show section `tab`'s selection as a person does in a space: Now or Usage floating over
+    /// it, or the selected subject in its own tab, focused.
+    fn show(ui: &mut Ui, tab: usize) {
+        match tab {
+            0 => ui.open_home(),
+            4 => {
+                if !ui.usage_open() {
+                    ui.toggle_usage();
+                }
+            }
+            _ => {
+                let id = ui.list_selection(tab).expect("the list has a selection");
+                let pane = match tab {
+                    1 => Pane::Agent(Some(id)),
+                    2 => Pane::Mission(Some(id)),
+                    3 => Pane::Machine(Some(format!("machine/{id}"))),
+                    _ => Pane::Worktree(Some(id)),
+                };
+                ui.open_in_glass(pane, glass::Open::Tab);
+            }
+        }
+    }
+
     #[test]
     fn first_useful_conversation_requires_a_rendered_entry_not_a_placeholder() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         let target = ui.selected_id().unwrap();
         let entries = ui.world.conversations.get(&target).unwrap().clone();
         for state in [Load::Loading, Load::Failed("unavailable".into()), Load::Ready(Vec::new())] {
@@ -6926,7 +6652,7 @@ mod tests {
 
     fn expand_all_viewport_fixture() -> (Ui, String) {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         let conversation = ui.selected_id().unwrap();
         let items = [
             ("one", Some("size-limit")),
@@ -7031,7 +6757,7 @@ mod tests {
         );
         assert!(ui.next_content_read(&mut reads).is_none());
         ui.conversation_state.expanded.clear();
-        ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         let first = ui.next_content_read(&mut reads).unwrap();
         assert_eq!(first.reference, "one");
         assert!(ui.next_content_read(&mut reads).is_none());
@@ -7064,7 +6790,7 @@ mod tests {
             "load only after it scrolls into view"
         );
         assert!(ui.content.request_tool(&conversation, "one").is_empty());
-        ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(!ui.content.is_loading(&third));
         assert!(ui.next_content_read(&mut reads).is_none());
         reads.complete(&third);
@@ -7126,8 +6852,6 @@ mod tests {
     fn glasses_ctrl_e_loads_visible_clipped_output_and_collapse_releases_it() {
         let (mut ui, conversation) = expand_all_viewport_fixture();
         let mut reads = content::Reads::default();
-        ui.glasses = Some(glass::Glasses::open(None, None));
-        ui.open_in_glass(Pane::Agent(Some(conversation.clone())), glass::Open::Tab);
         ui.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(ui.content.expanded_all.contains(&conversation));
         let first = ui.next_content_read(&mut reads).unwrap();
@@ -7146,7 +6870,7 @@ mod tests {
     fn expand_all_does_not_load_a_viewport_hidden_by_an_opaque_layer() {
         let (mut ui, _) = expand_all_viewport_fixture();
         let mut reads = content::Reads::default();
-        ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         {
             let mut frame = ui.frame.borrow_mut();
             let rect = frame.panes[0].rect;
@@ -7174,7 +6898,7 @@ mod tests {
     #[test]
     fn focused_tool_chords_expand_and_collapse_without_toggling_all_tools() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         let conversation = ui.selected_id().unwrap();
         let entries = vec![
             Entry { id: "one".into(), at: "10:00".into(), body: Body::Tool { title: "one".into(), state: ToolState::Ok, output: vec![] } },
@@ -7216,7 +6940,7 @@ mod tests {
         }]);
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         ui.selected[0] = ui
             .listing(60)
             .ids
@@ -7286,59 +7010,49 @@ mod tests {
     }
 
     #[test]
-    fn the_top_bar_border_keeps_controls_above_the_body_in_both_layouts() {
-        for spaces in [false, true] {
-            for (width, height) in [(20, 6), (80, 12), (140, 40)] {
-                let mut ui = Ui::new(demo::world());
-                if spaces {
-                    ui.glasses = Some(glass::Glasses::open(None, None));
-                }
-                ui.world.link = Link::Offline("Connection unavailable".into());
-                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                terminal.draw(|frame| ui.render(frame)).unwrap();
-                let buffer = terminal.backend().buffer();
-                for x in 0..width {
-                    let cell = &buffer[(x, 1)];
-                    assert_eq!(cell.symbol(), "─");
-                    assert_eq!(cell.fg, theme::OVERLAY0);
-                    assert_eq!(cell.bg, theme::BASE);
-                }
-                assert!(ui.frame.borrow().panes.iter().all(|pane| pane.rect.y >= 2));
-                assert!(
-                    ui.frame
-                        .borrow()
-                        .hits
-                        .iter()
-                        .all(|(rect, _)| !contains(*rect, 1, 1))
-                );
-                let target = if spaces { Hit::Connection } else { Hit::Tab(1) };
-                let rect = ui
-                    .frame
+    fn the_top_bar_border_keeps_controls_above_the_body() {
+        for (width, height) in [(20, 6), (80, 12), (140, 40)] {
+            let mut ui = Ui::new(demo::world());
+            ui.world.link = Link::Offline("Connection unavailable".into());
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| ui.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for x in 0..width {
+                let cell = &buffer[(x, 1)];
+                assert_eq!(cell.symbol(), "─");
+                assert_eq!(cell.fg, theme::OVERLAY0);
+                assert_eq!(cell.bg, theme::BASE);
+            }
+            assert!(ui.frame.borrow().panes.iter().all(|pane| pane.rect.y >= 2));
+            assert!(
+                ui.frame
                     .borrow()
                     .hits
                     .iter()
-                    .find(|(_, hit)| *hit == target)
-                    .map(|(rect, _)| *rect)
-                    .unwrap();
-                assert_eq!(rect.y, 0);
-                assert_eq!(rect.height, 1);
-                if rect.x < width {
-                    ui.mouse(MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
-                        column: rect.x,
-                        row: 0,
-                        modifiers: KeyModifiers::NONE,
-                    });
-                    if spaces {
-                        assert!(
-                            ui.flash
-                                .as_ref()
-                                .is_some_and(|(text, _)| text.contains("Connection unavailable"))
-                        );
-                    } else {
-                        assert_eq!(ui.tab, 1);
-                    }
-                }
+                    .all(|(rect, _)| !contains(*rect, 1, 1))
+            );
+            let rect = ui
+                .frame
+                .borrow()
+                .hits
+                .iter()
+                .find(|(_, hit)| *hit == Hit::Connection)
+                .map(|(rect, _)| *rect)
+                .unwrap();
+            assert_eq!(rect.y, 0);
+            assert_eq!(rect.height, 1);
+            if rect.x < width {
+                ui.mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                });
+                assert!(
+                    ui.flash
+                        .as_ref()
+                        .is_some_and(|(text, _)| text.contains("Connection unavailable"))
+                );
             }
         }
     }
@@ -7381,7 +7095,7 @@ mod tests {
             &adapt::Extras::default(),
         ));
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         for (id, back) in [
             ("attention/feedback", "review.request-changes"),
             ("attention/approve", "review.reject"),
@@ -7437,7 +7151,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let request = ui
             .listing(60)
             .ids
@@ -7454,6 +7168,71 @@ mod tests {
         assert!(!ui.editing, "the answer is sent and the box closes");
     }
 
+    /// Answered asks leave and a new one arrives, each by `set_world`; then st delivers the
+    /// glasses again, as it does after a reconnect. The box the person is typing in stays open:
+    /// the selection followed the data, and the focus never moved.
+    #[test]
+    fn a_reconnect_keeps_the_answer_box_open_after_earlier_asks_left() {
+        let asks = |id: &str| Attention {
+            conversations: vec![],
+            id: id.into(),
+            tier: Tier::Stopped,
+            title: "Confirm on the remote member".into(),
+            waiting: Some("Asker on cedar".into()),
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/asker".into()),
+            kind: AttentionKind::Request {
+                from: "Asker".into(),
+                from_id: "agent/example/asker".into(),
+                question: "Confirm it.".into(),
+                structured: None,
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        };
+        let live = |items: Vec<Attention>| {
+            let mut world = demo::world();
+            world.link = Link::Live;
+            world.attention = Load::Ready(items);
+            world
+        };
+        let mut ui = Ui::new(live(vec![]));
+        ui.live = true;
+        let typed = |ui: &mut Ui, text: &str| {
+            for letter in text.chars() {
+                ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+            }
+        };
+        for id in ["attention/one", "attention/two"] {
+            ui.set_world(live(vec![asks(id)]));
+            typed(&mut ui, "cdone");
+            ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            for effect in std::mem::take(&mut ui.effects) {
+                ui.note_acted(&effect);
+            }
+            ui.set_world(live(vec![]));
+        }
+        ui.set_world(live(vec![asks("attention/three")]));
+        typed(&mut ui, "cConfirmed");
+        assert!(ui.editing, "c opens the answer box");
+        ui.show_focused();
+        assert!(ui.editing, "the glasses arriving again leave the box open");
+        typed(&mut ui, " on the remote member");
+        assert!(ui.chat.is_none() && ui.confirm.is_none(), "every letter went into the box");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            ui.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Attention { id, reason: Some(text), .. }
+                    if id == "attention/three" && text == "Confirmed on the remote member"
+            )),
+            "the whole answer is sent"
+        );
+    }
+
     #[test]
     fn the_missions_under_next_in_an_agents_details_open_when_clicked() {
         // Nathan, 2026-10-10: the missions listed under `next` should open their mission.
@@ -7466,7 +7245,6 @@ mod tests {
         agents[0].details.queue_missions =
             vec!["mission/fleet/atlas/store-move".into(), "mission/fleet/release/weekly".into()];
         let mut ui = Ui::new(world);
-        ui.switch_tab(1);
         ui.open(&id);
         let shown = frame(&ui, 140, 50);
         let at = |needle: &str| {
@@ -7494,7 +7272,6 @@ mod tests {
         agents[0].details.model = Some("claude-sonnet-5-5".into());
         agents[0].details.effort = Some("high".into());
         let mut ui = Ui::new(world);
-        ui.switch_tab(1);
         ui.open(&id);
         let shown = frame(&ui, 140, 50).join("\n");
         let model = shown.lines().position(|line| line.contains("model ") && line.contains("claude-sonnet-5-5")).expect(&shown);
@@ -7508,23 +7285,23 @@ mod tests {
     }
 
     #[test]
-    fn shift_o_simplifies_every_conversation_and_back() {
+    fn ctrl_p_simplifies_every_conversation_and_back() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         let agent = ui.selected_id().unwrap();
         let tools = |ui: &Ui| {
             let screen = frame(ui, 120, 40).join("\n");
             (screen.contains("tool calls ·"), screen)
         };
         assert!(!tools(&ui).0, "full by default");
-        ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
+        ui.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert!(ui.simple);
         let (bundled, screen) = tools(&ui);
         assert!(
             bundled || !screen.contains("$ "),
             "a run of calls folds to one line in {agent}: {screen}"
         );
-        ui.key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
+        ui.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert!(!ui.simple);
     }
 
@@ -7729,7 +7506,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let at = ui.listing(60).ids.iter().position(|id| id == "attention/pick").unwrap();
         ui.select(at);
         let type_in = |ui: &mut Ui, text: &str| {
@@ -7749,7 +7526,7 @@ mod tests {
         let mut ui2 = {
             let mut again = Ui::new(ui.world.clone());
             again.live = true;
-            again.tab = 0;
+            again.open_home();
             let at = again.listing(60).ids.iter().position(|id| id == "attention/pick").unwrap();
             again.select(at);
             again
@@ -7806,7 +7583,7 @@ mod tests {
             }
             let mut ui = Ui::new(world);
             ui.live = true;
-            ui.tab = 0;
+            ui.open_home();
             let at = ui
                 .listing(60)
                 .ids
@@ -7938,7 +7715,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let at = ui
             .listing(60)
             .ids
@@ -8020,7 +7797,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         ui.select(0);
         ui.click(Hit::Answer(1));
         // Another goes to the next answer, round again, and does not start over at the first.
@@ -8110,7 +7887,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let at = ui
             .listing(60)
             .ids
@@ -8191,7 +7968,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let at = ui
             .listing(60)
             .ids
@@ -8203,7 +7980,7 @@ mod tests {
         for shown in [
             "release-proof",
             "waits    tag-proof · Prove the published tag builds.",
-            "it continues once you answer",
+            "it continues once you",
             "Go to the mission",
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
@@ -8238,7 +8015,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let at = ui
             .listing(60)
             .ids
@@ -8276,7 +8053,7 @@ mod tests {
         let world = demo::world();
         let mut ui = Ui::new(world.clone());
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let ids = ui.listing(60).ids.clone();
         let (gone, acted) = (ids[0].clone(), ids[1].clone());
         ui.select(0);
@@ -8349,7 +8126,7 @@ mod tests {
         // Nathan, 2026-10-07: holding Ctrl+W deleted one word, not word after word.
         let mut ui = Ui::new(demo::world());
         ui.live = true;
-        ui.tab = 1;
+        show(&mut ui, 1);
         ui.select(0);
         let agent = ui.selected_id().unwrap();
         ui.editing = true;
@@ -8373,7 +8150,7 @@ mod tests {
         assert_eq!(ui.conversation_state.drafts[&agent], "one ");
         // Not typing, a held command key acts once (its press), never on repeats; a held arrow moves on.
         ui.editing = false;
-        ui.tab = 0;
+        ui.open_home();
         ui.select(0);
         ui.key(key(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Repeat));
         assert!(ui.confirm.is_none() && ui.effects.is_empty() && ui.flash.is_none());
@@ -8432,7 +8209,7 @@ mod tests {
         }
         let mut ui = Ui::new(world);
         ui.live = true;
-        ui.tab = 0;
+        ui.open_home();
         let pick = |ui: &mut Ui, kind: &str| {
             let at = ui
                 .listing(60)
@@ -8508,7 +8285,7 @@ mod tests {
     fn spoken_words_are_sent_tagged_dictated() {
         let mut ui = Ui::new(demo::world());
         ui.live = true;
-        ui.tab = 1;
+        show(&mut ui, 1);
         let agent = ui.selected_id().unwrap();
         ui.editing = true;
         ui.conversation_state
@@ -8554,7 +8331,7 @@ mod tests {
     fn a_draft_over_what_st_takes_is_not_sent_and_stays_in_the_box() {
         let mut ui = Ui::new(demo::world());
         ui.live = true;
-        ui.tab = 1;
+        show(&mut ui, 1);
         ui.message_limit = Some(262_144);
         let agent = ui.selected_id().unwrap();
         ui.editing = true;
@@ -8584,7 +8361,7 @@ mod tests {
     fn nothing_is_blocked_before_send_when_st_names_no_limit() {
         let mut ui = Ui::new(demo::world());
         ui.live = true;
-        ui.tab = 1;
+        show(&mut ui, 1);
         assert_eq!(ui.message_limit, None);
         let agent = ui.selected_id().unwrap();
         ui.editing = true;
@@ -8600,7 +8377,7 @@ mod tests {
     fn a_refused_message_goes_back_to_the_box_unless_something_newer_is_there() {
         let mut ui = Ui::new(demo::world());
         ui.live = true;
-        ui.tab = 1;
+        show(&mut ui, 1);
         let agent = ui.selected_id().unwrap();
         let tags = vec!["dictated".to_owned()];
         // The box is empty: the text, the reply it answered and its dictation mark return.
@@ -8633,7 +8410,7 @@ mod tests {
     fn spoken_words_kept_to_edit_are_tagged_when_sent_and_esc_drops_them() {
         let mut ui = Ui::new(demo::world());
         ui.live = true;
-        ui.tab = 1;
+        show(&mut ui, 1);
         let agent = ui.selected_id().unwrap();
         ui.editing = true;
         ui.voice = Some(voice::VoiceState::stand_in(&agent));
@@ -8665,7 +8442,7 @@ mod tests {
     #[test]
     fn a_first_page_st_keeps_refusing_says_why_while_stui_tries_again() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         let agent = ui.selected_id().unwrap();
         ui.world.conversations.insert(agent.clone(), Load::Loading);
         ui.conversation_failed(&agent, "the list changed while it was being read");
@@ -8681,7 +8458,11 @@ mod tests {
     fn loading_never_says_empty() {
         let mut ui = Ui::new(demo::loading());
         for tab in 0..5 {
-            ui.tab = tab;
+            match tab {
+                0 => ui.open_home(),
+                4 => show(&mut ui, 4),
+                _ => ui.open_in_glass(Pane::List(tab), glass::Open::Tab),
+            }
             let screen = frame(&ui, 120, 30).join("\n");
             assert!(!screen.contains("No agents"), "tab {tab}");
             assert!(!screen.contains("Nothing needs you"), "tab {tab}");
@@ -8791,7 +8572,7 @@ mod tests {
     #[test]
     fn a_conversation_read_back_keeps_its_place_while_entries_come_and_go() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         let id = ui.selected_id().unwrap();
         frame(&ui, 120, 30);
         let pane = ui
@@ -8855,7 +8636,7 @@ mod tests {
     #[test]
     fn earlier_entries_loaded_above_keep_what_was_being_read_in_place() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         let id = ui.selected_id().unwrap();
         let Some(Load::Ready(entries)) = ui.world.conversations.get_mut(&id) else {
             panic!("the demo agent has a conversation")
@@ -8925,7 +8706,7 @@ mod tests {
     #[test]
     fn a_click_on_a_subagent_line_only_selects_its_agent() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        ui.open_in_glass(Pane::List(1), glass::Open::Tab);
         let ids = ui.ids();
         let builder = ids
             .iter()
@@ -8943,7 +8724,7 @@ mod tests {
             .borrow()
             .hits
             .iter()
-            .find(|(rect, _)| rect.y == line as u16 && rect.x == 0)
+            .find(|(rect, hit)| rect.y == line as u16 && matches!(hit, Hit::Row(_)))
             .map(|(rect, hit)| (*rect, hit.clone()))
             .unwrap();
         assert_eq!(
@@ -8961,42 +8742,13 @@ mod tests {
             ui.selected_id().as_deref(),
             Some("agent/example/atlas/builder")
         );
-        assert_eq!(ui.tab, 1);
-    }
-
-    #[test]
-    fn every_tab_is_clickable() {
-        let mut ui = Ui::new(demo::world());
-        frame(&ui, 140, 40);
-        let tabs = ui
-            .frame
-            .borrow()
-            .hits
-            .iter()
-            .filter(|(_, hit)| matches!(hit, Hit::Tab(_)))
-            .map(|(rect, hit)| (*rect, hit.clone()))
-            .collect::<Vec<_>>();
-        assert_eq!(tabs.len(), TABS.len());
-        let (rect, _) = tabs[3];
-        ui.mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: rect.x + 1,
-            row: rect.y,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(ui.tab, 3);
+        assert_eq!(ui.tab(), 1);
     }
 
     #[test]
     fn a_conversation_follows_new_lines_until_scrolled_up() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
-        let cos = ui
-            .ids()
-            .iter()
-            .position(|id| id == "agent/example/cos")
-            .unwrap();
-        ui.select(cos);
+        ui.open("agent/example/cos");
         frame(&ui, 140, 30);
         let key = "chat:agent/example/cos".to_owned();
         assert!(ui.conversation_state.panes.borrow()[&key].follow);
@@ -9015,7 +8767,7 @@ mod tests {
     #[test]
     fn selection_copies_only_its_own_pane() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         frame(&ui, 140, 30);
         let pane = ui
             .frame
@@ -9083,7 +8835,7 @@ mod tests {
         let mut ui = Ui::new(demo::world());
         for width in [72u16, 100, 160] {
             for tab in 0..5 {
-                ui.tab = tab;
+                show(&mut ui, tab);
                 for line in frame(&ui, width, 40) {
                     assert!(text::width(&line) <= width as usize);
                 }
@@ -9100,7 +8852,7 @@ mod tests {
         let index = ui.ids().iter().position(|id| id == "attention/1").unwrap();
         ui.select(index);
         press(&mut ui, KeyCode::Char('g'));
-        assert_eq!(ui.tab, 2);
+        assert_eq!(ui.tab(), 2);
         assert_eq!(
             ui.selected_id().as_deref(),
             Some("mission/fleet/atlas/store-move")
@@ -9119,7 +8871,7 @@ mod tests {
         }
         press(&mut ui, KeyCode::Enter);
         // Sending goes to the agent's conversation, where the reply will appear.
-        assert_eq!(ui.tab, 1);
+        assert_eq!(ui.tab(), 1);
         assert_eq!(ui.selected_id().as_deref(), Some("agent/example/atlas/builder"));
         assert!(ui.chat.is_none());
         let screen = frame(&ui, 150, 70).join("\n");
@@ -9147,7 +8899,7 @@ mod tests {
             agents[0].details.progress = Some("Cut over 2 of 3 stores; waiting on the signer".into());
         }
         let mut ui = Ui::new(world);
-        ui.switch_tab(1);
+        show(&mut ui, 1);
         let screen = frame(&ui, 150, 40).join("\n");
         assert!(screen.contains("Cut over 2 of 3 stores"), "{screen}");
         // The details pane says it whole, above the step it comes from.
@@ -9177,7 +8929,7 @@ mod tests {
             );
         }
         let mut ui = Ui::new(world);
-        ui.switch_tab(2);
+        show(&mut ui, 2);
         let listed = frame(&ui, 150, 40).join("\n");
         assert!(listed.contains("Tests pass; opening the PR"), "{listed}");
     }
@@ -9187,7 +8939,7 @@ mod tests {
         // Nathan, 2026-10-06: keys stopped working, Ctrl+Q did not quit, until the
         // terminal tab was closed.
         let mut ui = Ui::new(demo::world());
-        ui.switch_tab(1);
+        show(&mut ui, 1);
         let input = ui.draft_key().expect("a conversation is open");
         let mut waiting = voice::VoiceState::stand_in(&input);
         waiting.started = Instant::now() - Duration::from_secs(30);
@@ -9206,7 +8958,7 @@ mod tests {
         assert!(ui.quit, "Ctrl+Q went through");
         // Plain typing still waits (it must not mix into the words) and Esc drops them.
         let mut ui = Ui::new(demo::world());
-        ui.switch_tab(1);
+        show(&mut ui, 1);
         let input = ui.draft_key().unwrap();
         let mut heard = voice::VoiceState::stand_in(&input);
         heard.device = "Built-in microphone".into();
@@ -9230,14 +8982,21 @@ mod tests {
         ui.select(index);
         press(&mut ui, KeyCode::Char('l'));
         assert!(!ui.ids().contains(&"attention/6".to_owned()));
+        let alerts = ui
+            .world
+            .attention
+            .items()
+            .iter()
+            .filter(|item| item.is_alert() && !ui.snoozed.contains(&item.id))
+            .count();
         let top = frame(&ui, 150, 30)[0].clone();
-        assert!(top.contains("◆5"), "{top}");
+        assert!(top.contains(&format!("◆ {alerts} alert")), "{top}");
     }
 
     #[test]
     fn clicking_an_agent_in_a_mission_opens_a_popover_not_another_tab() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 2;
+        show(&mut ui, 2);
         frame(&ui, 150, 60);
         let (rect, _) = ui
             .frame
@@ -9253,12 +9012,12 @@ mod tests {
             row: rect.y,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(ui.tab, 2);
+        assert_eq!(ui.tab(), 2);
         assert!(ui.popover.is_some());
         let screen = frame(&ui, 150, 60).join("\n");
         assert!(screen.contains("Go to agent"), "{screen}");
         press(&mut ui, KeyCode::Char('g'));
-        assert_eq!(ui.tab, 1);
+        assert_eq!(ui.tab(), 1);
         assert!(ui.popover.is_none());
     }
     #[test]
@@ -9294,7 +9053,7 @@ mod tests {
             }
         }
         let mut ui = Ui::new(world);
-        ui.tab = 1;
+        ui.open_in_glass(Pane::List(1), glass::Open::Tab);
         frame(&ui, 140, 30);
         for _ in 0..60 {
             ui.mouse(MouseEvent {
@@ -9314,7 +9073,7 @@ mod tests {
             lines - height,
             "scrolled to the bottom and stayed"
         );
-        press(&mut ui, KeyCode::Down);
+        ui.select(1);
         frame(&ui, 140, 30);
         assert!(
             ui.list_top.borrow()[1] < lines - height,
@@ -9324,8 +9083,8 @@ mod tests {
     #[test]
     fn the_message_box_grows_with_the_draft_and_keeps_new_lines() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
-        press(&mut ui, KeyCode::Char('c'));
+        show(&mut ui, 1);
+        // Letters type: the first one opens the box.
         for character in
             "first line of a long message that has to wrap across the box at least once or twice"
                 .chars()
@@ -9351,9 +9110,12 @@ mod tests {
         assert_eq!(terminal_rows_skipped(8, 10, Some((5, 0))), 0);
 
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        ui.open_in_glass(
+            Pane::Terminal("agent/example/atlas/builder".into()),
+            glass::Open::Tab,
+        );
         ui.terminal = Some(TerminalView {
-            agent: "agent/example/harbor/keeper".into(),
+            agent: "agent/example/atlas/builder".into(),
             name: "Keeper".into(),
             title: "Keeper · vim".into(),
             lines: (0..40)
@@ -9396,7 +9158,7 @@ mod tests {
     #[test]
     fn ctrl_bracket_opens_an_agents_terminal_and_ctrl_backslash_returns() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 1;
+        show(&mut ui, 1);
         press(&mut ui, KeyCode::Enter);
         assert!(ui.terminal.is_none(), "Enter alone never attaches");
         ui.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
@@ -9418,7 +9180,7 @@ mod tests {
     fn a_new_mission_needs_every_field_before_it_creates_a_launch() {
         let mut ui = Ui::new(demo::world());
         ui.live = true;
-        ui.tab = 2;
+        show(&mut ui, 2);
         press(&mut ui, KeyCode::Char('n'));
         for character in "Audit".chars() {
             press(&mut ui, KeyCode::Char(character));
@@ -9454,7 +9216,7 @@ mod tests {
     #[test]
     fn a_device_is_revoked_only_after_confirming() {
         let mut ui = Ui::new(demo::world());
-        ui.tab = 3;
+        show(&mut ui, 3);
         let screen = frame(&ui, 140, 60).join("\n");
         assert!(screen.contains("YOUR DEVICES"), "{screen}");
         let (rect, _) = ui

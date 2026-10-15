@@ -218,7 +218,7 @@ def say(screen: Screen, write, pump, events: Events, marker: str, timeout: float
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/release/st3")
-    parser.add_argument("--classic", action="store_true", help="run the classic tabs for a focused-screen transport check")
+    parser.add_argument("--space", help="open this space instead of the last one used on this device")
     parser.add_argument("--seconds", type=float, default=180)
     parser.add_argument("--label", default="measure")
     parser.add_argument("--rows", type=int, default=50)
@@ -244,8 +244,8 @@ def main() -> int:
         env["STUI_TIMING_LOG"] = arguments.timing
     events.write("start", binary_label=arguments.label)
     command = [arguments.binary, "ui"]
-    if arguments.classic:
-        command.append("--classic")
+    if arguments.space:
+        command.extend(["--space", arguments.space])
     process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     received = 0

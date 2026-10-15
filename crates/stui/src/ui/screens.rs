@@ -13,10 +13,6 @@ use ratatui::text::{Line, Span};
 /// What Home says when nothing needs the person; setup's first-run test waits for it.
 pub const HOME_IDLE_TEXT: &str = "No alerts right now.";
 
-/// The tabs everyone sees. Worktrees stays hidden until the graph models worktrees: its screens
-/// only have invented data to show (Nathan, 2026-09-28).
-pub const TABS: [&str; 5] = ["Now", "Agents", "Missions", "Fleet", "Usage"];
-
 pub enum Item {
     Header {
         title: String,
