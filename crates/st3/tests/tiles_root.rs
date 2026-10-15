@@ -56,8 +56,34 @@ fn text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// The prefix of the accounts a test makes, so a later run can remove what a killed run left.
-const PREFIX: &str = "sttfx";
+/// The prefix of the account a test makes, so a later run can remove what a killed run left. A
+/// host may declare its own fixture users (hetz2 has `sttfx1`..`sttfx32`), so it is not theirs.
+const PREFIX: &str = "sttiletest";
+
+/// Whether the account `name` with user ID `uid` is one these tests made: a user ID in the test
+/// range, and a name that is the prefix and exactly that ID, as `format!` writes it.
+fn ours(name: &str, uid: u32) -> bool {
+    (90_000..98_000).contains(&uid) && name.strip_prefix(PREFIX) == Some(uid.to_string().as_str())
+}
+
+#[test]
+fn the_sweep_takes_only_its_own_accounts() {
+    for i in 1..=32 {
+        assert!(!ours(&format!("sttfx{i}"), 61_000 + i));
+    }
+    assert!(!ours("sttfx90001", 90_001));
+    assert!(ours("sttiletest90000", 90_000));
+    assert!(ours("sttiletest97999", 97_999));
+    assert!(!ours("sttiletest89999", 89_999));
+    assert!(!ours("sttiletest98000", 98_000));
+    assert!(!ours("sttiletest", 90_001));
+    assert!(!ours("sttiletest+90001", 90_001));
+    assert!(!ours("sttiletest090001", 90_001));
+    assert!(!ours("sttiletest90001x", 90_001));
+    // A name that claims an ID the account does not have is someone else's.
+    assert!(!ours("sttiletest95000", 61_001));
+    assert!(!ours("sttiletest95000", 95_001));
+}
 
 /// A tile and the user ID the launcher gave it, which is also its group ID.
 struct TileUser {
@@ -356,11 +382,12 @@ impl Drop for Host {
 /// Remove what an earlier, killed run of these tests left: only this test's own prefix.
 fn sweep() {
     let passwd = std::fs::read_to_string("/etc/passwd").unwrap();
-    for user in passwd
-        .lines()
-        .filter_map(|line| line.split(':').next())
-        .filter(|user| user.starts_with(PREFIX))
-    {
+    for user in passwd.lines().filter_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let uid = fields.nth(1)?.parse().ok()?;
+        ours(name, uid).then_some(name)
+    }) {
         let _ = sudo(["pkill", "-KILL", "-u", user]);
         let _ = sudo(["userdel", user]);
         let _ = sudo(["groupdel", user]);
@@ -1016,6 +1043,7 @@ fn only_root_starts_a_tile_and_only_inside_its_unit() {
     );
     // An account that takes a tile's user ID would be the tile: the launch is refused.
     let account = format!("{PREFIX}{}", a.uid);
+    assert!(ours(&account, a.uid));
     ok(sudo([
         "useradd",
         "--system",
