@@ -329,7 +329,11 @@ same answer and one place is measured and optimized
 projection ships; agents and attention are already in it. A new `projection-fresh` target
 covers the time from the commit that changes an input to the publication that carries it:
 p99 1500 ms, since refreshers fold at most once a second. Its paths are `publish missions`,
-`publish agents` and `publish attention`, timed by the refresher. Both targets appear on
+`publish agents` and `publish attention`, timed by the refresher: each publication that advances
+its cut is one sample, from the first claim this node committed after the previous cut to the
+new publication. Replicated claims carry another node's clock and start no sample, and
+attention's first publication after no window read it (attention folds only while one does)
+is none either. Both targets appear on
 `GET /v1/client/request-latency` and in `st doctor`. `daemon_load` keeps its 300 ms
 first-snapshot budget for every window, now with projections on its rows, and stays under
 twice main's baseline. Bounds per row: a mission projection stays within 4 KiB, an agent

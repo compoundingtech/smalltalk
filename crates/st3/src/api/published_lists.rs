@@ -229,9 +229,17 @@ fn spawn<R: Send + Sync + 'static>(
                     }
                     match folded? {
                         Some((publication, changed)) => {
+                            let timing = base.as_ref().map(|base| {
+                                (base.cut, publication.cut, publication.published_at_unix_ms)
+                            });
                             // A fold that began before projections were replaced publishes
                             // nothing; the next one folds from nothing.
                             if let Some(served) = list.publish(publication, generation) {
+                                if let Some((previous, cut, at)) = timing {
+                                    crate::api::record_publish_latency(
+                                        &reader, name, previous, cut, at,
+                                    );
+                                }
                                 // Windows reread only when a row changed, or the list is served
                                 // again; an advanced cut alone shows them nothing new.
                                 if changed || !served {

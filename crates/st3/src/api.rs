@@ -1518,6 +1518,41 @@ pub(crate) fn record_stream_latency(collection: &str, elapsed: Duration, remote:
         .time(Instant::now(), timed, elapsed);
 }
 
+/// A refresher published `collection` at `cut`, after a publication at `previous`: time it
+/// from the first claim this node committed after `previous` to the new publication, as the
+/// `publish COLLECTION` path of `projection-fresh`. A publication with no newer local commit
+/// (only replicated claims, or none) is not a sample.
+pub(crate) fn record_publish_latency(
+    store: &Store,
+    collection: &str,
+    previous: u64,
+    cut: u64,
+    published_at_unix_ms: u128,
+) {
+    if cut <= previous {
+        return;
+    }
+    let committed = match store.first_local_commit_after(previous, cut) {
+        Ok(Some(committed)) => committed,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("st3: WARN cannot time the {collection} publication: {error:#}");
+            return;
+        }
+    };
+    let elapsed = published_at_unix_ms.saturating_sub(committed);
+    let timed = request_latency::Timed::resolve(
+        &format!("publish {collection}"),
+        false,
+        request_latency::Wait::No,
+    );
+    request_latency().lock().unwrap().time(
+        Instant::now(),
+        timed,
+        Duration::from_millis(elapsed.min(u64::MAX as u128) as u64),
+    );
+}
+
 fn record_request_latency(
     method: &axum::http::Method,
     route: &str,
@@ -6818,7 +6853,10 @@ pub fn start_agent_roster(state: &AppState) {
                     })
                 } else {
                     // Nothing published to start from: every card folds again from the log.
-                    let cold = reader.published_agent_roster(u64::MAX, false).is_none();
+                    let before = reader
+                        .published_agent_roster(u64::MAX, false)
+                        .map(|(cut, _, _)| cut);
+                    let cold = before.is_none();
                     let folded = Instant::now();
                     let refreshed = reader.answer_agent_roster_requests(|| {
                         refresh_agent_roster(&reader, false)?;
@@ -6827,6 +6865,11 @@ pub fn start_agent_roster(state: &AppState) {
                         }
                         Ok(())
                     });
+                    if let (Some(before), Some((cut, _, at))) =
+                        (before, reader.published_agent_roster(u64::MAX, false))
+                    {
+                        record_publish_latency(&reader, "agents", before, cut, at);
+                    }
                     record_roster_stage(if cold {
                         request_latency::RosterStage::RefreshCold
                     } else {

@@ -115,11 +115,14 @@ pub fn parse(text: &str) -> Result<Targets> {
                 .split_once(' ')
                 .with_context(|| format!("path {path:?} names no method"))?;
             ensure!(
-                matches!(method, "GET" | "POST" | "PUT" | "DELETE" | "stream"),
+                matches!(
+                    method,
+                    "GET" | "POST" | "PUT" | "DELETE" | "stream" | "publish"
+                ),
                 "path {path:?} has an unknown method"
             );
             ensure!(
-                method == "stream" || route.starts_with("/v1/"),
+                matches!(method, "stream" | "publish") || route.starts_with("/v1/"),
                 "path {path:?} is not a daemon route"
             );
             ensure!(paths.insert(path.as_str()), "path {path:?} has two targets");
@@ -565,6 +568,17 @@ mod tests {
         assert_eq!(fresh.remote_p99_ms, None);
         // A fresh list counts toward its own target only, never the first page's.
         assert_eq!(targets.for_path("GET /v1/client/agents").unwrap().name, "person-read");
+        for path in [
+            "GET /v1/client/missions",
+            "GET /v1/client/missions/{*id}",
+            "stream missions",
+        ] {
+            assert_eq!(targets.for_path(path).unwrap().name, "person-read", "{path}");
+        }
+        for path in ["publish missions", "publish agents", "publish attention"] {
+            let fresh = targets.for_path(path).unwrap();
+            assert_eq!((fresh.name.as_str(), fresh.p99_ms), ("projection-fresh", 1500), "{path}");
+        }
         let attach = targets.for_path("stream terminal").unwrap();
         assert_eq!(attach.p99_ms, 200);
         assert_eq!((targets.statement.p99_ms, targets.statement.max_ms), (10, 100));

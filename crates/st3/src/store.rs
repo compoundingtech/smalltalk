@@ -3858,6 +3858,25 @@ impl Store {
         Some((cut, refs, head.0, head.1))
     }
 
+    /// When this node committed its first claim after store index `after`, through `through`,
+    /// in Unix ms; `None` when every claim between came from another node, or there is none.
+    pub(crate) fn first_local_commit_after(
+        &self,
+        after: u64,
+        through: u64,
+    ) -> Result<Option<u128>> {
+        let accepted: Option<String> = self
+            .readers
+            .get()
+            .prepare_cached(
+                "SELECT accepted_at_unix_ms FROM claims WHERE store_index>?1 AND store_index<=?2
+                 AND origin=?3 ORDER BY store_index LIMIT 1",
+            )?
+            .query_row(params![after as i64, through as i64, self.origin()], |row| row.get(0))
+            .optional()?;
+        Ok(accepted.and_then(|accepted| accepted.parse().ok()))
+    }
+
     /// Follows the revision of complete current roster publications: it rises with every one,
     /// including a replacement at the same graph index after local activity or a deadline.
     pub(crate) fn subscribe_agent_roster(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -27472,6 +27491,28 @@ mission "garden" state="ready" {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    /// A publication's freshness is timed from this node's own commits: a claim another node
+    /// wrote, with that node's clock, is not one.
+    #[test]
+    fn the_first_local_commit_after_a_cut_skips_claims_another_node_wrote() {
+        let member = key();
+        let (_, a, stores) = fleet(&[("b", &member)]);
+        let b = &stores[0];
+        let before = b.index().unwrap();
+        note(&a, "written on a");
+        sync(&a, b);
+        let replicated = b.index().unwrap();
+        assert!(replicated > before, "a's claim reached b");
+        assert_eq!(b.first_local_commit_after(before, replicated).unwrap(), None);
+        let local = note(b, "written on b");
+        let through = b.index().unwrap();
+        assert_eq!(
+            b.first_local_commit_after(before, through).unwrap(),
+            Some(local.accepted_at_unix_ms)
+        );
+        assert_eq!(b.first_local_commit_after(through, through).unwrap(), None);
     }
 
     /// The anchor `a` founds the fleet and admits each named member.
