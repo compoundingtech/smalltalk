@@ -16,6 +16,7 @@ mod binary_payloads;
 mod boot_canaries;
 mod broken_gates;
 mod claude_idle;
+mod claude_statusline;
 mod client_creation;
 mod client_glasses;
 mod client_presence;
