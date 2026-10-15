@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""scripts/st-test against real repositories: the tree it signs, the merge case, failures, refusals."""
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from evidence_test_support import tool_path  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('st_test', str(ROOT / 'scripts/st-test'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+st_test = importlib.util.module_from_spec(spec)
+loader.exec_module(st_test)
+
+DATE = '2026-10-14T12:00:00Z'
+GIT_ENV = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null', LC_ALL='C',
+               GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid', GIT_COMMITTER_NAME='t',
+               GIT_COMMITTER_EMAIL='t@example.invalid', GIT_AUTHOR_DATE=DATE, GIT_COMMITTER_DATE=DATE)
+POLICY = {'version': 1, 'checks': {'demo': {'trust_levels': ['host'], 'kinds': {'wrapper': {
+    'command': ['sh', '-c', 'echo ran'],
+    'required_inputs': ['flake_lock_sha256', 'toolchain_sha256', 'wrapper_sha256', 'system', 'attempt'],
+    'bind_inputs': {'flake_lock_sha256': 'flake.lock'}}}}}}
+
+
+def git(repo, *args, stdin=None):
+    done = subprocess.run(['git', '-C', str(repo), *args], input=stdin, capture_output=True, env=GIT_ENV)
+    assert done.returncode == 0, (args, done.stderr.decode())
+    return done.stdout.decode().strip()
+
+
+class StTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        tmp = Path(self.tmp.name)
+        key = tmp / 'key'
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'host/box-1', '-f', str(key)], check=True)
+        pub = key.with_suffix('.pub').read_text().split()
+        self.home = tmp / 'home'
+        (self.home / '.config/st').mkdir(parents=True)
+        (self.home / '.config/st/evidence-sign.json').write_text(json.dumps(
+            {'signer': 'host/box-1', 'ssh_key': str(key), 'scratch_repo': str(tmp / 'scratch.git'),
+             'test_clock': True, 'path': tool_path()}))
+        git(tmp, 'init', '-q', '--bare', '-b', 'main', str(tmp / 'origin.git'))
+        self.work = tmp / 'work'
+        git(tmp, 'clone', '-q', str(tmp / 'origin.git'), str(self.work))
+        git(self.work, 'checkout', '-q', '-b', 'main')
+        (self.work / 'scripts').mkdir()
+        for name in st_test.BASE_SCRIPTS:
+            shutil.copy(ROOT / 'scripts' / name, self.work / 'scripts' / name)
+        (self.work / '.st').mkdir()
+        (self.work / '.st/evidence-keys').write_text(f'host/box-1 namespaces="git" {pub[0]} {pub[1]}\n')
+        (self.work / '.st/evidence-skip-policy.json').write_text(json.dumps(POLICY))
+        (self.work / 'flake.lock').write_text('{"nodes":{}}\n')
+        (self.work / 'a.txt').write_text('one\n')
+        git(self.work, 'add', '.')
+        git(self.work, 'commit', '-q', '-m', 'base')
+        git(self.work, 'push', '-q', 'origin', 'main')
+        git(self.work, 'checkout', '-q', '-b', 'feature')
+        patcher = mock.patch.dict(st_test.LOCAL, {'demo': ['sh', '-c', 'echo ran']}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def commit(self, name, content, branch=None):
+        if branch:
+            git(self.work, 'checkout', '-q', branch)
+        (self.work / name).write_text(content)
+        git(self.work, 'add', '.')
+        git(self.work, 'commit', '-q', '-m', f'{name} {content}')
+
+    def run_st_test(self, *args, command=None):
+        if command is not None:
+            st_test.LOCAL['demo'] = command
+        out, err = io.StringIO(), io.StringIO()
+        env = dict(GIT_ENV, HOME=str(self.home), EVIDENCE_SIGN_NOW=DATE)
+        cwd = os.getcwd()
+        os.chdir(self.work)
+        try:
+            with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = st_test.main(['--base', 'origin/main', '--repository', 'org/repo', '--toolchain-sha256', hashlib.sha256(b'drv').hexdigest(), *args])
+                except st_test.Failure as error:
+                    code = f'failure: {error}'
+        finally:
+            os.chdir(cwd)
+        return code, out.getvalue(), err.getvalue()
+
+    def statements(self):
+        found = []
+        for ref in git(self.work, 'for-each-ref', '--format=%(refname)', 'refs/notes/evidence/').splitlines():
+            blob = git(self.work, 'ls-tree', '-r', ref).split()[2]
+            found.append(json.loads(git(self.work, 'cat-file', 'blob', blob)))
+        return found
+
+    def test_a_branch_that_holds_the_base_tip_is_signed_in_place_and_reported_covered(self):
+        self.commit('b.txt', 'two')
+        code, out, err = self.run_st_test('--check', 'demo')
+        self.assertEqual(code, 0, err)
+        statement, = self.statements()
+        self.assertEqual(statement['subject'][0]['digest']['gitTree'], git(self.work, 'rev-parse', 'HEAD^{tree}'))
+        check = statement['predicate']['observed']['checks']['demo']
+        self.assertEqual((check['command'], check['exit_code']), (['sh', '-c', 'echo ran'], 0))
+        self.assertEqual(statement['predicate']['signer'], 'host/box-1')
+        self.assertIn('demo', out)
+        self.assertIn('covered by wrapper', out)
+        self.assertIn('this branch', out)
+        self.assertIn('clean worktree', out)
+
+    def test_untracked_and_ignored_files_in_the_checkout_cannot_change_the_result(self):
+        self.commit('b.txt', 'two')
+        (self.work / 'stray.txt').write_text('untracked')
+        (self.work / '.gitignore').write_text('ignored.txt\n')
+        git(self.work, 'add', '.gitignore')
+        git(self.work, 'commit', '-q', '-m', 'ignore')
+        (self.work / 'ignored.txt').write_text('ignored')
+        code, out, err = self.run_st_test('--check', 'demo', command=['sh', '-c', 'test ! -e stray.txt && test ! -e ignored.txt'])
+        self.assertEqual(code, 0, err + out)
+        self.assertEqual(len(self.statements()), 1)
+
+    def test_after_the_base_moved_the_merge_tree_is_what_is_signed(self):
+        self.commit('b.txt', 'feature work')
+        self.commit('c.txt', 'main moved', branch='main')
+        git(self.work, 'push', '-q', 'origin', 'main')
+        git(self.work, 'checkout', '-q', 'feature')
+        merged = git(self.work, 'merge-tree', '--write-tree', '--no-messages', 'origin/main', 'HEAD').splitlines()[0]
+        self.assertNotEqual(merged, git(self.work, 'rev-parse', 'HEAD^{tree}'))
+        code, out, err = self.run_st_test('--check', 'demo')
+        self.assertEqual(code, 0, err)
+        statement, = self.statements()
+        self.assertEqual(statement['subject'][0]['digest']['gitTree'], merged)
+        self.assertIn('merge with origin/main', out)
+        self.assertIn('covered by wrapper', out)
+        self.assertNotIn('merge', git(self.work, 'worktree', 'list'))  # the throwaway worktree is gone
+        self.assertEqual(git(self.work, 'rev-parse', 'HEAD^{tree}'), git(self.work, 'rev-parse', 'feature^{tree}'))
+
+    def test_a_failing_run_is_recorded_and_the_exit_code_says_so(self):
+        self.commit('b.txt', 'two')
+        code, out, err = self.run_st_test('--check', 'demo', command=['sh', '-c', 'echo broken; exit 3'])
+        self.assertEqual(code, 1)
+        statement, = self.statements()
+        self.assertEqual(statement['predicate']['observed']['checks']['demo']['exit_code'], 3)
+        self.assertIn('FAILED (3)', out)
+        self.assertNotIn('covered by', out)
+
+    def test_a_time_limit_is_a_failure_not_a_hang(self):
+        self.commit('b.txt', 'two')
+        code, out, err = self.run_st_test('--check', 'demo', '--time-limit', '1', command=['sleep', '30'])
+        self.assertEqual(code, 1)
+        self.assertIn('timed out', out)
+
+    def test_a_branch_that_conflicts_with_the_base_stops_before_running_anything(self):
+        self.commit('a.txt', 'feature edit\n')
+        self.commit('a.txt', 'main edit\n', branch='main')
+        git(self.work, 'push', '-q', 'origin', 'main')
+        git(self.work, 'checkout', '-q', 'feature')
+        code, _, _ = self.run_st_test('--check', 'demo')
+        self.assertIn('does not merge cleanly', str(code))
+        self.assertEqual(self.statements(), [])
+
+    def test_a_base_that_looks_like_a_git_option_is_refused(self):
+        self.commit('b.txt', 'two')
+        for bad in ('--upload-pack=x', '-x', 'a b', ''):
+            with self.assertRaises(st_test.Failure):
+                st_test.main([f'--base={bad}', '--check', 'demo'])
+        self.assertEqual(self.statements(), [])
+
+    def test_uncommitted_tracked_changes_and_unknown_checks_are_refused(self):
+        self.commit('b.txt', 'two')
+        (self.work / 'b.txt').write_text('edited, not committed')
+        code, _, _ = self.run_st_test('--check', 'demo')
+        self.assertIn('uncommitted changes', str(code))
+        git(self.work, 'checkout', '--', 'b.txt')
+        code, _, _ = self.run_st_test('--check', 'nope')
+        self.assertIn('no local command for nope', str(code))
+        self.assertEqual(self.statements(), [])
+
+    def test_the_scripts_that_run_come_from_the_base_not_from_the_branch(self):
+        (self.work / 'scripts/evidence-sign').write_text('#!/bin/sh\necho tampered >&2\nexit 9\n')
+        git(self.work, 'add', '.')
+        git(self.work, 'commit', '-q', '-m', 'tamper with the signer on the branch')
+        code, out, err = self.run_st_test('--check', 'demo')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.statements()), 1)
+
+    def test_the_real_table_lists_only_checks_with_a_command_and_prints_them(self):
+        done = subprocess.run([sys.executable, str(ROOT / 'scripts/st-test'), '--list'], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual([line.split(':')[0] for line in done.stdout.splitlines()], ['genie-freshness', 'typescript-client'])
+
+
+if __name__ == '__main__':
+    unittest.main()
