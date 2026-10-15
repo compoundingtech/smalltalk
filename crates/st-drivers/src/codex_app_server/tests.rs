@@ -8434,7 +8434,7 @@ fn the_control_pump_reports_the_recorded_usage_limit_failure_over_its_socket() {
 /// unclassified final error. Its thread accepts a new turn after the failed one.
 #[test]
 fn the_control_pump_keeps_a_retryable_disconnect_alive_for_the_next_turn() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::canonical_tempdir();
     let _stop_exclusive = stop_flag_tests();
     let config = delivery_config(tmp.path());
     let agent_dir = config.agent_dir.clone();
