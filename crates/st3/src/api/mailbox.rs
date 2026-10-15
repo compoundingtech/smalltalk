@@ -1255,20 +1255,29 @@ mod tests {
         }
     }
 
+    /// Backdate a send past the recovery window of the recipient's current boot. The
+    /// window is measured from the boot floor, so age from it (or from now, before any
+    /// boot): a slow runner between boot and this call must not make the mail recent.
     fn age_sent(store: &Store, database: &Path, subject: &str) {
         let claim = store
             .latest_claim(subject, Some("message.sent"))
             .unwrap()
             .unwrap();
+        let recipient = claim.body.get("fields").unwrap_or(&claim.body)["to"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let anchor = store
+            .native_mail_boot_floor(&recipient)
+            .unwrap()
+            .map_or(client_now_ms(), |(since, _)| since.min(client_now_ms()));
         let connection = rusqlite::Connection::open(database).unwrap();
         crate::store::configure_projection_writer(&connection).unwrap();
         connection
             .execute(
                 "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                 rusqlite::params![
-                    (client_now_ms()
-                        - u128::from(super::super::mail_backlog::THRESHOLD_MS)
-                        - 1_000)
+                    (anchor - u128::from(super::super::mail_backlog::THRESHOLD_MS) - 1_000)
                         .to_string(),
                     claim.id
                 ],
