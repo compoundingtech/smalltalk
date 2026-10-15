@@ -48,12 +48,12 @@ def main():
                     "idle_messages_per_seat": args.idle}
         (output / "build-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         with (output / "build.jsonl").open("w") as stdout, (output / "build.log").open("w") as stderr:
-            run("cargo", "test", "--release", "-p", "st3", "--lib",
+            run("cargo", "test", "--release", "-p", "st3-daemon", "--lib",
                 "api::mailbox::profile::many_streams", "--no-run", "--message-format=json",
                 cwd=checkout, stdout=stdout, stderr=stderr)
         executables = [item["executable"] for line in (output / "build.jsonl").read_text().splitlines()
                        if (item := json.loads(line)).get("reason") == "compiler-artifact"
-                       and item.get("executable") and item["target"]["name"] == "st3"
+                       and item.get("executable") and item["target"]["name"] == "st3-daemon"
                        and item["profile"]["test"]]
         if len(executables) != 1:
             raise RuntimeError(f"expected one test executable, got {executables}")
