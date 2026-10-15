@@ -7355,6 +7355,8 @@ mod tests {
                 "review_mode": mode, "title": "Review the draft", "detail": "Ready to ship?",
                 "priority": "normal", "state": "open", "requested_at": "2026-10-03T08:00:00Z",
                 "actions": ["review.approve", back],
+                "presentation": {"tier": "stopped", "kind": if mode == "feedback" { "feedback" } else { "review" },
+                    "agent": null, "raised_by": null, "waiting": null},
             }))
             .unwrap()
         };
