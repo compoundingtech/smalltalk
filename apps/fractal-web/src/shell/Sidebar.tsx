@@ -13,6 +13,7 @@ import type { MissionView } from '../missions/model.ts'
 import { Tree, TreeNode } from '../workbench-kit/Tree.tsx'
 import { AgentFolders } from './AgentFolders.tsx'
 import { useOpen, useSubjects } from './context.tsx'
+import { inboxEmptyText } from './inboxEmpty.ts'
 import type { Workspace, WindowAction } from './workspaces.ts'
 
 /** The workbench's only navigation column: sessions, every attention card and ordinary resources. */
@@ -132,8 +133,8 @@ export const Sidebar = React.memo(
             {inbox.length === 0 ? (
               <TreeNode
                 id="inbox/empty"
-                textValue="Nothing needs you"
-                content={<span {...stylex.props(styles.meta)}>Nothing needs you</span>}
+                textValue={inboxEmptyText(attentionFeed)}
+                content={<span {...stylex.props(styles.meta)}>{inboxEmptyText(attentionFeed)}</span>}
               />
             ) : (
               inbox.map((item) => (

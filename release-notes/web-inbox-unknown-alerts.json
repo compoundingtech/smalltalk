@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The web inbox no longer says nothing needs the person while its alerts are not loaded, could not be read, or are out of date",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites; no client contract change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Web app text only: it reads the freshness the attention feed already carries."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal web deploy; no additional startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or new swap-back restrictions."
+  }
+}
