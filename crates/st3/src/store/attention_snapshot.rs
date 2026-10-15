@@ -1749,9 +1749,13 @@ impl Store {
         if person.is_some_and(|person| person != owner) {
             return Ok(Vec::new());
         }
+        let last = last_turn_or_end(connection, seat)?;
         let mut items = Vec::new();
         for (claim, index, at, fields) in denials {
-            if index < started || native_prompt_answer(connection, &claim)?.is_some() {
+            if index < started
+                || moved_on(last.as_ref(), index, at)
+                || native_prompt_answer(connection, &claim)?.is_some()
+            {
                 continue;
             }
             let tool = fields["status"].as_str().unwrap_or("tool");
@@ -1817,11 +1821,17 @@ impl Store {
         let connection = self.readers.get();
         let started = running_since(&connection, seat).map_err(internal)?;
         let answered = native_prompt_answer(&connection, episode).map_err(internal)?;
+        let last = last_turn_or_end(&connection, seat).map_err(internal)?;
         drop(connection);
-        if started.is_none_or(|(started, _)| (denial.store_index as i64) < started) || answered.is_some() {
+        let index = denial.store_index as i64;
+        let at = denial.accepted_at_unix_ms;
+        if started.is_none_or(|(started, _)| index < started)
+            || moved_on(last.as_ref(), index, at)
+            || answered.is_some()
+        {
             return Err(St3Error::new(
                 "stale-fence",
-                "that prompt is no longer waiting: it was answered, or the seat restarted",
+                "that call is no longer waiting: it was answered, the seat moved on, or it restarted",
             ));
         }
         let tool = fields["status"].as_str().unwrap_or("tool").to_owned();
@@ -1892,6 +1902,46 @@ fn running_since(connection: &Connection, seat: &str) -> Result<Option<(i64, Str
         return Ok(None);
     }
     Ok(Some((index, fields["incarnation_id"].as_str().unwrap_or_default().to_owned())))
+}
+
+/// The newest observation of `seat` that began a turn or ended its session: its store position,
+/// state and when that state began. Observations of the seat at rest, which repeat as it is
+/// refreshed, lie after it and are passed over.
+fn last_turn_or_end(connection: &Connection, seat: &str) -> Result<Option<(i64, String, Option<u64>)>> {
+    connection
+        .prepare_cached(&format!(
+            "{} LIMIT 1",
+            newest_claims_of_kind_query("claims.store_index, claims.body", "harness.observed").replace(
+                " ORDER BY",
+                " AND json_extract(claims.body, '$.fields.state') IN ('working', 'ended') ORDER BY"
+            )
+        ))?
+        .query_row(params![seat, i64::MAX], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()?
+        .map(|(index, body)| -> Result<(i64, String, Option<u64>)> {
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            Ok((
+                index,
+                fields["state"].as_str().unwrap_or_default().to_owned(),
+                fields["observed_since_ms"].as_u64(),
+            ))
+        })
+        .transpose()
+}
+
+/// Whether the seat moved on after its hook raised a denial (at store position `index`, accepted
+/// at `at`), given its newest turn or end (see [`last_turn_or_end`]): it began another turn, or its
+/// session ended. The denied call then waits on nobody, so its alert goes. The `Stop` hook records
+/// the seat's state before it raises the denial, so the turn the denial ended, though it may still
+/// be observed working for a moment, began before it.
+fn moved_on(last: Option<&(i64, String, Option<u64>)>, index: i64, at: u128) -> bool {
+    last.is_some_and(|(observed, state, since)| {
+        *observed > index
+            && (state == "ended" || since.is_some_and(|since| u128::from(since) > at))
+    })
 }
 
 /// The newest few denials `seat`'s hooks raised: their claims, store positions, acceptance times

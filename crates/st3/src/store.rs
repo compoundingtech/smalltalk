@@ -58635,6 +58635,100 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         );
     }
 
+    /// A denied call waits on its person only until the seat moves on: once the seat begins another
+    /// turn or its session ends, the alert goes and an answer is refused. The turn the denial ended
+    /// is still observed working for a moment, and that is no new turn; nor is the seat at rest,
+    /// however often it is observed. The claims stay: only the alert they derived goes.
+    #[test]
+    fn a_classifier_denial_goes_once_the_seat_moves_on() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "denial-seat", Some("person/avery"))
+            .unwrap();
+        let seat = "agent/node.worker";
+        let append = |kind: &str, fields: Value, key: Option<&str>| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: key.map(str::to_owned),
+                })
+                .unwrap()
+        };
+        let denied = |call: &str| {
+            append(
+                "harness.diagnostic",
+                json!({"severity":"warning", "status":"Bash", "code":"permission-denied",
+                    "reason":"Production Reads", "driver":"claude",
+                    "session_id":"session-1", "matched_line": json!({"call_id": call}).to_string()}),
+                Some(&format!("claude-permission-denied:{seat}:{call}")),
+            )
+        };
+        // The driver names when it saw each state; the store keeps that as the state's start when
+        // the state changes, and carries the start over a refresh of the same state.
+        let observed = |state: &str, at: Option<u128>| {
+            let mut fields = json!({"state": state, "driver": "claude", "blocked_on": "none", "ask": "none"});
+            if let Some(at) = at {
+                fields["observed_at_ms"] = json!(at as u64);
+            }
+            append("harness.observed", fields, None)
+        };
+        let alerts = || {
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.kind == "harness-prompt")
+                .map(|item| item.episode)
+                .collect::<Vec<_>>()
+        };
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}), None);
+        let first = denied("toolu_1");
+        // The turn that ended in the denial, then the seat at rest, both seen before the `Stop` hook
+        // raised it: still waiting on the person.
+        let ending = observed("working", Some(first.accepted_at_unix_ms - 1_000));
+        assert_eq!(ending.body["fields"]["observed_since_ms"], (first.accepted_at_unix_ms - 1_000) as u64);
+        observed("idle", Some(first.accepted_at_unix_ms - 500));
+        assert_eq!(alerts(), vec![first.id.clone()]);
+        // However long the seat rests, refreshed as it is, the call still waits.
+        for refresh in 1..=40 {
+            observed("idle", Some(first.accepted_at_unix_ms + refresh * 300_000));
+        }
+        assert_eq!(alerts(), vec![first.id.clone()], "a resting seat's call still waits");
+        // Another turn begins: the call waits on nobody.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        observed("working", None);
+        assert!(alerts().is_empty(), "the seat moved on");
+        assert_eq!(
+            store.answer_native_prompt(seat, &first.id, "approve-once", "person/avery").unwrap_err().code,
+            "stale-fence"
+        );
+        // A session that ends leaves nothing waiting either.
+        let second = denied("toolu_2");
+        assert_eq!(alerts(), vec![second.id.clone()]);
+        observed("ended", None);
+        assert!(alerts().is_empty(), "the session ended");
+    }
+
     /// A Codex approval prompt is answered the same way. The answer names the Codex driver, whose
     /// control connection reads it and answers the app-server; a Codex question stays terminal-only.
     #[test]
