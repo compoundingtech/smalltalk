@@ -19426,6 +19426,14 @@ fn adopt_declared_mission_revision_tx(
             Some(batch_id),
         )
         .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run_id, claim.accepted_at_unix_ms.to_string()],
+                )
+                .map_err(internal)?;
+        }
         return Ok((vec![claim.id], true));
     }
 
@@ -35642,6 +35650,11 @@ mod tests {
     mod canonical_audit {
         use super::*;
         include!("store/canonical_audit.rs");
+    }
+
+    mod declarative_revision_timestamp_tests {
+        use super::*;
+        include!("store/declarative_revision_timestamp_tests.rs");
     }
 
     mod actual_purity_tests {
