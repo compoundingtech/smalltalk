@@ -238,3 +238,121 @@ fn membership_signers_do_not_multiply_claim_rows_or_scan_unrelated_signatures() 
         "unrelated signatures increased fold VM work: {before} -> {after}"
     );
 }
+
+#[test]
+fn sealed_fleet_cache_reuses_the_query_and_invalidates_every_fold_input() {
+    let mut connection = fixture();
+    connection.execute_batch(&fleet_generation_schema()).unwrap();
+    let anchor = admitted("anchor", "birch", "anchor-key", "anchor", "birch", 3);
+    insert_claim(&connection, &anchor);
+    envelope(&connection, &anchor, "anchor", &["anchor-key"]);
+    let mut cache = None;
+    // Count the actual history query, not cache publications or elapsed time.
+    connection.trace(Some(|sql| {
+        if sql.starts_with("SELECT claims.id, claims.kind, claims.subject, claims.body,") {
+            STATEMENTS.with(|count| count.set(count.get() + 1));
+        }
+    }));
+    STATEMENTS.with(|count| count.set(0));
+    let first = sealed_fleet_view_tx(&connection, &mut cache).unwrap();
+    assert_eq!(first.current("birch").len(), 1);
+    for _ in 0..8 {
+        assert_eq!(sealed_fleet_view_tx(&connection, &mut cache).unwrap(), first);
+    }
+    STATEMENTS.with(|count| assert_eq!(count.get(), 1));
+
+    // No time-dependent fields exist: "current" is an open writer window,
+    // not a wall-clock lease. Only a claim closes that window.
+    let mutations = [
+        "UPDATE claims SET body=json_set(body,'$.fields.mode','dial-out')",
+        "UPDATE claims SET subject='host/cedar'",
+        "UPDATE claims SET id='renamed'",
+        "UPDATE batches SET replica_sequence=4",
+        "UPDATE batches SET origin='cedar'",
+        "UPDATE batches SET origin='birch', replica_sequence=3",
+        "UPDATE replica_envelopes SET batch_id=NULL",
+        "UPDATE replica_envelopes SET batch_id='anchor'",
+        "UPDATE replica_envelopes SET envelope_hash='changed'",
+        "UPDATE replica_envelope_signatures SET envelope_hash='changed'",
+        "UPDATE replica_envelope_signatures SET member_key='other-key'",
+        "DELETE FROM replica_envelope_signatures",
+        "INSERT INTO replica_envelope_signatures VALUES('birch',3,'changed','anchor-key')",
+        "DELETE FROM replica_envelopes",
+        "INSERT INTO replica_envelopes VALUES('birch',3,'changed','anchor')",
+        "UPDATE meta SET value='other-anchor' WHERE key='fleet_anchor_key'",
+        "DELETE FROM meta WHERE key='fleet_anchor_key'",
+        "INSERT INTO meta VALUES('fleet_anchor_key','anchor-key')",
+        "DELETE FROM batches",
+        "INSERT INTO batches VALUES('anchor','birch',3)",
+        "DELETE FROM claims",
+        "INSERT INTO claims VALUES('new','fleet.member-left','host/birch','{\"fields\":{}}','anchor')",
+    ];
+    for sql in mutations {
+        let before = fleet_generation(&connection).unwrap();
+        connection.execute_batch(sql).unwrap();
+        let after = fleet_generation(&connection).unwrap();
+        assert!(after > before, "generation did not invalidate: {sql}");
+        STATEMENTS.with(|count| count.set(0));
+        let actual = sealed_fleet_view_tx(&connection, &mut cache).unwrap();
+        let expected_queries = usize::from(actual.anchor.is_some());
+        STATEMENTS.with(|count| assert_eq!(count.get(), expected_queries, "{sql}"));
+        assert_eq!(
+            actual,
+            crate::fleet::FleetView::from_membership(&fleet_membership_tx(&connection).unwrap()),
+            "{sql}"
+        );
+        STATEMENTS.with(|count| count.set(0));
+        assert_eq!(sealed_fleet_view_tx(&connection, &mut cache).unwrap(), actual);
+        STATEMENTS.with(|count| assert_eq!(count.get(), 0, "{sql}"));
+    }
+    connection.trace(None);
+}
+
+#[test]
+fn sealed_fleet_cache_never_includes_the_local_signer_fallback() {
+    let connection = fixture();
+    connection.execute_batch(&fleet_generation_schema()).unwrap();
+    let anchor = admitted("anchor", "birch", "anchor-key", "anchor", "birch", 3);
+    insert_claim(&connection, &anchor);
+    let local = fleet_membership_tx_with_local_signer(
+        &connection, Some(("birch", "anchor-key")),
+    ).unwrap();
+    assert!(local.counts("anchor"));
+    let mut cache = None;
+    assert!(sealed_fleet_view_tx(&connection, &mut cache).unwrap().members.is_empty());
+    envelope(&connection, &anchor, "sealed", &["anchor-key"]);
+    let sealed = sealed_fleet_view_tx(&connection, &mut cache).unwrap();
+    assert_eq!(sealed.current("birch")[0].state, "current");
+    assert_eq!(sealed_fleet_view_tx(&connection, &mut cache).unwrap(), sealed);
+}
+
+#[test]
+fn sealed_fleet_cache_tracks_batch_signers_after_envelope_identity_changes() {
+    let connection = fixture();
+    connection.execute_batch(&fleet_generation_schema()).unwrap();
+    let anchor = admitted("anchor", "birch", "anchor-key", "anchor", "birch", 3);
+    insert_claim(&connection, &anchor);
+    envelope(&connection, &anchor, "sealed", &["anchor-key"]);
+    connection.execute(
+        "UPDATE replica_envelopes SET writer='other-writer', sequence=99", [],
+    ).unwrap();
+    let mut cache = None;
+    assert_eq!(
+        sealed_fleet_view_tx(&connection, &mut cache).unwrap().current("birch").len(), 1,
+    );
+    for sql in [
+        "DELETE FROM replica_envelope_signatures",
+        "INSERT INTO replica_envelope_signatures VALUES('birch',3,'sealed','anchor-key')",
+        "UPDATE replica_envelope_signatures SET member_key='other-key'",
+        "UPDATE replica_envelope_signatures SET member_key='anchor-key'",
+    ] {
+        let before = fleet_generation(&connection).unwrap();
+        connection.execute_batch(sql).unwrap();
+        assert!(fleet_generation(&connection).unwrap() > before, "{sql}");
+        assert_eq!(
+            sealed_fleet_view_tx(&connection, &mut cache).unwrap(),
+            crate::fleet::FleetView::from_membership(&fleet_membership_tx(&connection).unwrap()),
+            "{sql}",
+        );
+    }
+}
