@@ -102,7 +102,7 @@ required-features = ["test-support"]
 
 [lib]
 name = "st3_package_marker"
-path = "src/lib.rs"
+path = "src/package_marker.rs"
 test = false
 doctest = false
 doc = false
