@@ -779,17 +779,26 @@ class EndToEnd(unittest.TestCase):
         base, key, record = self.input_scenario(sample_one_in=1)
         self.f.commit('two')
         self.assertEqual(self.run_gate(base)[0]['decision'], 'skip')
-        decisions = set()
-        for n in range(12):  # twelve different heads: with one in 3 some are sampled and some are not
-            base, key, record = self.input_scenario(sample_one_in=3)
-            self.f.commit(f'head {n}')
-            first = self.run_gate(base)[0]
-            decisions.add(first['decision'])
-            self.assertEqual(first['decision'], self.run_gate(base)[0]['decision'])  # a retry behaves the same
+        # The sample is a function of (check, input key, head). The heads here are FIXED object ids, never the checkout's real commit
+        # (whose id changes with the clock), so the outcome of every run below is the same on every machine and every day. Twelve
+        # fixed heads at one in three include both outcomes for this scenario's key; the test says so before it relies on it.
+        base, key, record = self.input_scenario(sample_one_in=3)
+        self.f.commit('the checkout head; its id must not matter')
+        heads = [f'{n:040x}' for n in range(1, 13)]
+        expected = {head: 'run' if gate.sampled({'check': 'linux-gate', 'head': head}, {'sample_one_in': 3, 'source_inputs': key}, '-') else 'skip'
+                    for head in heads}
+        self.assertEqual(set(expected.values()), {'skip', 'run'})
+        for head in heads:
+            first = self.run_gate(base, HEAD_SHA=head)[0]
+            self.assertEqual(first['decision'], expected[head], head)
+            self.assertEqual(first['decision'], self.run_gate(base, HEAD_SHA=head)[0]['decision'])  # a retry behaves the same
             if first['decision'] == 'run':
                 self.assertEqual(first['outcome'], 'satisfied')
                 self.assertTrue(first['reason'].startswith('satisfied_but_not_skipped:_sampled:'), first['reason'])
-        self.assertEqual(decisions, {'skip', 'run'})
+        # Control: the real commit does not matter. The same fixed head gives the same decision after the checkout moved on.
+        self.f.commit('the checkout moved')
+        again = self.run_gate(base, HEAD_SHA=heads[0])[0]
+        self.assertEqual(again['decision'], expected[heads[0]])
         self.assertTrue(gate.sampled({'check': 'c', 'head': 'h'}, {'sample_one_in': 'x'}, 't'))  # unreadable: sample
         self.assertFalse(gate.sampled({'check': 'c', 'head': 'h'}, {'sample_one_in': 1}, 't'))
         # A result without the rule at all (an older or faulty verifier) samples: it must never skip.
