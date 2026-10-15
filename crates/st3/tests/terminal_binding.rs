@@ -315,6 +315,10 @@ async fn fake_harness_receives_mail_and_exits_while_the_shell_survives_daemon_re
     std::fs::write(&provider, r#"
 import json, os, subprocess
 from pathlib import Path
+# A real idle hook supplies the evidence that authorizes new notifications.
+# MCP initialization alone cannot prove the provider is not awaiting a person.
+subprocess.run([os.environ['ST3_BIN'], 'driver-hook', 'claude-observe', 'Stop'],
+    input='{}', text=True, check=True)
 channel = subprocess.Popen([os.environ['ST3_BIN'], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 try:

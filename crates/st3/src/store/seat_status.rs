@@ -242,6 +242,7 @@ pub(super) fn enrich_harness(
             view.since_unix_ms = observation_time(&claims[entry.0]);
         }
     }
+    attention_snapshot::resolve_native_harness_at(connection, subject, index, view)?;
     Ok(())
 }
 

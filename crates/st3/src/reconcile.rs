@@ -1021,10 +1021,6 @@ pub struct Reconciler<R = NativeRuntime> {
     mission_declaration_parses: std::sync::atomic::AtomicUsize,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
     file_watchers_used: Arc<Mutex<HashSet<String>>>,
-    /// The native prompt (the observation that opened it) whose dialog this node saw on each
-    /// Claude seat's screen. Claude's input box is on screen while it works too, so the box
-    /// says a prompt is gone only after its dialog was seen.
-    prompt_dialogs_seen: Arc<Mutex<HashMap<String, String>>>,
     file_observations: Arc<Mutex<HashMap<String, FileStamp>>>,
     resource_provider: Arc<dyn ResourceProvider>,
     /// Open faults by subject and scope, loaded from the graph on first use.
@@ -1181,7 +1177,6 @@ impl Reconciler<NativeRuntime> {
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
-            prompt_dialogs_seen: Arc::new(Mutex::new(HashMap::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
@@ -1325,7 +1320,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
-            prompt_dialogs_seen: Arc::new(Mutex::new(HashMap::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
@@ -3086,7 +3080,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     subject,
                                     member,
                                     &observation,
-                                    screen.as_deref(),
                                 )?;
                                 self.reconcile_claude_trust_screen(
                                     subject,
@@ -4090,22 +4083,19 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(screen)
     }
 
-    /// Claude ends a turn whose permission or question prompt was refused in its terminal (Esc or
-    /// "No") without any hook event, so the seat's last word says it still waits on a person.
-    /// Its input box being back on screen says the prompt is gone: record that once against the
-    /// observation that opened it, so the prompt's alert clears.
+    /// Esc dismissals fire no hook. Re-derive closure from a freshly captured native idle box
+    /// and footer, fenced to the still-current runtime and observation. No remembered dialog
+    /// or timeout is needed, so restart and a dismissal between polls cannot strand mail.
     fn reconcile_native_prompt_screen(
         &self,
         subject: &DesiredSubject,
         member: &MemberSpec,
         observation: &RuntimeObservation,
-        screen: Option<&str>,
     ) -> Result<()> {
-        let (Some("claude"), true, Some(incarnation), Some(screen)) = (
+        let (Some("claude"), true, Some(incarnation)) = (
             member.driver.as_deref(),
             member.terminal && subject.kind == "agent",
             observation.incarnation_id.as_deref(),
-            screen,
         ) else {
             return Ok(());
         };
@@ -4116,25 +4106,33 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         };
         let fields = blocked.body.get("fields").unwrap_or(&blocked.body);
-        let mut seen = self
-            .prompt_dialogs_seen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if fields["blocked_on"] != "human" || fields["incarnation_id"] != incarnation {
-            seen.remove(&subject.subject);
+        if fields["blocked_on"] != "human"
+            || fields["incarnation_id"] != incarnation
+            || fields["driver"] != "claude"
+            || !matches!(fields["ask"].as_str(), Some("permission" | "question" | "review"))
+            || matches!(fields["state"].as_str(), Some("ended" | "indeterminate" | "unknown") | None)
+        {
             return Ok(());
         }
-        if !st_drivers::blocking_screen::claude_input_ready(screen) {
-            // The prompt's dialog is up.
-            seen.insert(subject.subject.clone(), blocked.id.clone());
+        // Capture after reading the prompt, never release using a screen obtained before it.
+        let Ok(screen) = self.member_screen(&member.runtime_id) else {
+            return Ok(());
+        };
+        if !st_drivers::blocking_screen::claude_input_idle(&screen) {
             return Ok(());
         }
-        // The box before the dialog was drawn, or while Claude works, says nothing.
-        if seen.get(&subject.subject) != Some(&blocked.id) {
+        // This is a live-seat fence, not verification of a prepared launch operation:
+        // desired members carry no launch-operation tag, including after daemon restart.
+        let Some(current) = self.runtime.snapshot_ptys()?.into_iter()
+            .find(|item| item.runtime_id == member.runtime_id) else {
+            return Ok(());
+        };
+        if current.status != "running" || current.incarnation_id.as_deref() != Some(incarnation)
+            || self.store.latest_claim(&subject.subject, Some("harness.observed"))?
+                .as_ref().map(|claim| &claim.id) != Some(&blocked.id)
+        {
             return Ok(());
         }
-        seen.remove(&subject.subject);
-        drop(seen);
         self.store.append_claim(&ClaimInput {
             subject: subject.subject.clone(),
             kind: "harness.diagnostic".into(),
@@ -37756,11 +37754,22 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
         assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 0);
     }
 
-    /// Claude reports nothing when its prompt is refused in the terminal; its input box coming
-    /// back says so, but only after the prompt's dialog was seen: the box is also on screen
-    /// before the dialog is drawn and while Claude works.
     #[test]
-    fn a_refused_claude_prompt_is_gone_only_after_its_dialog_was_seen() {
+    fn a_refused_claude_prompt_requires_fresh_idle_evidence() {
+        assert_claude_prompt_screen_resolution(false, true);
+    }
+
+    #[test]
+    fn claude_esc_dismissal_between_screen_polls_releases_mail() {
+        assert_claude_prompt_screen_resolution(false, false);
+    }
+
+    #[test]
+    fn claude_esc_dismissal_after_daemon_restart_releases_mail() {
+        assert_claude_prompt_screen_resolution(true, true);
+    }
+
+    fn assert_claude_prompt_screen_resolution(restart: bool, see_dialog: bool) {
         let fixture = |name: &str| -> String {
             match name {
                 "claude-working.txt" => include_str!("../../st-drivers/tests/fixtures/blocking-screens/claude-working.txt"),
@@ -37781,7 +37790,7 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
             "native-prompt-screen",
         );
         let runtime = Arc::new(FakeRuntime::default());
-        let reconciler = Reconciler::new(
+        let mut reconciler = Reconciler::new(
             store.clone(),
             runtime.clone(),
             "node".into(),
@@ -37796,7 +37805,7 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
                 .unwrap()
                 .insert("node.seat".into(), fixture(name));
         };
-        let ask = || {
+        let ask = |kind: &str, transition: u64| {
             store
                 .append_claim(&ClaimInput {
                     subject: "agent/node.seat".into(),
@@ -37807,7 +37816,9 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
                         ("driver".into(), Value::String("claude".into())),
                         ("incarnation_id".into(), Value::String("one".into())),
                         ("blocked_on".into(), Value::String("human".into())),
-                        ("ask".into(), Value::String("permission".into())),
+                        ("ask".into(), Value::String(kind.into())),
+                        ("ownership_sequence".into(), Value::from(1)),
+                        ("transition_sequence".into(), Value::from(transition)),
                     ]),
                     evidence: Vec::new(),
                     expected_subject: None,
@@ -37828,21 +37839,36 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
                             )))
                 })
         };
-        let first = ask();
-        // The hook fired, but Claude has not drawn its dialog yet: its box is still up.
-        show("claude-working.txt");
-        reconciler.reconcile_once().unwrap();
-        assert!(!gone(&first.id), "the box before the dialog proves nothing");
-        show("claude-permission-dialog.txt");
-        reconciler.reconcile_once().unwrap();
-        assert!(!gone(&first.id));
-        show("claude-permission-refused.txt");
-        reconciler.reconcile_once().unwrap();
-        assert!(gone(&first.id), "the dialog was seen, then refused");
-        // A later prompt whose dialog this node never saw stays open.
-        let second = ask();
-        reconciler.reconcile_once().unwrap();
-        assert!(!gone(&second.id));
+        for (index, kind) in ["permission", "question", "review"].into_iter().enumerate() {
+            let transition = index as u64 + 1;
+            let first = ask(kind, transition);
+            // A working box before the dialog is drawn is not native closure.
+            show("claude-working.txt");
+            reconciler.reconcile_once().unwrap();
+            assert!(!gone(&first.id));
+            assert_eq!(store.native_prompt_state("agent/node.seat", 1, transition).unwrap(),
+                crate::store::NativePromptState::Open);
+            if see_dialog {
+                show("claude-permission-dialog.txt");
+                reconciler.reconcile_once().unwrap();
+                assert!(!gone(&first.id));
+            }
+            if restart {
+                // Only graph history and the live runtime survive daemon replacement.
+                reconciler = Reconciler::new(
+                    store.clone(), runtime.clone(), "node".into(), Arc::new(Notify::new()));
+            }
+            show("claude-permission-refused.txt");
+            *runtime.screen_error.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            reconciler.reconcile_once().unwrap();
+            assert!(!gone(&first.id), "an unreadable screen cannot release mail");
+            *runtime.screen_error.lock().unwrap_or_else(PoisonError::into_inner) = false;
+            reconciler.reconcile_once().unwrap();
+            assert!(gone(&first.id), "{kind}: a fresh idle box closes the native episode");
+            assert_eq!(store.native_prompt_state("agent/node.seat", 1, transition).unwrap(),
+                crate::store::NativePromptState::Gone,
+                "the channel's authoritative lookup must release after the dismissal");
+        }
     }
 
     /// Claude's new-MCP-server dialog fires no hook (measured on Claude Code 2.1.296), so only the

@@ -714,6 +714,14 @@ WHERE kind='harness.observed'
     AND json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
         THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
 
+-- Native decision releases stay attached to the exact driver episode across
+-- arbitrarily many heartbeats; looking one up must not scan the seat's history.
+CREATE INDEX IF NOT EXISTS claims_harness_episode_index
+ON claims(subject, json_extract(body, '$.fields.ownership_sequence'),
+    json_extract(body, '$.fields.transition_sequence'),
+    length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind='harness.observed';
+
 -- A legacy observation without a text incarnation remains eligible for the current
 -- runtime's optional-field fold. Keep those rare rows separate: checking their JSON
 -- predicate against every named heartbeat made attached agent windows scan whole epochs.
@@ -7750,6 +7758,30 @@ impl Store {
                     .to_owned()
             }),
         )
+    }
+
+    /// Latest preparation outcome for one message and the recipient's current incarnation.
+    /// A delayed report from a retired channel cannot mask a current failure or recovery.
+    pub fn claude_preparation_diagnostic(
+        &self,
+        seat: &str,
+        message: &str,
+        incarnation: &str,
+    ) -> Result<Option<(Value, u128)>> {
+        let connection = self.readers.get();
+        let row = connection.prepare_cached(&canonical_sql(
+            "SELECT body, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND actor=?1 AND kind='harness.diagnostic'
+               AND json_extract(body, '$.fields.code')='claude-message-unforwarded'
+               AND json_extract(body, '$.fields.incarnation_id')=?3
+               AND EXISTS (SELECT 1 FROM claims AS message_claim
+                 WHERE message_claim.id=json_extract(claims.body, '$.evidence[0]')
+                   AND message_claim.subject=?2)
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        ))?.query_row(params![seat, message, incarnation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).optional()?;
+        row.map(|(body, at)| Ok((serde_json::from_str(&body)?, at.parse()?))).transpose()
     }
 
     pub fn next_active_mission_deadline(&self, origin: &str) -> Result<Option<u128>> {
@@ -56894,6 +56926,129 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         assert!(prompts().is_empty());
     }
 
+    #[test]
+    fn claude_native_prompt_lookup_window_never_infers_missing_episode_closure() {
+        let store = Store::open_memory("node").unwrap();
+        let seat = "agent/node.worker";
+        let observe = |ownership: u64, transition: u64, state: &str, blocked: &str, ask: &str| {
+            store.append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.observed".into(),
+                actor: Some(seat.into()),
+                fields: serde_json::from_value(json!({
+                    "driver":"claude", "state":state, "incarnation_id":"one",
+                    "blocked_on":blocked, "ask":ask,
+                    "ownership_sequence":ownership, "transition_sequence":transition,
+                })).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap()
+        };
+        for _ in 0..20 {
+            observe(1, 1, "idle", "none", "none");
+        }
+        // The new writer can precede its publication even with a full retained window.
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        for _ in 0..20 {
+            observe(1, 2, "indeterminate", "unknown", "unknown");
+        }
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        observe(1, 2, "working", "human", "permission");
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        for _ in 0..20 {
+            observe(1, 2, "working", "human", "permission");
+        }
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Open);
+        // Only positive successor evidence releases a record outside the bounded window.
+        for _ in 0..20 {
+            observe(1, 3, "idle", "none", "none");
+        }
+        assert_eq!(store.native_prompt_state(seat, 1, 2).unwrap(), NativePromptState::Gone);
+        assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open);
+    }
+
+    #[test]
+    fn claude_native_human_release_is_episode_fenced_durable_and_shared_with_sender_status() {
+        for ask in ["permission", "question", "review"] {
+            let store = Store::open_memory("node").unwrap();
+            let seat = "agent/node.worker";
+            let append = |kind: &str, fields: Value, key: Option<String>| {
+                store.append_claim(&ClaimInput {
+                    subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                    expected_subject: None, idempotency_key: key,
+                }).unwrap()
+            };
+            append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}), None);
+            let blocked = |transition| json!({
+                "state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":ask, "reason":"native prompt",
+                "ownership_sequence":1, "transition_sequence":transition
+            });
+            let asked = append("harness.observed", blocked(3), None);
+            let before = store.index().unwrap();
+            assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Open, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, before).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            append("harness.diagnostic", json!({
+                "code":"native-prompt-gone", "status":"resolved",
+                "driver":"claude", "incarnation_id":"one"
+            }), Some(native_prompt_gone_key(&asked.id)));
+            assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, before).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            if ask == "permission" {
+                // A replicated answer request can arrive after native closure.
+                // It must not resurrect the sender's held projection.
+                append("harness.diagnostic", json!({
+                    "code":"native-prompt-answered", "status":"allow",
+                    "driver":"claude", "incarnation_id":"one"
+                }), Some(format!("native-prompt-answer:{}", asked.id)));
+                assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone);
+                assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
+            }
+            for _ in 0..20 {
+                append("harness.observed", blocked(3), None);
+            }
+            // Esc/No emits no hook event; the blocked driver file can heartbeat
+            // for longer than the bounded recent-observation lookup window.
+            assert_eq!(store.native_prompt_state(seat, 1, 3).unwrap(), NativePromptState::Gone, "{ask}");
+            let released = store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap();
+            assert!(released.blocked_on.is_none(), "{ask}");
+            assert!(released.ask.is_none(), "{ask}");
+            assert_eq!(released.state, "idle", "{ask}");
+            // A full history window cannot release a not-yet-published new prompt.
+            assert_eq!(store.native_prompt_state(seat, 1, 999).unwrap(), NativePromptState::Open);
+            append("harness.observed", blocked(4), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            // Staleness is uncertainty, not prompt dismissal. Its derived
+            // snapshot retains the driver's ownership/transition counters.
+            append("harness.observed", json!({
+                "state":"indeterminate", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"unknown", "ask":"unknown", "reason":"stale",
+                "ownership_sequence":1, "transition_sequence":4
+            }), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open, "{ask}");
+            append("harness.observed", blocked(4), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Open, "{ask}");
+            assert_eq!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.as_deref(), Some("human"));
+            // A native timeout that ends the turn, unlike the hook's polling
+            // timeout while a dialog stays open, retires the hold.
+            append("harness.observed", json!({
+                "state":"ended", "driver":"claude", "incarnation_id":"one",
+                "ownership_sequence":1, "transition_sequence":5, "exit":"timeout"
+            }), None);
+            assert_eq!(store.native_prompt_state(seat, 1, 4).unwrap(), NativePromptState::Gone);
+            assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
+            append("runtime.observed", json!({"status":"running", "incarnation_id":"two"}), None);
+            append("harness.observed", json!({
+                "state":"ready", "driver":"claude", "incarnation_id":"two",
+                "ownership_sequence":2, "transition_sequence":1
+            }), None);
+            assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none());
+        }
+    }
+
     /// A Claude permission prompt can be answered from a client: only by the seat's person, only
     /// while it waits, and once. The hook sees the answer; the alert goes once it is answered.
     #[test]
@@ -56982,6 +57137,10 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 answer: "deny".into()
             }
         );
+        let answered = store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap();
+        assert_eq!(answered.blocked_on.as_deref(), Some("human"));
+        assert_eq!(answered.ask.as_deref(), Some("permission"));
+        // Recording the answer does not prove the native polling hook applied it.
         assert!(prompt().is_none(), "an answered prompt is no longer an alert");
         assert!(
             store
@@ -57113,8 +57272,8 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         // Within the hook's wait, the prompt is answered here.
         asked(now - window + 60_000, 3);
         assert_eq!(prompt().unwrap().answers, vec!["allow".to_owned(), "deny".to_owned()]);
-        // The next prompt opened before the hook's wait: still an alert, answered in the terminal,
-        // and so is each restatement of it, which keeps when it opened.
+        // Expiring the hook only disables answering through st. The native dialog
+        // stays open, and each restatement keeps its original opening time.
         append(
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
@@ -57137,7 +57296,20 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 .code,
             "stale-fence"
         );
+        assert_eq!(store.native_prompt_state(seat, 1, 5).unwrap(), NativePromptState::Open);
+        let index = store.index().unwrap();
+        let held = store.observed_harness_at(seat, index).unwrap().unwrap();
+        assert_eq!(held.blocked_on.as_deref(), Some("human"),
+            "hook expiry must retain the native human mail hold");
+        assert_eq!(store.seat_observation_at(seat, Some(&held), index, now_ms()).unwrap(), "current");
+        append(
+            "harness.observed",
+            json!({"state":"idle", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":6}),
+        );
         assert_eq!(store.native_prompt_state(seat, 1, 5).unwrap(), NativePromptState::Gone);
+        assert!(store.observed_harness_at(seat, store.index().unwrap()).unwrap().unwrap().blocked_on.is_none(),
+            "authoritative native closure releases the mail hold");
     }
 
     /// A driver writes each prompt as its own transition, so a later prompt for the same tool is
