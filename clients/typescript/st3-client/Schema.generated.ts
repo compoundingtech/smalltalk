@@ -1064,6 +1064,40 @@ export const AttentionTargetState = /*#__PURE__*/ (() => Schema.Struct({
 export type AttentionTargetState = typeof AttentionTargetState.Type
 export type AttentionTargetStateEncoded = typeof AttentionTargetState.Encoded
 
+export const DecisionNativeAsk = /*#__PURE__*/ (() => Schema.Struct({
+  "episode": optionalKey(Schema.String.check(Schema.isMaxLength(512))),
+  "key": Schema.String.check(Schema.isMaxLength(512)),
+  "run": optionalKey(MissionRunId),
+  "status": Schema.String.check(Schema.isMaxLength(64)),
+  "subject": StepRunId
+}).annotate({ identifier: "DecisionNativeAsk" }))()
+export type DecisionNativeAsk = typeof DecisionNativeAsk.Type
+export type DecisionNativeAskEncoded = typeof DecisionNativeAsk.Encoded
+
+export const DecisionAttention = /*#__PURE__*/ (() => Schema.Struct({
+  "activation": Schema.String.check(Schema.isPattern(new RegExp("^[a-f0-9]{16}$", "u"))),
+  "answer_id": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^[a-z0-9]{6}$", "u")))),
+  /** Relative link to this gateway's history-enabled attention detail; no second source or answer-write authority. */
+  "answer_link": optionalKey(Schema.String).annotate({ description: "Relative link to this gateway's history-enabled attention detail; no second source or answer-write authority." }),
+  "answer_source_revision": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^[a-f0-9]{64}$", "u")))),
+  "claim_id": Schema.String,
+  "decision_id": Id,
+  "decision_kind": Schema.Literals(["blocker","refinement"]),
+  "native_ask": optionalKey(DecisionNativeAsk),
+  "native_asks": Schema.Array(DecisionNativeAsk),
+  "person": Id,
+  "q": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(9007199254740991)),
+  "request_id": Schema.String.check(Schema.isPattern(new RegExp("^[a-z0-9]{6}$", "u"))),
+  "revived": Schema.Boolean,
+  "source_conflict": Schema.Boolean,
+  "source_revision": Schema.String.check(Schema.isPattern(new RegExp("^[a-f0-9]{64}$", "u"))),
+  "source_sequence": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(9007199254740991)),
+  "state": Schema.Literals(["pending","gated","answered","moot","undecidable"]),
+  "updated_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9007199254740991))
+}).annotate({ identifier: "DecisionAttention" }))()
+export type DecisionAttention = typeof DecisionAttention.Type
+export type DecisionAttentionEncoded = typeof DecisionAttention.Encoded
+
 export const LaunchPreview = /*#__PURE__*/ (() => Schema.Struct({
   "agents": Schema.Array(Schema.Struct({ "harness": optionalKey(Schema.Unknown), "host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "id": Schema.String, "worktree": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) })),
   "diagnostics_count": Schema.Int,
@@ -1092,7 +1126,7 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "actions": Schema.Array(Schema.Literals(["custom.reply","prompt.respond","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
   /** Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts. */
   "alert": optionalKey(Schema.Boolean).annotate({ description: "Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts." }),
-  "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault","harness-login","harness-prompt"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
+  "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault","harness-login","harness-prompt","decision"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
   "because": optionalKey(Schema.String),
   /** The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask. */
   "blocked": optionalKey(AttentionBlocked),
@@ -1102,6 +1136,8 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "conversation_ids": optionalKey(Schema.Array(Id)).annotate({ description: "Every agent conversation this item shows in, starting with conversation_id. A harness login alert names every seat that shares the login, since one sign-in answers them all." }),
   /** Data-only registered reply form; absent on native attention. */
   "custom_form": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Data-only registered reply form; absent on native attention." }),
+  /** Source-owned decision metadata. No private request or answer text; only pending is actionable. */
+  "decision": optionalKey(DecisionAttention),
   "detail": Schema.String,
   "episode": optionalKey(Schema.String),
   "fix": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),

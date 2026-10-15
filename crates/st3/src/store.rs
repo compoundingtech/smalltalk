@@ -152,6 +152,7 @@ pub(crate) mod summary_list;
     )
 )]
 pub(crate) mod attention_ivm;
+mod decision_attention;
 mod backup;
 mod checkpoint_rules;
 mod checkpoint_status;
@@ -15014,6 +15015,7 @@ impl Store {
         items.extend(self.harness_login_attention_items(person)?);
         items.extend(self.harness_prompt_attention_items(person, as_of)?);
         items.extend(self.custom_attention_items(person)?);
+        self.project_decision_attention(&mut items, person)?;
         // A person who published a broken gate is the one to correct it.
         items.extend(
             self.broken_gate_items(person, as_of)?

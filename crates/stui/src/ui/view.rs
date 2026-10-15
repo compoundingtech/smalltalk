@@ -257,6 +257,12 @@ pub enum AttentionKind {
         /// a recommendation. Absent on a free-text ask.
         structured: Option<Box<st3_client::StructuredRequest>>,
     },
+    /// A source-owned decision; this projection never offers a person-step answer action.
+    Decision {
+        state: String,
+        source: String,
+        question: String,
+    },
     /// Information the person asked an agent for (`st work update`): it asks nothing, and it
     /// clears once they read it.
     Update {
@@ -286,6 +292,7 @@ impl AttentionKind {
             AttentionKind::Prompt { .. } => "prompt",
             AttentionKind::Login { .. } => "login",
             AttentionKind::Request { .. } => "request",
+            AttentionKind::Decision { .. } => "decision",
             AttentionKind::Update { .. } => "update",
         }
     }

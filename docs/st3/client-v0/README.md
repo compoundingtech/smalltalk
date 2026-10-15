@@ -686,6 +686,25 @@ closes the TUI's prompt. Each waits on the exact observation its prompt wrote, s
 earlier prompt never answers a later one. An answer in the terminal still wins at once. A
 question prompt, and prompts of other harnesses, are answered in the terminal.
 
+Source-owned Axe decisions appear with `attention_kind: "decision"` and typed `decision`
+metadata. The requesting agent publishes the durable `decision.observed` value as itself;
+the value carries source identity, sequence/revision, fixed recipient, decision kind/state,
+activation and optional answer/native-ask references, not request documents, option labels
+or answer text. The existing detailed source resource keeps its separate authorized contract.
+
+Only unambiguous pending decisions are current cards. `history=true` retains answered, gated,
+moot and undecidable decisions under the same card identity. An answered decision carries
+`decision.answer_id`; its `decision.answer_link` returns that card through the same gateway's
+history detail route, with the answer identity intact. Retained answers prevent stale replay
+or a partially restored source log from reopening an answered card. Conflicting same-version
+source values or a changed recipient are undecidable rather than actionable.
+
+Native-ask repair may enrich the same source sequence/revision without changing the decision
+or its recipient. A validated native ask for that person and requester is joined to the source
+card instead of appearing twice. Decision cards have no completion actions: answer through
+Axe, not `work.done` or `attention.resolve`. A native link is a receipt, not authority to invent
+an answer or derive a new activation from a legacy keyless reference.
+
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`
 time it entered that state. Resource and document targets have none. The card describes the
