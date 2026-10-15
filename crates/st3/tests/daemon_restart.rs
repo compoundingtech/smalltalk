@@ -3118,3 +3118,4 @@ async fn claude_delivered_unread_mail_from_an_old_ledger_is_held_in_a_fresh_sess
     assert!(daemon.store.claims_for("message/unread", Some("message.read")).unwrap().is_empty());
     daemon.stop().await;
 }
+mod stop_escalation;

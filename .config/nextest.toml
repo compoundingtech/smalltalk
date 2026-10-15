@@ -120,3 +120,7 @@ success-output = "immediate"
 [[profile.ci.overrides]]
 filter = 'package(st3) and (test(/^store::tests::actual_purity_tests::/) or test(/^store::tests::repaired_original_sources_and_operations_ignore_local_retention_and_roll_back$/))'
 retries = 0
+# Native stop ordering must pass on the first attempt.
+[[profile.ci.overrides]]
+filter = 'package(=st3) and binary(=integration) and kind(test) and (test(=daemon_restart::stop_escalation::claude_stop_escalation_records_ended_before_its_group_sigkill) or test(=daemon_restart::stop_escalation::opencode_stop_escalation_records_cover_before_its_group_sigkill) or test(=daemon_restart::stop_escalation::opencode_graceful_stop_rewrites_cover_with_the_reaped_signal))'
+retries = 0
