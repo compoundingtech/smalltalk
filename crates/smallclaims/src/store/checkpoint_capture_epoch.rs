@@ -28,7 +28,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         )?;
         if !exists {
             transaction.execute_batch(&format!(
-                "ALTER TABLE checkpoint_capture_epoch ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+                /* sqlite-large-value: allow-for-now lv-h2974cb5454fc owner=smallclaims::store::checkpoint_capture_epoch TODO=stage-generation-and-keyed-reclamation */ "ALTER TABLE checkpoint_capture_epoch ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
             ))?;
         }
     }
@@ -44,7 +44,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         for table in TABLES {
             for event in ["INSERT", "UPDATE", "DELETE", "replace"] {
                 transaction.execute_batch(&format!(
-                    "DROP TRIGGER IF EXISTS {table}_checkpoint_capture_{event};"
+                    /* sqlite-large-value: allow-for-now lv-he1de637574d4 owner=smallclaims::store::checkpoint_capture_epoch TODO=stage-generation-and-keyed-reclamation */ "DROP TRIGGER IF EXISTS {table}_checkpoint_capture_{event};"
                 ))?;
             }
         }
@@ -64,7 +64,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     }
     if version != TRIGGER_VERSION {
         transaction.execute(
-            "UPDATE checkpoint_capture_epoch SET value=value+1,trigger_version=?1 WHERE id=1",
+            /* sqlite-large-value: allow-for-now lv-h8c9565295f2c owner=smallclaims::store::checkpoint_capture_epoch TODO=stage-generation-and-keyed-reclamation */ "UPDATE checkpoint_capture_epoch SET value=value+1,trigger_version=?1 WHERE id=1",
             [TRIGGER_VERSION],
         )?;
     }
@@ -263,7 +263,7 @@ fn create_trigger(
 ) -> Result<()> {
     let operation = if event == "replace" { "INSERT" } else { event };
     connection.execute_batch(&format!(
-        "CREATE TRIGGER IF NOT EXISTS {table}_checkpoint_capture_{event} {timing} {operation} ON {table}
+        /* sqlite-large-value: allow-for-now lv-heaf3fdbc6d5f owner=smallclaims::store::checkpoint_capture_epoch TODO=stage-generation-and-keyed-reclamation */ "CREATE TRIGGER IF NOT EXISTS {table}_checkpoint_capture_{event} {timing} {operation} ON {table}
          WHEN (SELECT cut_unix_ms FROM {GUARD})>0 AND ({condition}) BEGIN
              UPDATE checkpoint_capture_epoch SET value=value+1 WHERE id=1;
          END;"

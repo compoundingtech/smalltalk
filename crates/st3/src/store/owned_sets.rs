@@ -348,7 +348,7 @@ fn one_shot_retirement(
     let Some(launch) = desired.member.filter(|m| m.one_shot) else {
         return Ok(None);
     };
-    connection.query_row(&canonical_sql(
+    connection.query_row(/* sqlite-large-value: allow-for-now lv-h6c0bbe231d7b owner=st3::store::owned_sets TODO=trace-statement-and-value-representation */ &canonical_sql(
         "SELECT claims.id FROM claims WHERE claims.subject=?1 AND claims.kind='intent.desired'
          AND claims.actor='daemon/runtime' AND claims.origin=?2 AND claims.store_index<=?3
          AND json_extract(claims.body,'$.owned_set')=?4 AND json_extract(claims.body,'$.kind')='stop'
@@ -686,12 +686,12 @@ pub(super) fn plan_tx(
     }
     let membership = fleet_membership_tx(transaction).map_err(internal)?;
     for member in membership.incarnations().filter(|m| m.end.is_none()) {
-        let supported: Option<bool> = transaction.query_row(&canonical_sql(
+        let supported: Option<bool> = transaction.query_row(/* sqlite-large-value: allow-for-now lv-h0e8e32793360 owner=st3::store::owned_sets TODO=trace-statement-and-value-representation */ &canonical_sql(
             "SELECT json_extract(body,'$.fields.features.owned_sets')=1 FROM claims
              WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
         if options.rollout.is_some() || manual_seats {
-            let rollout_supported: Option<bool> = transaction.query_row(&canonical_sql(
+            let rollout_supported: Option<bool> = transaction.query_row(/* sqlite-large-value: allow-for-now lv-hc07b6636f839 owner=st3::store::owned_sets TODO=trace-statement-and-value-representation */ &canonical_sql(
                 "SELECT json_extract(body,'$.fields.features.seat_rollout')=1 FROM claims
                  WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                 params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
@@ -703,7 +703,7 @@ pub(super) fn plan_tx(
             }
         }
         if manual_seats {
-            let supported: Option<bool> = transaction.query_row(&canonical_sql(
+            let supported: Option<bool> = transaction.query_row(/* sqlite-large-value: allow-for-now lv-ha5876729c018 owner=st3::store::owned_sets TODO=trace-statement-and-value-representation */ &canonical_sql(
                 "SELECT json_extract(body,'$.fields.features.seat_rollout_manual')=1 FROM claims
                  WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                 params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
@@ -1133,7 +1133,7 @@ pub(super) fn project_tx(transaction: &Transaction<'_>) -> Result<(), St3Error> 
                 let Some(c) = claim(transaction, &m.claim, None)? else {
                     continue;
                 };
-                transaction.execute("INSERT INTO mission_definitions(mission_id,revision,state,claim_id) VALUES (?1,?2,?3,?4)
+                transaction.execute(/* sqlite-large-value: allow-for-now lv-h390ef5f3820a owner=st3::store::owned_sets TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO mission_definitions(mission_id,revision,state,claim_id) VALUES (?1,?2,?3,?4)
                     ON CONFLICT(mission_id) DO UPDATE SET revision=excluded.revision,state=excluded.state,claim_id=excluded.claim_id",
                     params![s.trim_start_matches("mission/"),m.revision,if retired{"retired"}else{c.body["state"].as_str().unwrap_or("draft")},m.claim]).map_err(internal)?;
             } else {
@@ -1143,7 +1143,7 @@ pub(super) fn project_tx(transaction: &Transaction<'_>) -> Result<(), St3Error> 
                     serde_json::from_value(claim(transaction, &m.claim, None)?.unwrap().body)
                         .map_err(internal)?
                 };
-                transaction.execute("INSERT INTO desired(subject,kind,revision,claim_id,body,member,owner_run,owner_generation,owner_step) VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,NULL)
+                transaction.execute(/* sqlite-large-value: allow-for-now lv-h26540ea3a776 owner=st3::store::owned_sets TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO desired(subject,kind,revision,claim_id,body,member,owner_run,owner_generation,owner_step) VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,NULL)
                     ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind,revision=excluded.revision,claim_id=excluded.claim_id,body=excluded.body,member=excluded.member,owner_run=NULL,owner_generation=NULL,owner_step=NULL",
                     params![s,desired.kind,m.revision,m.claim,canonical_json_text(&desired.desired).map_err(internal)?,desired.member.as_ref().map(canonical_serialized_json_text).transpose().map_err(internal)?]).map_err(internal)?;
             }
@@ -1344,7 +1344,7 @@ impl Store {
                 // Empty ownership uses one receipt and one staged-subject query for any roster;
                 // statement count alone does not bound rows or CPU for nonempty history.
                 let staged = connection
-                    .prepare(STAGED_SUBJECTS_QUERY)
+                    .prepare(/* sqlite-large-value: allow-for-now lv-h428bfc729250 owner=st3::store::owned_sets TODO=trace-statement-and-value-representation */ STAGED_SUBJECTS_QUERY)
                     .map_err(internal)?
                     .query_map([], |row| row.get::<_, String>(0))
                     .map_err(internal)?
@@ -1401,9 +1401,9 @@ impl Store {
         let empty: bool = {
             let connection = self.readers.get();
             connection
-                .prepare_cached(EMPTY_DESIRED_AUTHORITY_QUERY)
+                .prepare_cached(/* sqlite-large-value: allow-for-now lv-hf311a4dc4db9 owner=st3::store::owned_sets TODO=trace-statement-and-value-representation */ EMPTY_DESIRED_AUTHORITY_QUERY)
                 .map_err(internal)?
-                .query_row([&desired.subject], |row| row.get(0))
+                .query_row(/* sqlite-large-value: allow-for-now lv-h5dc28fefc23c owner=st3::store::owned_sets TODO=trace-statement-and-value-representation */ [&desired.subject], |row| row.get(0))
                 .map_err(internal)?
         };
         if empty {

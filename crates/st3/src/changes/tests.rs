@@ -93,7 +93,7 @@ impl Fixture {
     }
 
     fn create(&self) -> Revision {
-        let revision = self.repo.prepare(self.record.clone()).unwrap();
+        let revision = self.repo.prepare(/* sqlite-large-value: allow-for-now lv-hf6d70baa462c owner=st3::changes::tests TODO=trace-statement-and-value-representation */ self.record.clone()).unwrap();
         self.repo.publish("origin", None, &revision).unwrap();
         revision
     }
@@ -134,7 +134,7 @@ fn state_transitions_are_atomic_and_terminal_current_retains_source_history() {
     assert!(git(&fixture.remote, &["for-each-ref", "refs/tags"]).is_empty());
     let mut changed_base = transport::successor(&initial, "agent/fixture/builder").unwrap();
     changed_base.base_commit = changed_base.source_commit.clone();
-    assert!(fixture.repo.prepare(changed_base).is_err());
+    assert!(fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h34500d61e3d9 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ changed_base).is_err());
     let ready = fixture
         .repo
         .prepare_state(
@@ -283,9 +283,9 @@ fn a_stale_revision_cannot_create_a_claim_and_a_no_op_current_is_rejected() {
 fn missing_trailer_requires_explicit_import_or_recovery_and_duplicates_fail() {
     let mut fixture = Fixture::new(false);
     assert_eq!(fixture.repo.trailer("HEAD").unwrap(), None);
-    assert!(fixture.repo.prepare(fixture.record.clone()).is_err());
+    assert!(fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h579d5d33c72b owner=st3::changes::tests TODO=trace-statement-and-value-representation */ fixture.record.clone()).is_err());
     fixture.record.trailer_status = TrailerStatus::ExternalMissing;
-    let imported = fixture.repo.prepare(fixture.record.clone()).unwrap();
+    let imported = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-hf988f1c334e0 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ fixture.record.clone()).unwrap();
     assert_eq!(
         imported.record.source_commit,
         fixture.repo.source("HEAD").unwrap().0
@@ -307,7 +307,7 @@ fn missing_trailer_requires_explicit_import_or_recovery_and_duplicates_fail() {
     assert_eq!(tree, imported.record.source_tree);
     fixture.record.source_commit = source;
     fixture.record.trailer_status = TrailerStatus::Present;
-    fixture.repo.prepare(fixture.record.clone()).unwrap();
+    fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h489f2333145d owner=st3::changes::tests TODO=trace-statement-and-value-representation */ fixture.record.clone()).unwrap();
     let message = format!(
         "Synthetic duplicate\n\nChange-Id: {}\nChange-Id: {}",
         fixture.record.change_id, fixture.record.change_id
@@ -321,7 +321,7 @@ fn a_dropped_trailer_or_different_tree_cannot_validate_owned_metadata() {
     let fixture = Fixture::new(true);
     let mut record = fixture.record.clone();
     record.source_tree = record.base_commit.clone();
-    assert!(fixture.repo.prepare(record).is_err());
+    assert!(fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h8342210b2adc owner=st3::changes::tests TODO=trace-statement-and-value-representation */ record).is_err());
     git(
         &fixture.path,
         &["commit", "--amend", "-q", "-m", "Synthetic missing trailer"],
@@ -330,7 +330,7 @@ fn a_dropped_trailer_or_different_tree_cannot_validate_owned_metadata() {
     let mut record = fixture.record.clone();
     record.source_commit = source;
     record.source_tree = tree;
-    assert!(fixture.repo.prepare(record).is_err());
+    assert!(fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-hcbad69dc8176 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ record).is_err());
 }
 
 #[test]
@@ -428,7 +428,7 @@ fn invalid_record_identity_lane_claim_and_history_fail_before_publication() {
     let initial = fixture.create();
     let mut record = transport::successor(&initial, "agent/fixture/builder").unwrap();
     record.change_id = new_change_id().unwrap();
-    assert!(fixture.repo.prepare(record).is_err());
+    assert!(fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h4df27f28c075 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ record).is_err());
     for id in [
         "fixture",
         "i0123456789abcdef0123456789abcdef01234567",
@@ -479,7 +479,7 @@ fn generic_preparation_cannot_publish_landing_or_reopen_terminal_work() {
     let draft = fixture.create();
     let mut record = transport::successor(&draft, "agent/fixture/builder").unwrap();
     record.state = State::Landed;
-    let landed = fixture.repo.prepare(record).unwrap();
+    let landed = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h144f7a23939a owner=st3::changes::tests TODO=trace-statement-and-value-representation */ record).unwrap();
     assert!(
         fixture
             .repo
@@ -489,12 +489,12 @@ fn generic_preparation_cannot_publish_landing_or_reopen_terminal_work() {
     validate_advertisement(&fixture.repo.discover("origin").unwrap(), &draft).unwrap();
     let mut initial = fixture.record.clone();
     initial.state = State::Landed;
-    let initial = fixture.repo.prepare(initial).unwrap();
+    let initial = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-hc2f4a8ec9454 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ initial).unwrap();
     assert!(fixture.repo.publish("origin", None, &initial).is_err());
     for state in [State::Abandoned, State::Landed] {
         let mut record = transport::successor(&draft, "agent/fixture/builder").unwrap();
         record.state = state;
-        let terminal = fixture.repo.prepare(record).unwrap();
+        let terminal = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h9de46e35bf33 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ record).unwrap();
         // Simulate a foreign writer's terminal observation. Reading its data does
         // not grant an ordinary publisher authority to reopen it.
         let current = format!("{PREFIX}{}/current", terminal.record.change_id);
@@ -511,7 +511,7 @@ fn generic_preparation_cannot_publish_landing_or_reopen_terminal_work() {
         for state in [State::Draft, State::Ready] {
             let mut record = transport::successor(&terminal, "agent/fixture/builder").unwrap();
             record.state = state;
-            let reopened = fixture.repo.prepare(record).unwrap();
+            let reopened = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-hc34a2a7fe51f owner=st3::changes::tests TODO=trace-statement-and-value-representation */ record).unwrap();
             assert!(
                 fixture
                     .repo
@@ -536,7 +536,7 @@ fn generic_preparation_cannot_claim_a_different_lane_or_draft_or_changed_content
         .unwrap();
     let mut wrong_lane = claim.record.clone();
     wrong_lane.claim.as_mut().unwrap().lane = "build".into();
-    let wrong_lane = fixture.repo.prepare(wrong_lane).unwrap();
+    let wrong_lane = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-hd60c5e2db581 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ wrong_lane).unwrap();
     assert!(
         fixture
             .repo
@@ -545,7 +545,7 @@ fn generic_preparation_cannot_claim_a_different_lane_or_draft_or_changed_content
     );
     let mut changed_payload = claim.record.clone();
     changed_payload.depends_on.push(new_change_id().unwrap());
-    let changed_payload = fixture.repo.prepare(changed_payload).unwrap();
+    let changed_payload = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-hac114f280099 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ changed_payload).unwrap();
     assert!(
         fixture
             .repo
@@ -572,7 +572,7 @@ fn generic_preparation_cannot_claim_a_different_lane_or_draft_or_changed_content
     changed_source.source_tree = tree.clone();
     changed_source.claim.as_mut().unwrap().expected_source = source;
     changed_source.claim.as_mut().unwrap().expected_tree = tree;
-    let changed_source = fixture.repo.prepare(changed_source).unwrap();
+    let changed_source = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h703751966219 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ changed_source).unwrap();
     assert!(
         fixture
             .repo
@@ -590,7 +590,7 @@ fn generic_preparation_cannot_claim_a_different_lane_or_draft_or_changed_content
     let mut claimed_draft = transport::successor(&draft, "agent/fixture/one").unwrap();
     claimed_draft.state = State::Ready;
     claimed_draft.claim = claim.record.claim.clone();
-    let claimed_draft = fixture.repo.prepare(claimed_draft).unwrap();
+    let claimed_draft = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-hc1e3f5d2bd76 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ claimed_draft).unwrap();
     assert!(
         fixture
             .repo
@@ -643,7 +643,7 @@ fn generic_release_needs_worker_nonce_and_cannot_change_state_or_retarget_claim(
     );
     let mut foreign_release = release.record.clone();
     foreign_release.actor = "agent/fixture/two".into();
-    let foreign_release = fixture.repo.prepare(foreign_release).unwrap();
+    let foreign_release = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h0baae91ac50a owner=st3::changes::tests TODO=trace-statement-and-value-representation */ foreign_release).unwrap();
     assert!(
         fixture
             .repo
@@ -659,7 +659,7 @@ fn generic_release_needs_worker_nonce_and_cannot_change_state_or_retarget_claim(
     let mut changed_state = release.record.clone();
     changed_state.state = State::Draft;
     changed_state.next = None;
-    let changed_state = fixture.repo.prepare(changed_state).unwrap();
+    let changed_state = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h095066c719e1 owner=st3::changes::tests TODO=trace-statement-and-value-representation */ changed_state).unwrap();
     assert!(
         fixture
             .repo
@@ -674,7 +674,7 @@ fn generic_release_needs_worker_nonce_and_cannot_change_state_or_retarget_claim(
     );
     let mut retargeted = transport::successor(&claimed, &claim.worker).unwrap();
     retargeted.claim.as_mut().unwrap().lane = "build".into();
-    let retargeted = fixture.repo.prepare(retargeted).unwrap();
+    let retargeted = fixture.repo.prepare(/* sqlite-large-value: allow-for-now lv-h54f276fffeaa owner=st3::changes::tests TODO=trace-statement-and-value-representation */ retargeted).unwrap();
     assert!(
         fixture
             .repo

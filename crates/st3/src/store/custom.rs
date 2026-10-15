@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use st3_schema::custom::{self as schema, Authority, Basis, Expr, Manifest, Predicate, Select};
 
 // Explicit UPSERTs in triggers keep an outer admission UPSERT from overriding IGNORE.
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h900c8c6cf91c owner=st3::store::custom TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS custom_registrations (
  subject TEXT PRIMARY KEY, kind TEXT NOT NULL, version INTEGER NOT NULL,
  prefix TEXT NOT NULL, hash TEXT NOT NULL, manifest TEXT NOT NULL,
@@ -103,7 +103,7 @@ fn fields(claim: &ClaimRecord) -> BTreeMap<String, Value> {
         .unwrap_or_default()
 }
 fn claims(connection: &Connection, subject: &str) -> Result<Vec<ClaimRecord>> {
-    connection.prepare(&canonical_sql(
+    connection.prepare(/* sqlite-large-value: allow-for-now lv-hfc31cebd3684 owner=st3::store::custom TODO=trace-statement-and-value-representation */ &canonical_sql(
         "SELECT claims.id,claims.store_index,claims.batch_id,claims.subject,claims.kind,claims.origin,claims.actor,claims.body,claims.predecessors,claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id WHERE claims.subject=?1
          AND NOT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=claims.id AND state='repaired')
@@ -121,7 +121,7 @@ fn registration(
         .transpose()
 }
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(SCHEMA)?;
+    connection.execute_batch(/* sqlite-large-value: allow-for-now lv-hb105dfcf2a75 owner=st3::store::custom TODO=trace-statement-and-value-representation */ SCHEMA)?;
     Ok(())
 }
 pub(super) fn open(tx: &Transaction<'_>) -> Result<()> {
@@ -141,10 +141,10 @@ pub(super) fn open(tx: &Transaction<'_>) -> Result<()> {
     }
 }
 pub(super) fn rebuild(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch("DELETE FROM custom_registrations; DELETE FROM custom_sources; DELETE FROM custom_dependencies; DELETE FROM local_custom_dirty; INSERT INTO local_custom_dirty SELECT DISTINCT subject FROM claims WHERE subject LIKE 'custom/%' AND subject NOT LIKE 'custom/client/%';")?;
+    tx.execute_batch(/* sqlite-large-value: allow-for-now lv-hdf179f0d43ba owner=st3::store::custom TODO=prepare-body-and-predecessor-values */ "DELETE FROM custom_registrations; DELETE FROM custom_sources; DELETE FROM custom_dependencies; DELETE FROM local_custom_dirty; INSERT INTO local_custom_dirty SELECT DISTINCT subject FROM claims WHERE subject LIKE 'custom/%' AND subject NOT LIKE 'custom/client/%';")?;
     flush(tx)?;
     tx.execute(
-        "INSERT OR REPLACE INTO meta(key,value) VALUES('custom_projections_version','1')",
+        /* sqlite-large-value: allow-for-now lv-hb1a48d2dd337 owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO meta(key,value) VALUES('custom_projections_version','1')",
         [],
     )?;
     Ok(())
@@ -155,7 +155,7 @@ pub(super) fn flush(tx: &Transaction<'_>) -> Result<()> {
     })? {
         return Ok(());
     }
-    tx.execute("INSERT OR IGNORE INTO local_custom_dirty SELECT source FROM custom_dependencies WHERE dependency IN (SELECT subject FROM local_custom_dirty)", [])?;
+    tx.execute(/* sqlite-large-value: allow-for-now lv-hab74f89354bb owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO local_custom_dirty SELECT source FROM custom_dependencies WHERE dependency IN (SELECT subject FROM local_custom_dirty)", [])?;
     let registry_dirty: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM local_custom_dirty WHERE subject LIKE 'custom/st3-kinds/%')",
         [],
@@ -172,24 +172,24 @@ pub(super) fn flush(tx: &Transaction<'_>) -> Result<()> {
             .map(|(_, (prefix, _))| prefix.clone())
             .collect::<BTreeSet<_>>();
         for prefix in changed {
-            tx.execute("INSERT OR IGNORE INTO local_custom_dirty SELECT DISTINCT subject FROM claims WHERE subject>=?1 AND subject<?2",params![prefix,prefix_end(&prefix)])?;
+            tx.execute(/* sqlite-large-value: allow-for-now lv-h0019a90d0cba owner=st3::store::custom TODO=prepare-body-and-predecessor-values */ "INSERT OR IGNORE INTO local_custom_dirty SELECT DISTINCT subject FROM claims WHERE subject>=?1 AND subject<?2",params![prefix,prefix_end(&prefix)])?;
         }
     }
     let dirty=tx.prepare("SELECT subject FROM local_custom_dirty WHERE subject LIKE 'custom/%' AND subject NOT LIKE 'custom/client/%' AND subject NOT LIKE 'custom/st3-kinds/%' ORDER BY subject")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     // Build dependency edges before checking cycles, so arrival order cannot choose health.
     for _ in 0..2 {
         for subject in &dirty {
-            tx.execute_batch("SAVEPOINT custom_source")?;
+            tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h58a940b87b5e owner=st3::store::custom TODO=trace-statement-and-value-representation */ "SAVEPOINT custom_source")?;
             let result = refresh_source(tx, subject);
             if result.is_err() {
-                tx.execute_batch("ROLLBACK TO custom_source; RELEASE custom_source")?;
+                tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h020ad4fc533a owner=st3::store::custom TODO=trace-statement-and-value-representation */ "ROLLBACK TO custom_source; RELEASE custom_source")?;
                 result?;
             } else {
-                tx.execute_batch("RELEASE custom_source")?;
+                tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h54b42bfb5163 owner=st3::store::custom TODO=trace-statement-and-value-representation */ "RELEASE custom_source")?;
             }
         }
     }
-    tx.execute("DELETE FROM local_custom_dirty", [])?;
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h36a140f4cd5c owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_custom_dirty", [])?;
     Ok(())
 }
 fn prefix_end(prefix: &str) -> String {
@@ -220,7 +220,7 @@ fn registration_rows(connection: &Connection) -> Result<BTreeMap<String, (String
         .map_err(Into::into)
 }
 fn refresh_registrations(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute("DELETE FROM custom_registrations", [])?;
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h4b42dd151919 owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM custom_registrations", [])?;
     let subjects=tx.prepare("SELECT DISTINCT subject FROM claims WHERE kind='custom.st3-kinds.registered' ORDER BY subject")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for subject in subjects {
         let records = claims(tx, &subject)?;
@@ -260,7 +260,7 @@ fn refresh_registrations(tx: &Transaction<'_>) -> Result<()> {
                 "conflict"
             };
             tx.execute(
-                "INSERT INTO custom_registrations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                /* sqlite-large-value: allow-for-now lv-h7c75601738b9 owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO custom_registrations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 params![
                     subject,
                     m.kind,
@@ -280,7 +280,7 @@ fn refresh_registrations(tx: &Transaction<'_>) -> Result<()> {
         }
     }
     // Overlapping replicated registrations cannot silently capture each other's subjects.
-    tx.execute("UPDATE custom_registrations SET state='conflict',error='overlapping registration prefixes' WHERE EXISTS(SELECT 1 FROM custom_registrations other WHERE other.subject<>custom_registrations.subject AND (substr(other.prefix,1,length(custom_registrations.prefix))=custom_registrations.prefix OR substr(custom_registrations.prefix,1,length(other.prefix))=other.prefix))",[])?;
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h862f3b6f085c owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "UPDATE custom_registrations SET state='conflict',error='overlapping registration prefixes' WHERE EXISTS(SELECT 1 FROM custom_registrations other WHERE other.subject<>custom_registrations.subject AND (substr(other.prefix,1,length(custom_registrations.prefix))=custom_registrations.prefix OR substr(custom_registrations.prefix,1,length(other.prefix))=other.prefix))",[])?;
     Ok(())
 }
 
@@ -510,11 +510,11 @@ fn refresh_source(tx: &Transaction<'_>, subject: &str) -> Result<()> {
             let revision =
                 canonical_hash(&history.iter().map(|c| c.id.as_str()).collect::<Vec<_>>())?;
             let body = json!({"id":subject,"kind":"custom-subject","registered_kind":"","registration":hash,"revision":revision,"state":"pending-dependencies","fields":{},"updated_at":timestamp(c.accepted_at_unix_ms)});
-            tx.execute("INSERT OR REPLACE INTO custom_sources VALUES(?1,?2,'',?3,'pending-dependencies',?4,NULL,NULL,0,?5)",params![subject,hash,revision,canonical_json_text(&body)?,c.accepted_at_unix_ms.to_string()])?;
+            tx.execute(/* sqlite-large-value: allow-for-now lv-ha1e2ed6d0eb1 owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO custom_sources VALUES(?1,?2,'',?3,'pending-dependencies',?4,NULL,NULL,0,?5)",params![subject,hash,revision,canonical_json_text(&body)?,c.accepted_at_unix_ms.to_string()])?;
             return Ok(());
         }
-        tx.execute("DELETE FROM custom_sources WHERE subject=?1", [subject])?;
-        tx.execute("DELETE FROM custom_dependencies WHERE source=?1", [subject])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h2acbe33a23dd owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM custom_sources WHERE subject=?1", [subject])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h26ca8f9bc21c owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM custom_dependencies WHERE source=?1", [subject])?;
         return Ok(());
     };
     let history = claims(tx, subject)?;
@@ -560,7 +560,7 @@ fn refresh_source(tx: &Transaction<'_>, subject: &str) -> Result<()> {
             basis.extend(b);
         }
     }
-    tx.execute("DELETE FROM custom_dependencies WHERE source=?1", [subject])?;
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h06a95693f313 owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM custom_dependencies WHERE source=?1", [subject])?;
     if basis.len() > 256 {
         state = "invalid";
         error = Some("selected slots exceed 256 basis dependencies".into());
@@ -568,7 +568,7 @@ fn refresh_source(tx: &Transaction<'_>, subject: &str) -> Result<()> {
     }
     for b in &basis {
         tx.execute(
-            "INSERT OR REPLACE INTO custom_dependencies VALUES(?1,?2,?3,?4)",
+            /* sqlite-large-value: allow-for-now lv-hd6d43782ccf0 owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO custom_dependencies VALUES(?1,?2,?3,?4)",
             params![
                 subject,
                 b.subject,
@@ -615,7 +615,7 @@ fn refresh_source(tx: &Transaction<'_>, subject: &str) -> Result<()> {
                 && let Some(reference) = fields(c).get(name).and_then(Value::as_str)
             {
                 tx.execute(
-                    "INSERT OR IGNORE INTO custom_dependencies VALUES(?1,?2,'[]','')",
+                    /* sqlite-large-value: allow-for-now lv-h0e02e8dd8812 owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO custom_dependencies VALUES(?1,?2,'[]','')",
                     params![subject, reference],
                 )?;
             }
@@ -624,7 +624,7 @@ fn refresh_source(tx: &Transaction<'_>, subject: &str) -> Result<()> {
                 && let Ok((name, _)) = split_document_ref(reference)
             {
                 tx.execute(
-                    "INSERT OR IGNORE INTO custom_dependencies VALUES(?1,?2,'[]','')",
+                    /* sqlite-large-value: allow-for-now lv-h5d2a23bfe2fa owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO custom_dependencies VALUES(?1,?2,'[]','')",
                     params![subject, name],
                 )?;
             }
@@ -709,7 +709,7 @@ fn refresh_source(tx: &Transaction<'_>, subject: &str) -> Result<()> {
     }
     let requested_at = creation.map_or(0, |c| c.accepted_at_unix_ms).to_string();
     body["updated_at"] = json!(timestamp(requested_at.parse().unwrap_or(0)));
-    tx.execute("INSERT INTO custom_sources VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(subject) DO UPDATE SET registration=excluded.registration,kind=excluded.kind,revision=excluded.revision,state=excluded.state,body=excluded.body,person=excluded.person,episode=excluded.episode,active=excluded.active,requested_at=excluded.requested_at",params![subject,hash,m.kind,revision,state,canonical_json_text(&body)?,person,episode,active,requested_at])?;
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h4284a1f2dd3b owner=st3::store::custom TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO custom_sources VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(subject) DO UPDATE SET registration=excluded.registration,kind=excluded.kind,revision=excluded.revision,state=excluded.state,body=excluded.body,person=excluded.person,episode=excluded.episode,active=excluded.active,requested_at=excluded.requested_at",params![subject,hash,m.kind,revision,state,canonical_json_text(&body)?,person,episode,active,requested_at])?;
     Ok(())
 }
 
@@ -800,7 +800,7 @@ impl Store {
             }
         };
         let texts = connection
-            .prepare(query)?
+            .prepare(/* sqlite-large-value: allow-for-now lv-h05168aa0464d owner=st3::store::custom TODO=trace-statement-and-value-representation */ query)?
             .query_map(
                 params![kind, version, after.unwrap_or(""), limit.min(501)],
                 |r| r.get::<_, String>(0),

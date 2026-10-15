@@ -13,7 +13,7 @@ const LEGACY_QUERY: &str = "SELECT EXISTS(
 fn insert_run(connection: &Connection, id: &str, status: &str, phase: &str) {
     connection
         .execute(
-            "INSERT INTO mission_runs(id,mission_id,initial_revision,current_generation_id,
+            /* sqlite-large-value: allow-for-now lv-he797496b2082 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO mission_runs(id,mission_id,initial_revision,current_generation_id,
              root_revision,root_run_id,workspace,requester,inputs,mode,status,phase,
              created_at_unix_ms,updated_at_unix_ms)
          VALUES(?1,'mission/test','revision','generation','revision',?1,'/tmp/test',
@@ -27,13 +27,13 @@ fn insert_claim(connection: &Connection, id: &str, subject: &str, kind: &str, bo
     // Deliberately foreign origin: the existing historical-start query has no origin filter.
     connection
         .execute(
-            "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+            /* sqlite-large-value: allow-for-now lv-h5ebfca343005 owner=st3::store::schedule_active_run_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
          VALUES(?1,'foreign',1,?1,'1')",
             [id],
         )
         .unwrap();
     connection.execute(
-        "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+        /* sqlite-large-value: allow-for-now lv-h224c818f4136 owner=st3::store::schedule_active_run_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
          VALUES(?1,?1,?2,?3,'foreign',?4,'[]','1')",
         params![id, subject, kind, body.to_string()],
     ).unwrap();
@@ -43,7 +43,7 @@ fn assert_result(store: &Store, subject: &str, expected: bool) {
     let legacy: bool = store
         .readers
         .get()
-        .query_row(LEGACY_QUERY, [subject], |row| row.get(0))
+        .query_row(/* sqlite-large-value: allow-for-now lv-h4acf21db00e3 owner=st3::store::schedule_active_run_tests TODO=trace-statement-and-value-representation */ LEGACY_QUERY, [subject], |row| row.get(0))
         .unwrap();
     assert_eq!(legacy, expected, "legacy fixture: {subject}");
     assert_eq!(
@@ -246,7 +246,7 @@ fn schedule_active_run_seek_preserves_status_only_and_historical_started_semanti
         .connection
         .write()
         .execute(
-            "UPDATE mission_runs SET status='failed' WHERE id='older'",
+            /* sqlite-large-value: allow-for-now lv-h3210244e7244 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status='failed' WHERE id='older'",
             [],
         )
         .unwrap();
@@ -255,7 +255,7 @@ fn schedule_active_run_seek_preserves_status_only_and_historical_started_semanti
         .connection
         .write()
         .execute(
-            "UPDATE mission_runs SET status='running',phase='terminal' WHERE id='older'",
+            /* sqlite-large-value: allow-for-now lv-h63e95ab22443 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status='running',phase='terminal' WHERE id='older'",
             [],
         )
         .unwrap();
@@ -269,14 +269,14 @@ fn schedule_active_run_seek_keeps_malformed_json_an_error() {
     let connection = Connection::open_in_memory().unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE claims(subject TEXT,kind TEXT,body TEXT);
+            /* sqlite-large-value: allow-for-now lv-hce217e455699 owner=st3::store::schedule_active_run_tests TODO=chunk-or-reference-variable-columns */ "CREATE TABLE claims(subject TEXT,kind TEXT,body TEXT);
          CREATE TABLE mission_runs(id TEXT PRIMARY KEY,status TEXT);
          INSERT INTO claims VALUES('schedule/bad','schedule.work-started','{');
          INSERT INTO mission_runs VALUES('run','running');",
         )
         .unwrap();
     for query in [LEGACY_QUERY, Store::SCHEDULE_ACTIVE_STARTED_RUN_QUERY] {
-        let result = connection.query_row(query, ["schedule/bad"], |row| row.get::<_, bool>(0));
+        let result = connection.query_row(/* sqlite-large-value: allow-for-now lv-h0fe5198d4c93 owner=st3::store::schedule_active_run_tests TODO=trace-statement-and-value-representation */ query, ["schedule/bad"], |row| row.get::<_, bool>(0));
         assert!(
             result.is_err(),
             "malformed JSON must not become an empty result"
@@ -301,7 +301,7 @@ fn schedule_active_run_seek_uses_existing_id_index_without_unrelated_run_growth(
         );
     }
     let plan = transaction
-        .prepare(&format!(
+        .prepare(/* sqlite-large-value: allow-for-now lv-h5214289d79d4 owner=st3::store::schedule_active_run_tests TODO=trace-statement-and-value-representation */ &format!(
             "EXPLAIN QUERY PLAN {}",
             Store::SCHEDULE_ACTIVE_STARTED_RUN_QUERY
         ))
@@ -331,7 +331,7 @@ fn schedule_active_run_seek_uses_existing_id_index_without_unrelated_run_growth(
         inserted = population;
         let mut steps = 0;
         let mut statement = transaction
-            .prepare(Store::SCHEDULE_ACTIVE_STARTED_RUN_QUERY)
+            .prepare(/* sqlite-large-value: allow-for-now lv-h9fd3f5f348b9 owner=st3::store::schedule_active_run_tests TODO=trace-statement-and-value-representation */ Store::SCHEDULE_ACTIVE_STARTED_RUN_QUERY)
             .unwrap();
         for (subject, expected) in [
             ("schedule/active", true),
@@ -340,7 +340,7 @@ fn schedule_active_run_seek_uses_existing_id_index_without_unrelated_run_growth(
         ] {
             statement.reset_status(StatementStatus::VmStep);
             statement.reset_status(StatementStatus::FullscanStep);
-            let answer: bool = statement.query_row([subject], |row| row.get(0)).unwrap();
+            let answer: bool = statement.query_row(/* sqlite-large-value: allow-for-now lv-hc4b661a154e0 owner=st3::store::schedule_active_run_tests TODO=trace-statement-and-value-representation */ [subject], |row| row.get(0)).unwrap();
             assert_eq!(answer, expected);
             let fullscan = statement.get_status(StatementStatus::FullscanStep);
             let vm = statement.get_status(StatementStatus::VmStep);
@@ -411,19 +411,19 @@ fn schedule_active_run_seek_keeps_claim_and_run_at_one_reader_cut() {
                 // Both complete cuts are negative; either mixed claim/run cut is positive.
                 transaction
                     .execute(
-                        "UPDATE mission_runs SET status='running' WHERE id='cut-old'",
+                        /* sqlite-large-value: allow-for-now lv-h8ef74aa38027 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status='running' WHERE id='cut-old'",
                         [],
                     )
                     .unwrap();
                 transaction
                     .execute(
-                        "UPDATE mission_runs SET status='failed' WHERE id='cut-new'",
+                        /* sqlite-large-value: allow-for-now lv-he86091076e15 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status='failed' WHERE id='cut-new'",
                         [],
                     )
                     .unwrap();
                 transaction
                     .execute(
-                        "UPDATE claims SET body=?1 WHERE id='cut-started'",
+                        /* sqlite-large-value: allow-for-now lv-h1560c6ba782f owner=st3::store::schedule_active_run_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=?1 WHERE id='cut-started'",
                         [json!({"fields":{"mission_run":"mission-run/cut-new"}}).to_string()],
                     )
                     .unwrap();
@@ -442,7 +442,7 @@ fn schedule_active_run_seek_keeps_claim_and_run_at_one_reader_cut() {
         .connection
         .write()
         .execute(
-            "UPDATE mission_runs SET status='running' WHERE id='cut-new'",
+            /* sqlite-large-value: allow-for-now lv-h278e10cc36c9 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status='running' WHERE id='cut-new'",
             [],
         )
         .unwrap();
@@ -458,7 +458,7 @@ fn schedule_active_run_seek_preserves_blob_storage_and_duplicate_typed_ids() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(&format!(
-                "PRAGMA encoding='{encoding}';
+                /* sqlite-large-value: allow-for-now lv-hec6ceef2b322 owner=st3::store::schedule_active_run_tests TODO=chunk-or-reference-variable-columns */ "PRAGMA encoding='{encoding}';
              CREATE TABLE claims(subject TEXT,kind TEXT,body TEXT);
              CREATE TABLE mission_runs(id TEXT PRIMARY KEY,status TEXT);",
             ))
@@ -471,24 +471,24 @@ fn schedule_active_run_seek_preserves_blob_storage_and_duplicate_typed_ids() {
         // Exercise ordinary text IDs as well as equal-byte text/blob identities.
         for id in ["text", "é/雪", "text-nul\0tail"] {
             connection
-                .execute("INSERT INTO mission_runs VALUES(?1,'running')", [id])
+                .execute(/* sqlite-large-value: allow-for-now lv-h8f2fbc1098e8 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO mission_runs VALUES(?1,'running')", [id])
                 .unwrap();
         }
         for id in ["blob", "blob-nul\0tail"] {
             connection
                 .execute(
-                    "INSERT INTO mission_runs VALUES(CAST(?1 AS BLOB),'running')",
+                    /* sqlite-large-value: allow-for-now lv-he677c9649946 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO mission_runs VALUES(CAST(?1 AS BLOB),'running')",
                     [id],
                 )
                 .unwrap();
         }
         connection
-            .execute("INSERT INTO mission_runs VALUES('blob','failed')", [])
+            .execute(/* sqlite-large-value: allow-for-now lv-ha3423e131328 owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO mission_runs VALUES('blob','failed')", [])
             .unwrap();
         for id in ["text", "é/雪", "text-nul\0tail", "blob", "blob-nul\0tail"] {
             connection
                 .execute(
-                    "INSERT INTO claims VALUES(?1,'schedule.work-started',?2)",
+                    /* sqlite-large-value: allow-for-now lv-h4ccf4fae440f owner=st3::store::schedule_active_run_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims VALUES(?1,'schedule.work-started',?2)",
                     params![
                         format!("schedule/{id}"),
                         json!({"fields":{"mission_run":format!("mission-run/{id}")}}).to_string()
@@ -499,7 +499,7 @@ fn schedule_active_run_seek_preserves_blob_storage_and_duplicate_typed_ids() {
         let check = |subject: &str, expected| {
             for query in [LEGACY_QUERY, Store::SCHEDULE_ACTIVE_STARTED_RUN_QUERY] {
                 let answer: bool = connection
-                    .query_row(query, [subject], |row| row.get(0))
+                    .query_row(/* sqlite-large-value: allow-for-now lv-h374e78f5ea71 owner=st3::store::schedule_active_run_tests TODO=trace-statement-and-value-representation */ query, [subject], |row| row.get(0))
                     .unwrap();
                 assert_eq!(answer, expected, "{encoding}: {subject}");
             }
@@ -509,7 +509,7 @@ fn schedule_active_run_seek_preserves_blob_storage_and_duplicate_typed_ids() {
         }
         connection
             .execute(
-                "UPDATE mission_runs SET status='completed' WHERE typeof(id)='blob'",
+                /* sqlite-large-value: allow-for-now lv-h5d4c5bbc36de owner=st3::store::schedule_active_run_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_runs SET status='completed' WHERE typeof(id)='blob'",
                 [],
             )
             .unwrap();

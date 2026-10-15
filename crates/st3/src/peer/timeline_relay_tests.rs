@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use tower::ServiceExt as _;
 
 fn validator(definition: &str) -> jsonschema::Validator {
-    let mut schema: Value = serde_json::from_str(include_str!(
+    let mut schema: Value = serde_json::from_str(/* sqlite-large-value: allow-for-now lv-h5cf7f86aea7c owner=st3::peer::timeline_relay_tests TODO=trace-statement-and-value-representation */ include_str!(
         "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
     ))
     .unwrap();
@@ -42,7 +42,7 @@ async fn relay_omission_preserves_raw_pages_changes_and_collection_frames() {
         "session/{}",
         &hex::encode(Sha256::digest(format!("{agent}:{incarnation}").as_bytes()))[..24]
     );
-    let mut local: Value = serde_json::from_str(include_str!(
+    let mut local: Value = serde_json::from_str(/* sqlite-large-value: allow-for-now lv-hfce7c228bf9b owner=st3::peer::timeline_relay_tests TODO=trace-statement-and-value-representation */ include_str!(
         "../../../../docs/st3/client-v0/fixtures/timeline-relay-omission.json"
     ))
     .unwrap();

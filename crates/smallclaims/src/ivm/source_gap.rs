@@ -34,7 +34,7 @@ fn fence_sql(names: &[&str], reason: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "UPDATE ivm_views SET ready=0 WHERE name IN ({list}) AND ready<>0;
+        /* sqlite-large-value: allow-for-now lv-h991e9de2d5ca owner=smallclaims::ivm::source_gap TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_views SET ready=0 WHERE name IN ({list}) AND ready<>0;
          INSERT INTO ivm_view_errors(view,error) VALUES {rows}
            ON CONFLICT(view) DO UPDATE SET error=excluded.error
            WHERE error IS NOT excluded.error;"
@@ -64,7 +64,7 @@ pub(super) fn install<'a>(
     )?;
     ensure!(ordinary, "source gap requires an ordinary main table");
     let columns = tx
-        .prepare(&format!("PRAGMA main.table_info({table_sql})"))?
+        .prepare(/* sqlite-large-value: allow-for-now lv-hba295a650f59 owner=smallclaims::ivm::source_gap TODO=trace-statement-and-value-representation */ &format!("PRAGMA main.table_info({table_sql})"))?
         .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?
         .take(129)
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -82,7 +82,7 @@ pub(super) fn install<'a>(
         "source gap requires one explicit primary-key column"
     );
     let key_sql = identifier(&keys[0].0)?;
-    let gaps = tx.prepare(&format!("SELECT CASE WHEN {column_sql} IS NULL THEN NULL ELSE substr(CAST({column_sql} AS TEXT),1,1024) END FROM main.{table_sql} LIMIT 2"))?
+    let gaps = tx.prepare(/* sqlite-large-value: allow-for-now lv-h31cd4a351d79 owner=smallclaims::ivm::source_gap TODO=trace-statement-and-value-representation */ &format!("SELECT CASE WHEN {column_sql} IS NULL THEN NULL ELSE substr(CAST({column_sql} AS TEXT),1,1024) END FROM main.{table_sql} LIMIT 2"))?
         .query_map([], |r| r.get::<_,Option<String>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(gaps.len() == 1, "source gap requires exactly one state row");
@@ -102,7 +102,7 @@ pub(super) fn install<'a>(
         "CASE WHEN OLD.{key_sql} IS NOT NEW.{key_sql} THEN 'source gap state identity changed' ELSE {new_gap} END"
     );
     tx.execute_batch(&format!(
-        "DROP TRIGGER IF EXISTS \"{prefix}_insert\";
+        /* sqlite-large-value: allow-for-now lv-h2e7ea7094783 owner=smallclaims::ivm::source_gap TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER IF EXISTS \"{prefix}_insert\";
          DROP TRIGGER IF EXISTS \"{prefix}_update\";
          DROP TRIGGER IF EXISTS \"{prefix}_delete\";
          CREATE TRIGGER \"{prefix}_insert\" AFTER INSERT ON main.{table_sql}

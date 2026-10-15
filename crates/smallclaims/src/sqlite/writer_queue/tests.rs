@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 fn writer() -> WriterConnection {
     let connection = Connection::open_in_memory().unwrap();
-    connection.execute_batch("CREATE TABLE claims(store_index INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TABLE values_(id INTEGER PRIMARY KEY)").unwrap();
+    connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h1ba817f95aef owner=smallclaims::sqlite::writer_queue::tests TODO=chunk-or-reference-variable-columns */ "CREATE TABLE claims(store_index INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TABLE values_(id INTEGER PRIMARY KEY)").unwrap();
     WriterConnection::new(connection, Arc::new(AtomicU64::new(0)))
 }
 
@@ -102,7 +102,7 @@ fn abandoned_background_request_returns_connection_and_does_not_block_foreground
     front.release(front.acquire());
     back.release(back.acquire());
     writer
-        .batched(|tx| tx.execute("INSERT INTO values_ VALUES(1)", []))
+        .batched(|tx| tx.execute(/* sqlite-large-value: allow-for-now lv-h642e5d4b0401 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(1)", []))
         .unwrap()
         .unwrap();
 }
@@ -113,11 +113,11 @@ fn background_guard_retains_prepare_finalize_rollback_and_return_observer_order(
     writer
         .install_transaction_hooks(
             |tx| {
-                tx.execute("INSERT INTO values_ VALUES(1)", [])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h629a4dab8b00 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(1)", [])?;
                 Ok(())
             },
             |tx| {
-                tx.execute("INSERT INTO values_ VALUES(2)", [])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h80c949c995f9 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(2)", [])?;
                 Ok(())
             },
         )
@@ -132,14 +132,14 @@ fn background_guard_retains_prepare_finalize_rollback_and_return_observer_order(
     {
         let mut connection = writer.write_background();
         let tx = connection.transaction().unwrap();
-        tx.execute("INSERT INTO values_ VALUES(3)", []).unwrap();
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h411c31509178 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(3)", []).unwrap();
         tx.rollback().unwrap();
     }
     assert_eq!(observed.recv().unwrap(), 0);
     {
         let mut connection = writer.write_background();
         let tx = connection.transaction().unwrap();
-        tx.execute("INSERT INTO values_ VALUES(3)", []).unwrap();
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h60c5a3abcdbc owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(3)", []).unwrap();
         tx.commit().unwrap();
         assert!(
             observed.try_recv().is_err(),
@@ -156,14 +156,14 @@ fn background_finalizer_refusal_rolls_back_before_next_foreground_work() {
         .install_transaction_hooks(
             |_| Ok(()),
             |tx| {
-                tx.execute("INSERT INTO values_ VALUES(2)", [])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-hfb1fea020486 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(2)", [])?;
                 anyhow::bail!("refused derived publication")
             },
         )
         .unwrap();
     let mut guard = writer.write_background();
     let tx = guard.transaction().unwrap();
-    tx.execute("INSERT INTO values_ VALUES(1)", []).unwrap();
+    tx.execute(/* sqlite-large-value: allow-for-now lv-he5957c758461 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(1)", []).unwrap();
     assert!(tx.commit().is_err());
     drop(guard);
     assert_eq!(
@@ -285,7 +285,7 @@ fn foreground_only_fifo_and_batched_durable_answers_are_unchanged() {
     let (done, answer) = mpsc::sync_channel(1);
     writer.send(WriterJob::Batched {
         run: Box::new(|tx| {
-            tx.execute("INSERT INTO values_ VALUES(1)", []).unwrap();
+            tx.execute(/* sqlite-large-value: allow-for-now lv-hda4118777e70 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(1)", []).unwrap();
             true
         }),
         profile: None,
@@ -344,11 +344,11 @@ fn real_hook_installation_barrier_waits_for_prior_background_return() {
     let thread = std::thread::spawn(move || {
         let result = installing.install_transaction_hooks(
             |tx| {
-                tx.execute("INSERT INTO values_ VALUES(1)", [])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h1bfc6939d6e9 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(1)", [])?;
                 Ok(())
             },
             |tx| {
-                tx.execute("INSERT INTO values_ VALUES(2)", [])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h5e880ba8c383 owner=smallclaims::sqlite::writer_queue::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO values_ VALUES(2)", [])?;
                 Ok(())
             },
         );

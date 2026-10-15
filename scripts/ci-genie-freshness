@@ -16,4 +16,6 @@ for test in \
   ci-evidence-gate-test; do
   python3 "scripts/$test"
 done
+python3 scripts/check-sqlite-large-values-test
+python3 scripts/check-sqlite-large-values
 genie --check

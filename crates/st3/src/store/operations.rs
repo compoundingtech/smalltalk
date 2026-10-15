@@ -11,7 +11,7 @@ fn recently_ended_mission_valid_until(
     now: u128,
 ) -> Result<Option<u128>> {
     let mut statement = connection.prepare(
-        "WITH latest AS (
+        /* sqlite-large-value: allow-for-now lv-h5d9b468f3805 owner=st3::store::operations TODO=trace-statement-and-value-representation */ "WITH latest AS (
             SELECT mission_id,status,updated_at_unix_ms,ROW_NUMBER() OVER (
                 PARTITION BY mission_id ORDER BY created_at_unix_ms DESC,id DESC
             ) AS position FROM mission_runs
@@ -91,7 +91,7 @@ impl Store {
                 let subject = format!("mission-run/{id}");
                 let reason: Option<String> = connection
                     .query_row(
-                        &canonical_sql("SELECT COALESCE(json_extract(body,'$.fields.reason'),
+                        /* sqlite-large-value: allow-for-now lv-h1a2fe3e5a6a3 owner=st3::store::operations TODO=trace-statement-and-value-representation */ &canonical_sql("SELECT COALESCE(json_extract(body,'$.fields.reason'),
                                      json_extract(body,'$.fields.summary'))
                      FROM claims WHERE subject=?1 AND kind='mission-run.state'
                        AND COALESCE(json_extract(body,'$.fields.reason'),json_extract(body,'$.fields.summary')) IS NOT NULL
@@ -195,7 +195,7 @@ impl Store {
             WHERE mission_id IN (SELECT CASE WHEN value LIKE 'mission/%'
                 THEN substr(value,9) ELSE value END FROM json_each(?1))
         )";
-        let mut statement = connection.prepare(&format!(
+        let mut statement = connection.prepare(/* sqlite-large-value: allow-for-now lv-hec1b330fbe1f owner=st3::store::operations TODO=trace-statement-and-value-representation */ &format!(
             "{newest}, preview AS (
                 SELECT s.*,ROW_NUMBER() OVER (
                     PARTITION BY s.run_id ORDER BY s.created_at_unix_ms,s.step_path
@@ -240,7 +240,7 @@ impl Store {
 
         // Decimal-text comparison preserves the full u128 clock range, unlike SQLite's
         // signed INTEGER cast. Only person_work::current consults acceptance time here.
-        let mut statement = connection.prepare(&canonical_sql(&format!(
+        let mut statement = connection.prepare(/* sqlite-large-value: allow-for-now lv-h998eb46b07de owner=st3::store::operations TODO=trace-statement-and-value-representation */ &canonical_sql(&format!(
             "{newest}
              SELECT claims.id,claims.store_index,claims.batch_id,claims.subject,claims.kind,
                     claims.origin,claims.actor,claims.body,claims.predecessors,claims.accepted_at_unix_ms
@@ -257,7 +257,7 @@ impl Store {
         if asks.is_empty() {
             return Ok(until);
         }
-        let mut statement = connection.prepare(&format!(
+        let mut statement = connection.prepare(/* sqlite-large-value: allow-for-now lv-hca904c12ecb7 owner=st3::store::operations TODO=trace-statement-and-value-representation */ &format!(
             "{newest} SELECT id FROM newest WHERE position<=3"
         ))?;
         let runs = statement
@@ -349,7 +349,7 @@ impl Store {
                AND (?5 IS NULL OR c.actor=?5 OR s.assignee=?5 OR s.lease_owner=?5)
              ORDER BY c.store_index DESC LIMIT ?6"
         );
-        let mut statement = connection.prepare(&sql)?;
+        let mut statement = connection.prepare(/* sqlite-large-value: allow-for-now lv-h1ce133f304a8 owner=st3::store::operations TODO=trace-statement-and-value-representation */ &sql)?;
         let rows = statement.query_map(
             params![
                 before.min(i64::MAX as u64),

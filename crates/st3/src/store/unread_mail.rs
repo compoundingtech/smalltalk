@@ -11,7 +11,7 @@ const COUNT_SQL: &str = "WITH levels(shift) AS (VALUES(56),(48),(40),(32),(24),(
              AND prefix<(?1 >> levels.shift)
          )),0) FROM levels";
 
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h256785ca316b owner=st3::store::unread_mail TODO=chunk-or-reference-variable-columns */ r#"
 BEGIN IMMEDIATE;
 DROP INDEX IF EXISTS claims_message_sent_time_index;
 CREATE TABLE IF NOT EXISTS unread_mail (
@@ -69,7 +69,7 @@ COMMIT;
 "#;
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(SCHEMA)?;
+    connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h0d9f80aa1d8e owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ SCHEMA)?;
     let filled: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key='unread_mail_prefixes')",
         [],
@@ -77,7 +77,7 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
     )?;
     if !filled {
         connection.execute_batch(
-            "BEGIN IMMEDIATE;
+            /* sqlite-large-value: allow-for-now lv-hb1bab0dbadb5 owner=st3::store::unread_mail TODO=prepare-body-and-predecessor-values */ "BEGIN IMMEDIATE;
              DELETE FROM unread_mail;
              DELETE FROM unread_mail_prefixes;
              INSERT INTO unread_mail(subject,sent_time)
@@ -102,9 +102,9 @@ fn flush_pending(connection: &Connection) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
-    let mut remove = connection.prepare_cached("DELETE FROM unread_mail WHERE subject=?1")?;
+    let mut remove = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hfc518f8182fa owner=st3::store::unread_mail TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM unread_mail WHERE subject=?1")?;
     let mut insert = connection.prepare_cached(
-        "INSERT INTO unread_mail(subject,sent_time)
+        /* sqlite-large-value: allow-for-now lv-h7c47ad5d0393 owner=st3::store::unread_mail TODO=prepare-body-and-predecessor-values */ "INSERT INTO unread_mail(subject,sent_time)
          SELECT ?1,MAX(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
          WHERE subject=?1 AND kind='message.sent'
          AND NOT EXISTS (
@@ -113,11 +113,11 @@ fn flush_pending(connection: &Connection) -> Result<()> {
          ) HAVING COUNT(*)>0",
     )?;
     let mut clear =
-        connection.prepare_cached("DELETE FROM unread_mail_pending WHERE subject=?1")?;
+        connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h3cee727ab5b1 owner=st3::store::unread_mail TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM unread_mail_pending WHERE subject=?1")?;
     for subject in pending {
-        remove.execute([&subject])?;
-        insert.execute([&subject])?;
-        clear.execute([&subject])?;
+        remove.execute(/* sqlite-large-value: allow-for-now lv-h2afb48923b9e owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ [&subject])?;
+        insert.execute(/* sqlite-large-value: allow-for-now lv-hec6a5b0a52b7 owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ [&subject])?;
+        clear.execute(/* sqlite-large-value: allow-for-now lv-h14fdfac9f48f owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ [&subject])?;
     }
     Ok(())
 }
@@ -127,8 +127,8 @@ fn flush_pending(connection: &Connection) -> Result<()> {
 pub(super) fn count_in_snapshot(connection: &Connection, before_unix_ms: u128) -> Result<u64> {
     let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
     let base: i64 = connection
-        .prepare_cached(COUNT_SQL)?
-        .query_row([before], |row| row.get(0))?;
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-hc115ca2e5067 owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ COUNT_SQL)?
+        .query_row(/* sqlite-large-value: allow-for-now lv-h033c2f95b66a owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ [before], |row| row.get(0))?;
     let delta: i64 = connection
         .prepare_cached(
             "SELECT COALESCE(SUM(
@@ -142,7 +142,7 @@ pub(super) fn count_in_snapshot(connection: &Connection, before_unix_ms: u128) -
                    THEN 1 ELSE 0 END
          ),0) FROM unread_mail_pending pending",
         )?
-        .query_row([before], |row| row.get(0))?;
+        .query_row(/* sqlite-large-value: allow-for-now lv-hf7ab06e26181 owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ [before], |row| row.get(0))?;
     Ok(u64::try_from(base + delta)?)
 }
 
@@ -191,8 +191,8 @@ pub(super) fn count_before(transaction: &Transaction<'_>, before_unix_ms: u128) 
     // become visible together, and a concurrent message cannot disappear between the two.
     flush_pending(transaction)?;
     let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
-    let mut statement = transaction.prepare_cached(COUNT_SQL)?;
-    Ok(statement.query_row([before], |row| row.get(0))?)
+    let mut statement = transaction.prepare_cached(/* sqlite-large-value: allow-for-now lv-hc444ba3b39ed owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ COUNT_SQL)?;
+    Ok(statement.query_row(/* sqlite-large-value: allow-for-now lv-hf089af9d7507 owner=st3::store::unread_mail TODO=trace-statement-and-value-representation */ [before], |row| row.get(0))?)
 }
 
 #[cfg(test)]

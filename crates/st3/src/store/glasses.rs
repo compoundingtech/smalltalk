@@ -3,7 +3,7 @@ use super::*;
 use st3_schema::glasses::MAX_GLASSES;
 
 fn glass_claims(connection: &Connection, person: &str, through: u64) -> Result<Vec<ClaimRecord>> {
-    let mut statement = connection.prepare(&canonical_sql(
+    let mut statement = connection.prepare(/* sqlite-large-value: allow-for-now lv-h5c3d4077198e owner=st3::store::glasses TODO=trace-statement-and-value-representation */ &canonical_sql(
         "WITH ranked AS (
             SELECT claims.id, ROW_NUMBER() OVER (PARTITION BY claims.subject, claims.kind ORDER BY CANONICAL_ASC(claims)) AS first,
                 ROW_NUMBER() OVER (PARTITION BY claims.subject, claims.kind ORDER BY CANONICAL_DESC(claims)) AS last

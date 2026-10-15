@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 const FORMAT: &str = "smallclaims.ivm.events.v1";
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h8ad263293309 owner=smallclaims::ivm::events TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS ivm_event_state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), format TEXT NOT NULL,
  database_id TEXT NOT NULL, capacity INTEGER NOT NULL CHECK(capacity BETWEEN 1 AND 4096),
@@ -185,9 +185,9 @@ pub fn install(tx: &Transaction<'_>, capacity: usize) -> Result<()> {
         )?,
         "registered view name exceeds event byte bound"
     );
-    tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h222fc582e23e owner=smallclaims::ivm::events TODO=trace-statement-and-value-representation */ SCHEMA)?;
     tx.execute(
-        "INSERT OR IGNORE INTO ivm_event_state SELECT 1,?1,?2,?3,1,k.sequence,s.sequence
+        /* sqlite-large-value: allow-for-now lv-h3e5003ad46f2 owner=smallclaims::ivm::events TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO ivm_event_state SELECT 1,?1,?2,?3,1,k.sequence,s.sequence
          FROM ivm_key_frontier k,ivm_status_frontier s WHERE k.singleton=1 AND s.singleton=1",
         params![FORMAT, uuid::Uuid::now_v7().to_string(), capacity],
     )?;
@@ -207,7 +207,7 @@ pub fn install(tx: &Transaction<'_>, capacity: usize) -> Result<()> {
 /// only cursor identity; it does not repair output, replay claims or authorize stale reads.
 pub fn rotate_identity(tx: &Transaction<'_>) -> Result<()> {
     let changed = tx.execute(
-        "UPDATE ivm_event_state SET database_id=?1 WHERE singleton=1 AND format=?2",
+        /* sqlite-large-value: allow-for-now lv-h082583823aac owner=smallclaims::ivm::events TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_event_state SET database_id=?1 WHERE singleton=1 AND format=?2",
         params![uuid::Uuid::now_v7().to_string(), FORMAT],
     )?;
     ensure!(changed == 1, "event source unavailable");

@@ -2,7 +2,7 @@
 //! populate it. Startup backfill commits at most 64 message subjects at a time.
 use super::*;
 
-const FOLD: &str = r#"
+const FOLD: &str = /* sqlite-large-value: allow-for-now lv-h66d288941b23 owner=st3::store::idle_mail TODO=prepare-body-and-predecessor-values */ r#"
 INSERT OR REPLACE INTO local_idle_messages(subject,recipient,wait_tag,source_prefix,sent_at,pending,delivered)
 SELECT sent.subject,COALESCE(json_extract(sent.body,'$.fields.to'),''),
        json_extract(sent.body,'$.fields.tags[1]'),
@@ -22,7 +22,7 @@ FROM claims sent WHERE sent.store_index=(
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(
-        r#"
+        /* sqlite-large-value: allow-for-now lv-hffacca1f5beb owner=st3::store::idle_mail TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS local_idle_messages (
     subject TEXT PRIMARY KEY,
     recipient TEXT NOT NULL,
@@ -49,7 +49,7 @@ DROP TRIGGER IF EXISTS local_idle_messages_update;
     ] {
         let subject = format!("{reference}.subject");
         connection.execute_batch(&format!(
-            "CREATE TRIGGER IF NOT EXISTS local_idle_messages_{name} {event} ON claims
+            /* sqlite-large-value: allow-for-now lv-hc806b9aeb1bf owner=st3::store::idle_mail TODO=prepare-body-and-predecessor-values */ "CREATE TRIGGER IF NOT EXISTS local_idle_messages_{name} {event} ON claims
              WHEN {reference}.kind IN ({kinds})
              BEGIN DELETE FROM local_idle_messages WHERE subject={subject}; {} END;",
             FOLD.replace("SUBJECT", &subject),
@@ -63,7 +63,7 @@ DROP TRIGGER IF EXISTS local_idle_messages_update;
     // Receipts are monotone. If replication brings one before its send, the sent fold finds it.
     // Updating only state avoids reading and parsing a potentially large sent body per receipt.
     connection.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS local_idle_messages_receipt_v1 AFTER INSERT ON claims
+        /* sqlite-large-value: allow-for-now lv-h7739973b179c owner=st3::store::idle_mail TODO=prepare-body-and-predecessor-values */ "CREATE TRIGGER IF NOT EXISTS local_idle_messages_receipt_v1 AFTER INSERT ON claims
          WHEN NEW.kind IN ('message.delivered','message.read','message.closed')
          BEGIN UPDATE local_idle_messages SET pending=0,
            delivered=CASE WHEN NEW.kind IN ('message.delivered','message.read') THEN 1 ELSE delivered END
@@ -72,7 +72,7 @@ DROP TRIGGER IF EXISTS local_idle_messages_update;
     )?;
     // Claim bytes are immutable in normal admission; a migration can update them.
     connection.execute_batch(&format!(
-        "CREATE TRIGGER IF NOT EXISTS local_idle_messages_update_v1
+        /* sqlite-large-value: allow-for-now lv-hc95ccbbd3b02 owner=st3::store::idle_mail TODO=prepare-body-and-predecessor-values */ "CREATE TRIGGER IF NOT EXISTS local_idle_messages_update_v1
          AFTER UPDATE OF subject,kind,body,accepted_at_unix_ms ON claims
          WHEN OLD.kind IN ('message.sent','message.delivered','message.read','message.closed')
            OR NEW.kind IN ('message.sent','message.delivered','message.read','message.closed')
@@ -98,9 +98,9 @@ DROP TRIGGER IF EXISTS local_idle_messages_update;
         .optional()?
         .unwrap_or_default();
     let fold_sql = FOLD.replace("SUBJECT", "?1");
-    let mut fold = connection.prepare_cached(&fold_sql)?;
+    let mut fold = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h1135ef41e4cc owner=st3::store::idle_mail TODO=trace-statement-and-value-representation */ &fold_sql)?;
     let mut remove =
-        connection.prepare_cached("DELETE FROM local_idle_messages WHERE subject=?1")?;
+        connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h5c91d5bc43c8 owner=st3::store::idle_mail TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_idle_messages WHERE subject=?1")?;
     loop {
         let subjects = connection
             .prepare_cached(
@@ -112,29 +112,29 @@ DROP TRIGGER IF EXISTS local_idle_messages_update;
             break;
         }
         // Idempotent batches also recover an interrupted first startup without a read-side build.
-        connection.execute_batch("BEGIN IMMEDIATE")?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h2ac1b55bcff6 owner=st3::store::idle_mail TODO=trace-statement-and-value-representation */ "BEGIN IMMEDIATE")?;
         let started = std::time::Instant::now();
         let mut last_processed = &subjects[0];
         let result = (|| -> Result<()> {
             for subject in &subjects {
-                remove.execute([subject])?;
-                fold.execute([subject])?;
+                remove.execute(/* sqlite-large-value: allow-for-now lv-h13b48893ec70 owner=st3::store::idle_mail TODO=trace-statement-and-value-representation */ [subject])?;
+                fold.execute(/* sqlite-large-value: allow-for-now lv-h518c4954515c owner=st3::store::idle_mail TODO=trace-statement-and-value-representation */ [subject])?;
                 last_processed = subject;
                 if started.elapsed() >= std::time::Duration::from_millis(20) {
                     break;
                 }
             }
             connection.execute(
-                "INSERT INTO meta(key,value) VALUES('local_idle_messages_backfill_after',?1)
+                /* sqlite-large-value: allow-for-now lv-ha9813a9b336a owner=st3::store::idle_mail TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES('local_idle_messages_backfill_after',?1)
                                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [last_processed],
             )?;
             Ok(())
         })();
         match result {
-            Ok(()) => connection.execute_batch("COMMIT")?,
+            Ok(()) => connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h83955a33cbe2 owner=st3::store::idle_mail TODO=trace-statement-and-value-representation */ "COMMIT")?,
             Err(error) => {
-                connection.execute_batch("ROLLBACK")?;
+                connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h22944a02d789 owner=st3::store::idle_mail TODO=trace-statement-and-value-representation */ "ROLLBACK")?;
                 return Err(error);
             }
         }
@@ -143,7 +143,7 @@ DROP TRIGGER IF EXISTS local_idle_messages_update;
     // Both opens can finish the same idempotent backfill. Completion must be atomic and
     // tolerate the other opener's marker; a crash cannot clear the cursor without the marker.
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        /* sqlite-large-value: allow-for-now lv-hb5629f0afdfd owner=st3::store::idle_mail TODO=bound-or-reference-values-and-reclamation */ "BEGIN IMMEDIATE;
          DELETE FROM meta WHERE key='local_idle_messages_backfill_after';
          INSERT OR IGNORE INTO meta(key,value) VALUES('local_idle_messages_v1','1');
          COMMIT;",

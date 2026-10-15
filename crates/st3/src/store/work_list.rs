@@ -478,7 +478,7 @@ impl Store {
         let mut requesters = BTreeSet::new();
         let mut every_ask = false;
         let mut tree_roots = BTreeSet::new();
-        let mut statement = connection.prepare_cached(published_list::CLAIMS_SINCE)?;
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h1ea29f6254be owner=st3::store::work_list TODO=trace-statement-and-value-representation */ published_list::CLAIMS_SINCE)?;
         let claims = statement
             .query_map(params![after, through], |row| {
                 Ok((
@@ -499,7 +499,7 @@ impl Store {
             } else if let Some(generation) = subject.strip_prefix("run-generation/") {
                 let mut owner = connection
                     .prepare_cached("SELECT run_id FROM run_generations WHERE id=?1")?;
-                if let Some(run) = owner.query_row([generation], |row| row.get::<_, String>(0)).optional()? {
+                if let Some(run) = owner.query_row(/* sqlite-large-value: allow-for-now lv-h0464607e2401 owner=st3::store::work_list TODO=trace-statement-and-value-representation */ [generation], |row| row.get::<_, String>(0)).optional()? {
                     runs.insert(run);
                 }
             } else if let Some(proposal) = subject.strip_prefix("revision-proposal/") {
@@ -597,7 +597,7 @@ impl Store {
     /// Every step that holds a worker lease, with the lease's end: few, by the lease index.
     pub(crate) fn work_leases(&self) -> Result<HashMap<String, u128>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(WORK_LEASES)?;
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hf752de2e0548 owner=st3::store::work_list TODO=trace-statement-and-value-representation */ WORK_LEASES)?;
         let leases = statement
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u128)))?
             .collect::<rusqlite::Result<HashMap<_, _>>>()?;
@@ -609,8 +609,8 @@ impl Store {
     pub(crate) fn next_claim_after(&self, subject: &str, time: u128) -> Result<Option<u128>> {
         let connection = self.readers.get();
         let next = connection
-            .prepare_cached(NEXT_CLAIM_AFTER)?
-            .query_row(params![subject, time.min(i64::MAX as u128) as i64], |row| row.get::<_, Option<i64>>(0))?;
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h77e0eb32b151 owner=st3::store::work_list TODO=trace-statement-and-value-representation */ NEXT_CLAIM_AFTER)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-ha5c0eaee4181 owner=st3::store::work_list TODO=trace-statement-and-value-representation */ params![subject, time.min(i64::MAX as u128) as i64], |row| row.get::<_, Option<i64>>(0))?;
         Ok(next.map(|next| next.max(0) as u128))
     }
 
@@ -635,7 +635,7 @@ impl Store {
         }
         let connection = self.readers.get();
         let rows = connection
-            .prepare_cached(STEP_ASSIGNEES)?
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h2038e7080246 owner=st3::store::work_list TODO=trace-statement-and-value-representation */ STEP_ASSIGNEES)?
             .query_map([serde_json::to_string(steps)?], |row| {
                 Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
             })?
@@ -691,8 +691,8 @@ impl Store {
     pub(crate) fn repaired_since(&self, after: u64, through: u64) -> Result<bool> {
         let connection = self.readers.get();
         Ok(connection
-            .prepare_cached(REPAIRED_SINCE)?
-            .query_row(params![after, through], |_| Ok(()))
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-hc5072082e59b owner=st3::store::work_list TODO=trace-statement-and-value-representation */ REPAIRED_SINCE)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-h0b9fabf33ebe owner=st3::store::work_list TODO=trace-statement-and-value-representation */ params![after, through], |_| Ok(()))
             .optional()?
             .is_some())
     }

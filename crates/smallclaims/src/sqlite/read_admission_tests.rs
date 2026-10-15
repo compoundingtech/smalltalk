@@ -463,7 +463,7 @@ fn synchronous_admission_is_cancellable_without_a_tokio_runtime() {
 fn panic_error_and_cancelled_transaction_return_clean_capacity() {
     let (_directory, pool) = pool(1);
     let panic = catch_unwind(AssertUnwindSafe(|| pool.request_read(|| {
-        pool.get().execute_batch("BEGIN").unwrap();
+        pool.get().execute_batch(/* sqlite-large-value: allow-for-now lv-h491af119020d owner=smallclaims::sqlite::read_admission_tests TODO=trace-statement-and-value-representation */ "BEGIN").unwrap();
         panic!("request panic");
     })));
     assert!(panic.is_err());
@@ -475,7 +475,7 @@ fn panic_error_and_cancelled_transaction_return_clean_capacity() {
 
     let budget = ReadBudget::new("/transaction", Duration::from_secs(30));
     let error = read_budget::with(Some(budget.clone()), || pool.request_read(|| {
-        pool.get().execute_batch("BEGIN").unwrap();
+        pool.get().execute_batch(/* sqlite-large-value: allow-for-now lv-h851eb4364e69 owner=smallclaims::sqlite::read_admission_tests TODO=trace-statement-and-value-representation */ "BEGIN").unwrap();
         budget.cancel();
         read_budget::check()
     })).unwrap().unwrap_err();

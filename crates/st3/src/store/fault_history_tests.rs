@@ -192,13 +192,13 @@ fn a_history_row_decode_error_propagates_instead_of_returning_no_faults() {
     // Test-only corruption of the row's actor type: JSON and canonical sort stay valid.
     // Earlier reducers have no candidates; claim_from_row fails inside the history fold.
     store.connection.write().execute(
-        "UPDATE claims SET actor=x'00' WHERE id=?1", [&failure.id],
+        /* sqlite-large-value: allow-for-now lv-h9aaa5d017f08 owner=st3::store::fault_history_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET actor=x'00' WHERE id=?1", [&failure.id],
     ).unwrap();
     assert!(store.operational_attention_items_with_failures(None, now_ms()).is_err());
     assert!(store.fault_snapshot(now_ms()).is_err());
     assert!(store.broken_gate_items(None, now_ms()).is_err());
     store.connection.write().execute(
-        "UPDATE claims SET actor='daemon/runtime' WHERE id=?1", [&failure.id],
+        /* sqlite-large-value: allow-for-now lv-hc922de39f301 owner=st3::store::fault_history_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET actor='daemon/runtime' WHERE id=?1", [&failure.id],
     ).unwrap();
     assert_eq!(assert_fault_parity(&store, now_ms()).len(), 1);
 }

@@ -11,7 +11,7 @@ pub(super) struct DailyUsage {
     pub unpriced: u64,
 }
 const ALLOWANCES: &str = "doc/usage/agent-message-allowances";
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-hb41ae33456ee owner=st3::store::agent_messages TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS agent_message_sends (
     subject TEXT PRIMARY KEY,
     sent_ms INTEGER NOT NULL,
@@ -52,7 +52,7 @@ END;
 "#;
 
 pub(super) fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(SCHEMA)?;
+    connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h8ec767aded1b owner=st3::store::agent_messages TODO=trace-statement-and-value-representation */ SCHEMA)?;
     Ok(())
 }
 
@@ -64,7 +64,7 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
     )?;
     if !filled {
         transaction.execute_batch(
-            "DELETE FROM agent_message_sends;
+            /* sqlite-large-value: allow-for-now lv-h79a83f476018 owner=st3::store::agent_messages TODO=prepare-body-and-predecessor-values */ "DELETE FROM agent_message_sends;
              DELETE FROM agent_message_days;
              INSERT OR IGNORE INTO local_agent_message_pending
              SELECT DISTINCT subject FROM claims WHERE kind='message.sent';",
@@ -76,15 +76,15 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
     coordination::initialize(transaction)?;
     // A corrupt historical body must leave counts incomplete without preventing startup.
     // Roll back this entire bounded page, including any counts preceding the bad body.
-    transaction.execute_batch("SAVEPOINT coordination_startup")?;
+    transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h0b7a5d5b9ba2 owner=st3::store::agent_messages TODO=trace-statement-and-value-representation */ "SAVEPOINT coordination_startup")?;
     if let Err(error) = coordination::backfill(transaction) {
-        transaction.execute_batch("ROLLBACK TO coordination_startup")?;
+        transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h5737ba7aefa1 owner=st3::store::agent_messages TODO=trace-statement-and-value-representation */ "ROLLBACK TO coordination_startup")?;
         eprintln!("st3: WARN coordination bootstrap remains incomplete: {error}");
     }
-    transaction.execute_batch("RELEASE coordination_startup")?;
+    transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-hb29be52959a4 owner=st3::store::agent_messages TODO=trace-statement-and-value-representation */ "RELEASE coordination_startup")?;
     if !filled {
         transaction.execute(
-            "INSERT INTO meta(key,value) VALUES('agent_message_days_v1','1')",
+            /* sqlite-large-value: allow-for-now lv-h738d6383729a owner=st3::store::agent_messages TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES('agent_message_days_v1','1')",
             [],
         )?;
     }
@@ -195,18 +195,18 @@ fn flush_with_coordination(
             .optional()?;
         if current != desired {
             transaction.execute(
-                "DELETE FROM agent_message_sends WHERE subject=?1",
+                /* sqlite-large-value: allow-for-now lv-h89b671ae14ec owner=st3::store::agent_messages TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM agent_message_sends WHERE subject=?1",
                 [&subject],
             )?;
             if let Some((at, recipient)) = desired {
                 transaction.execute(
-                    "INSERT INTO agent_message_sends VALUES(?1,?2,?3)",
+                    /* sqlite-large-value: allow-for-now lv-h0788aae1a4f5 owner=st3::store::agent_messages TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO agent_message_sends VALUES(?1,?2,?3)",
                     params![subject, at, recipient],
                 )?;
             }
         }
         transaction.execute(
-            "DELETE FROM local_agent_message_pending WHERE subject=?1",
+            /* sqlite-large-value: allow-for-now lv-h094a1c707a0f owner=st3::store::agent_messages TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_agent_message_pending WHERE subject=?1",
             [&subject],
         )?;
     }

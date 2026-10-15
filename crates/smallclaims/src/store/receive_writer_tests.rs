@@ -72,7 +72,7 @@ fn catch_up_admission_bounds_the_work_a_queued_write_waits_for() {
                 .unwrap();
             connection
                 .execute_batch(
-                    "CREATE TEMP TRIGGER admission_cost BEFORE INSERT ON claims
+                    /* sqlite-large-value: allow-for-now lv-hc280ea0222d1 owner=smallclaims::store::receive_writer_tests TODO=prepare-body-and-predecessor-values */ "CREATE TEMP TRIGGER admission_cost BEFORE INSERT ON claims
                  BEGIN SELECT admission_cost(); END;",
                 )
                 .unwrap();
@@ -94,7 +94,7 @@ fn catch_up_admission_bounds_the_work_a_queued_write_waits_for() {
                     .unwrap();
                 observed.send(admitted).unwrap();
                 tx.execute(
-                    "INSERT INTO meta(key,value) VALUES('queued-write','committed')",
+                    /* sqlite-large-value: allow-for-now lv-hc19c6b34c2e3 owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES('queued-write','committed')",
                     [],
                 )
                 .unwrap();
@@ -172,7 +172,7 @@ fn preverified_receipt_stays_atomic_and_signature_retry_stays_idempotent() {
         .connection
         .write()
         .execute_batch(&format!(
-            "CREATE TEMP TRIGGER fail_receipt BEFORE INSERT ON replica_envelopes
+            /* sqlite-large-value: allow-for-now lv-h467c21549699 owner=smallclaims::store::receive_writer_tests TODO=chunk-or-reference-exact-wire-values */ "CREATE TEMP TRIGGER fail_receipt BEFORE INSERT ON replica_envelopes
          WHEN NEW.sequence={last} BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;",
         ))
         .unwrap();
@@ -189,14 +189,14 @@ fn preverified_receipt_stays_atomic_and_signature_retry_stays_idempotent() {
         let count: usize = target
             .readers
             .get()
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .query_row(/* sqlite-large-value: allow-for-now lv-h29de37689fd2 owner=smallclaims::store::receive_writer_tests TODO=trace-statement-and-value-representation */ &format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "failed receipt committed {table}");
     }
     target
         .connection
         .write()
-        .execute_batch("DROP TRIGGER fail_receipt")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-h114ae93c1ae3 owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER fail_receipt")
         .unwrap();
     let received = target
         .receive_replication_exchange("birch", FLEET, &exchange)
@@ -290,7 +290,7 @@ fn preverification_cannot_restore_a_checkpointed_payload_or_signature() {
         .connection
         .write()
         .execute(
-            "INSERT INTO checkpoint_envelopes VALUES(?1,?2,?3,?4,'checkpoint/test')",
+            /* sqlite-large-value: allow-for-now lv-h40a6a477e4f0 owner=smallclaims::store::receive_writer_tests TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoint_envelopes VALUES(?1,?2,?3,?4,'checkpoint/test')",
             params![
                 envelope.writer,
                 envelope.sequence,
@@ -310,7 +310,7 @@ fn preverification_cannot_restore_a_checkpointed_payload_or_signature() {
         let count: usize = target
             .readers
             .get()
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .query_row(/* sqlite-large-value: allow-for-now lv-h8b7177f7a629 owner=smallclaims::store::receive_writer_tests TODO=trace-statement-and-value-representation */ &format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -434,7 +434,7 @@ fn admission_does_not_restore_source_dropped_before_its_background_loan() {
         let mut writer = target.connection.write();
         let tx = writer.transaction().unwrap();
         tx.execute(
-            "INSERT INTO checkpoint_envelopes VALUES(?1,?2,?3,?4,'checkpoint/test')",
+            /* sqlite-large-value: allow-for-now lv-h9fe75ab6969f owner=smallclaims::store::receive_writer_tests TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoint_envelopes VALUES(?1,?2,?3,?4,'checkpoint/test')",
             params![
                 envelope.writer,
                 envelope.sequence,
@@ -444,7 +444,7 @@ fn admission_does_not_restore_source_dropped_before_its_background_loan() {
         )
         .unwrap();
         tx.execute(
-            "DELETE FROM replica_envelopes WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+            /* sqlite-large-value: allow-for-now lv-h970b515ca97b owner=smallclaims::store::receive_writer_tests TODO=chunk-or-reference-exact-wire-values */ "DELETE FROM replica_envelopes WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
             params![envelope.writer, envelope.sequence, envelope.hash],
         )
         .unwrap();
@@ -462,7 +462,7 @@ fn admission_does_not_restore_source_dropped_before_its_background_loan() {
             target
                 .readers
                 .get()
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                .query_row(/* sqlite-large-value: allow-for-now lv-ha64a86b53612 owner=smallclaims::store::receive_writer_tests TODO=trace-statement-and-value-representation */ &format!("SELECT COUNT(*) FROM {table}"), [], |row| row
                     .get::<_, usize>(0))
                 .unwrap(),
             0,
@@ -523,7 +523,7 @@ fn background_receipt_finalizer_failure_rolls_back_the_whole_page_and_retry() {
             target
                 .readers
                 .get()
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                .query_row(/* sqlite-large-value: allow-for-now lv-h3f0a6e9339fd owner=smallclaims::store::receive_writer_tests TODO=trace-statement-and-value-representation */ &format!("SELECT COUNT(*) FROM {table}"), [], |row| row
                     .get::<_, usize>(0))
                 .unwrap(),
             0
@@ -654,7 +654,7 @@ fn an_old_sealing_frontier_recovers_skipped_batches_once_after_reopen() {
             .connection
             .write()
             .execute_batch(
-                "DELETE FROM meta WHERE key='batch_rowid_high_water';
+                /* sqlite-large-value: allow-for-now lv-h4e49f4042edf owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key='batch_rowid_high_water';
              INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid','8');",
             )
             .unwrap();
@@ -751,7 +751,7 @@ fn a_batch_skipped_behind_the_frontier_is_sealed_by_the_first_snapshot_after_adm
             .connection
             .write()
             .execute_batch(
-                "DELETE FROM meta WHERE key='batch_rowid_high_water';
+                /* sqlite-large-value: allow-for-now lv-h80dca9a82fd6 owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key='batch_rowid_high_water';
              INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid','8');",
             )
             .unwrap();
@@ -864,14 +864,14 @@ fn sealing_recovery_ignores_trimmed_sources_and_preserves_a_complete_cursor() {
         store.seal_local_batches().unwrap();
         let mut connection = store.connection.write();
         let tx = connection.transaction().unwrap();
-        tx.execute("INSERT INTO checkpoint_claims(id,writer,sequence,envelope_hash,subject,kind,
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h244bd143de35 owner=smallclaims::store::receive_writer_tests TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoint_claims(id,writer,sequence,envelope_hash,subject,kind,
             actor,predecessors,operation_id,request_digest,accepted_at_unix_ms,checkpoint)
             VALUES (?1,'cedar',1,'fixture-envelope',?2,'example.note',NULL,'[]',NULL,NULL,0,'checkpoint/fixture')",
             params![covered.id, covered.subject]).unwrap();
-        tx.execute("DELETE FROM replica_envelopes", []).unwrap();
-        tx.execute("DELETE FROM claims WHERE id=?1", [&header_only.id])
+        tx.execute(/* sqlite-large-value: allow-for-now lv-ha2c5e9d13ede owner=smallclaims::store::receive_writer_tests TODO=chunk-or-reference-exact-wire-values */ "DELETE FROM replica_envelopes", []).unwrap();
+        tx.execute(/* sqlite-large-value: allow-for-now lv-ha806231badab owner=smallclaims::store::receive_writer_tests TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id=?1", [&header_only.id])
             .unwrap();
-        tx.execute("DELETE FROM meta WHERE key='batch_rowid_high_water'", [])
+        tx.execute(/* sqlite-large-value: allow-for-now lv-he5d7cc0aa7aa owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key='batch_rowid_high_water'", [])
             .unwrap();
         tx.commit().unwrap();
     }
@@ -905,7 +905,7 @@ fn sealing_recovery_ignores_trimmed_sources_and_preserves_a_complete_cursor() {
     // A pre-cursor store should likewise discover that no retained claim needs recovery.
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute("DELETE FROM meta WHERE key='seeded_batch_rowid'", [])
+        .execute(/* sqlite-large-value: allow-for-now lv-heb01acaa45bb owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key='seeded_batch_rowid'", [])
         .unwrap();
     let store = Store::open(&path, "cedar", Arc::new(Plain)).unwrap();
     assert_eq!(store.seeded_batch_rowid.load(Ordering::Acquire), 2);
@@ -928,7 +928,7 @@ fn credential_loading_leaves_many_skipped_batches_for_resumable_history_activati
             .connection
             .write()
             .execute_batch(
-                "DELETE FROM meta WHERE key='batch_rowid_high_water';
+                /* sqlite-large-value: allow-for-now lv-h4bea37063e9f owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key='batch_rowid_high_water';
             INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid','400');",
             )
             .unwrap();
@@ -993,10 +993,10 @@ fn upgrading_again_recovers_a_batch_skipped_by_a_downgraded_writer() {
         store.seal_local_batches().unwrap();
         let connection = store.connection.write();
         connection
-            .execute("DELETE FROM claims WHERE id=?1", [&first.id])
+            .execute(/* sqlite-large-value: allow-for-now lv-ha77ce21369d5 owner=smallclaims::store::receive_writer_tests TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id=?1", [&first.id])
             .unwrap();
         connection
-            .execute("DELETE FROM batches WHERE id=?1", [&first.batch_id])
+            .execute(/* sqlite-large-value: allow-for-now lv-h87fc9d88824b owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM batches WHERE id=?1", [&first.batch_id])
             .unwrap();
     }
     {
@@ -1007,11 +1007,11 @@ fn upgrading_again_recovers_a_batch_skipped_by_a_downgraded_writer() {
         // Emulate an older writer's default SQLite allocation and unchanged high-water meta.
         let connection = store.connection.write();
         connection
-            .execute("UPDATE batches SET rowid=1 WHERE id=?1", [&later.batch_id])
+            .execute(/* sqlite-large-value: allow-for-now lv-hf43488f16b99 owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE batches SET rowid=1 WHERE id=?1", [&later.batch_id])
             .unwrap();
         connection
             .execute(
-                "UPDATE meta SET value='1' WHERE key='batch_rowid_high_water'",
+                /* sqlite-large-value: allow-for-now lv-h6586257ba6b1 owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE meta SET value='1' WHERE key='batch_rowid_high_water'",
                 [],
             )
             .unwrap();
@@ -1048,7 +1048,7 @@ fn signing_an_unsigned_backlog_releases_the_writer_between_pages() {
             .unwrap();
         connection
             .execute_batch(
-                "CREATE TEMP TRIGGER signature_gate BEFORE INSERT ON replica_envelope_signatures
+                /* sqlite-large-value: allow-for-now lv-hcc7d9c00ac1a owner=smallclaims::store::receive_writer_tests TODO=chunk-or-reference-exact-wire-values */ "CREATE TEMP TRIGGER signature_gate BEFORE INSERT ON replica_envelope_signatures
             BEGIN SELECT signature_gate(); END;",
             )
             .unwrap();
@@ -1077,7 +1077,7 @@ fn signing_an_unsigned_backlog_releases_the_writer_between_pages() {
                 )
                 .unwrap();
             tx.execute(
-                "INSERT INTO meta(key,value) VALUES('signing-fairness','committed')",
+                /* sqlite-large-value: allow-for-now lv-h1795cee573e7 owner=smallclaims::store::receive_writer_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES('signing-fairness','committed')",
                 [],
             )
             .unwrap();

@@ -185,7 +185,7 @@ pub(super) fn read(store: &Store, actor: &str, at: u128) -> Result<Vec<StepRunVi
 fn inputs(store: &Store, actor: &str, at: u128) -> Result<Inputs> {
     let connection = store.readers.get();
     let mut views = connection
-        .prepare_cached(&seat_work_at_snapshot_query(false))?
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-he2406e553d10 owner=st3::store::reconcile_work_context TODO=trace-statement-and-value-representation */ &seat_work_at_snapshot_query(false))?
         .query_map(params![actor, true, false], step_run_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let carried = carried_claimants_tx(
@@ -200,7 +200,7 @@ fn inputs(store: &Store, actor: &str, at: u128) -> Result<Inputs> {
         .map(|view| view.run.strip_prefix("mission-run/").unwrap_or(&view.run))
         .collect::<BTreeSet<_>>();
     let phases = connection
-        .prepare_cached(PHASES)?
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-h023d81d0766e owner=st3::store::reconcile_work_context TODO=trace-statement-and-value-representation */ PHASES)?
         .query_map([serde_json::to_string(&runs)?], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
@@ -220,7 +220,7 @@ fn inputs(store: &Store, actor: &str, at: u128) -> Result<Inputs> {
     for chunk in generations.chunks(CHUNK) {
         definitions.extend(
             connection
-                .prepare_cached(DEFINITIONS)?
+                .prepare_cached(/* sqlite-large-value: allow-for-now lv-h11202bf3c300 owner=st3::store::reconcile_work_context TODO=trace-statement-and-value-representation */ DEFINITIONS)?
                 .query_map([serde_json::to_string(chunk)?], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
                 })?
@@ -254,7 +254,7 @@ fn support(connection: &Connection, views: &[StepRunView]) -> Result<Vec<(bool, 
     for chunk in views.chunks(CHUNK) {
         let subjects = chunk.iter().map(|view| &view.subject).collect::<Vec<_>>();
         let rows = connection
-            .prepare_cached(SUPPORT)?
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h4e7308e01437 owner=st3::store::reconcile_work_context TODO=trace-statement-and-value-representation */ SUPPORT)?
             .query_map([serde_json::to_string(&subjects)?], |row| {
                 Ok((
                     row.get::<_, usize>(0)?,
@@ -310,7 +310,7 @@ fn owners(
             })
             .collect::<Vec<_>>();
         let rows = connection
-            .prepare_cached(OWNERS)?
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-h564720bc3f90 owner=st3::store::reconcile_work_context TODO=trace-statement-and-value-representation */ OWNERS)?
             .query_map([serde_json::to_string(&requested)?], |row| {
                 let owner = if row.get::<_, bool>(1)? {
                     Some((

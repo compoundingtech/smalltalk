@@ -53,7 +53,7 @@ impl Store {
                       WHERE kind IN ('owned-set.revised','record.repaired') AND store_index>?2)",
             )?
             .query_row(
-                params![fence.subject, previous.index, previous.local],
+                /* sqlite-large-value: allow-for-now lv-h1d54643b3007 owner=st3::store::mailbox_changes TODO=trace-statement-and-value-representation */ params![fence.subject, previous.index, previous.local],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
         // Configuration publication or replication repair may change message projections
@@ -67,7 +67,7 @@ impl Store {
             .unwrap_or(&recipient);
         let messages = if fence.component == "delivery" && mark.index != previous.index {
             connection
-                .prepare_cached(MESSAGE_CHANGES)?
+                .prepare_cached(/* sqlite-large-value: allow-for-now lv-hb0f33ff370dd owner=st3::store::mailbox_changes TODO=trace-statement-and-value-representation */ MESSAGE_CHANGES)?
                 .query_map(
                     params![
                         previous.index,
@@ -128,7 +128,7 @@ impl Store {
                       AND claims.kind IN ('message.sent','intent.desired')")
             });
             let connection = self.readers.get();
-            let mut statement = connection.prepare_cached(&QUERY)?;
+            let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-habd6fcd6e1c4 owner=st3::store::mailbox_changes TODO=trace-statement-and-value-representation */ &QUERY)?;
             let mut rows = statement.query([serde_json::to_string(&missing)?])?;
             // ClaimKey order is the canonical order, so a subject's least key is its first claim.
             while let Some(row) = rows.next()? {

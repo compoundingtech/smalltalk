@@ -119,7 +119,7 @@ mission "reuse-child" state="ready" {
     }
     // Expired held work must get the same effective state before definition enrichment.
     store.connection.write().execute(
-        "UPDATE step_runs SET status='claimed', lease_owner='person/test', lease_incarnation='worker-one', lease_expires_at_unix_ms='0' WHERE subject=?1",
+        /* sqlite-large-value: allow-for-now lv-h76ba0dd38775 owner=st3::store::mission_eval_reuse_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET status='claimed', lease_owner='person/test', lease_incarnation='worker-one', lease_expires_at_unix_ms='0' WHERE subject=?1",
         [&child.steps[0].subject],
     ).unwrap();
     assert_equivalent(&store, &child.id, snapshot);
@@ -129,10 +129,10 @@ mission "reuse-child" state="ready" {
 fn evaluation_definition_reuse_preserves_missing_revision_and_empty_step_behavior() {
     let snapshot = now_ms().saturating_add(10_000);
     let (store, id) = crate::reconcile::tests::mission_eval_reuse::fixture();
-    store.connection.write().execute("DELETE FROM mission_revisions", []).unwrap();
+    store.connection.write().execute(/* sqlite-large-value: allow-for-now lv-h8bafafe23933 owner=st3::store::mission_eval_reuse_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM mission_revisions", []).unwrap();
     assert_equivalent(&store, &id, snapshot);
     assert!(store.mission_run_for_evaluation(&id).unwrap().1.is_none());
-    store.connection.write().execute("DELETE FROM step_runs", []).unwrap();
+    store.connection.write().execute(/* sqlite-large-value: allow-for-now lv-he06ac1dfc359 owner=st3::store::mission_eval_reuse_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM step_runs", []).unwrap();
     assert_equivalent(&store, &id, snapshot);
     assert!(store.mission_run_for_evaluation(&id).unwrap().1.is_none());
 }
@@ -141,7 +141,7 @@ fn evaluation_definition_reuse_preserves_missing_revision_and_empty_step_behavio
 fn evaluation_definition_reuse_preserves_invalid_definition_errors() {
     let (store, id) = crate::reconcile::tests::mission_eval_reuse::fixture();
     store.connection.write().execute(
-        "UPDATE mission_revisions SET body='not-json'", [],
+        /* sqlite-large-value: allow-for-now lv-h93ed9d5b0a6d owner=st3::store::mission_eval_reuse_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE mission_revisions SET body='not-json'", [],
     ).unwrap();
     let snapshot = now_ms();
     let legacy_error = {
@@ -152,7 +152,7 @@ fn evaluation_definition_reuse_preserves_invalid_definition_errors() {
     assert!(matches!(legacy_error, rusqlite::Error::FromSqlConversionFailure(..)));
     assert!(matches!(current_error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::FromSqlConversionFailure(..))));
     // With no steps, legacy reconciliation does not require parsing the definition.
-    store.connection.write().execute("DELETE FROM step_runs", []).unwrap();
+    store.connection.write().execute(/* sqlite-large-value: allow-for-now lv-h98546a79772f owner=st3::store::mission_eval_reuse_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM step_runs", []).unwrap();
     let (view, mission) = store.mission_run_for_evaluation(&id).unwrap();
     assert!(view.steps.is_empty());
     assert!(mission.is_none());

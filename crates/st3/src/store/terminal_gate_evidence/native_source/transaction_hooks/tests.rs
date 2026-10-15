@@ -100,7 +100,7 @@ impl Fixture {
     }
 }
 fn update_exit(tx: &rusqlite::Connection, code: i64) {
-    tx.execute("UPDATE claims SET body=json_set(body,'$.fields.exit_code',?1) WHERE subject='exec/one/probe' AND kind='runtime.observed'", [code]).unwrap();
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h9aaeca5ebe34 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=json_set(body,'$.fields.exit_code',?1) WHERE subject='exec/one/probe' AND kind='runtime.observed'", [code]).unwrap();
 }
 fn answer(rx: Receiver<Result<(), String>>) -> Result<(), String> {
     rx.recv_timeout(Duration::from_secs(10)).unwrap()
@@ -165,7 +165,7 @@ fn managed_gate_explicit_bootstrap_slot_and_missing_metadata_refusal() {
     tx.rollback().unwrap();
     drop(writer);
     f.raw(|c| {
-        c.execute("DELETE FROM test_native_terminal_guard", [])
+        c.execute(/* sqlite-large-value: allow-for-now lv-h4dafcb72765f owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM test_native_terminal_guard", [])
             .unwrap();
     });
     let mut writer = f.store.connection.write();
@@ -355,7 +355,7 @@ fn managed_gate_prepare_finalize_panic_and_commit_errors_roll_back_all_callers()
     assert_eq!(f.saved(), before);
     f.adapter.fault.store(0, Ordering::Relaxed);
     f.raw(|c| {
-        c.execute_batch("CREATE TEMP TRIGGER test_managed_storage_failure BEFORE UPDATE OF generation ON main.ivm_install_roots WHEN NEW.generation>OLD.generation BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;").unwrap();
+        c.execute_batch(/* sqlite-large-value: allow-for-now lv-h45c6008aafc6 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=bound-or-reference-values-and-reclamation */ "CREATE TEMP TRIGGER test_managed_storage_failure BEFORE UPDATE OF generation ON main.ivm_install_roots WHEN NEW.generation>OLD.generation BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;").unwrap();
     });
     {
         let mut writer = f.store.connection.write();
@@ -369,15 +369,15 @@ fn managed_gate_prepare_finalize_panic_and_commit_errors_roll_back_all_callers()
     }
     assert_eq!(f.saved(), before);
     f.raw(|c| {
-        c.execute_batch("DROP TRIGGER test_managed_storage_failure")
+        c.execute_batch(/* sqlite-large-value: allow-for-now lv-h073ddd442545 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER test_managed_storage_failure")
             .unwrap();
     });
     f.reset_counts();
-    f.raw(|c| { c.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE test_managed_parent(id INTEGER PRIMARY KEY); CREATE TABLE test_managed_child(parent INTEGER REFERENCES test_managed_parent DEFERRABLE INITIALLY DEFERRED);").unwrap(); });
+    f.raw(|c| { c.execute_batch(/* sqlite-large-value: allow-for-now lv-h53528ebd9d97 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=chunk-or-reference-variable-columns */ "PRAGMA foreign_keys=ON; CREATE TABLE test_managed_parent(id INTEGER PRIMARY KEY); CREATE TABLE test_managed_child(parent INTEGER REFERENCES test_managed_parent DEFERRABLE INITIALLY DEFERRED);").unwrap(); });
     let mut writer = f.store.connection.write();
     let tx = writer.transaction().unwrap();
     update_exit(&tx, 99);
-    tx.execute("INSERT INTO test_managed_child VALUES(404)", [])
+    tx.execute(/* sqlite-large-value: allow-for-now lv-h37a1556005e1 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO test_managed_child VALUES(404)", [])
         .unwrap();
     assert!(tx.commit().is_err()); // succeeds through finalize, fails at SQLite COMMIT
     drop(writer);
@@ -430,9 +430,9 @@ fn managed_gate_raw_bypasses_and_leaked_scope_never_become_ready() {
         let root = f.saved().0;
         match mode {
             0 => f.raw(|c| {
-                c.execute_batch("BEGIN").unwrap();
+                c.execute_batch(/* sqlite-large-value: allow-for-now lv-h146dab5dacae owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=trace-statement-and-value-representation */ "BEGIN").unwrap();
                 update_exit_raw(c, 4);
-                c.execute_batch("COMMIT").unwrap();
+                c.execute_batch(/* sqlite-large-value: allow-for-now lv-hf2b7c63a69f2 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=trace-statement-and-value-representation */ "COMMIT").unwrap();
             }),
             1 => f.raw(|c| {
                 let tx = c.unchecked_transaction().unwrap();
@@ -459,7 +459,7 @@ fn managed_gate_raw_bypasses_and_leaked_scope_never_become_ready() {
                 let tx = writer.transaction().unwrap();
                 // Raw COMMIT violates the managed wrapper. Already committed state cannot
                 // be rolled back. Even an unchanged old root is not reader-eligible.
-                tx.execute_batch("COMMIT").unwrap();
+                tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h6617da78bb86 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=trace-statement-and-value-representation */ "COMMIT").unwrap();
                 assert!(tx.commit().is_err());
             }
             _ => unreachable!(),
@@ -479,7 +479,7 @@ fn managed_gate_raw_bypasses_and_leaked_scope_never_become_ready() {
     }
 }
 fn update_exit_raw(c: &rusqlite::Connection, code: i64) {
-    c.execute("UPDATE claims SET body=json_set(body,'$.fields.exit_code',?1) WHERE subject='exec/one/probe' AND kind='runtime.observed'",[code]).unwrap();
+    c.execute(/* sqlite-large-value: allow-for-now lv-hea7aa30468a2 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=json_set(body,'$.fields.exit_code',?1) WHERE subject='exec/one/probe' AND kind='runtime.observed'",[code]).unwrap();
 }
 
 #[test]
@@ -522,7 +522,7 @@ fn managed_gate_clean_reopen_open_time_writes_and_callback_lifetime() {
         // Force the real open_projections replay on this tiny PRIVATE source. The edit
         // itself changes only unprotected meta: the next Store::open changes source rows.
         c.execute(
-            "DELETE FROM meta WHERE key='canonical_shared_projection_rules'",
+            /* sqlite-large-value: allow-for-now lv-h8ede4e905e68 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta WHERE key='canonical_shared_projection_rules'",
             [],
         )
         .unwrap();
@@ -549,8 +549,8 @@ fn managed_gate_work_at_zero_1024_and_100000_unrelated_rows() {
         let f = Fixture::new(true);
         // Setup is explicitly raw and unrelated. No source capture, no cost claim.
         f.raw(|c| {
-            c.execute("INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES('foreign','node',999,'fixture-foreign','1')",[]).unwrap();
-            if n>0 { c.execute("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<?1) INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms) SELECT 'foreign/'||n,'foreign','exec/unrelated/'||n,'runtime.observed','node','{}','[]','1' FROM rows",[n]).unwrap(); }
+            c.execute(/* sqlite-large-value: allow-for-now lv-hfddc5b72fad4 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES('foreign','node',999,'fixture-foreign','1')",[]).unwrap();
+            if n>0 { c.execute(/* sqlite-large-value: allow-for-now lv-ha1071a3b6863 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=prepare-body-and-predecessor-values */ "WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<?1) INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms) SELECT 'foreign/'||n,'foreign','exec/unrelated/'||n,'runtime.observed','node','{}','[]','1' FROM rows",[n]).unwrap(); }
         });
         for operation in ["idle", "unrelated", "noop"] {
             f.reset_counts();
@@ -559,7 +559,7 @@ fn managed_gate_work_at_zero_1024_and_100000_unrelated_rows() {
             let tx = writer.transaction().unwrap();
             match operation {
                 "unrelated" => {
-                    tx.execute("UPDATE claims SET body=body WHERE id='foreign/1'", [])
+                    tx.execute(/* sqlite-large-value: allow-for-now lv-h6253df66fdb9 owner=st3::store::terminal_gate_evidence::native_source::transaction_hooks::tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=body WHERE id='foreign/1'", [])
                         .unwrap();
                 }
                 "noop" => update_exit(&tx, 2),

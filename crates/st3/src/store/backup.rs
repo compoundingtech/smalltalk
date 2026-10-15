@@ -47,7 +47,7 @@ impl Store {
         loop {
             // Both index seeks are bounded before the UNION sorts at most two pages.
             let identities = connection.prepare_cached(
-                "WITH live AS (SELECT writer,sequence,envelope_hash FROM replica_envelopes
+                /* sqlite-large-value: allow-for-now lv-hc8f8befcbe97 owner=st3::store::backup TODO=trace-statement-and-value-representation */ "WITH live AS (SELECT writer,sequence,envelope_hash FROM replica_envelopes
                    WHERE (writer,sequence,envelope_hash)>(?1,?2,?3) AND batch_id IS NOT NULL
                    ORDER BY writer,sequence,envelope_hash LIMIT ?4),
                  dropped AS (SELECT writer,sequence,envelope_hash FROM checkpoint_envelopes
@@ -259,13 +259,13 @@ impl Store {
             self.pin_fleet_anchor(anchor)?;
         }
         self.connection.write().execute(
-            "INSERT INTO meta(key,value) VALUES('backup_restore_writer',?1)",
+            /* sqlite-large-value: allow-for-now lv-h814887c4e019 owner=st3::store::backup TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES('backup_restore_writer',?1)",
             [writer],
         )?;
         Ok(())
     }
 
-    pub(crate) fn receive_backup_page(
+    pub(crate) /* sqlite-large-value-flow: allow-for-now flow-h63e2f41410b8 owner=st3::store::backup TODO=chunk-or-reference-exact-wire-values */ fn receive_backup_page(
         &self,
         header: &Header,
         envelopes: &[ReplicaEnvelope],
@@ -317,7 +317,7 @@ impl Store {
                 );
             }
             transaction.execute(
-                "INSERT INTO replica_envelopes(writer,sequence,envelope_hash,previous_hash,accepted_at_unix_ms,
+                /* sqlite-large-value: allow-for-now lv-hd687b3c3e99d owner=st3::store::backup TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_envelopes(writer,sequence,envelope_hash,previous_hash,accepted_at_unix_ms,
                      payload,relay,receipt_state,received_at_unix_ms)
                  VALUES(?1,?2,?3,?4,?5,?6,'backup','pending',?7)",
                 params![envelope.writer, envelope.sequence, envelope.hash, envelope.previous_hash,
@@ -476,7 +476,7 @@ impl Store {
                     // Retained predecessors must match their exact batch hash. A predecessor
                     // removed by a verified checkpoint has only its certified wire identity left.
                     let found: bool =
-                        predecessor.query_row(params![writer, sequence - 1, link], |r| r.get(0))?;
+                        predecessor.query_row(/* sqlite-large-value: allow-for-now lv-h4fd9d89fd71a owner=st3::store::backup TODO=trace-statement-and-value-representation */ params![writer, sequence - 1, link], |r| r.get(0))?;
                     anyhow::ensure!(
                         found,
                         "backup writer chain has a missing or broken predecessor; retry after replication catches up"

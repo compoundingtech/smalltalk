@@ -56,7 +56,7 @@ fn operation_for_selection(
     selected: &Selection,
 ) -> Result<Option<Operation>, St3Error> {
     smallclaims::touched::note_read(|| subject.to_owned());
-    let mut query = connection.prepare_cached(&canonical_sql(
+    let mut query = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h78cdbbd36e18 owner=st3::store::rollouts TODO=trace-statement-and-value-representation */ &canonical_sql(
         "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
          FROM claims WHERE subject=?1 AND kind IN ('runtime.action.requested','runtime.action.succeeded','runtime.action.failed','runtime.action.deadline-reached')
          ORDER BY CANONICAL_ASC(claims)" )).map_err(internal)?;
@@ -419,7 +419,7 @@ impl Store {
             // native binding in this transaction; an explicit request still requires positive
             // runtime exit before replacement and never falls back to a fresh conversation.
             let ended_binding = if selected.manual && ended && carry.is_none() {
-                tx.query_row(&canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='harness.session-file'
+                tx.query_row(/* sqlite-large-value: allow-for-now lv-hb482290f6536 owner=st3::store::rollouts TODO=trace-statement-and-value-representation */ &canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='harness.session-file'
                     AND json_extract(body,'$.fields.incarnation_id')=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                     params![subject,incarnation], |row| row.get::<_,String>(0)).optional().map_err(internal)?
                     .map(|body| serde_json::from_str::<Value>(&body)).transpose().map_err(internal)?

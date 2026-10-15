@@ -184,7 +184,7 @@ fn reads_and_write_validation_do_not_need_claim_history() {
     let mut connection = store.connection.write();
     let transaction = connection.transaction().unwrap();
     // If either path consults edit history this fails, rather than merely asserting query text.
-    transaction.execute_batch("ALTER TABLE claims RENAME TO unavailable_history").unwrap();
+    transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h4989c24bad7c owner=st3::store::arrangements_tests TODO=prepare-body-and-predecessor-values */ "ALTER TABLE claims RENAME TO unavailable_history").unwrap();
     assert_eq!(arrangement_at(&transaction,SUBJECT,u64::MAX).unwrap().unwrap(),before);
     assert_eq!(arrangements_at(&transaction,"person/ada",u64::MAX).unwrap(),vec![before.clone()]);
     prepare(&transaction,&input(json!([{"op":"folder.rename","id":A,"name":"New"}]))).unwrap();
@@ -217,7 +217,7 @@ fn heads_survive_reopen_and_an_upgrade_backfills_once() {
     let before = layout(&store);
     {
         let connection = store.connection.write();
-        connection.execute_batch("DELETE FROM arrangement_registers; DELETE FROM arrangements; DELETE FROM meta WHERE key='arrangement_heads_v1'").unwrap();
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h944b19a575a9 owner=st3::store::arrangements_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM arrangement_registers; DELETE FROM arrangements; DELETE FROM meta WHERE key='arrangement_heads_v1'").unwrap();
     }
     drop(store);
     let store = Store::open(&path,"node").unwrap();

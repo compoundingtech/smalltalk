@@ -58,7 +58,7 @@ fn page(
         let transaction = connection.unchecked_transaction()?;
         let mut count = 0;
         let result = (|| {
-            let mut statement = transaction.prepare_cached(sql)?;
+            let mut statement = transaction.prepare_cached(/* sqlite-large-value: allow-for-now lv-h3d81b96c9cc2 owner=st3::store::operation_audit TODO=trace-statement-and-value-representation */ sql)?;
             let mut rows = statement.query(parameters)?;
             while let Some(row) = rows.next()? {
                 consume(row)?;

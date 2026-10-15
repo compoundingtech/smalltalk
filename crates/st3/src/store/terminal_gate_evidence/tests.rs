@@ -192,7 +192,7 @@ fn dormant_global_capture_encoding_and_storage_failures_still_fence_the_namespac
     fixture.record(mutation("gate/one", Some(facts())));
     fixture
         .db
-        .execute_batch("DROP TABLE test_terminal_members")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-h3d7cb52d2f45 owner=st3::store::terminal_gate_evidence::tests TODO=bound-or-reference-values-and-reclamation */ "DROP TABLE test_terminal_members")
         .unwrap();
     fixture.record(mutation("gate/other", Some(facts())));
     assert!(fixture.installer.root(&fixture.db, VIEW).is_err());
@@ -369,7 +369,7 @@ fn dormant_fixture_flush_probe_and_unrelated_lookup_have_fixed_measured_sql_work
         if growth != 0 {
             // One row per foreign namespace: supporting index fixture, not maintained
             // native authority state. No namespace exceeds the membership cap.
-            fixture.db.execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1024)
+            fixture.db.execute_batch(/* sqlite-large-value: allow-for-now lv-h04efb2cb8932 owner=st3::store::terminal_gate_evidence::tests TODO=bound-or-reference-values-and-reclamation */ "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1024)
                 INSERT INTO test_terminal_members SELECT 'foreign/'||i,'other','other witness' FROM n;").unwrap();
         }
         for sql in [
@@ -379,9 +379,9 @@ fn dormant_fixture_flush_probe_and_unrelated_lookup_have_fixed_measured_sql_work
             SQL_STATEMENTS.with(|count| count.set(0));
             fixture.db.trace(Some(count_sql));
             let before = fixture.db.total_changes();
-            let mut statement = fixture.db.prepare(sql).unwrap();
+            let mut statement = fixture.db.prepare(/* sqlite-large-value: allow-for-now lv-h63a6a056d745 owner=st3::store::terminal_gate_evidence::tests TODO=trace-statement-and-value-representation */ sql).unwrap();
             let found: bool = statement
-                .query_row([root.namespace.as_str()], |r| r.get(0))
+                .query_row(/* sqlite-large-value: allow-for-now lv-h9b0dc5e1b039 owner=st3::store::terminal_gate_evidence::tests TODO=trace-statement-and-value-representation */ [root.namespace.as_str()], |r| r.get(0))
                 .unwrap();
             let vm = statement.get_status(rusqlite::StatementStatus::VmStep);
             let scans = statement.get_status(rusqlite::StatementStatus::FullscanStep);

@@ -267,7 +267,7 @@ fn the_last_replicated_lease_is_what_sorting_every_lease_claim_found() {
         store
             .readers
             .get()
-            .query_row(query, [subject], |row| row.get(0))
+            .query_row(/* sqlite-large-value: allow-for-now lv-h42b4f66b9d6a owner=st3::store::work_renew_tests TODO=trace-statement-and-value-representation */ query, [subject], |row| row.get(0))
             .unwrap()
     };
     // Reports and published renewals interleave, many in the same millisecond, some apart.
@@ -303,7 +303,7 @@ fn the_last_replicated_lease_seeks_each_kinds_newest_millisecond() {
     let renewal = claimed_step(0);
     let connection = renewal.store.readers.get();
     let mut statement = connection
-        .prepare(&format!(
+        .prepare(/* sqlite-large-value: allow-for-now lv-h79cf0aa2c935 owner=st3::store::work_renew_tests TODO=trace-statement-and-value-representation */ &format!(
             "EXPLAIN QUERY PLAN {}",
             last_replicated_lease_query()
         ))

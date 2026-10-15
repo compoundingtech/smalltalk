@@ -11,7 +11,7 @@ fn snapshots(store: &Store) -> Vec<u64> {
 
 fn agent_subjects(connection: &Connection, index: u64) -> Vec<String> {
     connection
-        .prepare_cached(RANGE_SUBJECTS)
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-hd872c0c033b2 owner=st3::store::card_fold_tests TODO=trace-statement-and-value-representation */ RANGE_SUBJECTS)
         .unwrap()
         .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))
         .unwrap()
@@ -458,7 +458,7 @@ fn newest_claim_reads_sort_only_the_newest_millisecond() {
     let store = Store::open_memory("alder").unwrap();
     let connection = store.readers.get();
     let plan = connection
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", card_fold::newest_claims_sql()))
+        .prepare(/* sqlite-large-value: allow-for-now lv-h47e1d3b1772a owner=st3::store::card_fold_tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {}", card_fold::newest_claims_sql()))
         .unwrap()
         .query_map(params!["[]", 1], |row| row.get::<_, String>(3))
         .unwrap()
@@ -487,7 +487,7 @@ fn card_fold_orders_claims_that_tie_in_one_batch_by_their_position() {
             .unwrap();
         connection
             .execute(
-                "UPDATE claims SET batch_id=?1, accepted_at_unix_ms=?2
+                /* sqlite-large-value: allow-for-now lv-h8b98099c63cf owner=st3::store::card_fold_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET batch_id=?1, accepted_at_unix_ms=?2
                  WHERE subject='agent/retired' AND kind='runtime.observed'",
                 params![first_batch, accepted],
             )

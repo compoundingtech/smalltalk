@@ -71,7 +71,7 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
         for id in crate::store::test_envelope_ids("alder-retired", 0..768, &store.origin) {
             transaction
                 .execute(
-                    "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, ?4)",
+                    /* sqlite-large-value: allow-for-now lv-h67d08b9ee5cc owner=smallclaims::sync::worker_tests TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, ?4)",
                     rusqlite::params![
                         id.writer,
                         id.sequence,
@@ -230,7 +230,7 @@ fn fleet_size_full_inventory_fallback_cost() {
     for id in crate::store::test_envelope_ids("alder-retired", 0..70_000, "lineage") {
         transaction
             .execute(
-                "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, 'checkpoint/example')",
+                /* sqlite-large-value: allow-for-now lv-hd2b7ba01e655 owner=smallclaims::sync::worker_tests TODO=stage-generation-and-keyed-reclamation */ "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, 'checkpoint/example')",
                 rusqlite::params![id.writer, id.sequence, id.hash],
             )
             .unwrap();

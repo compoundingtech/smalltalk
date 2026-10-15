@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use smallclaims::windows::StoreWork;
 
 /// The targets file this daemon was built with.
-pub const SOURCE: &str = include_str!("../../../slo/targets.toml");
+pub const SOURCE: &str = /* sqlite-large-value: allow-for-now lv-ha586d6581dfc owner=st3::slo TODO=trace-statement-and-value-representation */ include_str!("../../../slo/targets.toml");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

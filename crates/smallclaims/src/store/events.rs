@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const MIGRATION_CHUNK: usize = 64;
 
-const VIEW: &str = "CREATE VIEW events AS
+const VIEW: &str = /* sqlite-large-value: allow-for-now lv-h10009ac67082 owner=smallclaims::store::events TODO=prepare-body-and-predecessor-values */ "CREATE VIEW events AS
     SELECT p.store_index,c.kind,p.subject,c.body
     FROM event_positions p CROSS JOIN claims c ON c.store_index=p.store_index";
 
@@ -21,14 +21,14 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     let transaction = connection.unchecked_transaction()?;
     if kind.as_deref() == Some("table") {
         // No copy or scan here. Existing positions, including holes, keep their identity.
-        transaction.execute_batch("ALTER TABLE events RENAME TO local_event_payloads;")?;
+        transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-hd0617fa2d240 owner=smallclaims::store::events TODO=bound-or-reference-values-and-reclamation */ "ALTER TABLE events RENAME TO local_event_payloads;")?;
         // Old checkpoints did not record retired store positions. MIN(events) also cannot
         // distinguish excluded-prefix gaps from lost history or expose a retired middle row.
         // Require one explicit resync at the upgrade frontier instead of inventing continuity.
         raise_resume_floor_tx(&transaction, super::current_index(&transaction)?)?;
     }
     transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS event_positions (
+        /* sqlite-large-value: allow-for-now lv-h5bab0b69713d owner=smallclaims::store::events TODO=chunk-or-reference-variable-columns */ "CREATE TABLE IF NOT EXISTS event_positions (
              store_index INTEGER PRIMARY KEY,
              subject TEXT NOT NULL
          );",
@@ -39,10 +39,10 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     if kind.as_deref() == Some("table") || kind.is_none() {
-        transaction.execute_batch(VIEW)?;
+        transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h58eafaf28baf owner=smallclaims::store::events TODO=trace-statement-and-value-representation */ VIEW)?;
         if legacy {
             transaction.execute_batch(
-                "DROP VIEW events;
+                /* sqlite-large-value: allow-for-now lv-h5565b4adb53d owner=smallclaims::store::events TODO=prepare-body-and-predecessor-values */ "DROP VIEW events;
                  CREATE VIEW events AS
                  SELECT p.store_index,c.kind,p.subject,c.body
                  FROM event_positions p CROSS JOIN claims c ON c.store_index=p.store_index
@@ -76,7 +76,7 @@ pub fn migrate_chunk_tx(transaction: &Transaction<'_>) -> Result<usize> {
         .collect::<Result<Vec<_>, _>>()?;
     for position in &positions {
         transaction.execute(
-            "INSERT OR IGNORE INTO event_positions(store_index,subject)
+            /* sqlite-large-value: allow-for-now lv-h4b445febdcfb owner=smallclaims::store::events TODO=prepare-body-and-predecessor-values */ "INSERT OR IGNORE INTO event_positions(store_index,subject)
              SELECT store_index,subject FROM claims WHERE store_index=?1",
             [position],
         )?;
@@ -89,20 +89,20 @@ pub fn migrate_chunk_tx(transaction: &Transaction<'_>) -> Result<usize> {
             raise_resume_floor_tx(transaction, *position)?;
         }
         transaction.execute(
-            "DELETE FROM local_event_payloads WHERE store_index=?1",
+            /* sqlite-large-value: allow-for-now lv-hba6f8075196e owner=smallclaims::store::events TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_event_payloads WHERE store_index=?1",
             [position],
         )?;
     }
     if positions.len() < MIGRATION_CHUNK {
-        transaction.execute_batch("DROP VIEW events; DROP TABLE local_event_payloads;")?;
-        transaction.execute_batch(VIEW)?;
+        transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h48f50d45e8f5 owner=smallclaims::store::events TODO=bound-or-reference-values-and-reclamation */ "DROP VIEW events; DROP TABLE local_event_payloads;")?;
+        transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-hca7d37a4fe7b owner=smallclaims::store::events TODO=trace-statement-and-value-representation */ VIEW)?;
     }
     Ok(positions.len())
 }
 
 pub fn raise_resume_floor_tx(transaction: &Transaction<'_>, index: u64) -> Result<()> {
     transaction.execute(
-        "INSERT INTO meta(key,value) VALUES('event_resume_floor',?1)
+        /* sqlite-large-value: allow-for-now lv-hcf8185341b43 owner=smallclaims::store::events TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES('event_resume_floor',?1)
          ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(meta.value AS INTEGER),?1) AS TEXT)",
         [index],
     )?;
@@ -146,12 +146,12 @@ pub fn remove_claim_tx(transaction: &Transaction<'_>, claim: &str) -> Result<()>
     }
     raise_resume_floor_tx(transaction, position)?;
     transaction.execute(
-        "DELETE FROM event_positions WHERE store_index=?1",
+        /* sqlite-large-value: allow-for-now lv-he18080ef1b0b owner=smallclaims::store::events TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM event_positions WHERE store_index=?1",
         [position],
     )?;
     if pending {
         transaction.execute(
-            "DELETE FROM local_event_payloads WHERE store_index=?1",
+            /* sqlite-large-value: allow-for-now lv-h9ac1754027a8 owner=smallclaims::store::events TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_event_payloads WHERE store_index=?1",
             [position],
         )?;
     }

@@ -5,7 +5,7 @@ fn writer() -> WriterConnection {
     let connection = Connection::open_in_memory().unwrap();
     connection
         .execute_batch(
-            "PRAGMA foreign_keys=ON;
+            /* sqlite-large-value: allow-for-now lv-h716a4dfd7b59 owner=smallclaims::sqlite::managed_commit_counter_tests TODO=chunk-or-reference-variable-columns */ "PRAGMA foreign_keys=ON;
         CREATE TABLE claims(store_index INTEGER PRIMARY KEY);
         CREATE TABLE parent(id INTEGER PRIMARY KEY);
         CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
@@ -43,13 +43,13 @@ fn managed_outer_commits_count_success_once_and_exclude_other_units() {
         let mut tx = guard.transaction().unwrap();
         {
             let nested = tx.savepoint().unwrap();
-            nested.execute("INSERT INTO parent VALUES(1)", []).unwrap();
+            nested.execute(/* sqlite-large-value: allow-for-now lv-heea4f88a3d41 owner=smallclaims::sqlite::managed_commit_counter_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO parent VALUES(1)", []).unwrap();
             nested.commit().unwrap();
         }
         check(expected); // Successful nested commit is not an outer commit.
         {
             let nested = tx.savepoint().unwrap();
-            nested.execute("INSERT INTO parent VALUES(2)", []).unwrap();
+            nested.execute(/* sqlite-large-value: allow-for-now lv-h1b389162d86b owner=smallclaims::sqlite::managed_commit_counter_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO parent VALUES(2)", []).unwrap();
             // Savepoint drop rolls back; neither attempt counts.
         }
         tx.commit().unwrap();
@@ -71,17 +71,17 @@ fn managed_outer_commits_count_success_once_and_exclude_other_units() {
                 .is_err()
         );
         let tx = guard.transaction().unwrap();
-        tx.execute("INSERT INTO child VALUES(999)", []).unwrap();
+        tx.execute(/* sqlite-large-value: allow-for-now lv-hee6048971629 owner=smallclaims::sqlite::managed_commit_counter_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO child VALUES(999)", []).unwrap();
         assert!(tx.commit().is_err()); // Real outer SQLite COMMIT failure.
         check(expected);
-        guard.execute("INSERT INTO parent VALUES(3)", []).unwrap(); // Raw autocommit excluded.
+        guard.execute(/* sqlite-large-value: allow-for-now lv-hee0044559f6d owner=smallclaims::sqlite::managed_commit_counter_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO parent VALUES(3)", []).unwrap(); // Raw autocommit excluded.
         guard
-            .execute_batch("BEGIN; INSERT INTO parent VALUES(4); COMMIT")
+            .execute_batch(/* sqlite-large-value: allow-for-now lv-h94be999929bf owner=smallclaims::sqlite::managed_commit_counter_tests TODO=bound-or-reference-values-and-reclamation */ "BEGIN; INSERT INTO parent VALUES(4); COMMIT")
             .unwrap();
         let tx = rusqlite::Connection::transaction(&mut guard).unwrap();
         tx.commit().unwrap(); // Raw API transaction excluded.
         let tx = guard.transaction().unwrap();
-        tx.execute_batch("COMMIT").unwrap();
+        tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h9585484bf15f owner=smallclaims::sqlite::managed_commit_counter_tests TODO=trace-statement-and-value-representation */ "COMMIT").unwrap();
         assert!(tx.commit().is_err()); // Raw-ended wrapper cannot count again.
         check(expected);
     }
@@ -103,7 +103,7 @@ fn managed_outer_commits_count_success_once_and_exclude_other_units() {
     assert!(
         writer
             .batched(|tx| {
-                tx.execute("INSERT INTO child VALUES(999)", [])?;
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h5fd0c74f6731 owner=smallclaims::sqlite::managed_commit_counter_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO child VALUES(999)", [])?;
                 Ok::<_, anyhow::Error>(())
             })
             .is_err()

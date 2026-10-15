@@ -5,7 +5,7 @@ use super::*;
 
 fn custom(state: &AppState, subject: &str, person: &str) {
     let manifest =
-        serde_json::from_str(include_str!("../../../../../examples/st3/custom-review.json"))
+        serde_json::from_str(/* sqlite-large-value: allow-for-now lv-haa0cb564a8c1 owner=st3::api::client_v0::published_attention_tests TODO=trace-statement-and-value-representation */ include_str!("../../../../../examples/st3/custom-review.json"))
             .unwrap();
     state
         .store

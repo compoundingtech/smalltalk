@@ -28,8 +28,8 @@ impl Store {
     pub fn replica_record(&self, record_ref: &str) -> Result<Option<ReplicaRecordView>> {
         let connection = self.readers.get();
         Ok(connection
-            .prepare_cached(POINT_SQL)?
-            .query_row([record_ref], decode)
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-hc203f8f75c66 owner=smallclaims::store::replica_record TODO=trace-statement-and-value-representation */ POINT_SQL)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-h7f473423a540 owner=smallclaims::store::replica_record TODO=trace-statement-and-value-representation */ [record_ref], decode)
             .optional()?)
     }
 }

@@ -191,7 +191,7 @@ fn indexed_episode_read_error_clears_consumed_proof() {
     assert!(proof.is_current(&state, &fence, &peer));
     // Break only the indexed episode lookup in this isolated file store.
     rusqlite::Connection::open(&database).unwrap()
-        .execute_batch("DROP INDEX claims_subject_kind_accepted_index").unwrap();
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-he127ff49b19a owner=st3::api::mailbox::replay_proof_tests TODO=bound-or-reference-values-and-reclamation */ "DROP INDEX claims_subject_kind_accepted_index").unwrap();
     assert!(state.store.mailbox_failure_episode(&fence, &authority::episode(&fence)).is_err());
     assert!(!proof.is_current(&state, &fence, &peer));
 }
@@ -224,7 +224,7 @@ fn revoked_lease_clears_proof_with_the_same_owner_identity() {
     let proof = authority::replay_proof_inputs(&state, &fence, &peer).unwrap();
     assert!(proof.is_current(&state, &fence, &peer));
     rusqlite::Connection::open(&database).unwrap().execute(
-        "UPDATE local_mailbox_leases SET revoked=1 WHERE subject=?1 AND component=?2",
+        /* sqlite-large-value: allow-for-now lv-h746da844fa22 owner=st3::api::mailbox::replay_proof_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_mailbox_leases SET revoked=1 WHERE subject=?1 AND component=?2",
         rusqlite::params![fence.subject, fence.component],
     ).unwrap();
     assert_eq!(state.store.mailbox_lease_authority(&fence).unwrap(), Some(proof.lease_owner.clone()));

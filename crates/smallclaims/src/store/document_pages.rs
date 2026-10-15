@@ -161,7 +161,7 @@ pub(super) fn read(
         after.is_some(),
     );
     let connection = store.readers.get();
-    let mut statement = connection.prepare_cached(&sql)?;
+    let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h2f4c6110e554 owner=smallclaims::store::document_pages TODO=trace-statement-and-value-representation */ &sql)?;
     statement
         .query_map(
             params![name, prefix, cursor_name, cursor_index, lower, upper, limit],
