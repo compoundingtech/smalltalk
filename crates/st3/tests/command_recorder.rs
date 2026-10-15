@@ -939,8 +939,10 @@ fn terminal_stdout_stays_interactive_and_does_not_publish_a_receipt() {
         libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
         (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave))
     };
+    // macOS discards what a pty holds once its last slave descriptor closes, so this side keeps
+    // the slave open until the output has been read.
     let mut child = fixture.recorded("gh").args(["issue", "create"])
-        .stdout(slave).spawn().unwrap();
+        .stdout(slave.try_clone().unwrap()).spawn().unwrap();
     let status = wait_within(&mut child, Duration::from_secs(10));
     assert!(status.success());
     assert_eq!(read_line(&mut master).trim_end_matches('\r'), "interactive");
@@ -948,6 +950,7 @@ fn terminal_stdout_stays_interactive_and_does_not_publish_a_receipt() {
         read_line(&mut master).trim_end_matches('\r'),
         "https://github.com/owner/repo/issues/123",
     );
+    drop(slave);
     assert!(fixture.receipts().is_empty());
     assert!(fixture.records()[0].get("receipt_url").is_none());
 }
