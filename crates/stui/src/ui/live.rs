@@ -1784,6 +1784,10 @@ pub fn run(context: Context) -> Result<()> {
         if changed {
             ui.content.index(&timelines);
             extras.conversations = conversations(&model, &person, &timelines, &failed, &conversing);
+            extras.pending_calls = timelines
+                .iter()
+                .map(|(agent, timeline)| (agent.clone(), adapt::pending_calls(&timeline.items)))
+                .collect();
             for entry in &pending {
                 if let Some(Load::Ready(entries)) = extras.conversations.get_mut(&entry.agent) {
                     entries.push(super::view::Entry {

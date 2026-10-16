@@ -38,6 +38,15 @@ pub enum Link {
     Offline(String),
 }
 
+/// A tool call a seat's harness recorded and has no result for yet: its tool and its whole input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingCall {
+    /// Its tool use (or Codex item) id, which a prompt names as the call it asks about.
+    pub id: String,
+    pub tool: String,
+    pub input: serde_json::Value,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct World {
     pub person: String,
@@ -75,6 +84,10 @@ pub struct World {
     /// The person's paired devices.
     pub devices: Load<Vec<Device>>,
     pub conversations: BTreeMap<String, Load<Vec<Entry>>>,
+    /// Each loaded conversation's tool calls with no result yet, in full, oldest first: a native
+    /// prompt asks about one of them, and a person answers only what they can read.
+    #[serde(skip)]
+    pub pending_calls: BTreeMap<String, Vec<PendingCall>>,
     /// Missions nobody needs the person for, counted so Home can say what it is not showing.
     pub quiet_missions: usize,
     /// Token spend over the Usage tab's period: one row per agent, mission run, step, model,
@@ -246,6 +259,10 @@ pub enum AttentionKind {
         answers: Vec<String>,
         /// The harness observation that opened it, which an answer names.
         episode: String,
+        /// The exact call it asks about, as st names it: `Some(None)` when its harness named
+        /// none, `None` from a daemon that predates naming it. Allow is offered only beside it.
+        #[serde(skip)]
+        call: Option<Option<String>>,
     },
     /// A harness not signed in to its provider; one sign-in answers every seat that shares it.
     Login {

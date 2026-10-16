@@ -804,6 +804,11 @@ impl ClientError {
     }
 }
 
+/// How st begins its refusal of an answer to a native prompt, written for the person: the prompt
+/// was answered elsewhere or replaced, or only its terminal can answer it. A `stale-fence` that
+/// begins with it keeps st's own words.
+pub const PROMPT_REFUSAL_PREFIX: &str = "that prompt ";
+
 /// An error st sent (a code, when it gave one, and its message) as a person reads it.
 pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
     let Some(code) = code else {
@@ -814,6 +819,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         .find_map(|word| word.strip_prefix("host/"))
         .map(|host| host.trim_end_matches(|c: char| !c.is_alphanumeric()));
     match code {
+        // A native prompt's answer is refused in words written for the person: the prompt was
+        // answered elsewhere or replaced, or only its terminal can answer it.
+        ErrorCode::StaleFence if message.starts_with(PROMPT_REFUSAL_PREFIX) => message.to_owned(),
         ErrorCode::StaleFence => {
             "st changed while this was on its way, so it was not applied".into()
         }
@@ -2803,6 +2811,15 @@ mod tests {
         assert_eq!(
             stale.plain(),
             "st changed while this was on its way, so it was not applied"
+        );
+        // A prompt's refusal keeps st's own words: why it cannot be answered from here.
+        assert_eq!(
+            api(
+                ErrorCode::StaleFence,
+                "that prompt is no longer waiting: it was answered or replaced"
+            )
+            .plain(),
+            "that prompt is no longer waiting: it was answered or replaced"
         );
         assert!(stale.is_transient());
         let remote = api(

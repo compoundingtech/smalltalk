@@ -2563,13 +2563,19 @@ impl Store {
         let Some((claim, _, harness)) = current.filter(|(claim, _, _)| claim == episode) else {
             return Err(St3Error::new(
                 "stale-fence",
-                "that prompt is no longer waiting: it was answered or replaced",
+                format!(
+                    "{}is no longer waiting: it was answered or replaced",
+                    st3_client::PROMPT_REFUSAL_PREFIX
+                ),
             ));
         };
         if !answerable(&harness, now) {
             return Err(St3Error::new(
                 "stale-fence",
-                "that prompt can only be answered in the seat's terminal",
+                format!(
+                    "{}can only be answered in the seat's terminal",
+                    st3_client::PROMPT_REFUSAL_PREFIX
+                ),
             ));
         }
         if answer == "allow" && subagent_prompt(&harness) {

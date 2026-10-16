@@ -17,6 +17,8 @@ use std::collections::BTreeSet;
 #[derive(Default)]
 pub struct Extras {
     pub conversations: BTreeMap<String, Load<Vec<Entry>>>,
+    /// Each conversation's tool calls with no result yet (see [`pending_calls`]).
+    pub pending_calls: BTreeMap<String, Vec<super::view::PendingCall>>,
     pub previews: BTreeMap<String, Load<MissionPreview>>,
     /// Loaded messages behind unread-message items: sender, title, text.
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
@@ -239,6 +241,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
             extras.window_errors.get("devices"),
         ),
         conversations: extras.conversations.clone(),
+        pending_calls: extras.pending_calls.clone(),
         quiet_missions: quiet,
         usage: match &model.usage {
             Some(Ok(period)) => Load::Ready(period.rows.clone()),
@@ -438,6 +441,11 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             })
                             .unwrap_or_default(),
                         episode: item.episode.clone(),
+                        call: item
+                            .action_parameters
+                            .get("prompt.respond")
+                            .and_then(|parameters| parameters.get("call_id"))
+                            .map(|call| call.as_str().map(str::to_owned)),
                     },
                 ),
                 "harness-login" => (
@@ -928,6 +936,35 @@ pub fn names(model: &Model, person: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 use st3_conversation_ui::adapt::from_harness;
 pub use st3_conversation_ui::adapt::unreadable_transcript;
+
+/// The tool calls `timeline` records with no result yet, oldest first, each in full. A native
+/// prompt asks about one of them, though it names none: only when exactly one waits is it certain
+/// which one an answer is for.
+pub fn pending_calls(timeline: &[st3_client::TimelineEntry]) -> Vec<super::view::PendingCall> {
+    let answered: std::collections::HashSet<&str> = timeline
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            st3_client::TimelineBody::ToolResult(result) => Some(result.call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    timeline
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            st3_client::TimelineBody::ToolCall(call)
+                if !answered.contains(call.call_id.as_str()) && seen.insert(call.call_id.as_str()) =>
+            {
+                Some(super::view::PendingCall {
+                    id: call.call_id.clone(),
+                    tool: call.name.clone(),
+                    input: call.arguments.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 /// Standalone native images need a focusable row even when the text adapter has no words.
 pub fn conversation(timeline: &[st3_client::TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {

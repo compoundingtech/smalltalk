@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Answer every native prompt kind from stui, with the call it would make shown in full",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses the existing prompt.respond action and attention rows; a prompt's answers render generically, so an older daemon's allow and deny render as before."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or new swap-back restrictions."
+  }
+}

@@ -4499,6 +4499,7 @@ mod tests {
                 text: "Claude asks to use Bash".into(),
                 answers: vec!["allow".into(), "deny".into()],
                 episode: "episode-1".into(),
+                call: None,
             },
             actions: vec!["prompt.respond".into()],
             related: vec![],

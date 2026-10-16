@@ -14,6 +14,90 @@ const SHOWN: usize = 2;
 /// The lines of a pending call the band shows. A call that is longer is cut with an ellipsis, and
 /// then `allow` is withheld: a person allows only what they can read in full.
 const CALL_LINES: usize = 4;
+/// The lines of a plan the band shows before it is cut and `approve` is withheld likewise.
+const PLAN_LINES: usize = 24;
+
+/// A pending call's input as lines a person reads: each field on its own line, with a value's
+/// further lines indented under it, so a multi-line command or an edit's text is there in full.
+fn call_lines(call: &PendingCall) -> Vec<String> {
+    let mut lines = Vec::new();
+    match &call.input {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                let text = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => serde_json::to_string_pretty(other).unwrap_or_default(),
+                };
+                let mut rest = text.lines();
+                lines.push(format!("{key}: {}", rest.next().unwrap_or_default()));
+                lines.extend(rest.map(|line| format!("  {line}")));
+            }
+        }
+        serde_json::Value::Null => {}
+        serde_json::Value::String(text) => lines.extend(text.lines().map(str::to_owned)),
+        other => lines.extend(
+            serde_json::to_string_pretty(other)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned),
+        ),
+    }
+    lines
+}
+
+/// One question of a harness's pending `AskUserQuestion` call.
+#[derive(Debug, Clone, PartialEq)]
+struct Question {
+    text: String,
+    header: String,
+    options: Vec<String>,
+    multi: bool,
+}
+
+/// The questions an `AskUserQuestion` call asks, when it is one and they can be read.
+fn questions(call: &PendingCall) -> Option<Vec<Question>> {
+    if call.tool != "AskUserQuestion" {
+        return None;
+    }
+    let asked = call.input.get("questions")?.as_array()?;
+    let questions = asked
+        .iter()
+        .map(|question| {
+            Some(Question {
+                text: question.get("question")?.as_str()?.to_owned(),
+                header: question
+                    .get("header")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                options: question
+                    .get("options")?
+                    .as_array()?
+                    .iter()
+                    .map(|option| option.get("label")?.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()?,
+                multi: question
+                    .get("multiSelect")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!questions.is_empty() && questions.iter().all(|question| !question.options.is_empty()))
+        .then_some(questions)
+}
+
+/// How an answer a prompt offers reads on its button.
+fn answer_label(answer: &str) -> String {
+    match answer {
+        "use-all" => "use all".into(),
+        "approve" => "approve plan".into(),
+        "answer" => "send".into(),
+        "approve-once" => "allow once".into(),
+        "approve-kind" => "allow this kind".into(),
+        other => other.to_owned(),
+    }
+}
 
 /// One row of the band: its line, and the buttons on it by column.
 pub(super) struct BandRow {
@@ -104,24 +188,270 @@ impl Ui {
             .collect()
     }
 
-    /// The tool calls the conversation shows as unanswered, oldest first, as the seat's harness
-    /// recorded them. A permission prompt is for one of them, but `prompt.respond` names no
-    /// call: only when exactly one is unanswered is it certain which one an allow lets through.
-    fn unanswered_calls(&self, agent: &str) -> Vec<String> {
-        let Some(Load::Ready(entries)) = self.world.conversations.get(agent) else {
-            return Vec::new();
+    /// The tool calls the conversation records with no result yet, oldest first, in full.
+    fn calls_waiting(&self, agent: &str) -> &[PendingCall] {
+        self.world
+            .pending_calls
+            .get(agent)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The calls to show beside a prompt's answers: the exact call it asks about, when st names
+    /// it (none when its harness named none); from an older daemon, every unanswered call, of
+    /// which only a lone one is certain.
+    fn prompt_calls(&self, seat: &str, call: &Option<Option<String>>) -> Vec<&PendingCall> {
+        let waiting = self.calls_waiting(seat);
+        match call {
+            None => waiting.iter().collect(),
+            Some(named) => waiting
+                .iter()
+                .filter(|pending| named.as_deref() == Some(pending.id.as_str()))
+                .collect(),
+        }
+    }
+
+    /// What the band shows under a native prompt, and its buttons. `allow` and `approve` are
+    /// offered only beside the one waiting call shown in full; a question's options are chosen
+    /// here and sent together; a screen prompt's own answers (use, skip, trust, ...) and `deny`
+    /// are always one tap.
+    fn prompt_answer_rows(
+        &self,
+        id: &str,
+        seat: &str,
+        answers: &[String],
+        prompt: &str,
+        call: &Option<Option<String>>,
+        width: usize,
+    ) -> (Vec<BandRow>, Vec<(String, Color, Hit)>) {
+        let mut rows = Vec::new();
+        let mut buttons = Vec::new();
+        let button = |answer: &str, color: Color| {
+            (
+                answer_label(answer),
+                color,
+                Hit::Alert(id.to_owned(), AlertTap::Answer(answer.to_owned())),
+            )
         };
-        entries
+        if answers.is_empty() {
+            // Answered where it is shown.
+            rows.extend(
+                text::wrap(
+                    &[text::run(
+                        format!("{} · answer it in the terminal (Ctrl+])", first_line(prompt)),
+                        theme::dim(),
+                    )],
+                    width,
+                    &[text::run("   ", theme::dim())],
+                    &[text::run("   ", theme::dim())],
+                    None,
+                )
+                .into_iter()
+                .take(2)
+                .map(|line| BandRow { line, hits: Vec::new() }),
+            );
+            return (rows, buttons);
+        }
+        let calls = self.prompt_calls(seat, call);
+        let gated = answers
             .iter()
-            .filter_map(|entry| match &entry.body {
-                Body::Tool {
-                    title,
-                    state: ToolState::Running,
-                    ..
-                } => Some(title.clone()),
-                _ => None,
-            })
-            .collect()
+            .find(|answer| matches!(answer.as_str(), "allow" | "approve" | "answer"));
+        match (gated.map(String::as_str), calls.as_slice()) {
+            (Some("answer"), [only]) if let Some(asked) = questions(only) => {
+                let chosen = self.question_choices.get(&question_key(id, &only.id));
+                for (index, question) in asked.iter().enumerate() {
+                    let header = if question.header.is_empty() {
+                        question.text.clone()
+                    } else {
+                        format!("{} · {}", question.header, question.text)
+                    };
+                    rows.extend(note_rows(
+                        &format!(
+                            "{header}{}",
+                            if question.multi { " (choose any)" } else { "" }
+                        ),
+                        width,
+                    ));
+                    let picked = chosen.and_then(|chosen| chosen.get(&index));
+                    rows.extend(BandRow::button_rows(
+                        question
+                            .options
+                            .iter()
+                            .enumerate()
+                            .map(|(option, label)| {
+                                let on = picked.is_some_and(|picked| picked.contains(&option));
+                                (
+                                    format!("{}{}", if on { "✓ " } else { "" }, text::truncate(label, 32)),
+                                    if on { theme::GREEN } else { theme::SURFACE2 },
+                                    Hit::Alert(id.to_owned(), AlertTap::Choose(index, option)),
+                                )
+                            })
+                            .collect(),
+                        width,
+                    ));
+                }
+                let complete = (0..asked.len()).all(|index| {
+                    chosen
+                        .and_then(|chosen| chosen.get(&index))
+                        .is_some_and(|picked| !picked.is_empty())
+                });
+                if complete {
+                    buttons.push(button("answer", theme::GREEN));
+                }
+            }
+            (Some("answer"), _) => rows.extend(note_rows(
+                "the question is not in the conversation yet: answer it in the terminal (Ctrl+]) or open it in Now",
+                width,
+            )),
+            // Several calls wait and the prompt names none: show them all and offer no allow.
+            (Some(_), [_, _, ..]) => {
+                rows.extend(note_rows(
+                    &format!(
+                        "{} calls are unanswered and st cannot tell which one the harness asks about; answer it in the terminal (Ctrl+]):",
+                        calls.len()
+                    ),
+                    width,
+                ));
+                for call in calls.iter().take(CALL_LINES) {
+                    let line = call_lines(call).into_iter().next().unwrap_or_default();
+                    rows.push(BandRow::text(vec![
+                        Span::styled("   · ", theme::dim()),
+                        Span::styled(
+                            text::truncate(&format!("{} {line}", call.tool), width.saturating_sub(8)),
+                            theme::text(),
+                        ),
+                    ]));
+                }
+                if calls.len() > CALL_LINES {
+                    rows.push(BandRow::text(vec![Span::styled(
+                        format!("   … and {} more", calls.len() - CALL_LINES),
+                        theme::dim(),
+                    )]));
+                }
+            }
+            (Some(gated), [only]) => {
+                let limit = if gated == "approve" { PLAN_LINES } else { CALL_LINES };
+                let mut runs = vec![text::run(format!("{}\n", only.tool), theme::bold())];
+                runs.push(text::run(call_lines(only).join("\n"), theme::text()));
+                let lines = text::wrap(
+                    &runs,
+                    width.saturating_sub(4),
+                    &[text::run("   ", theme::dim())],
+                    &[text::run("   ", theme::dim())],
+                    None,
+                );
+                let cut = lines.len() > limit;
+                let last = lines.len().min(limit);
+                for (index, line) in lines.into_iter().take(limit).enumerate() {
+                    let mut line = line;
+                    if cut && index + 1 == last {
+                        line.spans.push(Span::styled(" …", theme::dim()));
+                    }
+                    rows.push(BandRow { line, hits: Vec::new() });
+                }
+                // The whole call must be in view to allow it, and the whole plan to approve it.
+                if !cut {
+                    buttons.push(button(gated, theme::GREEN));
+                } else {
+                    rows.extend(note_rows(
+                        "it is too long to show here in full: open it in Now, or answer it in the terminal (Ctrl+])",
+                        width,
+                    ));
+                }
+            }
+            (Some(_), []) => rows.extend(note_rows(
+                "the call it would make is not in the conversation yet: answer it in the terminal (Ctrl+]) or open it in Now",
+                width,
+            )),
+            (None, _) => rows.extend(note_rows(first_line(prompt), width)),
+        }
+        // A screen prompt's own answers, then deny, are one tap each.
+        for answer in answers {
+            match answer.as_str() {
+                "allow" | "approve" | "answer" | "deny" => {}
+                other => buttons.push(button(other, theme::ACCENT)),
+            }
+        }
+        if answers.iter().any(|answer| answer == "deny") {
+            buttons.push((
+                if gated.is_some_and(|gated| gated == "answer") {
+                    "decline".into()
+                } else {
+                    "deny".into()
+                },
+                theme::RED,
+                Hit::Alert(id.to_owned(), AlertTap::Answer("deny".into())),
+            ));
+        }
+        (rows, buttons)
+    }
+
+    /// Choose an option of a harness question alert's question, or for a multi-select toggle
+    /// it. Nothing is sent until the person sends every question's choice.
+    pub(super) fn choose_answer(&mut self, id: &str, question: usize, option: usize) {
+        let Some((seat, call)) = self.world.attention.items().iter().find_map(|item| match &item.kind {
+            AttentionKind::Prompt { seat_id, call, .. } if item.id == id => {
+                Some((seat_id.clone(), call.clone()))
+            }
+            _ => None,
+        }) else {
+            self.flash("That alert is gone");
+            return;
+        };
+        let Some((asked, key)) = (match self.prompt_calls(&seat, &call).as_slice() {
+            [only] => questions(only).map(|asked| (asked, question_key(id, &only.id))),
+            _ => None,
+        }) else {
+            self.flash("The question is gone");
+            return;
+        };
+        let Some(multi) = asked.get(question).map(|question| question.multi) else {
+            return;
+        };
+        // Picks belong to this exact question call: a replaced question starts with none.
+        let prefix = question_key(id, "");
+        self.question_choices
+            .retain(|other, _| *other == key || !other.starts_with(&prefix));
+        let picked = self
+            .question_choices
+            .entry(key)
+            .or_default()
+            .entry(question)
+            .or_default();
+        if multi {
+            if !picked.remove(&option) {
+                picked.insert(option);
+            }
+        } else {
+            picked.clear();
+            picked.insert(option);
+        }
+    }
+
+    /// The JSON a question alert sends: positions only, each question's position to the positions
+    /// of the options chosen. The questions and labels stay in the conversation; the seat's hook
+    /// turns positions into labels.
+    fn question_answer(&self, id: &str, seat: &str, call: &Option<Option<String>>) -> Option<String> {
+        let calls = self.prompt_calls(seat, call);
+        let [only] = calls.as_slice() else {
+            return None;
+        };
+        let asked = questions(only)?;
+        let chosen = self.question_choices.get(&question_key(id, &only.id))?;
+        let mut answers = serde_json::Map::new();
+        for (index, question) in asked.iter().enumerate() {
+            let options = chosen
+                .get(&index)?
+                .iter()
+                .filter(|option| **option < question.options.len())
+                .copied()
+                .collect::<Vec<_>>();
+            if options.is_empty() {
+                return None;
+            }
+            answers.insert(index.to_string(), serde_json::json!(options));
+        }
+        Some(serde_json::Value::Object(answers).to_string())
     }
 
     /// The band for `agent` at `width` columns: empty when nothing waits on the person there,
@@ -229,96 +559,13 @@ impl Ui {
                     seat_id,
                     answers,
                     text: prompt,
+                    call,
                     ..
                 } => {
-                    let calls = if answers.is_empty() {
-                        Vec::new()
-                    } else {
-                        self.unanswered_calls(seat_id)
-                    };
-                    match calls.as_slice() {
-                        // Several calls are unanswered and the prompt names none: show them all
-                        // and offer only deny. Allowing the wrong one is not undoable.
-                        [_, _, ..] => {
-                            rows.extend(note_rows(
-                                &format!(
-                                    "{} calls are unanswered and st cannot tell which one Claude asks about; allow it in the terminal (Ctrl+]):",
-                                    calls.len()
-                                ),
-                                width,
-                            ));
-                            for call in calls.iter().take(CALL_LINES) {
-                                rows.push(BandRow::text(vec![
-                                    Span::styled("   · ", theme::dim()),
-                                    Span::styled(
-                                        text::truncate(first_line(call), width.saturating_sub(8)),
-                                        theme::text(),
-                                    ),
-                                ]));
-                            }
-                            if calls.len() > CALL_LINES {
-                                rows.push(BandRow::text(vec![Span::styled(
-                                    format!("   … and {} more", calls.len() - CALL_LINES),
-                                    theme::dim(),
-                                )]));
-                            }
-                        }
-                        [call] => {
-                            let lines = text::wrap(
-                                &[text::run(call.clone(), theme::text())],
-                                width.saturating_sub(4),
-                                &[text::run("   ", theme::dim())],
-                                &[text::run("   ", theme::dim())],
-                                None,
-                            );
-                            let cut = lines.len() > CALL_LINES;
-                            let last = lines.len().min(CALL_LINES);
-                            for (index, line) in lines.into_iter().take(CALL_LINES).enumerate() {
-                                let mut line = line;
-                                if cut && index + 1 == last {
-                                    line.spans.push(Span::styled(" …", theme::dim()));
-                                }
-                                rows.push(BandRow { line, hits: Vec::new() });
-                            }
-                            // The whole call must be in view to allow it.
-                            if !cut && answers.iter().any(|answer| answer == "allow") {
-                                buttons.push((
-                                    "allow".into(),
-                                    theme::GREEN,
-                                    Hit::Alert(item.id.clone(), AlertTap::Answer("allow".into())),
-                                ));
-                            }
-                        }
-                        [] if answers.is_empty() => {
-                            // Another harness's prompt: it is answered where it is shown.
-                            rows.extend(
-                                text::wrap(
-                                    &[text::run(
-                                        format!("{} · answer it in the terminal (Ctrl+])", first_line(prompt)),
-                                        theme::dim(),
-                                    )],
-                                    width,
-                                    &[text::run("   ", theme::dim())],
-                                    &[text::run("   ", theme::dim())],
-                                    None,
-                                )
-                                .into_iter()
-                                .take(2)
-                                .map(|line| BandRow { line, hits: Vec::new() }),
-                            );
-                        }
-                        [] => rows.extend(note_rows(
-                            "the call it would make is not in the conversation yet: answer it in the terminal (Ctrl+]) or open it in Now",
-                            width,
-                        )),
-                    }
-                    if answers.iter().any(|answer| answer == "deny") {
-                        buttons.push((
-                            "deny".into(),
-                            theme::RED,
-                            Hit::Alert(item.id.clone(), AlertTap::Answer("deny".into())),
-                        ));
-                    }
+                    let (prompt_rows, prompt_buttons) =
+                        self.prompt_answer_rows(&item.id, seat_id, answers, prompt, call, width);
+                    rows.extend(prompt_rows);
+                    buttons.extend(prompt_buttons);
                 }
                 AttentionKind::Request {
                     structured: Some(request),
@@ -436,16 +683,26 @@ impl Ui {
             return;
         };
         let effect = match &item.kind {
-            AttentionKind::Prompt { .. } if item.actions.iter().any(|a| a == "prompt.respond") => {
-                Some((
-                    Effect::Attention {
-                        id: id.to_owned(),
-                        action: "prompt.respond".into(),
-                        reason: None,
-                        answer: Some(answer.to_owned()),
-                    },
-                    format!("Answering {answer}…"),
-                ))
+            AttentionKind::Prompt { seat_id, call, .. }
+                if item.actions.iter().any(|a| a == "prompt.respond") =>
+            {
+                // A question's answer is the choices made here.
+                let sent = if answer == "answer" {
+                    self.question_answer(id, seat_id, call)
+                } else {
+                    Some(answer.to_owned())
+                };
+                sent.map(|sent| {
+                    (
+                        Effect::Attention {
+                            id: id.to_owned(),
+                            action: "prompt.respond".into(),
+                            reason: None,
+                            answer: Some(sent),
+                        },
+                        format!("Answering {}…", answer_label(answer)),
+                    )
+                })
             }
             AttentionKind::Request {
                 structured: Some(request),
@@ -485,12 +742,20 @@ impl Ui {
         match effect {
             Some((effect, notice)) if self.live => {
                 self.effects.push(effect);
+                let prefix = question_key(id, "");
+                self.question_choices.retain(|key, _| !key.starts_with(&prefix));
                 self.flash(notice);
             }
             Some((_, notice)) => self.flash(format!("{notice} demo: nothing was sent")),
             None => self.flash("st does not offer that answer here: open it in Now"),
         }
     }
+}
+
+/// Where the picks for a question alert's question call are kept: by the alert and the exact call,
+/// so picks made for one question never answer another that replaced it.
+fn question_key(alert: &str, call: &str) -> String {
+    format!("{alert}\u{0}{call}")
 }
 
 /// The first non-empty line, without markdown's heading marks.
@@ -520,6 +785,7 @@ mod tests {
                 text: "Claude asks to use Bash".into(),
                 answers: answers.iter().map(|answer| (*answer).to_owned()).collect(),
                 episode: "episode-1".into(),
+                call: None,
             },
             actions: if answers.is_empty() {
                 vec![]
@@ -539,16 +805,22 @@ mod tests {
         Ui::new(world)
     }
 
-    fn running_call(title: &str) -> Entry {
-        Entry {
-            id: "tool-1".into(),
-            at: "10:00".into(),
-            body: Body::Tool {
-                title: title.into(),
-                state: ToolState::Running,
-                output: vec![],
-            },
+    fn call(tool: &str, input: serde_json::Value) -> PendingCall {
+        PendingCall {
+            id: format!("call-{tool}"),
+            tool: tool.into(),
+            input,
         }
+    }
+
+    fn bash(command: &str) -> PendingCall {
+        call("Bash", serde_json::json!({"command": command}))
+    }
+
+    fn waiting(ui: &mut Ui, calls: Vec<PendingCall>) {
+        ui.world
+            .pending_calls
+            .insert("agent/example/atlas".into(), calls);
     }
 
     /// The cards, as a person sees them after expanding the band.
@@ -593,10 +865,7 @@ mod tests {
     #[test]
     fn a_pending_claude_call_is_shown_in_full_beside_allow_and_deny() {
         let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        ui.world.conversations.insert(
-            "agent/example/atlas".into(),
-            Load::Ready(vec![running_call("Bash · rm -rf build/cache")]),
-        );
+        waiting(&mut ui, vec![bash("rm -rf build/cache")]);
         let rows = ui.expanded_band("agent/example/atlas", 80);
         let shown = texts(&rows);
         assert!(shown.contains("1 alert"), "{shown}");
@@ -615,15 +884,12 @@ mod tests {
     #[test]
     fn with_several_calls_unanswered_every_one_is_listed_and_only_deny_is_offered() {
         let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        ui.world.conversations.insert(
-            "agent/example/atlas".into(),
-            Load::Ready(vec![
-                running_call("Bash · rm -rf build/cache"),
-                Entry {
-                    id: "tool-2".into(),
-                    ..running_call("Write · notes.md")
-                },
-            ]),
+        waiting(
+            &mut ui,
+            vec![
+                bash("rm -rf build/cache"),
+                call("Write", serde_json::json!({"file_path": "notes.md", "content": "hi"})),
+            ],
         );
         let rows = ui.expanded_band("agent/example/atlas", 80);
         let shown = texts(&rows);
@@ -657,11 +923,7 @@ mod tests {
             AlertTap::Answer("deny".into())
         )));
         // A call too long to read in full is not allowed from here either.
-        let long = format!("Bash · {}", "word ".repeat(200));
-        ui.world.conversations.insert(
-            "agent/example/atlas".into(),
-            Load::Ready(vec![running_call(&long)]),
-        );
+        waiting(&mut ui, vec![bash(&"word ".repeat(200))]);
         let rows = ui.expanded_band("agent/example/atlas", 60);
         assert!(!taps(&rows).contains(&Hit::Alert(
             "attention/one".into(),
@@ -728,6 +990,126 @@ mod tests {
             [Effect::Attention { id, action, answer: Some(answer), .. }]
                 if id == "attention/one" && action == "prompt.respond" && answer == "deny"
         ));
+    }
+
+    /// A harness question is answered here: each question with its options, chosen with a tap
+    /// (any number for a multi-select), and sent together once every question has a choice.
+    #[test]
+    fn a_question_is_answered_with_the_options_chosen_here() {
+        let mut ui = with_alerts(vec![prompt("attention/one", &["answer", "deny"])]);
+        ui.live = true;
+        waiting(
+            &mut ui,
+            vec![call(
+                "AskUserQuestion",
+                serde_json::json!({"questions": [
+                    {"question": "Which color?", "header": "Color", "multiSelect": false,
+                     "options": [{"label": "Red", "description": ""}, {"label": "Blue", "description": ""}]},
+                    {"question": "Which pets?", "header": "Pets", "multiSelect": true,
+                     "options": [{"label": "Cat", "description": ""}, {"label": "Dog", "description": ""},
+                                 {"label": "Fish", "description": ""}]},
+                ]}),
+            )],
+        );
+        let send = Hit::Alert("attention/one".into(), AlertTap::Answer("answer".into()));
+        let rows = ui.expanded_band("agent/example/atlas", 80);
+        let shown = texts(&rows);
+        assert!(shown.contains("Color · Which color?"), "{shown}");
+        assert!(shown.contains("Pets · Which pets? (choose any)"), "{shown}");
+        assert!(shown.contains("Fish"), "{shown}");
+        assert!(!taps(&rows).contains(&send), "nothing is chosen yet");
+        assert!(taps(&rows).contains(&Hit::Alert(
+            "attention/one".into(),
+            AlertTap::Answer("deny".into())
+        )));
+        for (question, option) in [(0, 0), (0, 1), (1, 0), (1, 2), (1, 1), (1, 1)] {
+            ui.click(Hit::Alert("attention/one".into(), AlertTap::Choose(question, option)));
+        }
+        let rows = ui.expanded_band("agent/example/atlas", 80);
+        assert!(texts(&rows).contains("✓ Blue"), "{}", texts(&rows));
+        assert!(taps(&rows).contains(&send));
+        // Another question call replaces it: the picks made for the first never answer it.
+        let asked = ui.world.pending_calls["agent/example/atlas"][0].clone();
+        waiting(&mut ui, vec![PendingCall { id: "call-replaced".into(), ..asked.clone() }]);
+        let rows = ui.expanded_band("agent/example/atlas", 80);
+        assert!(!texts(&rows).contains("✓ Blue"), "{}", texts(&rows));
+        assert!(!taps(&rows).contains(&send), "nothing is chosen for the new question");
+        waiting(&mut ui, vec![asked]);
+        ui.click(send);
+        let [Effect::Attention { action, answer: Some(answer), .. }] = ui.effects.as_slice() else {
+            panic!("{:?}", ui.effects);
+        };
+        assert_eq!(action, "prompt.respond");
+        // Positions only: the questions' and options' words stay in the conversation.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(answer).unwrap(),
+            serde_json::json!({"0": [1], "1": [0, 2]})
+        );
+    }
+
+    /// A prompt that names its exact call is answered only beside that call: a parent's open
+    /// Task call is never the call an allow lets through, and a prompt that named none has no
+    /// allow at all.
+    #[test]
+    fn allow_is_offered_only_beside_the_exact_call_the_prompt_names() {
+        let named = |call: Option<&str>| {
+            let mut item = prompt("attention/one", &["allow", "deny"]);
+            if let AttentionKind::Prompt { call: named, .. } = &mut item.kind {
+                *named = Some(call.map(str::to_owned));
+            }
+            item
+        };
+        let allow = Hit::Alert("attention/one".into(), AlertTap::Answer("allow".into()));
+        let task = call("Task", serde_json::json!({"prompt": "run the build"}));
+        // The subagent's call is not in this conversation: only the parent's Task call is.
+        let mut ui = with_alerts(vec![named(Some("call-Bash"))]);
+        waiting(&mut ui, vec![task.clone()]);
+        let rows = ui.expanded_band("agent/example/atlas", 80);
+        assert!(!taps(&rows).contains(&allow));
+        assert!(!texts(&rows).contains("run the build"), "{}", texts(&rows));
+        // Beside the named call, among others, allow is offered and only it is shown.
+        waiting(&mut ui, vec![task.clone(), bash("make")]);
+        let rows = ui.expanded_band("agent/example/atlas", 80);
+        assert!(taps(&rows).contains(&allow));
+        assert!(texts(&rows).contains("command: make"));
+        assert!(!texts(&rows).contains("run the build"));
+        // Named none: no allow, whatever is pending.
+        let mut ui = with_alerts(vec![named(None)]);
+        waiting(&mut ui, vec![bash("make")]);
+        assert!(!taps(&ui.expanded_band("agent/example/atlas", 80)).contains(&allow));
+    }
+
+    /// A plan is shown in full beside `approve`; a screen prompt's own answers are one tap each.
+    #[test]
+    fn a_plan_and_a_screen_prompt_offer_their_own_answers() {
+        let mut ui = with_alerts(vec![prompt("attention/one", &["approve", "deny"])]);
+        waiting(
+            &mut ui,
+            vec![call(
+                "ExitPlanMode",
+                serde_json::json!({"plan": "1. Create hello.txt\n2. Write hello in it"}),
+            )],
+        );
+        let rows = ui.expanded_band("agent/example/atlas", 80);
+        assert!(texts(&rows).contains("2. Write hello in it"), "{}", texts(&rows));
+        assert!(taps(&rows).contains(&Hit::Alert(
+            "attention/one".into(),
+            AlertTap::Answer("approve".into())
+        )));
+
+        let ui = with_alerts(vec![prompt("attention/two", &["use", "use-all", "skip"])]);
+        let rows = ui.expanded_band("agent/example/atlas", 80);
+        let taps = taps(&rows);
+        for answer in ["use", "use-all", "skip"] {
+            assert!(
+                taps.contains(&Hit::Alert(
+                    "attention/two".into(),
+                    AlertTap::Answer(answer.into())
+                )),
+                "{answer}"
+            );
+        }
+        assert!(texts(&rows).contains(" use all "), "{}", texts(&rows));
     }
 
     #[test]
