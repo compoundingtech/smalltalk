@@ -338,8 +338,6 @@ pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
 /// a file the provider will keep appending to. `Ok(false)` means no link was needed.
 #[cfg(unix)]
 pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<bool, Refusal> {
-    use std::os::unix::fs::{MetadataExt as _, symlink};
-
     let mut arguments = argv
         .iter()
         .skip(1)
@@ -358,7 +356,17 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
     let Some(selected) = selected else {
         return Ok(false);
     };
-    let transcript = Path::new(selected);
+    pi_family_link_selected_transcript(Path::new(selected), sessions)
+}
+
+/// Make an exact transcript selected by the strict resume handshake visible to inventory.
+#[cfg(unix)]
+pub fn pi_family_link_selected_transcript(
+    transcript: &Path,
+    sessions: &Path,
+) -> Result<bool, Refusal> {
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
     if !transcript.is_absolute() {
         return Err(Refusal::new(
             "resume-path-relative",
@@ -517,15 +525,33 @@ fn exchange_transcript_inventory(prepared: &Path, sessions: &Path) -> std::io::R
 /// Both pi and omp resume by the transcript path checked here. omp's own session-ID lookup does
 /// not follow symlinks, so it cannot find the individual-file link st stages in the inventory;
 /// the checked path is passed as is, without a second resolution. pi silently starts a new
-/// session at a path that does not exist, so both check the transcript first.
+/// session at a path that does not exist, so both check the transcript first. omp resumes a
+/// pinned imported transcript (`resume_path`) by its own path once its header names the session.
 pub fn pi_family_argv(
     driver: &str,
     argv: Vec<String>,
     sessions: &Path,
     id: &str,
+    resume_path: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
     refuse_authored(&argv, selection_flags("pi"))?;
+    if driver == "omp"
+        && let Some(path) = resume_path
+    {
+        if pi_family_header_id(path).as_deref() != Some(id) {
+            return Err(Refusal::new(
+                "transcript-header-mismatch",
+                "the imported transcript does not name the required session",
+            ));
+        }
+        #[cfg(unix)]
+        pi_family_link_selected_transcript(path, sessions)?;
+        return Ok(insert_after_program(
+            argv,
+            &["--resume", &path.to_string_lossy()],
+        ));
+    }
     let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
@@ -1020,7 +1046,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi"]), &sessions, "one")
+            pi_family_argv("pi", argv(&["pi"]), &sessions, "one", None)
                 .unwrap_err()
                 .code,
             "transcript-missing"
@@ -1032,15 +1058,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two").unwrap(),
+            pi_family_argv("pi", argv(&["pi", "-e", "x"]), &sessions, "two", None).unwrap(),
             argv(&["pi", "--session", &path.to_string_lossy(), "-e", "x"])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), &sessions, "two").unwrap(),
+            pi_family_argv("omp", argv(&["omp"]), &sessions, "two", None).unwrap(),
             argv(&["omp", "--resume", &path.to_string_lossy()])
         );
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two")
+            pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two", None)
                 .unwrap_err()
                 .code,
             "authored-session-selection"
@@ -1101,7 +1127,7 @@ sed -n '1s/.*"id":"\([^"]*\)".*/\1/p' "$file"
         let staged = sessions.join(transcript.file_name().unwrap());
         assert!(fs::symlink_metadata(&staged).unwrap().file_type().is_symlink());
 
-        let resumed = pi_family_argv("omp", argv(&["omp", "--model", "m"]), &sessions, id).unwrap();
+        let resumed = pi_family_argv("omp", argv(&["omp", "--model", "m"]), &sessions, id, None).unwrap();
         assert_eq!(resumed, argv(&["omp", "--resume", &staged.to_string_lossy(), "--model", "m"]));
         let output = stub_omp(root.path(), &sessions, &resumed);
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -1124,7 +1150,7 @@ sed -n '1s/.*"id":"\([^"]*\)".*/\1/p' "$file"
         // A dangling link is not a transcript, and a header naming another session is not this one.
         symlink(root.path().join("gone.jsonl"), sessions.join(&name)).unwrap();
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), &sessions, id).unwrap_err().code,
+            pi_family_argv("omp", argv(&["omp"]), &sessions, id, None).unwrap_err().code,
             "transcript-missing"
         );
         fs::remove_file(sessions.join(&name)).unwrap();
@@ -1132,7 +1158,7 @@ sed -n '1s/.*"id":"\([^"]*\)".*/\1/p' "$file"
         fs::write(&target, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
         symlink(&target, sessions.join(&name)).unwrap();
         assert_eq!(
-            pi_family_argv("omp", argv(&["omp"]), &sessions, id).unwrap_err().code,
+            pi_family_argv("omp", argv(&["omp"]), &sessions, id, None).unwrap_err().code,
             "transcript-missing"
         );
     }
