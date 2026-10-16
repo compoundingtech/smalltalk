@@ -100,10 +100,41 @@ impl GithubConfig {
                 "github.sekrets_profile must name a non-empty profile without surrounding whitespace");
         }
         if let Some(path) = &self.token_file {
-            crate::github_http::open_token_file(path)?;
+            open_token_file(path)?;
         }
         Ok(())
     }
+}
+
+/// Validate the opened descriptor before reading its contents, including on every reload.
+/// Nonblocking open lets a configured FIFO fail validation without hanging startup.
+pub(crate) fn open_token_file(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open GitHub token file {}", path.display()))?;
+    let metadata = file.metadata().context("inspect GitHub token file")?;
+    validate_token_file_metadata(&metadata, unsafe { libc::geteuid() })?;
+    Ok(file)
+}
+
+pub(crate) fn validate_token_file_metadata(metadata: &fs::Metadata, effective_uid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    anyhow::ensure!(
+        metadata.is_file(),
+        "GitHub token file must be a regular file"
+    );
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o077 == 0,
+        "GitHub token file must grant no permissions to group or others; use chmod 600"
+    );
+    anyhow::ensure!(
+        metadata.uid() == effective_uid,
+        "GitHub token file must be owned by the daemon account"
+    );
+    Ok(())
 }
 
 /// Whether this node takes part in checkpoints. A node that does not never seals, and every
@@ -242,7 +273,7 @@ impl ReconcileConfig {
     }
 
     /// The idle-nudge settings these values name.
-    pub fn idle_nudge(&self) -> Result<crate::reconcile::IdleNudgeSettings> {
+    pub fn idle_nudge(&self) -> Result<IdleNudgeSettings> {
         let at_least_a_minute = |value: &str, name: &str| -> Result<u64> {
             let ms = parse_duration_ms(value, name)?;
             anyhow::ensure!(ms >= 60_000, "{name} must be at least 1m");
@@ -252,13 +283,33 @@ impl ReconcileConfig {
             "off" => None,
             after => Some(at_least_a_minute(after, "reconcile.idle_nudge_after")?),
         };
-        Ok(crate::reconcile::IdleNudgeSettings {
+        Ok(IdleNudgeSettings {
             after_ms,
             quiet_watch_ms: at_least_a_minute(
                 &self.idle_nudge_quiet_watch,
                 "reconcile.idle_nudge_quiet_watch",
             )?,
         })
+    }
+}
+
+/// The default idle time before a nudge.
+pub const IDLE_NUDGE_AFTER_MS: u64 = 30 * 60_000;
+/// The default time a wait holds after it last woke its seat.
+pub const IDLE_NUDGE_QUIET_WATCH_MS: u64 = 2 * 60 * 60_000;
+/// The daemon's idle-nudge settings. `after_ms` is `None` when nudges are off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdleNudgeSettings {
+    pub after_ms: Option<u64>,
+    pub quiet_watch_ms: u64,
+}
+
+impl Default for IdleNudgeSettings {
+    fn default() -> Self {
+        Self {
+            after_ms: Some(IDLE_NUDGE_AFTER_MS),
+            quiet_watch_ms: IDLE_NUDGE_QUIET_WATCH_MS,
+        }
     }
 }
 
@@ -316,7 +367,45 @@ pub struct ObservationsConfig {
     /// The most observations to keep for one subject and kind.
     pub max_per_subject_kind: usize,
     /// Export every local observation to an OpenTelemetry collector. Off when absent.
-    pub otlp: Option<crate::otlp::OtlpConfig>,
+    pub otlp: Option<OtlpConfig>,
+}
+
+/// `[observations.otlp]`: absent means no exporter runs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpConfig {
+    /// The collector's OTLP/HTTP base URL, such as `http://127.0.0.1:4318`.
+    pub endpoint: String,
+    /// A TOML file of extra request headers, such as an API key. It stays out of the main
+    /// config so that file can be shared.
+    #[serde(default)]
+    pub headers_file: Option<PathBuf>,
+}
+
+impl OtlpConfig {
+    pub fn validate(&self) -> Result<()> {
+        let url = reqwest::Url::parse(&self.endpoint)
+            .with_context(|| format!("parse observations.otlp.endpoint `{}`", self.endpoint))?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            "observations.otlp.endpoint must use http or https"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn logs_url(&self) -> String {
+        format!("{}/v1/logs", self.endpoint.trim_end_matches('/'))
+    }
+
+    pub(crate) fn headers(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let Some(path) = &self.headers_file else {
+            return Ok(Default::default());
+        };
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read observations.otlp.headers_file {}", path.display()))?;
+        toml::from_str(&text)
+            .with_context(|| format!("parse observations.otlp.headers_file {}", path.display()))
+    }
 }
 
 impl Default for ObservationsConfig {

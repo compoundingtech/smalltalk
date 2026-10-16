@@ -11,8 +11,6 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::StepRunView;
-
 pub const MOVED_CLAIM: &str = "agent.queue.moved";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -157,22 +155,6 @@ pub struct SeatStep<'a> {
     /// The seat that held this step before a revision carried it, until that
     /// seat claims it again.
     pub carried_claimant: Option<&'a str>,
-}
-
-impl<'a> From<&'a StepRunView> for SeatStep<'a> {
-    fn from(view: &'a StepRunView) -> Self {
-        Self {
-            subject: &view.subject,
-            run: &view.run,
-            step: &view.step,
-            status: &view.status,
-            assignee: view.assigned_to.as_deref(),
-            claimant: view.claimant.as_deref(),
-            available_to: &view.available_to,
-            created_at_unix_ms: view.created_at_unix_ms,
-            carried_claimant: view.carried_claimant.as_deref(),
-        }
-    }
 }
 
 /// What one seat holds and what it takes next.

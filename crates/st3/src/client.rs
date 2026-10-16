@@ -74,6 +74,18 @@ struct FollowTest {
     messages: Vec<String>,
 }
 
+/// A native mailbox subscription's lease fence (`mailbox`).
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct Fence {
+    pub subject: String,
+    pub incarnation: String,
+    pub component: String,
+    pub epoch: u64,
+    pub token: String,
+}
+
+/// The daemon route a replication worker hands a read to when it must forward it.
+pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 const FOLLOW_OUTAGE_LIMIT: Duration = Duration::from_secs(5 * 60);
 const FOLLOW_DEADLINE_PAUSE: Duration = Duration::from_secs(10);
 const FOLLOW_DEADLINE_CAP: Duration = Duration::from_secs(60);
@@ -751,7 +763,7 @@ impl Client {
 
     pub async fn open_mailbox(
         &self,
-        fence: &crate::mailbox::Fence,
+        fence: &Fence,
     ) -> Result<tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>> {
         let Endpoint::Unix(path) = &self.endpoint else {
             anyhow::bail!("native mailbox subscriptions require a local Unix socket");
@@ -1243,7 +1255,7 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     if path.starts_with("/v1/internal/replication/export")
         || path.starts_with("/v1/internal/replication/receive")
         || path.starts_with("/v1/internal/replication/checkpoint")
-        || path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH)
+        || path.starts_with(CLIENT_READ_FORWARD_PATH)
     {
         // A forwarded client read is bounded by the relay's own per-hop timeouts.
         deadlines.bulk

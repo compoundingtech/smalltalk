@@ -7,12 +7,10 @@
 //! down only delays export, and observations trimmed before export are counted as a gap.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -22,43 +20,7 @@ pub use slo::run as run_slo;
 use crate::model::ClaimRecord;
 use crate::store::{Store, local_observation_position};
 
-/// `[observations.otlp]`: absent means no exporter runs.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct OtlpConfig {
-    /// The collector's OTLP/HTTP base URL, such as `http://127.0.0.1:4318`.
-    pub endpoint: String,
-    /// A TOML file of extra request headers, such as an API key. It stays out of the main
-    /// config so that file can be shared.
-    #[serde(default)]
-    pub headers_file: Option<PathBuf>,
-}
-
-impl OtlpConfig {
-    pub fn validate(&self) -> Result<()> {
-        let url = reqwest::Url::parse(&self.endpoint)
-            .with_context(|| format!("parse observations.otlp.endpoint `{}`", self.endpoint))?;
-        anyhow::ensure!(
-            matches!(url.scheme(), "http" | "https"),
-            "observations.otlp.endpoint must use http or https"
-        );
-        Ok(())
-    }
-
-    fn logs_url(&self) -> String {
-        format!("{}/v1/logs", self.endpoint.trim_end_matches('/'))
-    }
-
-    fn headers(&self) -> Result<BTreeMap<String, String>> {
-        let Some(path) = &self.headers_file else {
-            return Ok(BTreeMap::new());
-        };
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read observations.otlp.headers_file {}", path.display()))?;
-        toml::from_str(&text)
-            .with_context(|| format!("parse observations.otlp.headers_file {}", path.display()))
-    }
-}
+pub use crate::config::OtlpConfig;
 
 /// The most observations sent in one request.
 pub const OTLP_BATCH: usize = 512;

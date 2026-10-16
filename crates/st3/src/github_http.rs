@@ -1,9 +1,11 @@
 //! Authentication and the one send path for daemon GitHub HTTP requests.
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::future::Future;
 use std::io::Read as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -11,6 +13,8 @@ use std::time::SystemTime;
 use tokio::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
+
+pub(crate) use crate::config::open_token_file;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 
@@ -116,34 +120,6 @@ fn default_version(environment: &BTreeMap<String, String>) -> Result<DefaultVers
     })
 }
 
-/// Validate the opened descriptor before reading its contents, including on every reload.
-/// Nonblocking open lets a configured FIFO fail validation without hanging startup.
-pub(crate) fn open_token_file(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("open GitHub token file {}", path.display()))?;
-    let metadata = file.metadata().context("inspect GitHub token file")?;
-    validate_token_file_metadata(&metadata, unsafe { libc::geteuid() })?;
-    Ok(file)
-}
-
-fn validate_token_file_metadata(metadata: &std::fs::Metadata, effective_uid: u32) -> Result<()> {
-    anyhow::ensure!(
-        metadata.is_file(),
-        "GitHub token file must be a regular file"
-    );
-    anyhow::ensure!(
-        metadata.permissions().mode() & 0o077 == 0,
-        "GitHub token file must grant no permissions to group or others; use chmod 600"
-    );
-    anyhow::ensure!(
-        metadata.uid() == effective_uid,
-        "GitHub token file must be owned by the daemon account"
-    );
-    Ok(())
-}
 
 fn read_token_file(file: File) -> Result<String> {
     let mut bytes = Vec::new();
@@ -1123,7 +1099,7 @@ mod tests {
         let metadata = std::fs::metadata(path).unwrap();
         let other_uid = metadata.uid().wrapping_add(1);
         assert!(
-            validate_token_file_metadata(&metadata, other_uid)
+            crate::config::validate_token_file_metadata(&metadata, other_uid)
                 .unwrap_err()
                 .to_string()
                 .contains("owned by")

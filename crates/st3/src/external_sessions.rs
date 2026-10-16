@@ -24,13 +24,8 @@ pub(crate) const MAX_EXPOSED_HISTORY: usize = 2_000;
 const MAX_METADATA_LINES: usize = 64;
 const MAX_TIMELINE_LINES: usize = 4_096;
 const MAX_TIMELINE_BYTES: u64 = 32 * 1024 * 1024;
-// Wire size limits and owner references are applied by api/client_v0/conversation_blocks.
-// Typed OMP event views also bound each native value independently; timeline pagination
-// separately budgets encoded entries and response metadata against the gateway's ceiling.
-pub(crate) const MAX_TIMELINE_VALUE_BYTES: usize = 8 * 1024;
-/// Native kind and attribution are identities, not payload: a wide one must not crowd out the
-/// rest of a view.
-pub(crate) const MAX_OMP_EVENT_IDENTITY_BYTES: usize = 256;
+#[cfg(test)]
+use crate::native_views::{MAX_OMP_EVENT_IDENTITY_BYTES, MAX_TIMELINE_VALUE_BYTES, bounded_value};
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 /// How long a saved-history request waits for a background transcript read before it answers
 /// with the last complete inventory.
@@ -4935,27 +4930,6 @@ fn preserve_omp_result_timing(items: &mut [Value], native_result: &Value) {
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
     }
-}
-
-/// Bound a native value to `limit` bytes. A string is clipped as text, so a value of exactly
-/// `limit` bytes is kept whole; any other value that encodes to more than `limit` becomes
-/// marked JSON text, so the view that carries it stays valid JSON.
-pub(crate) fn bounded_value(value: &Value, limit: usize) -> Value {
-    let text = match value {
-        Value::String(text) => std::borrow::Cow::Borrowed(text.as_str()),
-        _ => std::borrow::Cow::Owned(serde_json::to_string(value).unwrap_or_default()),
-    };
-    if text.len() <= limit {
-        return value.clone();
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    json!(format!(
-        "{}\n[st truncated this native timeline value]",
-        &text[..end]
-    ))
 }
 
 fn timeline_item(

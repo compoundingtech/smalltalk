@@ -1213,10 +1213,20 @@ pub struct PlannedAction {
     pub reason: String,
 }
 
+/// How a dry run's declaration differs from the published one (`store::declarations`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeclarationDiff {
+    /// Null means no previously published declaration; adoption includes the unmanaged value.
+    pub before: Option<Value>,
+    pub after: Value,
+    /// JSON pointers; arrays are compared as a whole, objects by field.
+    pub fields: BTreeSet<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MissionResponse {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub declaration_diffs: BTreeMap<String, crate::store::declarations::DeclarationDiff>,
+    pub declaration_diffs: BTreeMap<String, DeclarationDiff>,
     pub store_index: u64,
     pub source_hash: String,
     pub normalized: Value,
@@ -2169,20 +2179,6 @@ impl MessageSendRefusal {
     }
 }
 
-impl MessageView {
-    /// A long body as the attachment record it is kept as: a file on the member that took the
-    /// send, fetched from there like an image. See [`crate::message_body`].
-    pub fn body_attachment(&self) -> Option<MessageAttachment> {
-        Some(MessageAttachment {
-            sha256: crate::message_body::parse_reference(self.body_ref.as_deref()?)?.to_owned(),
-            media_type: crate::message_body::MEDIA_TYPE.into(),
-            name: None,
-            size: self.body_bytes?,
-            origin: self.body_origin.clone()?,
-        })
-    }
-}
-
 /// The daemon's answer to a message send, and what a send's idempotency key landed as. Older
 /// daemons answer a send with the bare message, which reads as a new send with no time.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2660,6 +2656,22 @@ pub struct StepRunView {
     pub updated_at_unix_ms: u128,
 }
 
+impl<'a> From<&'a StepRunView> for crate::seat_queue::SeatStep<'a> {
+    fn from(view: &'a StepRunView) -> Self {
+        Self {
+            subject: &view.subject,
+            run: &view.run,
+            step: &view.step,
+            status: &view.status,
+            assignee: view.assigned_to.as_deref(),
+            claimant: view.claimant.as_deref(),
+            available_to: &view.available_to,
+            created_at_unix_ms: view.created_at_unix_ms,
+            carried_claimant: view.carried_claimant.as_deref(),
+        }
+    }
+}
+
 impl StepRunView {
     /// The held states whose leases native drivers renew, including verification and blocking.
     pub fn work_claim_is_held_by(&self, subject: &str) -> bool {
@@ -2916,8 +2928,18 @@ pub struct PersonStepResponse {
     pub episode: Option<String>,
     /// A named answer or text for a structured request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub answer: Option<crate::person_request::AnswerInput>,
+    pub answer: Option<AnswerInput>,
     pub idempotency_key: String,
+}
+
+/// A person's answer as submitted: a named answer `id`, text, or both (`person_request`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// A person's response to an ask, as data: the typed answer when the ask was structured.

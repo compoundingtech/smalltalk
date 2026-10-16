@@ -65,8 +65,7 @@ const CLIENT_READ_HOP_MARGIN: Duration = Duration::from_secs(10);
 const CLIENT_READ_LINKS_TTL: Duration = Duration::from_secs(5);
 /// How long an owner's stale-fence refusal counts as a recent fence conflict.
 const CLIENT_READ_FENCE_WINDOW: Duration = Duration::from_secs(60);
-/// The daemon route a replication worker hands a read to when it must forward it.
-pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
+pub use crate::client::CLIENT_READ_FORWARD_PATH;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]

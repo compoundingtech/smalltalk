@@ -7,24 +7,3 @@ pub use smallclaims::fleet::{
     Refusal, Sender, Window, accept, envelope_signature_message, verify_signature,
 };
 pub use smallclaims::fleet::{code, file, handshake, join, keys, membership, transport, view};
-
-use anyhow::Result;
-
-use crate::config::Config;
-use crate::store::Store;
-
-/// Bring a member's store in line with its `fleet.toml` before the daemon writes anything.
-pub fn activate(store: &Store, config: &Config) -> Result<()> {
-    match &config.fleet {
-        Some(file) => smallclaims::fleet::activate(store, &config.state_dir, file),
-        None => Ok(()),
-    }
-}
-
-/// Restore credentials before startup writes; history activation follows API binding.
-pub fn prepare(store: &Store, config: &Config) -> Result<()> {
-    match &config.fleet {
-        Some(file) => smallclaims::fleet::prepare(store, &config.state_dir, file),
-        None => Ok(()),
-    }
-}

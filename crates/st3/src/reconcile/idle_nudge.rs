@@ -26,28 +26,10 @@ use super::*;
 use crate::store::WORK_NUDGED_KIND;
 use serde_json::json;
 
-/// The default idle time before a nudge.
-pub const IDLE_NUDGE_AFTER_MS: u64 = 30 * 60_000;
-/// The default time a wait holds after it last woke its seat.
-pub const IDLE_NUDGE_QUIET_WATCH_MS: u64 = 2 * 60 * 60_000;
+pub use crate::config::{IDLE_NUDGE_AFTER_MS, IDLE_NUDGE_QUIET_WATCH_MS, IdleNudgeSettings};
+
 /// The least time between two quiet nudges about one step.
 pub const IDLE_NUDGE_MIN_INTERVAL_MS: u128 = 2 * 60 * 60_000;
-
-/// The daemon's idle-nudge settings. `after_ms` is `None` when nudges are off.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IdleNudgeSettings {
-    pub after_ms: Option<u64>,
-    pub quiet_watch_ms: u64,
-}
-
-impl Default for IdleNudgeSettings {
-    fn default() -> Self {
-        Self {
-            after_ms: Some(IDLE_NUDGE_AFTER_MS),
-            quiet_watch_ms: IDLE_NUDGE_QUIET_WATCH_MS,
-        }
-    }
-}
 
 /// The steps a seat holds: claimed by it and not yet submitted.
 pub(super) fn held_steps<'a>(agent: &str, work: &'a [StepRunView]) -> Vec<&'a StepRunView> {

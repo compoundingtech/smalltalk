@@ -2,14 +2,7 @@
 use super::*;
 use serde::Deserialize;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct DeclarationDiff {
-    /// Null means no previously published declaration; adoption includes the unmanaged value.
-    pub before: Option<Value>,
-    pub after: Value,
-    /// JSON pointers; arrays are compared as a whole, objects by field.
-    pub fields: BTreeSet<String>,
-}
+pub use crate::model::DeclarationDiff;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PublicationDefinition {

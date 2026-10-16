@@ -213,13 +213,6 @@ pub(crate) fn merge_register(mut derived: Value, register: Option<&Value>) -> Op
     (!target.is_empty()).then_some(derived)
 }
 
-/// The live latest-wins values for a conversation, e.g. `working`. Wire the register here when
-/// draft #1583 (the live conversation register) lands; until then no register exists and the
-/// header is derived from the transcript window alone.
-pub(crate) fn register_value(_state: &crate::api::AppState, _session_id: &str) -> Option<Value> {
-    None
-}
-
 /// Whether the window the items came from lost its prefix: the native fold's truncation entry,
 /// or the bounded-query notices the projected timeline adds.
 pub(crate) fn window_truncated(items: &[Value]) -> bool {

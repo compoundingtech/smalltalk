@@ -6,14 +6,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct Fence {
-    pub subject: String,
-    pub incarnation: String,
-    pub component: String,
-    pub epoch: u64,
-    pub token: String,
-}
+pub use crate::client::Fence;
 
 /// Captured by the daemon from its authenticated Unix peer, never from a request body.
 /// Provider ownership comes from the current driver record under the runtime's paths.

@@ -22,6 +22,22 @@ const DAY: u128 = 24 * HOUR;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ROWS: usize = 32_000;
 
+/// GitHub refused a request until a known time: a primary or secondary rate limit. It clears
+/// on its own at `retry_at_unix_ms`.
+#[derive(Debug)]
+pub struct ProviderRateLimit {
+    pub retry_at_unix_ms: u128,
+    pub status: u16,
+}
+
+impl std::fmt::Display for ProviderRateLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "GitHub HTTP {} rate limit", self.status)
+    }
+}
+
+impl std::error::Error for ProviderRateLimit {}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Reservation {
@@ -204,7 +220,7 @@ fn admit(
             .min()
             .unwrap_or(now)
             .saturating_add(HOUR + MINUTE);
-        anyhow::bail!(crate::resource::ProviderRateLimit {
+        anyhow::bail!(ProviderRateLimit {
             retry_at_unix_ms: retry_at,
             status: 429
         });
@@ -443,7 +459,7 @@ mod tests {
         .unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::resource::ProviderRateLimit>()
+                .downcast_ref::<ProviderRateLimit>()
                 .is_some()
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);

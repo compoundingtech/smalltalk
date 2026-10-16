@@ -41,21 +41,7 @@ pub struct ProviderObservation {
 /// not finish in one poll, so an observer's declared interval does not delay it.
 pub const PROVIDER_CONTINUE_MS: u128 = 1_000;
 
-/// GitHub refused a request until a known time: a primary or secondary rate limit. It clears
-/// on its own at `retry_at_unix_ms`.
-#[derive(Debug)]
-pub struct ProviderRateLimit {
-    pub retry_at_unix_ms: u128,
-    pub status: u16,
-}
-
-impl std::fmt::Display for ProviderRateLimit {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "GitHub HTTP {} rate limit", self.status)
-    }
-}
-
-impl std::error::Error for ProviderRateLimit {}
+pub use crate::github_admission::ProviderRateLimit;
 
 /// GitHub rejected the token itself. Nothing changes until a person signs in again.
 #[derive(Debug)]

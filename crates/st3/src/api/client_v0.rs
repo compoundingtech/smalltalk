@@ -5704,8 +5704,15 @@ fn conversation_page_header(
     );
     crate::conversation_header::merge_register(
         derived,
-        crate::conversation_header::register_value(state, session_id).as_ref(),
+        conversation_register_value(state, session_id).as_ref(),
     )
+}
+
+/// The live latest-wins values for a conversation, e.g. `working`. Wire the register here when
+/// draft #1583 (the live conversation register) lands; until then no register exists and the
+/// header is derived from the transcript window alone.
+fn conversation_register_value(_state: &AppState, _session_id: &str) -> Option<Value> {
+    None
 }
 
 /// Only offset continuations (OpenCode and claim timelines) retain their original window

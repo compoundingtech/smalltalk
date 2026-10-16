@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub use crate::model::AnswerInput;
 use crate::model::St3Error;
 
 pub const REQUEST_VERSION: u32 = 1;
@@ -126,16 +127,6 @@ pub struct AnswerOption {
     pub outcome: Option<DecisionOutcome>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<String>,
-}
-
-/// A person's answer as submitted: a named answer `id`, text, or both.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct AnswerInput {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
 }
 
 fn invalid(message: impl Into<String>) -> St3Error {

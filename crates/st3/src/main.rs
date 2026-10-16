@@ -6843,7 +6843,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     // A member pins its anchor, applies its writer floor, and signs with its key before it
     // writes anything, so every local batch after this point is signed.
-    st3::fleet::prepare(&store, &config)?;
+    if let Some(file) = &config.fleet {
+        smallclaims::fleet::prepare(&store, &config.state_dir, file)?;
+    }
     // Every claim this node writes is signed; keys are made here the first time, silently.
     let keys = st3::fleet::join::key_directory(&config.state_dir);
     if config.fleet.is_none() {

@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest as _, Sha256};
 
-use crate::model::St3Error;
+use crate::model::{MessageAttachment, MessageView, St3Error};
 
 /// The most a message may carry in its claim without a file.
 pub const INLINE_MAX_BYTES: usize = 8192;
@@ -428,6 +428,20 @@ pub fn reference(hash: &str) -> String {
 pub fn parse_reference(reference: &str) -> Option<&str> {
     let hash = reference.strip_prefix("blob/")?;
     crate::blobs::is_sha256(hash).then_some(hash)
+}
+
+impl MessageView {
+    /// A long body as the attachment record it is kept as: a file on the member that took the
+    /// send, fetched from there like an image.
+    pub fn body_attachment(&self) -> Option<MessageAttachment> {
+        Some(MessageAttachment {
+            sha256: parse_reference(self.body_ref.as_deref()?)?.to_owned(),
+            media_type: MEDIA_TYPE.into(),
+            name: None,
+            size: self.body_bytes?,
+            origin: self.body_origin.clone()?,
+        })
+    }
 }
 
 /// The images and the body among a claim's `attachments`. Only references a file name can be
