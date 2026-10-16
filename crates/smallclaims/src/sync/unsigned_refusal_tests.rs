@@ -140,17 +140,19 @@ async fn a_signed_refusal_keeps_its_earlier_report() {
 
 #[tokio::test]
 async fn a_refusal_with_any_signature_header_is_authenticated_not_excused() {
-    let reported = answered(|_| {
-        let mut response = (AnswerStatus::INTERNAL_SERVER_ERROR, "invented-body").into_response();
-        response
-            .headers_mut()
-            .insert(HEADER_SIGNATURE, HeaderValue::from_static("00"));
-        response
-    })
-    .await;
-    assert!(
-        reported.contains("the signed message has no valid x-st3-fleet header"),
-        "{reported}"
-    );
-    assert!(!reported.contains("unsigned"), "{reported}");
+    for name in [HEADER_SIGNATURE, "x-fractal-signature"] {
+        let reported = answered(move |_| {
+            let mut response = (AnswerStatus::INTERNAL_SERVER_ERROR, "invented-body").into_response();
+            response
+                .headers_mut()
+                .insert(name, HeaderValue::from_static("00"));
+            response
+        })
+        .await;
+        assert!(
+            reported.contains("the signed message has no valid x-st3-fleet header"),
+            "{reported}"
+        );
+        assert!(!reported.contains("unsigned"), "{reported}");
+    }
 }

@@ -53,6 +53,7 @@ def live_latency(path):
         sock.settimeout(2)
         sock.connect(str(path))
         sock.settimeout(max(0.001, deadline - time.monotonic()))
+        # TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old names until all members accept aliases; sunset 60 days after first shipping release.
         sock.sendall(b"GET /v1/client/request-latency HTTP/1.1\r\nHost: localhost\r\n"
                      b"x-st3-person: person/fleet-tester\r\nConnection: close\r\n\r\n")
         sock.setblocking(False)

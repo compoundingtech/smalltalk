@@ -61,6 +61,7 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+mod wire_names;
 mod client_blobs;
 #[cfg(test)]
 mod terminal_gate_evidence;
@@ -132,6 +133,7 @@ pub struct AppState {
     pub planner_default: PlannerSpec,
 }
 
+// TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old output until all members accept aliases; sunset 60 days after first shipping release.
 const CLIENT_API_VERSION: &str = "st3.client.v0";
 const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
 const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
@@ -982,6 +984,9 @@ async fn response_envelope_unbounded(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    if let Err(error) = wire_names::receive_headers(request.headers_mut()) {
+        return error.into_response();
+    }
     // Anonymous pairing discovery is public, static compatibility metadata. Bypass
     // authentication, snapshots, presence and the normal envelope/activity counter entirely.
     if matches!(transport, ClientTransportBoundary::FabricLoopback)
@@ -15076,6 +15081,7 @@ async fn events(
             || tokio::time::Instant::now() >= deadline
         {
             let next = page.next_after.unwrap_or(query.after).to_string();
+            // TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): retain x-st-* until receivers accept aliases; sunset 60 days after first shipping release.
             return Ok((
                 [
                     ("x-st-next-after", next),
@@ -15092,6 +15098,7 @@ async fn events(
             Ok(Ok(()))
         ) {
             let page = read_event_page(&state, &query).await?;
+            // TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): retain x-st-* until receivers accept aliases; sunset 60 days after first shipping release.
             return Ok((
                 [
                     (
@@ -17691,6 +17698,7 @@ async fn terminal_session(
             "the terminal incarnation changed before attachment",
         )));
     }
+    // TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old names until all members accept aliases; sunset 60 days after first shipping release.
     Ok(websocket
         .protocols(["st3.terminal.v1"])
         .on_upgrade(move |socket| terminal_proxy(socket, state.pty_root, runtime_id)))

@@ -159,23 +159,12 @@ pub(crate) async fn stream(
         .flat_map(|value| value.split(','))
         .map(str::trim)
         .collect::<Vec<_>>();
-    let capabilities = protocols
-        .iter()
-        .filter_map(|protocol| protocol.strip_prefix(TERMINAL_CAPABILITY_PROTOCOL_PREFIX))
-        .collect::<Vec<_>>();
     // The upgrade is already authenticated. Native PEEK clients need no capability;
     // browsers may continue using their capability and ATTACH still requires one.
-    let direct_peek = query.mode == st3_client::RawTerminalMode::Peek
-        && protocols == [SUBPROTOCOL];
-    if !direct_peek
-        && (protocols.len() != 2
-            || protocols.iter().filter(|protocol| **protocol == SUBPROTOCOL).count() != 1
-            || capabilities.len() != 1)
-    {
-        return Err(validation(
-            "raw terminal requires st3.client.pty.v0 plus one st3.cap.* protocol",
-        ));
-    }
+    let (selected, capability) = super::super::wire_names::terminal_protocol(
+        &protocols, SUBPROTOCOL, query.mode == st3_client::RawTerminalMode::Peek,
+    ).ok_or_else(|| validation("raw terminal requires one supported pty protocol plus one capability protocol (optional for peek)"))?;
+    let direct_peek = capability.is_none();
     let live = remote_terminal_live_session(&state, &terminal_subject(&id), &query.incarnation)?;
     if !live.terminal {
         return Err(validation("raw attachment requires a terminal runtime"));
@@ -184,7 +173,7 @@ pub(crate) async fn stream(
         Some(authorization_epoch(&state, &session)?)
     } else if query.mode == st3_client::RawTerminalMode::Peek {
         Some(peek_capability::consume(
-            &state, &session, &client_detail_id("terminal", &id), &live, capabilities[0],
+            &state, &session, &client_detail_id("terminal", &id), &live, capability.unwrap(),
         )?)
     } else {
         consume_terminal_attachment_mode(
@@ -192,7 +181,7 @@ pub(crate) async fn stream(
             &session,
             &client_detail_id("terminal", &id),
             &query.incarnation,
-            Some(capabilities[0]),
+            capability,
             Some(mode_name(query.mode)),
         )?;
         None
@@ -272,7 +261,7 @@ pub(crate) async fn stream(
         );
     }
     Ok(websocket
-        .protocols([SUBPROTOCOL])
+        .protocols([selected.to_owned()])
         .max_message_size(CHUNK * 4)
         .max_frame_size(CHUNK * 4)
         .on_upgrade(move |socket| splice(socket, transport, Some(query.mode), lease, control, upgrade, first_frame)))
