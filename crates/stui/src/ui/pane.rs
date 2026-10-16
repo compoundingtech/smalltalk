@@ -28,6 +28,8 @@ pub enum Pane {
     NewMission,
     /// An observed graph resource, with open vocabulary facts.
     Resource(String),
+    /// One version of a stored st document (`doc/NAME@HASH`), its text shown as Markdown.
+    Document(String),
 }
 
 impl Pane {
@@ -47,6 +49,7 @@ impl Pane {
             Pane::Usage(subject) => with("usage", subject),
             Pane::NewMission => "new-mission:".into(),
             Pane::Resource(id) => format!("resource:{id}"),
+            Pane::Document(name) => format!("document:{name}"),
         }
     }
 
@@ -70,6 +73,7 @@ impl Pane {
             "usage" => Pane::Usage(subject),
             "new-mission" => Pane::NewMission,
             "resource" => Pane::Resource(subject?),
+            "document" => Pane::Document(subject?),
             _ => return None,
         })
     }

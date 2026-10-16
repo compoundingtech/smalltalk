@@ -935,6 +935,24 @@
       "verification": "existing CLI integration"
     },
     {
+      "command": "st demo check",
+      "description": "Check a demo file and list its beats without playing it",
+      "tests": [
+        "crates/st3/src/demo.rs::a_demo_file_reads_as_its_seed_and_beats",
+        "crates/st3/src/demo.rs::mistakes_are_named_with_their_line",
+        "crates/st3/src/demo.rs::the_example_demos_are_playable_files"
+      ],
+      "verification": "the parser on a full demo, each kind of mistake with its line, and every example demo in examples/demos"
+    },
+    {
+      "command": "st demo play",
+      "description": "Reset an instance, seed a scripted demo and play its beats in the terminal interface",
+      "tests": [
+        "crates/st3/tests/demo_play.rs::a_demo_plays_in_its_own_instance_and_ends_with_the_interface"
+      ],
+      "verification": "the real st binary under a PTY in a throwaway HOME: the instance is reset and seeded, timed and key-paced beats change the picture, and the daemon and scripted agents stop when the interface quits"
+    },
+    {
       "command": "st documents get",
       "description": "Read exact document bytes by immutable name-and-hash reference",
       "tests": [
