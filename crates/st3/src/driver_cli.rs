@@ -626,7 +626,17 @@ async fn drive_st2_native(
         ..
     } = paths.clone();
     let mut mailbox =
-        NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
+        match NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await {
+            Ok(mailbox) => mailbox,
+            // A provider can run its whole life inside the bind's one-second retry pause (a
+            // loaded host, a short fixture). The daemon then refuses the binding because that
+            // provider has ended. There is nothing left to deliver to: record the exit as
+            // usual instead of failing the wrapper with the refusal.
+            Err(error) if provider_ended_before_bind(&error) && provider_task_settled(&task).await => {
+                NativeMailbox::unbound(subject, &incarnation, driver, &mut loop_state)
+            }
+            Err(error) => return Err(error),
+        };
     let attach_started = settle.attach_started();
     if driver == "claude" && mailbox.subscription.is_some() && settle.passed()
         && let Err(error) = check_claude_attachment(
@@ -692,6 +702,16 @@ async fn drive_st2_native(
                 {
                     fs::write(PathBuf::from(root).join("fence-received"),
                         if task.is_finished() { "finished" } else { "pending" })?;
+                }
+                // The subscription can reopen after the provider has ended, and the daemon then
+                // fences it as terminal. With the provider's task returned there is nothing left
+                // to deliver to: stop listening and let the task arm record the exit.
+                if let Some(st3::mailbox::Frame::Fenced { reason }) = &frame
+                    && provider_ended_refusal(reason)
+                    && provider_task_settled(&task).await
+                {
+                    mailbox.subscription = None;
+                    continue;
                 }
                 let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
