@@ -293,6 +293,14 @@ class Run:
         try: return unwrap(json.loads(r["stdout"]))
         except ValueError: return None
 
+    def require_initial_roster(self):
+        # Health/socket startup is not roster readiness. No polling or implicit CLI wait.
+        r=self.execute("Initial history roster publication",shlex.join(["curl","--silent","--show-error","--fail","--unix-socket",f"/run/user/{self.m.uid}/st3.sock","http://localhost/v1/client/agents?history=true&min_cut=0&limit=200"]),timeout=15)
+        if r["exit"]: raise RuntimeError("initial roster publication failed")
+        payload=json.loads(r["stdout"])
+        if payload.get("snapshot",{}).get("store_index",-1)<0:
+            raise RuntimeError("daemon omitted the served roster cut")
+
     def pty(self,title,argv,**options):
         request=json.dumps({"argv":argv,"timeout":55,**options})
         r=self.execute(title,shlex.join(["python3","-c",PTY_PROBE,request]),timeout=65)
@@ -551,6 +559,7 @@ class Run:
     def onboarding_checks(self,scenario):
         if scenario=="no-harness":
             self.check("no-harness-explained",bool(re.search(r"(no .*harness|no .*provider|install (claude|codex)|harness.*not .*found)","\n".join(c["stdout"]+c["stderr"] for c in self.commands if c["title"]=="Setup flags"),re.I)),"wizard explains that no provider is installed")
+            self.require_initial_roster()
             seats=self.json_cli("All seats without a harness","agents","ls","--all")
             runs=self.json_cli("All missions without a harness","missions","ls","--all")
             self.check("no-harness-no-seat",isinstance(seats,dict) and isinstance(seats.get("items"),list) and not any(s["id"]=="agent/st/assistant" for s in seats["items"]),"no assistant created without a harness; daemon list succeeds")

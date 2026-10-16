@@ -138,6 +138,7 @@ final class St3ClientTests: XCTestCase {
             ("runtime-authority-indeterminate", ErrorCode.runtimeAuthorityIndeterminate),
             ("terminal-unavailable", ErrorCode.terminalUnavailable),
             ("terminal-ended", ErrorCode.terminalEnded),
+            ("agent-roster-cut-not-ready", ErrorCode.agentRosterCutNotReady),
         ] {
             let decoded = try JSONDecoder().decode(ErrorCode.self, from: Data("\"\(raw)\"".utf8))
             XCTAssertEqual(decoded, expected)

@@ -87,6 +87,12 @@ st replication status --json
 st doctor
 ```
 
+Ordinary `st agents ls` and `st agents tree` read the latest published roster without
+requesting a refresh. Immediately after starting or changing an agent they can show the
+earlier roster; after daemon startup the roster may still be being prepared. When you need
+to see your own write, pass its same-host receipt `store_index` as `min_cut` to the agents
+client read and check the served snapshot index. This is not a replicated or cross-host cut.
+
 The worker and missions declared on studio should appear on both machines. `replication status` reports the last successful exchange, backlog, authority digest, graph digest, and table digests. After both members have caught up and writes settle, matching authority digests mean they hold the same replicated history. With matching builds and no waiting claims, matching graph and table digests also confirm the same shared projections. During an upgrade, a reader may hold claims that need a newer build; update it before comparing projections.
 
 If doctor reports invalid claim-signature warnings, retain the report and follow the [operator guidance](st3/founder-signing-audit.md); matching replication digests alone do not establish valid claim signatures.

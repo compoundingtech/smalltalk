@@ -832,6 +832,13 @@ fn cli_request_and_daemon_server_share_one_trace() {
     };
     let root = tempfile::tempdir().unwrap();
     let mut daemon = ExportDaemon::start(&collector, root.path());
+    // Socket readiness is not a roster publication; this fixture explicitly needs one.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(st3_client::Client::unix(&daemon.socket).agents_list_after(None, None, false, 0))
+        .expect("the fixture must publish its initial roster");
     let mut command = isolated_command(&collector, root.path());
     command
         .args(["run", "--out"])

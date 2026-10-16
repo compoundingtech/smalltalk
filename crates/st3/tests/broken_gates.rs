@@ -82,6 +82,22 @@ impl Daemon {
         serde_json::from_slice(&output.stdout).unwrap_or(Value::Null)
     }
 
+    /// Plain CLI roster reads no longer wait. Tests needing publication name the cut
+    /// explicitly on the same daemon, without adding a sleep or a retry to the CLI.
+    fn require_roster_cut(&self, cut: u64) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let response = runtime.block_on(async {
+            st3_client::Client::unix(self.root.join("daemon.sock"))
+                .agents_list_after(None, Some(200), true, cut)
+                .await
+                .expect("the fixture must publish the requested host-local roster cut")
+        });
+        assert!(response.snapshot.store_index >= cut);
+    }
+
     fn run_cli(&self, args: &[&str]) -> std::process::Output {
         self.run_cli_format(args, true)
     }
@@ -210,6 +226,9 @@ fn mission_publish_dry_run_prints_the_preview_without_gates_or_publication() {
     }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
+    // There is no mutation receipt before the first read: cut zero asks only for
+    // this daemon's initial history publication, not a later global head.
+    daemon.require_roster_cut(0);
     let file = root.path().join("preview.kdl");
     let source = r#"version 2
 agent "example/helper" {
@@ -356,6 +375,9 @@ fn apply_bundles_seats_missions_and_schedules_and_refuses_partial_publication() 
     }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
+    // There is no mutation receipt before the first read: cut zero asks only for
+    // this daemon's initial history publication, not a later global head.
+    daemon.require_roster_cut(0);
     let seat = root.path().join("seat.kdl");
     let mission = root.path().join("mission.kdl");
     let schedule = root.path().join("schedule.kdl");
@@ -418,6 +440,7 @@ fn apply_bundles_seats_missions_and_schedules_and_refuses_partial_publication() 
             .contains("example/helper")
     );
     let applied = daemon.command(&["apply", seat, mission, schedule, "--as", PUBLISHER]);
+    daemon.require_roster_cut(applied["store_index"].as_u64().expect("apply acceptance cut"));
     assert!(
         applied.to_string().contains("schedule/example/daily"),
         "{applied}"

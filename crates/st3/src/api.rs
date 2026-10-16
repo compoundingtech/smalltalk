@@ -207,6 +207,8 @@ struct ClientListQuery {
     /// when the latest roster refresh failed and none is in flight.
     #[serde(default)]
     fresh: bool,
+    /// Agents: wait for publication of this host-local mutation store_index, not the head.
+    min_cut: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1783,6 +1785,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "projection-detail-invalid-source"
         | "cursor-gap"
         | "page-cursor-expired"
+        | "agent-roster-cut-not-ready"
         | "rate-limited"
         | "runtime-not-local"
         | "runtime-authority-indeterminate"
@@ -5496,14 +5499,28 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
+    if query.min_cut.is_some() && query.cursor.is_some() {
+        return Err(client_v0::validation("min_cut is only supported on the first agents page"));
+    }
+    if let Some(wanted) = query.min_cut {
+        let head = state.store.index().map_err(ApiError::internal)?;
+        if wanted > head {
+            let mut error = agent_roster_cut_not_ready(wanted);
+            error.details.insert("head".into(), json!(head));
+            return Err(error);
+        }
+    }
     // A daemon's readers never fold the roster: they answer from its refresher's publications.
     if state.store.agent_roster_refresher_running() {
         return client_agents_published(state, snapshot, query).await;
     }
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
-    let requested = snapshot.store_index;
-    let fresh = query.fresh;
+    // Embedded stores without a refresher build once and reject an unmet cut immediately;
+    // only the daemon's publication path has a refresher to wait for.
+    let requested = query.min_cut.unwrap_or(snapshot.store_index);
+    let fresh = query.fresh || query.min_cut.is_some();
+    let min_cut = query.min_cut;
     for admitted in [false, true] {
         let admission = if admitted {
             Some(state.store.admit_agent_resources("http").await)
@@ -5531,6 +5548,8 @@ async fn client_agents(
             })
         }).await??;
         if let Some(page) = result {
+            let page = checked_agent_roster_page(Some(page), min_cut)?
+                .expect("an exact roster page is present");
             let path = match (filtered, admitted) {
                 (true, _) => "filtered_full",
                 (false, true) => "exact_cold",
@@ -5544,17 +5563,17 @@ async fn client_agents(
 }
 
 /// An agents page from the refresher's publications. A first page answers at once from the
-/// newest one, or says not ready; a fresh read briefly waits for its cut or for proof that
-/// a complete publication's cards are unchanged through it. A
-/// continuation answers from the roster published at exactly its first page's cut, or says the
-/// page expired. Neither folds a card.
+/// newest one, or says not ready; a legacy fresh read briefly waits for its cut or for proof
+/// that a complete publication's cards are unchanged through it, while a named min_cut uses one
+/// strict, fixed mutation-cut barrier. A continuation answers from the roster published at
+/// exactly its first page's cut, or says the page expired. Neither folds a card.
 async fn client_agents_published(
     state: AppState,
     snapshot: ClientSnapshot,
     query: ClientListQuery,
 ) -> Result<ClientPageResponse, ApiError> {
     state.store.note_agent_roster_read();
-    let requested = snapshot.store_index;
+    let requested = query.min_cut.unwrap_or(snapshot.store_index);
     if query.cursor.is_some() {
         let reader = state.clone();
         return blocking_roster(move || {
@@ -5562,8 +5581,17 @@ async fn client_agents_published(
         })
         .await?;
     }
-    let fresh = query.fresh;
-    let fresh_wait = if fresh {
+    let fresh = query.fresh || query.min_cut.is_some();
+    let fresh_wait = if let Some(wanted) = query.min_cut {
+        let waited = Instant::now();
+        let published = wait_for_agent_roster_cut(&state.store, query.history, wanted).await;
+        record_roster_stage(request_latency::RosterStage::FreshWait, waited.elapsed());
+        crate::otel::roster_attribute("st.roster.publication_wait_ms", waited.elapsed().as_secs_f64() * 1000.0);
+        if !published {
+            return Err(agent_roster_cut_not_ready(wanted));
+        }
+        None
+    } else if query.fresh {
         let waited = Instant::now();
         let outcome = wait_for_agent_roster(&state.store, query.history).await;
         record_roster_stage(request_latency::RosterStage::FreshWait, waited.elapsed());
@@ -5573,6 +5601,7 @@ async fn client_agents_published(
     };
     let reader = state.clone();
     let history = query.history;
+    let min_cut = query.min_cut;
     let built = Instant::now();
     let page = blocking_roster(move || {
         Ok(client_agents_published_page(&reader, &query, requested, fresh_wait))
@@ -5580,7 +5609,7 @@ async fn client_agents_published(
     if fresh {
         record_roster_stage(request_latency::RosterStage::FreshPage, built.elapsed());
     }
-    match page?? {
+    match checked_agent_roster_page(page??, min_cut)? {
         Some(page) => Ok(page),
         None => {
             crate::otel::record_roster_read("not_ready", requested, None, fresh);
@@ -5600,6 +5629,28 @@ fn agent_roster_not_ready() -> ApiError {
         code: "agent-roster-not-ready".into(),
         message: "the agents roster is still being prepared; retry shortly".into(),
         details: Box::default(),
+    }
+}
+
+/// A successful wait cannot certify a later page after a publication reset or replacement.
+fn checked_agent_roster_page(
+    page: Option<ClientPageResponse>,
+    min_cut: Option<u64>,
+) -> Result<Option<ClientPageResponse>, ApiError> {
+    if let Some(wanted) = min_cut
+        && page.as_ref().is_none_or(|page| page.0.0.store_index < wanted)
+    {
+        return Err(agent_roster_cut_not_ready(wanted));
+    }
+    Ok(page)
+}
+
+fn agent_roster_cut_not_ready(wanted: u64) -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "agent-roster-cut-not-ready".into(),
+        message: format!("the agents roster has not published cut {wanted}; retry shortly"),
+        details: Box::new(serde_json::Map::from_iter([("min_cut".into(), json!(wanted))])),
     }
 }
 
@@ -5848,6 +5899,28 @@ fn record_roster_fresh_wait(
     );
 }
 
+/// Wait only for the caller's mutation cut. Concurrent writes never move the target.
+/// A failed refresh cannot satisfy read-after-write; retain the bounded publication wait.
+async fn wait_for_agent_roster_cut(store: &Arc<Store>, history: bool, wanted: u64) -> bool {
+    let published = |store: &Store| {
+        let index = store.index().ok()?;
+        store.published_agent_roster(index, history).map(|(cut, _, _)| cut).or_else(|| {
+            (!history).then(|| store.published_agent_roster_head(index, 1)).flatten()
+                .map(|(cut, _, _, _)| cut)
+        })
+    };
+    let mut publications = store.subscribe_agent_roster();
+    tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
+        while published(store).is_none_or(|cut| cut < wanted) {
+            store.request_fresh_agent_roster(history);
+            if publications.changed().await.is_err() {
+                return false;
+            }
+        }
+        true
+    }).await.unwrap_or(false)
+}
+
 /// The snapshot of a roster published at `cut`: that cut, its time, and when it was folded.
 fn roster_snapshot(state: &AppState, cut: u64, published_at_unix_ms: u128) -> ClientSnapshot {
     ClientSnapshot {
@@ -5884,7 +5957,7 @@ fn client_agents_published_page(
                 return Ok(None);
             };
             store.request_agent_roster_refresh();
-            crate::otel::record_roster_read("published_head", requested, Some(index), query.fresh);
+            crate::otel::record_roster_read("published_head", requested, Some(index), query.fresh || query.min_cut.is_some());
             // A partial head is not the complete publication used by unchanged-through.
             let snapshot = roster_snapshot(state, index, published_at);
             let mut page =
@@ -5916,7 +5989,7 @@ fn client_agents_published_page(
         } else {
             "published_complete"
         };
-        crate::otel::record_roster_read(path, requested, Some(index), query.fresh);
+        crate::otel::record_roster_read(path, requested, Some(index), query.fresh || query.min_cut.is_some());
         if recording {
             served = Some((index, published_at, Arc::clone(&cards)));
         }
@@ -6994,7 +7067,7 @@ const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 /// that a very cheap fold cannot turn fresh reads into many refreshes a second.
 const AGENT_ROSTER_FRESH_PAUSE: Duration = Duration::from_millis(100);
 
-/// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
+/// How long a legacy fresh or named-cut read waits for publication: long enough
 /// for the refresher to finish a fold, pause as long, and fold again.
 const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
 
@@ -27102,6 +27175,133 @@ mission "wake" state="ready" {
                 assert_eq!(started.elapsed(), AGENT_ROSTER_READ_WAIT);
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn named_roster_future_cut_is_rejected_without_waiting_or_refreshing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let wake = store.start_agent_roster_refresher().unwrap();
+        let head = store.index().unwrap();
+        for history in [false, true] {
+            for fresh in [false, true] {
+                let started = tokio::time::Instant::now();
+                let error = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                    Query(ClientListQuery { history, fresh, min_cut: Some(u64::MAX),
+                        ..ClientListQuery::default() })).await.unwrap_err();
+                assert_eq!(started.elapsed(), Duration::ZERO);
+                assert_eq!(error.code, "agent-roster-cut-not-ready");
+                assert_eq!(error.details["min_cut"], u64::MAX);
+                assert_eq!(error.details["head"], head);
+            }
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(1), wake.notified()).await.is_err(),
+            "an impossible cut must not request a refresh");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn named_roster_cut_timeout_has_one_timer_even_with_legacy_fresh_and_failure() {
+        for history in [false, true] {
+            for fresh in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let state = state(root.path());
+                let store = &state.store;
+                let _wake = store.start_agent_roster_refresher().unwrap();
+                roster_resilience_runtime(store, "agent/cut-timeout", "old");
+                refresh_agent_roster(store, history).unwrap();
+                roster_resilience_runtime(store, "agent/cut-timeout", "new");
+                let wanted = store.index().unwrap();
+                assert!(store.answer_agent_roster_requests::<()>(||
+                    anyhow::bail!("previous failure cannot satisfy a named cut")).is_err());
+                let started = tokio::time::Instant::now();
+                let error = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                    Query(ClientListQuery { history, fresh, min_cut: Some(wanted),
+                        ..ClientListQuery::default() })).await.unwrap_err();
+                // This timeout returns before blocking_roster: paused time is exact here.
+                assert_eq!(started.elapsed(), AGENT_ROSTER_READ_WAIT, "one fixed timer");
+                assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(error.code, "agent-roster-cut-not-ready");
+                assert_eq!(error.details["min_cut"], wanted);
+                let (status, _) = get_request(router(state), "/v1/health").await;
+                assert_eq!(status, StatusCode::OK, "a refused cut must leave the daemon healthy");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn named_roster_cut_uses_its_mutation_receipt_not_later_head_or_legacy_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        roster_resilience_runtime(store, "agent/receipt-cut", "old");
+        refresh_agent_roster(store, false).unwrap();
+        let (status, receipt) = json_request(router(state.clone()), "/v1/claims", json!({
+            "subject":"agent/receipt-cut", "actor":"agent/receipt-cut", "kind":"runtime.observed", "fields":{
+                "status":"running", "runtime_id":"receipt-new", "incarnation_id":"one"}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        let wanted = receipt["store_index"].as_u64().expect("the same host's acceptance receipt");
+        let read = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { min_cut: Some(wanted), ..ClientListQuery::default() }));
+        tokio::pin!(read);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut read).await.is_err(),
+            "the mutation receipt must not be satisfied by the old publication");
+        refresh_agent_roster(store, false).unwrap();
+        let (Extension(snapshot), Json(page)) = read.await.unwrap();
+        assert_eq!(snapshot.store_index, wanted);
+        assert_eq!(page.items[0]["runtime_ids"], json!(["runtime/receipt-new"]));
+        for n in 0..3 {
+            store.append_claim(&ClaimInput {
+                subject: format!("custom/test/after-cut-{n}"), kind: "custom.test.marker".into(),
+                actor: None, fields: BTreeMap::new(), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        assert!(store.index().unwrap() > wanted);
+        let (Extension(snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(500),
+            client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                Query(ClientListQuery { fresh: true, min_cut: Some(wanted),
+                    ..ClientListQuery::default() }))).await
+            .expect("an already satisfied named cut must add no legacy wait").unwrap();
+        assert_eq!(snapshot.store_index, wanted);
+        assert_eq!(page.items[0]["runtime_ids"], json!(["runtime/receipt-new"]));
+    }
+
+    #[tokio::test]
+    async fn named_roster_cut_rechecks_the_served_page_after_wait_and_publication_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        roster_resilience_runtime(store, "agent/reset-cut", "old");
+        refresh_agent_roster(store, false).unwrap();
+        let older = client_agents_published_page(&state, &ClientListQuery::default(), 0, None).unwrap();
+        roster_resilience_runtime(store, "agent/reset-cut", "new");
+        refresh_agent_roster(store, false).unwrap();
+        let wanted = store.index().unwrap();
+        assert!(wait_for_agent_roster_cut(store, false, wanted).await);
+        let error = checked_agent_roster_page(older, Some(wanted)).unwrap_err();
+        assert_eq!(error.code, "agent-roster-cut-not-ready");
+        // Exercise the exact post-wait reset seam without adding a production test hook.
+        store.forget_current_views();
+        let page = client_agents_published_page(&state, &ClientListQuery::default(), wanted, None).unwrap();
+        assert!(page.is_none());
+        let error = checked_agent_roster_page(page, Some(wanted)).unwrap_err();
+        assert_eq!(error.code, "agent-roster-cut-not-ready");
+        assert!(checked_agent_roster_page(None, None).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn named_roster_cut_rejects_a_continuation_before_decoding_its_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let (status, error) = get_request(router(state),
+            "/v1/client/agents?min_cut=0&fresh=true&cursor=not-a-cursor").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error["code"], "validation-failed");
+        assert!(error["message"].as_str().unwrap().contains("first agents page"));
     }
 
     #[test]

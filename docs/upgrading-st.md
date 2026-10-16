@@ -150,6 +150,12 @@ st agents ls
 st replication status
 ```
 
+Ordinary `st agents ls` and `st agents tree` read the latest published roster without
+requesting a refresh. Immediately after starting or changing an agent they can show the
+earlier roster; after daemon startup the roster may still be being prepared. When you need
+to see your own write, pass its same-host receipt `store_index` as `min_cut` to the agents
+client read and check the served snapshot index. This is not a replicated or cross-host cut.
+
 `service install` refreshes executable paths and restarts the installed daemon and replication services. The daemon adopts live seats; supported drivers/channels follow its new binary. A provider's conversation can keep running through the deploy. Compare the installed CLI's
 `machine_version` with the responding daemon's `machine_version` in doctor; also compare both
 with the archive's source metadata. An active service alone does not prove that the API is ready.

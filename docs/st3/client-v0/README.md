@@ -1893,19 +1893,45 @@ background refresher last published; no read folds the roster itself. Each page 
 that roster's own cut in its `snapshot` (`store_index`, `created_at`) and when it was folded
 (`published_at`). That cut can be older than the request, by about a second plus one fold.
 
-A first page answers at once. A client that prefers to see what was written before its request
-passes `fresh=true`. The daemon requests a refresh and waits up to two seconds for a publication
-at or after the request's cut, including while the refresher is idle. It returns the newest
-publication at once only if the latest attempt failed and no newer attempt is in flight.
-A failure while the read waits also wakes it. The retained publication's original `store_index`
-and `published_at` show its age. `st agents ls` and `st agents tree` ask for this fresh read;
-Rust exposes `agents_list_fresh`.
+An ordinary first page answers immediately from the latest publication, including `st agents ls`
+and `st agents tree`, which no longer send `fresh=true`. Existing callers may still pass
+`fresh=true`: its legacy behavior is unchanged. It requests a refresh and waits up to two
+seconds for a publication at or after the request cut, returns the retained publication
+promptly after a failed latest attempt with no newer attempt in flight, and uses the existing
+unchanged-card proof. Rust keeps `agents_list_fresh`; current-work `fresh=true` is unchanged.
 
-A read returns a retryable 503 (the stream sends `resync`) only before a usable roster of
-the requested mode has been published, or after a full projection reset clears it. Current
-and history rosters remain separate: a history read never substitutes current-only membership.
+Ordinary `st agents ls` and `st agents tree` read the latest published roster without
+requesting a refresh. Immediately after starting or changing an agent they can show the
+earlier roster; after daemon startup the roster may still be being prepared. When you need
+to see your own write, pass its same-host receipt `store_index` as `min_cut` to the agents
+client read and check the served snapshot index. This is not a replicated or cross-host cut.
+
+A caller that needs a strict read-after-write fence passes `min_cut=N`, using the
+`ClaimRecord.store_index` returned by its write on this same host. This is a host-local
+acceptance index, not a replicated sequence: a cut minted on host A must not fence host B.
+The daemon waits at most two seconds for a publication whose served `snapshot.store_index`
+is at least `min_cut`, rechecking the final snapshot after the wait. A cut above this host's
+current head is refused immediately with the same cut-not-ready error and `min_cut`/`head`
+details; it cannot be a receipt from a write this host already accepted. If that cut is unavailable,
+it returns retryable HTTP 503 with `details.reason: "agent-roster-cut-not-ready"`; failure of a
+refresh never permits an older publication to satisfy this barrier. When both `fresh` and
+`min_cut` are supplied, `min_cut` wins: one named barrier and one two-second timer.
+
+An older daemon ignores `min_cut` and returns its newest publication, without a new server
+error. The caller must compare the returned `snapshot.store_index` on the same host with its
+requested cut. Rust's additive `agents_list_after` does that comparison and reports the same
+cut-not-ready message/error as a barrier timeout if the publication is older. There is no
+in-repo CLI mutation-following roster read; existing mutation commands' point-detail reads
+stay unchanged.
+
+Without an explicit cut, a read returns a retryable 503 (the stream sends `resync`) only before
+a usable roster of the requested mode has been published, or after a full projection reset
+clears it. Current and history rosters remain separate: a history read never substitutes
+current-only membership.
 A continuation reads the roster published at its first page's cut; once that roster is gone
 it answers `page-cursor-expired`. A stream rereads on a new publication.
+Combining `min_cut` with a continuation `cursor` is rejected with `validation-failed`: the
+continuation is already pinned to its first page's cut.
 
 A card-faults read that reaches its deadline does not stop publication. Other card fields
 are current; each affected card keeps its previous `fault`, including a known null value.

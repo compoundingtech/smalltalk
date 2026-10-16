@@ -899,6 +899,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
             "this image was removed after its retention window; the message text remains".into()
         }
         ErrorCode::ValidationFailed
+        | ErrorCode::AgentRosterCutNotReady
         | ErrorCode::ProjectionDetailTooLarge
         | ErrorCode::ProjectionDetailInvalidSource
         | ErrorCode::AttentionMigrated
@@ -1330,6 +1331,57 @@ impl Client {
         }
         self.list_internal_with_filters("agents", cursor, limit, history, &filters)
             .await
+    }
+    /// Read a roster publication covering a mutation's host-local `store_index`.
+    /// Use the same host that accepted the mutation; ordinary reads do not wait for a cut.
+    /// This starts a page sequence. Continue with `agents_list` or `agents_list_for_status`
+    /// and the returned cursor, without a cut. An older daemon may ignore the query;
+    /// a served index below min_cut returns the same cut-not-ready error as a timeout.
+    pub async fn agents_list_after(
+        &self,
+        status: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+        min_cut: u64,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let requested = min_cut;
+        let min_cut = min_cut.to_string();
+        let filters = [
+            ("min_cut", min_cut.as_str()),
+            ("status", status.unwrap_or_default()),
+        ];
+        let filter_count = if status.is_some() { 2 } else { 1 };
+        let response: Envelope<Page> = self
+            .list_internal_with_filters("agents", None, limit, history, &filters[..filter_count])
+            .await?;
+        // Older daemons ignore min_cut and return their newest publication. Do not
+        // mistake that successful HTTP response for a fulfilled same-host barrier.
+        if response.snapshot.store_index < requested {
+            let code = ErrorCode::AgentRosterCutNotReady;
+            let message =
+                format!("the agents roster has not published cut {requested}; retry shortly");
+            return Err(ClientError::Api(
+                code.clone(),
+                message.clone(),
+                Box::new(ErrorEnvelope {
+                    api_version: response.api_version,
+                    error_version: "st3.client.error.v0".into(),
+                    request_id: response.request_id,
+                    code,
+                    message,
+                    retryable: true,
+                    retry_after_ms: None,
+                    details: std::collections::BTreeMap::from([
+                        (
+                            "reason".into(),
+                            serde_json::json!("agent-roster-cut-not-ready"),
+                        ),
+                        ("min_cut".into(), serde_json::json!(requested)),
+                    ]),
+                }),
+            ));
+        }
+        Ok(response)
     }
     /// The current work list's first page as of this request: the daemon waits briefly for a
     /// publication at least as new as the request. While the list is not ready, or not yet that
@@ -4383,6 +4435,82 @@ mod tests {
             }
             lines
         })
+    }
+
+    #[test]
+    fn agents_reads_keep_legacy_fresh_and_add_an_explicit_host_local_cut() {
+        runtime().block_on(async {
+            let page = EMPTY_PAGE
+                .replace("launch-children", "agents")
+                .replace("resource-page", "page");
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("agents.sock");
+            let server = scripted_server(&socket, vec![(0, 200, page); 6]);
+            let client = Client::unix(&socket);
+            client.agents_list(None, None, false).await.unwrap();
+            client
+                .agents_list_for_status("running", None, Some(5), false)
+                .await
+                .unwrap();
+            client
+                .agents_list_after(None, None, false, 0)
+                .await
+                .unwrap();
+            client
+                .agents_list_after(Some("needs attention"), Some(5), true, 1)
+                .await
+                .unwrap();
+            client
+                .agents_list_fresh(None, None, Some(5), false)
+                .await
+                .unwrap();
+            client
+                .agents_list_for_status("needs attention", Some("page&next"), Some(5), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                server.await.unwrap(),
+                vec![
+                    "GET /v1/client/agents HTTP/1.1",
+                    "GET /v1/client/agents?limit=5&status=running HTTP/1.1",
+                    "GET /v1/client/agents?min_cut=0 HTTP/1.1",
+                    "GET /v1/client/agents?limit=5&history=true&min_cut=1&status=needs%20attention HTTP/1.1",
+                    "GET /v1/client/agents?limit=5&fresh=true HTTP/1.1",
+                    "GET /v1/client/agents?cursor=page%26next&limit=5&history=true&status=needs%20attention HTTP/1.1",
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn a_named_roster_cut_detects_old_daemons_without_a_second_request() {
+        runtime().block_on(async {
+            for served in [6, 7, 8] {
+                let mut page: serde_json::Value = serde_json::from_str(EMPTY_PAGE).unwrap();
+                page["value"]["collection"] = serde_json::json!("agents");
+                page["snapshot"]["store_index"] = serde_json::json!(served);
+                let directory = tempfile::tempdir().unwrap();
+                let socket = directory.path().join("old-daemon.sock");
+                // An old daemon ignores min_cut and returns 200 with its newest publication.
+                let server = scripted_server(&socket, vec![(0, 200, page.to_string())]);
+                let result = Client::unix(&socket)
+                    .agents_list_after(None, None, false, 7)
+                    .await;
+                if served < 7 {
+                    let error = result.unwrap_err();
+                    assert!(matches!(&error, ClientError::Api(
+                        ErrorCode::AgentRosterCutNotReady, _, envelope)
+                        if envelope.retryable && envelope.details["min_cut"] == 7));
+                    assert!(error.plain().contains("has not published cut 7"));
+                } else {
+                    assert_eq!(result.unwrap().snapshot.store_index, served);
+                }
+                assert_eq!(
+                    server.await.unwrap(),
+                    vec!["GET /v1/client/agents?min_cut=7 HTTP/1.1"]
+                );
+            }
+        });
     }
 
     #[test]

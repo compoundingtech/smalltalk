@@ -247,12 +247,13 @@ GET /v1/client/agents SERVER / first_frame     st.roster.rebuild INTERNAL root (
 | Attribute | Type | Vocabulary / meaning |
 | --- | --- | --- |
 | `st.roster.path` | string enum | `published_complete`, `published_head`, `exact_warm`, `exact_cold`, `filtered_full`, `not_ready`; any status-filtered read is `filtered_full` |
-| `st.roster.fresh_requested` | boolean | The HTTP agents query's `fresh` value, including exact reads, published first pages, continuations and `not_ready`; WebSocket reads and background rebuild roots report `false` because they have no freshness query |
+| `st.roster.fresh_requested` | boolean | Whether the HTTP agents query asks for legacy `fresh=true` or a named `min_cut`, including exact reads, published first pages, continuations and `not_ready`; WebSocket reads and background rebuild roots report `false` because they have no freshness query |
 | `st.roster.fresh_wait` | string enum | Exit of the fresh published-first-page wait: `published`, `unchanged`, `refresh_failed`, `disconnected`, `timeout`, `read_failed`; absent when no wait ran |
 | `st.roster.fresh_wait_cut` | integer | Actual wait target read when the wait starts, distinct from the earlier request cut and the publication served; absent if that index read failed |
 | `st.roster.fresh_proof` | string enum | Proof for the exact complete publication served: `not_checked` for other wait exits, `verified`, `refused` (including head-only, not-ready or evicted publication), `read_failed` |
 | `st.roster.fresh_unchanged_verified` | boolean | True exactly when `fresh_proof=verified`; only an `unchanged` wait exit can receive verification |
-| `st.roster.requested_cut` | integer | Store index of the read's snapshot |
+| `st.roster.requested_cut` | integer | Named `min_cut`, if supplied; otherwise store index of the read's snapshot |
+| `st.roster.publication_wait_ms` | double | Milliseconds spent in the explicit `min_cut` publication barrier |
 | `st.roster.publication_cut` | integer | Store index of the publication served; absent for `not_ready` |
 | `st.roster.worker_queue_ms` | double | Cumulative submission-to-start time of the read's blocking workers, excluding reader acquisition and execution |
 | `st.roster.reader_acquire_ms` | double | Cumulative SQLite reader acquisition, connection opening, `BEGIN`, and first index read |
