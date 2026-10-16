@@ -1,6 +1,6 @@
 import type * as Native from '@smalltalk/st3-client/schema'
 import * as stylex from '@stylexjs/stylex'
-import { DateTime } from 'effect'
+import { DateTime, Option } from 'effect'
 import * as React from 'react'
 
 import { cleanMessageText } from '../../../../../clients/typescript/st3-views/conversationView.ts'
@@ -11,10 +11,11 @@ import { AlertButton } from './AlertButton.tsx'
 import { tokens } from '../../ui-compat/tokens.stylex.ts'
 import type { AlertAction, AlertActionResult } from './alert-action-port.ts'
 
-// Asks and review gates in an agent's conversation, answered in place with the answers stui and
-// the phone give: a structured request's named answers, Yes and No for a yes-or-no question, the
-// person's own words, Nothing to do; a gate's approve, send back or reject. Every answer is
-// confirmed before it is sent, so a stray click answers nothing.
+// Asks, review gates and launch approvals in an agent's conversation, answered in place with the
+// answers stui and the phone give: a structured request's named answers, Yes and No for a
+// yes-or-no question, the person's own words, Nothing to do; a gate's approve, send back or
+// reject; a launch's approve, send back to its planner, or cancel. Every answer is confirmed
+// before it is sent, so a stray click answers nothing.
 
 /** One answer an alert offers, and what it sends. */
 export type AlertChoice = {
@@ -93,6 +94,18 @@ export const alertChoices = (alert: Native.Attention): readonly AlertChoice[] | 
       choices.push({ key: 'changes', label: 'Send back', words: 'required', tone: 'secondary', action: (words) => ({ type: 'review.request-changes', reason: words.trim() }) })
     if (offered.includes('review.reject'))
       choices.push({ key: 'reject', label: 'Reject', words: 'required', tone: 'danger', action: (words) => ({ type: 'review.reject', reason: words.trim() }) })
+    return choices.length > 0 ? choices : null
+  }
+  if (alert.attention_kind === 'launch-approval') {
+    const choices: AlertChoice[] = []
+    if (offered.includes('launch.approve')) {
+      // Approving launches the preview shown; a launch without one says why and cannot be approved.
+      if (Option.isSome(alert.preview))
+        choices.push({ key: 'approve', label: 'Approve launch', words: 'none', tone: 'primary', action: () => ({ type: 'launch.approve' }) })
+      choices.push({ key: 'revise', label: 'Send back', words: 'required', tone: 'secondary', action: (words) => ({ type: 'launch.revise', feedback: words.trim() }) })
+    }
+    if (offered.includes('launch.cancel'))
+      choices.push({ key: 'cancel', label: 'Cancel launch', words: 'none', tone: 'danger', action: () => ({ type: 'launch.cancel' }) })
     return choices.length > 0 ? choices : null
   }
   return null
@@ -175,7 +188,47 @@ const Question = ({ text }: { readonly text: string }): React.ReactNode => {
   )
 }
 
+/** What a launch would start, as its planner previewed it: goal, steps, agents and gates. */
+const LaunchPreview = ({ alert }: { readonly alert: Native.Attention }): React.ReactNode => {
+  if (Option.isNone(alert.preview)) {
+    return (
+      <div {...stylex.props(styles.note)}>
+        There is no valid preview of this launch yet, so it cannot be approved.
+        {alert.detail ? ` ${cleanMessageText(alert.detail)}` : ''}
+      </div>
+    )
+  }
+  const preview = alert.preview.value
+  return (
+    <>
+      <div {...stylex.props(styles.body)}><strong>Goal:</strong> {preview.goal}</div>
+      {preview.request_excerpt ? <div {...stylex.props(styles.meta)}>Asked for: {preview.request_excerpt}</div> : null}
+      {preview.steps.length > 0 ? (
+        <ol {...stylex.props(styles.list)} aria-label="Steps">
+          {preview.steps.map((step) => (
+            <li key={step.path}>
+              {step.title}
+              {Option.isSome(step.assignee) ? <span {...stylex.props(styles.soft)}> · {step.assignee.value.replace(/^agent\//, '')}</span> : null}
+              {step.depends.length > 0 ? <span {...stylex.props(styles.soft)}> · after {step.depends.join(', ')}</span> : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      {preview.agents.length > 0 ? (
+        <div {...stylex.props(styles.meta)}>
+          Agents: {preview.agents.map((agent) => `${agent.id.replace(/^agent\//, '')}${Option.isSome(agent.host) ? ` on ${agent.host.value}` : ''}${Option.isSome(agent.worktree) ? ` in ${agent.worktree.value}` : ''}`).join('; ')}
+        </div>
+      ) : null}
+      <div {...stylex.props(styles.meta)}>
+        Gates: {preview.gates.human} for a person, {preview.gates.automated} automated
+        {preview.diagnostics_count > 0 ? ` · ${preview.diagnostics_count} diagnostics` : ''}
+      </div>
+    </>
+  )
+}
+
 const Body = ({ alert }: { readonly alert: Native.Attention }): React.ReactNode => {
+  if (alert.attention_kind === 'launch-approval') return <LaunchPreview alert={alert} />
   const request = alert.request
   if (request !== undefined) {
     const label = (id: string) => request.answers?.find((answer) => answer.id === id)?.label ?? id
@@ -264,7 +317,9 @@ export const AnswerAlert = ({
         <div {...stylex.props(styles.note)}>
           {alert.attention_kind === 'harness-login'
             ? 'Sign in from the seat\'s terminal. One sign-in answers every seat that shares it.'
-            : 'Answer this one in st for now.'}
+            : alert.attention_kind === 'revision-approval'
+              ? 'Approve or cancel a revision with st work revision approve or cancel, as in the terminal app.'
+              : 'Answer this one in st for now.'}
         </div>
       ) : onAct === undefined ? (
         <div {...stylex.props(styles.note)}>This device cannot answer alerts. Answer it in st.</div>

@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import { ClientError, type St3Client } from '@smalltalk/st3-client'
 import type * as Native from '@smalltalk/st3-client/schema'
-import { DateTime } from 'effect'
+import { DateTime, Option } from 'effect'
 
 // Node rendering exercises the real composition, not the CSS compiler.
 vi.mock('@stylexjs/stylex', () => ({
@@ -56,6 +56,18 @@ const decision = {
   recommendation: { answer: 'merge', reason: 'Tests and review passed.' },
 }
 
+const preview = {
+  goal: 'Build the nightly report',
+  request_excerpt: 'every night at two',
+  steps: [
+    { path: 'build', title: 'Build it', assignee: Option.some('agent/example/builder'), depends: [] },
+    { path: 'review', title: 'Review it', assignee: Option.none(), depends: ['build'] },
+  ],
+  agents: [{ id: 'agent/example/builder', host: Option.some('example-host'), worktree: Option.none() }],
+  gates: { automated: 2, human: 1 },
+  diagnostics_count: 0,
+}
+
 const keys = (alert: Native.Attention) => alertChoices(alert)?.map((choice) => choice.key)
 const choice = (alert: Native.Attention, key: string) => alertChoices(alert)!.find((each) => each.key === key)!
 
@@ -101,9 +113,20 @@ describe('alertChoices', () => {
     expect(alertChoices(item({ attention_kind: 'human-gate', actions: [] }))).toBeNull()
   })
 
+  it('approves a launch only with a preview to approve, sends it back with words, or cancels it', () => {
+    const launch = item({ attention_kind: 'launch-approval', source_id: 'planning-session/launch/nightly', actions: ['launch.approve', 'launch.cancel'], preview: Option.some(preview) })
+    expect(keys(launch)).toEqual(['approve', 'revise', 'cancel'])
+    expect(choice(launch, 'approve').action('')).toEqual({ type: 'launch.approve' })
+    expect(choice(launch, 'revise')).toMatchObject({ words: 'required' })
+    expect(choice(launch, 'revise').action(' Add a review step. ')).toEqual({ type: 'launch.revise', feedback: 'Add a review step.' })
+    expect(choice(launch, 'cancel')).toMatchObject({ tone: 'danger', words: 'none' })
+    expect(keys(item({ attention_kind: 'launch-approval', actions: ['launch.approve', 'launch.cancel'], preview: Option.none() }))).toEqual(['revise', 'cancel'])
+  })
+
   it('answers nothing st does not offer here', () => {
     expect(alertChoices(item({ actions: [] }))).toBeNull()
-    expect(alertChoices(item({ attention_kind: 'launch-approval', actions: ['launch.approve'] }))).toBeNull()
+    expect(alertChoices(item({ attention_kind: 'launch-approval', actions: [], preview: Option.some(preview) }))).toBeNull()
+    expect(alertChoices(item({ attention_kind: 'revision-approval', actions: ['mission.approve-revision'] }))).toBeNull()
   })
 })
 
@@ -163,6 +186,21 @@ describe('AnswerAlert', () => {
     expect(html).toContain('Notes<span> doc/notes</span>')
   })
 
+  it('shows what a launch would start, or why it has nothing to approve', () => {
+    const html = renderToStaticMarkup(<AnswerAlert alert={item({ attention_kind: 'launch-approval', title: 'Launch nightly', actions: ['launch.approve'], preview: Option.some(preview) })} onAct={async () => ({ _tag: 'Sent' })} now={now} />)
+    expect(html).toContain('Launch approval · from example/atlas')
+    expect(html).toContain('<strong>Goal:</strong> Build the nightly report')
+    expect(html).toContain('Review it<span> · after build</span>')
+    expect(html).toContain('Agents: example/builder on example-host')
+    expect(html).toContain('Gates: 1 for a person, 2 automated')
+    expect(html).toContain('>Approve launch<')
+    const none = renderToStaticMarkup(<AnswerAlert alert={item({ attention_kind: 'launch-approval', detail: 'The mission file does not parse.', actions: ['launch.approve'], preview: Option.none() })} onAct={async () => ({ _tag: 'Sent' })} now={now} />)
+    expect(none).toContain('There is no valid preview of this launch yet, so it cannot be approved. The mission file does not parse.')
+    expect(none).not.toContain('>Approve launch<')
+    expect(renderToStaticMarkup(<AnswerAlert alert={item({ attention_kind: 'revision-approval', detail: 'Add a deploy step', actions: ['mission.approve-revision'] })} onAct={async () => ({ _tag: 'Sent' })} now={now} />))
+      .toContain('st work revision approve or cancel')
+  })
+
   it('shows a JSON report as its telling fields', () => {
     const html = renderToStaticMarkup(<AnswerAlert alert={item({ detail: 'Build finished {"status":"failed","error":"linker","extra":1}' })} now={now} />)
     expect(html).toContain('<dt>status</dt>')
@@ -173,7 +211,7 @@ describe('AnswerAlert', () => {
     expect(renderToStaticMarkup(<AnswerAlert alert={item({})} now={now} />)).toContain('This device cannot answer alerts.')
     expect(renderToStaticMarkup(<AnswerAlert alert={item({ attention_kind: 'harness-login', actions: [] })} onAct={async () => ({ _tag: 'Sent' })} now={now} />))
       .toContain('Sign in from the seat&#x27;s terminal.')
-    expect(renderToStaticMarkup(<AnswerAlert alert={item({ attention_kind: 'launch-approval', actions: ['launch.approve'] })} onAct={async () => ({ _tag: 'Sent' })} now={now} />))
+    expect(renderToStaticMarkup(<AnswerAlert alert={item({ attention_kind: 'fault', actions: [] })} onAct={async () => ({ _tag: 'Sent' })} now={now} />))
       .toContain('Answer this one in st for now.')
   })
 
@@ -222,6 +260,62 @@ describe('gatewayAlertActions', () => {
     expect(await port.act({ alert: answered, action })).toEqual({ _tag: 'Refused', detail: 'This changed since you read it. Read it again before answering.' })
     expect(await port.act({ alert: answered, action })).toEqual({ _tag: 'Refused', detail: 'st no longer offers this answer here.' })
     expect(workDone).not.toHaveBeenCalled()
+  })
+
+  it('approves exactly the variant and preview the alert shows, fenced on the alert, the launch and that variant', async () => {
+    const launchApprove = vi.fn(async (_request: unknown) => ({ value: { status: 'completed' } }))
+    const launchRevise = vi.fn(async (_request: unknown) => ({ value: { status: 'completed' } }))
+    const launchCancel = vi.fn(async (_request: unknown) => ({ value: { status: 'completed' } }))
+    const token = (digit: string) => `lpv0:${digit.repeat(64)}`
+    const client = {
+      // As st raises it: the alert names its variant, and its episode is the preview's hash.
+      attentionGet: vi.fn(async () => envelope({ ...open, actions: ['launch.approve', 'launch.cancel'], source_id: 'planning-session/launch/nightly', variant_id: 'variant/two', episode: token('b') })),
+      launchesGet: vi.fn(async () => ({ snapshot: { id: 'snapshot/launch' }, value: { kind: 'launch', id: 'launch/nightly', revision: 'l3' } })),
+      launchVariantsList: vi.fn(async () => ({ snapshot: { id: 'snapshot/launch' }, value: { items: [
+        { kind: 'launch-variant', id: 'variant/one', revision: 'v1', ordinal: 1, preview_token: token('a') },
+        { kind: 'launch-variant', id: 'variant/two', revision: 'v2', ordinal: 2, preview_token: token('b') },
+        { kind: 'launch-variant', id: 'variant/three', revision: 'v3', ordinal: 3, preview_token: token('c') },
+      ] } })),
+      launchApprove, launchRevise, launchCancel,
+    } as unknown as St3Client
+    const port = gatewayAlertActions(client)
+    expect(await port.act({ alert: answered, action: { type: 'launch.approve' } })).toEqual({ _tag: 'Sent' })
+    expect(client.launchesGet).toHaveBeenCalledWith('launch/nightly')
+    // A newer previewed variant (three) exists, and is not approved in place of the one shown.
+    expect(launchApprove.mock.calls[0]![0]).toMatchObject({
+      fence: { snapshot_id: 'snapshot/launch', subject_revisions: { 'attention/ask': 'r1', 'launch/nightly': 'l3', 'variant/two': 'v2' }, preview_token: token('b') },
+      parameters: { launch_id: 'launch/nightly', variant_id: 'variant/two' },
+    })
+    expect(await port.act({ alert: answered, action: { type: 'launch.revise', feedback: 'Add a review step.' } })).toEqual({ _tag: 'Sent' })
+    expect(launchRevise.mock.calls[0]![0]).toMatchObject({ fence: { subject_revisions: { 'launch/nightly': 'l3' } }, parameters: { launch_id: 'launch/nightly', feedback: 'Add a review step.' } })
+    expect(await port.act({ alert: answered, action: { type: 'launch.cancel' } })).toEqual({ _tag: 'Sent' })
+    expect(launchCancel.mock.calls[0]![0]).toMatchObject({ parameters: { target_id: 'launch/nightly' } })
+  })
+
+  it('approves nothing when the shown preview changed, is gone, or the alert names none', async () => {
+    const token = (digit: string) => `lpv0:${digit.repeat(64)}`
+    const approve = async (alertFields: Record<string, unknown>, items: readonly unknown[]) => {
+      const launchApprove = vi.fn()
+      const client = {
+        attentionGet: vi.fn(async () => envelope({ ...open, actions: ['launch.approve'], launch_id: 'launch/nightly', ...alertFields })),
+        launchesGet: vi.fn(async () => ({ snapshot: { id: 'snapshot/launch' }, value: { kind: 'launch', id: 'launch/nightly', revision: 'l3' } })),
+        launchVariantsList: vi.fn(async () => ({ snapshot: { id: 'snapshot/launch' }, value: { items } })),
+        launchApprove,
+      } as unknown as St3Client
+      const result = await gatewayAlertActions(client).act({ alert: answered, action: { type: 'launch.approve' } })
+      expect(launchApprove).not.toHaveBeenCalled()
+      return result
+    }
+    const two = { kind: 'launch-variant', id: 'variant/two', revision: 'v2', ordinal: 2, preview_token: token('b') }
+    const changed = { _tag: 'Refused', detail: 'The preview this alert shows has changed. Read it again before approving.' }
+    // The same variant previewed again under a new token.
+    expect(await approve({ variant_id: 'variant/two', episode: token('a') }, [two])).toEqual(changed)
+    // The variant shown is gone.
+    expect(await approve({ variant_id: 'variant/one', preview_token: token('a') }, [two])).toEqual(changed)
+    // No variant or preview named.
+    expect(await approve({ episode: token('b') }, [two])).toEqual({
+      _tag: 'Refused', detail: 'This alert does not say which preview it shows, so it cannot be approved here. Review it in st.',
+    })
   })
 
   it('says why st refused, and never sends an unconfirmed answer again', async () => {
