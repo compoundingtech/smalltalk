@@ -39,7 +39,8 @@ warnings must stay rate-limited in its private `driver.log`, outside the PTY.
 
 Claude's `channel-missing` and `channel-uninitialized` scenarios restart with healthy hooks
 but no usable channel. They require `claude-channel-unattached` with a blocked seat within
-45 seconds, a visible hold for early mail, and recovery with exactly one native offer and one
+45 seconds (awaited in the daemon's event log from a cursor taken before the restart, so the
+roughly ten-second blocked window cannot be missed; see `scripts/st3_events.py`), a visible hold for early mail, and recovery with exactly one native offer and one
 staged/delivered/read receipt. Two further restarts must deliver fresh startup mail once without
 replaying recovered mail. The missing-channel seat must restart automatically, continuing its
 native session. The uninitialized channel attaches during the recheck window and must keep its
