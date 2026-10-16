@@ -93,6 +93,21 @@ describe('bounded perceived UX', () => {
     expect(h.snapshot().spans.at(-1)?.attributes['wf.sync.reconnect_ms']).toBe(40)
     h.ux.dispose()
   })
+  it('times an answered alert to the paint that no longer shows it, against st\'s 2 s alert_landed budget', () => {
+    const h = harness()
+    h.time(100)
+    const fast = h.ux.beginAlertAnswer()
+    h.time(900); fast.landed(); h.time(950); h.paint()
+    const slow = h.ux.beginAlertAnswer()
+    h.time(3500); slow.landed(); h.paint()
+    h.ux.beginAlertAnswer().cancel()
+    const spans = h.snapshot().spans.filter((span) => span.name === 'wf.ux.alert_landed')
+    expect(spans.map((span) => [span.durationMs, span.attributes['wf.ux.budget_met'], span.attributes['wf.ux.outcome']])).toEqual([
+      [850, true, 'painted'], [2550, false, 'painted'], [0, undefined, 'disposed'],
+    ])
+    expect(spans[0]?.attributes['wf.ux.budget_ms']).toBe(2000)
+    h.ux.dispose()
+  })
   it('bounds missing paints and send-echo hooks and cleans all operations on disposal', () => {
     const h = harness()
     h.ux.beginSwitch({ ref: 'unpainted', warm: false, slotCount: 0 })

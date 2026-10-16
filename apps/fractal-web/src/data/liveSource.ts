@@ -32,6 +32,7 @@ import { gatewayTerminalInput } from '../terminal/terminal-input-port.ts'
 import { gatewayTerminalResize } from '../terminal/terminal-resize-port.ts'
 import { gatewayAgentControls } from '../agents/agent-control-port.ts'
 import { gatewayPromptAnswers } from '../conversation/alerts/prompt-answer-port.ts'
+import { gatewayAlertActions } from '../conversation/alerts/alert-action-port.ts'
 import { gatewayDocuments } from '../documents/document-port.ts'
 import { gatewayAttachments, gatewayMessageSend } from './attachmentPort.ts'
 import { gatewayContentSearch } from './contentSearchPort.ts'
@@ -1105,6 +1106,7 @@ export const liveSource = ({
       terminalResize: gatewayTerminalResize(client),
       agentControls: gatewayAgentControls(client),
       prompts: gatewayPromptAnswers(client),
+      alertActions: gatewayAlertActions(client),
       documents: gatewayDocuments(client),
       // Grants gate arming in the view and every post; the gateway still refuses a revoked grant.
       terminalInput: gatewayTerminalInput({

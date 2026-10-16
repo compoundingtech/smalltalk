@@ -31,7 +31,7 @@ export type HomeRow = {
   age: string;
 };
 
-type Kindish = Pick<Attention, 'attention_kind' | 'priority'> & { update?: Attention['update'] };
+type Kindish = Pick<Attention, 'attention_kind'> & { update?: unknown };
 /** Where Home shows an item, or null for a kind that is not a request or a review. */
 export function homeKind(item: Kindish): { tier: Tier; kind: HomeKind } | null {
   switch (item.attention_kind as string) {
@@ -139,11 +139,17 @@ export function isAlert(item: Alertish): boolean {
   return item.alert ?? (!item.update && item.attention_kind !== 'unread-message');
 }
 
+/** As much of an attention row as choosing alerts reads, so a client's decoded rows work too. */
+export type AlertRow = Pick<Attention, 'state' | 'person_id' | 'attention_kind' | 'source_id'> & {
+  alert?: boolean; update?: unknown; closedElsewhere?: boolean;
+  conversation_id?: string; conversation_ids?: readonly string[]; requester_id?: string | null;
+};
+
 /**
  * The alerts the person can see: open, theirs, an alert, of a kind the app shows, and not an item
  * st closed that only waits to be cleared. The same rows Home lists, so the count and the list agree.
  */
-export function openAlerts(items: readonly KeptAttention[], actor: string | undefined): KeptAttention[] {
+export function openAlerts<T extends AlertRow>(items: readonly T[], actor: string | undefined): T[] {
   return items.filter(item => !item.closedElsewhere && onHome(item, actor) && isAlert(item) && homeKind(item) !== null);
 }
 
@@ -161,7 +167,7 @@ export function alertConversations(item: Pick<Attention, 'source_id'> & { conver
 }
 
 /** The alerts that show in one agent's conversation. */
-export function alertsIn(items: readonly KeptAttention[], agentId: string, actor: string | undefined): KeptAttention[] {
+export function alertsIn<T extends AlertRow>(items: readonly T[], agentId: string, actor: string | undefined): T[] {
   return openAlerts(items, actor).filter(item => alertConversations(item).includes(agentId));
 }
 

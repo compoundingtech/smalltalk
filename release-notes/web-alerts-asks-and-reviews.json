@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Answer asks and review gates from the alert strip in the web app's conversation view",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses the existing work.done and review.* actions; st3-views alert selection now also accepts decoded rows, with the same results for stui and the phone."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or new swap-back restrictions."
+  }
+}

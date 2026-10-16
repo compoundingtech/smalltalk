@@ -3,6 +3,7 @@ import agentControls from './2026-10-14-agent-controls.ts'
 import liveTranscriptPolish from './2026-10-14-live-transcript-polish.ts'
 import promptAnswers from './2026-10-14-prompt-answers.ts'
 import scopedChangelog from './2026-10-13-scoped-changelog.ts'
+import alertsInConversation from './2026-10-14-alerts-in-conversation.ts'
 import changelogPlacement from './2026-10-12-changelog-placement.ts'
 import changelogGlass from './2026-10-12-changelog-glass.ts'
 import changelogDismissFocus from './2026-10-11-changelog-dismiss-focus.ts'
@@ -15,6 +16,7 @@ export const changelogSources: readonly ChangelogSourceRegistration[] = Object.f
   { file: '2026-10-14-live-transcript-polish.ts', source: liveTranscriptPolish, visibility: 'public' },
   { file: '2026-10-14-prompt-answers.ts', source: promptAnswers, visibility: 'public' },
   { file: '2026-10-13-scoped-changelog.ts', source: scopedChangelog, visibility: 'public' },
+  { file: '2026-10-14-alerts-in-conversation.ts', source: alertsInConversation, visibility: 'public' },
   { file: '2026-10-12-changelog-placement.ts', source: changelogPlacement, visibility: 'public' },
   { file: '2026-10-12-changelog-glass.ts', source: changelogGlass, visibility: 'public' },
   { file: '2026-10-11-changelog-dismiss-focus.ts', source: changelogDismissFocus, visibility: 'public' },

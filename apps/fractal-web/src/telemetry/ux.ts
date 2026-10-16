@@ -1,7 +1,7 @@
 import { Context, Exit, Option, Tracer } from 'effect'
 import type { SyncStatus } from '@st3/sdk/effect'
 
-export const uxSpanNames = ['wf.ux.reload', 'wf.ux.switch', 'wf.ux.switch.data_ready', 'wf.ux.first_frame', 'wf.sync.transition', 'wf.ux.send_echo'] as const
+export const uxSpanNames = ['wf.ux.reload', 'wf.ux.switch', 'wf.ux.switch.data_ready', 'wf.ux.first_frame', 'wf.sync.transition', 'wf.ux.send_echo', 'wf.ux.alert_landed'] as const
 export const uxAttributeNames = ['wf.ux.budget_ms', 'wf.ux.budget_phase', 'wf.ux.budget_met', 'wf.ux.shell_ms', 'wf.ux.roster_after_shell_ms', 'wf.ux.cache', 'wf.ux.slot_count', 'wf.ux.data_ready_ms', 'wf.ux.painted', 'wf.ux.outcome', 'wf.subscription.kind', 'wf.sync.from', 'wf.sync.to', 'wf.sync.stage', 'wf.sync.previous_ms', 'wf.sync.reconnect_ms'] as const
 
 /** Browser-visible completion, not a React render or a data-arrival timestamp. */
@@ -24,6 +24,9 @@ export const afterNextPaint = (callback: () => void): (() => void) => {
   }
 }
 
+/** st's `alert_landed_p95_ms_lt` (clients/typescript/st3-views/slo.ts): an answered alert leaves within 2 s. */
+const ALERT_LANDED_BUDGET_MS = 2000
+
 interface Operation {
   readonly span: Tracer.Span
   readonly start: number
@@ -40,6 +43,8 @@ export interface UxTelemetry {
   readonly transcriptCommitted: (ref: string) => () => void
   /** Feature layer hook: invoke at send, complete only when the verified echo DOM commits. */
   readonly beginSendEcho: () => { readonly committed: () => () => void; readonly cancel: () => void }
+  /** Invoke when st takes an answer to an alert; complete when the cleared strip paints (st's `alert_landed`). */
+  readonly beginAlertAnswer: () => { readonly landed: () => () => void; readonly cancel: () => void }
   readonly observeSync: (options: { readonly key: object; readonly kind: 'window' | 'conversation' | 'terminal' | 'gateway'; readonly status: SyncStatus }) => void
   readonly dispose: () => void
 }
@@ -133,6 +138,18 @@ export const makeUxTelemetry = ({ tracer, now = () => performance.now(), timeOri
           if (!operations.has(operation)) return
           operation.span.attribute('wf.ux.painted', true)
           operation.span.attribute('wf.ux.budget_met', now() - operation.start < 100)
+          operation.finish('painted')
+        }),
+        cancel: () => operation.finish('disposed'),
+      }
+    },
+    beginAlertAnswer: () => {
+      const operation = start('wf.ux.alert_landed', 'answer', { 'wf.ux.budget_ms': ALERT_LANDED_BUDGET_MS, 'wf.ux.budget_phase': 'answer-to-cleared-paint', 'wf.ux.painted': false })
+      return {
+        landed: () => onPaint(() => {
+          if (!operations.has(operation)) return
+          operation.span.attribute('wf.ux.painted', true)
+          operation.span.attribute('wf.ux.budget_met', now() - operation.start < ALERT_LANDED_BUDGET_MS)
           operation.finish('painted')
         }),
         cancel: () => operation.finish('disposed'),

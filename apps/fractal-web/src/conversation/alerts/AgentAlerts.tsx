@@ -4,6 +4,7 @@ import * as React from 'react'
 
 import {
   alertConversations,
+  alertsIn,
   answerLabel,
   offeredAnswers,
   pendingCalls,
@@ -16,8 +17,11 @@ import {
 } from '../../../../../clients/typescript/st3-views/homeView.ts'
 import { geometryVars as g, spaceVars as s } from '../../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { useAttention, useDataSource } from '../../data/react.tsx'
-import { scale, tokens } from '../../ui-compat/tokens.stylex.ts'
-import { Button } from '../../ui-compat/components.tsx'
+import type { UxTelemetry } from '../../telemetry/ux.ts'
+import { tokens } from '../../ui-compat/tokens.stylex.ts'
+import { AlertButton } from './AlertButton.tsx'
+import type { AlertAction, AlertActionResult } from './alert-action-port.ts'
+import { AnswerAlert } from './AnswerAlert.tsx'
 
 /** What the strip reads of a conversation's items: its tool calls, joined with their results. */
 export type ConversationCall = { readonly _tag: string; readonly id: string } & Partial<{
@@ -36,25 +40,31 @@ const styles = stylex.create({
     marginInline: 'auto',
     display: 'flex',
     flexDirection: 'column',
-    gap: scale.space2,
+    gap: '8px',
     paddingBlock: s.md,
     borderTopWidth: 1,
     borderTopStyle: 'solid',
     borderTopColor: tokens['--ds-gray-alpha-400'],
+    // Many alerts keep the conversation readable: the strip scrolls, the transcript keeps its room.
+    maxHeight: '40vh',
+    overflowY: 'auto',
   },
-  alert: { display: 'flex', flexDirection: 'column', gap: scale.space1, fontSize: '0.8125rem' },
+  count: { fontWeight: 600, fontSize: '0.75rem', color: tokens['--ds-gray-900'] },
+  folded: { display: 'flex', flexDirection: 'column', gap: '8px' },
+  summary: { cursor: 'pointer', fontWeight: 600, fontSize: '0.8125rem', color: tokens['--ds-gray-1000'] },
+  alert: { display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '0.8125rem' },
   title: { fontWeight: 600, color: tokens['--ds-gray-1000'] },
   detail: { color: tokens['--ds-gray-900'], whiteSpace: 'pre-wrap' },
   call: {
     margin: 0,
-    padding: scale.space2,
+    padding: '8px',
     borderRadius: 4,
     backgroundColor: tokens['--ds-gray-alpha-100'],
     whiteSpace: 'pre-wrap',
     overflowWrap: 'anywhere',
     fontSize: '0.75rem',
   },
-  answers: { display: 'flex', flexWrap: 'wrap', gap: scale.space2 },
+  answers: { display: 'flex', flexWrap: 'wrap', gap: '8px' },
   note: { color: tokens['--ds-gray-900'], fontSize: '0.75rem' },
 })
 
@@ -67,6 +77,13 @@ export const promptAlerts = (items: readonly Native.Attention[], agentRef: strin
       alertConversations(item).includes(agentRef),
   )
 
+/**
+ * Every alert this agent's conversation shows, as stui and the phone choose them (`alertsIn`):
+ * open, an alert, of a kind Home shows, and naming this conversation.
+ */
+export const conversationAlerts = (items: readonly Native.Attention[], agentRef: string): readonly Native.Attention[] =>
+  alertsIn(items, agentRef, undefined)
+
 /** The tool calls a conversation shows with no result yet, in full, as st3-views reads them. */
 export const waitingCalls = (items: readonly ConversationCall[]): PendingCall[] =>
   pendingCalls(
@@ -78,29 +95,44 @@ export const waitingCalls = (items: readonly ConversationCall[]): PendingCall[] 
   )
 
 type Answer = (alert: Native.Attention, answer: string, sent: string) => Promise<PromptAnswerResult>
+type Act = (alert: Native.Attention, action: AlertAction) => Promise<AlertActionResult>
 
 /**
- * The prompts an agent's harness waits on, above its composer, with the answers st can deliver:
- * the one waiting call in full beside `allow` (or a plan beside `approve`), a question's options
- * to choose and send together, a screen prompt's own answers. Anything else is answered in the
- * seat's terminal. An answer in the terminal still wins.
+ * The alerts of an agent's conversation, above its composer. A prompt its harness waits on shows
+ * with the answers st can deliver: the one waiting call in full beside `allow` (or a plan beside
+ * `approve`), a question's options to choose and send together, a screen prompt's own answers.
+ * Anything else is answered in the seat's terminal, and an answer there still wins. An ask or a
+ * review gate shows with its own answers (`AnswerAlert`).
  */
 export const AgentAlerts = ({
   alerts,
   calls,
   onAnswer,
+  onAct,
 }: {
   readonly alerts: readonly Native.Attention[]
   readonly calls: readonly PendingCall[]
   readonly onAnswer?: Answer
+  readonly onAct?: Act
 }): React.ReactNode => {
   if (alerts.length === 0) return null
+  const one = (alert: Native.Attention) =>
+    alert.attention_kind === 'harness-prompt'
+      // A new prompt or revision behind the same alert starts with nothing chosen.
+      ? <PromptAlert key={promptAlertKey(alert)} alert={alert} calls={calls} onAnswer={onAnswer} />
+      : <AnswerAlert key={alert.id} alert={alert} onAct={onAct} />
+  const [first, ...rest] = alerts
   return (
     <div {...stylex.props(styles.pinned)} data-testid="conversation-alerts">
       <div {...stylex.props(styles.strip)}>
-        {alerts.map((alert) => (
-          // A new prompt or revision behind the same alert starts with nothing chosen.
-          <PromptAlert key={promptAlertKey(alert)} alert={alert} calls={calls} onAnswer={onAnswer} />
+        {alerts.length > 1 ? <div {...stylex.props(styles.count)}>◆ {alerts.length} alerts</div> : null}
+        {one(first!)}
+        {/* The first alert is open; the others open on a click, as on the phone. */}
+        {rest.map((alert) => (
+          <details key={alert.id} {...stylex.props(styles.folded)}>
+            <summary {...stylex.props(styles.summary)}>◆ {alert.title}</summary>
+            {one(alert)}
+          </details>
         ))}
       </div>
     </div>
@@ -163,10 +195,10 @@ const PromptAlert = ({
               {question.options.map((option, choice) => {
                 const on = (chosen[index] ?? []).includes(choice)
                 return (
-                  <Button key={choice} size="sm" variant={on ? 'primary' : 'secondary'} aria-pressed={on} isDisabled={sending}
+                  <AlertButton key={choice} tone={on ? 'primary' : 'secondary'} aria-pressed={on} isDisabled={sending}
                     onPress={() => choose(index, choice, question.multiSelect)}>
                     {on ? `✓ ${option.label}` : option.label}
-                  </Button>
+                  </AlertButton>
                 )
               })}
             </div>
@@ -187,10 +219,10 @@ const PromptAlert = ({
       {offered.length > 0 ? (
         <div {...stylex.props(styles.answers)}>
           {offered.map((answer) => (
-            <Button key={answer} size="sm" variant={answer === 'deny' ? 'danger' : answer === gated ? 'primary' : 'secondary'}
+            <AlertButton key={answer} tone={answer === 'deny' ? 'danger' : answer === gated ? 'primary' : 'secondary'}
               isDisabled={sending || (answer === 'answer' && sendable === null)} onPress={() => send(answer)}>
               {answer === 'deny' && gated === 'answer' ? 'Decline' : answerLabel(answer)}
-            </Button>
+            </AlertButton>
           ))}
         </div>
       ) : null}
@@ -203,17 +235,47 @@ const PromptAlert = ({
 export const LiveAgentAlerts = ({
   agentRef,
   items,
+  ux,
 }: {
   readonly agentRef: string
   readonly items: readonly ConversationCall[]
+  readonly ux?: UxTelemetry
 }): React.ReactNode => {
   const source = useDataSource()
   const attention = useAttention()
   const calls = React.useMemo(() => waitingCalls(items), [items])
   const alerts = React.useMemo(
-    () => (attention._tag === 'Observed' ? promptAlerts(attention.value, agentRef) : []),
+    () => (attention._tag === 'Observed' ? conversationAlerts(attention.value, agentRef) : []),
     [attention, agentRef],
   )
+  // From st taking an answer to the paint that no longer shows its alert (st's `alert_landed`).
+  const answered = React.useRef(new Map<string, ReturnType<UxTelemetry['beginAlertAnswer']>>())
+  const landing = React.useRef<Array<() => void>>([])
+  React.useLayoutEffect(() => {
+    const shown = new Set<string>(alerts.map((alert) => alert.id))
+    for (const [id, operation] of answered.current) {
+      if (shown.has(id)) continue
+      answered.current.delete(id)
+      landing.current.push(operation.landed())
+    }
+  }, [alerts])
+  React.useEffect(() => () => {
+    for (const operation of answered.current.values()) operation.cancel()
+    for (const cancel of landing.current) cancel()
+  }, [])
+  const actions = source.alertActions
+  const onAct: Act | undefined =
+    actions === undefined
+      ? undefined
+      : (alert, action) => {
+          const operation = ux?.beginAlertAnswer()
+          return actions.act({ alert, action }).then((result) => {
+            if (operation === undefined) return result
+            if (result._tag === 'Sent') answered.current.set(alert.id, operation)
+            else operation.cancel()
+            return result
+          })
+        }
   const prompts = source.prompts
   const onAnswer: Answer | undefined =
     prompts === undefined
@@ -227,5 +289,5 @@ export const LiveAgentAlerts = ({
                 answer: sent,
               })
         }
-  return <AgentAlerts alerts={alerts} calls={calls} onAnswer={onAnswer} />
+  return <AgentAlerts alerts={alerts} calls={calls} onAnswer={onAnswer} onAct={onAct} />
 }

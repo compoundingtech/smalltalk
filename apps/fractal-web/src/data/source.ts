@@ -42,6 +42,7 @@ import type { TerminalInputPortFactory } from '../terminal/orderedTerminalInput.
 import type { TerminalResizePort } from '../terminal/terminal-resize-port.ts'
 import type { AgentControlPort } from '../agents/agent-control-port.ts'
 import type { PromptAnswerPort } from '../conversation/alerts/prompt-answer-port.ts'
+import type { AlertActionPort } from '../conversation/alerts/alert-action-port.ts'
 import type { DocumentPort } from '../documents/document-port.ts'
 import type { SubjectReads } from './subjectReadPort.ts'
 
@@ -283,6 +284,8 @@ export interface DataSource {
   readonly terminalResize?: TerminalResizePort
   /** Answers to native harness prompts (`prompt.respond`), one submission each. */
   readonly prompts?: PromptAnswerPort
+  /** Answers to asks and review gates (`work.done`, `review.*`), one submission each. */
+  readonly alertActions?: AlertActionPort
   /** Retained owner scrollback, with its own independently granted availability. */
   readonly terminalHistory?: TerminalHistoryFactory
   /** Ordered input sessions bound to one terminal incarnation; absent when the source cannot type. */

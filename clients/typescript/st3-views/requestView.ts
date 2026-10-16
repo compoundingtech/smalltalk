@@ -26,7 +26,7 @@ export function report(text: string): Report | null {
   try { fields = JSON.parse(text.slice(start, end + 1)); } catch { return null; }
   if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return null;
   const record = fields as Record<string, unknown>;
-  const shown = (value: unknown) => typeof value === 'string' ? value.split('\n')[0] : JSON.stringify(value);
+  const shown = (value: unknown): string => (typeof value === 'string' ? value.split('\n')[0] : JSON.stringify(value)) ?? '';
   let telling = TELLING.filter(key => key in record);
   if (!telling.length) telling = Object.keys(record).slice(0, OTHERS);
   const rows: ReportRow[] = telling.map(key => ({
