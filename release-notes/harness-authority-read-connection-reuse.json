@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Harness authority reads reuse SQLite connections without retaining snapshots, avoiding repeated connection setup while limiting the cache to 128 connections across the process and 64 per thread.",
+  "replay": {"status": "none", "detail": "Read connection reuse only; claims, events and replay are unchanged."},
+  "schema": {"status": "none", "detail": "No schema change; the spool version is still checked on every read."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "Reads retain the same runtime ownership checks and observe newly committed state. Replaced spool files reopen their connections. When the global cache is full, a thread replaces its oldest connection or reads without caching."},
+  "downtime": {"status": "none", "detail": "No coordinated downtime."},
+  "manual": {"status": "none", "detail": "No operator step."},
+  "recovery": {"status": "none", "detail": "Revert the commit; no stored data migration is required."}
+}
