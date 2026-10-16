@@ -22,6 +22,34 @@ const ASSISTANT: &str = include_str!("builtins/assistant.kdl");
 const ONBOARDING: &str = include_str!("builtins/onboarding.kdl");
 const GUIDE: &str = include_str!("../../../docs/st3/onboarding-guide.md");
 
+type Sink = Box<dyn FnMut(String)>;
+
+thread_local! {
+    /// Where this thread's setup and onboarding output goes instead of the terminal, while the
+    /// setup screen owns it. The caller prints what was said once the screen has gone.
+    static SINK: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Say one line to the person: on the terminal, or into the sink when one is set.
+pub(crate) fn said(line: impl Into<String>) {
+    let line = line.into();
+    let unsent = SINK.with(|sink| match sink.borrow_mut().as_mut() {
+        Some(send) => {
+            send(line);
+            None
+        }
+        None => Some(line),
+    });
+    if let Some(line) = unsent {
+        println!("{line}");
+    }
+}
+
+/// Set (or clear) this thread's sink; returns the one it replaced.
+pub(crate) fn capture(sink: Option<Sink>) -> Option<Sink> {
+    SINK.with(|current| std::mem::replace(&mut *current.borrow_mut(), sink))
+}
+
 fn client(config: &Config) -> Result<Client> {
     Client::unix_as(
         config.client_socket(),
@@ -117,7 +145,7 @@ pub async fn start(
             subject.desired_token.is_some() && subject.kind.as_deref() != Some("agent")
         })
     {
-        crate::setup::said(
+        said(
             "The built-in Smalltalk Assistant is stopped; setup leaves it stopped. Use st setup --onboarding to begin again explicitly."
         );
         return Ok(None);
@@ -214,7 +242,7 @@ pub async fn start(
         .await?
         .context("built-in Smalltalk Assistant disappeared during publication")?;
     if current.kind.as_deref() != Some("agent") {
-        crate::setup::said("The built-in Smalltalk Assistant was stopped; setup leaves it stopped.");
+        said("The built-in Smalltalk Assistant was stopped; setup leaves it stopped.");
         return Ok(None);
     }
     anyhow::ensure!(
@@ -257,7 +285,7 @@ pub async fn start(
         }
         return Err(error);
     }
-    crate::setup::said(
+    said(
         "Started mission/st/onboarding with agent/st/assistant. The Assistant stays available after onboarding."
     );
     Ok(Some(ASSISTANT_SUBJECT.into()))
@@ -268,7 +296,7 @@ fn declaration_changed(rerun: bool) -> Result<Option<String>> {
         !rerun,
         "the built-in Smalltalk Assistant changed during setup; retry setup to inspect its new state"
     );
-    crate::setup::said(
+    said(
         "The onboarding declarations changed concurrently; ordinary setup preserves their current state. Run st setup again if onboarding has not started."
     );
     Ok(None)

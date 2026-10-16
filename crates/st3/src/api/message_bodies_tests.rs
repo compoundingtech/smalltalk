@@ -691,8 +691,8 @@ async fn a_body_is_named_while_its_message_exists_and_only_then() {
         temporary: false,
         expired: false,
     };
-    assert!(message_body::body_is_named(&state.store, &file(subject.trim_start_matches("message/"))));
-    assert!(!message_body::body_is_named(&state.store, &file("no-such-message")));
+    assert!(crate::store::message_bodies::body_is_named(&state.store, &file(subject.trim_start_matches("message/"))));
+    assert!(!crate::store::message_bodies::body_is_named(&state.store, &file("no-such-message")));
 }
 
 #[test]
@@ -787,7 +787,7 @@ async fn an_expired_body_reads_as_expired_and_keeps_the_message_valid() {
             .set_modified(ago(days))
             .unwrap();
     };
-    let named = |file: &message_body::BodyFile| message_body::body_is_named(&state.store, file);
+    let named = |file: &message_body::BodyFile| crate::store::message_bodies::body_is_named(&state.store, file);
     // Inside its retention the body stays; past it, the text goes and a marker stays.
     age(10);
     assert_eq!(bodies.reconcile(message_body::retention_from(None), named), 0);

@@ -10,6 +10,7 @@ mod ci_test_paths;
 pub mod accounts;
 pub mod api;
 pub mod archive;
+pub(crate) mod client_values;
 pub mod attach_image;
 pub mod backup;
 pub mod blobs;
