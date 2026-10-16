@@ -217,6 +217,60 @@ st conversations ls person/ada
 `st alerts ls`. `reject` and `request-changes` also take `--reason TEXT`.
 If the gate is no longer waiting, it says who answered it or what changed since it asked.
 
+After changing a person identity, repair its current inbox once. Upgrade every fleet member
+to a build that understands person repair first, and send the repair through one member.
+OLD and NEW must be distinct complete `person/NAME` subjects. NEW must already be known
+from stored identity or routing evidence; naming it in this request does not create it.
+Only OLD or NEW may act: agents and unrelated people are refused.
+
+```sh
+st persons rename person/ada person/robin --as person/robin \
+  --idempotency-key ada-person-repair
+```
+
+This atomically reassigns eligible open person steps and pending human reviews on that
+member without changing their episodes, original requests, saved specifications, run
+requesters, or historical actors. It creates no alias and does not rewrite published
+missions. Work created later still follows its declarations.
+
+Use `--json` to keep the complete report:
+
+| Report field | Meaning and next action |
+| --- | --- |
+| `reassigned_steps`, `reassigned_reviews` | Current steps and review owners moved to NEW. Read NEW's inbox to continue them. |
+| `unchanged_attention_requests`, `unchanged_fault_cards` | Current attention requests and fault cards still routed to OLD; these were not moved. Inspect each ID and resolve it through its normal workflow. |
+| `unchanged_revision_approvals`, `unchanged_planning_launch_approvals` | Revision-proposal and planning-launch approvals still routed to OLD; these were not moved either. Inspect and handle the existing approval rather than assuming it reached NEW. |
+| `live_run_references` | Live run IDs mapped to JSON-pointer paths that still name OLD in their routing or retained specifications. Runtime step assignees use `/step_runs/<escaped-step-subject>/assignee`; saved-spec routes and `/requester` are listed separately. Inspect the run and use an authorized run revision where appropriate; republishing alone does not change a live run. |
+| `published_mission_references` | Published mission IDs mapped to JSON-pointer paths still naming OLD, including step assignees and reviewer routes. Update the source declarations and republish before starting future work. |
+| `run_requesters`, `missions_to_republish` | Summary IDs for unchanged live-run requesters and published missions with OLD references. Requesters remain historical attribution, not renamed actors. |
+| `namespace_notice` | Client-derived custom/person namespaces, including private glasses and terminals, are not automatically moved. No namespace migration or alias is created. |
+
+The report is a snapshot, not a promise that OLD will receive no future work. Review every
+unchanged category and routing path. Saved specifications and historical attribution remain
+unchanged even when current runtime routing has moved.
+
+After a timeout, retry the **same key and identical request**, including the actor, through
+the same upgraded member. The winning durable receipt returns its original report, including
+after reopen or replication; it does not sweep work created since that receipt. Reusing a key
+for another request returns `idempotency-conflict`. A completed repair fences OLD against a
+different destination with `person-rename-conflict` before any routing writes, so competing
+requests on that member cannot split the repair.
+
+Independent disconnected members can each initially accept a different destination.
+After their receipts replicate, the earliest completed receipt in canonical claim order
+(including envelope ordering) selects one destination consistently for both work and review
+routing. Losing routes are removed by rebuilding the affected run projections; retrying a
+losing receipt's exact request returns `person-rename-conflict` instead of its old report.
+The winner's exact retry remains write-free. This is eventual convergence, not global
+admission exclusion before replication. Use one member for repair rather than deliberately
+issuing competing requests.
+
+Do not try to undo a completed repair by swapping an older binary back in or sending OLD to
+another destination. Keep the receipt and claim history, finish updating declarations and
+handling the reported unchanged items, and roll forward on compatible builds. Restoring an
+older backup loses subsequent claims and requires coordinated fleet recovery, not just a
+local binary rollback.
+
 `st --help` and `st help` show the main uses first. They then group commands for everyday use,
 agent seats, and running a machine or fleet. `st help --all` also lists commands used internally.
 Use `st help agents new` to open a command's full help.

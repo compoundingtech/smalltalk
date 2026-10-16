@@ -178,6 +178,11 @@ enum Command {
         #[command(subcommand)]
         command: AgentsCommand,
     },
+    /// Repair current work after a person identity changes.
+    Persons {
+        #[command(subcommand)]
+        command: PersonsCommand,
+    },
     /// Read, follow, and send normalized conversations.
     Conversations {
         #[command(subcommand)]
@@ -3482,6 +3487,24 @@ struct AgentHoldArgs {
     actor: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum PersonsCommand {
+    /// Reassign open work and pending reviews; report declarations needing republishing.
+    Rename(PersonRenameArgs),
+}
+
+#[derive(Args)]
+struct PersonRenameArgs {
+    #[arg(value_parser = parse_person_subject)]
+    old_person: String,
+    #[arg(value_parser = parse_person_subject)]
+    new_person: String,
+    #[arg(long = "as", value_parser = parse_actor_subject)]
+    actor: Option<String>,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    idempotency_key: Option<String>,
+}
+
 #[derive(Args)]
 struct AgentRenameArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
@@ -5893,6 +5916,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Agents { command } => {
             run_agents(&endpoint, config.person.as_deref(), command, cli.json).await
         }
+        Command::Persons { command } => {
+            run_persons(&endpoint, config.person.as_deref(), command, cli.json).await
+        }
         Command::Conversations { command } => {
             run_message(
                 &client,
@@ -6159,6 +6185,11 @@ fn guard_mutating_cli_actor(
                 None => None,
             },
             _ => None,
+        },
+        Command::Persons { command } => match command {
+            PersonsCommand::Rename(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness person rename needs explicit --as {own}")
+            })?),
         },
         Command::Work { command } => match command {
             WorkCommand::Delegation(args) => Some(args.actor.as_str()),
@@ -14031,6 +14062,34 @@ fn render_import_session(session: &st3_client::Session) -> String {
         let _ = writeln!(output, "  blocked: {reason}");
     }
     output
+}
+
+async fn run_persons(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    command: PersonsCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        PersonsCommand::Rename(args) => {
+            let actor = args.actor.as_deref().or(configured_person).context(
+                "st3 persons rename needs --as ACTOR or a configured person",
+            )?;
+            let response: Value = cli_client(endpoint)
+                .post(
+                    "/v1/persons/rename",
+                    &json!({
+                        "old_person": args.old_person,
+                        "new_person": args.new_person,
+                        "actor": actor,
+                        "idempotency_key": args.idempotency_key
+                            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                    }),
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+    }
 }
 
 async fn run_agents(
@@ -29504,6 +29563,7 @@ mod tests {
             );
         }
     }
+
 
     #[test]
     fn removed_legacy_handlers_are_absent_from_cli_and_server_sources() {

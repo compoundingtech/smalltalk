@@ -1317,6 +1317,46 @@
       "gate"
     ]
   },
+  "gate.reviewer-reassigned": {
+    "kind": "gate.reviewer-reassigned",
+    "subjects": [
+      "gate-operation"
+    ],
+    "fields": {
+      "owner": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      },
+      "previous_reviewer": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      },
+      "request": {
+        "value_type": "string",
+        "required": false,
+        "immutable": false,
+        "reference": false
+      },
+      "reviewer": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      }
+    },
+    "additional_fields": false,
+    "write_policy": "authorized-requester",
+    "cardinality": "append",
+    "projection": "gates",
+    "wakes_reconciler": true,
+    "source_kdl": [
+      "gate"
+    ]
+  },
   "github.posted": {
     "kind": "github.posted",
     "subjects": [
@@ -3747,6 +3787,37 @@
     "write_policy": "same-subject-actor",
     "cardinality": "state-transition",
     "projection": "directive-notes",
+    "wakes_reconciler": false
+  },
+  "person.rename.completed": {
+    "kind": "person.rename.completed",
+    "subjects": [
+      "person"
+    ],
+    "fields": {
+      "new_person": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      },
+      "old_person": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      },
+      "report": {
+        "value_type": "object",
+        "required": false,
+        "immutable": false,
+        "reference": false
+      }
+    },
+    "additional_fields": false,
+    "write_policy": "authorized-requester",
+    "cardinality": "append",
+    "projection": null,
     "wakes_reconciler": false
   },
   "planning-session.approved": {
@@ -7578,6 +7649,55 @@
     },
     "additional_fields": false,
     "write_policy": "authorized-participant",
+    "cardinality": "append",
+    "projection": "work",
+    "wakes_reconciler": true
+  },
+  "work.person-reassigned": {
+    "kind": "work.person-reassigned",
+    "subjects": [
+      "step-run"
+    ],
+    "fields": {
+      "attempt": {
+        "value_type": "integer",
+        "required": false,
+        "immutable": false,
+        "reference": false
+      },
+      "episode": {
+        "value_type": "string",
+        "required": false,
+        "immutable": false,
+        "reference": false
+      },
+      "generation": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      },
+      "person": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      },
+      "previous_person": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      },
+      "run": {
+        "value_type": "subject-reference",
+        "required": false,
+        "immutable": false,
+        "reference": true
+      }
+    },
+    "additional_fields": false,
+    "write_policy": "authorized-requester",
     "cardinality": "append",
     "projection": "work",
     "wakes_reconciler": true
