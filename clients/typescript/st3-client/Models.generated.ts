@@ -2068,7 +2068,7 @@ export type TimelineUsageBody = {
   turn_id?: string;
 };
 
-export type TimelineView = (TimelineViewBash | TimelineViewEdit | TimelineViewWrite | TimelineViewRead | TimelineViewSearch | TimelineViewTodo | TimelineViewAsk | TimelineViewTask | TimelineViewHub | TimelineViewEval | TimelineViewGeneric | TimelineViewIrc | TimelineViewJob | TimelineViewSkill | TimelineViewCompaction | TimelineViewAssistantError | TimelineViewModelChange | TimelineViewThinkingLevel | TimelineViewTitle | TimelineViewSessionExit | TimelineViewToolStart | TimelineViewResetBoundary | TimelineViewCredentialPin | {
+export type TimelineView = (TimelineViewBash | TimelineViewEdit | TimelineViewWrite | TimelineViewRead | TimelineViewSearch | TimelineViewTodo | TimelineViewAsk | TimelineViewTask | TimelineViewHub | TimelineViewEval | TimelineViewGeneric | TimelineViewIrc | TimelineViewJob | TimelineViewSkill | TimelineViewCompaction | TimelineViewAssistantError | TimelineViewModelChange | TimelineViewThinkingLevel | TimelineViewTitle | TimelineViewSessionExit | TimelineViewToolStart | TimelineViewResetBoundary | TimelineViewCredentialPin | TimelineViewOmpEvent | {
   type: string;
 });
 
@@ -2212,6 +2212,14 @@ export type TimelineViewModelChange = {
   model: string;
   role?: string;
   type: "model_change";
+};
+
+export type TimelineViewOmpEvent = {
+  attribution?: unknown;
+  content?: unknown;
+  details?: unknown;
+  kind: string;
+  type: "omp_event";
 };
 
 export type TimelineViewRead = {
