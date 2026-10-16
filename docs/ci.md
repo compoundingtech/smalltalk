@@ -543,6 +543,16 @@ for all observed HTTP(S) origins. Cookie/quota audits and a first-document
 local/session-storage audit reject residual state. Case-internal navigation may
 retain its own state; it is never inherited by another case.
 
+The gate takes three options, all unset in CI today (full set, a11y on, no budget).
+`KIT_PLAY_SET=critical` selects only stories tagged `critical` (an empty selection fails);
+`KIT_PLAY_A11Y=off` sets addon-a11y's own `a11y.manual` global so axe does not run, and
+each case must then carry no a11y report, while with a11y on each case must carry exactly
+one passed a11y report; `KIT_PLAY_MAX_SECONDS` is the set's wall-time budget: every case
+still runs and a run over budget fails (fix the cause; the budget is not raised). The
+receipt records the set, a11y mode, budget, and machine-wide CPU in core-minutes with
+the load averages (exact on a dedicated runner).
+`kit-play-gate.browser-test.mjs` proves these against a fixture build in real Chromium.
+
 `kit-play-isolation.browser-test.mjs` runs in the same kit-input-gated CI lane before
 the full play matrix. It exercises storage/service-worker/popup isolation, concurrent
 worker independence, retained HTTP asset caching, and failing-story/leaked-state

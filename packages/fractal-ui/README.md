@@ -52,6 +52,8 @@ To run only the gate after building Storybook, inside `nix develop .#web`:
 node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook-static /tmp/fractal-kit-play-receipt
 ```
 
+Options (environment): `KIT_PLAY_SET=critical` runs only stories tagged `critical` (add `tags: ['critical']` to a story or its meta; the UI owners decide which flows are critical), `KIT_PLAY_A11Y=off` skips the axe check (the separate full run keeps it), and `KIT_PLAY_MAX_SECONDS=<n>` fails a run that takes longer than its budget while still running every case. The receipt records the set, a11y mode, budget and CPU core-minutes.
+
 ## Stories
 
 - **Fractal UI / Visual language**: one working context rendered in the chosen direction. It contains a thread list, a conversation with a tool call and a diff, a terminal pane, a command palette and component specimens. `Explore` exposes direction, scheme and density as canvas controls and Storybook args. The `FolioLight` … `OrbitDark` and `Compact` stories are fixed comparison entries.

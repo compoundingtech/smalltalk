@@ -295,7 +295,7 @@ for required in (False, True):
         result = subprocess.run(["bash", "-c", harness], check=True, capture_output=True, text=True,
                                 env={**os.environ, "KIT_INPUTS": str(required).lower(),
                                      "BASE_SHA": "base", "HEAD_SHA": "head", "GITHUB_STEP_SUMMARY": str(summary)})
-        for name in ("UI kit play index contracts", "UI kit context isolation controls", "UI kit Storybook", "UI kit strict plays"):
+        for name in ("UI kit play index contracts", "UI kit context isolation controls", "UI kit gate set, a11y and budget controls", "UI kit Storybook", "UI kit strict plays"):
             assert (name in result.stdout) == required, result.stdout
         if not required:
             assert "skipped: no kit inputs changed (base..head)" in summary.read_text()
