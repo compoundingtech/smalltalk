@@ -127,6 +127,7 @@ async fn completion_control(order: Option<&str>, exit: u8, rejection: Option<&st
     let runtime = runtime();
     let socket = root.path().join("api.sock");
     let state = st3::api::AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,

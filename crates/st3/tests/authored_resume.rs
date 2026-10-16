@@ -104,6 +104,7 @@ agent "garden/worker" {{
         .unwrap();
     let socket = root.path().join("api.sock");
     let state = AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

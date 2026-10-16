@@ -640,3 +640,68 @@ fn message_operation_late_conflict_after_duplicate_receipt_matches_replay() {
         serde_json::to_value(&signature).unwrap()
     );
 }
+
+#[test]
+fn assistant_provenance_generic_signed_and_transaction_appends_refuse_forgery() {
+    let store = Store::open_memory("node").unwrap();
+    for (actor, field, value) in [
+        ("assistant/chatgpt", "from", json!("person/eval")),
+        ("person/eval", "from", json!("assistant/chatgpt")),
+        ("person/eval", "sender_class", json!("external-assistant")),
+        ("person/eval", "assistant_grant_id", json!("assistant-grant/forged")),
+    ] {
+        let mut input = request();
+        input.actor = Some(actor.into());
+        input.fields.insert(field.into(), value);
+        assert_eq!(store.append_claim(&input).unwrap_err().code, "assistant-send-refused");
+        assert_eq!(store.graph.append_claim_outcome(&input).unwrap_err().code, "assistant-send-refused");
+        assert_eq!(store.append_signed_message(&input, &signed(&input)).unwrap_err().code, "assistant-send-refused");
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let error = append_claim_tx(&transaction, "node", &input.subject, &input.kind,
+            input.actor.as_deref(), &json!({"fields":input.fields}), &[], None).unwrap_err();
+        assert_eq!(error.downcast_ref::<St3Error>().unwrap().code, "assistant-send-refused");
+    }
+    assert!(store.latest_claim("message/local-signed-send", None).unwrap().is_none());
+}
+
+#[test]
+fn assistant_provenance_stamps_authenticated_grant_and_preserves_replica_admission() {
+    let store = Store::open_memory("node").unwrap();
+    let grant_subject = "custom/client/assistant-v1-native-fixture";
+    let grant_id = "assistant-grant/native-fixture";
+    store.append_claim(&ClaimInput {
+        subject: grant_subject.into(), kind: "custom.client.assistant.v1.granted".into(),
+        actor: Some("person/eval".into()),
+        fields: serde_json::from_value(json!({
+            "principal":"assistant/chatgpt", "session_actor":"assistant/chatgpt/session/native-fixture",
+            "issuer":"person/eval", "disclosure_consent":true, "policy_revision":1,
+            "expires_at_unix_ms":now_ms() as u64 + 60_000,
+            "scopes":["write.assistant.messages"], "recipient_allowlist":["agent/eval.recipient"],
+            "grant_id":grant_id
+        })).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let authorization = assistant_write::AssistantWriteAuthorization {
+        grant_subject: grant_subject.into(), actor: "assistant/chatgpt/session/native-fixture".into(),
+        owner: "person/eval".into(), policy_revision: 1, scope: "write.assistant.messages".into(),
+        recipient: Some("agent/eval.recipient".into()), approval_subject: None,
+    };
+    let mut input = request();
+    input.fields.insert("sender_class".into(), json!("external-assistant"));
+    input.fields.insert("assistant_grant_id".into(), json!("assistant-grant/caller-forged"));
+    let (claim, appended) = store.append_assistant_claim_outcome(&input, &authorization).unwrap();
+    assert!(appended);
+    assert_eq!(claim.body["fields"]["sender_class"], "external-assistant");
+    assert_eq!(claim.body["fields"]["assistant_grant_id"], grant_id);
+    assert_eq!(store.append_assistant_claim_outcome(&input, &authorization).unwrap().0.id, claim.id);
+    assert!(matches!(classify_replicated_claim_with_registry(&claim, st3_schema::registry()).unwrap(),
+        ReplicatedClaimAdmission::Valid));
+    let mut forged = claim;
+    forged.body["fields"].as_object_mut().unwrap().remove("assistant_grant_id");
+    assert_eq!(classify_replicated_claim_with_registry(&forged, st3_schema::registry()).err().unwrap().code,
+        "assistant-send-refused");
+    let mut wrong_actor = input;
+    wrong_actor.actor = Some("person/intruder".into());
+    assert_eq!(store.append_assistant_claim_outcome(&wrong_actor, &authorization).unwrap_err().code, "forbidden");
+}

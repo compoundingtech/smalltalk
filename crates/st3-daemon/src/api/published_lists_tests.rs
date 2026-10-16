@@ -754,6 +754,7 @@ fn published_lists_follow_a_nested_run_tree() {
 
 fn app_state(root: &std::path::Path) -> AppState {
     AppState {
+        owning_person: None,
         store: Arc::new(Store::open(&root.join("graph.db"), "cedar").unwrap()),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

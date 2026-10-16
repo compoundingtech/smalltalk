@@ -425,6 +425,7 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
     let notify = Arc::new(Notify::new());
     let (event_notify, _events) = watch::channel(0_u64);
     let state = AppState {
+        owning_person: None,
         store: store.clone(),
         notify: notify.clone(),
         event_notify: event_notify.clone(),
@@ -1744,6 +1745,7 @@ async fn send_messages(scratch: &Path, main: &Path, count: usize) {
     let store = Arc::new(Store::open(main, NODE).unwrap());
     let socket = scratch.join("generate.sock");
     let state = AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

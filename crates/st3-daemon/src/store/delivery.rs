@@ -53,6 +53,9 @@ impl Store {
         input: &ClaimInput,
         signature: &smallclaims::principal::ClaimSignature,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        assistant_write::refuse_unverified(&input.kind, input.actor.as_deref(),
+            input.fields.get("from").and_then(Value::as_str),
+            input.fields.contains_key("sender_class") || input.fields.contains_key("assistant_grant_id"))?;
         if input.kind != "message.sent" || input.actor.is_none() {
             return Err(St3Error::new("invalid-signature", "a signed message names its actor"));
         }

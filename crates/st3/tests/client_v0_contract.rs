@@ -1089,6 +1089,7 @@ fn event_feeds_are_contiguous_and_terminal_streams_replace_whole_screens() {
 
 fn test_state(root: &Path) -> AppState {
     AppState {
+        owning_person: None,
         // Server reads and writes overlap; use the daemon's file-backed WAL semantics.
         store: Arc::new(
             Store::open(&root.join("claims.sqlite3"), "client-v0-baseline").unwrap(),
@@ -2927,6 +2928,10 @@ mission "example/other/one" state="ready" { concurrent-runs; goal "Wait outside 
             client_json_person(app.clone(), "/v1/client/capabilities", agent).await;
         for capability in capabilities["value"]["capabilities"].as_array().unwrap() {
             let id = capability["id"].as_str().unwrap();
+            if id == "assistant.grants.v1" {
+                assert_eq!(capability["state"], "ungranted", "{agent}: {capability}");
+                continue;
+            }
             if capability["state"] == "unavailable" || id.contains("glass") {
                 continue;
             }
@@ -4611,4 +4616,76 @@ async fn terminal_filters_are_acknowledged_only_on_terminal_pages() {
         serde_json::json!({"owner": "agent/lookup/alder", "state": "running"})
     );
     assert_eq!(terminals["value"]["items"].as_array().unwrap().len(), 1);
+}
+
+/// Schema shape only: fixtures carry placeholder pins and an intentionally invalid signature, so
+/// this proves nothing about Ed25519 verification, nonce replay or pin equality (daemon tests do).
+#[test]
+fn assistant_read_fixtures_conform_and_malformed_proofs_and_pins_do_not() {
+    let envelope = contract_validator("Envelope");
+    for name in [
+        "assistant-summary.json",
+        "assistant-attention-page.json",
+        "assistant-mission-page.json",
+        "assistant-agent-page.json",
+        "assistant-conversation-content.json",
+        "assistant-terminal-content.json",
+    ] {
+        assert_conforms(&envelope, name, &fixture(name));
+    }
+    // An empty assistant page must not also read as a generic resource Page.
+    let mut empty = fixture("assistant-attention-page.json");
+    empty["value"]["items"] = serde_json::json!([]);
+    assert_conforms(&envelope, "empty assistant attention page", &empty);
+    // The summary carries counts and as_of only; the fixed owner never appears in it.
+    let mut summary = fixture("assistant-summary.json");
+    summary["value"]["person_id"] = serde_json::json!("person/operator");
+    assert!(!contract_validator("AssistantSummary").is_valid(&summary["value"]));
+
+    let proof = contract_validator("ScgReadAuthorization");
+    assert_conforms(&proof, "SCG read authorization", &fixture("assistant-read-authorization.json"));
+    for (pointer, value) in [
+        ("/signature", serde_json::json!("too-short")),
+        ("/payload/identity", serde_json::json!("claude")),
+        ("/payload/projection", serde_json::json!("status")),
+        ("/payload/request_digest", serde_json::json!("8AF8FF220CA571D9BB06E960970592116147A5BB0AD3D3C330306496B1B3DAA3")),
+        ("/payload/max_response_bytes", serde_json::json!(16385)),
+        ("/payload/parameters/start", serde_json::json!(0)),
+        ("/payload/issuer", serde_json::json!("assistant/chatgpt")),
+    ] {
+        let mut malformed = fixture("assistant-read-authorization.json");
+        *malformed.pointer_mut(pointer).unwrap() = value;
+        assert!(!proof.is_valid(&malformed), "{pointer} must be rejected");
+    }
+    let mut extra = fixture("assistant-read-authorization.json");
+    extra["payload"]["person_id"] = serde_json::json!("person/operator");
+    assert!(!proof.is_valid(&extra));
+
+    let trust = contract_validator("AssistantReadTrustRequest");
+    assert_conforms(&trust, "read trust request", &fixture("assistant-read-trust.json"));
+    for (field, value) in [
+        ("shim_public_key", serde_json::json!("c2hvcnQ")),
+        ("attestor_public_key", serde_json::json!("placeholder+attestor/pin=not-a-real-key-00")),
+        ("default_response_bytes", serde_json::json!(4097)),
+        ("max_response_bytes", serde_json::json!(16385)),
+        ("api_version", serde_json::json!("st3.client.v1")),
+    ] {
+        let mut malformed = fixture("assistant-read-trust.json");
+        malformed[field] = value;
+        assert!(!trust.is_valid(&malformed), "{field} must be rejected");
+    }
+    let operations = json(asset_root().join("schemas/operations.json"));
+    let assistant_reads = operations["reads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|read| read["path"].as_str().unwrap().starts_with("/v1/client/assistant/"))
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_reads.len(), 6);
+    for read in assistant_reads {
+        assert_eq!(read["proof_header"], "x-st3-scg-read-authorization", "{read}");
+        assert_eq!(read["minimal_read_mode"], "approval-once", "{read}");
+        assert_eq!(read["max_response_bytes"], 16384, "{read}");
+        assert!(read["scope"].as_str().unwrap().starts_with("read.assistant."), "{read}");
+    }
 }

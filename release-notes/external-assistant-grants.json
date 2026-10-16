@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "summary": "Add isolated external-assistant pairing and trusted-local revocable grant management without live issuance",
+  "replay": {
+    "status": "changed",
+    "detail": "Separate versioned assistant grant and revocation claims provide authoritative policy history; historical person grants retain their existing reader. Assistant requests and management must reach the authoritative grant issuer member."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Client-v0 adds disjoint person and assistant pairing requests and sessions, assistant grant policy models with a concrete PersonId issuer, challenge/device/capabilities metadata, and trusted-local grant inspect/revoke/policy operations."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Only the daemon-configured owning person through the trusted-local CLI manages assistant grants; absent owner configuration fails closed. Server-established harness and native-peer provenance prevents forged owner headers from enabling grant inspection or owner assistant-device enumeration; paired person devices cannot administer grants even over Unix. Deployment owner identity stays in external configuration, never a hardcoded public identity. Explicit closed read scopes, disclosure consent, bounded expiry and approval-once policy do not confer person authority or message permission."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Existing person wire shapes and profile semantics remain unchanged. The TypeScript SDK is a source break for general pairing callers: PairingBegin and PairedSession become untagged unions (PersonPairingBegin | AssistantPairingBegin and PersonPairedSession | AssistantPairedSession), so generic callers must narrow before reading person_id, and person_id becomes optional on shared projections; Rust person variants keep deny_unknown_fields. Generated SDK person callers use PersonPairingBegin/PersonPairedSession. Assistant grants require assistant.grants.v1 and never fall back to person pairing."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal daemon replacement is sufficient; no live grant issuance or adapter deployment is part of this change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Assistant completion uses a separate owner-only profile. Live issuance remains gated on reviewed read authorization, caller/disclosure policy, feasibility and coordinated kill acceptance; future send remains dormant."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Assistant policy and revocation survive restart. A failed local credential commit requires trusted-local grant inspection/revocation before a fresh pairing; old local profiles remain intact."
+  },
+  "commits": []
+}
