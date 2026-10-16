@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A shell opened in the tui waits and retries, saying why, when st refuses its attach for a reason that passes, instead of ending the tab",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes."},
+  "compatibility": {"status": "none", "detail": "tui only. It sends the same requests, repeated at most once every five seconds for about a minute and a half; the daemon's answers and authority decisions are unchanged and the tui never guesses a host."},
+  "downtime": {"status": "none", "detail": "No startup work or interruption."},
+  "manual": {"status": "none", "detail": "No operator action."},
+  "recovery": {"status": "none", "detail": "No persistent state changes."}
+}
