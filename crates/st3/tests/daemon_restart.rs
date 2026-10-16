@@ -321,6 +321,37 @@ fn stop(mut child: Child) -> String {
     stderr
 }
 
+/// What a channel that offered nothing leaves behind. The in-process daemon barely traces, so
+/// without this a failed wait says only "Timeout": print every claim since `mark` in commit
+/// order, the stopped channel's stderr, and the driver files that gate its offers.
+fn channel_evidence(daemon: &Daemon, root: &Path, mark: u64, channel: Child) -> String {
+    let claims = match daemon.store.events_after(mark, None) {
+        Ok(events) => events
+            .iter()
+            .map(|event| {
+                let body = event.body.to_string();
+                let body: String = body.chars().take(600).collect();
+                format!("{} {} {} {body}", event.store_index, event.kind, event.subject)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(error) => format!("unreadable: {error:#}"),
+    };
+    let mut files = String::new();
+    for directory in ["claude-driver", "drivers"] {
+        for path in files_containing(&root.join(directory), "") {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let text: String = text.chars().take(2000).collect();
+            files.push_str(&format!("--- {}\n{text}\n", path.display()));
+        }
+    }
+    format!(
+        "\nclaims after store index {mark}:\n{claims}\nchannel stderr:\n{}\ndriver api log:\n{}\ndriver files:\n{files}",
+        stop(channel),
+        driver_log(root),
+    )
+}
+
 /// A failed assertion must also stop this test's provider process group.
 struct TestSeat(Option<Child>);
 impl std::ops::Deref for TestSeat {
@@ -2494,15 +2525,20 @@ async fn claude_mcp_initializes_offline_then_attaches_and_reconnects_without_res
         received.try_recv().is_err(),
         "offline initialization offered mail"
     );
+    let mark = daemon.store.index().unwrap();
     daemon.start_admitted_protocol().await;
     daemon.send(
         "message/quartz-offline",
         "agent/quartz",
         "OFFLINE START PROBE",
     );
-    let notice = received
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the same channel did not attach after daemon startup");
+    let notice = match received.recv_timeout(Duration::from_secs(10)) {
+        Ok(notice) => notice,
+        Err(error) => panic!(
+            "the same channel did not attach after daemon startup: {error:?}{}",
+            channel_evidence(&daemon, root, mark, channel)
+        ),
+    };
     assert_eq!(notice["method"], "notifications/claude/channel");
     let envelope = notice["params"]["content"].as_str().unwrap();
     fixture.append(
@@ -2522,6 +2558,7 @@ async fn claude_mcp_initializes_offline_then_attaches_and_reconnects_without_res
     )
     .await;
     // A later daemon outage preserves the initialized stdio connection and its owner.
+    let mark = daemon.store.index().unwrap();
     daemon.stop().await;
     daemon.send(
         "message/quartz-reconnected",
@@ -2533,9 +2570,13 @@ async fn claude_mcp_initializes_offline_then_attaches_and_reconnects_without_res
         "the initialized Claude channel during an outage",
     );
     daemon.start_admitted_protocol().await;
-    let notice = received
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the initialized channel did not reconnect");
+    let notice = match received.recv_timeout(Duration::from_secs(10)) {
+        Ok(notice) => notice,
+        Err(error) => panic!(
+            "the initialized channel did not reconnect: {error:?}{}",
+            channel_evidence(&daemon, root, mark, channel)
+        ),
+    };
     assert!(
         notice["params"]["content"]
             .as_str()
@@ -2570,12 +2611,17 @@ async fn claude_mcp_initializes_offline_then_attaches_and_reconnects_without_res
         "reconnection duplicated a native offer"
     );
     drop(input);
-    wait_until(
-        "Claude EOF ends the channel",
-        Duration::from_secs(5),
-        || channel.try_wait().unwrap().is_some(),
-    )
-    .await;
+    // wait_until's poll and limit, plus the evidence: CI run 38874839876 failed here.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while channel.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting until Claude EOF ends the channel{}",
+                channel_evidence(&daemon, root, mark, channel)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     daemon.stop().await;
 }
 
