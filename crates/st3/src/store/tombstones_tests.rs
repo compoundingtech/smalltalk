@@ -761,8 +761,49 @@ fn production_history_has_bounded_journal_writes() {
     );
 }
 
+/// How long a write waits behind a trim is wall time, which a loaded builder stretches (a
+/// commit's fsync alone). What the trim bounds is its work per writer loan: a chunk takes another
+/// envelope only while `TRIM_CHUNK_BUDGET` has not run out, so if each envelope costs at least
+/// `cost`, no chunk deletes more than budget / cost of them. Load only makes a chunk delete
+/// fewer. The writer serves its queue in order, so a write waits for at most the chunk it queued
+/// behind. Then, concurrently, every write still runs while the trim is under way.
 #[test]
 fn a_trim_never_makes_a_write_wait_long() {
+    let cost = std::time::Duration::from_millis(2);
+    let per_chunk = usize::try_from(
+        smallclaims::store::checkpoint_trim::TRIM_CHUNK_BUDGET.as_micros() / cost.as_micros(),
+    )
+    .unwrap();
+    {
+        let store = Store::open_memory("alder").unwrap();
+        store.bind_fleet(FLEET).unwrap();
+        write_diagnostics(&store, "daemon/alder", 200);
+        let cut = now_ms() + 1_000;
+        let plan = plan_drops(&store.checkpoint_sealed_set(cut).unwrap());
+        let chunks = 3;
+        assert!(plan.envelopes.len() > 2 * chunks * per_chunk, "{}", plan.envelopes.len());
+        store.set_trim_row_cost(cost);
+        store.set_trim_fault(Some(TrimFault::AfterChunk(chunks)));
+        let mut actions = Vec::new();
+        assert!(
+            store
+                .trim_checkpoint(
+                    CHECKPOINT,
+                    cut,
+                    &plan.drop_digest,
+                    &plan.envelopes,
+                    &plan.claims,
+                    false,
+                    &mut actions,
+                )
+                .is_err()
+        );
+        let deleted = dropped_keys(&plan).difference(&held(&store)).count();
+        assert!(
+            (1..=chunks * per_chunk).contains(&deleted),
+            "{chunks} chunks deleted {deleted} envelopes; each may delete at most {per_chunk}"
+        );
+    }
     let directory = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(
         Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap(),
@@ -775,7 +816,7 @@ fn a_trim_never_makes_a_write_wait_long() {
     production_history(&store, 150_000);
     // Every deleted row is slow, as on a store missing an index: 2,000 of them at once would
     // hold the writer for four seconds.
-    store.set_trim_row_cost(std::time::Duration::from_millis(2));
+    store.set_trim_row_cost(cost);
     let trimming = {
         let store = store.clone();
         let plan = plan.clone();
@@ -811,11 +852,10 @@ fn a_trim_never_makes_a_write_wait_long() {
         matches!(&actions[..], [CheckpointAction::Trimmed { claims, .. }] if *claims == plan.claims.len()),
         "{actions:?}"
     );
+    // A trim that held the writer throughout (at least two seconds of row cost) would leave
+    // these writes waiting until it finished.
     assert!(writes >= 20, "only {writes} writes ran during the trim");
-    assert!(
-        longest < std::time::Duration::from_millis(500),
-        "a write waited {longest:?} for the trim"
-    );
+    println!("{writes} writes during the trim; the longest waited {longest:?}");
 }
 
 /// As `store_with_drops`, on a node that signs its claims, so each has a signature and verdict.

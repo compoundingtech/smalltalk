@@ -407,7 +407,9 @@ deleting a claim looks up every row that references it. `every_foreign_key_colum
 `crates/st3/src/store.rs` fails otherwise, so add the index in the same change as the foreign key.
 
 `a_trim_never_makes_a_write_wait_long` in `crates/st3/src/store/tombstones_tests.rs` trims a production-sized
-history (150,000 claims and operations) with every row made slow and fails without the budget;
+history (150,000 claims and operations) with every row made slow and fails without the budget: no
+chunk deletes more than budget / row cost envelopes, however loaded the machine, and writes run
+throughout the trim;
 `production_history_has_bounded_journal_writes` bounds that setup's journal writes; and
 `a_trim_that_stops_anywhere_finishes_the_same_after_a_restart` in `checkpoint_agreement_tests.rs` stops
 part way through recording and deleting.

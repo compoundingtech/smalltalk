@@ -225,14 +225,6 @@
       "reason": "Fails in the Nix build sandbox while it passes in central CI (linux-tests). Measured on main 24d78d71b: run alone in the sandbox at 1 and at 4 test threads, cancellation_adopts_and_stops_gate_processes_after_daemon_restart passed alone twice but failed in 2 of 3 full-suite Nix runs (same timeout). The step that never happens is the finally-step gate (final.pid) after 'missions cancel'; the mission_cancellation sibling tests that cancel without work in flight pass. Not load alone, and not systemd (the test stubs systemctl). Root cause in the sandbox not found; excluded rather than weakened.",
       "owner": "nix-evidence (mission fleet/factory/nix-evidence)",
       "runs_instead": "central CI linux-tests shards and the wrapper path"
-    },
-    {
-      "package": "st3",
-      "binary": "st3",
-      "test": "store::tombstones_tests::a_trim_never_makes_a_write_wait_long",
-      "reason": "Timing assertion (500 ms) failed once at 634 ms on a loaded Nix builder (Nix run 38598779882); cause unknown; the hosted re-measurement was cancelled while queued. Threshold unchanged. Issue: https://github.com/compoundingtech/smalltalk/issues/2896",
-      "owner": "db-size",
-      "runs_instead": "central CI linux-tests shards"
     }
   ]
 }
