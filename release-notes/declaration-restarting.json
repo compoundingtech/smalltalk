@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Show bounded declaration-driven relaunch status until replacement harness readiness",
+  "replay": {
+    "status": "none",
+    "detail": "No replay fallback, history reconstruction, read-triggered repair or recovery wait is added."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "The claim registry adds optional runtime.observed restarting_from (retired incarnation). No SQLite table, index, trigger, schema version or migration changes. The registry and replication compatibility digests change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, canonical selection, membership, admission authority or launch decision rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Client agent state may be restarting for up to two minutes from the selected runtime observation while an active declaration-driven shutdown/start awaits readiness. Deferred stopped/exited/vanished states, current human blocks, faults, moves and suspension retain precedence. Existing agents-new waits treat it as not-ready; explicit restart also requires a different incarnation. AgentState is an open string; stui/phone/web visual rendering is unqualified. Older registries retain observations containing restarting_from as authenticated unknown-field waiting records, without projection; known records continue syncing and differing compatibility digests do not outright reject wire-log replication. Landing is held until the heal-writer #2596 successor is deployed and the old-registry three-day scheduler control passes. Once those holds are satisfied, a lagging member may retain the field visibly waiting during rolling upgrades; do not require an offline member to upgrade merely to permit relaunches elsewhere. Retain waiting records for normal upgrade admission. Do not rely on the new marker or projection parity on older members. Projection equality across registry digests is not asserted."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No added stop, relaunch, daemon downtime or startup recovery is introduced. Candidate restart-to-API and restart-to-health times have not been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No data or identity conversion is required. Consumers of the open agent-state string should display restarting during declaration cutover."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "The presentation deadline changes no durable marker, recovery action or fault. No automatic restart, retry, added wait budget or replay fallback is introduced. After the #2596 deployment and long-lag test gates, rolling publication is allowed: older receivers retain the observation visibly waiting without a heal caused solely by registry mismatch; swap-back and installed mixed-version acceptance remain unqualified."
+  }
+}

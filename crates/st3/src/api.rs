@@ -2893,6 +2893,7 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
                     item["state"] = json!("waiting");
                 }
             }
+            overlay_declaration_restart(item, client_now_ms());
             overlay_down(item, launch_since, report_age_ms, reported.as_deref(), client_now_ms() as u64);
             overlay_delivery_presence(item, &local_host);
             // The presentation reads the facts settled just above, so it is settled with them. A
@@ -2907,6 +2908,29 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
         overlay_subagents(store, items)?;
         Ok(())
     })
+}
+
+// A marker describes a replacement, not proof that its owner is still progressing.
+// Evaluate this on every live presentation, including retained roster cards, rather
+// than only when a new claim invalidates the fold. Expiry changes no durable fact.
+const DECLARATION_RESTART_PRESENTATION_MS: u128 = 120_000;
+
+pub(crate) fn declaration_restart_valid_until(queue: Option<u128>, items: &[Value], now: u128) -> Option<u128> {
+    queue.into_iter().chain(items.iter().filter(|item| item["state"] == "restarting")
+        .filter_map(|item| item["_restart_until_unix_ms"].as_u64().map(u128::from))
+        .filter(|deadline| *deadline > now)).min()
+}
+
+fn overlay_declaration_restart(item: &mut Value, now: u128) {
+    let fields = item.as_object_mut().expect("agent card");
+    let previous = fields.remove("_restart_underlying_state");
+    let deadline = fields.remove("_restart_until_unix_ms").and_then(|value| value.as_u64());
+    if fields.get("state").and_then(Value::as_str) == Some("restarting")
+        && deadline.is_none_or(|deadline| now >= u128::from(deadline))
+        && let Some(previous) = previous
+    {
+        fields.insert("state".into(), previous);
+    }
 }
 
 /// How long a declared seat may take to show a running session before it is called down.
@@ -3380,6 +3404,28 @@ fn client_agent_cards_presented(
                     .or_else(|| subject.desired_token.as_deref().and_then(claim_time))
             })
             .flatten();
+            // A declaration replacement carries the incarnation it is retiring. Keep
+            // that shutdown and the new harness readiness interval distinct from a first start.
+            let restarting_from = fields
+                .and_then(|fields| fields.get("restarting_from"))
+                .and_then(Value::as_str);
+            let restart_underlying_state = state;
+            let restart_until = subject.actual_claim.as_deref()
+                .and_then(|claim| actual_claim_times.as_ref().ok()?.get(claim).copied())
+                .map(|accepted| accepted.saturating_add(DECLARATION_RESTART_PRESENTATION_MS));
+            let restarting = restart_until.is_some() && restarting_from.is_some_and(|from| {
+                subject.reachability == "reachable"
+                    && !matches!(state, "waiting" | "failed")
+                    && (state == "starting"
+                        || (fields
+                            .and_then(|fields| fields.get("incarnation_id"))
+                            .and_then(Value::as_str) == Some(from)
+                            && matches!(
+                                observed,
+                                Some("running")
+                            )))
+            });
+            let state = if restarting { "restarting" } else { state };
             let handoff = subject.desired_token.as_deref()
                 .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
                 .transpose()?.flatten();
@@ -3459,6 +3505,8 @@ fn client_agent_cards_presented(
                 "updated_at": updated_at,
                 "name": name,
                 "state": state,
+                "_restart_underlying_state": restart_underlying_state,
+                "_restart_until_unix_ms": restart_until,
                 "reachability": subject.reachability,
                 "runtime_ids": runtime_ids,
                 "owner_run_id": subject.owner_run,
@@ -27886,6 +27934,198 @@ mission "labelled" state="ready" {
         assert_eq!(cards[0]["next_work"], *next);
         store.set_step_state(&first, "working", None).unwrap();
         checked_agent_cache(&store, false, store.index().unwrap());
+    }
+
+    #[test]
+    fn declaration_restart_marker_preserves_suspension_and_placement() {
+        for moving in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = state(root.path());
+            let store = state.store.clone();
+            let source = r#"version 2
+agent "example/overlay" { workspace "/tmp"; harness "codex" {} }
+"#;
+            store.apply_internal(&parse_intent(source, "node").unwrap(), "overlay-source").unwrap();
+            let subject = "agent/example/overlay";
+            store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({"status":"running", "host":"node",
+                    "runtime_id":"example.overlay", "incarnation_id":"old", "restarting_from":"old"})).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "harness.observed".into(), actor: None,
+                fields: serde_json::from_value(json!({"state":"idle", "driver":"codex", "incarnation_id":"old"})).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            assert_eq!(checked_agent_cache(&store, false, store.index().unwrap())[0]["state"], "restarting");
+            if moving {
+                let moved = source.replace("workspace", "host \"remote\"; workspace");
+                store.apply_internal(&parse_intent(&moved, "node").unwrap(), "overlay-move").unwrap();
+                let cards = checked_agent_cache(&store, false, store.index().unwrap());
+                assert_eq!(cards[0]["state"], "waiting");
+                assert_ne!(cards[0]["handoff"]["phase"], "running");
+            } else {
+                let token = store.selected_desired_token(subject).unwrap().unwrap();
+                let request = store.append_claim(&ClaimInput {
+                    subject: subject.into(), kind: "runtime.action.requested".into(), actor: Some("person/test".into()),
+                    fields: serde_json::from_value(json!({"action":"suspend", "incarnation_id":"old"})).unwrap(),
+                    evidence: vec![token], expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                store.append_claim(&ClaimInput {
+                    subject: subject.into(), kind: "runtime.action.succeeded".into(), actor: Some("person/test".into()),
+                    fields: serde_json::from_value(json!({"action":"suspend", "operation_status":"suspended"})).unwrap(),
+                    evidence: vec![request.id.clone()], expected_subject: None,
+                    idempotency_key: Some(crate::suspension::suspend_completed_key(&request.id)),
+                }).unwrap();
+                let cards = checked_agent_cache(&store, false, store.index().unwrap());
+                assert_eq!(cards[0]["state"], "suspended");
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_relaunch_is_restarting_until_replacement_harness_is_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let intent = parse_intent(
+            r#"version 2
+agent "example/relaunch" { workspace "/tmp"; harness "codex" {} }
+"#,
+            "node",
+        )
+        .unwrap();
+        store
+            .apply_internal(&intent, "relaunch-declaration")
+            .unwrap();
+        let subject = "agent/example/relaunch";
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let state_at = |index| checked_agent_cache(&store, false, index)[0]["state"].clone();
+        append(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"old","runtime_id":"example.relaunch"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "starting",
+            "first launch has no replacement"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"idle","driver":"codex","incarnation_id":"old"}),
+        );
+        let ready_cut = store.index().unwrap();
+        assert_eq!(state_at(ready_cut), "running");
+        append(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"old","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        let restart_cut = store.index().unwrap();
+        assert_eq!(state_at(restart_cut), "restarting");
+        let raw = client_agent_resources_uncached(&store, false, restart_cut).unwrap();
+        let deadline = raw[0]["_restart_until_unix_ms"].as_u64().unwrap() as u128;
+        assert_eq!(store.agent_roster_valid_until(restart_cut), Some(deadline),
+            "the existing agents window must wake at presentation expiry without a new claim");
+        let mut before = raw[0].clone();
+        overlay_declaration_restart(&mut before, deadline - 1);
+        assert_eq!(before["state"], "restarting");
+        let mut stuck = raw[0].clone();
+        overlay_declaration_restart(&mut stuck, deadline);
+        assert_eq!(stuck["state"], "running", "a stale marker cannot conceal the underlying state");
+        assert!(stuck.get("_restart_until_unix_ms").is_none());
+        assert_eq!(
+            state_at(ready_cut),
+            "running",
+            "snapshot before cutover stays unchanged"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"blocked","blocked_on":"human","ask":"permission","driver":"codex","incarnation_id":"old"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "waiting",
+            "the retiring harness's current human block remains visible"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"ended","blocked_on":null,"ask":null,"driver":"codex","incarnation_id":"old"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "failed",
+            "the retiring harness's failure is not hidden by its restart marker"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"idle","blocked_on":null,"ask":null,"driver":"codex","incarnation_id":"old"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "restarting");
+        append(
+            "runtime.observed",
+            json!({"status":"exited","incarnation_id":"old","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "stopped", "a deferred replacement is not active progress");
+        append(
+            "runtime.observed",
+            json!({"status":"starting","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "restarting");
+        append(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"new","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "restarting",
+            "a new wrapper is not ready"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"blocked","blocked_on":"human","ask":"permission","driver":"codex","incarnation_id":"new"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "waiting",
+            "human blocks remain visible"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"idle","blocked_on":null,"ask":null,"driver":"codex","incarnation_id":"new"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "running");
+        assert_eq!(
+            state_at(restart_cut),
+            "restarting",
+            "replacement readiness cannot rewrite history"
+        );
+        append(
+            "runtime.observed",
+            json!({"status":"stopped","incarnation_id":"new","runtime_id":"example.relaunch"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "stopped",
+            "explicit stop has no restart marker"
+        );
+        append(
+            "runtime.observed",
+            json!({"status":"failed","runtime_id":"example.relaunch"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "failed");
     }
 
     #[test]

@@ -3067,6 +3067,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                                             ),
                                         ]),
                                     )?;
+                                    // Keep the old incarnation visible while its declaration is
+                                    // replacing it. A running wrapper is not a completed relaunch.
+                                    let mut fields = member_fields(
+                                        member,
+                                        &observation.status,
+                                        observation.incarnation_id.as_deref(),
+                                        true,
+                                    );
+                                    if let Some(incarnation) = &observation.incarnation_id {
+                                        fields.insert(
+                                            "restarting_from".into(),
+                                            Value::String(incarnation.clone()),
+                                        );
+                                    }
+                                    self.record_once(&subject.subject, "runtime.observed", fields)?;
                                     self.reconcile_runtime_stop(
                                         &subject.subject,
                                         &member.runtime_id,
@@ -6512,6 +6527,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 evidence.push(token);
             }
             fields.insert("host".into(), Value::String(self.host.clone()));
+            if self.store.latest_actual_value(subject)?.is_some_and(|actual| {
+                actual_field(&actual, "restarting_from").is_some_and(Value::is_string)
+            }) {
+                fields.insert("restarting_from".into(), Value::Null);
+            }
             self.record_once_with_evidence(subject, "runtime.observed", fields, evidence)?;
             return Ok(true);
         }
@@ -7066,11 +7086,17 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("start-failed:{operation_id}")),
             };
+            let mut absent = member_fields(member, "absent", None, false);
+            if self.store.latest_actual_value(&subject.subject)?.is_some_and(|actual| {
+                actual_field(&actual, "restarting_from").is_some_and(Value::is_string)
+            }) {
+                absent.insert("restarting_from".into(), Value::Null);
+            }
             let observed = ClaimInput {
                 subject: subject.subject.clone(),
                 kind: "runtime.observed".into(),
                 actor: None,
-                fields: member_fields(member, "absent", None, false),
+                fields: absent,
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some(format!("start-absent:{operation_id}")),
@@ -7111,11 +7137,17 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: Some(format!("start-succeeded:{operation_id}")),
         };
+        let mut starting = member_fields(member, "starting", incarnation.as_deref(), false);
+        if let Some(previous) = self.store.latest_actual_value(&subject.subject)?
+            && let Some(from) = actual_field(&previous, "restarting_from")
+        {
+            starting.insert("restarting_from".into(), from.clone());
+        }
         let observed = ClaimInput {
             subject: subject.subject.clone(),
             kind: "runtime.observed".into(),
             actor: None,
-            fields: member_fields(member, "starting", incarnation.as_deref(), false),
+            fields: starting,
             evidence: placement_evidence,
             expected_subject: None,
             idempotency_key: Some(format!("start-observed:{operation_id}")),
@@ -8534,6 +8566,41 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Some(exit_code) = observation.exit_code {
             fields.insert("exit_code".into(), Value::from(exit_code));
         }
+        // Reuse the observation needed for record-once deduplication. Unmarked agents
+        // need no extra actual-state query or harness fold on this hot path.
+        let previous = self.store.latest_observation(&subject.subject, "runtime.observed")?;
+        if subject.kind == "agent"
+            && let Some(from) = previous.as_ref()
+                .and_then(|claim| claim.body.pointer("/fields/restarting_from"))
+                .and_then(Value::as_str)
+        {
+            let replacement_ready = observation
+                .incarnation_id
+                .as_deref()
+                .is_some_and(|current| current != from)
+                && observation.status == "running"
+                && (member.driver.is_none()
+                    || self
+                        .store
+                        .current_harness(&subject.subject)?
+                        .is_some_and(|harness| {
+                            Some(harness.incarnation_id.as_str())
+                                == observation.incarnation_id.as_deref()
+                                && harness.is_ready()
+                        }));
+            fields.insert(
+                "restarting_from".into(),
+                if replacement_ready { Value::Null } else { Value::String(from.into()) },
+            );
+        }
+        if subject.kind == "agent" && previous.as_ref()
+            .and_then(|claim| claim.body.pointer("/fields/restarting_from"))
+            .is_some_and(Value::is_null)
+        {
+            // Keep the explicit clear stable: omitting it on the next pass would
+            // append an otherwise identical observation just to remove the field.
+            fields.insert("restarting_from".into(), Value::Null);
+        }
         let mut evidence = Vec::new();
         if member.kind == MemberKind::Exec {
             // Launch receipts stay on the runtime's node. Carry the launched declaration as
@@ -8573,7 +8640,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .collect();
             }
         }
-        self.record_once_with_evidence(&subject.subject, "runtime.observed", fields, evidence)
+        self.record_once_with_previous(&subject.subject, "runtime.observed", fields, evidence, previous.as_ref())
     }
 
     /// An unchanged diagnostic is one durable operation per affected subject and code, even
@@ -8665,10 +8732,19 @@ impl<R: RuntimeControl> Reconciler<R> {
         fields: BTreeMap<String, Value>,
         evidence: Vec<String>,
     ) -> Result<()> {
-        if self
-            .store
-            .latest_observation(subject, kind)?
-            .is_some_and(|claim| {
+        let previous = self.store.latest_observation(subject, kind)?;
+        self.record_once_with_previous(subject, kind, fields, evidence, previous.as_ref())
+    }
+
+    fn record_once_with_previous(
+        &self,
+        subject: &str,
+        kind: &str,
+        fields: BTreeMap<String, Value>,
+        evidence: Vec<String>,
+        previous: Option<&crate::model::ClaimRecord>,
+    ) -> Result<()> {
+        if previous.is_some_and(|claim| {
                 claim.body.get("fields")
                     == Some(&serde_json::to_value(&fields).unwrap_or(Value::Null))
                     && claim.body.get("evidence") == Some(&serde_json::json!(evidence))
@@ -24702,6 +24778,156 @@ agent "test/worker" { workspace "/tmp"; command "true"; name "X"; restart "never
         }).unwrap();
         store.rename_agent("agent/test/worker", Some("X again"), "relabel-x").unwrap();
         reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn declaration_restart_marker_reuses_deduplication_reads_for_unmarked_agents() {
+        for agents in [1, 16] {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            let source = format!("version 2\n{}", (0..agents).map(|index| {
+                format!("agent \"control/{index}\" {{ workspace \"/tmp\"; harness \"codex\" {{}} }}\n")
+            }).collect::<String>());
+            apply_source(&store, &source, "unmarked-controls");
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(store.clone(), runtime, "node".into(), Arc::new(Notify::new()));
+            let desired = store.desired_subjects().unwrap();
+            for subject in &desired {
+                let member = subject.member.as_ref().unwrap();
+                reconciler.record_member_as(subject, member, &RuntimeObservation {
+                    runtime_id: member.runtime_id.clone(), terminal: true, status: "running".into(),
+                    exit_code: None, incarnation_id: Some("stable".into()),
+                }, false).unwrap();
+            }
+            let cut = store.index().unwrap();
+            // The pre-change observation path: build fields, then record-once dedupe.
+            let baseline = smallclaims::sqlite::work::SqliteWorkScope::start();
+            for subject in &desired {
+                let member = subject.member.as_ref().unwrap();
+                reconciler.record_once(&subject.subject, "runtime.observed",
+                    member_fields(member, "running", Some("stable"), false)).unwrap();
+            }
+            let baseline = baseline.finish();
+            let revised = smallclaims::sqlite::work::SqliteWorkScope::start();
+            for subject in &desired {
+                let member = subject.member.as_ref().unwrap();
+                reconciler.record_member_as(subject, member, &RuntimeObservation {
+                    runtime_id: member.runtime_id.clone(), terminal: true, status: "running".into(),
+                    exit_code: None, incarnation_id: Some("stable".into()),
+                }, false).unwrap();
+            }
+            let revised = revised.finish();
+            assert_eq!(revised.statements, baseline.statements, "unmarked agents add no statements");
+            assert_eq!(revised.vm_steps, baseline.vm_steps, "unmarked agents add no SQL work");
+            assert_eq!(store.index().unwrap(), cut, "unchanged agents append no observation");
+            eprintln!("unmarked agents={agents} baseline={baseline:?} revised={revised:?}");
+        }
+    }
+
+    #[test]
+    fn declaration_restart_marker_survives_shutdown_and_clears_on_ready_incarnation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"version 2
+agent "example/relaunch" { workspace "/tmp"; harness "codex" {}; env { REVISION "one" }; restart "never" }
+"#;
+        apply_source(&store, source, "relaunch-one");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let runtime_id = runtime.starts.lock().unwrap()[0].clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("old".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .latest_actual_value("agent/example/relaunch")
+                .unwrap()
+                .unwrap()["restarting_from"]
+                .is_null()
+        );
+        let replacement_cut = store.index().unwrap();
+        apply_source(&store, &source.replace("/tmp", "/var/tmp"), "relaunch-two");
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            runtime.stops.lock().unwrap().as_slice(),
+            std::slice::from_ref(&runtime_id)
+        );
+        let marker = || {
+            store
+                .latest_actual_value("agent/example/relaunch")
+                .unwrap()
+                .unwrap()["restarting_from"]
+                .clone()
+        };
+        assert_eq!(marker(), "old");
+        let cut = store.index().unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(marker(), "old");
+        assert_eq!(
+            store
+                .observations_for("agent/example/relaunch", "runtime.observed")
+                .unwrap()
+                .iter()
+                .filter(|claim| claim.store_index > cut)
+                .count(),
+            0,
+            "unchanged shutdown must not alternate running and restarting observations"
+        );
+        runtime.ptys.lock().unwrap()[0].status = "exited".into();
+        runtime.ptys.lock().unwrap()[0].exit_code = Some(0);
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 2);
+        assert_eq!(marker(), "old");
+        runtime.ptys.lock().unwrap()[0].status = "running".into();
+        runtime.ptys.lock().unwrap()[0].incarnation_id = Some("new".into());
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(marker(), "old");
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/example/relaunch".into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    serde_json::json!({"state":"idle","driver":"codex","incarnation_id":"new"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert!(marker().is_null());
+        let finished_cut = store.index().unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(store.observations_for("agent/example/relaunch", "runtime.observed").unwrap()
+            .iter().filter(|claim| claim.store_index > finished_cut).count(), 0, "ready clear must remain stable");
+        let replacement_observations = store.observations_for("agent/example/relaunch", "runtime.observed")
+            .unwrap().into_iter().filter(|claim| claim.store_index > replacement_cut).count();
+        assert_eq!(replacement_observations, 5,
+            "cutover, old exit, starting, new running, and ready clear; no per-pass claims");
+
+        // An explicit stop during a later cutover ends the replacement interval.
+        apply_source(&store, source, "relaunch-back");
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(marker(), "new");
+        apply_source(&store, r#"version 2
+stop "agent/example/relaunch"
+"#, "stop-relaunch");
+        runtime.ptys.lock().unwrap()[0].status = "exited".into();
+        runtime.ptys.lock().unwrap()[0].exit_code = Some(0);
+        reconciler.reconcile_once().unwrap();
+        assert!(marker().is_null());
         assert_eq!(runtime.starts.lock().unwrap().len(), 2);
     }
 

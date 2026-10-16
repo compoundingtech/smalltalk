@@ -3207,6 +3207,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("exit_code", integer()),
             ("exit_signal", integer()),
             ("incarnation_id", string()),
+            ("restarting_from", string()),
             ("adopted", boolean()),
             ("driver", string()),
             ("host", string()),
