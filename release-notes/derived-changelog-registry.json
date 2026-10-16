@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Derive the web app changelog registry from its directory so adding an entry no longer edits a shared file",
+  "replay": {"status": "none", "detail": "Build tooling only; no claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "The compiled public changelog manifest and the public bundle are byte-identical before and after."},
+  "downtime": {"status": "none", "detail": "No startup work or interruption."},
+  "manual": {"status": "none", "detail": "No operator actions; open branches drop their mod.ts hunk, keep their entry file and merge main."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or swap-back restrictions."}
+}
