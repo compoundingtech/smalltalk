@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Test refusal of a replaced delegation policy with unchanged allowed actions",
+  "replay": {
+    "status": "none",
+    "detail": "Only an authored private Store control is added; production behavior is unchanged by this follow-up."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only an authored private Store control is added; production behavior is unchanged by this follow-up."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only an authored private Store control is added; production behavior is unchanged by this follow-up."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only an authored private Store control is added; production behavior is unchanged by this follow-up."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only an authored private Store control is added; production behavior is unchanged by this follow-up."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only an authored private Store control is added; production behavior is unchanged by this follow-up."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only an authored private Store control is added; production behavior is unchanged by this follow-up."
+  }
+}

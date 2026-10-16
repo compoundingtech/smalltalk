@@ -85,6 +85,7 @@ mod read_deadline;
 mod response_body;
 mod owned_sets;
 mod published_attention;
+mod attention_history;
 pub use published_attention::start_attention_list;
 #[cfg(test)]
 pub(crate) use published_attention::{published_attention_rows, refresh_attention_list};
@@ -1891,7 +1892,9 @@ fn decode_client_cursor(cursor: &str) -> Result<ClientPageCursor, ApiError> {
 }
 
 fn decode_client_cursor_snapshot(cursor: &str) -> Result<ClientSnapshot, ApiError> {
-    if cursor.starts_with(client_v0::NATIVE_PAGE_CURSOR_PREFIX) {
+    if cursor.starts_with(attention_history::CURSOR_PREFIX) {
+        attention_history::cursor_snapshot(cursor)
+    } else if cursor.starts_with(client_v0::NATIVE_PAGE_CURSOR_PREFIX) {
         client_v0::native_page_cursor_snapshot(cursor)
     } else {
         decode_client_cursor(cursor).map(|cursor| cursor.snapshot)
@@ -2070,6 +2073,7 @@ fn client_page_read(
             has_more,
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+            omitted_items: None,
         },
         sync: client_sync_notice(state),
         replicated: None,
@@ -5225,6 +5229,7 @@ fn client_work_published_page(
             has_more,
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+            omitted_items: None,
         },
         sync: client_sync_notice(state),
         replicated: None,
@@ -5343,6 +5348,7 @@ fn client_work_published_continuation(
             has_more,
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(cursor.expires_at_unix_ms)),
+            omitted_items: None,
         },
         sync: client_sync_notice(state),
         replicated: None,
@@ -5456,6 +5462,7 @@ async fn client_work_history(
             has_more,
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+            omitted_items: None,
         },
         sync: client_sync_notice(state),
         replicated: None,
@@ -6378,6 +6385,9 @@ async fn client_attention(
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
+    if query.history {
+        return attention_history::page(state, snapshot, effective_query, "attention").await;
+    }
     let history = query.history;
     client_snapshot_page(
         &state,
@@ -6398,12 +6408,18 @@ async fn client_attention_detail(
     Extension(session): Extension<client_v0::ClientSession>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
-    let mut items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-        .map_err(ApiError::internal)?;
+    if let Some(claim) = attention_history::closed_claim_id(&id) {
+        return attention_history::detail(state, claim.to_owned(), person)
+            .await
+            .map(IntoResponse::into_response);
+    }
+    let mut items =
+        client_attention_resources_with_previews(&state, person.as_deref(), query.history)
+            .map_err(ApiError::internal)?;
     client_attention_compatibility(&mut items, session.custom_forms);
-    client_detail(items, "attention", &id)
+    client_detail(items, "attention", &id).map(IntoResponse::into_response)
 }
 
 async fn client_messages(
@@ -6785,6 +6801,7 @@ async fn client_history(
             has_more,
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+            omitted_items: None,
         },
         sync: client_sync_notice(&state),
         replicated: None,
@@ -13543,6 +13560,53 @@ async fn resolve_attention(
                 "an attention outcome must be resolved or dismissed",
             )));
         }
+        if let Some(denial) = state
+            .store
+            .claim_by_id(&proof.episode)
+            .map_err(ApiError::internal)?
+            .filter(|claim| claim.kind == "harness.diagnostic")
+        {
+            if request.outcome != "dismissed"
+                || client_attention_id(&denial.subject, &proof.person, &proof.episode)
+                    .map_err(ApiError::internal)?
+                    != subject
+            {
+                return Err(ApiError::bad(St3Error::new(
+                    "delegation-refused",
+                    "dismissal needs the exact denial card and episode",
+                )));
+            }
+            let result = state
+                .store
+                .respond_native_prompt(
+                    &denial.subject,
+                    &proof.episode,
+                    "dismiss",
+                    &actor,
+                    Some(&proof),
+                )
+                .map_err(ApiError::bad)?;
+            signal_changed(&state);
+            return Ok(Json(AttentionRequestView {
+                subject,
+                request: proof.episode,
+                reviewer: proof.person,
+                title: "Denied call dismissed".into(),
+                reason: summary.clone(),
+                severity: "warning".into(),
+                targets: vec![denial.subject],
+                actor,
+                requested_at_unix_ms: denial.accepted_at_unix_ms,
+                status: "resolved".into(),
+                resolved_at_unix_ms: Some(result.accepted_at_unix_ms),
+                outcome: Some("dismissed".into()),
+                resolution_reason: Some(summary),
+                until: None,
+                step: None,
+                step_attempt: None,
+                closed_by: None,
+            }));
+        }
         // Resolve the exact original update, including a completed one on an identical retry.
         // Attention snapshots contain only open cards; they cannot identify closed episodes.
         let update = state
@@ -13645,14 +13709,54 @@ async fn decide_subscription_request(
 }
 
 async fn withdraw_attention(
-    State(_state): State<AppState>,
-    AxumPath(_subject): AxumPath<String>,
-    Json(_request): Json<AttentionWithdrawRequest>,
-) -> Result<Json<AttentionRequestView>, ApiError> {
-    Err(ApiError::bad(St3Error::new(
-        "attention-migrated",
-        "attention is a derived view; use work ask/done/cancel-ask or act on its source",
-    )))
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<AttentionWithdrawRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let target = if let Some(episode) = &request.episode {
+        let original = state
+            .store
+            .claim_by_id(episode)
+            .map_err(ApiError::internal)?
+            .filter(|claim| claim.kind == "work.person-asked")
+            .ok_or_else(|| ApiError::bad(St3Error::new("stale-fence", "missing update episode")))?;
+        let person = original.body["fields"]["person"]
+            .as_str()
+            .unwrap_or_default();
+        if subject != original.subject
+            && client_attention_id(&original.subject, person, episode)
+                .map_err(ApiError::internal)?
+                != subject
+        {
+            return Err(ApiError::bad(St3Error::new(
+                "stale-fence",
+                "the update episode belongs to another item",
+            )));
+        }
+        original.subject
+    } else if subject.starts_with("step-run/") {
+        subject
+    } else {
+        return Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "withdraw an update's step-run source, or supply its exact --episode; remedy other alerts at their source",
+        )));
+    };
+    let result = state
+        .store
+        .withdraw_person_update(&PersonStepResponse {
+            delegation: None,
+            subject: target,
+            actor: request.actor,
+            summary: request.reason,
+            evidence: vec![],
+            episode: request.episode,
+            answer: None,
+            idempotency_key: request.idempotency_key,
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
 }
 
 /// The owner a review decision answers. A step, mission or loop run, or a resource, answers for
@@ -20831,7 +20935,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
-    async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {
+    pub(super) async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {
         let response = app
             .oneshot(
                 Request::builder()
@@ -30250,6 +30354,8 @@ agent "seat" { workspace "/tmp"; command "true" }
 }
 
 #[cfg(test)]
-mod work_incarnation_tests;
+mod alert_action_controls;
 #[cfg(test)]
 mod message_bodies_tests;
+#[cfg(test)]
+mod work_incarnation_tests;

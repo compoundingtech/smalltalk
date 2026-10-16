@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Correct history fixtures to use valid severity and exact bounded lookup plans",
+  "replay": {"status": "none", "detail": "Only authored control inputs and exact accepted plan strings change; no production or replay change."},
+  "schema": {"status": "none", "detail": "The diagnostic severity registry remains warning or error; the three authored fixtures incorrectly used info and now use warning."},
+  "rules": {"status": "none", "detail": "No rule, query, index or cardinality change. All candidate-count, covering-index, scan-refusal, sort-ancestor and row-bound assertions remain."},
+  "compatibility": {"status": "none", "detail": "The plan control accepts only the named episode index SEARCH with id equality alone or with a rowid/store_index upper range, and rejects scans, another index and non-equality shapes. The production join cut has existed since e1236bec."},
+  "downtime": {"status": "none", "detail": "Test-only correction."},
+  "manual": {"status": "none", "detail": "No runtime action or configuration change."},
+  "recovery": {"status": "none", "detail": "Authored assertions are unrun until fresh hosted qualification and establish no native or rollout acceptance."}
+}

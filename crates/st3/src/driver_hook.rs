@@ -1120,11 +1120,23 @@ mod tests {
         let store = Store::open_memory("node").unwrap();
         let seat = "agent/node.worker";
         let append = |kind: &str, fields: Value, key: Option<String>| {
-            store.append_claim(&crate::model::ClaimInput {
-                subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
-                fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
-                expected_subject: None, idempotency_key: key,
-            }).unwrap()
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    // The fixture's answer is a person's request, while driver observations
+                    // remain authored by the seat. An agent answer needs delegation.
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(if fields["code"] == "native-prompt-answered" {
+                        "person/avery".into()
+                    } else {
+                        seat.into()
+                    }),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: key,
+                })
+                .unwrap()
         };
         append("runtime.observed", serde_json::json!({
             "status":"running", "incarnation_id":"current"

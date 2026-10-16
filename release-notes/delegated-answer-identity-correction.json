@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Use the typed answer operation identity and reopen the old-registry control",
+  "replay": {
+    "status": "none",
+    "detail": "Corrects the new, unmerged delegated answer path before rollout; no existing claim migration or replay is introduced."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No new claim field, SQL, index or generated-client change. The primary answer uses the existing typed claim operation envelope and request digest."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing policy and source writer fences, acting agent, represented person and exact proof matching, answer guards and one-sent-claim cardinality are unchanged. The ordinary person writer and all answer readers are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The new delegated answer previously carried a cache identity invisible to answer readers. It now uses claim_operation on the exact ClaimInput to create op/id plus the st3.claim-request.v1 digest, appended and registered in the same transaction as its notice. The notice keeps its existing cache identity. Identical retries can find the original answer; prompt-answer reads and the attention fold see it, and a second answer remains refused."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup, deployment or runtime action in this correction."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "The old-registry control closes and reopens the same temporary database with a new runtime instead of resetting a write-once registry. No live policy or database action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Authored controls are not execution evidence or rollout/native acceptance. The existing all-receiver compatibility and actual-grant restrictions still apply."
+  }
+}

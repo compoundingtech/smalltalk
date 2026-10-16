@@ -6747,6 +6747,7 @@ mod tests {
                     has_more: false,
                     next_cursor: None,
                     cursor_expires_at: None,
+                    omitted_items: None,
                 },
                 indexed_at: "2026-10-02T21:41:00Z".into(),
                 host_id: "host/example".into(),

@@ -142,6 +142,9 @@ pub use runtime_starts::{RuntimeStartAdmission, RuntimeStartOperation, RuntimeSt
 mod roster_admission;
 pub(crate) use roster_admission::AdmissionGuard;
 mod adhoc_work;
+#[cfg(test)]
+pub(crate) mod alert_action_controls;
+pub(crate) mod attention_history;
 mod attention_snapshot;
 pub(crate) use attention_snapshot::{
     CLAUDE_PROMPT_ANSWER_WAIT_MS, NativePromptState, PromptAnswer, native_prompt_gone_key,
@@ -13673,18 +13676,7 @@ impl Store {
     ) -> Result<Option<(DesiredSubject, Option<String>)>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
-        connection
-            .query_row(
-                "SELECT desired.subject, desired.kind, desired.body, desired.member,
-                        desired.owner_run, desired.owner_generation, desired.owner_step,
-                        claims.actor
-                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
-                 WHERE desired.subject = ?1",
-                [subject],
-                |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
-            )
-            .optional()
-            .map_err(Into::into)
+        desired_subject_with_writer_at(&connection, subject)
     }
 
     /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
@@ -18397,48 +18389,16 @@ impl Store {
     /// Prefer a bound account person, then follow declaration authors and mission requesters.
     /// Missing or cyclic ownership remains unknown; it never selects a global operator.
     pub(crate) fn agent_person(&self, agent: &str) -> Result<Option<String>> {
-        let mut actor = agent.to_owned();
-        let mut seen = BTreeSet::new();
-        for _ in 0..16 {
-            if actor.starts_with("person/") {
-                return Ok(Some(actor));
-            }
-            if !seen.insert(actor.clone()) {
-                return Ok(None);
-            }
-            let Some((desired, writer)) = self.desired_subject_with_writer(&actor)? else {
-                return Ok(None);
-            };
-            if actor == agent {
-                let owner = match crate::accounts::harness_binding(&desired.desired)
-                    .map(|binding| binding.binding)
-                {
-                    Some(crate::accounts::Binding::Pool(person)) => Some(person),
-                    Some(crate::accounts::Binding::Account(account)) => self
-                        .desired_subject_with_writer(&format!("account/{account}"))?
-                        .and_then(|(account, _)| {
-                            crate::accounts::parse_account(&account.subject, &account.desired)
-                        })
-                        .and_then(|account| account.owner),
-                    None => None,
-                };
-                if let Some(owner) = owner.filter(|owner| owner.starts_with("person/")) {
-                    return Ok(Some(owner));
-                }
-            }
-            let requester = desired
-                .owner_run
-                .as_deref()
-                .map(|run| self.mission_run(run))
-                .transpose()?
-                .flatten()
-                .map(|run| run.requester);
-            let Some(next) = requester.or(writer) else {
-                return Ok(None);
-            };
-            actor = next;
-        }
-        Ok(None)
+        // Keep the existing public read's full mission view, errors and touched
+        // dependencies. Only the new writer path uses a bounded header lookup.
+        agent_person_walk(
+            agent,
+            |subject| self.desired_subject_with_writer(subject),
+            |run| {
+                self.mission_run(run)
+                    .map(|view| view.map(|view| view.requester))
+            },
+        )
     }
 
     pub fn current_harness(
@@ -22836,6 +22796,9 @@ fn append_admitted_claim_tx(
         || fields.contains_key("delegation")
         || fields.contains_key("acted_for")
         || (kind == "work.person-done" && actor.is_some_and(|actor| actor.starts_with("agent/")))
+        || (kind == "harness.diagnostic"
+            && fields.get("code") == Some(&json!("native-prompt-answered"))
+            && actor.is_some_and(|actor| actor.starts_with("agent/")))
     {
         let evidence = serde_json::from_value::<Vec<String>>(
             body.get("evidence").cloned().unwrap_or_else(|| json!([])),
@@ -24833,6 +24796,108 @@ fn intent_leaves_at(
         .map(|(id, _)| id)
         .filter(|id| !referenced.contains(id))
         .collect())
+}
+
+fn desired_subject_with_writer_at(
+    connection: &Connection,
+    subject: &str,
+) -> Result<Option<(DesiredSubject, Option<String>)>> {
+    smallclaims::touched::note_read(|| subject.to_owned());
+    connection
+        .query_row(
+            "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                        desired.owner_run, desired.owner_generation, desired.owner_step,
+                        claims.actor
+                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
+                 WHERE desired.subject = ?1",
+            [subject],
+            |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// The new writer's ownership lookup stays on its transaction. Its requester
+/// query uses the same authoritative header join as the existing public view.
+fn agent_person_at(connection: &Connection, agent: &str) -> Result<Option<String>> {
+    agent_person_walk(
+        agent,
+        |subject| desired_subject_with_writer_at(connection, subject),
+        |run| {
+            smallclaims::touched::note_read(|| {
+                format!(
+                    "mission-run/{}",
+                    run.strip_prefix("mission-run/").unwrap_or(run)
+                )
+            });
+            connection
+                    .query_row(
+                        // Match mission_run_header_tx's current-generation join: a
+                        // header with no generation has no requester to follow.
+                        "SELECT mission_runs.requester FROM mission_runs
+                         JOIN run_generations ON run_generations.id=mission_runs.current_generation_id
+                         WHERE mission_runs.id=?1",
+                        [run.strip_prefix("mission-run/").unwrap_or(run)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional().map_err(Into::into)
+        },
+    )
+}
+
+/// One bounded ownership precedence/cycle walk. Public reads retain their original
+/// full-view resolver; writer admission supplies its same-transaction resolver.
+fn agent_person_walk<D, R>(
+    agent: &str,
+    mut lookup_desired: D,
+    mut lookup_requester: R,
+) -> Result<Option<String>>
+where
+    D: FnMut(&str) -> Result<Option<(DesiredSubject, Option<String>)>>,
+    R: FnMut(&str) -> Result<Option<String>>,
+{
+    let mut actor = agent.to_owned();
+    let mut seen = BTreeSet::new();
+    for _ in 0..16 {
+        if actor.starts_with("person/") {
+            return Ok(Some(actor));
+        }
+        if !seen.insert(actor.clone()) {
+            return Ok(None);
+        }
+        let Some((desired, writer)) = lookup_desired(&actor)? else {
+            return Ok(None);
+        };
+        if actor == agent {
+            let owner = match crate::accounts::harness_binding(&desired.desired)
+                .map(|binding| binding.binding)
+            {
+                Some(crate::accounts::Binding::Pool(person)) => Some(person),
+                Some(crate::accounts::Binding::Account(account)) => {
+                    lookup_desired(&format!("account/{account}"))?
+                        .and_then(|(account, _)| {
+                            crate::accounts::parse_account(&account.subject, &account.desired)
+                        })
+                        .and_then(|account| account.owner)
+                }
+                None => None,
+            };
+            if let Some(owner) = owner.filter(|owner| owner.starts_with("person/")) {
+                return Ok(Some(owner));
+            }
+        }
+        let requester = desired
+            .owner_run
+            .as_deref()
+            .map(&mut lookup_requester)
+            .transpose()?
+            .flatten();
+        let Some(next) = requester.or(writer) else {
+            return Ok(None);
+        };
+        actor = next;
+    }
+    Ok(None)
 }
 
 fn desired_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredSubject> {
@@ -58590,6 +58655,7 @@ mission "typecase" state="ready" {
             .withdraw_attention(
                 "attention/other-fault",
                 &AttentionWithdrawRequest {
+                    episode: None,
                     reason: "cleared".into(),
                     actor: "agent/node.requester".into(),
                     idempotency_key: "other-fault-withdrawn".into(),
@@ -59141,11 +59207,23 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             let store = Store::open_memory("node").unwrap();
             let seat = "agent/node.worker";
             let append = |kind: &str, fields: Value, key: Option<String>| {
-                store.append_claim(&ClaimInput {
-                    subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
-                    fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
-                    expected_subject: None, idempotency_key: key,
-                }).unwrap()
+                store
+                    .append_claim(&ClaimInput {
+                        // The fixture's answer is a person's request, while driver observations
+                        // remain authored by the seat. An agent answer needs delegation.
+                        subject: seat.into(),
+                        kind: kind.into(),
+                        actor: Some(if fields["code"] == "native-prompt-answered" {
+                            "person/avery".into()
+                        } else {
+                            seat.into()
+                        }),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: key,
+                    })
+                    .unwrap()
             };
             append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}), None);
             let blocked = |transition| json!({

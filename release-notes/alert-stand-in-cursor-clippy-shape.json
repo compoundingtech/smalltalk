@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Collapse the retained-history cursor guard as required by Clippy.",
+  "replay": {
+    "status": "none",
+    "detail": "Clippy-shape correction only: combine the existing Some(cursor) check with the same parenthesized invalid-cursor predicate. No predicate, evaluation order, refusal, SQL, response, authority or test assertion changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Clippy-shape correction only: combine the existing Some(cursor) check with the same parenthesized invalid-cursor predicate. No predicate, evaluation order, refusal, SQL, response, authority or test assertion changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Clippy-shape correction only: combine the existing Some(cursor) check with the same parenthesized invalid-cursor predicate. No predicate, evaluation order, refusal, SQL, response, authority or test assertion changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Clippy-shape correction only: combine the existing Some(cursor) check with the same parenthesized invalid-cursor predicate. No predicate, evaluation order, refusal, SQL, response, authority or test assertion changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Clippy-shape correction only: combine the existing Some(cursor) check with the same parenthesized invalid-cursor predicate. No predicate, evaluation order, refusal, SQL, response, authority or test assertion changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Clippy-shape correction only: combine the existing Some(cursor) check with the same parenthesized invalid-cursor predicate. No predicate, evaluation order, refusal, SQL, response, authority or test assertion changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Clippy-shape correction only: combine the existing Some(cursor) check with the same parenthesized invalid-cursor predicate. No predicate, evaluation order, refusal, SQL, response, authority or test assertion changes."
+  }
+}

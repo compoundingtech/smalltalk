@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Preserve ordinary native prompt answers while carrying optional delegation",
+  "replay": { "status": "none", "detail": "No replay or stored identity change in this main carry." },
+  "schema": { "status": "none", "detail": "No further replicated claim field or SQL change. Preserve main's 1..16384-character prompt answer string and the already proposed optional delegation object." },
+  "rules": { "status": "none", "detail": "The existing source adapter still requires dismiss whenever a delegation proof is present; without proof, ordinary person permission, plan, question and screen answers use the unchanged person path." },
+  "compatibility": { "status": "none", "detail": "Combines main's ordinary text answers with this PR's accepted optional proof instead of restoring the old answer enum. Clients omitting delegation keep their ordinary wire shape. Canonical generated equality and authored composed-shape controls require fresh hosted execution." },
+  "downtime": { "status": "none", "detail": "No deployment or runtime action." },
+  "manual": { "status": "none", "detail": "Existing all-receiver rollout and actual person-grant restrictions still apply before use." },
+  "recovery": { "status": "none", "detail": "Source composition is not native acceptance or incident recovery." }
+}
