@@ -61,6 +61,18 @@ internal `POST /v1/messages` takes the same list. Each `blob` must be an upload 
 this member still holds. The daemon completes each entry with `size` and `origin` before it writes
 the claim. A message with an attachment may have empty text.
 
+## Asks
+
+An ask may carry up to four images for the person to look at, as a message does:
+`st work ask --request FILE --attach IMAGE` uploads each image and names it in the request's
+`attachments` as `{blob, media_type, name}`. The daemon completes each with its size and origin
+before it writes the ask, so the claim holds only references. An update carries none.
+
+A client reads an ask's image with the same routes, naming the ask's person step as the carrier:
+`?message=step-run/…`. The person the ask is for may read it, and anyone in the fleet may when an
+agent asks, as with a message to or from an agent. The relay to the origin carries the step the
+same way.
+
 ## Read
 
 - `GET /v1/client/blobs/{sha256}?message=message/ID` answers the raw bytes with their type.
@@ -97,3 +109,24 @@ delivery like any other transient fault. A file past its retention window is nam
 envelope, and a harness opens the file with its own file tool.
 
 Seat copies are removed after the same seven days.
+
+## Images in a harness transcript
+
+An image block in a Claude, Codex, pi or OpenCode transcript is not an attachment: its bytes stay
+in the transcript on the seat's host. A client reads it as conversation content by an on-demand
+reference. The reference names the image's size and the format its own first bytes show, never
+the harness's label for it, so a client says what the image is before reading it. An image named
+by a URL is a link the person opens; nothing fetches it to draw it.
+
+## What shows where
+
+| Image | Terminal UI | iOS |
+|---|---|---|
+| A message's images, including a Discord import's | A line each, `▣ name · type · size  open`; loads inline (click or Ctrl+U), by itself where the terminal draws images | See the iOS change |
+| An image in a transcript, including a tool result's | `[image type, size]` under its turn or call; loads inline the same way | See the iOS change |
+| An ask's images | A line each on the ask's card in Now; loads inline the same way | See the iOS change |
+| A delivery that names an image (`<attachment …/>`) | The message's image line; the seat's path is never shown | See the iOS change |
+
+Before an image loads, its line names its type and size and says how to load it. While it loads
+it says `loading…`. When its owner cannot be reached it says so with a way to try again.
+

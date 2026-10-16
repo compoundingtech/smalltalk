@@ -2623,6 +2623,9 @@ pub struct StructuredRequest {
     pub answers: Vec<RequestAnswerOption>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub custom: bool,
+    /// Images to look at, read with the blob route and the ask's step as the carrier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 /// Information an agent brings a person who asked for it. Nothing waits on it.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

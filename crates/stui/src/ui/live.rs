@@ -376,7 +376,9 @@ impl AnswerTiming {
 }
 
 enum Fetched {
-    Content(super::content::Key, Result<(String, Vec<u8>), String>),
+    Content(super::content::Key, Result<super::content::Fetched, String>),
+    /// An image's terminal encoding, built on a worker for the size a draw asked.
+    Protocol(super::content::Key, u16, u16, super::content::Encoding),
     Read(String, ReceiptOutcome),
     /// A page before the oldest entry of a conversation's session: its entries, whether st
     /// holds more before them, and the cursor for that next page; or why it could not be read.
@@ -566,16 +568,21 @@ pub fn run(context: Context) -> Result<()> {
     if std::env::var_os("STUI_TEST_PANIC_AFTER_ENTER").is_some() {
         panic!("terminal restoration probe");
     }
-    // How images are drawn: asked of a terminal known to draw them, once, inside the
-    // alternate screen and before any event is read. A terminal that never answers would
-    // leave the query reading stdin and swallow keys, so others get half blocks unasked.
-    ui.auto_images = super::attach::graphics_terminal();
-    ui.picker = Some(if ui.auto_images {
+    // How images are drawn: asked of the terminal itself, once, inside the alternate screen and
+    // before any event is read, as ratatui-image asks it (kitty graphics, sixel in its device
+    // attributes, iTerm2, through tmux too). Only a terminal that answered a status report is
+    // asked: one that never answers would leave the query reading stdin and swallow keys, so it
+    // gets half blocks unasked. Images load by themselves only where the terminal draws them.
+    let answered = super::attach::terminal_answers(Duration::from_millis(400));
+    let picker = if answered {
         ratatui_image::picker::Picker::from_query_stdio()
             .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
     } else {
         ratatui_image::picker::Picker::halfblocks()
-    });
+    };
+    ui.auto_images =
+        picker.protocol_type() != ratatui_image::picker::ProtocolType::Halfblocks;
+    ui.picker = Some(picker);
     // Clickable addresses (OSC 8) where the terminal draws images, as kitty and its kin do.
     let hyperlinks = super::attach::graphics_terminal();
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -611,6 +618,9 @@ pub fn run(context: Context) -> Result<()> {
     let mut missions_sent = false;
     let mut missions_until: Option<Instant> = None;
     let mut content_reads = super::content::Reads::default();
+    // Image encodings being built on a worker, by image and size, so each is built once.
+    let mut encoding: std::collections::BTreeSet<(super::content::Key, u16, u16)> =
+        std::collections::BTreeSet::new();
     let mut inventory_grace = InventoryGrace::default();
     let mut inventory_sent: Option<Inventories> = None;
     let mut usage_wanted_hours = None;
@@ -1030,7 +1040,11 @@ pub fn run(context: Context) -> Result<()> {
             match result {
                 Fetched::Content(key, result) => {
                     content_reads.complete(&key);
-                    ui.content.complete(key, result);
+                    ui.content.finish(key, result);
+                }
+                Fetched::Protocol(key, width, height, protocol) => {
+                    encoding.remove(&(key.clone(), width, height));
+                    ui.content.install_protocol(key, width, height, protocol);
                 }
                 Fetched::Read(id, result) => {
                     read_receipts.completed(id, result, Instant::now());
@@ -1546,7 +1560,7 @@ pub fn run(context: Context) -> Result<()> {
             }
             if !extras.live && !matches!(effect, Effect::CloseTerminal) {
                 if let Effect::LoadContent(key) = effect {
-                    ui.content.complete(key, Err("Offline · reconnect, then load again".into()));
+                    ui.content.finish(key, Err("Offline · reconnect, then load again".into()));
                 }
                 ui.flash(if extras.degraded.is_some() {
                     "Reconnecting to st · try again in a moment; nothing was queued"
@@ -1905,6 +1919,18 @@ pub fn run(context: Context) -> Result<()> {
                 }
             }
             ui.set_world(adapt::world(&model, &person, &extras));
+            // An ask's images, from the attention just adapted (not the previous world's).
+            if let Load::Ready(items) = &ui.world.attention {
+                ui.content.index_requests(
+                    items
+                        .iter()
+                        .flat_map(|item| match &item.kind {
+                            super::view::AttentionKind::Request { images, .. } => images.clone(),
+                            _ => Vec::new(),
+                        })
+                        .collect(),
+                );
+            }
             focus_initial_subject(&mut ui, &mut initial_subject, agents_live, glasses_ready);
             changed = false;
             if last_cache_save.elapsed() >= Duration::from_secs(60) {
@@ -1957,6 +1983,23 @@ pub fn run(context: Context) -> Result<()> {
         if hyperlinks && !links.is_empty() {
             super::hyperlinks::write_links(terminal.backend_mut(), &links)?;
         }
+        // Image encodings the draw asked for, built off the draw path; the frame after one
+        // arrives draws it.
+        if let Some(picker) = ui.picker.clone() {
+            for (key, width, height, image) in ui.content.protocol_jobs() {
+                if !encoding.insert((key.clone(), width, height)) {
+                    continue;
+                }
+                let picker = picker.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn_blocking(move || {
+                    if let Some(protocol) = super::content::encode(&picker, &image, width, height) {
+                        let _ = tx.send(Fetched::Protocol(key, width, height, protocol));
+                    }
+                });
+            }
+        }
+        ui.release_far_images();
         if extras.live
             && let Some(key) = ui.next_content_read(&mut content_reads)
         {
@@ -2779,17 +2822,20 @@ async fn perform(
             ))
         }
         Effect::OpenImage { image } => {
+            // In the person's own viewer where this machine has one; saved where they keep
+            // downloads (ST3_DOWNLOADS or their download directory) where it has none.
             let bytes = client.blob(&image.sha256, Some(&image.message)).await?;
             let dir = super::attach::dir()
                 .ok_or_else(|| anyhow::anyhow!("No place to keep the image (HOME is not set)"))?;
-            let path = super::attach::received(&dir, &image, &bytes)?;
-            let shown = super::attach::show(&path);
+            let kept = super::attach::received(&dir, &image, &bytes)?;
+            if super::attach::show(&kept) {
+                return Ok((format!("Opened {}", image.name.as_deref().unwrap_or("the image")), None));
+            }
+            let downloads = super::attach::downloads()
+                .ok_or_else(|| anyhow::anyhow!("No place to save the image (HOME is not set)"))?;
+            let path = super::attach::save(&downloads, &image, &bytes)?;
             Ok((
-                if shown {
-                    format!("Opened {}", path.display())
-                } else {
-                    format!("Saved to {}", path.display())
-                },
+                format!("Saved to {} · ST3_DOWNLOADS chooses where", path.display()),
                 None,
             ))
         }

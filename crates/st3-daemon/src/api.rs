@@ -4101,7 +4101,7 @@ fn client_attention_resources_from_items(
                     resource["action_parameters"]["work.done"]["answer"] = json!({"id": "read"});
                     resource["update"] = update;
                 }
-                Some(request) => resource["request"] = request,
+                Some(request) => resource["request"] = crate::person_request::client_view(&request),
                 None => {}
             }
         }
@@ -13589,9 +13589,35 @@ async fn ask_person(
             ),
         )));
     }
+    if let Some(structured) = request.request.as_mut() {
+        complete_request_images(&state, &request.actor, structured)?;
+    }
     let result = state.store.ask_person(&request).map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(result))
+}
+
+/// A request names its images by the asker's uploads, as a send does; the ask claim keeps each
+/// completed with its size and the member holding the bytes (`docs/st3/attachments.md`).
+fn complete_request_images(
+    state: &AppState,
+    asker: &str,
+    request: &mut Value,
+) -> Result<(), ApiError> {
+    let Some(inputs) = request.get("attachments").filter(|inputs| !inputs.is_null()) else {
+        return Ok(());
+    };
+    let inputs: Vec<crate::model::AttachmentInput> = serde_json::from_value(inputs.clone()).map_err(|error| {
+        ApiError::bad(St3Error::new(
+            "invalid-person-request",
+            format!(
+                "each image names an upload, {{\"blob\":\"blob/<sha256>\",\"media_type\":\"image/png\",\"name\":\"sketch.png\"}}: {error}"
+            ),
+        ))
+    })?;
+    let completed = client_blobs::resolve_attachments(state, asker, &inputs)?;
+    request["attachments"] = serde_json::to_value(completed).map_err(ApiError::internal)?;
+    Ok(())
 }
 
 async fn done_person_step(

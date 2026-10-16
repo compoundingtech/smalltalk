@@ -308,7 +308,7 @@ fn person_row(
             row["action_parameters"]["work.done"]["answer"] = json!({"id":"read"});
             row["update"] = update.clone();
         }
-        Some(request) => row["request"] = request.clone(),
+        Some(request) => row["request"] = crate::person_request::client_view(request),
         None => {}
     }
     Ok(Some((item, row, eligible)))
