@@ -3,6 +3,7 @@ import { ConversationPaneFallback } from './ConversationPaneFallback.tsx'
 import type * as ConversationPaneModule from './ConversationPane.tsx'
 import { ConversationHeaderActions } from './ConversationHeaderActions.tsx'
 import { AgentActions } from './AgentActions.tsx'
+import { AlertsPopover } from './AlertsPopover.tsx'
 import { retainPane, workspaceView, workspaceViewNotice, type RetainedPane, type WorkspaceView } from './workspaceView.ts'
 import { MISSIONS_REF } from './workspaceView.ts'
 import { ThreadHeaderSlotContext } from '../shell/threadHeaderSlot.tsx'
@@ -231,7 +232,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                   <Aria.Button aria-label={collapsed ? 'Expand agents' : 'Collapse agents'} onPress={() => setCollapsed(!collapsed)} {...stylex.props(styles.iconButton)}>
                     {collapsed ? '»' : '«'}
                   </Aria.Button>
-                  {collapsed ? null : <strong>Fractal</strong>}
+                  {collapsed ? null : <><strong>Fractal</strong><AlertsPopover onOpen={select} now={now} /></>}
                 </header>
                 {collapsed ? null : (
                   <>
