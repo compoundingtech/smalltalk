@@ -5496,6 +5496,7 @@ impl Store {
             .map_err(internal)?;
         let mut flat = Vec::new();
         flatten_steps(&mission, default_selector.clone(), &[], &mut flat);
+        let parents = crate::mission::parent_step_index(&mission);
         for (step, selector, constraints) in flat {
             let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
             let step_subject = format!("step-run/{generation_id}/{}", step.path);
@@ -5506,7 +5507,10 @@ impl Store {
             step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
             step_variables.insert(
                 "ST_PARENT_STEP_RUN".into(),
-                crate::mission::parent_step_path(&mission, &step.path)
+                parents
+                    .get(step.path.as_str())
+                    .copied()
+                    .flatten()
                     .map(|path| format!("step-run/{generation_id}/{path}"))
                     .or_else(|| parent_step_run.clone())
                     .unwrap_or_default(),
@@ -8793,6 +8797,7 @@ impl Store {
             })?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         let mut visible = Vec::with_capacity(views.len());
+        let mut definitions = PinnedDefinitions::default();
         for mut view in views {
             if actor.is_some() && !detailed {
                 // A pending available-to step or a draining run can become visible
@@ -8803,9 +8808,14 @@ impl Store {
                 smallclaims::touched::note_read(|| view.generation.clone());
             }
             if detailed {
-                enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+                enrich_step_queue_cached(&connection, &mut view, snapshot_unix_ms, &mut definitions)?;
             } else {
-                enrich_step_queue_for_reconcile_at(&connection, &mut view, snapshot_unix_ms)?;
+                enrich_step_queue_for_reconcile_cached(
+                    &connection,
+                    &mut view,
+                    snapshot_unix_ms,
+                    &mut definitions,
+                )?;
             }
             view.carried_claimant = carried_claimants.get(&view.subject).cloned();
             if run_phases
@@ -8919,6 +8929,7 @@ impl Store {
             step_run_from_row,
         )?;
         let (mut skipped, mut page) = (0, Vec::new());
+        let mut definitions = PinnedDefinitions::default();
         for row in rows {
             let mut view = row?;
             if !visible(&view)? {
@@ -8931,7 +8942,7 @@ impl Store {
             if page.len() == limit {
                 return Ok((page, true));
             }
-            enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+            enrich_step_queue_cached(&connection, &mut view, snapshot_unix_ms, &mut definitions)?;
             page.push(view);
         }
         Ok((page, false))
@@ -8988,9 +8999,10 @@ impl Store {
             step_run_from_row,
         )?;
         let mut visible = Vec::new();
+        let mut definitions = PinnedDefinitions::default();
         for row in rows {
             let mut view = row?;
-            enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+            enrich_step_queue_cached(&connection, &mut view, snapshot_unix_ms, &mut definitions)?;
             let visible_to_actor = actor.as_ref().is_none_or(|actor| {
                 view.assigned_to.as_deref() == Some(actor.as_str())
                     || view.claimant.as_deref() == Some(actor.as_str())
@@ -28827,6 +28839,8 @@ thread_local! {
     static STATUS_AFTER_DESIRED_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Pinned mission definitions a read parsed, so a test can see one parse serve a whole run.
+    pub(crate) static DEFINITIONS_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The SQLite work each work action did inside its writer job, by idempotency key, so a test
@@ -33904,6 +33918,17 @@ fn enrich_step_queue_at(
     view: &mut StepRunView,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
+    enrich_step_queue_cached(connection, view, snapshot_unix_ms, &mut PinnedDefinitions::default())
+}
+
+/// [`enrich_step_queue_at`] for the steps of one read: the pinned definitions already parsed for
+/// an earlier step of it are reused, not parsed again for each step.
+fn enrich_step_queue_cached(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+    definitions: &mut PinnedDefinitions,
+) -> rusqlite::Result<()> {
     #[cfg(test)]
     STEPS_ENRICHED.with(|enriched| enriched.set(enriched.get() + 1));
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
@@ -33923,7 +33948,7 @@ fn enrich_step_queue_at(
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_nudge_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
-    enrich_step_definition(connection, view)?;
+    enrich_step_definition_cached(connection, view, definitions)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
     person_work::enrich_responses(connection, view)
 }
@@ -34043,13 +34068,28 @@ fn enrich_step_summaries_at(
     Ok(())
 }
 
+#[cfg(test)]
 fn enrich_step_queue_for_reconcile_at(
     connection: &Connection,
     view: &mut StepRunView,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
+    enrich_step_queue_for_reconcile_cached(
+        connection,
+        view,
+        snapshot_unix_ms,
+        &mut PinnedDefinitions::default(),
+    )
+}
+
+fn enrich_step_queue_for_reconcile_cached(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+    definitions: &mut PinnedDefinitions,
+) -> rusqlite::Result<()> {
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
-    enrich_step_definition(connection, view)?;
+    enrich_step_definition_cached(connection, view, definitions)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
     person_work::enrich_responses(connection, view)
 }
@@ -34084,8 +34124,38 @@ fn pinned_generation_mission_tx(
 }
 
 fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
-    if let Some(mission) = pinned_generation_mission_tx(connection, &view.generation)? {
-        apply_step_definition(view, &mission);
+    enrich_step_definition_cached(connection, view, &mut PinnedDefinitions::default())
+}
+
+/// The pinned definitions one read has parsed, by generation. A generation's definition is the
+/// whole mission, so parsing it again for each of the run's steps costs the square of the run's
+/// size (4,200 steps: 170 s in a debug build).
+#[derive(Default)]
+struct PinnedDefinitions(BTreeMap<String, Option<MissionSpec>>);
+
+impl PinnedDefinitions {
+    fn of(
+        &mut self,
+        connection: &Connection,
+        generation: &str,
+    ) -> rusqlite::Result<Option<&MissionSpec>> {
+        if !self.0.contains_key(generation) {
+            #[cfg(test)]
+            DEFINITIONS_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
+            let mission = pinned_generation_mission_tx(connection, generation)?;
+            self.0.insert(generation.to_owned(), mission);
+        }
+        Ok(self.0[generation].as_ref())
+    }
+}
+
+fn enrich_step_definition_cached(
+    connection: &Connection,
+    view: &mut StepRunView,
+    definitions: &mut PinnedDefinitions,
+) -> rusqlite::Result<()> {
+    if let Some(mission) = definitions.of(connection, &view.generation)? {
+        apply_step_definition(view, mission);
     }
     Ok(())
 }
@@ -35804,9 +35874,10 @@ fn mission_run_view_and_definition_tx(
     } else {
         pinned_generation_mission_tx(connection, &view.generation)?
     };
+    let mut definitions = PinnedDefinitions::default();
     for step in &mut view.steps {
         if presentation {
-            enrich_step_queue(connection, step)?;
+            enrich_step_queue_cached(connection, step, now_ms(), &mut definitions)?;
         } else {
             let snapshot_unix_ms = now_ms();
             apply_effective_step_state(connection, step, snapshot_unix_ms)?;
@@ -36158,8 +36229,9 @@ fn run_generation_view_tx(
     view.steps = statement
         .query_map([generation_id], step_run_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
+    let mut definitions = PinnedDefinitions::default();
     for step in &mut view.steps {
-        enrich_step_queue(connection, step)?;
+        enrich_step_queue_cached(connection, step, now_ms(), &mut definitions)?;
     }
     Ok(view)
 }

@@ -403,7 +403,9 @@ fn batched_work_metadata_reduces_whole_read_statements_on_128_1000_4200_steps() 
             serde_json::to_value(new).unwrap(),
             serde_json::to_value(old).unwrap()
         );
-        // This fixture has one exact run/generation pair and one pinned definition.
+        // This fixture has one exact run/generation pair and one pinned definition. The per-step
+        // read enriches each step with four statements, but reads the definition once for the
+        // run, not for each step.
         let batched_statements = 2 + count.div_ceil(CHUNK) as u64;
         println!(
             "{count}-step calls (after fixture setup, not cold database): old {old_work:?} {old_time:?}; new {new_work:?} {new_time:?}"
@@ -417,7 +419,7 @@ fn batched_work_metadata_reduces_whole_read_statements_on_128_1000_4200_steps() 
         assert!(new_work.statements > 0);
         assert_eq!(
             old_work.statements,
-            new_work.statements + 4 * count as u64 - batched_statements
+            new_work.statements + 3 * count as u64 + 1 - batched_statements
         );
         assert!(
             new_work.vm_steps < old_work.vm_steps,
@@ -1217,4 +1219,29 @@ fn batched_work_metadata_origin_ask_after_a_pass_invalidates_its_seat() {
             .iter()
             .any(|view| view.subject == origin.subject && !view.person_answers.is_empty())
     );
+}
+
+#[test]
+fn the_per_step_work_read_parses_a_runs_definition_once_for_all_its_steps() {
+    let store = fixture(300);
+    crate::store::DEFINITIONS_PARSED.with(|parsed| parsed.set(0));
+    let views = oracle(&store, ACTOR, now_ms()).unwrap();
+    assert_eq!(views.len(), 300);
+    assert_eq!(
+        crate::store::DEFINITIONS_PARSED.with(std::cell::Cell::get),
+        1,
+        "one run, one pinned definition: parsing it for each step costs the square of the run"
+    );
+}
+
+#[test]
+fn creating_a_run_parses_its_definition_once_for_all_its_steps() {
+    crate::store::DEFINITIONS_PARSED.with(|parsed| parsed.set(0));
+    let store = fixture(300);
+    assert_eq!(
+        crate::store::DEFINITIONS_PARSED.with(std::cell::Cell::get),
+        1,
+        "the run view that creating a run returns reads the pinned definition once, not for each step"
+    );
+    drop(store);
 }

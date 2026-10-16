@@ -201,6 +201,28 @@ pub fn parent_step_path<'a>(mission: &'a MissionSpec, path: &str) -> Option<&'a 
     find(mission, path, None)
 }
 
+/// [`parent_step_path`] for every step of the mission, found in one walk: a loop over a run's
+/// steps asks for each step's parent, and searching the mission again for each costs the square
+/// of its size. A path found twice keeps the parent the search would have found first.
+pub fn parent_step_index(mission: &MissionSpec) -> std::collections::HashMap<&str, Option<&str>> {
+    fn walk<'a>(
+        mission: &'a MissionSpec,
+        parent: Option<&'a str>,
+        index: &mut std::collections::HashMap<&'a str, Option<&'a str>>,
+    ) {
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
+            index.entry(step.path.as_str()).or_insert(parent);
+            if let Some(nested) = &step.nested_mission {
+                walk(nested, Some(&step.path), index);
+            }
+        }
+    }
+    let mut index = std::collections::HashMap::new();
+    walk(mission, None, &mut index);
+    index
+}
+
 fn insert_mission(
     missions: &mut BTreeMap<String, MissionSpec>,
     mission: MissionSpec,
@@ -2960,6 +2982,34 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_parent_index_gives_every_step_the_parent_the_search_finds() {
+        let source = r#"version 2
+mission "outer" state="ready" {
+  goal "Nest steps."
+  step "top" { agentless }
+  step "group" {
+    agentless
+    mission "inner" state="ready" {
+      goal "Inside."
+      step "leaf" { agentless }
+      step "deeper" { agentless; mission "innermost" state="ready" { goal "Deepest."; step "bottom" { agentless } } }
+    }
+  }
+  step "last" { agentless }
+}"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let mission = &intent.missions["outer"];
+        let index = super::parent_step_index(mission);
+        assert!(index.len() >= 6, "{index:?}");
+        for (path, parent) in &index {
+            assert_eq!(*parent, super::parent_step_path(mission, path), "{path}");
+        }
+        assert!(index.values().any(Option::is_none) && index.values().any(Option::is_some));
+        assert_eq!(super::parent_step_path(mission, "no-such-step"), None);
+        assert!(!index.contains_key("no-such-step"));
+    }
+
     #[test]
     fn keep_open_and_system_are_bare_flags() {
         let source = r#"version 2
