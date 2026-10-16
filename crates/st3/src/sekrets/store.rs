@@ -119,21 +119,9 @@ pub struct GatewayStore {
     db: Connection,
 }
 
-/// `person/ada` → `ada`.
-pub fn person_name(person: &str) -> Option<&str> {
-    person
-        .strip_prefix("person/")
-        .filter(|name| valid_word(name))
-}
-
-fn valid_word(word: &str) -> bool {
-    !word.is_empty()
-        && word.len() <= 64
-        && !word.starts_with(['.', '-'])
-        && word.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
-        })
-}
+// One definition of a person's name and a profile word, shared with root's tile registry.
+pub use st_tiles_registry::names::person_name;
+use st_tiles_registry::names::valid_word;
 
 /// A profile ID is `OWNER/NAME`, where OWNER is the owning person's name.
 pub fn check_profile_id(id: &str, owner: &str) -> Result<()> {
@@ -592,6 +580,69 @@ pub fn create_private_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_person_and_a_word_have_one_definition_shared_with_the_tile_registry() {
+        // The gateway's names are the registry's own items, not a copy of them.
+        assert_eq!(
+            std::any::type_name_of_val(&person_name),
+            "st_tiles_registry::names::person_name"
+        );
+        assert_eq!(
+            std::any::type_name_of_val(&valid_word),
+            "st_tiles_registry::names::valid_word"
+        );
+        let long = "a".repeat(64);
+        let too_long = "a".repeat(65);
+        for (word, valid) in [
+            ("ada", true),
+            ("agent-gh", true),
+            ("robin", true),
+            ("a_b.c-d", true),
+            ("x9", true),
+            (long.as_str(), true),
+            ("", false),
+            (too_long.as_str(), false),
+            (".ada", false),
+            ("-ada", false),
+            ("Ada", false),
+            ("a b", false),
+            ("a/b", false),
+            ("ädä", false),
+            ("a\0", false),
+        ] {
+            assert_eq!(valid_word(word), valid, "{word:?}");
+            assert_eq!(
+                st_tiles_registry::names::valid_word(word),
+                valid,
+                "{word:?}"
+            );
+        }
+        for (person, name) in [
+            ("person/ada", Some("ada")),
+            ("person/robin", Some("robin")),
+            ("person/", None),
+            ("person/ada!", None),
+            ("person/ada/x", None),
+            ("person/.ada", None),
+            ("persona/ada", None),
+            ("agent/ada", None),
+            ("ada", None),
+        ] {
+            assert_eq!(person_name(person), name, "{person:?}");
+            assert_eq!(
+                st_tiles_registry::names::person_name(person),
+                name,
+                "{person:?}"
+            );
+            assert_eq!(crate::tiles::registry::names::person_name(person), name);
+        }
+        // A profile ID is checked with the same rule.
+        assert!(check_profile_id("ada/agent-gh", "person/ada").is_ok());
+        assert!(check_profile_id("bob/gh", "person/ada").is_err());
+        assert!(check_profile_id("ada/Agent", "person/ada").is_err());
+        assert!(check_profile_id("ada/.gh", "person/ada").is_err());
+    }
 
     #[test]
     fn profiles_grants_locks_and_the_log_round_trip() {

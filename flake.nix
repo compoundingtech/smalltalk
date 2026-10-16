@@ -247,6 +247,8 @@
           "--exclude"
           "st3-schema"
           "--exclude"
+          "st-tiles-registry"
+          "--exclude"
           "stui"
         ];
 
@@ -443,6 +445,8 @@
             "st3-migrate"
             "-p"
             "st3-schema"
+            "-p"
+            "st-tiles-registry"
             "-p"
             "stui"
           ];

@@ -4487,6 +4487,15 @@ name = "st-storage-version"
 version = "0.1.0"
 
 [[package]]
+name = "st-tiles-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "st-wire"
 version = "0.1.0"
 dependencies = [
@@ -4640,6 +4649,7 @@ dependencies = [
  "smallclaims",
  "st-drivers",
  "st-runtime",
+ "st-tiles-registry",
  "st3",
  "st3-client",
  "st3-conversation-ui",

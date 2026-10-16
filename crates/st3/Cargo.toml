@@ -61,6 +61,7 @@ st3-ui-model = { path = "../st3-ui-model" }
 stui = { path = "../stui" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }
 st3-schema = { path = "../st3-schema" }
+st-tiles-registry = { path = "../st-tiles-registry" }
 st-drivers = { path = "../st-drivers" }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

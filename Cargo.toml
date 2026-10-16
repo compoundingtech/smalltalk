@@ -14,6 +14,7 @@ members = [
   "crates/st-drivers",
   "crates/st-runtime",
   "crates/st-storage-version",
+  "crates/st-tiles-registry",
   "crates/st-resource-protocol",
   "crates/st2-resource-providers",
   "crates/st2-resource-wasip2",
