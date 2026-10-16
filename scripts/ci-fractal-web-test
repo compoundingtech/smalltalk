@@ -295,8 +295,32 @@ for required in (False, True):
         result = subprocess.run(["bash", "-c", harness], check=True, capture_output=True, text=True,
                                 env={**os.environ, "KIT_INPUTS": str(required).lower(),
                                      "BASE_SHA": "base", "HEAD_SHA": "head", "GITHUB_STEP_SUMMARY": str(summary)})
-        for name in ("UI kit play index contracts", "UI kit context isolation controls", "UI kit Storybook", "UI kit strict plays"):
+        for name in ("UI kit play index contracts", "UI kit context isolation controls", "UI kit Storybook and module graph", "UI kit strict plays"):
             assert (name in result.stdout) == required, result.stdout
         if not required:
             assert "skipped: no kit inputs changed (base..head)" in summary.read_text()
         print(f"passed: kit lanes {'run' if required else 'skip explicitly'}")
+
+# The kit module graph check: every bundled repository file must be a declared kit input.
+graph_check = root / "scripts/ci-fractal-web-kit-graph"
+detector_kit_paths = runpy.run_path(str(detector))["kit_paths"]
+assert detector_kit_paths(["apps/fractal-web/src/changelog/seen.ts"]), "changelog files the kit renders select kit plays"
+assert not detector_kit_paths(["apps/fractal-web/src/alerts/AlertsPopover.tsx"]), "other app-only changes still skip kit plays"
+with tempfile.TemporaryDirectory() as scratch:
+    def graph(*ids):
+        path = Path(scratch, "preview-stats.json")
+        path.write_text(json.dumps({"modules": [{"id": identifier} for identifier in ids]}))
+        return subprocess.run([str(graph_check), str(path)], capture_output=True, text=True)
+    covered = graph("./src/Composer.stories.tsx", "./.storybook/preview.ts?v=1", "./../../node_modules/react/index.js",
+                    "/virtual:/@storybook/builder-vite/vite-app.js", "./../../apps/fractal-web/src/changelog/ChangelogView.tsx")
+    assert covered.returncode == 0 and "3 repository files, 0 outside" in covered.stdout, covered
+    outside = graph("./src/Composer.stories.tsx", "./../../apps/fractal-web/src/alerts/AlertsPopover.tsx")
+    assert outside.returncode == 1 and "apps/fractal-web/src/alerts/AlertsPopover.tsx" in outside.stderr, outside
+    for ids in ((), ("./../../node_modules/react/index.js",), ("/virtual:/x",)):
+        empty = graph(*ids)
+        assert empty.returncode == 1 and "unreadable" in empty.stderr, empty
+    escaped = graph("./../../../outside-the-repository.ts")
+    assert escaped.returncode == 1 and "outside the repository" in escaped.stderr, escaped
+    Path(scratch, "preview-stats.json").write_text("{")
+    assert subprocess.run([str(graph_check), str(Path(scratch, "preview-stats.json"))], capture_output=True).returncode == 1
+print("passed: the kit module graph check accepts declared inputs and rejects files outside them, empty and malformed graphs")

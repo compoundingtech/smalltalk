@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Fail when the kit Storybook bundles a repository file that the kit-input detector does not cover.
+
+The detector (scripts/ci-fractal-web-changes) decides from changed paths whether kit plays run. Its
+KIT_PATTERNS are declared by hand; this reads the module graph the bundler actually built
+(`storybook build --stats-json DIR` writes DIR/preview-stats.json) and requires every repository
+file in it to match a kit pattern, so an import from outside the declared inputs cannot make a
+change skip the plays that render it. Dependencies under node_modules are covered by the lockfile
+and manifests; bundler-virtual modules have no file. An empty or unreadable graph fails.
+
+Usage: ci-fractal-web-kit-graph <preview-stats.json> [<storybook config dir, default packages/fractal-ui>]
+"""
+
+import json
+from pathlib import Path
+import runpy
+import sys
+
+root = Path(__file__).resolve().parent.parent
+kit_paths = runpy.run_path(str(root / "scripts/ci-fractal-web-changes"))["kit_paths"]
+
+
+def graph_files(stats, package):
+    """Repository-relative files in the bundler's module graph; module ids are relative to the package."""
+    modules = stats.get("modules") if isinstance(stats, dict) else None
+    if not isinstance(modules, list) or not modules:
+        raise ValueError("module graph is empty or malformed")
+    files = set()
+    for module in modules:
+        identifier = module.get("id") if isinstance(module, dict) else None
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError(f"module without an id: {module!r}")
+        path = identifier.split("?", 1)[0]
+        if path.startswith(("\0", "/virtual:", "virtual:", "/@")):
+            continue
+        absolute = (package / path).resolve() if not path.startswith("/") else Path(path).resolve()
+        try:
+            relative = absolute.relative_to(root)
+        except ValueError:
+            raise ValueError(f"module outside the repository: {identifier}")
+        if "node_modules" in relative.parts:
+            continue
+        files.add(relative.as_posix())
+    if not files:
+        raise ValueError("module graph names no repository file")
+    return sorted(files)
+
+
+def main(argv):
+    if len(argv) not in (2, 3):
+        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+        return 2
+    package = (root / (argv[2] if len(argv) == 3 else "packages/fractal-ui")).resolve()
+    try:
+        files = graph_files(json.loads(Path(argv[1]).read_text()), package)
+    except (OSError, ValueError) as error:
+        print(f"::error::kit module graph unreadable: {error}", file=sys.stderr)
+        return 1
+    covered = set(kit_paths(files))
+    missing = [path for path in files if path not in covered]
+    for path in missing:
+        print(f"::error::kit Storybook bundles {path}, which no KIT_PATTERNS entry in scripts/ci-fractal-web-changes covers", file=sys.stderr)
+    print(f"kit module graph: {len(files)} repository files, {len(missing)} outside the kit inputs")
+    return 1 if missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
