@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import test from 'node:test';
 import { watchSync, syncBannerText } from './syncWatch.ts';
 import { alertsEmptyText } from './alertsEmpty.ts';
 
@@ -6,42 +7,62 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const behind = { state: 'catching-up', peers: [{ host_id: 'host/harbor', peer_only_envelopes: 9, local_only_envelopes: 0 }] };
 
 // A read happens at once and again each interval; each result is published, a failure as unknown.
-{
+await test('publishes each read, including failures as unknown', { timeout: 5_000 }, async t => {
   const seen = [];
   const results = [behind, null, 'boom', null];
-  const stop = watchSync(async () => { const next = results.shift(); if (next === 'boom') throw new Error('down'); return next; }, (value, stale) => seen.push(stale ? ['stale', value] : value), 10);
-  await wait(80);
+  const { promise: published, resolve } = Promise.withResolvers();
+  const stop = watchSync(async () => { const next = results.shift(); if (next === 'boom') throw new Error('down'); return next; }, (value, stale) => {
+    seen.push(stale ? ['stale', value] : value);
+    if (seen.length === 4) resolve();
+  }, 10);
+  t.after(stop);
+  await published;
   stop();
-  assert.deepEqual(seen.slice(0, 4), [behind, null, undefined, null]);
-}
+  assert.deepEqual(seen, [behind, null, undefined, null]);
+});
 
 // A failed read after a behind notice keeps it, marked stale; a failed read after level, or with
 // nothing read, is unknown; the next answer replaces either.
-{
+await test('keeps a behind notice stale until the next answer replaces it', { timeout: 5_000 }, async t => {
   const seen = [];
   const results = [behind, 'boom', 'boom', null, 'boom'];
-  const stop = watchSync(async () => { const next = results.shift(); if (next === 'boom') throw new Error('down'); return next; }, (value, stale) => seen.push(stale ? ['stale', value] : value), 10);
-  await wait(100);
+  const { promise: published, resolve } = Promise.withResolvers();
+  const stop = watchSync(async () => { const next = results.shift(); if (next === 'boom') throw new Error('down'); return next; }, (value, stale) => {
+    seen.push(stale ? ['stale', value] : value);
+    if (seen.length === 5) resolve();
+  }, 10);
+  t.after(stop);
+  await published;
   stop();
-  assert.deepEqual(seen.slice(0, 5), [behind, ['stale', behind], ['stale', behind], null, undefined]);
-}
-{
+  assert.deepEqual(seen, [behind, ['stale', behind], ['stale', behind], null, undefined]);
+});
+await test('publishes unknown when the first read fails', { timeout: 5_000 }, async t => {
   const seen = [];
-  const stop = watchSync(async () => { throw new Error('down'); }, (value, stale) => seen.push([value, stale]), 10);
-  await wait(35);
+  const { promise: published, resolve } = Promise.withResolvers();
+  const stop = watchSync(async () => { throw new Error('down'); }, (value, stale) => {
+    seen.push([value, stale]);
+    resolve();
+  }, 10);
+  t.after(stop);
+  await published;
   stop();
-  assert.deepEqual(seen[0], [undefined, false]);
-}
+  assert.deepEqual(seen, [[undefined, false]]);
+});
 
 // A read that never answers counts as failed after the timeout, and the reads go on.
-{
+await test('continues reading after a hung read times out', { timeout: 5_000 }, async t => {
   const seen = [];
   let calls = 0;
-  const stop = watchSync(() => { calls++; return calls === 1 ? new Promise(() => {}) : Promise.resolve(behind); }, (value, stale) => seen.push([value, stale]), 10, 15);
-  await wait(120);
+  const { promise: published, resolve } = Promise.withResolvers();
+  const stop = watchSync(() => { calls++; return calls === 1 ? new Promise(() => {}) : Promise.resolve(behind); }, (value, stale) => {
+    seen.push([value, stale]);
+    if (seen.length === 2) resolve();
+  }, 10, 15);
+  t.after(stop);
+  await published;
   stop();
-  assert.deepEqual(seen.slice(0, 2), [[undefined, false], [behind, false]]);
-}
+  assert.deepEqual(seen, [[undefined, false], [behind, false]]);
+});
 
 // The banner says when its notice was not refreshed, and says nothing for level or unknown.
 assert.equal(syncBannerText(behind, false), 'Catching up: harbor has 9 envelopes this host lacks · estimating time to catch up. What shows here can be out of date until then.');
