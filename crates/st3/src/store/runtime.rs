@@ -289,14 +289,7 @@ impl Runtime for SmalltalkRuntime {
             views.initialize_empty(transaction, cut)?;
             smallclaims::ivm::events::install(transaction, 4096)?;
         }
-        publication_facts::initialize(transaction)?;
-        custom::open(transaction)?;
-        resources::open(transaction)?;
-        glass_heads::open(transaction)?;
-        directive_notes::flush(transaction)?;
-        agent_messages::open(transaction)?;
-        arrangements::open(transaction)?;
-        limits::open_limits(transaction)?;
+        projectors::run_hooks(projectors::OPEN, transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -428,12 +421,7 @@ impl Runtime for SmalltalkRuntime {
     }
 
     fn after_projection(&self, transaction: &Transaction<'_>) -> Result<(), St3Error> {
-        custom::flush(transaction).map_err(internal)?;
-        resources::flush(transaction).map_err(internal)?;
-        glass_heads::flush(transaction).map_err(internal)?;
-        directive_notes::flush(transaction).map_err(internal)?;
-        agent_messages::flush(transaction).map_err(internal)?;
-        limits::flush_limits(transaction).map_err(internal)?;
+        projectors::run_hooks(projectors::FLUSH, transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 

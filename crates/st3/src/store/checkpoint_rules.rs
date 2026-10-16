@@ -949,11 +949,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_operations_tx(transaction)?;
     project_replicated_base_claims(transaction)?;
     project_replicated_mission_runs(transaction)?;
-    rebuild_planning_tx(transaction)?;
-    resources::rebuild(transaction)?;
-    glass_heads::rebuild(transaction)?;
-    directive_notes::rebuild(transaction)?;
-    arrangements::rebuild(transaction)?;
+    projectors::run_hooks(projectors::REBUILD, transaction)?;
     Ok(())
 }
 
