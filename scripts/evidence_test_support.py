@@ -7,6 +7,17 @@ import tempfile
 sys.dont_write_bytecode = True
 
 
+# What the signer refuses to start with (scripts/evidence-sign REFUSED_ENVIRONMENT). Some hosts set LD_PRELOAD for
+# every process, so a test that expects the signer to run first removes these from its own environment.
+LOADER_VARIABLES = ('LD_PRELOAD', 'LD_AUDIT', 'DYLD_INSERT_LIBRARIES', 'GCONV_PATH', 'NLSPATH',
+                    'PYTHONPATH', 'PYTHONSTARTUP', 'PYTHONHOME')
+
+
+def clean_loader_environment():
+    for name in LOADER_VARIABLES:
+        os.environ.pop(name, None)
+
+
 def tool_path():
     """Directories of the real git and ssh-keygen on this machine, usable as the signer's own path.
 
