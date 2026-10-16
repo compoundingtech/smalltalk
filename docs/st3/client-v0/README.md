@@ -2008,6 +2008,68 @@ ST3_TERMINALS_COMPAT_BIN=/path/to/older/st3 cargo test -p st3 --test integration
 Choose a binary built before these terminal filters. The fake legacy-server refusal
 and escaping test, server filter/paging tests, and TypeScript client checks run in CI.
 
+### Native delivery receipt links
+
+Capability `conversation-delivery-links` version 1 supports the optional top-level
+`TimelineEntry.delivers` message reference. Request it with
+`X-St3-Features: conversation-delivery-links.v1` (alongside any other features).
+A link names the Small Talk message consumed by that native user turn. Use
+`message.read` to retrieve its full body; a clipped native envelope is a preview.
+Without this feature the field is omitted, including on relayed and cached pages.
+The updated Rust owner-relay client negotiates it and preserves it through typed
+serialization; older daemons/clients keep their existing envelope workaround.
+
+The first producer is Claude's current verified transcript binding, explicit
+user-record id and existing consumption predicate. Queue acceptance/removal,
+ordinal-only ids, other unqualified adapters and old receipts supply no link.
+The lookup uses the qualified transcript's driver/native session identity; managed
+route session IDs and cursors remain separate and unchanged. The owner retains
+only native session/record ids beside the newly appended read
+receipt in the same existing writer savepoint. Claim body, signature, receipt
+operation/idempotency digest and ACK timing are unchanged. This local metadata
+is not replicated, a transcript payload or an admission authority. No history
+is backfilled: restore from claim-only backups leaves these links unavailable.
+A normal reopen retains metadata. Acceptance-time corrections keep the binding;
+updates to the receipt's id, subject, kind, actor, origin or body retire it. The
+conditional deletion trigger also clears it with foreign keys disabled. Reads
+never initialize or rebuild it. A private receipt-meaning fingerprint (subject,
+actor, origin and canonical receipt body) refuses changed/reused ids even if a
+fault or unsupported table copy lost its update trigger. It is an equality
+witness, never native authority. The lookup bounds count missing and above-cut
+physical candidates too; its logical cut checks the current claim row position.
+
+The actual production projection replay/rebuild retains claim ids/rows, this
+local table and its triggers. The old migration in store.rs swaps batches only;
+it does not replace claims, and their native receipt bindings survive. The cited
+foreign-keys-off deletion in peer.rs is a test fault on intent.desired claims.
+Actual retention/repair deletions of receipt rows retire the local binding;
+claim-only reinsertion/restoration does not guess or rebuild it. Arbitrary
+claims-table replacement is not a supported migration: a future implementation
+must preserve proof metadata for unchanged claim identities/meaning, reinstall
+guard triggers, and explicitly retire changed ids. Missing or changed receipts
+never produce a link. Earlier unreleased v1 PR-head metadata is not adopted or
+backfilled into v2; the optional link remains unavailable for those old receipts.
+
+The daemon currently validates only the identity's well-formed shape from its
+authenticated Claude delivery peer. Matching that session/record to the verified
+Claude binding and existing envelope-consumption predicate happens in the
+channel, not again in the daemon. A compromised authenticated seat can therefore
+mislabel links in its own timelines; this feature grants no new native authority.
+If the same-savepoint metadata INSERT fails, the read receipt is rolled back and
+no ACK is issued. Existing receipt recovery retains the frozen proof and retries
+with exponential delay capped at 30 seconds. The delay and each request remain
+bounded; there is no new finite retry count, TTL eviction or silent proof loss.
+
+One statement checks at most 200 selected native ids, at most three indexed
+receipts each, and at most 4 KiB of receipt body each. Two eligible receipts for
+one native turn, an exhausted physical bound, repaired/noncanonical claims or
+missing operation proof leave the optional field absent. Newly recorded receipts
+wake the existing follower and cause its ordinary cursor-gap refresh when they
+would change an already delivered native entry. This is receipt provenance,
+not a read-after-send guarantee or proof that the owner's harness has delivered
+any unobserved send. Daemons roll out first. Optional author/recipients fields
+are a separate approved follow-up; existing from/to types are unchanged here.
+
 ### Owner-native conversation blocks
 
 With `X-St3-Features: conversation-blocks.v1`, native timeline entries include
