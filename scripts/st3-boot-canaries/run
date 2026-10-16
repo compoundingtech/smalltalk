@@ -465,8 +465,35 @@ def forget_native_session(node, harness, session):
         path.unlink()
 
 
+def offers(text, reference):
+    """Whether this handed-off text is the message itself, not another message that mentions it.
+
+    A message's envelope names itself in `graph="message/ID"`. The daemon's "Session restarted:
+    where you were" message lists the seat's unread mail by ID in its body: that is a mention, and
+    counting it as a second offer made a fresh probe read a moment before the summary was composed
+    fail "offered once" (run 38904809882). Text without any envelope falls back to a plain mention.
+    """
+    if 'graph="message/' not in text:
+        return reference in text
+    return f'graph="{reference}"' in text
+
+
 def native_offer_count(node, reference):
-    """Count provider handoffs, independently of idempotent graph receipt claims."""
+    """Count provider handoffs of this message itself, independently of idempotent graph receipt claims.
+
+    For "offered exactly once" waits. A real duplicate (two envelopes naming it) counts twice.
+    """
+    return sum((row.get("event") == "channel" and offers(row.get("content", ""), reference))
+               or (row.get("event") == "turn" and offers(row.get("text", ""), reference))
+               for row in receipts(node, "a"))
+
+
+def native_mention_count(node, reference):
+    """Count provider handoffs that mention the message in any way, its own envelope or a listing.
+
+    For "must not have reached the provider yet" checks: those stay as strict as before, so a mail
+    that must still be held fails if any handed-off text names it.
+    """
     return sum((row.get("event") == "channel" and reference in row.get("content", ""))
                or (row.get("event") == "turn" and reference in row.get("text", ""))
                for row in receipts(node, "a"))
@@ -583,7 +610,7 @@ def suspend_and_resume(node, seats, harness):
           seats.bound, "the resumed seat did not read fresh mail")
     if (node.api("/v1/messages/read/" + sent) or {}).get("status") != held.get("status"):
         fail("resuming a seat automatically advanced its old mail")
-    if native_offer_count(node, sent) != 0:
+    if native_mention_count(node, sent) != 0:
         fail("resuming a seat offered old mail to the provider")
     if native_offer_count(node, recent) != 1:
         fail("recovered recent mail reached the provider again")
@@ -703,7 +730,7 @@ def claude_attachment(node, seats, mode):
     delivery = (node.api("/v1/messages/delivery/" + early) or {}).get("delivery")
     if not delivery or delivery.get("state") != "waiting" or "channel" not in delivery.get("reason", ""):
         fail(f"unattached channel did not visibly hold early mail: {delivery}")
-    if native_offer_count(node, early) != 0:
+    if native_mention_count(node, early) != 0:
         fail("an unattached channel offered early mail")
     blocked_incarnation = seats.view("a")[0].get("incarnation_id")
     if mode == "uninitialized":
@@ -784,7 +811,7 @@ def claude_channel_parked(node, seats):
     time.sleep(30)
     if len(attempts()) != 3 or len([row for row in receipts(node, "a") if row.get("event") == "started"]) != starts:
         fail("parked channel restarted after the daemon lost its in-memory budget")
-    if native_offer_count(node, early) != 0:
+    if native_mention_count(node, early) != 0:
         fail("parked channel offered mail without attachment")
     delivery = (node.api("/v1/messages/delivery/" + early) or {}).get("delivery")
     if not delivery or delivery.get("state") != "waiting" or not delivery.get("reason"):

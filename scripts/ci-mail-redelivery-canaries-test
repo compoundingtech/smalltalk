@@ -40,7 +40,7 @@ else:
     (wrapper_root / 'scripts').mkdir(parents=True)
     for name in ('ci-linux', 'ci-mail-redelivery-canaries'):
         (wrapper_root / 'scripts' / name).write_text((ROOT / 'scripts' / name).read_text())
-    for name in ('ci-cargo-tools-env-test', 'ci-rustc-wrapper-test', 'sccache-evidence-test', 'check-st-boundary-test', 'check-st-boundary'):
+    for name in ('ci-cargo-tools-env-test', 'ci-rustc-wrapper-test', 'sccache-evidence-test', 'check-st-boundary-test', 'st3-boot-canaries-offers-test', 'check-st-boundary'):
         (wrapper_root / 'scripts' / name).write_text('pass\n')
 
     def check(case, expected, wrapper=False):

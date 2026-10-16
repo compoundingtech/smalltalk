@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""The boot canary counts a message's own handoff, not another message that mentions it.
+
+Receipts below are shaped like the failing run 38904809882: the probe's own envelope, and the
+daemon's "Session restarted: where you were" message that lists the probe as unread mail.
+"""
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import sys
+import unittest
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+loader = importlib.machinery.SourceFileLoader("boot_canaries_run", str(HERE / "st3-boot-canaries/run"))
+spec = importlib.util.spec_from_loader("boot_canaries_run", loader)
+canary = importlib.util.module_from_spec(spec)
+loader.exec_module(canary)
+
+PROBE = "message/70d46cc1b19751e0"
+OWN = ('<smalltalk-message id="70d46cc1b19751e0" from="person/eval" to="agent/canary/boot/c1/seat-a" '
+       f'subject="immediate probe 1" sha256="x" graph="{PROBE}">\nearly fresh mail\n</smalltalk-message>')
+SUMMARY = ('<smalltalk-message id="3e10821ce0e5eb12" from="daemon/runtime" to="agent/canary/boot/c1/seat-a" '
+           'subject="Session restarted: where you were" sha256="y" graph="message/3e10821ce0e5eb12">\n'
+           f"## Unread mail - `{PROBE}` from person/eval: immediate probe 1\n</smalltalk-message>")
+
+
+def with_receipts(rows):
+    canary.receipts = lambda node, letter: rows
+    return object()
+
+
+def channel(content):
+    return {"event": "channel", "content": content}
+
+
+class OfferCounts(unittest.TestCase):
+    def test_a_summary_that_lists_the_probe_is_not_a_second_offer(self):
+        node = with_receipts([channel(OWN), channel(SUMMARY)])
+        self.assertEqual(canary.native_offer_count(node, PROBE), 1)
+        self.assertEqual(canary.native_offer_count(node, "message/3e10821ce0e5eb12"), 1)
+
+    def test_the_old_plain_mention_counted_two_and_the_mention_count_still_does(self):
+        node = with_receipts([channel(OWN), channel(SUMMARY)])
+        self.assertEqual(canary.native_mention_count(node, PROBE), 2)
+
+    def test_a_real_duplicate_offer_still_counts_twice(self):
+        for rows in ([channel(OWN), channel(OWN)],
+                     [channel(OWN), {"event": "turn", "text": OWN}],
+                     [channel(OWN), channel(OWN), channel(SUMMARY)]):
+            node = with_receipts(rows)
+            self.assertEqual(canary.native_offer_count(node, PROBE), 2, rows)
+
+    def test_a_message_never_handed_off_counts_zero_even_when_a_summary_lists_it(self):
+        node = with_receipts([channel(SUMMARY)])
+        self.assertEqual(canary.native_offer_count(node, PROBE), 0)
+        self.assertEqual(canary.native_mention_count(node, PROBE), 1)
+
+    def test_text_without_an_envelope_keeps_the_plain_mention_match(self):
+        node = with_receipts([{"event": "turn", "text": f"please read {PROBE}"}])
+        self.assertEqual(canary.native_offer_count(node, PROBE), 1)
+
+    def test_other_receipt_events_are_ignored(self):
+        node = with_receipts([{"event": "read", "reference": PROBE, "content": OWN}])
+        self.assertEqual(canary.native_offer_count(node, PROBE), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

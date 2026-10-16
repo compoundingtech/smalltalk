@@ -70,6 +70,7 @@ python3 scripts/ci-cargo-tools-env-test
 python3 scripts/ci-rustc-wrapper-test
 python3 scripts/sccache-evidence-test
 python3 scripts/check-st-boundary-test
+python3 scripts/st3-boot-canaries-offers-test
 python3 scripts/check-st-boundary
 
 start=$SECONDS status=0
