@@ -39,7 +39,7 @@ needs the `control.messages` scope. The answer is `{blob, sha256, size, media_ty
 is `blob/<sha256>`. The same bytes answer the same reference. `st blobs put FILE` does it from the
 CLI, and `st conversations send --attach FILE` does it as part of a send.
 
-Before it uploads, the CLI prepares the file (`crates/st3/src/attach_image.rs`): an SVG is
+Before it uploads, the CLI prepares the file (`crates/st3-daemon/src/attach_image.rs`): an SVG is
 rendered to a PNG on white at twice its size (at most 4096 pixels on a side), and an `<image href>`
 such as a screenshot it marks up is drawn only from a `data:` URL or a file inside the SVG's own
 folder (after `..` and symbolic links), so an SVG from elsewhere cannot pull another local image

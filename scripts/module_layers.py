@@ -190,8 +190,9 @@ def crate_findings(root):
     """Facts about the st3 and st3-daemon packages that docs/st3/crate-contract.md promises.
 
     They apply once crates/st3-daemon exists: the library does not depend on a binary-side crate,
-    the two packages carry the same version (the library reports CARGO_PKG_VERSION), and their
-    build.rs files are the same (both read the ST3_FIXTURE_* variables for the same feature).
+    the two packages carry the same version (the library reports CARGO_PKG_VERSION), a dependency both
+    manifests name is declared the same, and their build.rs files are the same (both read the
+    ST3_FIXTURE_* variables for the same feature).
     """
     daemon = os.path.join(root, "crates", "st3-daemon")
     if not os.path.isfile(os.path.join(daemon, "Cargo.toml")):
@@ -206,9 +207,35 @@ def crate_findings(root):
     if library["package"]["version"] != binary["package"]["version"]:
         problems.append(f"crates/st3-daemon version {library['package']['version']} differs from "
                         f"crates/st3 version {binary['package']['version']}")
-    for name in BINARY_SIDE_CRATES:
-        if name in library.get("dependencies", {}):
-            problems.append(f"crates/st3-daemon depends on {name}, which is binary-side")
+    for section in ("dependencies", "build-dependencies"):
+        for key, spec in library.get(section, {}).items():
+            name = spec.get("package", key) if isinstance(spec, dict) else key
+            if name in BINARY_SIDE_CRATES:
+                problems.append(f"crates/st3-daemon depends on {name}, which is binary-side")
+    # Both manifests list the library's dependencies, so a bump in one that the other misses would put
+    # two versions of a crate into the build: a dependency named in both must be declared the same.
+    for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+        for key, spec in sorted(library.get(section, {}).items()):
+            other = binary.get(section, {}).get(key)
+            if other is not None and other != spec:
+                problems.append(f"{key} in [{section}] differs between crates/st3-daemon ({spec}) and crates/st3 ({other})")
+    # A nextest filter that names package st3 and not st3-daemon silently stops matching the library's
+    # tests once they live in st3-daemon; only filters for the binary-side integration tests may do so.
+    nextest = os.path.join(root, ".config", "nextest.toml")
+    if os.path.isfile(nextest):
+        with open(nextest, "rb") as handle:
+            config = tomllib.load(handle)
+        for profile, body in config.get("profile", {}).items():
+            filters = [(f"profile.{profile}.default-filter", body["default-filter"])] if "default-filter" in body else []
+            for kind in ("overrides", "scripts"):
+                for index, entry in enumerate(body.get(kind, [])):
+                    if "filter" in entry:
+                        filters.append((f"profile.{profile}.{kind}[{index}]", entry["filter"]))
+            for where, expression in filters:
+                if re.search(r"package\(=?st3\)", expression) and "st3-daemon" not in expression \
+                        and "binary(=integration)" not in expression:
+                    problems.append(f".config/nextest.toml {where} names package st3 but not st3-daemon, "
+                                    "so it no longer selects the library's tests")
     build = [os.path.join(d, "build.rs") for d in (daemon, os.path.join(root, "crates", "st3"))]
     contents = []
     for path in build:

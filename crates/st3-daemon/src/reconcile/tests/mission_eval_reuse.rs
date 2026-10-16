@@ -58,7 +58,7 @@ pub(crate) fn fixture() -> (Arc<Store>, String) {
 // Pre-reuse baseline (debug test profile, 100 full evaluations): 5640.540 ms thread
 // CPU, 56.405 ms/evaluation, 5689.020 ms wall. Reproduce before/after with:
 // flock --close /tmp/misc-heavy-build.lock nice -n 19 ionice -c3 env CARGO_BUILD_JOBS=4
-// /run/current-system/sw/bin/nix develop -c cargo test -p st3 --lib
+// /run/current-system/sw/bin/nix develop -c cargo test -p st3-daemon --lib
 // mission_run_evaluation_cpu_20_steps -- --ignored --nocapture --test-threads=1
 #[test]
 #[ignore = "CPU timing benchmark; run explicitly with --ignored --nocapture --test-threads=1"]

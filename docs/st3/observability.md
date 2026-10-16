@@ -50,7 +50,7 @@ hook signals ── daemon observations exporter ──────────�
 
 ## Pipeline and identity
 
-`crates/st3/src/otel.rs` owns SDK initialization, resource construction, and shutdown.
+`crates/st3-daemon/src/otel.rs` owns SDK initialization, resource construction, and shutdown.
 The tracer provider uses `Sampler::AlwaysOn` and a plain SDK `BatchSpanProcessor` to export
 every span, including spans with an unsampled remote parent. There is no in-process sampler
 or span buffer beyond the SDK batch queue. The manifest pins OpenTelemetry API, SDK
@@ -85,13 +85,13 @@ unit. `ST3_CLI_OTEL=off` selects it for the CLI only.
 | Driver hook | `st-hook` via daemon observations exporter; no direct SDK export | No collector flush in the hook |
 | `driver claude-statusline` | None; `telemetry::local_only()` | No pipeline |
 
-`crates/st3/src/telemetry.rs` remains the hook path. Hooks hand signals to the daemon and
+`crates/st3-daemon/src/telemetry.rs` remains the hook path. Hooks hand signals to the daemon and
 never contact a collector. The observations exporter emits hook spans and hook invocation
 metrics as `st-hook`; observation logs and usage metrics retain `st-daemon`. Statusline calls remain local-only and do not initialize an SDK pipeline.
 
 The shared resource contains `service.name`, `service.version` from
 `st_drivers::version::machine_version()`, a random per-process `service.instance.id`,
-`host.name`, and `st3.node`. The observations exporter in `crates/st3/src/otlp.rs` uses this
+`host.name`, and `st3.node`. The observations exporter in `crates/st3-daemon/src/otlp.rs` uses this
 resource builder, including the version: hook spans and invocation metrics are `st-hook`,
 observation logs and usage metrics are `st-daemon`. The bare `st` service name is retired.
 The platform edge supplies fleet-owned attributes.

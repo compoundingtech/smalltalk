@@ -33,13 +33,17 @@ def main():
     if output.exists():
         parser.error("output must be new; existing measurements are never overwritten")
     commit = run("git", "rev-parse", "--verify", f"{args.ref}^{{commit}}", capture_output=True, text=True).stdout.strip()
-    fixture = (repo / "crates/st3/src/api/mailbox_profile.rs").read_bytes()
+    # The library lives in crates/st3-daemon since the crate split and in crates/st3 before it.
+    here = "crates/st3-daemon" if (repo / "crates/st3-daemon/Cargo.toml").exists() else "crates/st3"
+    fixture = (repo / here / "src/api/mailbox_profile.rs").read_bytes()
     output.mkdir(parents=True)
     checkout = output / "checkout"
     run("git", "worktree", "add", "--detach", str(checkout), commit)
     try:
-        (checkout / "crates/st3/src/api/mailbox_profile.rs").write_bytes(fixture)
-        mailbox = checkout / "crates/st3/src/api/mailbox.rs"
+        package = "st3-daemon" if (checkout / "crates/st3-daemon/Cargo.toml").exists() else "st3"
+        library = checkout / "crates" / package
+        (library / "src/api/mailbox_profile.rs").write_bytes(fixture)
+        mailbox = library / "src/api/mailbox.rs"
         source = mailbox.read_text()
         if '#[path = "mailbox_profile.rs"]' not in source:
             mailbox.write_text(source + '\n#[cfg(test)]\n#[path = "mailbox_profile.rs"]\nmod profile;\n')
@@ -48,12 +52,12 @@ def main():
                     "idle_messages_per_seat": args.idle}
         (output / "build-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         with (output / "build.jsonl").open("w") as stdout, (output / "build.log").open("w") as stderr:
-            run("cargo", "test", "--release", "-p", "st3", "--lib",
+            run("cargo", "test", "--release", "-p", package, "--lib",
                 "api::mailbox::profile::many_streams", "--no-run", "--message-format=json",
                 cwd=checkout, stdout=stdout, stderr=stderr)
         executables = [item["executable"] for line in (output / "build.jsonl").read_text().splitlines()
                        if (item := json.loads(line)).get("reason") == "compiler-artifact"
-                       and item.get("executable") and item["target"]["name"] == "st3"
+                       and item.get("executable") and item["target"]["name"] == package
                        and item["profile"]["test"]]
         if len(executables) != 1:
             raise RuntimeError(f"expected one test executable, got {executables}")
