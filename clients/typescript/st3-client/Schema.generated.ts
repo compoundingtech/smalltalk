@@ -1121,6 +1121,29 @@ export const AttentionActor = /*#__PURE__*/ (() => Schema.Struct({
 export type AttentionActor = typeof AttentionActor.Type
 export type AttentionActorEncoded = typeof AttentionActor.Encoded
 
+export const AttentionRevisionLine = /*#__PURE__*/ (() => Schema.Struct({
+  /** + adds a step, - removes one, ~ changes the mission or a step. */
+  "op": Schema.Literals(["+","-","~"]).annotate({ description: "+ adds a step, - removes one, ~ changes the mission or a step." }),
+  /** In plain words: `step PATH`, or `PATH: fields` and `mission: fields` for a change. */
+  "text": Schema.String.annotate({ description: "In plain words: `step PATH`, or `PATH: fields` and `mission: fields` for a change." })
+}).annotate({ identifier: "AttentionRevisionLine" }))()
+export type AttentionRevisionLine = typeof AttentionRevisionLine.Type
+export type AttentionRevisionLineEncoded = typeof AttentionRevisionLine.Encoded
+
+export const AttentionRevision = /*#__PURE__*/ (() => Schema.Struct({
+  /** The revision the run runs now. */
+  "from_revision": Schema.String.annotate({ description: "The revision the run runs now." }),
+  /** The mission's own changed fields, then by step path the steps added, removed and changed. */
+  "lines": Schema.Array(AttentionRevisionLine).check(Schema.isMaxLength(200)).annotate({ description: "The mission's own changed fields, then by step path the steps added, removed and changed." }),
+  "reason": Schema.String,
+  /** The candidate revision. */
+  "to_revision": Schema.String.annotate({ description: "The candidate revision." }),
+  /** Whether there were more than 200 lines. */
+  "truncated": Schema.Boolean.annotate({ description: "Whether there were more than 200 lines." })
+}).annotate({ identifier: "AttentionRevision" }))()
+export type AttentionRevision = typeof AttentionRevision.Type
+export type AttentionRevisionEncoded = typeof AttentionRevision.Encoded
+
 export const AttentionWaiting = /*#__PURE__*/ (() => Schema.Struct({
   /** The step's name within its mission. */
   "path": Schema.String.annotate({ description: "The step's name within its mission." }),
@@ -1136,6 +1159,8 @@ export const AttentionPresentation = /*#__PURE__*/ (() => Schema.Struct({
   "kind": Schema.OptionFromNullOr(Schema.Literals(["review","feedback","request","update","launch","revision","prompt","login","fault"])).annotate({ description: "The card; null for a row that is no card (an unread message stays in its conversation)." }),
   /** Who raised it: the requester, else the agent behind it, with st's own actors labeled st; else its mission. */
   "raised_by": Schema.OptionFromNullOr(AttentionActor).annotate({ description: "Who raised it: the requester, else the agent behind it, with st's own actors labeled st; else its mission." }),
+  /** On a revision card: what the candidate revision changes. Absent elsewhere, and when st no longer has the proposal or either revision. */
+  "revision": optionalKey(AttentionRevision),
   /** The Now group, by its fixtures/clients/words.json tier id; null for a row that is not a Now card. */
   "tier": Schema.OptionFromNullOr(Schema.Literals(["stopped","alert","today","later"])).annotate({ description: "The Now group, by its fixtures/clients/words.json tier id; null for a row that is not a Now card." }),
   /** The step it holds. */

@@ -1035,7 +1035,27 @@
         "kind": { "enum": ["review", "feedback", "request", "update", "launch", "revision", "prompt", "login", "fault", null], "description": "The card; null for a row that is no card (an unread message stays in its conversation)." },
         "agent": { "oneOf": [{ "$ref": "#/$defs/AttentionActor" }, { "type": "null" }], "description": "Who Chat about this reaches: the conversation, else the step's claimant, else an agent working in the mission, else the agent that asked. null means the chief of staff." },
         "raised_by": { "oneOf": [{ "$ref": "#/$defs/AttentionActor" }, { "type": "null" }], "description": "Who raised it: the requester, else the agent behind it, with st's own actors labeled st; else its mission." },
-        "waiting": { "oneOf": [{ "$ref": "#/$defs/AttentionWaiting" }, { "type": "null" }], "description": "The step it holds." }
+        "waiting": { "oneOf": [{ "$ref": "#/$defs/AttentionWaiting" }, { "type": "null" }], "description": "The step it holds." },
+        "revision": { "$ref": "#/$defs/AttentionRevision", "description": "On a revision card: what the candidate revision changes. Absent elsewhere, and when st no longer has the proposal or either revision." }
+      }
+    },
+    "AttentionRevision": {
+      "type": "object",
+      "required": ["from_revision", "to_revision", "reason", "lines", "truncated"],
+      "properties": {
+        "from_revision": { "type": "string", "description": "The revision the run runs now." },
+        "to_revision": { "type": "string", "description": "The candidate revision." },
+        "reason": { "type": "string" },
+        "lines": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/AttentionRevisionLine" }, "description": "The mission's own changed fields, then by step path the steps added, removed and changed." },
+        "truncated": { "type": "boolean", "description": "Whether there were more than 200 lines." }
+      }
+    },
+    "AttentionRevisionLine": {
+      "type": "object",
+      "required": ["op", "text"],
+      "properties": {
+        "op": { "enum": ["+", "-", "~"], "description": "+ adds a step, - removes one, ~ changes the mission or a step." },
+        "text": { "type": "string", "description": "In plain words: `step PATH`, or `PATH: fields` and `mission: fields` for a change." }
       }
     },
     "AttentionActor": {

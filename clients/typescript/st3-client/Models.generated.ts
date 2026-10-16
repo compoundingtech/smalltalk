@@ -493,8 +493,22 @@ export type AttentionPresentation = {
   agent: (AttentionActor | null);
   kind: "review" | "feedback" | "request" | "update" | "launch" | "revision" | "prompt" | "login" | "fault" | null;
   raised_by: (AttentionActor | null);
+  revision?: AttentionRevision;
   tier: "stopped" | "alert" | "today" | "later" | null;
   waiting: (AttentionWaiting | null);
+};
+
+export type AttentionRevision = {
+  from_revision: string;
+  lines: Array<AttentionRevisionLine>;
+  reason: string;
+  to_revision: string;
+  truncated: boolean;
+};
+
+export type AttentionRevisionLine = {
+  op: "+" | "-" | "~";
+  text: string;
 };
 
 export type AttentionTargetState = {

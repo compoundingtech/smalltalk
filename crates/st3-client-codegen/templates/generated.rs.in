@@ -415,6 +415,26 @@ pub struct AttentionPresentation {
     pub raised_by: Option<AttentionActor>,
     #[serde(default)]
     pub waiting: Option<AttentionWaiting>,
+    /// On a revision card: what the candidate revision changes.
+    #[serde(default)]
+    pub revision: Option<AttentionRevision>,
+}
+/// What a candidate mission revision changes.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AttentionRevision {
+    pub from_revision: String,
+    pub to_revision: String,
+    pub reason: String,
+    #[serde(default)]
+    pub lines: Vec<AttentionRevisionLine>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+/// One change: `+` adds a step, `-` removes one, `~` changes the mission or a step.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AttentionRevisionLine {
+    pub op: String,
+    pub text: String,
 }
 /// An agent or other actor, with the name a person reads.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

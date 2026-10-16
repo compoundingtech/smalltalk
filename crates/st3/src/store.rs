@@ -42317,6 +42317,18 @@ mission "reviewed" state="ready" revisions="human-only" {
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].kind, "revision-approval");
         assert_eq!(attention[0].subject, proposal.subject);
+        // Its card names what the candidate changes, from the revision the run runs now.
+        let card = crate::api::revision_card(
+            &store,
+            &json!({"source_id": attention[0].subject, "mission_id": attention[0].mission}),
+        )
+        .unwrap()
+        .expect("st has both revisions");
+        assert_eq!(card["lines"], json!([{"op": "~", "text": "mission: goal"}]));
+        assert_eq!(
+            (&card["from_revision"], &card["to_revision"], &card["truncated"]),
+            (&json!(initial.revision), &json!(candidate.revision), &json!(false))
+        );
 
         let approved = store
             .approve_revision_proposal(

@@ -470,12 +470,14 @@ Settled: `custom.*` kinds are Today requests, as in the terminal UI. Allow depen
 On a revision card, `Attention.presentation.revision` is
 `{from_revision, to_revision, reason, lines[], truncated}`. Each line is `{op, text}`: `+` adds a
 step or a field, `-` removes one, and `~` changes one, naming the step and the fields that
-changed in plain words (`~ review: goal, assignee`). There are at most 200 lines; beyond that,
-`truncated` is true. The refresher computes the lines from the declaration diff between the
-current and the candidate revision, the comparison `st apply --dry-run` already makes.
+changed in plain words (`+ step publish`, `~ review: goal, assignee`, `+ review: timeout`). The
+mission's own fields come first as `mission: …`, then the steps by path. Fields st derives (a
+step's definition hash) are not named; what they derive from is. There are at most 200 lines;
+beyond that, `truncated` is true. The attention refresher computes the lines from the published
+revision the run runs now and the candidate (`crates/st3/src/api/revision_changes.rs`). A card
+whose proposal or revisions st no longer has carries no `revision`.
 
-Today no client has these lines live: the terminal UI's revision card is always empty outside
-the demo, and the phone and Fractal show no changes.
+The terminal UI's revision card reads them in its own PR; until then no client shows them.
 
 ### Mission declaration
 

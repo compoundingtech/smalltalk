@@ -406,8 +406,21 @@ fn present_rows(
     for row in rows {
         match st3_ui_model::attention::Facts::deserialize(&*row) {
             Ok(facts) => {
-                row["presentation"] =
+                let mut presentation =
                     serde_json::to_value(st3_ui_model::attention::present(&facts, &known))?;
+                // A revision card names what the candidate changes. One st cannot read names
+                // nothing; it never fails the list.
+                if facts.attention_kind == "revision-approval" {
+                    match super::revision_changes::revision_card(store, row) {
+                        Ok(Some(revision)) => presentation["revision"] = revision,
+                        Ok(None) => {}
+                        Err(error) => eprintln!(
+                            "st3: WARN attention {} names no revision changes: {error:#}",
+                            row["id"]
+                        ),
+                    }
+                }
+                row["presentation"] = presentation;
             }
             Err(error) => eprintln!(
                 "st3: WARN attention {} has no presentation: {error}",
