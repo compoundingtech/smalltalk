@@ -1,9 +1,0 @@
-package st2:resource-provider@0.1.0;
-
-world provider {
-  export provider-api;
-}
-
-world fixture-host {
-  import provider-api;
-}
