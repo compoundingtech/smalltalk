@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Document gated control-report degradation and cover typed API refusals in the driver retry policy.",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation and one retry classification control only; production retry implementation, request fields, authority, stored state and recovery behavior are unchanged by this follow-up."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation and one retry classification control only; production retry implementation, request fields, authority, stored state and recovery behavior are unchanged by this follow-up."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation and one retry classification control only; production retry implementation, request fields, authority, stored state and recovery behavior are unchanged by this follow-up."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation and one retry classification control only; production retry implementation, request fields, authority, stored state and recovery behavior are unchanged by this follow-up."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation and one retry classification control only; production retry implementation, request fields, authority, stored state and recovery behavior are unchanged by this follow-up."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation and one retry classification control only; production retry implementation, request fields, authority, stored state and recovery behavior are unchanged by this follow-up."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation and one retry classification control only; production retry implementation, request fields, authority, stored state and recovery behavior are unchanged by this follow-up."
+  }
+}

@@ -17916,6 +17916,7 @@ async fn wait_for_agent_incarnation_from(
 ) -> Result<String> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut outage_logged = false;
+    let mut retry = st3::client::DriverRetry::default();
     loop {
         // A restarted provider process can begin before the reconciler has projected its new PTY
         // observation. Reading the graph immediately would then bind this new driver to the old
@@ -17928,7 +17929,7 @@ async fn wait_for_agent_incarnation_from(
         };
         match lookup {
             Ok(Some(incarnation)) => return Ok(incarnation),
-            Ok(None) => {}
+            Ok(None) => retry.succeeded(),
             // A restarting daemon cannot answer yet; its outage does not use up the wait.
             Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
                 if !outage_logged {
@@ -17939,7 +17940,7 @@ async fn wait_for_agent_incarnation_from(
                     outage_logged = true;
                 }
                 deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-                tokio::time::sleep(st3::client::driver_retry_pause()).await;
+                tokio::time::sleep(retry.failed(&error)).await;
                 continue;
             }
             Err(error) => return Err(error),
@@ -20121,6 +20122,33 @@ impl ResumeSettle {
         }
     }
 
+    /// Delivery and local housekeeping keep their interval during settle. Do not poll the
+    /// deferred control retry until it is eligible: even an overdue retry must not wake it early.
+    /// The returned eligibility guards the report body and its success/failure state updates.
+    async fn control_tick(
+        &self,
+        retry: &mut st3::client::DriverRetry,
+        interval: &mut tokio::time::Interval,
+    ) -> bool {
+        if self.passed() {
+            retry.tick(interval).await;
+        } else {
+            interval.tick().await;
+        }
+        self.passed()
+    }
+
+    /// Renewals do no interval or retry work before settle. On eligibility the existing due
+    /// interval/retry can run once; Skip intervals prevent a catch-up burst. No state is reset.
+    async fn retry_tick(
+        &self,
+        retry: &mut st3::client::DriverRetry,
+        interval: &mut tokio::time::Interval,
+    ) {
+        self.wait().await;
+        retry.tick(interval).await;
+    }
+
     /// When the driver starts checking the channel's attachment, so a resumed driver's wait does
     /// not count toward the channel's 20 s to attach.
     fn attach_started(&self) -> Instant {
@@ -20277,6 +20305,8 @@ async fn drive_st2_native(
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
+    let mut work_retry = st3::client::DriverRetry::default();
+    let mut control_retry = st3::client::DriverRetry::default();
     let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
     let mut last_limits_fingerprint = None;
@@ -20406,8 +20436,7 @@ async fn drive_st2_native(
                 }).await?;
                 return outcome;
             }
-            _ = interval.tick(), if !completion_announced => {
-                let settled = settle.passed();
+            settled = settle.control_tick(&mut control_retry, &mut interval), if !completion_announced => {
                 if driver == "claude" && mailbox.subscription.is_some() && settled
                     && let Err(error) = check_claude_attachment(
                         client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
@@ -20569,6 +20598,7 @@ async fn drive_st2_native(
                     && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "opencode-server").await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
+                if settled && control_retry.ready() {
                 let tick: Result<()> = async {
                     if observations.enabled || !settled { return Ok(()) }
                     // The wrapper writes admission before claiming a new harness session. Wait
@@ -20689,8 +20719,13 @@ async fn drive_st2_native(
                     .await?;
                     Ok(())
                 }.await;
-                if let Err(error) = tick {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match tick {
+                    Ok(()) => control_retry.succeeded(),
+                    Err(error) => {
+                        control_retry.failed(&error);
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
                 }
                 if let Some(subagents) = subagents.as_mut().filter(|_| settled)
                     && let Err(error) = subagents.tick(client).await
@@ -20699,18 +20734,24 @@ async fn drive_st2_native(
                 }
                 replacement.check();
             }
-            _ = work_interval.tick(), if !completion_announced && settle.passed() => {
+            _ = settle.retry_tick(&mut work_retry, &mut work_interval), if !completion_announced && settle.passed() => {
                 let tick: Result<()> = async {
                     if let Some(minute) = renewal_minute(subject)?
                         && renewed_minute != Some(minute)
+                        && work_retry.ready()
                     {
-                        renew_claimed_work(client, subject, minute).await?;
+                        renew_claimed_work(client, subject, minute, &mut work_retry).await?;
+                        work_retry.succeeded();
                         renewed_minute = Some(minute);
                     }
                     Ok(())
                 }.await;
-                if let Err(error) = tick {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match tick {
+                    Ok(()) => {}
+                    Err(error) => {
+                        work_retry.failed(&error);
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
                 }
             }
         }
@@ -22315,6 +22356,7 @@ async fn run_pi_channel(
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
+    let mut work_retry = st3::client::DriverRetry::default();
     let mut checked_todo_minute = None;
     let mut todo_end_seen = None;
     loop {
@@ -22633,7 +22675,7 @@ async fn run_pi_channel(
                     reader = Some(spawn_reader(input_tx.clone()));
                 }
             }
-            _ = work_interval.tick() => {
+            _ = work_retry.tick(&mut work_interval) => {
                 let minute = unix_minute()?;
                 if checked_todo_minute != Some(minute) {
                     checked_todo_minute = Some(minute);
@@ -22664,10 +22706,17 @@ async fn run_pi_channel(
                 }
                 if let Some(renew_minute) = renewal_minute(subject)?
                     && renewed_minute != Some(renew_minute)
+                    && work_retry.ready()
                 {
-                    match renew_claimed_work(client, subject, renew_minute).await {
-                        Ok(()) => renewed_minute = Some(renew_minute),
-                        Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                    match renew_claimed_work(client, subject, renew_minute, &mut work_retry).await {
+                        Ok(()) => {
+                            work_retry.succeeded();
+                            renewed_minute = Some(renew_minute);
+                        }
+                        Err(error) => {
+                            work_retry.failed(&error);
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                        }
                     }
                 }
             }
@@ -23529,6 +23578,8 @@ async fn drive_codex_native(
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
+    let mut work_retry = st3::client::DriverRetry::default();
+    let mut control_retry = st3::client::DriverRetry::default();
     let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
     let mut last_limits_fingerprint = None;
@@ -23644,7 +23695,7 @@ async fn drive_codex_native(
                 }
                 return outcome;
             },
-            _ = interval.tick(), if !completion_announced => {
+            settled = settle.control_tick(&mut control_retry, &mut interval), if !completion_announced => {
                 if let Err(error) = observations.expire_due() {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
@@ -23693,7 +23744,7 @@ async fn drive_codex_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 }
-                let settled = settle.passed();
+                if settled && control_retry.ready() {
                 let tick: Result<()> = async {
                     if !settled { return Ok(()) }
                     if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))
@@ -23815,8 +23866,13 @@ async fn drive_codex_native(
                     .await?;
                     Ok(())
                 }.await;
-                if let Err(error) = tick {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match tick {
+                    Ok(()) => control_retry.succeeded(),
+                    Err(error) => {
+                        control_retry.failed(&error);
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
                 }
                 subagents.set_timeline_incarnation(
                     st_drivers::codex_app_server::current_runtime_incarnation(
@@ -23834,18 +23890,24 @@ async fn drive_codex_native(
                     replacement.check();
                 }
             }
-            _ = work_interval.tick(), if !completion_announced && settle.passed() => {
+            _ = settle.retry_tick(&mut work_retry, &mut work_interval), if !completion_announced && settle.passed() => {
                 let tick: Result<()> = async {
                     if let Some(minute) = renewal_minute(subject)?
                         && renewed_minute != Some(minute)
+                        && work_retry.ready()
                     {
-                        renew_claimed_work(client, subject, minute).await?;
+                        renew_claimed_work(client, subject, minute, &mut work_retry).await?;
+                        work_retry.succeeded();
                         renewed_minute = Some(minute);
                     }
                     Ok(())
                 }.await;
-                if let Err(error) = tick {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match tick {
+                    Ok(()) => {}
+                    Err(error) => {
+                        work_retry.failed(&error);
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
                 }
             }
         }
@@ -24065,7 +24127,7 @@ fn tolerate_driver_api_outage(
         // The driver shares a PTY with its provider. Writing to stderr here would
         // corrupt the provider's interactive screen while the API is restarting.
         let line = format!(
-            "{}; the driver keeps running and retries every second until the daemon is back",
+            "{}; the driver keeps running and retries with bounded backoff until the daemon is back",
             outage.unwrap_or_else(|| format!("the st daemon did not answer ({error:#})"))
         );
         let _ = write_driver_log(subject, &line);
@@ -24102,12 +24164,16 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     let mut last_warning = None;
+    let mut retry = st3::client::DriverRetry::default();
     loop {
         match call().await {
             Ok(value) => return Ok(value),
-            Err(error) => tolerate_driver_api_outage(subject, error, &mut last_warning)?,
+            Err(error) => {
+                let pause = retry.failed(&error);
+                tolerate_driver_api_outage(subject, error, &mut last_warning)?;
+                tokio::time::sleep(pause).await;
+            }
         }
-        tokio::time::sleep(st3::client::driver_retry_pause()).await;
     }
 }
 
@@ -24139,10 +24205,16 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
     )
 }
 
-async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+async fn renew_claimed_work(
+    client: &Client,
+    subject: &str,
+    minute: u64,
+    retry: &mut st3::client::DriverRetry,
+) -> Result<()> {
     let work: Vec<StepRunView> = client
         .get(&format!("/v1/work?actor={}&view=renewal", urlencoding::encode(subject)))
         .await?;
+    update_renewal_retry_lease(retry, &work, subject, current_unix_ms()?);
     // Most resident seats hold no work. Only a held claim needs the status reduction
     // that proves its harness incarnation is still live before renewing the lease.
     if !work.iter().any(|step| step.work_claim_is_held_by(subject)) {
@@ -24194,6 +24266,26 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// Called only after a complete, successful work read. A failed read or a held claim whose
+/// expiry is unknown does not establish that a previous lease bound is no longer relevant.
+fn update_renewal_retry_lease(
+    retry: &mut st3::client::DriverRetry,
+    work: &[StepRunView],
+    subject: &str,
+    now_ms: u128,
+) {
+    let mut held = work
+        .iter()
+        .filter(|step| step.work_claim_is_held_by(subject))
+        .peekable();
+    if held.peek().is_none() {
+        retry.clear_lease_margin();
+    } else if let Some(expiry) = held.filter_map(|step| step.claim_expires_at_unix_ms).min() {
+        let remaining = expiry.saturating_sub(now_ms);
+        retry.lease_margin(Duration::from_millis(remaining.min(u128::from(u64::MAX)) as u64));
+    }
 }
 
 /// Ask the daemon to suspend or resume `subject`, then wait for the request to finish: the seat
@@ -24364,11 +24456,10 @@ impl NativeDeliverySupervisor {
             self.daemon_outage = daemon_unreachable;
         }
         self.failures = self.failures.saturating_add(1);
-        let shift = self.failures.saturating_sub(1).min(5);
         let backoff = if daemon_unreachable {
             Duration::from_secs(1)
         } else {
-            Duration::from_secs((1_u64 << shift).min(30))
+            st3::client::driver_retry_base(self.failures.saturating_sub(1))
         };
         self.retry_after = Some(Instant::now() + backoff);
         backoff
@@ -30096,6 +30187,89 @@ mod tests {
         }
     }
 
+    fn retry_lease_step(status: &str, claimant: &str, expiry: Option<u128>) -> StepRunView {
+        serde_json::from_value(json!({
+            "subject": "step-run/retry/work", "run": "mission-run/retry",
+            "generation": "run-generation/retry", "step": "work",
+            "definition_hash": "definition", "status": status, "attempt": 1,
+            "assigned_to": claimant, "agentless": false, "title": null,
+            "worker_reported": false, "claimant": claimant,
+            "claim_incarnation": "worker-one", "claim_expires_at_unix_ms": expiry,
+            "execution_elapsed_ms": 0, "readiness_epoch": 1,
+            "blocked_reason": null, "not_before_unix_ms": null,
+            "created_at_unix_ms": 1, "updated_at_unix_ms": 1
+        }))
+        .unwrap()
+    }
+
+    fn repeated_timeout_pause(retry: &mut st3::client::DriverRetry) -> Duration {
+        let error = anyhow::anyhow!("daemon response exceeded its deadline");
+        let mut pause = Duration::ZERO;
+        for _ in 0..6 {
+            pause = retry.failed(&error);
+        }
+        pause
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewal_retry_empty_selection_retires_an_expired_lease_bound() {
+        let mut retry = st3::client::DriverRetry::default();
+        retry.lease_margin(Duration::from_secs(1));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(repeated_timeout_pause(&mut retry) <= Duration::from_secs(1));
+        // This is the production selector, called only after the work read succeeds.
+        update_renewal_retry_lease(&mut retry, &[], "agent/worker", 1_000);
+        retry.succeeded();
+        assert!((Duration::from_secs(15)..=Duration::from_secs(30))
+            .contains(&repeated_timeout_pause(&mut retry)));
+    }
+
+    #[tokio::test]
+    async fn renewal_retry_failed_work_read_preserves_the_known_lease_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let client = Client::unix(root.path().join("missing.sock"));
+        let mut retry = st3::client::DriverRetry::default();
+        retry.lease_margin(Duration::from_secs(2));
+        // Exercise the real request/selection boundary: an error is not an empty response.
+        assert!(
+            renew_claimed_work(&client, "agent/worker", 0, &mut retry)
+                .await
+                .is_err()
+        );
+        assert!(repeated_timeout_pause(&mut retry) <= Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewal_retry_selects_live_leases_and_replaces_the_old_bound() {
+        let mut retry = st3::client::DriverRetry::default();
+        retry.lease_margin(Duration::ZERO);
+        let work = [
+            retry_lease_step("working", "agent/worker", Some(21_000)),
+            retry_lease_step("verifying", "agent/worker", Some(41_000)),
+            retry_lease_step("blocked", "agent/worker", Some(61_000)),
+            retry_lease_step("claimed", "agent/other", Some(1_000)),
+            retry_lease_step("completed", "agent/worker", Some(1_000)),
+        ];
+        update_renewal_retry_lease(&mut retry, &work, "agent/worker", 1_000);
+        // The earliest relevant live lease wins; foreign/terminal rows cannot clamp it.
+        assert_eq!(repeated_timeout_pause(&mut retry), Duration::from_secs(10));
+        let replacement = [retry_lease_step("claimed", "agent/worker", Some(101_000))];
+        update_renewal_retry_lease(&mut retry, &replacement, "agent/worker", 1_000);
+        retry.succeeded();
+        assert!((Duration::from_secs(15)..=Duration::from_secs(30))
+            .contains(&repeated_timeout_pause(&mut retry)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewal_retry_unknown_expiry_and_success_do_not_retire_a_known_bound() {
+        let mut retry = st3::client::DriverRetry::default();
+        retry.lease_margin(Duration::from_secs(20));
+        let work = [retry_lease_step("claimed", "agent/worker", None)];
+        update_renewal_retry_lease(&mut retry, &work, "agent/worker", 1_000);
+        retry.succeeded();
+        assert_eq!(repeated_timeout_pause(&mut retry), Duration::from_secs(10));
+    }
+
     #[test]
     fn legacy_attention_help_directs_callers_to_person_work() {
         let mut command = Cli::command();
@@ -33981,6 +34155,79 @@ mission "review" state="ready" {
         assert_eq!(store.local_observations_tail(100).unwrap().len(), 1);
         server.abort();
     }
+    #[tokio::test(start_paused = true)]
+    async fn resumed_driver_retry_ticks_wait_for_settle_without_delaying_delivery() {
+        let started = tokio::time::Instant::now();
+        let settle = ResumeSettle::after(Duration::from_secs(30));
+        let mut control = st3::client::DriverRetry::default();
+        let mut work = st3::client::DriverRetry::default();
+        let mut control_interval = tokio::time::interval(Duration::from_secs(10));
+        let mut work_interval = tokio::time::interval(Duration::from_secs(1));
+        control_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut attempts = 0;
+        for delivery_tick in 0..3 {
+            // This is the production control-arm wake and eligibility result: local delivery
+            // keeps ticking, but the report body cannot run or record success/failure yet.
+            let settled = settle.control_tick(&mut control, &mut control_interval).await;
+            let expected = Duration::from_secs(delivery_tick * 10);
+            let elapsed = tokio::time::Instant::now() - started;
+            assert!(elapsed >= expected && elapsed <= expected + Duration::from_millis(5));
+            assert!(!settled);
+            if settled && control.ready() {
+                attempts += 1;
+                control.failed(&anyhow::anyhow!("control deadline"));
+            }
+        }
+        assert_eq!(attempts, 0);
+        // Even the work interval's initial immediate tick stays unconsumed before eligibility.
+        assert!(tokio::time::timeout(
+            Duration::from_secs(9), settle.retry_tick(&mut work, &mut work_interval)
+        ).await.is_err());
+        assert!(!settle.passed());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let settled = settle.control_tick(&mut control, &mut control_interval).await;
+        assert!(settled && control.ready());
+        attempts += 1;
+        assert_eq!(attempts, 1);
+        settle.retry_tick(&mut work, &mut work_interval).await;
+        let elapsed = tokio::time::Instant::now() - started;
+        assert!(elapsed >= Duration::from_secs(30) && elapsed <= Duration::from_millis(30_005));
+        // Once eligible, the exact retry deadline wakes between ordinary interval ticks.
+        let pause = control.failed(&anyhow::anyhow!("control deadline"));
+        assert!((Duration::from_millis(500)..=Duration::from_millis(1500)).contains(&pause));
+        let failed_at = tokio::time::Instant::now();
+        assert!(tokio::time::timeout(
+            pause / 2, settle.control_tick(&mut control, &mut control_interval)
+        ).await.is_err());
+        assert!(settle.control_tick(&mut control, &mut control_interval).await);
+        let elapsed = tokio::time::Instant::now() - failed_at;
+        assert!(elapsed >= pause && elapsed <= pause + Duration::from_millis(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_driver_settle_does_not_fire_or_reset_an_existing_retry() {
+        let settle = ResumeSettle::after(Duration::from_secs(30));
+        let mut retry = st3::client::DriverRetry::default();
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        // Seed two prior failures. Their retry falls due before the next delivery interval;
+        // polling it during settle would make this timeout return early.
+        retry.failed(&anyhow::anyhow!("control deadline"));
+        retry.failed(&anyhow::anyhow!("control deadline"));
+        assert!(tokio::time::timeout(
+            Duration::from_secs(4), settle.control_tick(&mut retry, &mut interval)
+        ).await.is_err());
+        assert!(!settle.passed());
+        tokio::time::advance(Duration::from_secs(26)).await;
+        assert!(settle.control_tick(&mut retry, &mut interval).await);
+        // Settle is eligibility, not operation success: the next failure uses base four.
+        // This range cannot overlap a reset-to-base-one retry's 0.5–1.5 s range.
+        let pause = retry.failed(&anyhow::anyhow!("control deadline"));
+        assert!((Duration::from_secs(2)..=Duration::from_secs(6)).contains(&pause));
+    }
+
     /// A deploy re-executes every driver while the daemon restarts. A resumed driver keeps the
     /// harness events its hooks write meanwhile in the outbox and sends them once its settle
     /// passes, not in the new daemon's first instant. A launched driver sends them at once.

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Back off driver daemon timeouts while retaining fast refused-socket recovery and held-work lease bounds.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim admission, canonical ordering, checkpoint, retention or replay change. Existing mailbox fences and per-operation idempotency keys remain unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, indexes, persisted retry state or migration."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority, lease duration or work eligibility predicate changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Driver timeout retries use independent per-operation exponential bases of 1, 2, 4, 8, 16 and 30 seconds with jitter and an actual 30-second cap. Refused or absent sockets retry within one second. Success resets growth; known held-work expiry bounds renewal waits, and only an authoritative work selection with no held claim clears that bound. Existing feed and delivery-specific schedules are preserved."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No coordinated stop or store conversion. Behavior changes when the updated client or driver starts; deployment is outside this patch."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual configuration or production repair required."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "An unresponsive daemon receives fewer driver retries, while local completion work remains on its regular tick. Existing stable mailbox tokens, renewal keys, owned subscription cancellation and warning rate limits remain. A retry wait bound cannot guarantee renewal through an outage longer than the lease or bound the next request duration."
+  }
+}

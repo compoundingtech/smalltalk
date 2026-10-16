@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Compose driver retry pacing with the landed resume settle gate.",
+  "replay": {
+    "status": "none",
+    "detail": "Preserves landed resume settle eligibility and existing retry curves together. Delivery/local ticks continue during settle without polling deferred control retries; work retry ticks wait for eligibility. No failure counter/deadline reset or catch-up burst on the transition. No schema, authority, lease, request deadline, mailbox recovery oracle or storage change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Preserves landed resume settle eligibility and existing retry curves together. Delivery/local ticks continue during settle without polling deferred control retries; work retry ticks wait for eligibility. No failure counter/deadline reset or catch-up burst on the transition. No schema, authority, lease, request deadline, mailbox recovery oracle or storage change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Preserves landed resume settle eligibility and existing retry curves together. Delivery/local ticks continue during settle without polling deferred control retries; work retry ticks wait for eligibility. No failure counter/deadline reset or catch-up burst on the transition. No schema, authority, lease, request deadline, mailbox recovery oracle or storage change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Preserves landed resume settle eligibility and existing retry curves together. Delivery/local ticks continue during settle without polling deferred control retries; work retry ticks wait for eligibility. No failure counter/deadline reset or catch-up burst on the transition. No schema, authority, lease, request deadline, mailbox recovery oracle or storage change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Preserves landed resume settle eligibility and existing retry curves together. Delivery/local ticks continue during settle without polling deferred control retries; work retry ticks wait for eligibility. No failure counter/deadline reset or catch-up burst on the transition. No schema, authority, lease, request deadline, mailbox recovery oracle or storage change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Preserves landed resume settle eligibility and existing retry curves together. Delivery/local ticks continue during settle without polling deferred control retries; work retry ticks wait for eligibility. No failure counter/deadline reset or catch-up burst on the transition. No schema, authority, lease, request deadline, mailbox recovery oracle or storage change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Preserves landed resume settle eligibility and existing retry curves together. Delivery/local ticks continue during settle without polling deferred control retries; work retry ticks wait for eligibility. No failure counter/deadline reset or catch-up burst on the transition. No schema, authority, lease, request deadline, mailbox recovery oracle or storage change."
+  }
+}
