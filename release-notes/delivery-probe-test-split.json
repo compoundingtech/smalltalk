@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The delivery probe test file runs its in-process cases and each native scenario as separate tests so they run in parallel; no product behavior changes",
+  "replay": {
+    "status": "none",
+    "detail": "No stored history or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, claim or configuration schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination version change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test-only change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration and no restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting restores the single serial test."
+  }
+}

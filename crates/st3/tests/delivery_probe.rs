@@ -1,7 +1,11 @@
 //! The live probe's own consumer must prove a native handoff, not a mailbox lookup.
+//!
+//! `scripts/st3-delivery-probe-test` holds the fake-API cases and four native scenarios that each boot
+//! their own daemons and probe seats. One Rust test per unit lets them run side by side.
+
+/// Run the named unittest selectors of the probe script in an isolated, process-supervised child.
 #[cfg(target_os = "linux")]
-#[test]
-fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
+fn probe(selectors: &[&str]) {
     if st3::test_support::supervise_test() {
         return;
     }
@@ -19,6 +23,7 @@ fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
         .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg("--scratch")
         .arg(scratch.path())
+        .args(selectors)
         .output()
         .expect("run the isolated native delivery probe");
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -29,4 +34,39 @@ fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
         "{stderr}\n{}",
         String::from_utf8_lossy(&result.stdout)
     );
+    // A selector that matches nothing runs zero cases and still prints OK.
+    assert!(
+        !stderr.contains("Ran 0 tests"),
+        "the selector matched no test: {stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_probe_against_a_fake_api_alerts_and_recovers() {
+    probe(&["ProbeTests"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_delivery_probe_waits_for_runtime_publication() {
+    probe(&["NativeProbeTests.test_native_read_waits_for_runtime_publication"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_delivery_probe_alerts_attention_and_recovers_without_model_turns() {
+    probe(&["NativeProbeTests.test_native_read_outage_attention_and_recovery"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_delivery_probe_alerts_the_agent_and_recovers_without_model_turns() {
+    probe(&["NativeProbeTests.test_native_read_outage_agent_message_and_recovery"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_delivery_probe_falls_back_to_the_reviewer_when_the_agent_is_unavailable() {
+    probe(&["NativeProbeTests.test_native_unavailable_alert_agent_falls_back_to_reviewer"]);
 }
