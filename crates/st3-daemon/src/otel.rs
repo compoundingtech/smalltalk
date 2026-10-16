@@ -266,6 +266,19 @@ fn roster_wait(key: &'static str, elapsed: f64) {
     roster_attribute(key, total);
 }
 
+/// CPU time this thread has used.
+pub fn thread_cpu() -> std::time::Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: time points to a valid timespec; the clock reads this thread only.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } != 0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
 /// The closure never yields: both clocks therefore belong to one physical worker thread.
 pub fn roster_phase<T>(name: &'static str, work: impl FnOnce() -> T) -> T {
     if !roster_recording() {
@@ -281,9 +294,9 @@ pub fn roster_phase<T>(name: &'static str, work: impl FnOnce() -> T) -> T {
         _ => unreachable!("roster phases use a closed vocabulary"),
     };
     let started = Instant::now();
-    let cpu = crate::incremental::thread_cpu();
+    let cpu = thread_cpu();
     let value = work();
-    let cpu_elapsed = crate::incremental::thread_cpu().saturating_sub(cpu);
+    let cpu_elapsed = thread_cpu().saturating_sub(cpu);
     let wall_elapsed = started.elapsed();
     roster_accumulate(wall_key, wall_elapsed.as_secs_f64() * 1000.0);
     roster_accumulate(cpu_key, cpu_elapsed.as_secs_f64() * 1000.0);
@@ -867,9 +880,6 @@ impl Telemetry {
                     }
                     opentelemetry::global::set_meter_provider(provider.clone());
                     METRICS_ENABLED.store(true, Ordering::Relaxed);
-                    if matches!(unit, Unit::Daemon) {
-                        crate::reconcile_telemetry::init();
-                    }
                     telemetry.meter_provider = Some(provider);
                 }
                 Err(error) => {
