@@ -991,7 +991,7 @@ async fn inventory_subscriptions_refuse_invalid_filters_limits_and_authority() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn idle_inventory_windows_do_not_reread_across_the_old_client_intervals() {
     let root = tempfile::tempdir().unwrap();
     let state = super::tests::test_state_named(root.path(), "idle-inventory-fixture");
@@ -1026,10 +1026,14 @@ async fn idle_inventory_windows_do_not_reread_across_the_old_client_intervals() 
     let session = paired_client_session(&state, &grant, "fabric-loopback", false).unwrap();
     let mut fixture = Fixture::open_as(state, session, true, None, &collections).await;
     for _ in collections {
-        assert_eq!(fixture.frame().await["kind"], "snapshot");
+        assert_eq!(fixture.paused_frame().await["kind"], "snapshot");
     }
-    tokio::time::sleep(Duration::from_secs(65)).await;
-    fixture.quiet().await;
+    // 65 s on the paused clock, one attention-clock interval at a time: that clock skips the
+    // ticks a single longer step would miss, so each of its two ticks has to come due.
+    fixture.paused_advance(ATTENTION_CLOCK_INTERVAL).await;
+    fixture.paused_advance(ATTENTION_CLOCK_INTERVAL).await;
+    fixture.paused_advance(Duration::from_secs(5)).await;
+    fixture.paused_quiet().await;
     assert_eq!(
         fixture.counts(),
         counts(&collections.map(|collection| (collection, 1)))
