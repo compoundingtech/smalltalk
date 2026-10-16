@@ -58,6 +58,7 @@ jobs:
       ci1_profile: ${{ steps.pick.outputs.ci1_profile }}
       ci1_secondary: ${{ steps.pick.outputs.ci1_secondary }}
       ci1_mail: ${{ steps.pick.outputs.ci1_mail }}
+      ci1_build: ${{ steps.pick.outputs.ci1_build }}
     steps:
       - name: Keep reserved primary lanes and use idle general runners for tests and canaries
         id: pick
@@ -71,6 +72,8 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           NEED: ${{ vars.CI1_MIN_IDLE || '1' }}
           MERGE_OVERFLOW: ${{ vars.CI_MERGE_OVERFLOW || 'on' }}
+          MERGE_PRODUCER_OWNED: ${{ vars.CI_MERGE_TEST_BUILD_OWNED }}
+          MERGE_NAMESPACE_PROFILE: ${{ vars.CI_MERGE_NAMESPACE_PROFILE }}
           MERGE_NEED: ${{ vars.CI_MERGE_MIN_IDLE || '3' }}
           RUN_ID: ${{ github.run_id }}
           MODE: priority
@@ -151,6 +154,46 @@ jobs:
                   return waits, f"complete advisory queue view: {len(runs)} runs, queued={queued}, oldest_seconds={waits}"
               except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, AttributeError) as error:
                   return None, f"queue view UNKNOWN ({type(error).__name__}); idle-role fallback"
+          def producer_host(pages):
+              """Advisory, complete six-member host census; no reservation or API mutation.
+
+              Return host affinity only with <=3 busy of six online members and two idle
+              priority workers (a race margin, not a reservation). Missing ephemeral registrations or ambiguous views fall back.
+              """
+              try:
+                  totals = {page['total_count'] for page in pages}
+                  if len(totals) != 1 or any(type(page['total_count']) is not int for page in pages):
+                      return None
+                  rows = [runner for page in pages for runner in page['runners']]
+                  if len(rows) != next(iter(totals)):
+                      return None
+                  ids, names, hosts = set(), set(), {host: {} for host in ('ci1', 'ci2')}
+                  for row in rows:
+                      name, ident = row['name'], row['id']
+                      if (not isinstance(name, str) or type(ident) is not int or ident < 1
+                              or ident in ids or name in names or type(row['busy']) is not bool
+                              or row['status'] not in ('online', 'offline')):
+                          return None
+                      ids.add(ident); names.add(name)
+                      labels = {label['name'] for label in row['labels']}
+                      if not all(isinstance(label, str) for label in labels):
+                          return None
+                      for host in hosts:
+                          expected = {host+'-'+str(i) for i in range(1, 6)} | {host+'-merge-1'}
+                          if name in expected:
+                              hosts[host][name] = (row['status'], row['busy'], labels)
+                  choices = []
+                  for host, members in hosts.items():
+                      if len(members) != 6 or any(status != 'online' for status, busy, labels in members.values()):
+                          continue
+                      busy = sum(busy for status, busy, labels in members.values())
+                      eligible = sum(not occupied and {'ci1-priority', 'ci-host-'+host} <= labels
+                                     for status, occupied, labels in members.values())
+                      if busy <= 3 and eligible >= 2:
+                          choices.append((busy, host))
+                  return min(choices)[1] if choices else None
+              except (KeyError, TypeError, ValueError):
+                  return None
 
 
           def main():
@@ -163,11 +206,26 @@ jobs:
                   pass
               output = open(env["GITHUB_OUTPUT"], "a")
               summary = open(env["GITHUB_STEP_SUMMARY"], "a")
+              def emit_labels(key, labels):
+                  print(f'{key}={json.dumps(labels, separators=(",", ":"))}', file=output)
+                  print(f'{key}: {json.dumps(labels)}', file=summary)
               def emit(key, label):
                   labels = [label] if isinstance(label, str) else label
                   print(f'{key}={json.dumps(labels, separators=(",", ":"))}', file=output)
                   print(f'{key}: **{labels[0].split("-")[0]}** ({labels})', file=summary)
+              producer_mode = env.get('MERGE_PRODUCER_OWNED', '') if event == 'merge_group' else ''
+              run_id = env.get('RUN_ID', '')
+              profile = env.get('MERGE_NAMESPACE_PROFILE') or 'linux-x86-64'
+              producer_fallback = [f'namespace-profile-{profile};job.priority=1;github.run-id={run_id}'] if run_id.isascii() and run_id.isdigit() and int(run_id) > 0 else []
+              def pick_producer(pages=None):
+                  if not producer_mode or not producer_fallback:
+                      return
+                  host = producer_host(pages) if producer_mode == 'on' and pages else None
+                  labels = ['ci-host-'+host, 'ci1-priority'] if host else producer_fallback
+                  emit_labels('ci1_build', labels)
+                  print('Merge producer: %s; census is advisory, not a reservation' % (host or 'Namespace'), file=summary)
               def unavailable(reason):
+                  pick_producer()
                   print(reason)
                   if priority:
                       emit("ci1", "ci1-priority")
@@ -225,6 +283,7 @@ jobs:
                               for key, (status, busy, labels) in by_id.items())):
                   unavailable("unqualified merge capacity status")
                   return
+              pick_producer(pages)
               # Group 3 is the common pool. These compatibility role names are shared on both hosts.
               online = sum(status == "online" for status, busy, labels in by_id.values())
               def candidates(label):
