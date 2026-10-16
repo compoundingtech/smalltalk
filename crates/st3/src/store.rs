@@ -1,3 +1,16 @@
+// Literal recipient predicates shared with the private point qualification reader.
+// Callers choose their own indexed subject/candidate traversal, not a new eligibility domain.
+macro_rules! message_sent_recipient_match {
+    () => {
+        "json_extract(body, '$.fields.to') IN (?1, ?2)"
+    };
+}
+macro_rules! message_desired_recipient_match {
+    () => {
+        "json_extract(child.value, '$.name')='to' AND json_extract(child.value, '$.arguments[0]') IN (?1, ?2)"
+    };
+}
+
 mod trace_principal;
 #[cfg(test)]
 mod accountable_tests;
@@ -20,6 +33,9 @@ mod mailbox_changes;
 mod mailbox_lease;
 #[cfg(test)]
 mod message_send_tests;
+// Qualification only: no production caller or Source registration.
+#[cfg(test)]
+mod message_point_qualification;
 #[cfg(test)]
 mod message_thread_legacy_rank_dependency_tests;
 #[cfg(test)]
@@ -14478,24 +14494,18 @@ impl Store {
         // they can reconcile delivery receipts. Start at the indexed recipient
         // claims, not every lifecycle claim for every message in the fleet.
         let fast_recipient = recipient.as_deref();
-        let bare_recipient = fast_recipient.map(|value| {
-            value
-                .strip_prefix("agent/")
-                .filter(|suffix| !suffix.contains('/'))
-                .unwrap_or(value)
-        });
+        let bare_recipient = fast_recipient.map(message_bare_recipient);
         if let (Some(recipient), Some(bare_recipient)) = (fast_recipient, bare_recipient) {
             let mut statement = connection.prepare(if delivery {
-                "WITH candidates(subject) AS (
+                concat!("WITH candidates(subject) AS (
                      SELECT subject FROM claims INDEXED BY claims_message_to_index
                      WHERE kind='message.sent'
-                       AND json_extract(body, '$.fields.to') IN (?1, ?2)
+                       AND ", message_sent_recipient_match!(), "
                      UNION
                      SELECT desired.subject FROM desired,
                             json_each(desired.body, '$.children') child
                      WHERE desired.kind='message'
-                       AND json_extract(child.value, '$.name')='to'
-                       AND json_extract(child.value, '$.arguments[0]') IN (?1, ?2)
+                       AND ", message_desired_recipient_match!(), "
                  ), created AS (
                      SELECT subject,
                             (SELECT MIN(store_index) FROM claims
@@ -14516,18 +14526,17 @@ impl Store {
                      SELECT 1 FROM claims closed
                      WHERE closed.subject=ranked.subject AND closed.kind='message.closed'
                    ))
-                 ORDER BY created_index, subject LIMIT ?5"
+                 ORDER BY created_index, subject LIMIT ?5")
             } else {
-                "WITH candidates(subject) AS (
+                concat!("WITH candidates(subject) AS (
                      SELECT subject FROM claims INDEXED BY claims_message_to_index
                      WHERE kind='message.sent'
-                       AND json_extract(body, '$.fields.to') IN (?1, ?2)
+                       AND ", message_sent_recipient_match!(), "
                      UNION
                      SELECT desired.subject FROM desired,
                             json_each(desired.body, '$.children') child
                      WHERE desired.kind='message'
-                       AND json_extract(child.value, '$.name')='to'
-                       AND json_extract(child.value, '$.arguments[0]') IN (?1, ?2)
+                       AND ", message_desired_recipient_match!(), "
                  ), created AS (
                      SELECT subject,
                             (SELECT MIN(store_index) FROM claims
@@ -14540,7 +14549,7 @@ impl Store {
                      SELECT 1 FROM claims closed
                      WHERE closed.subject=created.subject AND closed.kind='message.closed'
                    ))
-                 ORDER BY created_index, subject LIMIT ?5"
+                 ORDER BY created_index, subject LIMIT ?5")
             })?;
             let mut subjects = statement
                 .query_map(
@@ -25469,6 +25478,23 @@ fn message_canonical_key_tx(connection: &Connection, subject: &str) -> Result<ca
 #[path = "store/message_canonical_sort_tests.rs"]
 mod message_canonical_sort_tests;
 
+fn message_bare_recipient(value: &str) -> &str {
+    value
+        .strip_prefix("agent/")
+        .filter(|suffix| !suffix.contains('/'))
+        .unwrap_or(value)
+}
+
+fn message_reminder_rank(tags: &[String]) -> Option<(&str, u64)> {
+    let reminder = tags.iter().find_map(|tag| tag.strip_prefix("reminder:"))?;
+    let version = tags
+        .iter()
+        .find_map(|tag| tag.strip_prefix("version:"))
+        .and_then(|version| version.parse::<u64>().ok())
+        .unwrap_or_default();
+    Some((reminder, version))
+}
+
 fn selected_actionable_messages(
     connection: &Connection,
     messages: Vec<MessageView>,
@@ -25476,20 +25502,10 @@ fn selected_actionable_messages(
     let mut selected_reminders = BTreeMap::<String, (u64, MessageView)>::new();
     let mut selected = Vec::new();
     for message in messages {
-        let reminder = message
-            .tags
-            .iter()
-            .find_map(|tag| tag.strip_prefix("reminder:"));
-        let Some(reminder) = reminder else {
+        let Some((reminder, version)) = message_reminder_rank(&message.tags) else {
             selected.push(message);
             continue;
         };
-        let version = message
-            .tags
-            .iter()
-            .find_map(|tag| tag.strip_prefix("version:"))
-            .and_then(|version| version.parse::<u64>().ok())
-            .unwrap_or_default();
         let replace = selected_reminders
             .get(reminder)
             .is_none_or(|(current, selected)| {

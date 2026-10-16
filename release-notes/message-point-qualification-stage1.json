@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add private test-only qualification of canonical message point reads; share unchanged recipient predicates and reminder-rank parsing with existing mailbox readers.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay implementation, startup work or projection reconstruction changes. The new point capture and its controls are compiled only in tests."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema version, installer, registration, retention or writer hooks are added. Storage remains at the chosen baseline."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digest inputs, replication admission or fleet coordination changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No public route, error code, scope, cursor, client schema, provider contract or message membership promise changes. Runtime extraction preserves the existing recipient SQL predicates and first reminder/version parsing; equivalence is subject to required hosted qualification."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No new runtime initialization, background work or service-interruption requirement; no restart or performance observations are claimed."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new operator or user steps. Qualification limits apply only to the test-only helper and do not refuse production messages."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted state or migration is introduced by this change, so it adds no recovery or rollback procedure beyond the chosen baseline."
+  }
+}
