@@ -13,7 +13,8 @@
     "./deviceSigning": "./deviceSigning.ts",
     "./clientName": "./clientName.ts",
     "./time": "./time.ts",
-    "./slo": "./slo.ts"
+    "./slo": "./slo.ts",
+    "./documentView": "./documentView.ts"
   },
   "scripts": {
     "test": "node --experimental-transform-types --test tests/*.test.mjs",

@@ -5,4 +5,5 @@
 #![forbid(unsafe_code)]
 
 pub mod agents;
+pub mod documents;
 pub mod missions;

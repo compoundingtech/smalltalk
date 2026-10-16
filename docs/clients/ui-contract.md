@@ -33,6 +33,7 @@ view's contract; the web app updates them (see below).
 | `device-pairing-proofs-v1.json` | Pairing proof and fingerprint vectors. |
 | `transcripts/*.json` | Real Claude and Codex timelines, scrubbed of private names. |
 | `transcripts/*.expected.json` | The conversation a client must derive from each (display times omitted). |
+| `documents-v1.json` | Document links, the link-cycle trail, and the error states a document view shows. |
 
 ## Definition of good
 
@@ -573,3 +574,36 @@ Same capabilities, native idioms:
 | New mission control | A New mission button opening a composer sheet |
 
 iOS demo screenshots use `apps/ios/demoGateway.mjs`: invented data, nothing real.
+
+## Documents
+
+A document view shows one version of a named document (`doc/NAME@HASH`), read-only, as its
+author wrote it. Every client reads it the same way: `document.get` on
+`/v1/client/documents/content` for the text and `documents.list` on `/v1/client/documents` for
+the list ([client API](../st3/client-v0/README.md#documents)); there is no second path to a
+document. The shared model is `st3_ui_model::documents` (Rust) and `@smalltalk/st3-views`
+`documentView.ts` (TypeScript); `fixtures/clients/documents-v1.json` pins both.
+
+- **What the view needs:** the name; the Markdown text exactly as stored, rendered and never
+  filtered or rewritten; the version (its hash, shown as its first twelve characters); when that
+  version was bound to its name; whether it is the latest; and its outgoing `doc/…` links, in
+  order, each once.
+- **Links:** a link is `doc/NAME` (the latest version) or `doc/NAME@HASH`, found wherever `doc/`
+  starts a word in the text, including Markdown links, tables and code blocks. Following a link
+  opens that document in the same view; following one back to a document already on the trail
+  returns to it, so a cycle of links never grows the trail. Back returns one document.
+- **The list:** documents under a prefix in name order, a page at a time (`next_cursor`), each
+  row the name, short version and changed time. Loading, empty and failed are three states:
+  "Loading…", "No documents under PREFIX.", or why it could not be read.
+- **When a document cannot be shown, say why**, never a blank page: *not found* (no document
+  has that name on this host, 404 `not-found`), *not synced yet* (a pinned version this host has
+  not received, 404 `document-not-synced`; it shows once it syncs), *remote unavailable* (the
+  host did not answer), or *not text* (the bytes are not UTF-8).
+- **References:** `document-references.get` names the documents a message, mission or step
+  refers to, so a message, mission or step view can link to them.
+- Nothing here edits or publishes a document.
+- **Who may read:** every session with `read.projections` may list every document and read
+  any version, as the CLI already does (`st documents ls`, `st documents get doc/NAME`). Only a
+  message subject in `document-references.get` is gated by who may read that message.
+  Per-agent document privacy, if it comes, belongs to the agent isolation work and would gate
+  these routes and the CLI together.

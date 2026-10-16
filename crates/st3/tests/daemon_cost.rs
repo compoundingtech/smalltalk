@@ -618,6 +618,14 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/documents/content",
         "/v1/client/documents/content?name={document_reference}",
     ),
+    get(
+        "GET /v1/client/documents",
+        "/v1/client/documents?prefix=doc%2Fbench%2F&limit=50",
+    ),
+    get(
+        "GET /v1/client/document-references",
+        "/v1/client/document-references?subject=message/{sent}",
+    ),
     get("GET /v1/client/usage", "/v1/client/usage?since_ms={usage_since}&until_ms={usage_until}"),
     get("GET /v1/client/clients", "/v1/client/clients"),
     get(

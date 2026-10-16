@@ -832,6 +832,7 @@ impl ClientError {
                             | ErrorCode::PageCursorExpired
                             | ErrorCode::CursorGap
                             | ErrorCode::RemoteUnavailable
+                            | ErrorCode::DocumentNotSynced
                             | ErrorCode::RateLimited
                             | ErrorCode::RuntimeAuthorityIndeterminate
                             | ErrorCode::TerminalUnavailable
@@ -895,6 +896,10 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         | ErrorCode::MessageStoreFull
         | ErrorCode::LongMessageSignatureUnsupported => message.to_owned(),
         ErrorCode::BlobNotFound => "this image is not stored on this machine".into(),
+        ErrorCode::DocumentNotSynced => {
+            "this version of the document has not reached this host yet".into()
+        }
+        ErrorCode::InvalidDocumentReference => message.to_owned(),
         ErrorCode::BlobExpired => {
             "this image was removed after its retention window; the message text remains".into()
         }
@@ -1691,6 +1696,42 @@ impl Client {
         self.get(&format!(
             "/v1/client/documents/content?name={}",
             percent_encode(name)
+        ))
+        .await
+    }
+    pub async fn documents_list(
+        &self,
+        prefix: Option<&str>,
+        history: bool,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<DocumentsPage>, ClientError> {
+        let mut query = Vec::new();
+        for (name, value) in [("prefix", prefix), ("cursor", cursor)] {
+            if let Some(value) = value {
+                query.push(format!("{name}={}", percent_encode(value)));
+            }
+        }
+        if history {
+            query.push("history=true".to_owned());
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        self.get(&format!("/v1/client/documents{query}")).await
+    }
+    pub async fn document_references_get(
+        &self,
+        subject: &str,
+    ) -> Result<Envelope<DocumentReferences>, ClientError> {
+        self.get(&format!(
+            "/v1/client/document-references?subject={}",
+            percent_encode(subject)
         ))
         .await
     }
@@ -4113,6 +4154,15 @@ mod tests {
         );
         assert_eq!(remote.plain(), "Juniper cannot be reached right now");
         assert!(remote.is_transient());
+        let unsynced = api(
+            ErrorCode::DocumentNotSynced,
+            "document `doc/a@b` has not reached this host yet",
+        );
+        assert_eq!(
+            unsynced.plain(),
+            "this version of the document has not reached this host yet"
+        );
+        assert!(unsynced.is_transient());
         let gone = api(ErrorCode::NotFound, "agent `agent/x` does not exist");
         assert_eq!(gone.plain(), "it is gone: agent `agent/x` does not exist");
         assert!(!gone.is_transient());

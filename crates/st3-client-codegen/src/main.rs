@@ -246,6 +246,16 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn document_get(&self, name: &str) -> Result<Envelope<DocumentContent>, ClientError> {{ self.get(&format!(\"/v1/client/documents/content?name={{}}\", percent_encode(name))).await }}"
             )?;
+        } else if id == "documents.list" {
+            writeln!(
+                out,
+                "    pub async fn documents_list(&self, prefix: Option<&str>, history: bool, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<DocumentsPage>, ClientError> {{ let mut query = Vec::new(); for (name, value) in [(\"prefix\", prefix), (\"cursor\", cursor)] {{ if let Some(value) = value {{ query.push(format!(\"{{name}}={{}}\", percent_encode(value))); }} }} if history {{ query.push(\"history=true\".to_owned()); }} if let Some(limit) = limit {{ query.push(format!(\"limit={{limit}}\")); }} let query = if query.is_empty() {{ String::new() }} else {{ format!(\"?{{}}\", query.join(\"&\")) }}; self.get(&format!(\"/v1/client/documents{{query}}\")).await }}"
+            )?;
+        } else if id == "document-references.get" {
+            writeln!(
+                out,
+                "    pub async fn document_references_get(&self, subject: &str) -> Result<Envelope<DocumentReferences>, ClientError> {{ self.get(&format!(\"/v1/client/document-references?subject={{}}\", percent_encode(subject))).await }}"
+            )?;
         } else if id == "conversation.search" {
             writeln!(
                 out,
@@ -415,6 +425,16 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func documentGet(name: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: name)]) }}"
+            )?;
+        } else if id == "documents.list" {
+            writeln!(
+                out,
+                "    public func documentsList(prefix: String? = nil, history: Bool = false, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<DocumentsPage> {{ var query: [URLQueryItem] = []; for (name, value) in [(\"prefix\", prefix), (\"cursor\", cursor)] {{ if let value {{ query.append(.init(name: name, value: value)) }} }}; if history {{ query.append(.init(name: \"history\", value: \"true\")) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/documents\", query: query) }}"
+            )?;
+        } else if id == "document-references.get" {
+            writeln!(
+                out,
+                "    public func documentReferencesGet(subject: String) async throws -> Envelope<DocumentReferences> {{ try await get(\"v1/client/document-references\", query: [.init(name: \"subject\", value: subject)]) }}"
             )?;
         } else if id == "agent-workspace.get" {
             writeln!(
@@ -660,6 +680,10 @@ fn validate_surfaces(
         "AttentionBlocked",
         "AttentionTargetState",
         "DocumentContent",
+        "DocumentItem",
+        "DocumentsPage",
+        "DocumentReference",
+        "DocumentReferences",
         "MessageBody",
         "AgentDeclaration",
         "AgentWorkspace",
@@ -1322,6 +1346,16 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
+        } else if id == "documents.list" {
+            writeln!(
+                out,
+                "    async {method}(options: {{ prefix?: string; history?: boolean; cursor?: string; limit?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options)); }}"
+            )?;
+        } else if id == "document-references.get" {
+            writeln!(
+                out,
+                "    async {method}(subject: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ subject }})); }}"
             )?;
         } else if id == "custom-subjects.list" {
             writeln!(

@@ -110,6 +110,9 @@ pub enum ErrorCode {
     MessageTooLarge,
     MessageStoreFull,
     LongMessageSignatureUnsupported,
+    InvalidDocumentReference,
+    /// A pinned document version this host has not received yet.
+    DocumentNotSynced,
     Internal,
     #[serde(other)]
     Unknown,
@@ -414,8 +417,75 @@ pub struct AttentionTargetState {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DocumentContent {
+    /// The exact version read, `doc/NAME@HASH`, also when the request named only `doc/NAME`.
     pub reference: String,
     pub bytes: Vec<u8>,
+    /// The fields below are absent from daemons older than the `documents` capability.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// When this version was bound to its name.
+    #[serde(default)]
+    pub changed_at_unix_ms: Option<u64>,
+    /// Whether this is the name's newest version on the answering host.
+    #[serde(default)]
+    pub latest: Option<bool>,
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+/// One version of a named document, without its bytes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DocumentItem {
+    /// `doc/NAME@HASH`, which `document_get` reads.
+    pub reference: String,
+    pub name: String,
+    pub version: String,
+    pub size: u64,
+    pub changed_at_unix_ms: u64,
+    pub latest: bool,
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+/// One page of documents in name order, newest version first within a name.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DocumentsPage {
+    pub items: Vec<DocumentItem>,
+    pub has_more: bool,
+    pub limit: u64,
+    pub history: bool,
+    /// Asks for the next page with the same filters.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// A document a message, mission or step names.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DocumentReference {
+    /// As written: `doc/NAME@HASH`, or `doc/NAME` for its latest version.
+    pub reference: String,
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// `content` (a message whose content is the document), `body` (a link in a message's text)
+    /// or `step` (a step's pinned document).
+    pub source: String,
+    /// The step that pins it, for a mission or step.
+    #[serde(default)]
+    pub step: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DocumentReferences {
+    pub subject: String,
+    pub references: Vec<DocumentReference>,
+    /// False when a message's text lives on a machine that did not answer: `references` then
+    /// come from its preview only.
+    pub complete: bool,
 }
 
 /// The whole text of a message, of which a long message's `content` is only the start. It is

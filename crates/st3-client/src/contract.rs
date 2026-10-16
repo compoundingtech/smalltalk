@@ -69,6 +69,8 @@ pub const READ_OPERATIONS: &[(&str, &str)] = &[
     ("sets.get", "/v1/client/sets/{id}"),
     ("capabilities.get", "/v1/client/capabilities"),
     ("document.get", "/v1/client/documents/content"),
+    ("documents.list", "/v1/client/documents"),
+    ("document-references.get", "/v1/client/document-references"),
     ("publication.definition", "/v1/client/publication-definition"),
     ("subject.definition", "/v1/client/subject-definition"),
     ("mail-backlog.summary", "/v1/client/mail-backlog"),
