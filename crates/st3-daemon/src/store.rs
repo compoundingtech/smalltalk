@@ -77,6 +77,10 @@ mod roster_fresh_proof_tests;
 mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
 mod operation_audit;
+mod mission_provenance;
+pub(crate) mod agent_queue_values;
+pub mod backup_format;
+pub mod message_bodies;
 mod projectors;
 #[cfg(test)]
 mod projectors_tests;
@@ -2480,16 +2484,7 @@ fn item_facts(
     facts
 }
 
-/// Whether `seen` is the same comment as `known` or one created after it.
-pub(crate) fn newer_comment(seen: &Value, known: &Value) -> bool {
-    let created = |comment: &Value| {
-        comment
-            .get("created_at")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
-    seen.get("id") == known.get("id") || created(seen) >= created(known)
-}
+use crate::resource::newer_comment;
 
 /// The items of one repository collection whose recorded facts change with this observation.
 /// `current` names only the items the observation saw, each with only the facts it read; an
@@ -3982,7 +3977,7 @@ impl Store {
                     let mut body = serde_json::to_value(mission).map_err(internal)?;
                     if let Some(plan) = &owned_plan { body["owned_set"] = json!(plan.preview.set); }
                     if let Some(provenance) = intent.mission_provenance.get(&mission.id)
-                        && let Some(claim) = crate::provenance::record(transaction, &self.origin, mission, provenance, actor, &batch_id)? {
+                        && let Some(claim) = mission_provenance::record(transaction, &self.origin, mission, provenance, actor, &batch_id)? {
                         claim_ids.push(claim.id);
                     }
                     if !receipt_attached {
@@ -15908,18 +15903,7 @@ fn a_document_binding_that_arrives_out_of_order_does_not_rebuild_every_version()
     assert_eq!(documents(&target), incremental);
 }
 
-pub(crate) fn canonical_child_string(value: &Value, name: &str) -> Option<String> {
-    value
-        .get("children")?
-        .as_array()?
-        .iter()
-        .find(|child| child.get("name").and_then(Value::as_str) == Some(name))?
-        .get("arguments")?
-        .as_array()?
-        .first()?
-        .as_str()
-        .map(str::to_owned)
-}
+pub(crate) use crate::model::canonical_child_string;
 
 fn canonical_child_strings(value: &Value, name: &str) -> Vec<String> {
     value
@@ -48019,7 +48003,7 @@ fn append_claim_with_commit_context(
                     .with_detail("current_head", json!(actual)));
                 }
             }
-            if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+            if input.kind == crate::model::PLACEMENT_SOURCE_OFFLINE_KIND {
                 let current: Option<String> = transaction.query_row(
                     "SELECT claim_id FROM desired WHERE subject=?1 AND kind='agent'",
                     [&input.subject], |row| row.get(0),
@@ -48093,7 +48077,7 @@ fn append_claim_with_commit_context(
             // A placement handoff explicitly cites its local runtime and peer stop proof.
             // Keep same-subject evidence as causal links even when a newer declaration
             // displaced the runtime branch from the selected subject head.
-            if input.kind == "runtime.observed" || input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+            if input.kind == "runtime.observed" || input.kind == crate::model::PLACEMENT_SOURCE_OFFLINE_KIND {
                 for evidence in &input.evidence {
                     if claim_by_id_tx(transaction, evidence).map_err(internal)?
                         .is_some_and(|claim| claim.subject == input.subject)
@@ -48101,7 +48085,7 @@ fn append_claim_with_commit_context(
                         predecessors.push(evidence.clone());
                     }
                 }
-                if input.kind == crate::placement::SOURCE_OFFLINE_KIND {
+                if input.kind == crate::model::PLACEMENT_SOURCE_OFFLINE_KIND {
                     // The operator explicitly supersedes these sources' known runtime records.
                     // Retain those branches so destination routing is usable while sources are
                     // offline. Choose them under the writer lock; idempotent retries keep the

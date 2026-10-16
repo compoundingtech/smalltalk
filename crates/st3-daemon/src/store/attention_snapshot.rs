@@ -606,7 +606,7 @@ impl Store {
         for ((source, scope, _origin), claim) in latest {
             // A restart can diagnose many late admissions in one pass. Keep these visible in
             // mission views and doctor without creating an operator item for each run.
-            if scope == crate::reconcile::FIRST_READINESS_FAULT_SCOPE
+            if scope == crate::model::FIRST_READINESS_FAULT_SCOPE
                 || claim.body["fields"]["status"] != "faulted"
                 || as_of.saturating_sub(claim.accepted_at_unix_ms) < 120_000
             {
@@ -1025,7 +1025,7 @@ impl Store {
         person: Option<&str>,
         as_of: u128,
     ) -> Result<Vec<AttentionItemView>> {
-        use crate::reconcile::ObserverCondition;
+        use crate::resource::ObserverCondition;
         let connection = self.readers.get();
         let mut items = Vec::new();
         for desired in self
@@ -1859,7 +1859,7 @@ impl Store {
         let fields = &denial.body["fields"];
         if denial.subject != seat
             || denial.kind != "harness.diagnostic"
-            || fields["code"] != crate::driver_hook::PERMISSION_DENIED_CODE
+            || fields["code"] != crate::model::PERMISSION_DENIED_CODE
         {
             return Ok(None);
         }
