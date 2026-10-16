@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Frame the post-commit fixture child marker on its own stdout line while retaining the parent's exact check.",
+  "replay": { "status": "none", "detail": "Fixture-only output correction; no replay or backfill." },
+  "schema": { "status": "none", "detail": "No production SQL, DDL, index, trigger or migration change." },
+  "rules": { "status": "none", "detail": "Exit78, exact stdout, bounded phase-file and all state oracles remain required." },
+  "compatibility": { "status": "none", "detail": "The first hosted parent failed its stdout assertion before phase-file or reopen checks. A leading newline makes framing independent of libtest's progress prefix; captured stdout/stderr is reported on a future assertion failure. This correction is unrun, with no recovery pass inferred." },
+  "downtime": { "status": "none", "detail": "No operational or deployment change." },
+  "manual": { "status": "none", "detail": "No nextest, retry, timeout, dependency or activation change." },
+  "recovery": { "status": "none", "detail": "No identity, gate, library or cleanup policy change; all post-commit recovery qualification remains pending." }
+}
