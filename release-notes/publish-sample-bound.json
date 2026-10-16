@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A projection-fresh sample reads at most 10,000 claims: a publication further behind its previous one (a catch-up) is not a sample",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites; no contract change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "projection-fresh counts no sample for a publication more than 10,000 claims after the previous one; its other samples are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work or expected interruption. Bounds the claims range a refresher scans for a freshness sample after a long replication catch-up."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or swap-back restrictions."
+  }
+}
