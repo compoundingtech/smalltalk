@@ -303,6 +303,54 @@ fn generated_resource_union_decodes_all_kinds() {
 }
 
 #[test]
+fn usage_aggregation_schema_literals_keep_agent_rows() {
+    let schema: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/st3/client-v0/schemas/client-v0.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let literals = schema["$defs"]["UsageSummary"]["properties"]["aggregation"]["enum"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        literals,
+        serde_json::json!([
+            "cumulative-per-incarnation-else-response-deltas",
+            "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas"
+        ])
+        .as_array()
+        .unwrap()
+    );
+    for aggregation in literals {
+        let page: Page = serde_json::from_value(serde_json::json!({
+            "kind": "page", "collection": "agents", "filters": {},
+            "items": [{
+                "kind": "agent", "id": "agent/example", "revision": "r1",
+                "updated_at": "2026-10-04T08:00:00Z", "name": "Example",
+                "state": "running", "reachability": "local", "runtime_ids": [],
+                "usage": {
+                    "total_tokens": 1200, "input_tokens": 900, "output_tokens": 300,
+                    "cached_tokens": 100, "incarnation_count": 2,
+                    "aggregation": aggregation
+                }
+            }],
+            "page": {"limit": 50, "has_more": false}
+        }))
+        .unwrap();
+        let [Resource::Agent(agent)] = page.items.as_slice() else {
+            panic!("usage aggregation must not discard the agent row: {:?}", page.items);
+        };
+        assert_eq!(
+            agent.usage.as_ref().unwrap().aggregation,
+            aggregation.as_str().unwrap()
+        );
+    }
+}
+
+#[test]
 fn session_usage_context_decodes_through_flattened_resource() {
     let resource: Resource = serde_json::from_value(serde_json::json!({
         "id": "session/compatibility-test",
@@ -322,7 +370,7 @@ fn session_usage_context_decodes_through_flattened_resource() {
             "cost": null,
             "currency": null,
             "incarnation_count": 2,
-            "aggregation": "response-deltas",
+            "aggregation": "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas",
             "context": {
                 "used_tokens": 800,
                 "window_tokens": 200000,

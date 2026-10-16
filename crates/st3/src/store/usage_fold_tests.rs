@@ -105,7 +105,7 @@ fn kept_usage_folds_stay_within_their_weight() {
     let fold = |series: usize| {
         let mut spend = BTreeMap::new();
         spend.insert("i0".to_owned(), UsageSpend {
-            rollups: (0..series).map(|n| (format!("series-{n}"), (1, 1, 0, 0, 0))).collect(),
+            rollups: (0..series).map(|n| (format!("series-{n}"), RollupSpend { total: 1, input: 1, output: 0, writes: 0, reads: 0, cost_microusd: None })).collect(),
             ..UsageSpend::default()
         });
         CachedUsageFold { through: 1, last_accepted: "1".into(),

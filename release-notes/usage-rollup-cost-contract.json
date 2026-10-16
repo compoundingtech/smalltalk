@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Agent usage summaries include selected rollup costs only when all contributing costs are known and use one currency.",
+  "replay": {"status": "changed", "detail": "Usage readers include selected rollup costs and require complete single-currency costs. Claim replay and arrangement rebuild behavior stay unchanged."},
+  "schema": {"status": "none", "detail": "No persisted tables, indexes or projection layouts change."},
+  "rules": {"status": "changed", "transitions": [[16, 17]], "detail": "Checkpoint rules change from 16 to 17 and include the usage-reader cost contract in the rules digest. The existing arrangement proof and replay identity are retained. Mixed rules digests cannot seal a new shared checkpoint."},
+  "compatibility": {"status": "changed", "detail": "Step 1 (this PR): clients accept both cumulative-per-incarnation-else-response-deltas and rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas for UsageSummary.aggregation; the daemon continues emitting the old literal. Step 2: only after those clients are deployed, a separate PR changes the daemon to emit the new literal. Step 3: drop acceptance of the old literal later, after old daemons are retired."},
+  "downtime": {"status": "unknown", "detail": "Restart-to-API and restart-to-health times have not been measured for this change."},
+  "manual": {"status": "changed", "detail": "Deploy dual-literal clients first while the daemon still emits the old literal. After the clients are deployed, flip daemon emission in a separate PR; remove old-literal acceptance only in a later step. All checkpoint participants must use matching rules before new shared checkpoint sealing can continue."},
+  "recovery": {"status": "changed", "detail": "During step 1, old and dual-literal clients can use the daemon because it still emits the old literal. During step 2, keep dual-literal clients deployed; the daemon can roll back to old-literal emission without a coordinated client rollback. Do not roll clients back to old-only builds while any daemon emits the new literal. Defer step 3 until old daemons are retired; restore dual-literal clients before any later rollback to an old-literal daemon. Checkpoint participants must still use matching rules."}
+}

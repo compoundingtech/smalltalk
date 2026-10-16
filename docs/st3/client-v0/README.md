@@ -497,6 +497,20 @@ fallback for every recipient and reports no calibration. Recalibration changes f
 of historical counts; the pinned document makes an exported report reproducible. Older daemons
 omit the entire estimate, which clients treat as unavailable.
 
+An agent's `usage` summary selects the newest response rollup in each incarnation/model/account/
+run/step/host slot. Selected rollups take precedence over legacy cumulative or response records
+for that incarnation, for both tokens and cost. Known `cost_microusd` values are summed once and
+exposed as USD in `usage.cost`; `reported_cost_microusd` is already included, not added again.
+Clients accept both `cumulative-per-incarnation-else-response-deltas` and
+`rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas` for `aggregation`.
+The daemon still emits the old literal in this client-first rollout. Only after dual-literal
+clients are deployed will a separate PR switch daemon emission to the new literal; acceptance
+of the old literal will be removed later, after old daemons are retired.
+Any contributing tokens without a price, or selected costs in different currencies, leaves the
+combined cost/currency unknown, including legacy cumulative and response records. A newer priced
+rollup replaces an unpriced one in the same slot. This summary is not period spend, native session
+lifetime accounting, or a child-agent total.
+
 `GET /v1/client/usage?since_ms=…&until_ms=…` reads token spend over a period: the last 24 hours
 when both are omitted, ending now when `until_ms` is omitted. It requires `read.projections`. The
 value is `UsagePeriod { since_ms, until_ms, rows }`, with one `UsageRow` per agent, mission run,

@@ -2943,15 +2943,21 @@ witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
 
 #[test]
-fn the_policy_renders_the_rules_description_with_review_reader_fenced_since_15() {
-    assert_eq!(super::checkpoint_rules::RULES_VERSION, 16);
+fn the_policy_renders_the_rules_description_with_review_reader_fenced_since_15_and_usage_reader_since_16() {
+    assert_eq!(super::checkpoint_rules::RULES_VERSION, 17);
     assert_eq!(
         super::checkpoint_rules::rules_description(),
-        RULES_V14_DESCRIPTION.replace(
-            "harness.limits keep=all-source-observations",
-            "harness.limits slot=subject keep=newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at\n\
-             runtime.reconcile-decision slot=subject,key keep=newest,newest-carrier-of-each-field",
-        ) + "\nreview=retain-binding,withdrawal,verdict,actor-evidence,attempt-relation-references"
+        RULES_V14_DESCRIPTION
+            .replace(
+                "harness.limits keep=all-source-observations",
+                "harness.limits slot=subject keep=newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at\n\
+                 runtime.reconcile-decision slot=subject,key keep=newest,newest-carrier-of-each-field",
+            )
+            .replace(
+                "\nguards=",
+                "\nreader-usage=rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas,cost-complete-single-currency\nguards=",
+            )
+            + "\nreview=retain-binding,withdrawal,verdict,actor-evidence,attempt-relation-references"
     );
 }
 
