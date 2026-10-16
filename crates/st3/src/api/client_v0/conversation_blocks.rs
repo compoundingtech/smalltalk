@@ -845,6 +845,13 @@ pub(super) fn prepare_one(
 
 /// Keep negotiated data out of legacy relayed clients without changing their known enum.
 pub(in crate::api) fn legacy(value: &mut Value, session: &ClientSession) {
+    if !session.conversation_delivery_links
+        && let Some(items) = value.get_mut("items").and_then(Value::as_array_mut)
+    {
+        for item in items {
+            if let Some(item) = item.as_object_mut() { item.remove("delivers"); }
+        }
+    }
     if session.conversation_blocks {
         return;
     }

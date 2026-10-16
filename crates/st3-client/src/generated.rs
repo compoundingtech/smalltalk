@@ -2018,6 +2018,8 @@ pub struct TimelinePage {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TimelineEntry {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivers: Option<String>,
     pub sequence: u64,
     pub revision: u32,
     pub timestamp: String,
