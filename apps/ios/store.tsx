@@ -13,6 +13,7 @@ import { REPAIR_WARNING, validatePairingTrust, verifyPairing } from './pairingPr
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages, mergedRows } from './collectionPages';
 import { rememberBounded } from './boundedCache';
+import { IMAGES } from './imageView';
 import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from './terminalControls';
 import { sendFences } from './sendFence';
 import { Feed } from './feed';
@@ -175,8 +176,6 @@ function useAppStore(proof?: FabricProfile) {
     return () => { current = false; };
   }, [proof, caps?.session_actor]);
   useEffect(() => foreground.current.subscribe(active => { if (!active && !proofRef.current) void localDrafts.save(draftsOwner.current, draftCache.current); }), []);
-  // Images messages carry, as data URIs, so a conversation scrolled back to does not read them again.
-  const imageCache = useRef(new Map<string, Promise<string>>());
   // The request of a send st never confirmed, so sending the same message again repeats it instead of making a second.
   // Attention the person acted on from here: st closing it is their doing, not a vanishing.
   const acted = useRef(new Set<string>());
@@ -888,14 +887,10 @@ function useAppStore(proof?: FabricProfile) {
     },
     /** An image a message carries, as a data URI; st reads it from the member that has it. */
     image(image: { sha256: string; message: string; mediaType: string }): Promise<string> {
-      const known = imageCache.current.get(image.sha256);
-      if (known) return known;
-      if (!client || status !== 'online') return Promise.reject(new Error(status === 'online' ? 'not connected' : 'offline'));
-      const reading = client.blob(image.sha256, image.message).then(bytes => `data:${image.mediaType};base64,${encodeBase64(bytes)}`);
-      // A failed read is tried again next time it is shown.
-      reading.catch(() => { if (imageCache.current.get(image.sha256) === reading) imageCache.current.delete(image.sha256); });
-      rememberBounded(imageCache.current, image.sha256, reading, 24);
-      return reading;
+      return IMAGES.read(image.sha256, () => {
+        if (!client || status !== 'online') return Promise.reject(new Error(status === 'online' ? 'not connected' : 'offline'));
+        return client.blob(image.sha256, image.message).then(bytes => `data:${image.mediaType};base64,${encodeBase64(bytes)}`);
+      });
     },
     /** The whole text of a long message (a conversation shows only its start), read from the member that took it. */
     async messageBody(message: string): Promise<{ text: string; complete?: boolean }> {

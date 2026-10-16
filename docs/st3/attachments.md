@@ -122,11 +122,19 @@ by a URL is a link the person opens; nothing fetches it to draw it.
 
 | Image | Terminal UI | iOS |
 |---|---|---|
-| A message's images, including a Discord import's | A line each, `▣ name · type · size  open`; loads inline (click or Ctrl+U), by itself where the terminal draws images | See the iOS change |
-| An image in a transcript, including a tool result's | `[image type, size]` under its turn or call; loads inline the same way | See the iOS change |
-| An ask's images | A line each on the ask's card in Now; loads inline the same way | See the iOS change |
-| A delivery that names an image (`<attachment …/>`) | The message's image line; the seat's path is never shown | See the iOS change |
+| A message's images, including a Discord import's | A line each, `▣ name · type · size  open`; loads inline (click or Ctrl+U), by itself where the terminal draws images | A box each under the message, naming the image, type and size; loads when it scrolls into view |
+| An image in a transcript, including a tool result's | `[image type, size]` under its turn or call; loads inline the same way | A box under its turn or call, the same way; an image alone in a turn is that box, not the words `[image · load from owner]` |
+| An ask's images | A line each on the ask's card in Now; loads inline the same way | A box each on the ask's card, in Now and above the conversation |
+| A delivery that names an image (`<attachment …/>`) | The message's image box; the seat's path is never shown | The same |
 
 Before an image loads, its line names its type and size and says how to load it. While it loads
 it says `loading…`. When its owner cannot be reached it says so with a way to try again.
+
+On the phone, a tap on a shown image opens it on the whole screen: pinch to zoom, **Close** to go
+back, and **Share** to save it to Photos or Files or open it in another app. An image past its
+retention says it has expired and offers no retry. The phone reads an image only while its box is
+on screen and lets go of it when the box leaves; up to 16 MB of read images stay for when they
+come back. React Native decodes each image at the size of the box or screen that draws it, so a
+huge image is held scaled down. A Markdown image (`![alt](url)`) is a link, `▣ alt · image link`,
+in both clients; nothing fetches it to draw it.
 

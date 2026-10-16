@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Show every image in a conversation on the phone: a message's images load when they scroll into view and say their name, type and real size before; an image alone in a transcript turn is its image, not the words `[image · load from owner]`; a delivery's <attachment/> becomes the message's image without its path; an ask's images show on its card. A tap zooms (pinch, Close) and Share saves or opens it elsewhere. An unreachable owner and an expired image say so in words.",
+  "replay": {
+    "status": "none",
+    "detail": "The phone reads the same claims and timelines; nothing is replayed or migrated."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema change; the phone reads the ask attachments the terminal UI change added."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digest inputs are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Against an older daemon an ask has no images and transcript images name no size; the phone says size unknown."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Build and install the iOS app again to get the change (docs/stui-and-ios.md)."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Installing the previous app build restores the previous behaviour."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None; only the app changes."
+  }
+}
