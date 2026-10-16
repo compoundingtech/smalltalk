@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The seat-deploy guide says when a suspend right after a deploy waits for a resumed driver's settle",
+  "replay": {"status": "none", "detail": "Documentation only."},
+  "schema": {"status": "none", "detail": "Documentation only."},
+  "rules": {"status": "none", "detail": "Documentation only."},
+  "compatibility": {"status": "none", "detail": "Documentation only."},
+  "downtime": {"status": "none", "detail": "Documentation only. It describes the existing behaviour: after a deploy, a seat whose harness changed state while the daemon was down reports its new state when its settle of up to 30 seconds ends, and a suspend sent before then is refused."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Documentation only."}
+}
