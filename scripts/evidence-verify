@@ -30,7 +30,9 @@ SHA256 = re.compile(r'^[0-9a-f]{64}\Z')
 NOTES = 'refs/notes/evidence/'
 INPUT_NOTES = 'refs/notes/evidence-input/'
 STATEMENT_TYPE = 'https://in-toto.io/Statement/v1'
-PREDICATE_TYPE = 'https://smalltalk.dev/evidence/gate/v1'
+PREDICATE_TYPE = 'https://compounding.tech/fractal/evidence/gate/v1'
+# Permanent signed-history decoder exception: evidence predicate URI, #3032.
+LEGACY_PREDICATE_TYPE = 'https://smalltalk.dev/evidence/gate/v1'
 KEYS_PATH = '.st/evidence-keys'
 POLICY_PATH = '.st/evidence-skip-policy.json'
 KINDS = ('nix', 'wrapper', 'sekrets', 'observed')
@@ -227,7 +229,7 @@ def statement_of(blob, tree):
         predicate = value['predicate']
         subject = value['subject']
         observed = predicate['observed']
-        if (value['_type'] != STATEMENT_TYPE or value['predicateType'] != PREDICATE_TYPE
+        if (value['_type'] != STATEMENT_TYPE or value['predicateType'] not in (PREDICATE_TYPE, LEGACY_PREDICATE_TYPE)
                 or len(subject) != 1 or not OID.match(subject[0]['name'])
                 or subject[0]['digest'] != {'gitTree': tree}
                 or predicate['schema_version'] != 1

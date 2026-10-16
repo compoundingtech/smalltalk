@@ -11,8 +11,16 @@ verified trace receipt; v1 rejects it until its predicate and verifier exist.
 ## Record and transport
 
 The record is an in-toto v1 statement with one subject: `name` is the observed
-full commit ID, and `digest.gitTree` is its exact Git tree ID. The predicate type
-is `https://smalltalk.dev/evidence/gate/v1`. Its fields are:
+full commit ID, and `digest.gitTree` is its exact Git tree ID. Rust and Python
+verifiers accept both predicate types:
+`https://compounding.tech/fractal/evidence/gate/v1` and
+`https://smalltalk.dev/evidence/gate/v1`. Acceptance of the old URI is the
+permanent signed-history decoder exception named in
+[#3032](https://github.com/compoundingtech/smalltalk/issues/3032); existing signed
+attestations are never rewritten. All other predicate URIs are rejected.
+The Rust observers and `scripts/evidence-sign` still write
+`https://smalltalk.dev/evidence/gate/v1`. The signer switches only in a later
+release, after this dual-URI verifier release is on main. Its fields are:
 
 | Field | Meaning |
 | --- | --- |

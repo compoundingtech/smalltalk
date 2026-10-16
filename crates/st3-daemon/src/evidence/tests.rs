@@ -206,6 +206,32 @@ impl Fixture {
 }
 
 #[test]
+fn legacy_and_fractal_predicate_uris_verify_but_an_unknown_uri_is_rejected() {
+    let f = Fixture::new();
+    assert_eq!(PREDICATE_TYPE, "https://smalltalk.dev/evidence/gate/v1");
+    for uri in [
+        "https://smalltalk.dev/evidence/gate/v1",
+        "https://compounding.tech/fractal/evidence/gate/v1",
+    ] {
+        let mut statement = f.tests("fixture-runner", 0);
+        statement.predicate_type = uri.into();
+        let record = f.put(&statement);
+        assert_eq!(
+            verify_record(f.repo(), &record, &f.trusted)
+                .unwrap()
+                .predicate_type,
+            uri
+        );
+    }
+    let mut statement = f.tests("fixture-runner", 0);
+    statement.predicate_type = "https://example.invalid/evidence/gate/v1".into();
+    assert_eq!(
+        statement.validate(f.repo()).unwrap_err().to_string(),
+        "unsupported evidence format"
+    );
+}
+
+#[test]
 fn tests_and_review_round_trip_and_gate() {
     let f = Fixture::new();
     let tests = f.put(&f.tests("fixture-runner", 0));

@@ -268,7 +268,10 @@ def main():
     body = {
         '_type': 'https://in-toto.io/Statement/v1',
         'subject': [{'name': commit, 'digest': {'gitTree': tree}}],
+        # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-evidence-predicate-uri — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+        # Keep writing the old URI until the accepting verifier release is on main.
         'predicateType': 'https://smalltalk.dev/evidence/gate/v1',
+        # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-evidence-predicate-uri
         'predicate': {
             'schema_version': 1, 'change_id': request['change_id'], 'signer': signer, 'tier': 'full',
             're_attests': None,

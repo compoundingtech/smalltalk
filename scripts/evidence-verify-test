@@ -60,11 +60,12 @@ class Fixture:
         return self.git('rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD^{tree}')
 
     def note(self, commit, tree, key, signer, check='unit', command=('make', 'test'), exit_code=0,
-             runner='nix', tier='full', seconds=0, sign=True, naive=False, inputs=None, omit_inputs=False, mutate=None, parent=None):
+             runner='nix', tier='full', seconds=0, sign=True, naive=False, inputs=None, omit_inputs=False, mutate=None, parent=None,
+             predicate_type='https://smalltalk.dev/evidence/gate/v1'):
         statement = {
             '_type': 'https://in-toto.io/Statement/v1',
             'subject': [{'name': commit, 'digest': {'gitTree': tree}}],
-            'predicateType': 'https://smalltalk.dev/evidence/gate/v1',
+            'predicateType': predicate_type,
             'predicate': {
                 'schema_version': 1, 'change_id': 'change-1', 'signer': signer, 'tier': tier,
                 're_attests': None, 'producer_sha256': 'a' * 64,
@@ -119,6 +120,20 @@ class Verifier(unittest.TestCase):
         self.assertEqual((result['record'], result['kind'], result['signer'], result['trust_level']),
                          (record, 'nix', 'machine/ci1', 'machine'))
         self.assertEqual(result['command'], ['make', 'test'])
+
+    def test_legacy_and_fractal_predicate_uris_are_accepted_but_a_third_uri_is_not(self):
+        # With no other records and the exact subject tree, only the URI is unsupported.
+        self.f.note(self.commit, self.tree, self.ci, 'machine/ci1',
+                    predicate_type='https://example.invalid/evidence/gate/v1')
+        self.assertEqual(self.reason(self.tree), 'no_record')
+        for index, uri in enumerate(('https://smalltalk.dev/evidence/gate/v1',
+                                     'https://compounding.tech/fractal/evidence/gate/v1')):
+            with self.subTest(uri=uri):
+                record = self.f.note(self.commit, self.tree, self.ci, 'machine/ci1',
+                                     predicate_type=uri, seconds=index)
+                code, result = self.f.verify(self.tree)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result['record'], record)
 
     def test_wrapper_and_sekrets_are_accepted_kinds_and_unknown_kinds_are_not(self):
         self.f.note(self.commit, self.tree, self.ci, 'machine/ci1', runner='sekrets')

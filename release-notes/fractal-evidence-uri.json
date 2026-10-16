@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Accept Fractal gate evidence predicate URIs while preserving signed Smalltalk history",
+  "replay": {"status": "none", "detail": "Existing signed evidence is read unchanged; no replay is needed."},
+  "schema": {"status": "none", "detail": "The gate evidence v1 payload schema is unchanged."},
+  "rules": {"status": "none", "detail": "Signature, trust and gate policy requirements are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Rust and Python verifiers accept https://compounding.tech/fractal/evidence/gate/v1 and permanently accept https://smalltalk.dev/evidence/gate/v1. Signers continue writing the old URI until the dual-URI verifier release is on main."},
+  "downtime": {"status": "none", "detail": "Verifier-first rollout requires no downtime and preserves compatibility with existing signers."},
+  "manual": {"status": "none", "detail": "No operator action is required for this verifier-only release."},
+  "recovery": {"status": "none", "detail": "Existing signed records and signer output remain compatible with the previous release."}
+}
