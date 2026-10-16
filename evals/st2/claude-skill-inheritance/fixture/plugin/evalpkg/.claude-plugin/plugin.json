@@ -1,5 +1,0 @@
-{
-  "name": "evalpkg",
-  "description": "Eval harness local plugin: carries the PLUGIN-scope inheritance probe skill.",
-  "version": "1.0.0"
-}
