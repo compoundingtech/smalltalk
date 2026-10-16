@@ -91,6 +91,8 @@ pub struct Form {
     pub login_note: String,
     /// "Keep running after I log out", offered only where that can be enabled without sudo.
     pub linger: Option<bool>,
+    /// The folder agents work in, shown once so nobody is surprised by it; empty hides the line.
+    pub work_root: String,
     pub rows: Vec<Row>,
     /// "Let Codex work without asking"; present only when Codex was found. Ticked by default:
     /// the install's own access mode applies. Unticked, Codex asks.
@@ -633,6 +635,16 @@ impl Screen {
             lines.push(checkbox_line(focus(Item::Linger), check(on), "Keep running after I log out", theme::text()));
             marks.push((first, Item::Linger, lines.len() - 1, None));
         }
+        if !self.form.work_root.is_empty() {
+            lines.extend(wrap(
+                &format!(
+                    "Agents work in {}, so none of them has to look through your home folder.",
+                    self.form.work_root
+                ),
+                0,
+                theme::dim(),
+            ));
+        }
         lines.push(Line::default());
 
         lines.push(Line::from(Span::styled("Agents", theme::label())));
@@ -994,6 +1006,7 @@ mod tests {
             login: true,
             login_note: "Installs a user service. Remove it with st service uninstall.".into(),
             linger: Some(false),
+            work_root: "/home/ada/st".into(),
             rows: vec![
                 row("claude", "Claude", Some("/usr/bin/claude")),
                 row("codex", "Codex", Some("/usr/bin/codex")),
@@ -1047,6 +1060,7 @@ mod tests {
             "studio",
             "[x] Start st when I log in",
             "Keep running after I log out",
+            "Agents work in /home/ada/st, so none of them has to look through your home folder.",
             "[x] Claude",
             "found /usr/bin/claude",
             "[x] Codex",

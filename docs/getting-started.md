@@ -66,6 +66,13 @@ everything to choose:
   [Managed harness access](st3/harness-access.md)). Unticked, Codex asks. The choice is
   saved as `codex_work_without_asking` in the config.
 
+One dim line under the login choices names the **work folder**: `~/st` by default (an
+`--instance` has its own `work` folder), or `work_root` in the config. Setup creates it.
+Agents started without a folder of their own work in a subfolder of it, so none of them
+has to look through your home folder, which on macOS would raise a permission prompt.
+`work_root` must be an absolute path, not the home folder itself and not inside Documents,
+Desktop or Downloads. `st uninstall` leaves its contents alone.
+
 One consent line sits above the two buttons: *Set up st for the selected agents, adding
 its local integrations and required workspace configuration?* **Set up** does it for
 every ticked agent at once; **Skip for now** sets up st itself and no agent. Signing in

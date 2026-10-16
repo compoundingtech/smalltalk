@@ -145,6 +145,11 @@ fn form(start: &Start, environment: &BTreeMap<String, String>) -> Form {
         login: start.args.service.unwrap_or(true),
         login_note,
         linger: lingering_offered(),
+        work_root: start
+            .config
+            .work_root()
+            .map(|root| root.display().to_string())
+            .unwrap_or_default(),
         rows,
         codex,
     }

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The setup screen names the work folder, and the skill tells seats to stay in it",
+  "replay": {
+    "status": "none",
+    "detail": "No stored history or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or claim schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination version change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Text only: one line on the setup checklist screen and a section in the bundled skill and getting-started guide. No config key, wire field or API changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to do."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Revert the change; nothing was written."
+  }
+}

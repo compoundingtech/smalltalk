@@ -160,6 +160,8 @@ mod tests {
             "`st service restart`",
             "confirm with `st doctor`",
             "it is not a security boundary",
+            "work in a subfolder of the install's work root: `~/st` by default",
+            "avoid listing or searching `$HOME`",
             "`\"$ST3_BIN\" agents handoff write --as \"$ST_AGENT\"`",
             "only this seat writes its own",
             "Prepare for restart",
