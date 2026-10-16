@@ -404,7 +404,7 @@ grace cleanup, and 72 seconds of protocol-heartbeat idle with no request.
 `collectionSocket.test.mjs` checks authentication and control-event delivery at
 the native bridge boundary; it does not claim an iOS simulator was driven.
 
-The stui consumer is covered by `st3-feed/src/inventory_tests.rs` over an isolated
+The stui consumer is covered by `crates/st3-e2e/tests/feed/inventory.rs` over an isolated
 Unix daemon: all six windows, typed client/usage adaptation, period replacement,
 unsubscription and authoritative reconnect snapshots.
 `stui/tests/client_only.rs::inventory_screens_send_no_request_after_their_first_frames_for_more_than_a_minute`

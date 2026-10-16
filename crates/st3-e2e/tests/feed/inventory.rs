@@ -1,5 +1,4 @@
 use super::*;
-use crate::tests::{next_window, test_state};
 
 #[tokio::test]
 async fn inventories_follow_sources_switch_periods_leave_and_reconnect_over_a_real_socket() {
