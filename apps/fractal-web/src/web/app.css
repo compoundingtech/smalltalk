@@ -6,6 +6,18 @@ body,
   height: 100%;
 }
 
+/* Text selection: the legacy rule paints --selection (the near-invisible active-row fill here). */
+[data-testid='live-agent-workspace'] ::selection {
+  background: var(--muted);
+  color: var(--canvas);
+}
+
+/* Keyboard focus on menu and list items: the kit's neutral ring, not the legacy accent ring. */
+[data-testid='live-agent-workspace'] :is([role='menuitem'], [role='menuitemradio'], [role='menuitemcheckbox'], [role='option'])[data-focus-visible] {
+  outline: 2px solid var(--muted);
+  outline-offset: -2px;
+}
+
 /* Reserve the HUD's own strip without subscribing the workbench to its preference. */
 body:has([data-testid='wf-devbar']:not([hidden])) {
   --wf-devbar-space: 24px;

@@ -11,6 +11,7 @@ import { colorVars as c, typeVars as t, spaceVars as s, geometryVars as g } from
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import * as Aria from 'react-aria-components'
+import { UNSAFE_PortalProvider } from 'react-aria'
 import * as stylex from '@stylexjs/stylex'
 import { useAtom, useAtomValue } from '@effect/atom-react'
 import { Schema } from 'effect'
@@ -121,8 +122,20 @@ const initialAgentFromUrl = () => {
   }
 }
 
+/**
+ * React Aria overlays (menus, popovers, tooltips, modals) portal into a host inside the themed
+ * root instead of document.body, where only the legacy document palette and fonts apply. The
+ * provider sits above the shell state, so its context value never changes on a switch and the
+ * portalled panes inherit it without a context scan.
+ */
+export function LiveAgentWorkspace(props: { readonly ux?: UxTelemetry; readonly onSelectConversation?: (ref: string) => void }) {
+  const overlayHost = React.useRef<HTMLDivElement>(null)
+  const getContainer = React.useCallback(() => overlayHost.current, [])
+  return <UNSAFE_PortalProvider getContainer={getContainer}><Workspace {...props} overlayHost={overlayHost} /></UNSAFE_PortalProvider>
+}
+
 /** One authoritative agent thread per workspace; local geometry never grants backend authority. */
-export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?: UxTelemetry; readonly onSelectConversation?: (ref: string) => void }) {
+function Workspace({ ux, onSelectConversation, overlayHost }: { readonly ux?: UxTelemetry; readonly onSelectConversation?: (ref: string) => void; readonly overlayHost: React.RefObject<HTMLDivElement | null> }) {
   const fleet = useFleet(), subjects = useSubjectList(), connection = useConnection(), now = useNow()
   const [storedAgent, setStoredAgent] = useAtom(selectedAgent)
   const [ratio, setRatio] = useAtom(sidebarRatio), [collapsed, setCollapsed] = useAtom(sidebarClosed), [scheme, setScheme] = useAtom(palette)
@@ -312,6 +325,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                   </aside>
                 </>
               ) : null}
+              <div ref={overlayHost} {...stylex.props(styles.overlayHost)} />
             </div>
           </ThreadHeaderSlotContext.Provider>
         </MonitorDetailProvider>
@@ -424,6 +438,9 @@ export function LiveSidebarSearch({ value, onChange }: { readonly value: string;
 const styles = stylex.create({
   legacyBridge: { '--canvas': c.canvas, '--panel': c.raised, '--recess': c.message, '--ink': c.fg, '--muted': c.fgMuted, '--line': c.borderStrong, '--accent': c.primary, '--on-accent': c.onPrimary, '--selection': c.rowActive, '--good': c.done, '--warning': c.attention, '--danger': c.dangerFg, '--sans': t.fontSans, '--mono': t.fontMono },
   app: { display: 'flex', height: 'calc(100dvh - var(--wf-devbar-space, 0px))', width: '100%', overflow: 'hidden', backgroundColor: c.canvas, color: c.fg, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading },
+  // Out of flow, above the panes. Viewport-wide but zero-height: no hit area of
+  // its own, yet shrink-to-fit popovers get the viewport as available width.
+  overlayHost: { position: 'fixed', top: 0, left: 0, width: '100%', height: 0, zIndex: 20 },
   sidebar: { display: 'flex', flexDirection: 'column', flexShrink: 0, minHeight: 0, overflow: 'hidden', backgroundColor: c.sidebar },
   brand: { height: g.band, paddingInline: s.lg, display: 'flex', alignItems: 'center', gap: s.md, flexShrink: 0 },
   iconButton: { width: 28, height: 28, display: 'inline-flex', justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer' },

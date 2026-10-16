@@ -102,6 +102,7 @@ node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook
 - Density: spacing, control height, chrome size. Each direction applies its own pixel bias.
 
 Every foreground/background pair used for text meets WCAG AA (≥ 4.5:1) in all six palettes. The minimum, 4.59:1, is in Relay dark. Under `prefers-reduced-motion`, durations are zero and spinner and pulse animations stop. Fonts come from system stacks only; no font or image assets are distributed.
+Rows and menu items — sidebar rows, row menus, workspace menus — show keyboard focus with the neutral 2px `fgMuted` ring; standalone buttons and triggers keep the accent ring. The selection highlight is `fgMuted` under canvas text (about 5.6:1).
 
 ## Assistant-ui surfaces
 
@@ -189,6 +190,7 @@ The focused Workbench stories use W3/H1/P3/D2; Composer stories use C2/R3/M2/K1 
 Workbench pane identities survive layout changes through persistent pane slots. `workspaceId` scopes stored ratios, tabs and composer drafts, so two workspaces displaying the same pane do not share draft text. `ViewportStore` and `ViewportStoreContext` retain per-conversation scroll/follow/unread state when a thread pane is parked or moved; `Transcript.viewportKey` identifies the owning conversation. The minimal terminal boundary is host-supplied read-only lines/session facts for pane rendering and drag targets, not a terminal transport or emulator.
 
 `DiffPanel` accepts numeric or string widths, optional `onClose` and `landmarkContext`, current-turn and branch file lists, and an explicit `{ path, sequence }` reveal request. Missing file facts remain missing. The host interprets `onOpenTool` and drives controlled diff reveals; the kit never guesses a path from a tool's input. Its scope picker, line-wrap and whitespace controls remain keyboard accessible, with semantic-token React Aria portals owned by `ThemePortal`.
+Overlays — Tooltip, Popover/Menu, Modal/Dialog — must render inside the themed root, where the active scheme's tokens resolve. The web app does this through its workspace portal provider; standalone kit consumers wrap their tree in `ThemePortal`.
 
 `DiffPanel` is exported from `@smalltalk/fractal-ui/assistant-ui`, not from `@smalltalk/fractal-ui/assistant-ui/shell`. Its source highlighting loads the Markdown grammar graph, and the shell entry stays runtime-free. `pnpm check:shell-imports` walks the shell entry's import graph and fails if Markdown, refractor or the assistant-ui runtime becomes reachable.
 

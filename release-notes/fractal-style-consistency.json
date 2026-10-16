@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fractal web menus, popovers, tooltips and modals render inside the themed workspace root, so they use the workspace colours and font in both schemes instead of the legacy olive document palette. Keyboard focus on sidebar rows and menu items uses the neutral fgMuted ring instead of the accent ring, and text selection is visible in both schemes.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Presentation only in apps/fractal-web and packages/fractal-ui (SidebarAgentRow focus styles); no protocol, data or CLI change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}
