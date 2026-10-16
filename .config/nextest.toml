@@ -10,7 +10,7 @@ priority = 100
 # tests above already do). Order only: no selection, retry, thread or assertion change.
 [[profile.default.overrides]]
 filter = '''
-(package(=st3) and (
+((package(=st3) or package(=st3-daemon)) and (
     test(/^convergence::(seed_1_converges_on_a_real_disk|the_checks_catch_a_partial_adoption)$/)
     or test(/^delivery_probe::native_delivery_probe_alerts_and_recovers_without_model_turns$/)
     or test(/^client_only::inventory_screens_send_no_request_after_their_first_frames_for_more_than_a_minute$/)
@@ -94,13 +94,13 @@ retries = 0
 # Retain the exact served-roster proof's six churn tuples on success in ordinary
 # consumer logs. Output visibility only; selection, retries and budgets are unchanged.
 [[profile.ci.overrides]]
-filter = 'package(=st3) and test(/^api::tests::roster_fresh::traced_unchanged_proof_reports_work_for_each_churn_interval$/)'
+filter = '(package(=st3) or package(=st3-daemon)) and test(/^api::tests::roster_fresh::traced_unchanged_proof_reports_work_for_each_churn_interval$/)'
 success-output = "immediate"
 
 # Retain private resource preparation's seed/read/validate/fallback work and replay
 # counters in ordinary hosted logs. Visibility only: no selection, retry or budget change.
 [[profile.ci.overrides]]
-filter = 'package(=st3) and (test(/^store::resource_preparation::tests::quiet_preparation_and_two_stale_attempts_report_separate_writer_work$/) or test(/^store::resource_preparation::tests::no_change_fast_writer_work_does_not_grow_with_resource_history$/) or test(/^store::resource_preparation::tests::changed_and_attempt_outcomes_match_the_canonical_path_and_retry_receipts$/))'
+filter = '(package(=st3) or package(=st3-daemon)) and (test(/^store::resource_preparation::tests::quiet_preparation_and_two_stale_attempts_report_separate_writer_work$/) or test(/^store::resource_preparation::tests::no_change_fast_writer_work_does_not_grow_with_resource_history$/) or test(/^store::resource_preparation::tests::changed_and_attempt_outcomes_match_the_canonical_path_and_retry_receipts$/))'
 success-output = "immediate"
 
 # Keep both measured control intervals visible even when the idle positive passes.

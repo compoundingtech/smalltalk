@@ -219,6 +219,23 @@ def crate_findings(root):
             other = binary.get(section, {}).get(key)
             if other is not None and other != spec:
                 problems.append(f"{key} in [{section}] differs between crates/st3-daemon ({spec}) and crates/st3 ({other})")
+    # A nextest filter that names package st3 and not st3-daemon silently stops matching the library's
+    # tests once they live in st3-daemon; only filters for the binary-side integration tests may do so.
+    nextest = os.path.join(root, ".config", "nextest.toml")
+    if os.path.isfile(nextest):
+        with open(nextest, "rb") as handle:
+            config = tomllib.load(handle)
+        for profile, body in config.get("profile", {}).items():
+            filters = [(f"profile.{profile}.default-filter", body["default-filter"])] if "default-filter" in body else []
+            for kind in ("overrides", "scripts"):
+                for index, entry in enumerate(body.get(kind, [])):
+                    if "filter" in entry:
+                        filters.append((f"profile.{profile}.{kind}[{index}]", entry["filter"]))
+            for where, expression in filters:
+                if re.search(r"package\(=?st3\)", expression) and "st3-daemon" not in expression \
+                        and "binary(=integration)" not in expression:
+                    problems.append(f".config/nextest.toml {where} names package st3 but not st3-daemon, "
+                                    "so it no longer selects the library's tests")
     build = [os.path.join(d, "build.rs") for d in (daemon, os.path.join(root, "crates", "st3"))]
     contents = []
     for path in build:
