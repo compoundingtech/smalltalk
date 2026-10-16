@@ -3170,6 +3170,20 @@ impl Ui {
     /// Show `pane` in this glass: where it already shows, else as `how` says. Home stays Home,
     /// so what opens from Home gets its own tab, and a Home item opens on Home itself.
     pub(crate) fn open_in_glass(&mut self, pane: Pane, how: Open) {
+        self.open_in_glass_inner(pane.clone(), how);
+        // Opening an agent attaches its terminal once its tab has stayed in front a moment,
+        // unless this device chose its conversation. Only opening does: moving the focus to a
+        // tab or split already open only focuses it.
+        if !self.conversation_first()
+            && let Pane::Agent(Some(id)) = &pane
+            && id.starts_with("agent/")
+            && self.focused_pane().as_ref() == Some(&pane)
+        {
+            self.attach_when = Some((id.clone(), Instant::now()));
+        }
+    }
+
+    fn open_in_glass_inner(&mut self, pane: Pane, how: Open) {
         if let Some(glasses) = self.glasses.as_mut() {
             glasses.home = false;
         }
@@ -4041,12 +4055,6 @@ impl Ui {
         // A message box belongs to the pane it was opened in: once another pane or tab has the
         // focus, typing must not go on into a draft nobody can see (Nathan, 2026-10-07).
         if before != (self.tab, self.selected_id()) {
-            if !self.conversation_first()
-                && let Some(Pane::Agent(Some(id))) = self.focused_pane()
-                && id.starts_with("agent/")
-            {
-                self.attach_when = Some((id, Instant::now()));
-            }
             self.editing = false;
             self.chat = None;
             self.answering = None;
@@ -4745,13 +4753,20 @@ mod tests {
             Open::Tab,
         );
         ui.effects.clear();
-        // Passing through the agent's tab: nothing attaches.
-        ui.show_tab(0);
-        ui.show_tab(1);
+        // Opened and passed by at once: nothing attaches.
+        std::thread::sleep(ATTACH_DWELL + std::time::Duration::from_millis(50));
         ui.step_default_view();
         assert!(ui.effects.is_empty(), "{:?}", ui.effects);
-        // Staying on it does, and the tab is the terminal now.
+        // Moving the focus back to its tab only focuses it.
         ui.show_tab(0);
+        std::thread::sleep(ATTACH_DWELL + std::time::Duration::from_millis(50));
+        ui.step_default_view();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        // Opening it, and staying, attaches, and the tab is the terminal now.
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+            Open::Tab,
+        );
         std::thread::sleep(ATTACH_DWELL + std::time::Duration::from_millis(50));
         ui.step_default_view();
         assert!(

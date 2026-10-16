@@ -1062,14 +1062,16 @@ impl Ui {
         self.conversation_first == Some(true)
     }
 
-    /// Attach the terminal of an agent whose tab has been in front for a moment, unless this
-    /// device opens agents on their conversation. An agent without a terminal (a session st did
-    /// not start, a harness with none) stays on its conversation, and nothing is said.
+    /// Attach the terminal of an agent just opened whose tab has been in front for a moment,
+    /// unless this device opens agents on their conversation. An agent without a terminal (a
+    /// session st did not start, a harness with none) stays on its conversation, and nothing is
+    /// said; Ctrl+] decides the same way.
     pub(crate) fn step_default_view(&mut self) {
         let Some((id, at)) = &self.attach_when else {
             return;
         };
-        if at.elapsed() < ATTACH_DWELL {
+        // Until st has listed the agents, whether this one has a terminal is not known yet.
+        if at.elapsed() < ATTACH_DWELL || self.world.agents.ready().is_none() {
             return;
         }
         let id = id.clone();
@@ -1082,7 +1084,7 @@ impl Ui {
             .agents
             .items()
             .iter()
-            .any(|agent| agent.id == id && agent.terminal && !agent.unmanaged);
+            .any(|agent| agent.id == id && agent.terminal);
         if still_here && !attached && !self.editing && !self.conversation_first() && has_terminal {
             // The tab turns into the terminal, as Ctrl+] does; Ctrl+\ turns it back.
             self.open_terminal();
