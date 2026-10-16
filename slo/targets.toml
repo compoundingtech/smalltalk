@@ -15,7 +15,7 @@
 [[latency]]
 name = "person-read"
 about = "Reads a person waits on: agents list, missions list, open a conversation, conversation changes, work list, Now, documents"
-p99_ms = 100
+p99_ms = 300
 # The same reads through this daemon from another machine that owns them.
 remote_p99_ms = 300
 paths = [
@@ -67,7 +67,7 @@ paths = [
 [[latency]]
 name = "write-ack"
 about = "Writes and acks: send, work actions, harness events"
-p99_ms = 100
+p99_ms = 300
 paths = [
   "POST /v1/messages",
   "POST /v1/client/actions",
@@ -100,7 +100,7 @@ max_ms = 100
 
 [transaction]
 about = "Any transaction, read or write, and any hold of the store's writer"
-max_ms = 100
+max_ms = 300
 
 [cpu]
 about = "Daemon CPU: near zero when idle, at most 2 cores under daemon_load"

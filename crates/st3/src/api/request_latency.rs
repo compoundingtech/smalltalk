@@ -599,6 +599,7 @@ mod tests {
         };
         time(&mut meter, "GET /v1/client/now", false, false, 50);
         time(&mut meter, "GET /v1/client/now", false, false, 150);
+        time(&mut meter, "GET /v1/client/now", false, false, 350);
         time(&mut meter, "stream agents", true, false, 250);
         time(&mut meter, "stream conversation", true, false, 350);
         time(&mut meter, "GET /v1/client/conversations/{id}/changes", false, true, 30_000);
@@ -614,7 +615,7 @@ mod tests {
                 .clone()
         };
         let read = target("person-read");
-        assert_eq!(read["windows"]["1m"]["count"], 2);
+        assert_eq!(read["windows"]["1m"]["count"], 3);
         assert_eq!(read["windows"]["1m"]["over_target"], 1);
         assert_eq!(read["remote_windows"]["5m"]["count"], 2);
         assert_eq!(read["remote_windows"]["5m"]["over_target"], 1);
@@ -650,19 +651,22 @@ mod tests {
         let poll = Timed::resolve("GET /v1/client/agents", false, Wait::LongPoll);
         assert_eq!(poll.key, "GET /v1/client/agents (long poll)");
         assert_eq!(named(&poll), None);
-        // A fresh read over its own 300 ms is over that target, not the 100 ms of a first page.
+        // Fresh and ordinary reads have separate windows, each with a 300 ms target.
         let mut meter = Meter::default();
         let now = Instant::now();
         meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::Fresh), Duration::from_millis(200));
         meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::Fresh), Duration::from_millis(400));
         meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::No), Duration::from_millis(150));
+        // The target is inclusive: exactly 300 ms is not over it (Meter::time uses >).
+        meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::No), Duration::from_millis(300));
+        meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::No), Duration::from_millis(350));
         let report = meter.windows(now);
         let row = |name: &str| {
             report["targets"].as_array().unwrap().iter().find(|row| row["name"] == name).unwrap().clone()
         };
         assert_eq!(row("person-read-fresh")["windows"]["1m"]["count"], 2);
         assert_eq!(row("person-read-fresh")["windows"]["1m"]["over_target"], 1);
-        assert_eq!(row("person-read")["windows"]["1m"]["count"], 1);
+        assert_eq!(row("person-read")["windows"]["1m"]["count"], 3);
         assert_eq!(row("person-read")["windows"]["1m"]["over_target"], 1);
     }
 

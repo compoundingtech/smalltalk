@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Loosen the approved daemon read, write-ack and transaction latency targets from 100 ms to 300 ms.",
+  "replay": {
+    "status": "none",
+    "detail": "No canonical data, projection or replay change; latency windows remain process-local measurements."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, migrations or wire fields change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule, rules version, digest or retention change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The approved person-read and write-ack p99 targets loosen from 100 ms to 300 ms. The transaction maximum likewise becomes 300 ms for reads, writes and writer holds. Timings above 100 ms and at most 300 ms no longer miss these objectives or qualify as misses for target-based alerts; timings above 300 ms still miss. This changes the policy, not the measured latency. Remote and fresh reads already use 300 ms. SQL statement targets, database targets and independent daemon_load budgets retain their values."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional restart or downtime is introduced. The next ordinary build and restart uses the updated built-in targets; this source change does not deploy or modify live settings."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No live policy application or configuration action is required by this source change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "An older build retains its original targets. No stored readings or breach history are rewritten, and no performance improvement is claimed from changing the targets."
+  }
+}

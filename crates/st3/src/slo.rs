@@ -567,7 +567,7 @@ mod tests {
     fn the_built_in_targets_file_is_valid_and_names_the_mission_targets() {
         let targets = parse(SOURCE).unwrap();
         let read = targets.for_path("GET /v1/client/agents").unwrap();
-        assert_eq!((read.p99_ms, read.remote_p99_ms), (100, Some(300)));
+        assert_eq!((read.p99_ms, read.remote_p99_ms), (300, Some(300)));
         assert_eq!(read.target(true), Duration::from_millis(300));
         for path in [
             "stream agents",
@@ -585,7 +585,7 @@ mod tests {
             "POST /v1/harness-events",
         ] {
             let write = targets.for_path(path).unwrap();
-            assert_eq!((write.name.as_str(), write.p99_ms), ("write-ack", 100), "{path}");
+            assert_eq!((write.name.as_str(), write.p99_ms), ("write-ack", 300), "{path}");
         }
         let fresh = targets.for_path("GET /v1/client/agents (fresh)").unwrap();
         assert_eq!((fresh.name.as_str(), fresh.p99_ms), ("person-read-fresh", 300));
@@ -606,7 +606,7 @@ mod tests {
         let attach = targets.for_path("stream terminal").unwrap();
         assert_eq!(attach.p99_ms, 200);
         assert_eq!((targets.statement.p99_ms, targets.statement.max_ms), (10, 100));
-        assert_eq!(targets.transaction.max_ms, 100);
+        assert_eq!(targets.transaction.max_ms, 300);
         assert_eq!(targets.cpu.max_cores, 2.0);
         assert_eq!((targets.database.max_live_gb, targets.database.max_growth_mb_per_day), (8.0, 300.0));
         assert!(targets.for_path("GET /v1/health").is_none());
