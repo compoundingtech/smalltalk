@@ -45,6 +45,8 @@ pub mod gate_kinds;
 pub mod gate_report;
 pub mod github_watch;
 pub mod graph;
+#[path = "reconcile/schedule_standby.rs"]
+pub mod schedule_standby;
 pub mod handoff;
 pub(crate) mod graph_watch_ivm;
 pub mod harness_events;

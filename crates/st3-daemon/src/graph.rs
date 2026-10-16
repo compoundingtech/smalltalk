@@ -1627,7 +1627,7 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
             one_string(node)?;
         }
         "message" => validate_message(node)?,
-        "schedule" => validate_schedule(node)?,
+        "schedule" => validate_schedule(node, &context.default_host)?,
         "lane" => validate_lane(node)?,
         _ => unreachable!("the desired-state registry controls structure kinds"),
     }
@@ -4059,7 +4059,7 @@ fn validate_message(node: &KdlNode) -> Result<(), St3Error> {
     Ok(())
 }
 
-fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
+fn validate_schedule(node: &KdlNode, default_host: &str) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
     one_string_with_children(node)?;
     let body = node
@@ -4074,6 +4074,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
         body,
         &[
             "host",
+            "standby",
             "at",
             "every",
             "anchor",
@@ -4087,6 +4088,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     )?;
     for child in [
         "host",
+        "standby",
         "at",
         "every",
         "anchor",
@@ -4096,6 +4098,26 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
         "work",
     ] {
         unique_child(body, child)?;
+    }
+    if let Some(standby) = unique_child(body, "standby")? {
+        ensure_bare(standby)?;
+        let settings = standby.children().ok_or_else(|| {
+            St3Error::new("invalid-schedule-standby", "standby needs host and after children")
+        })?;
+        reject_unknown_children(settings, &["host", "after"], "standby", "standby")?;
+        for setting in settings.nodes() { ensure_no_properties(setting)?; }
+        unique_child(settings, "host")?;
+        unique_child(settings, "after")?;
+        let host = required_child_string(settings, "host", "standby")?;
+        validate_name(&host, false)?;
+        let primary = placement_host(child_string(body, "host")?.unwrap_or_else(|| default_host.into()), default_host);
+        if host == "local" || host == primary || host.contains('/') {
+            return Err(St3Error::new("invalid-schedule-standby", "standby needs an explicit member name distinct from the primary"));
+        }
+        let after = parse_duration(&required_child_string(settings, "after", "standby")?, true)?;
+        if after > i64::MAX as u64 {
+            return Err(St3Error::new("duration-range", "standby after is too large"));
+        }
     }
     let at = child_string(body, "at")?;
     let every = child_string(body, "every")?;
@@ -4447,6 +4469,7 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         return Some(ScheduleSpec {
             stopped: true,
             host: default_host.into(),
+            standby: None,
             at_unix_ms: None,
             every_ms: None,
             anchor_unix_ms: None,
@@ -4461,6 +4484,18 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         .unwrap_or(default_host)
         .to_owned();
     let host = placement_host(host, default_host);
+    let standby = match children.iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("standby")) {
+        Some(node) => {
+            let standby_host = canonical_child_value(node, "host")?.as_str()?;
+            let after_ms = parse_duration(canonical_child_value(node, "after")?.as_str()?, true).ok()?;
+            if standby_host == "local" || standby_host == host || after_ms > i64::MAX as u64 {
+                return None;
+            }
+            Some(crate::model::ScheduleStandby { host: standby_host.into(), after_ms })
+        },
+        None => None,
+    };
     let at_unix_ms = canonical_child_value(value, "at")
         .and_then(Value::as_str)
         .and_then(|value| parse_utc_time(value).ok());
@@ -4514,6 +4549,7 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
     Some(ScheduleSpec {
         stopped: false,
         host,
+        standby,
         at_unix_ms,
         every_ms,
         anchor_unix_ms,
@@ -7248,5 +7284,56 @@ schedule "cycle" {{
             .code,
             "unpinned-mission-run",
         );
+    }
+}
+
+#[cfg(test)]
+mod schedule_standby_controls {
+    use super::*;
+
+    fn source(standby: &str) -> String {
+        format!(r#"version 2
+schedule "orchard" {{ host "ivory"; {standby}
+  every "1h"; anchor "2030-01-01T00:00:00Z"
+  work {{ mission "harvest"; workspace "/tmp/orchard" }}
+}}"#)
+    }
+
+    #[test]
+    fn schedule_standby_is_one_explicit_child_block_with_required_age() {
+        let parsed = parse_intent(&source(r#"standby { host "jade"; after "5m" }"#), "ivory").unwrap();
+        let spec = schedule_spec(&parsed.subjects["schedule/orchard"].desired, "ivory").unwrap();
+        assert_eq!(spec.standby.unwrap(), crate::model::ScheduleStandby { host: "jade".into(), after_ms: 300_000 });
+        for invalid in [
+            r#"standby "jade" after="5m""#,
+            r#"standby { host "jade" }"#,
+            r#"standby { after "5m" }"#,
+            r#"standby { host "jade"; host "other"; after "5m" }"#,
+            r#"standby { host "jade"; after "5m"; after "10m" }"#,
+            r#"standby { host "jade"; after "0s" }"#,
+            r#"standby { host "jade"; after "-1s" }"#,
+            r#"standby { host "jade"; after "18446744073709551615d" }"#,
+            r#"standby { host "ivory"; after "5m" }"#,
+            r#"standby { host "local"; after "5m" }"#,
+            r#"standby { host "jade" extra="x"; after "5m" }"#,
+            r#"standby { host "jade"; after "5m"; election "lease" }"#,
+            r#"standby { host "jade"; after "5m" }; standby { host "other"; after "5m" }"#,
+        ] {
+            assert!(parse_intent(&source(invalid), "ivory").is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn schedule_standby_omission_and_selected_origin_keep_primary_only_default() {
+        let without = source("");
+        let parsed = parse_intent(&without, "ivory").unwrap();
+        let spec = schedule_spec(&parsed.subjects["schedule/orchard"].desired, "receiving-member").unwrap();
+        assert_eq!(spec.host, "ivory");
+        assert!(spec.standby.is_none());
+        assert!(serde_json::to_value(spec).unwrap().get("standby").is_none());
+        let local = without.replace("host \"ivory\";", "host \"local\";");
+        let parsed = parse_intent(&local, "ivory").unwrap();
+        assert_eq!(schedule_spec(&parsed.subjects["schedule/orchard"].desired, "ivory").unwrap().host, "ivory");
+        assert!(parse_intent(&source(r#"standby { host "ivory"; after "5m" }"#).replace("host \"ivory\";", "host \"local\";"), "ivory").is_err());
     }
 }

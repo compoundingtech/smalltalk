@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Changed schedules: optional automatic standby; jobs must be safe to run twice. A restarted standby can skip a run while the primary is down.",
+  "replay": {
+    "status": "none",
+    "detail": "Reuse deterministic schedule occurrence identity and existing durable scheduled/reached/work facts. Existing catch-up policies and primary-only schedules are unchanged; no history replay or backfill."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Add optional standby and reason fields to existing occurrence scheduled/reached claims and schedule_standby=1 in the existing daemon.started features object. No new stored kind, table, column or storage version."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No retention/checkpoint/rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add standby { host \"archive\"; after \"5m\" } with required positive finite age and no default. Optional schedule_standby observation on subject show/history, underlying exact status actual.schedule_standby, and optional takeover detail on existing occurrence claims. All active members must advertise schedule_standby=1; mixed fleets remain primary-only; roll-forward only. Generated-client codegen --check is required for this additive public read change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment or activation included. Missing/incomplete state holds standby. If the standby restarts while the primary is down, the standby cannot take over until it has heard the primary once; a run in that window may be skipped (catch-up policy applies when the primary returns)."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Upgrade all active members before publishing a standby. While hosts cannot hear each other a job may run on both; jobs must be safe to run twice. Write jobs so a second run is harmless. If the standby restarts while the primary is down, the standby cannot take over until it has heard the primary once; a run in that window may be skipped (catch-up policy applies when the primary returns)."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "No exclusive lease/manual takeover/mid-run handback. latest runs the current missed occurrence once; skip moves on; bounded all holds beyond its bound. Unavailable standby work fails visibly once per occurrence. If the standby restarts while the primary is down, the standby cannot take over until it has heard the primary once; a run in that window may be skipped (catch-up policy applies when the primary returns)."
+  }
+}

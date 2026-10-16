@@ -2201,3 +2201,28 @@ them. Idle receipts outside the sync notice set do not notify client streams;
 repeated same-carrier failures likewise stay quiet when the graph is unchanged. Existing sync notice conditions
 remain the same. Older servers omit these optional fields; older clients ignore
 the additions. No API version, scope, operation or claim shape changes.
+
+## Schedule standby public read change set
+
+Compatibility **changed**: the optional standby declaration adds an optional
+`schedule_standby` local observation to CLI subject show/history. The exact legacy
+status route exposes it inside the existing open JSON `SubjectStatus.actual`
+object as `actual.schedule_standby`; it does not add a required generated-client
+resource or operation. Existing occurrence scheduled/reached claim bodies gain
+optional `standby` detail and `reason`. These additions keep the same claim kinds.
+
+Fields: `primary_host`, `standby_host`, `after_ms`, `eligibility`, `reason`,
+nullable `primary_heartbeat_age_ms`, `heartbeat_basis`, `observed_primary_view`,
+`run_twice_warning` and `cold_standby_limit`. A current local observation is not
+a converged eligibility assertion or exclusive lease. Historical reads label
+eligibility unknown and do not inject a current heartbeat age. History remains
+JSON lines of original claims/events with the optional observation field; an
+empty history still has no claims. Use subject show to read its current warnings.
+
+Jobs must be safe to run twice. The declaration guide, subject show (structured
+and text), history and release note expose the same cold-standby limitation:
+
+If the standby restarts while the primary is down, the standby cannot take over until it has heard the primary once; a run in that window may be skipped (catch-up policy applies when the primary returns).
+
+Hosted validation must run `cargo run -p st3-client-codegen -- --check`. Generated
+files remain generated; do not hand-edit clients for open JSON observation detail.

@@ -14917,7 +14917,7 @@ async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let store = state.store.clone();
     blocking_store(move || {
-        if let (true, false, Some(subject)) = (query.harness_only, query.history, &query.subject) {
+        let mut response = if let (true, false, Some(subject)) = (query.harness_only, query.history, &query.subject) {
             store.status_harness_only(subject)
         } else if query.history {
             store.status_history(
@@ -14931,7 +14931,26 @@ async fn status(
                 query.owner_run.as_deref(),
                 query.at_index,
             )
+        }?;
+        // Exact schedule reads gain an optional local observation. Keep broad/agent reads and
+        // primary-only schedules on their existing path; this is never a persisted projection.
+        if query.subject.as_deref().is_some_and(|subject| subject.starts_with("schedule/")) {
+            for subject in &mut response.subjects {
+                let origin = store.selected_desired_origin(&subject.subject)?.unwrap_or_else(|| store.origin.clone());
+                let Some(spec) = subject.desired.as_ref().and_then(|desired| crate::graph::schedule_spec(desired, &origin)) else { continue };
+                if let Some(mut shown) = crate::schedule_standby::display(&store, &subject.subject, &spec) {
+                    if query.at_index.is_some() || query.history {
+                        shown["eligibility"] = json!("unknown");
+                        shown["primary_heartbeat_age_ms"] = Value::Null;
+                        shown["heartbeat_basis"] = json!("unknown");
+                        shown["observed_primary_view"] = Value::Null;
+                        shown["reason"] = json!("historical declaration; no current eligibility assertion");
+                    }
+                    subject.actual.get_or_insert_with(|| json!({}))["schedule_standby"] = shown;
+                }
+            }
         }
+        Ok(response)
     })
     .await
     .map(Json)

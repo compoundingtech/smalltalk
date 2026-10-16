@@ -748,6 +748,8 @@ pub struct UnderSpec {
 pub struct ScheduleSpec {
     pub stopped: bool,
     pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standby: Option<ScheduleStandby>,
     pub at_unix_ms: Option<i64>,
     pub every_ms: Option<u64>,
     pub anchor_unix_ms: Option<i64>,
@@ -755,6 +757,12 @@ pub struct ScheduleSpec {
     pub catch_up: String,
     pub max_catch_up: Option<u32>,
     pub work: Option<ScheduledWork>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScheduleStandby {
+    pub host: String,
+    pub after_ms: u64,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CalendarSchedule {

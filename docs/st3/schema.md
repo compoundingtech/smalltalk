@@ -174,8 +174,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `runtime.reconcile-decision` | `agent`, `exec`, `pty`, `schedule` | `system-only` | `append` | `durable` | `decision:string`, `gate:string`, `input_number:integer`, `key:string`, `reachability:string`, `reason:string`, `restart_at_unix_ms:string` |  |
 | `runtime.restart-window-reset` | `agent`, `exec`, `pty` | `system-only` | `append` | `durable` | `desired_token:string`, `incarnation_id!:string`, `reason!:string` | `reset` |
 | `schedule.occurrence-cancelled` | `schedule` | `system-only` | `append` | `durable` | `occurrence:integer`, `reason:string`, `revision:string` | `schedule` |
-| `schedule.occurrence-reached` | `schedule` | `system-only` | `append` | `durable` | `at_unix_ms:integer`, `occurrence:integer`, `revision:string`, `scheduled:subject-reference`, `scheduled_at_unix_ms:string` | `schedule` |
-| `schedule.occurrence-scheduled` | `schedule` | `system-only` | `append` | `durable` | `at_unix_ms:integer`, `occurrence:integer`, `revision:string`, `scheduled_at_unix_ms:string` | `schedule` |
+| `schedule.occurrence-reached` | `schedule` | `system-only` | `append` | `durable` | `at_unix_ms:integer`, `occurrence:integer`, `reason:string`, `revision:string`, `scheduled:subject-reference`, `scheduled_at_unix_ms:string`, `standby:object` | `schedule` |
+| `schedule.occurrence-scheduled` | `schedule` | `system-only` | `append` | `durable` | `at_unix_ms:integer`, `occurrence:integer`, `reason:string`, `revision:string`, `scheduled_at_unix_ms:string`, `standby:object` | `schedule` |
 | `schedule.work-failed` | `schedule` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `request!:string` | `schedule` |
 | `schedule.work-requested` | `schedule` | `system-only` | `append` | `durable` | `inputs!:object`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `occurrence!:integer`, `revision!:string`, `workspace!:string` | `schedule` |
 | `schedule.work-started` | `schedule` | `system-only` | `append` | `durable` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `schedule` |

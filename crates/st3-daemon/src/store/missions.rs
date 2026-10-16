@@ -4894,6 +4894,9 @@ impl Store {
         if let Err(error) = message_subscriptions::validate(&connection, intent, store_index) {
             blockers.push(format!("{}: {}", error.code, error.message));
         }
+        if let Err(error) = schedule_standby::validate_publication(&connection, &self.origin, intent) {
+            blockers.push(format!("{}: {}", error.code, error.message));
+        }
         if let Err(error) = crate::provenance::validate_publication(&connection, intent) {
             blockers.push(format!("{}: {}", error.code, error.message));
         }
