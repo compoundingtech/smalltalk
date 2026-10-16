@@ -1,9 +1,51 @@
 #!/usr/bin/env bash
 # Print the pinned historical channel path; Nix caches the immutable build.
+#
+# Every messaging fault case is its own test process and each one asks for this path, so a local
+# run used to start eleven `nix build`s that queued behind each other (and behind every other
+# seat's builds) until the callers' 10 minute timeout killed them. The answer for one baseline
+# commit never changes, so the first caller builds under a lock and writes the path to a
+# per-user cache file; every other caller reads it. A path that is no longer executable (a
+# garbage-collected store path) is rebuilt. Set ST3_MESSAGING_COMPAT_BIN in the test environment
+# to skip this script entirely.
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 commit=$(jq -er '.commit | select(test("^[0-9a-fA-F]{40}$"))' "$repo/.github/messaging-compat-baseline.json")
+cache_dir=${ST3_MESSAGING_COMPAT_CACHE:-${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}/st3}
+cached=$cache_dir/messaging-compat-$commit.path
+
+# The cache only holds a path the current user wrote: a directory owned by someone else is ignored.
+use_cache=0
+if mkdir -p -m 700 "$cache_dir" 2>/dev/null && [[ -O $cache_dir && ! -L $cache_dir ]]; then use_cache=1; fi
+
+cached_binary() {
+  [[ $use_cache == 1 && -r $cached ]] || return 1
+  local path
+  path=$(<"$cached")
+  [[ -n $path && -x $path ]] || return 1
+  printf '%s\n' "$path"
+}
+
+if cached_binary; then exit 0; fi
+
+if [[ $use_cache == 1 ]] && command -v flock >/dev/null 2>&1; then
+  exec 9>"$cached.lock"
+  # Callers wrap this script in `timeout 10m` (600 s): the default stays below it, so a waiter
+  # prints its error before the timeout kills it silently.
+  wait=${ST3_MESSAGING_COMPAT_LOCK_WAIT:-540}
+  if ! flock -w "$wait" 9; then
+    echo "messaging-compat-binary: another process has been building the pinned historical channel for ${wait}s; set ST3_MESSAGING_COMPAT_BIN to a built st3 to skip this build" >&2
+    exit 1
+  fi
+  if cached_binary; then exit 0; fi
+fi
+
+echo "messaging-compat-binary: building the pinned historical channel ($commit); set ST3_MESSAGING_COMPAT_BIN to a built st3 to skip this build" >&2
 package=$(nix build --impure --no-link --print-out-paths --expr \
   "((builtins.getFlake \"github:compoundingtech/smalltalk/$commit\").packages.\${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; nativeCheckInputs = []; postInstall = \"\"; cargoBuildFlags = [\"-p\" \"st3\"]; })")
 test -x "$package/bin/st3"
+if [[ $use_cache == 1 ]]; then
+  printf '%s\n' "$package/bin/st3" > "$cached.$$"
+  mv -f "$cached.$$" "$cached"
+fi
 printf '%s\n' "$package/bin/st3"

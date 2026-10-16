@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""The historical channel is built once per baseline commit, however many test processes ask."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+script = root / 'scripts/messaging-compat-binary'
+commit = json.loads((root / '.github/messaging-compat-baseline.json').read_text())['commit']
+have_flock = shutil.which('flock') is not None
+
+# The callers wrap the script in `timeout 10m`; a default wait at or above that never prints its error.
+import re
+default_wait = int(re.search(r'ST3_MESSAGING_COMPAT_LOCK_WAIT:-(\d+)', script.read_text()).group(1))
+assert default_wait < 600, f'lock wait default {default_wait} s must be below the 600 s caller timeout'
+
+
+def executable(path, text):
+    path.write_text(text)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+class World:
+    """A fake nix and jq on PATH, a store the fake nix writes into, and a private cache directory."""
+
+    def __init__(self, work, nix_fails=False):
+        self.work = Path(work)
+        self.bin = self.work / 'bin'
+        self.bin.mkdir()
+        self.store = self.work / 'store'
+        self.store.mkdir()
+        self.calls = self.work / 'nix-calls'
+        self.cache = self.work / 'cache'
+        executable(self.bin / 'jq', f'#!/bin/sh\nprintf "%s\\n" {commit}\n')
+        build = 'exit 1' if nix_fails else (
+            f'sleep 1; d={self.store}/pkg-$$; mkdir -p "$d/bin"; printf "#!/bin/sh\\n" > "$d/bin/st3"; '
+            f'chmod +x "$d/bin/st3"; printf "%s\\n" "$d"')
+        executable(self.bin / 'nix', f'#!/bin/sh\necho x >> {self.calls}\n{build}\n')
+        self.env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}',
+                    'ST3_MESSAGING_COMPAT_CACHE': str(self.cache)}
+
+    def run(self, **extra):
+        return subprocess.run(['bash', str(script)], env={**self.env, **extra}, capture_output=True, text=True)
+
+    def nix_calls(self):
+        return len(self.calls.read_text().split()) if self.calls.exists() else 0
+
+
+with tempfile.TemporaryDirectory() as work:
+    world = World(work)
+    first = world.run()
+    assert first.returncode == 0, first.stderr
+    path = first.stdout.strip()
+    assert os.access(path, os.X_OK) and path.endswith('/bin/st3'), first.stdout
+    assert 'building the pinned historical channel' in first.stderr and 'ST3_MESSAGING_COMPAT_BIN' in first.stderr
+    again = world.run()
+    assert again.returncode == 0 and again.stdout.strip() == path and world.nix_calls() == 1, 'a second call must reuse the cache'
+    assert again.stderr == '', 'a cache hit is silent'
+
+    # A store path that was garbage collected is built again, not returned.
+    os.remove(path)
+    rebuilt = world.run()
+    assert rebuilt.returncode == 0 and rebuilt.stdout.strip() != path and world.nix_calls() == 2, rebuilt.stderr
+
+with tempfile.TemporaryDirectory() as work:
+    # Eleven test processes at once: one build.
+    world = World(work)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(world.run())) for _ in range(11)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert all(r.returncode == 0 for r in results), [r.stderr for r in results]
+    assert len({r.stdout.strip() for r in results}) == 1, 'every caller must get the same path'
+    if have_flock:
+        assert world.nix_calls() == 1, f'{world.nix_calls()} builds for eleven callers'
+    else:
+        print('flock is not installed here: concurrency not checked')
+
+with tempfile.TemporaryDirectory() as work:
+    # A failing build prints an error, caches nothing and fails the caller.
+    world = World(work, nix_fails=True)
+    failed = world.run()
+    assert failed.returncode != 0 and not list(world.cache.glob('*.path')), failed.stderr
+
+if have_flock:
+    with tempfile.TemporaryDirectory() as work:
+        # A lock that is never released fails fast with the way out, instead of a 10 minute timeout.
+        world = World(work)
+        world.cache.mkdir(mode=0o700)
+        with open(world.cache / f'messaging-compat-{commit}.path.lock', 'w') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            blocked = world.run(ST3_MESSAGING_COMPAT_LOCK_WAIT='1')
+        assert blocked.returncode == 1 and 'ST3_MESSAGING_COMPAT_BIN' in blocked.stderr, blocked.stderr
+        assert world.nix_calls() == 0, 'a blocked caller must not start its own build'
+print('messaging-compat-binary-test: ok')
