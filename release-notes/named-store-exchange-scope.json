@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bind optional named claim stores to a durable shard ID and reject replication exchanges addressed to another store.",
+  "replay": {"status": "none", "detail": "No existing claim is replayed, moved, or deleted. The default store continues to omit the optional shard ID in exchanges."},
+  "schema": {"status": "changed", "detail": "An explicitly opened named store records its shard ID in its own meta table. Opening a used default store under a shard name or opening a named file under a different name fails before exchange admission."},
+  "rules": {"status": "none", "detail": "Claim, projection, checkpoint, and retention rules are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Replication exchanges gain an optional shard_id field. Legacy and default exchanges omit it. A named store rejects an omitted or different ID; the default store rejects a named ID. No shard transport is wired by this change."},
+  "downtime": {"status": "none", "detail": "No deployed shard opens or routes writes by default."},
+  "manual": {"status": "none", "detail": "No operator action enables a shard. Activation and a one-member trial still require the reviewed topology choice and Ops binding."},
+  "recovery": {"status": "changed", "detail": "The shard marker persists across reopen. An empty-looking default file with fleet or checkpoint history cannot be relabelled as a shard; restore keeps each named file with its recorded ID."}
+}

@@ -70,6 +70,7 @@ impl ShardStores {
             let path = id.database_path(state_dir);
             std::fs::create_dir_all(path.parent().expect("shard database has a parent"))?;
             let store = Arc::new(Store::open(&path, origin, Arc::from(runtime(&id)))?);
+            store.bind_shard(&id)?;
             stores.insert(id, store);
         }
         Ok(Self { stores })
@@ -187,6 +188,24 @@ mod tests {
             [github.clone(), work.clone()],
         )
         .unwrap();
+        assert_eq!(
+            reopened
+                .get(&github)
+                .unwrap()
+                .bound_shard()
+                .unwrap()
+                .as_deref(),
+            Some("github")
+        );
+        assert_eq!(
+            reopened
+                .get(&work)
+                .unwrap()
+                .bound_shard()
+                .unwrap()
+                .as_deref(),
+            Some("work")
+        );
         assert_eq!(
             reopened
                 .get(&github)
@@ -309,5 +328,126 @@ mod tests {
                 .envelopes
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn an_exchange_for_one_shard_cannot_advance_another_or_the_default() {
+        const FLEET: &str = "5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12";
+        let root = tempfile::tempdir().unwrap();
+        let github = ShardId::parse("github").unwrap();
+        let work = ShardId::parse("work").unwrap();
+        let stores = ShardStores::open(
+            root.path(),
+            "source",
+            |_| Box::new(Plain),
+            [github.clone(), work.clone()],
+        )
+        .unwrap();
+        let source = stores.get(&github).unwrap();
+        let wrong_shard = stores.get(&work).unwrap();
+        let default = Store::open(
+            &root.path().join("default.sqlite3"),
+            "default",
+            Arc::new(Plain),
+        )
+        .unwrap();
+        for store in [source.as_ref(), wrong_shard.as_ref(), &default] {
+            store.bind_fleet(FLEET).unwrap();
+        }
+        source
+            .append_claim(&ClaimInput {
+                subject: "note/github".into(),
+                kind: "example.note".into(),
+                actor: Some("person/ada".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let exchange = source
+            .export_replication_exchange(FLEET, &wrong_shard.replication_inventory().unwrap())
+            .unwrap();
+        assert_eq!(exchange.shard_id.as_deref(), Some("github"));
+        for wrong in [wrong_shard.as_ref(), &default] {
+            let before_index = wrong.index().unwrap();
+            let before_inventory = wrong.replication_inventory().unwrap().digest;
+            let error = wrong
+                .receive_replication_exchange("source", FLEET, &exchange)
+                .unwrap_err();
+            assert_eq!(error.code, "shard-mismatch");
+            assert_eq!(wrong.index().unwrap(), before_index);
+            assert_eq!(
+                wrong.replication_inventory().unwrap().digest,
+                before_inventory
+            );
+            assert!(wrong.replication_inventory().unwrap().envelopes.is_empty());
+        }
+        // An older/default exchange omits the new field on the wire. It cannot enter a shard.
+        let legacy = default
+            .export_replication_exchange(FLEET, &source.replication_inventory().unwrap())
+            .unwrap();
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("shard_id").is_none());
+        let legacy = serde_json::from_value(wire).unwrap();
+        let before_index = source.index().unwrap();
+        let error = source
+            .receive_replication_exchange("default", FLEET, &legacy)
+            .unwrap_err();
+        assert_eq!(error.code, "shard-mismatch");
+        assert_eq!(source.index().unwrap(), before_index);
+    }
+
+    #[test]
+    fn a_used_default_file_cannot_be_relabelled_as_a_shard() {
+        use crate::store::EnvelopeTombstone;
+
+        let root = tempfile::tempdir().unwrap();
+        let github = ShardId::parse("github").unwrap();
+        let fleet_bound = Store::open(
+            &root.path().join("fleet-bound.sqlite3"),
+            "node",
+            Arc::new(Plain),
+        )
+        .unwrap();
+        fleet_bound.bind_fleet("fleet").unwrap();
+        assert!(fleet_bound.bind_shard(&github).is_err());
+
+        let trimmed = Store::open(
+            &root.path().join("trimmed.sqlite3"),
+            "node",
+            Arc::new(Plain),
+        )
+        .unwrap();
+        trimmed
+            .apply_checkpoint_drop(
+                "checkpoint/2026-09-27",
+                &[EnvelopeTombstone {
+                    writer: "source".into(),
+                    sequence: 1,
+                    envelope_hash: format!("{:064x}", 1),
+                    accepted_at_unix_ms: 1,
+                }],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(trimmed.index().unwrap(), 0);
+        assert!(trimmed.bind_shard(&github).is_err());
+
+        let named = Store::open(
+            &root.path().join("named.sqlite3"),
+            "node",
+            Arc::new(Plain),
+        )
+        .unwrap();
+        named.bind_shard(&github).unwrap();
+        drop(named);
+        let moved = Store::open(
+            &root.path().join("named.sqlite3"),
+            "node",
+            Arc::new(Plain),
+        )
+        .unwrap();
+        assert!(moved.bind_shard(&ShardId::parse("work").unwrap()).is_err());
     }
 }

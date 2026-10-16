@@ -51,6 +51,9 @@ pub struct ReplicationInventoryBucket {
 pub struct ReplicationExchange {
     pub peer: String,
     pub fleet_id: String,
+    /// None is the legacy/default store. A named shard must carry its durable ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_id: Option<String>,
     pub schema_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_registry_digest: Option<String>,
