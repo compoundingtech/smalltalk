@@ -20,8 +20,9 @@ import json, os, pathlib, shutil, sys
 args = sys.argv[1:]
 if args[:2] == ['run', 'list']:
     print(json.dumps([{'databaseId': 7, 'headSha': os.environ['FAKE_SHA']}]))
-elif args[:2] == ['release', 'view']:
-    print('v0.3.17')
+elif args[0] == 'api' and args[-1] == 'repos/example/project/releases?per_page=100':
+    print(json.dumps([[{'tag_name': 'v0.3.17', 'draft': False, 'prerelease': False,
+                       'published_at': '2026-10-07T00:00:00Z', 'id': 17}]]))
 elif args[:2] == ['run', 'download']:
     destination = pathlib.Path(args[args.index('--dir') + 1])
     for item in pathlib.Path(os.environ['FAKE_DIST']).iterdir():
@@ -78,6 +79,14 @@ with tempfile.TemporaryDirectory() as temporary:
     (checkout / 'scripts').mkdir(parents=True)
     shutil.copy(repo / 'scripts/release-smalltalk-daily', checkout / 'scripts/release-smalltalk-daily')
     shutil.copy(repo / 'scripts/release-smalltalk-manifest.py', checkout / 'scripts/release-smalltalk-manifest.py')
+    shutil.copy(repo / 'scripts/compat-baseline-release', checkout / 'scripts/compat-baseline-release')
+    (checkout / '.github').mkdir()
+    pin = {'commit': 'a' * 40, 'tag': 'v0.3.17', 'why': 'Previous stable release fixture',
+           'exception_reason': None, 'bundles': {target: {
+               'url': f'https://github.com/example/project/releases/download/v0.3.17/smalltalk-{target}.tar.gz',
+               'sha256': 'b' * 64} for target in TARGETS}}
+    for kind in ('fleet', 'messaging'):
+        (checkout / f'.github/{kind}-compat-baseline.json').write_text(json.dumps(pin))
     (checkout / 'scripts/release_notes.py').write_text(STUB_NOTES)
     sh('git', 'init', '-q', '-b', 'main', cwd=checkout)
     sh('git', 'config', 'user.name', 'Fixture', cwd=checkout)

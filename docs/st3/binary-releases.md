@@ -112,8 +112,8 @@ to catch package breakage early.
 
 The st3 Nix check uses nextest to give each test its own process, including CPU-budget and
 delivery-presence fixtures. Python, Node, and the Linux process utilities are declared test inputs;
-the st3 messaging compatibility binary is pinned by the `messaging-baseline` input in `flake.lock`
-and supplied through `ST3_MESSAGING_COMPAT_BIN` by the check’s `preCheck` inside the sandbox.
+the st3 messaging compatibility binary is the published release archive pinned by
+`.github/messaging-compat-baseline.json` and supplied through `ST3_MESSAGING_COMPAT_BIN` by the check’s `preCheck` inside the sandbox.
 The native runtime suite and documentation tests remain covered.
 
 ## Edge releases

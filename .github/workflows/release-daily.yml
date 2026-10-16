@@ -44,3 +44,31 @@ jobs:
         env:
           CACHE_REASON: Reuses verified main release artifacts; builds nothing.
         run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
+  advance:
+    name: advance-compatibility-baselines
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Propose baselines for the latest published stable release
+        run: |
+          set -euo pipefail
+          TAG=$(python3 scripts/compat-baseline-release latest)
+          python3 scripts/compat-baseline-release advance "$TAG"
+
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_REASON: Verifies published archives and proposes the baseline maintenance PR; builds nothing.
+        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""

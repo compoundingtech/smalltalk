@@ -14,12 +14,9 @@ if (process.env.ST_ADMISSION_TRACE) {
   await admit();
 } else {
 const directory = process.cwd();
-// Exercise an actual historical channel with today's daemon/driver/extension,
-// avoiding unrelated historical daemon startup and prompt contracts.
+// Exercise the actual previous-release channel with today's daemon/driver/extension.
 if (process.env.FAULT_OLD_CHANNEL_BIN) {
-  // The provider may load either generation's immutable extension during compatibility tests.
   process.env.ST_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
-  process.env.ST2_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
 }
 const actor = process.env.ST_AGENT;
 const endpoint = process.env.ST3_ENDPOINT;
@@ -48,14 +45,12 @@ process.on('exit', () => {
 });
 const spawn = childProcess.spawn;
 childProcess.spawn = (...args) => {
-  if (args[0] === process.env.FAULT_OLD_CHANNEL_BIN && process.env.ST_DRIVER_ROOT
-      && !args[1].includes('--catalog')) {
-    // This pinned graph channel only checks that the obsolete flag is present; it never
-    // reads a catalog. Adapt its CLI in the fixture, using the real native root without
-    // fabricating declarations or restoring catalog arguments in the current extension.
-    args[1] = ['--catalog', process.env.ST_DRIVER_ROOT, ...args[1]];
-  }
   args[2] = { ...args[2], detached: true };
+  if (args[0] === process.env.FAULT_OLD_CHANNEL_BIN) {
+    // Hold the release channel on its own installed path until the eval advances
+    // that path to the candidate. Its real ReplacementWatch owns the reexec.
+    args[2].env = { ...args[2].env, ST3_BIN: process.env.FAULT_OLD_CHANNEL_BIN };
+  }
   const child = spawn(...args);
   children.add(child);
   child.on('close', () => {

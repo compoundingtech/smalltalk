@@ -13,8 +13,6 @@
     # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
     effect-utils.url =
       "github:overengineeringstudio/effect-utils/3089f7e1faa82d7a4cb4de0e8d485164f837708b";
-    # The messaging fixture must not invoke Nix or fetch a historical build in the sandbox.
-    messaging-baseline.url = "github:compoundingtech/smalltalk/678103d3e8ae873a158bb2cb951d3ffefdf698c4";
   };
 
   outputs =
@@ -25,7 +23,6 @@
       fenix,
       pty,
       effect-utils,
-      messaging-baseline,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -148,14 +145,10 @@
           assert bindings.libghostty-vt-sys.version == "=${pty.lib.libghosttyContract.rustBindingsVersion}";
           pty.packages.${system}.libghostty-vt;
 
-        messagingBaseline =
-          assert messaging-baseline.rev == (builtins.fromJSON (builtins.readFile ./.github/messaging-compat-baseline.json)).commit;
-          messaging-baseline.packages.${system}.st3.overrideAttrs (_: {
-          doCheck = false;
-          nativeCheckInputs = [ ];
-          postInstall = "";
-          cargoBuildFlags = [ "-p" "st3" ];
-        });
+        messagingBaseline = import ./nix/compat-baseline.nix {
+          inherit pkgs;
+          baseline = builtins.fromJSON (builtins.readFile ./.github/messaging-compat-baseline.json);
+        };
 
         # Give the historical binary a distinct name in the check-only PATH.
         # Resolving it there keeps its store identity out of the runtime derivation.
@@ -875,7 +868,8 @@
         checks.st3-runtime-inputs =
           assert import ./nix/st3-runtime-input-tests.nix {
             inherit self system;
-            inputs = { inherit nixpkgs flake-utils fenix pty effect-utils messaging-baseline; };
+            baseline = messagingCompat;
+            inputs = { inherit nixpkgs flake-utils fenix pty effect-utils; };
           };
           pkgs.runCommand "st3-runtime-inputs" { } ''touch $out'';
         checks.st3-help = st3Help;

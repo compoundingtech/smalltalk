@@ -9,28 +9,11 @@ mkdir -p "$logs"
 
 fleet_compat() {
   local baseline
-  baseline=$(jq -er .commit .github/fleet-compat-baseline.json) || return
-  # The pinned baseline never changes: after the first run its Nix output is substituted from the
-  # keyed local binary cache (scripts/ci-nix-cache) instead of being built again.
-  # Building the baseline also runs the pinned pty's own unit tests, and two of its process-table
-  # tests are timing-sensitive on a loaded runner (different ones failed on different runs). A
-  # failed build leaves nothing behind, so a retry rebuilds only what failed.
-  local attempt
-  for attempt in 1 2 3; do
-    BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
-      ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
-        .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' && break
-    [ "$attempt" -lt 3 ] || return 1
-    echo "baseline build attempt $attempt failed; retrying" >&2
-  done
-  export ST3_COMPAT_BIN="$RUNNER_TEMP/baseline/bin/st3"
+  baseline=$(python3 scripts/compat-baseline fleet "$RUNNER_TEMP/baseline") || return
+  export ST3_COMPAT_BIN="$baseline"
   test -x "$ST3_COMPAT_BIN" || return
-  if "$ST3_COMPAT_BIN" fleet --help > /dev/null 2>&1; then
-    echo "the baseline must predate fleet membership" >&2
-    return 1
-  fi
   cargo test -p st3 --locked --test integration -- --ignored --exact \
-    fleet::an_old_build_config_peer_replicates_with_new_members 2>&1 | tee "$logs/compat-result.log" || return
+    fleet::previous_release_replicates_with_new_members_and_preserves_history_on_upgrade 2>&1 | tee "$logs/compat-result.log" || return
   grep -q "test result: ok. 1 passed" "$logs/compat-result.log"
 }
 

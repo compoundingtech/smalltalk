@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Exercise daily release diagnostics with rolling compatibility metadata",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "The existing daily-release failure-path fixture includes the real compatibility release helper, valid baseline pins and paginated release metadata, so it reaches its intended publication diagnostic assertions. Production release policy is unchanged."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No additional operator action."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

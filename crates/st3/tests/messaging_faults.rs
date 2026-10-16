@@ -12,7 +12,10 @@ fn controller_death_cleanup() {
         .args(["-m", "unittest", "discover", "-s"])
         .arg(repo.join("scripts/st3-messaging-faults-eval"))
         .args(["-p", "test_*.py"])
-        .env("ST3_MFE_TEST_BINARY", test_env!("CARGO_BIN_EXE_st3-fixture"))
+        .env(
+            "ST3_MFE_TEST_BINARY",
+            test_env!("CARGO_BIN_EXE_st3-fixture"),
+        )
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("run messaging cleanup, oracle, readiness and timing regressions");
@@ -31,18 +34,14 @@ fn run_case(case: &str) {
     let old = match std::env::var_os("ST3_MESSAGING_COMPAT_BIN") {
         Some(path) => PathBuf::from(path),
         None => {
-            // Pin the real channel before reexec/reporting, rather than making a current
-            // process pretend it is old. Nix caches this immutable package across CI runs.
-            let output = st3::test_support::command("timeout")
-                .args(["10m", "bash"])
+            // Run the actual previous release, not a current process pretending to be old.
+            let output = st3::test_support::command("bash")
                 .arg(repo.join("scripts/messaging-compat-binary"))
                 .output()
-                .expect(
-                    "Nix builds the pinned historical channel (or set ST3_MESSAGING_COMPAT_BIN)",
-                );
+                .expect("download the pinned release channel (or set ST3_MESSAGING_COMPAT_BIN)");
             assert!(
                 output.status.success(),
-                "historical channel build: {}",
+                "previous-release channel download: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
@@ -50,7 +49,7 @@ fn run_case(case: &str) {
     };
     assert!(
         old.is_file(),
-        "historical st3 is missing: {}",
+        "previous-release st3 is missing: {}",
         old.display()
     );
     let in_ci = std::env::var_os("CI_RUN_ID").is_some();

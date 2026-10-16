@@ -15,7 +15,7 @@ setsid -f env -i HOME="$HOME" USER="$USER" PATH="$PATH" \
   XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
   DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
   scripts/st3-messaging-faults-eval/run "$ST3_BIN" /tmp/messaging-faults-run \
-  --old-binary /path/to/pre-reexec/st3 \
+  --old-binary "$(scripts/messaging-compat-binary)" \
   >/tmp/messaging-faults-run.log 2>&1 </dev/null
 ```
 
@@ -54,29 +54,24 @@ Fixture errors record the phase that timed out. The cases are:
 | receiver-down | Receiving daemon and worker are down when the sender accepts the message | Restarted API answers and worker is started |
 | harness-restart | Kill the provider, queue a message, let the daemon restart its seat | New provider process exists |
 | channel-killed | Kill the live channel and send a message | Kill completes and sender accepts the message; recovery belongs to the real extension |
-| old-channel | Start a real historical channel under the candidate's driver and extension, then deploy the candidate with a short API outage while queueing remotely | New daemon answers and peer link opens |
+| old-channel | Start the actual previous-release channel under the candidate's driver and extension, then advance its installed reference to the candidate during a short API outage while queueing remotely | New daemon answers and peer link opens |
 | handoff-failed | Refuse native handoffs past the third failure; check agent, doctor and sender visibility | The provider API accepts handoffs again |
 
 Receiver-down models an unavailable receiving node's messaging services with its
 seat still alive. It does not simulate a host reboot. Harness-restart necessarily
 permits the one injected provider replacement; every other case requires the same
 provider PID and runtime incarnation. No case permits an additional provider start.
-The old binary must actually predate reexec; the runner records its hash, checks
-that it does not support `resume-probe`, and starts its actual channel process
-rather than simulating legacy requests. The old-channel case holds the receiving API down for
-at least three seconds so its one-second poll cannot race past the outage. The owned extension
-sends authority-free protocol-1 keepalives: an old channel whose API request failed can otherwise
-remain stuck in Tokio shutdown waiting for its stdin reader, never notifying the extension to
-reconnect. Replayed recipient receipts settle to existing later evidence without moving the
-message backward or creating another lifecycle claim. The candidate's driver and extension remain
-current, so the case isolates compatibility with an old channel. It does not prove
-an old driver's recovery or compatibility between arbitrary historical releases:
-failure of that case's warmup is a fixture error, not a fault verdict.
+The old-channel case runs the actual pinned previous-release channel under the candidate's
+daemon, driver and extension. It records the binary hash and checks the release's `resume-probe`
+contract. During the fault, its installed reference advances to the candidate while the
+receiving API is down. The release channel must reexec to that candidate in the same PID,
+with the provider PID and runtime incarnation unchanged. Replayed recipient receipts settle
+to existing later evidence without moving the message backward or creating another lifecycle
+claim. This proves the release-to-candidate channel upgrade, not arbitrary historical
+driver compatibility; failure of warmup is a fixture error, not a fault verdict.
 
-The pinned graph channel requires an obsolete `--catalog` argument but does not read it.
-The provider stand-in supplies the resolved native root as that argument when launching the
-historical channel. Current drivers and extensions use explicit paths, and the oracle rejects
-any `catalog.kdl` or `agent.kdl` created in the native driver state, including this case.
+Drivers and extensions use explicit paths. The oracle rejects any `catalog.kdl` or
+`agent.kdl` created in native driver state, including the previous-release case.
 
 The provider matches consumed text to immutable IDs from real channel-frame
 metadata, which also works with old channels that lack message envelopes. Observed
@@ -90,11 +85,10 @@ any projection fails the no-files gate. It observes a fixed 25-second tail after
 to catch duplicates and to outlast the delivery report's 20-second startup grace.
 Duplicates after that bounded observation window are not covered.
 
-Delivery and reporting are separate results: a working old channel that st reports
-as stale fails the reporting gate even if the message arrives. `result.json` records
-both receipt timing and the delivery assessment. Modern paths must be `current`, and every
-`st3 driver` process of the seat must run the daemon's executable; the historical
-path must be `legacy`, which exposes recent polling without inventing image/readiness evidence.
+Delivery and reporting are separate results: a working channel reported stale fails the
+reporting gate even if the message arrives. `result.json` records both receipt timing and
+the delivery assessment. Every path, including the upgraded previous-release channel, must
+be `current`, and every `st3 driver` process of the seat must run the daemon's executable.
 The failed-handoff case also requires a visible blockage in the agent, doctor and sender views. Per-case evidence keeps graph
 traces, native receipts, process snapshots, agent cards, replication status and
 daemon/worker logs. Paths are normalized before publishing; stores, configuration
@@ -131,11 +125,11 @@ so the Namespace Linux gate runs the complete matrix in parallel and retries ind
 Each test calls the same eval with `--cases CASE`; all recovery and observation gates remain
 unchanged. The fixture inherits a systemd user runtime only when its bus exists; on runners
 without a user manager, the existing detached task path is exercised. The separate isolation VM
-proves the systemd scope contracts. It builds the actual historical source
-pinned by `.github/messaging-compat-baseline.json` through Nix. That build omits
-checks, other binaries and the retired package's PTY wrapper; its channel source
-and locked Rust dependencies are unchanged. Nix caches the immutable package.
-Set `ST3_MESSAGING_COMPAT_BIN` to use an already built historical executable.
+proves the systemd scope contracts. The previous-release bundle is pinned by source, tag and
+archive SHA-256 in `.github/messaging-compat-baseline.json`; the native loader verifies the
+checksum and `BUILD.json` before execution. Nix consumes that same archive as a sandbox input
+and fixes its Linux interpreter path without rebuilding its channel source.
+Set `ST3_MESSAGING_COMPAT_BIN` to use an already extracted previous-release executable.
 `ST3_MESSAGING_FAULTS_EVIDENCE` can select a parent directory for per-case local evidence;
 on failure the default temporary evidence directory is retained. CI also retains
 successful normalized evidence under its checkout's `target/messaging-faults/<case>-*/evidence/`.

@@ -13,6 +13,8 @@ export default githubWorkflow(readyPRJobs(auditCaches({
   },
   "on": {
     "pull_request": { types: [...readyPullRequestTypes, 'labeled', 'unlabeled'] },
+    "merge_group": null,
+    "workflow_dispatch": null,
     "push": {
       "branches": [
         "main"
@@ -54,8 +56,17 @@ export default githubWorkflow(readyPRJobs(auditCaches({
         {
           "name": "Check repository content",
           "run": "python3 scripts/check-public-repo"
-        }
+        },
+        {
+          name: 'Test rolling compatibility baseline policy',
+          run: 'python3 scripts/compat-baseline-release-test\npython3 scripts/compat-baseline-test\n',
+        },
+        {
+          name: 'Check published stable release baseline freshness',
+          env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}' },
+          run: 'python3 scripts/compat-baseline-release check',
+        },
       ]
     }
   }
-}, {"public-repo": "Runs standard-library source checks without downloads or compilation.", "fractal-changelog": "Checks the full Git diff and pure changelog policy without dependencies or compilation."})))
+}, {"public-repo": "Runs standard-library guards and queries published release metadata; builds nothing.", "fractal-changelog": "Checks the full Git diff and pure changelog policy without dependencies or compilation."})))

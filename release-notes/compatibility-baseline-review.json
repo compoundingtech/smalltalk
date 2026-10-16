@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Isolate compatibility maintenance permissions from release publication",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Baseline freshness distinguishes stale pins from unavailable release metadata; archive downloads fail closed after a network timeout. No runtime compatibility contract changes."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "changed", "detail": "Upstream maintainers own review and merge of baseline maintenance PRs. Repository Actions settings must allow workflows to create pull requests. Separate postpublication jobs carry PR and workflow-dispatch write permissions; publication has only contents write access, with read-only Actions artifact access for daily releases. See docs/ci.md."},
+  "recovery": {"status": "none", "detail": "A failed advance job leaves the published release unchanged; rerun advance for the latest stable release."}
+}
