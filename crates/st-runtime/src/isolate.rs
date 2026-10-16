@@ -707,4 +707,26 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn scope_keeps_environment_values_out_of_argv_and_description() {
+        let mut command = wrap_for_mode(
+            Isolation::Scope,
+            true,
+            "st3-work.scope",
+            OsStr::new("sh"),
+            &[OsStr::new("-c"), OsStr::new("test \"$SEAT_MARKER\" = \"$EXPECTED\"")],
+            None,
+        );
+        command.env("SEAT_MARKER", "synthetic-marker");
+        command.env("EXPECTED", "synthetic-marker");
+        let arguments = command.get_args().collect::<Vec<_>>();
+        let separator = arguments.iter().position(|argument| *argument == "--").unwrap();
+        assert!(arguments.iter().all(|argument| {
+            let argument = argument.to_string_lossy();
+            !argument.contains("synthetic-marker") && !argument.contains("--env")
+                && !argument.contains("EnvironmentFile")
+        }));
+        assert!(arguments[..separator].contains(&OsStr::new("--description=st seat")));
+    }
 }
