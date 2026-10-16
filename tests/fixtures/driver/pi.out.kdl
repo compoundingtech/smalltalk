@@ -1,1 +1,0 @@
-argv st2 --catalog $CATALOG driver pi-session --identity host.worker --runtime-id host.worker -- pi -a --model "anthropic/claude-opus-5" --thinking high --tools read,bash,edit,write "Start the assigned work."
