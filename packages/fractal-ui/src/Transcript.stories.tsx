@@ -864,3 +864,50 @@ const styles = stylex.create({
   thread: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }, composerDock: { flexShrink: 0, boxSizing: 'border-box', width: '100%', maxWidth: g.lane, marginInline: 'auto', padding: s.lg },
   all: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: s.lg, padding: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
 })
+
+const mixedContentItems: readonly ConversationItem[] = [
+  { _tag: 'UnknownEvent', id: 'mixed/message', eventType: 'synthetic-internal-kind', mixedContent: true, data: {
+    text: 'Synthetic visible message body.',
+    blocks: [
+      { visibility: 'visible', payload: { text: 'Synthetic visible message body.' } },
+      { visibility: 'internal', payload: { raw: 'synthetic-mixed-raw-sentinel' } },
+    ],
+  }, at },
+  { _tag: 'Notice', id: 'mixed/control', kind: 'event', text: 'Synthetic ordinary notice control.', at },
+]
+const mixedContentData: TranscriptStoryData = {
+  sync: { _tag: 'Live', since: now },
+  turns: [{ id: 'mixed/turn', items: mixedContentItems, work: workLogTurnFromItems(mixedContentItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true }) }],
+}
+export const MixedContent: Story = {
+  render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={mixedContentData} onRetry={() => {}} /></main>,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement)
+    const show = await canvas.findByRole('button', { name: 'Show' })
+    await expect(canvas.getByText('Message with internal records')).toBeVisible()
+    await expect(show).toHaveAttribute('aria-expanded', 'false')
+    const rawAbsent = () => !canvasElement.textContent?.includes('synthetic-mixed-raw-sentinel')
+    await expect(rawAbsent()).toBe(true)
+    await expect(canvas.queryByTestId('mixed-content-body')).toBeNull()
+    await expect(canvasElement.textContent).not.toContain('Synthetic visible message body.')
+    await expect(canvasElement.textContent).not.toContain('synthetic-internal-kind')
+    const control = canvas.getByText('event · Synthetic ordinary notice control.')
+    await expect(control).toBeVisible()
+    await expect(control.closest('[data-testid="transcript-message"]')?.querySelector('button')).toBeNull()
+    show.focus()
+    await expect(show).toHaveFocus()
+    await userEvent.keyboard('{Enter}')
+    const hide = canvas.getByRole('button', { name: 'Hide' })
+    await expect(hide).toHaveAttribute('aria-expanded', 'true')
+    const body = canvas.getByTestId('mixed-content-body')
+    await expect(body).toBeVisible()
+    await expect(body.textContent).toBe(JSON.stringify(mixedContentItems[0]!._tag === 'UnknownEvent' ? mixedContentItems[0]!.data : null, null, 2))
+    // Negative control: the exact collapsed absence probe must fail after disclosure.
+    await expect(rawAbsent()).toBe(false)
+    await expect(control).toBeVisible()
+    await userEvent.click(hide)
+    await expect(canvas.getByRole('button', { name: 'Show' })).toHaveAttribute('aria-expanded', 'false')
+    await expect(rawAbsent()).toBe(true)
+    await expect(canvas.queryByTestId('mixed-content-body')).toBeNull()
+  },
+}

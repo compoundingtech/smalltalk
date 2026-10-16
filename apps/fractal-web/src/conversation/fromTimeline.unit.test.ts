@@ -1,7 +1,97 @@
-import { TimelineEntry } from '@smalltalk/st3-client/schema'
+import { TimelineEntry, Timestamp } from '@smalltalk/st3-client/schema'
 import { Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { LiveTimeline } from './fromTimeline.ts'
+import { transcriptTurnsForItems } from '../web/conversationTranscript.ts'
+
+describe('native block visibility', () => {
+  // Synthetic copy of st's normalize_omp tool_execution_start projection.
+  const raw = {
+    type: 'custom', customType: 'tool_execution_start',
+    data: { toolCallId: 'synthetic-call', toolName: 'bash', startedAt: 1792022400000 },
+  }
+  const text = `[omp tool start bash]\n${JSON.stringify({ raw })}`
+  const block = {
+    id: 'native-1/0', kind: 'status', source_type: 'custom',
+    payload: { raw }, visibility: 'internal',
+    view: {
+      type: 'tool_start', call_id: 'synthetic-call', tool: 'bash',
+      started_at: '2026-10-15T00:00:00.000Z',
+    },
+  }
+  const project = (text: string, blocks: ReadonlyArray<unknown>) => {
+    const timeline = new LiveTimeline()
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [Schema.decodeUnknownSync(TimelineEntry)({
+        id: 'timeline-entry/synthetic-tool-start', sequence: 1, revision: 1, final: true,
+        timestamp: '2026-10-15T00:00:00Z', type: 'content', role: 'system',
+        body: { media_type: 'text/plain', text, blocks },
+      })],
+    })
+    return timeline.project().items
+  }
+
+  it('keeps internal tool-start fallback out of prose, preserving inspectable data', () => {
+    expect(project(text, [block])).toMatchObject([{
+      _tag: 'UnknownEvent', eventType: 'tool_start',
+      data: { blocks: [{ visibility: 'internal', payload: { raw }, view: { type: 'tool_start' } }] },
+    }])
+    expect(project(text, [block])[0]).not.toHaveProperty('text')
+    const turns = transcriptTurnsForItems(project(text, [block]), { firstTurnComplete: true })
+    expect(turns.flatMap((turn) => turn.items)).toEqual([])
+    expect(JSON.stringify(turns)).not.toContain('tool_execution_start')
+  })
+
+  it.each(['internal', 'hidden-by-harness'])('uses %s visibility, not a label or view type', (visibility) => {
+    expect(project('Different fallback with {"synthetic":true}', [{
+      id: block.id, kind: block.kind, source_type: block.source_type, payload: block.payload, visibility,
+    }])).toMatchObject([{ _tag: 'UnknownEvent', eventType: 'internal native content' }])
+  })
+
+  it('keeps visible system JSON and even the same tool-start label as prose', () => {
+    for (const visibleText of ['System note: {"synthetic":true}', text]) {
+      expect(project(visibleText, [{ ...block, visibility: 'visible' }])).toMatchObject([{
+        _tag: 'Text', role: 'system', text: visibleText,
+      }])
+      expect(project(visibleText, [])).toMatchObject([{ _tag: 'Text', text: visibleText }])
+    }
+  })
+
+  it('does not treat an internal source record as the visibility of visible prose', () => {
+    const visibleText = 'Visible system text {"synthetic":true}'
+    expect(project(visibleText, [{
+      id: 'native-1/visible', kind: 'text', source_type: 'content', payload: { body_ref: true },
+    }, {
+      id: block.id, kind: 'source_record', source_type: block.source_type,
+      payload: block.payload, visibility: 'internal',
+    }])).toMatchObject([{ _tag: 'Text', text: visibleText }])
+  })
+
+  it.each(['visible', undefined])('retains a mixed body for visible disclosure (%s)', (visibility) => {
+    const visible = {
+      id: 'native-1/1', kind: 'text', source_type: 'content',
+      payload: { body_ref: true }, ...(visibility === undefined ? {} : { visibility }),
+    }
+    expect(project(`Visible synthetic prose\n${text}`, [block, visible])).toMatchObject([{
+      _tag: 'UnknownEvent', mixedContent: true, eventType: 'tool_start',
+      data: { text: `Visible synthetic prose\n${text}`, blocks: [{
+        ...block, view: { ...block.view, started_at: Schema.decodeUnknownSync(Timestamp)(block.view.started_at) },
+      }, visible] },
+    }])
+  })
+
+  it('preserves unspecified visibility as ordinary prose', () => {
+    const { visibility: _, ...unspecified } = block
+    expect(project(text, [unspecified])).toMatchObject([{ _tag: 'Text', text }])
+  })
+
+  it('does not count internal source records as mixed content', () => {
+    expect(project(text, [block, {
+      ...block, id: 'native-1/source', kind: 'source_record',
+    }])[0]).not.toHaveProperty('mixedContent')
+  })
+})
 
 describe('native conversation page boundaries', () => {
   it('retains the older edge across newer deltas and resets it on replace', () => {

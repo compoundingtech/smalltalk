@@ -29,6 +29,18 @@ rather than only a placeholder. The optional open-string `visibility` field is a
 UI hint (`visible` by default, `internal`, or `hidden-by-harness`), never a read-scope
 restriction. Unknown role means unknown attribution, not omission.
 
+Fractal Web ignores source records when classifying content visibility. If every
+presentation block is internal/hidden-by-harness, it retains an inspectable event,
+hidden by default, named after the primary block's typed view when available.
+Mixed visible/internal bodies instead keep a quiet, visible-by-default
+“Message with internal records · Show” disclosure; raw body data appears only on
+expansion. Native text blocks may only reference `body.text` via `body_ref`, so
+mixed bodies cannot safely reconstruct visible prose until blocks carry per-block
+text or body ranges. Unspecified visibility retains its existing visible behavior.
+This is defensive schema coverage: at producer revision `25d9c8000`, OMP
+`push_omp_content` emits ordinary text parts as separate entries, and no producer
+of mixed visible/internal presentation blocks has been demonstrated.
+
 Malformed JSON, unfinished tail lines, blank lines and unknown encodings become
 `raw_text` blocks. Their payload has `encoding: "base64"`, `bytes` containing the
 exact original bytes (including newline and controls), and a lossy `text` preview.

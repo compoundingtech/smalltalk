@@ -167,7 +167,7 @@ export const convertConversationItem = (item: ConversationItem): ThreadMessageLi
       diagnostics.push('semantic-row-as-text')
       return {
         ...common, role: 'system',
-        content: [{ type: 'text', text: `Unsupported event · ${item.eventType}` }],
+        content: [{ type: 'text', text: item.mixedContent === true ? 'Message with internal records' : `Unsupported event · ${item.eventType}` }],
       }
     default: {
       const unhandled: never = item

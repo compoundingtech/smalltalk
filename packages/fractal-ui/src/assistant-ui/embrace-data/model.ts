@@ -116,6 +116,8 @@ export type ConversationItem =
       readonly id: string
       readonly eventType: string
       readonly data: unknown
+      /** A message containing both visible content and internal records; body inspection is opt-in. */
+      readonly mixedContent?: boolean
       readonly sender?: Sender
       readonly at?: string
     }

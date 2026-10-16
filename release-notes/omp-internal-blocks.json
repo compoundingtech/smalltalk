@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep structured internal native content out of transcript prose instead of rendering its legacy text fallback.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "Uses existing timeline block visibility; no wire or storage changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "Content whose non-source presentation blocks are all internal or hidden-by-harness remains an inspectable UnknownEvent hidden by default. Schema-permitted mixed visible/internal non-source bodies remain visible as a collapsed Message with internal records disclosure, with raw body inspection only on expansion; no production producer of such mixed bodies has been demonstrated. Internal source-record annotations do not hide visible prose. Visible JSON messages, unspecified visibility and legacy entries without blocks retain their existing presentation." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}
