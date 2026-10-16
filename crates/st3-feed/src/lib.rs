@@ -39,8 +39,10 @@ const QUIET_BEFORE_PING: Duration = Duration::from_secs(10);
 const PONG_WAIT: Duration = Duration::from_secs(8);
 
 /// The waits between attempts to reach st again, reset once st answers.
-/// How long a window must stay unserved before st's reason for it is reported.
-const REPORT_AFTER: Duration = Duration::from_secs(1);
+/// How long a window must stay unserved before st's reason for it is reported. A resync or a
+/// slow answer from a daemon that is catching up clears itself within this; saying it sooner puts
+/// an error in front of a person for something that mends before they could read it.
+pub const REPORT_AFTER: Duration = Duration::from_secs(20);
 
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
@@ -575,7 +577,7 @@ async fn connected(
     let mut window_retries = WindowRetries::default();
     // Reasons st gave for a window it cannot serve yet, said once they have lasted a moment: a
     // write briefly revokes a source's readiness, and that blip is not worth a message.
-    let mut pending_reports: Vec<(Window, Instant, String)> = Vec::new();
+    let mut pending_reports = PendingReports::default();
     if following.is_some() {
         match follow(client, stream, updates, following).await {
             Ok(()) => {}
@@ -589,7 +591,7 @@ async fn connected(
             .filter_map(|current| current.retry_at)
             .min();
         let window_at = window_retries.next();
-        let report_at = pending_reports.iter().map(|(_, at, _)| *at).min();
+        let report_at = pending_reports.next();
         tokio::select! {
             _ = probe.tick() => {
                 let quiet = heard.quiet_for();
@@ -633,7 +635,7 @@ async fn connected(
                         }
                         *failures = 0;
                         window_retries.loaded(window);
-                        pending_reports.retain(|(pending, _, _)| *pending != window);
+                        pending_reports.cancel(window);
                         let rows = windows.entry(window).or_default();
                         rows.clear();
                         rows.extend(items.into_iter().map(|item| (item.header().id.clone(), item)));
@@ -647,7 +649,7 @@ async fn connected(
                             continue;
                         }
                         window_retries.loaded(window);
-                        pending_reports.retain(|(pending, _, _)| *pending != window);
+                        pending_reports.cancel(window);
                         let rows = windows.entry(window).or_default();
                         for id in removes {
                             rows.remove(&id);
@@ -677,7 +679,7 @@ async fn connected(
                             if matches!(window, Window::Inventory(_)) {
                                 if let Some(message) = message {
                                     let plain = st3_client::plain_message(code.as_ref(), &message);
-                                    if updates.send(Update::WindowFailed(window, plain)).is_err() { return Ended::Closed; }
+                                    pending_reports.report(window, Instant::now(), plain);
                                 }
                                 continue;
                             }
@@ -686,7 +688,7 @@ async fn connected(
                             let first = window_retries.failed(window, Instant::now());
                             if first && let Some(message) = message {
                                 let message = st3_client::plain_message(code.as_ref(), &message);
-                                pending_reports.push((window, Instant::now() + REPORT_AFTER, message));
+                                pending_reports.report(window, Instant::now(), message);
                             }
                         }
                     }
@@ -718,15 +720,13 @@ async fn connected(
                             }
                             if matches!(window, Window::Inventory(_)) {
                                 let plain = st3_client::plain_message(code.as_ref(), &message);
-                                if updates.send(Update::WindowFailed(window, plain)).is_err() { return Ended::Closed; }
+                                pending_reports.report(window, Instant::now(), plain);
                                 continue;
                             }
-                            // Said once; the retries are quiet until it loads.
+                            // Said once, and only if it lasts; the retries are quiet until it loads.
                             if window_retries.failed(window, Instant::now()) {
                                 let message = st3_client::plain_message(code.as_ref(), &message);
-                                if updates.send(Update::WindowFailed(window, message)).is_err() {
-                                    return Ended::Closed;
-                                }
+                                pending_reports.report(window, Instant::now(), message);
                             }
                         } else if id == TERMINAL {
                             terminal_failed(updates, following, code, message);
@@ -765,7 +765,7 @@ async fn connected(
                         let _ = stream.unsubscribe(Window::Missions.id()).await;
                         windows.remove(&Window::Missions);
                         window_retries.loaded(Window::Missions);
-                        pending_reports.retain(|(pending, _, _)| *pending != Window::Missions);
+                        pending_reports.cancel(Window::Missions);
                         if updates.send(Update::WindowStopped(Window::Missions)).is_err() {
                             return Ended::Closed;
                         }
@@ -779,7 +779,7 @@ async fn connected(
                         if let Err(error) = stream.unsubscribe(&inventory.id()).await { return Ended::Dropped(error.plain()); }
                         let window = Window::Inventory(inventory);
                         windows.remove(&window); window_retries.loaded(window);
-                        pending_reports.retain(|(pending, _, _)| *pending != window);
+                        pending_reports.cancel(window);
                         if updates.send(Update::WindowStopped(window)).is_err() { return Ended::Closed; }
                     }
                     for inventory in wanted.windows().into_iter().filter(|new| !previous.contains(*new)) {
@@ -843,16 +843,7 @@ async fn connected(
             }
             () = tokio::time::sleep_until(report_at.unwrap_or_else(Instant::now)), if report_at.is_some() => {
                 let now = Instant::now();
-                let mut due = Vec::new();
-                pending_reports.retain(|(window, at, message)| {
-                    if *at <= now {
-                        due.push((*window, message.clone()));
-                        false
-                    } else {
-                        true
-                    }
-                });
-                for (window, message) in due {
+                for (window, message) in pending_reports.due(now) {
                     if updates.send(Update::WindowFailed(window, message)).is_err() {
                         return Ended::Closed;
                     }
@@ -901,6 +892,47 @@ fn jitter(wait: Duration) -> Duration {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| u64::from(since.subsec_nanos()) % 1000);
     wait.mul_f64(spread as f64 / 2000.0)
+}
+
+/// Why a window is not being served, held until it has lasted `REPORT_AFTER`: a window that
+/// loads (or is left) in that time is never reported, so a failure that mends by itself says
+/// nothing, and one that lasts is said once.
+#[derive(Default)]
+struct PendingReports {
+    reports: Vec<(Window, Instant, String)>,
+}
+
+impl PendingReports {
+    /// `window` failed at `now` for `message`; keeps the first reason while one is pending.
+    fn report(&mut self, window: Window, now: Instant, message: String) {
+        if !self.reports.iter().any(|(pending, _, _)| *pending == window) {
+            self.reports.push((window, now + REPORT_AFTER, message));
+        }
+    }
+
+    /// The window loaded or was left: whatever was pending for it is moot.
+    fn cancel(&mut self, window: Window) {
+        self.reports.retain(|(pending, _, _)| *pending != window);
+    }
+
+    /// When the next report falls due.
+    fn next(&self) -> Option<Instant> {
+        self.reports.iter().map(|(_, at, _)| *at).min()
+    }
+
+    /// The reports due by `now`, each taken off.
+    fn due(&mut self, now: Instant) -> Vec<(Window, String)> {
+        let mut due = Vec::new();
+        self.reports.retain(|(window, at, message)| {
+            if *at <= now {
+                due.push((*window, message.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        due
+    }
 }
 
 /// Windows st stopped sending, and when to ask for each again.
@@ -1268,6 +1300,39 @@ pub async fn detach(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn a_window_failure_is_said_only_once_it_has_lasted_and_a_load_cancels_it() {
+        let start = Instant::now();
+        let mut reports = PendingReports::default();
+        reports.report(Window::Summary, start, "st is catching up".into());
+        // A second failure of the same window keeps the first reason and its clock.
+        reports.report(Window::Summary, start + REPORT_AFTER / 2, "later reason".into());
+        assert_eq!(reports.next(), Some(start + REPORT_AFTER));
+        // Quiet while it is young, up to the last instant before the delay.
+        assert!(reports.due(start).is_empty());
+        assert!(reports.due(start + REPORT_AFTER - Duration::from_millis(1)).is_empty());
+        // Said, once, when it has lasted.
+        assert_eq!(
+            reports.due(start + REPORT_AFTER),
+            [(Window::Summary, "st is catching up".to_owned())]
+        );
+        assert!(reports.due(start + REPORT_AFTER * 2).is_empty());
+        assert_eq!(reports.next(), None);
+
+        // A window that loads before the delay is never reported, and others are left alone.
+        reports.report(Window::Arrangements, start, "a".into());
+        reports.report(Window::Inventory(Inventory::Machines), start, "b".into());
+        reports.cancel(Window::Arrangements);
+        assert_eq!(
+            reports.due(start + REPORT_AFTER),
+            [(Window::Inventory(Inventory::Machines), "b".to_owned())]
+        );
+        // The same window can fail and be reported again after it has loaded in between.
+        reports.report(Window::Arrangements, start + REPORT_AFTER, "again".into());
+        assert_eq!(reports.next(), Some(start + REPORT_AFTER * 2));
+    }
+
     use std::sync::Arc;
     use tokio::sync::{Notify, watch};
 

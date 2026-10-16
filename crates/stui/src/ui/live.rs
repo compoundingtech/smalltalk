@@ -310,6 +310,30 @@ fn terminal_rows(items: Vec<Resource>) -> Vec<super::resource_sidebar::ResourceR
     }).collect()
 }
 
+/// A polled inventory's read finished at `now` (older daemons serve no inventory windows).
+/// Its error is held until it has kept failing for the time the feed waits before reporting a
+/// window (`feed::REPORT_AFTER`); a read that succeeds clears both the clock and the error.
+fn note_legacy_read(
+    failing: &mut BTreeMap<&'static str, Instant>,
+    errors: &mut BTreeMap<String, String>,
+    name: &'static str,
+    error: Option<&String>,
+    now: Instant,
+) {
+    match error {
+        Some(error) => {
+            let since = *failing.entry(name).or_insert(now);
+            if now.duration_since(since) >= feed::REPORT_AFTER {
+                errors.insert(name.into(), error.clone());
+            }
+        }
+        None => {
+            failing.remove(name);
+            errors.remove(name);
+        }
+    }
+}
+
 fn window_label(window: Window) -> String {
     match window { Window::Inventory(inventory) => inventory.collection().into(), _ => format!("{window:?}") }
 }
@@ -583,6 +607,9 @@ pub fn run(context: Context) -> Result<()> {
     let mut inventory_sent: Option<Inventories> = None;
     let mut usage_wanted_hours = None;
     let mut legacy_requested = BTreeSet::new();
+    // When each polled inventory first failed on this run of failures: a read that fails for a
+    // moment (a daemon catching up) is not said; one that keeps failing is.
+    let mut legacy_failing: BTreeMap<&'static str, Instant> = BTreeMap::new();
     let mut legacy_pending = BTreeSet::new();
     // The palette's conversation search: what st was last asked, and what is typed since when.
     let mut said_asked: Option<String> = None;
@@ -885,7 +912,10 @@ pub fn run(context: Context) -> Result<()> {
                 feed::Update::WindowFailed(window, error) => {
                     if let Window::Inventory(Inventory::Clients) = window && model.clients.is_none() { model.clients = Some(Err(error.clone())); }
                     if let Window::Inventory(Inventory::Usage(hours)) = window && hours == ui.usage_hours && model.usage.is_none() { model.usage = Some(Err(error.clone())); }
-                    ui.flash(format!("Could not load {}: {error}", window_label(window)));
+                    // Not flashed: a window that fails is retried quietly and the last good view
+                    // stays. What is left to say (it has not loaded, or has stayed unserved past
+                    // `REPORT_AFTER`, which the feed waits before sending this) goes where the
+                    // window is shown.
                     extras.window_errors.insert(window_label(window), error);
                     changed = true;
                 }
@@ -1139,30 +1169,30 @@ pub fn run(context: Context) -> Result<()> {
                         InventoryRead::Clients(outcome) => outcome.as_ref().err(),
                         InventoryRead::Usage(_, outcome) => outcome.as_ref().err(),
                     };
-                    if let Some(error) = error { extras.window_errors.insert(name.into(), error.clone()); }
-                    else { extras.window_errors.remove(name); }
+                    note_legacy_read(&mut legacy_failing, &mut extras.window_errors, name, error, Instant::now());
                     match result {
-                        InventoryRead::Rows(inventory, outcome) => match outcome {
-                            Ok(rows) => match inventory {
+                        // A failed read keeps the last good rows; the stale note says so if it lasts.
+                        InventoryRead::Rows(inventory, outcome) => if let Ok(rows) = outcome {
+                            match inventory {
                                 Inventory::Machines => model.machines = rows,
                                 Inventory::Devices => model.devices = rows,
                                 Inventory::Sessions => model.sessions = rows,
                                 _ => unreachable!(),
-                            },
-                            Err(error) => ui.flash(format!("Could not load {}: {error}", inventory.collection())),
+                            }
                         },
-                        InventoryRead::Terminals(outcome) => match outcome {
-                            Ok((rows, has_more)) => { ui.resource_sidebar.terminals = terminal_rows(rows); ui.resource_sidebar.terminals_has_more = has_more; },
-                            Err(error) => ui.flash(format!("Could not load terminals: {error}")),
+                        InventoryRead::Terminals(outcome) => if let Ok((rows, has_more)) = outcome {
+                            ui.resource_sidebar.terminals = terminal_rows(rows);
+                            ui.resource_sidebar.terminals_has_more = has_more;
                         },
                         InventoryRead::Clients(outcome) => match outcome {
                             Ok(clients) => model.clients = Some(Ok(clients)),
-                            Err(error) if matches!(model.clients, Some(Ok(_))) => ui.flash(format!("Could not read clients again: {error}")),
+                            // The last good list stays; the stale note says so if it keeps failing.
+                            Err(_) if matches!(model.clients, Some(Ok(_))) => {}
                             Err(error) => model.clients = Some(Err(error)),
                         },
                         InventoryRead::Usage(hours, outcome) if hours == ui.usage_hours => match outcome {
                             Ok(period) => model.usage = Some(Ok(period)),
-                            Err(error) if matches!(model.usage, Some(Ok(_))) => ui.flash(format!("Could not read usage again: {error}")),
+                            Err(_) if matches!(model.usage, Some(Ok(_))) => {}
                             Err(error) => model.usage = Some(Err(error)),
                         },
                         InventoryRead::Usage(_, _) => {},
@@ -2944,6 +2974,38 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_polled_inventory_that_fails_briefly_says_nothing_and_one_that_keeps_failing_is_said() {
+        let start = Instant::now();
+        let mut failing = BTreeMap::new();
+        let mut errors = BTreeMap::new();
+        let why = "st did not answer".to_owned();
+        let stale = |errors: &BTreeMap<String, String>| {
+            let extras = Extras { window_errors: errors.clone(), ..Extras::default() };
+            adapt::world(&Model::default(), "person/avery", &extras).stale
+        };
+
+        // Young failures leave no error and no stale line, and the rows say loading, not none.
+        note_legacy_read(&mut failing, &mut errors, "machines", Some(&why), start);
+        note_legacy_read(&mut failing, &mut errors, "machines", Some(&why), start + feed::REPORT_AFTER - Duration::from_millis(1));
+        assert!(errors.is_empty());
+        assert!(stale(&errors).is_empty());
+        let extras = Extras { window_errors: errors.clone(), ..Extras::default() };
+        assert!(matches!(adapt::world(&Model::default(), "person/avery", &extras).machines, Load::Loading));
+
+        // One that has lasted is said, in the stale note.
+        note_legacy_read(&mut failing, &mut errors, "machines", Some(&why), start + feed::REPORT_AFTER);
+        assert_eq!(errors.get("machines"), Some(&why));
+        assert_eq!(stale(&errors), ["machines: st did not answer"]);
+
+        // A read that succeeds clears the error and the clock; the next failure starts over.
+        note_legacy_read(&mut failing, &mut errors, "machines", None, start + feed::REPORT_AFTER * 2);
+        assert!(errors.is_empty() && failing.is_empty());
+        assert!(stale(&errors).is_empty());
+        note_legacy_read(&mut failing, &mut errors, "machines", Some(&why), start + feed::REPORT_AFTER * 3);
+        assert!(errors.is_empty());
+    }
+
     #[test]
     fn a_shells_attach_waits_out_a_refusal_that_passes_and_says_why() {
         // Nathan, 2026-10-16: a new terminal ended at once with "could not attach: st cannot tell
