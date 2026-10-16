@@ -1852,6 +1852,10 @@ pub struct AttentionItemView {
     pub variant_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// For a native prompt or denial: the id of the exact call it asks about in the seat's
+    /// conversation, when its harness named it. A client offers to allow only that call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_call: Option<String>,
     /// The agent whose conversation this item belongs to: the agent that asked, whose work a
     /// gate reviews, that planned a launch or proposed a revision, or the seat itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]

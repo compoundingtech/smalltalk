@@ -5270,6 +5270,9 @@ struct CodexApprovalAnswer {
     pending: VecDeque<PendingCodexApproval>,
     /// The last observation a request bound to; a later request never reuses it.
     last_prompt: Option<(u64, u64)>,
+    /// A request just bound to its observation, with the item (call) id it asks about, for the
+    /// control loop to publish once.
+    bound_call: Option<(u64, u64, String)>,
 }
 
 impl CodexApprovalAnswer {
@@ -5352,8 +5355,12 @@ impl CodexApprovalAnswer {
                         .zip(observed.transition_sequence)
                 })
                 .filter(|prompt| self.last_prompt != Some(*prompt));
-            if pending.prompt.is_some() {
+            if let Some((ownership, transition)) = pending.prompt {
                 self.last_prompt = pending.prompt;
+                // The request's item is the call the seat's conversation shows it as.
+                if let Some(item) = pending.params.get("itemId").and_then(Value::as_str) {
+                    self.bound_call = Some((ownership, transition, item.to_owned()));
+                }
             }
         }
         let (ownership, transition) = pending.prompt?;
@@ -5498,6 +5505,11 @@ fn pump_control(
             {
                 write_json_message(&mut websocket, &response)
                     .context("answering a Codex approval request from st")?;
+            }
+            if let Some((answers, _)) = prompt_answers.as_ref()
+                && let Some((ownership, transition, call)) = approval_answer.bound_call.take()
+            {
+                answers.publish_call(ownership, transition, &call);
             }
             if !peer_closed
                 && let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))

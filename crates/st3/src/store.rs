@@ -15469,7 +15469,7 @@ impl Store {
                     ),
                     launch_id: None,
                     variant_id: None,
-                    message_id: None, answers: Vec::new(), conversation: None,
+                    message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -18306,7 +18306,7 @@ impl Store {
             items.push(AttentionItemView {
                 episode: first.episode.clone(), priority: "high".into(), kind: "harness-login".into(), review_mode: None,
                 subject: first.subject.clone(), person: owner, requester_id: None, launch_id: None,
-                variant_id: None, message_id: None, answers: Vec::new(), conversation: Some(first.subject.clone()),
+                variant_id: None, message_id: None, prompt_call: None, answers: Vec::new(), conversation: Some(first.subject.clone()),
                 title, detail,
                 request: None, mission: None, mission_run: None, step: None,
                 targets: names.iter().map(|name| (*name).to_owned()).collect(),
@@ -25843,7 +25843,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         requester_id: None,
         launch_id: None,
         variant_id: None,
-        message_id: None, answers: Vec::new(), conversation: None,
+        message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
         title: review
             .title
             .clone()
@@ -25909,7 +25909,7 @@ fn attention_item_from_planning(
             "launch-variant/{}/{}",
             session.id, candidate.variant
         )),
-        message_id: None, answers: Vec::new(),
+        message_id: None, prompt_call: None, answers: Vec::new(),
         conversation: attention_snapshot::agent(&session.planner),
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
@@ -25968,7 +25968,7 @@ fn attention_item_from_revision(
         requester_id: None,
         launch_id: None,
         variant_id: None,
-        message_id: None, answers: Vec::new(),
+        message_id: None, prompt_call: None, answers: Vec::new(),
         conversation: attention_snapshot::agent(&proposal.actor),
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
@@ -26025,7 +26025,7 @@ fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemVi
         requester_id: Some(request.actor),
         launch_id: None,
         variant_id: None,
-        message_id: None, answers: Vec::new(), conversation: None,
+        message_id: None, prompt_call: None, answers: Vec::new(), conversation: None,
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -59810,6 +59810,85 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             store.answer_native_prompt(seat, &old.id, "approve-kind", "person/avery").unwrap_err().code,
             "stale-fence"
         );
+    }
+
+    /// A prompt names the exact call it asks about, as its hook published it for that very
+    /// observation; a later prompt's call is never an earlier one's, and an unnamed call is none.
+    #[test]
+    fn a_prompt_names_the_exact_call_its_hook_published() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "call-seat", Some("person/avery"))
+            .unwrap();
+        let seat = "agent/node.worker";
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let call_of_prompt = || {
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .into_iter()
+                .find(|item| item.kind == "harness-prompt")
+                .unwrap()
+                .prompt_call
+        };
+        let asked = |transition: u64| {
+            append(
+                "harness.observed",
+                json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"permission", "reason":"Bash",
+                    "ownership_sequence":1, "transition_sequence":transition}),
+            )
+        };
+        let published = |transition: u64, call: &str| {
+            append(
+                "harness.diagnostic",
+                json!({"severity":"warning", "status":"shown", "code":"native-prompt-call",
+                    "driver":"claude", "ownership_sequence":1,
+                    "matched_line": json!({"call_id": call, "transition": transition}).to_string()}),
+            )
+        };
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+        asked(3);
+        assert_eq!(call_of_prompt(), None, "not named yet: allowed only in the terminal");
+        published(3, "toolu_7");
+        assert_eq!(call_of_prompt().as_deref(), Some("toolu_7"));
+        // The next prompt is its own observation: the earlier call is not its call.
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":4}),
+        );
+        asked(5);
+        assert_eq!(call_of_prompt(), None);
+        published(5, "toolu_9");
+        assert_eq!(call_of_prompt().as_deref(), Some("toolu_9"));
     }
 
     /// A denied call waits on its person only until the seat moves on: once the seat begins another

@@ -5872,7 +5872,7 @@ fn two_approvals_wait_in_turn_and_each_binds_to_its_own_transition() {
     };
     let request = |id: u64, method: &str| {
         json!({"id": id, "method": method,
-            "params": {"threadId": "thread-main", "turnId": "turn-1"}})
+            "params": {"threadId": "thread-main", "turnId": "turn-1", "itemId": format!("item-{id}")}})
     };
     let mut approval = CodexApprovalAnswer::default();
     let mut at = Instant::now();
@@ -5908,6 +5908,8 @@ fn two_approvals_wait_in_turn_and_each_binds_to_its_own_transition() {
         Some(json!({"id": 1, "result": {"decision": "accept"}}))
     );
     assert_eq!(asked, vec![first]);
+    // Binding the request names the call it asks about: its item, as the conversation shows it.
+    assert_eq!(approval.bound_call.take(), Some((first.0, first.1, "item-1".into())));
 
     // Codex resolves the first; the second is the prompt now, and its own transition.
     let resolved = json!({"method": "serverRequest/resolved",

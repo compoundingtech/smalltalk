@@ -387,6 +387,10 @@ fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, agent_dir: &Path
         return;
     };
     let client = crate::client::Client::new(endpoint);
+    // The call this prompt asks about, published once the seat shows it: a client offers to
+    // allow only that exact call, never whichever call happens to be pending.
+    let call = st_drivers::claude_prompts::prompt_call(agent_dir, &prompt);
+    let mut published = false;
     let answer = wait_for_prompt_answer(
         || match st_drivers::claude_prompts::waiting(agent_dir, &prompt) {
             st_drivers::claude_prompts::Waiting::Gone => {
@@ -396,6 +400,11 @@ fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, agent_dir: &Path
                 Some(crate::store::NativePromptState::Open)
             }
             st_drivers::claude_prompts::Waiting::Shown(ownership, transition) => {
+                if !published && let Some(call) = call.as_deref() {
+                    published = runtime.block_on(publish_prompt_call(
+                        &client, "claude", &subject, ownership, transition, call,
+                    ));
+                }
                 let path = format!(
                     "/v1/harness-prompts/state?agent={}&ownership={ownership}&transition={transition}",
                     urlencoding::encode(&subject)
@@ -561,6 +570,46 @@ fn allow_approved_call(env: &dyn HookEnv, identity: &str, agent_dir: &Path, raw:
 
 /// The diagnostic code of a call Claude's auto mode classifier denied.
 pub(crate) const PERMISSION_DENIED_CODE: &str = "permission-denied";
+
+/// The diagnostic code that names the call a shown prompt asks about.
+pub const PROMPT_CALL_CODE: &str = "native-prompt-call";
+
+/// Record that the prompt the seat shows as (`ownership`, `transition`) asks about `call`: its
+/// tool use id in the seat's conversation. Whether it was recorded.
+pub async fn publish_prompt_call(
+    client: &crate::client::Client,
+    driver: &str,
+    subject: &str,
+    ownership: u64,
+    transition: u64,
+    call: &str,
+) -> bool {
+    let claim = crate::model::ClaimInput {
+        subject: subject.to_owned(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.to_owned()),
+        fields: BTreeMap::from([
+            ("severity".into(), Value::String("warning".into())),
+            ("status".into(), Value::String("shown".into())),
+            ("code".into(), Value::String(PROMPT_CALL_CODE.into())),
+            ("driver".into(), Value::String(driver.into())),
+            ("ownership_sequence".into(), Value::from(ownership)),
+            (
+                "matched_line".into(),
+                Value::String(serde_json::json!({"call_id": call, "transition": transition}).to_string()),
+            ),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(format!("{PROMPT_CALL_CODE}:{subject}:{ownership}:{transition}")),
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.post::<_, Value>("/v1/claims", &claim),
+    )
+    .await
+    .is_ok_and(|posted| posted.is_ok())
+}
 
 /// Poll `state` until the prompt is answered (its answer), gone, or `wait` runs out (none).
 fn wait_for_prompt_answer(
