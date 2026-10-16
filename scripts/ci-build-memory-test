@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Synthetic cgroup counter controls; no host reads or compilation."""
 import runpy
+import contextlib
+import io
+import json
 from pathlib import Path
 import unittest
 import tempfile
@@ -16,6 +19,28 @@ def group(identity=(1, 2), events='oom 3\noom_kill 1\n'):
 
 
 class Controls(unittest.TestCase):
+    def test_success_after_preserves_observed_kill_and_unknown_baseline(self):
+        main = module['main']
+        for baseline in (group(), None):
+            with self.subTest(baseline=baseline), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / 'ci-build-memory'
+                directory.mkdir()
+                if baseline is not None:
+                    (directory / 'before.json').write_text(json.dumps(baseline))
+                after = group(events='oom 5\noom_kill 2\n')
+                after['build_step_outcome'] = 'success'
+                with patch('sys.argv', ['ci-build-memory', 'after']), \
+                     patch.dict('os.environ', RUNNER_TEMP=temporary, BUILD_STEP_OUTCOME='success'), \
+                     patch.dict(main.__globals__, snapshot=lambda: after), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    main()
+                receipt = json.loads((directory / 'after.json').read_text())
+                self.assertEqual(receipt['build_step_outcome'], 'success')
+                if baseline is None:
+                    self.assertEqual(receipt['deltas'], 'UNKNOWN: baseline unavailable')
+                else:
+                    self.assertEqual(receipt['deltas'][0]['events_delta']['memory.events']['oom_kill'], 1)
+
     def test_cumulative_oom_does_not_become_new_oom(self):
         self.assertEqual(delta(group(), group())[0]['events_delta']['memory.events']['oom_kill'], 0)
 

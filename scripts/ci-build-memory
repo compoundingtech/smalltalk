@@ -90,12 +90,12 @@ def delta(before, after):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase', choices=('before', 'failure'))
+    parser.add_argument('phase', choices=('before', 'after', 'failure'))
     args = parser.parse_args()
     directory = Path(os.environ['RUNNER_TEMP']) / 'ci-build-memory'
     directory.mkdir(exist_ok=True)
     value = snapshot()
-    if args.phase == 'failure':
+    if args.phase != 'before':
         try:
             before = json.loads((directory / 'before.json').read_text())
             value['deltas'] = delta(before, value)
