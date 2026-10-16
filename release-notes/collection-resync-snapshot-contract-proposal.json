@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Document an opt-in client-v0 collection resync snapshot contract for review; no behavior change",
+  "replay": {"status": "none", "detail": "Proposal only; journal replay and collection delivery are unchanged."},
+  "schema": {"status": "none", "detail": "No wire or storage schema changes are implemented in this PR."},
+  "rules": {"status": "none", "detail": "Checkpoint, retention and fleet rules are unchanged."},
+  "compatibility": {"status": "none", "detail": "The proposed opt-in capability is not implemented; all current clients and daemons retain their current collection behavior."},
+  "downtime": {"status": "none", "detail": "No daemon change or rollout."},
+  "manual": {"status": "none", "detail": "No configuration or operator action."},
+  "recovery": {"status": "none", "detail": "Reverting removes the proposal and source comment only."}
+}

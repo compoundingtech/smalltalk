@@ -1117,6 +1117,11 @@ async fn deliver_ivm_collection(
             result
         }
         Output::Silent => Refreshed::Current,
+        // Proposed opt-in resync-snapshot contract:
+        // docs/st3/client-v0/collection-resync-snapshot-proposal.md. On an IVM
+        // journal gap, the replacement authorized window and its continuation
+        // must come from one read cut and one frame. Keep this legacy branch for
+        // clients that have not opted in; this comment changes no wire behavior.
         output @ (Output::Unavailable | Output::Resync) => {
             let code = if matches!(output, Output::Resync) { "cursor-gap" } else { "internal" };
             if send_collection(socket, json!({"kind":"resync", "id":subscription.request.id,
