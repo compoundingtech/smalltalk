@@ -633,6 +633,9 @@ fn clone_file(_source: &Path, _target: &Path) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
+/// Proof copies rewrite the store; keep their cache independent of ordinary reader targets.
+const CHECKPOINT_COPY_CACHE_KIB: usize = 8192;
+
 fn open_checkpoint_copy(copy: &Path) -> Result<Connection> {
     let connection = Connection::open(copy)?;
     projection_digest::register(&connection)?;
@@ -642,7 +645,7 @@ fn open_checkpoint_copy(copy: &Path) -> Result<Connection> {
     connection.execute_batch(&format!(
         "PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE; PRAGMA synchronous = OFF;
          PRAGMA cache_size = -{}; PRAGMA temp_store = FILE;",
-        crate::sqlite::READ_CACHE_KIB,
+        CHECKPOINT_COPY_CACHE_KIB,
     ))?;
     Ok(connection)
 }
@@ -1799,7 +1802,7 @@ mod memory_tests {
         );
         assert_eq!(
             connection.query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0)).unwrap(),
-            -(crate::sqlite::READ_CACHE_KIB as i64)
+            -8192
         );
         assert_eq!(
             connection.query_row("PRAGMA temp_store", [], |row| row.get::<_, i64>(0)).unwrap(),
