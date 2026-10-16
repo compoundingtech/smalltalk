@@ -134,8 +134,45 @@ fn enabled() -> bool {
     std::env::var("ST3_PUBLISHED_LISTS").as_deref() != Ok("off")
 }
 
+/// Observe completion of the generic list publications at a seeded graph cut.
+/// The lifecycle owner must call [`start_published_lists`] first. This never starts or
+/// folds a list; callers choose their own timeout. Optional disabled lists are skipped.
+pub async fn wait_published_lists_at_least(store: &Store, cut: u64) -> anyhow::Result<()> {
+    async fn wait<R>(list: &PublishedList<R>, cut: u64) -> anyhow::Result<()> {
+        use crate::store::published_list::ListRead;
+        let mut changes = list.subscribe();
+        loop {
+            match list.current() {
+                ListRead::Served(publication, _) if publication.cut >= cut => return Ok(()),
+                ListRead::NeverStarted => anyhow::bail!("the list refresher has not started"),
+                ListRead::Ended => anyhow::bail!("the list refresher ended before publication"),
+                ListRead::Served(_, _) | ListRead::NotReady => {}
+            }
+            changes.changed().await?;
+        }
+    }
+    wait(store.published_runtime_list(), cut).await?;
+    if store.published_missions_list().is_started() {
+        wait(store.published_missions_list(), cut).await?;
+    }
+    if store.published_work_list().is_started() {
+        wait(store.published_work_list(), cut).await?;
+    }
+    Ok(())
+}
+
 /// Start the refreshers of the missions and work lists, as the daemon starts.
 pub fn start_published_lists(state: &AppState) {
+    client_v0::published_runtimes::register_metrics(&state.store);
+    spawn(
+        state.store.clone(),
+        |store| store.published_runtime_list(),
+        "runtimes",
+        "runtimes/refresh",
+        client_v0::published_runtimes::fold,
+        true,
+        false,
+    );
     if !enabled() {
         return;
     }

@@ -64,6 +64,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case projectionDetailTooLarge, projectionDetailInvalidSource
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
+    case runtimeListNotReady, runtimeListEnded
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge, messageStoreFull, longMessageSignatureUnsupported
     case unknown(String)
@@ -96,6 +97,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
         case "message-too-large": .messageTooLarge; case "message-store-full": .messageStoreFull; case "long-message-signature-unsupported": .longMessageSignatureUnsupported
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
+        case "runtime-list-not-ready": .runtimeListNotReady; case "runtime-list-ended": .runtimeListEnded
         default: .unknown(raw)
         }
     }
@@ -126,6 +128,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
         case .messageTooLarge: "message-too-large"; case .messageStoreFull: "message-store-full"; case .longMessageSignatureUnsupported: "long-message-signature-unsupported"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
+        case .runtimeListNotReady: "runtime-list-not-ready"; case .runtimeListEnded: "runtime-list-ended"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)

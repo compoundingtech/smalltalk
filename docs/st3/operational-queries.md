@@ -7,6 +7,25 @@ incomplete step preview.
 the preview is incomplete. A page also respects a byte budget; its cursor resumes after the last
 returned mission. Full step details remain available by exact run subject.
 
+Current `/v1/client/runtimes` pages serve the latest complete background publication,
+under that publication's snapshot and `published_at` time. Reads clone only the requested
+page: they do not reduce runtime status or hash the complete collection. The shared
+collection refresher coalesces commits, runs one rebuild at a time, and pauses at least
+one second and as long as the preceding rebuild between attempts. Before the first
+publication, reads return HTTP 503 `runtime-list-not-ready` with `retryable=true`; a
+stopped refresher returns `runtime-list-ended` with `retryable=false` and requires a restart.
+Continuations retain the first page's frozen collection until its existing cursor expiry,
+including across republishes. Repeated first-page reads reuse that collection's cache entry
+and original expiry. Terminal permissions are applied to
+each returned page for its authenticated caller. `history=true` and exact runtime detail
+reads keep their existing snapshot reductions.
+
+OTel metrics `st.runtime_list.publication.age` (gauge, seconds) and
+`st.runtime_list.rebuild.duration` (histogram, seconds) distinguish stale publications
+from slow rebuild attempts. Publication age is absent until a complete list is available;
+rebuild duration includes failed attempts. The background rebuild still reduces the full
+runtime collection; publication removes that work from ordinary list requests.
+
 ```sh
 st missions ls --all
 st missions ls --all --cursor 'CURSOR'

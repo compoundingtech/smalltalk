@@ -95,6 +95,8 @@ pub enum ErrorCode {
     RateLimited,
     RuntimeNotLocal,
     RuntimeAuthorityIndeterminate,
+    RuntimeListNotReady,
+    RuntimeListEnded,
     RemoteUnavailable,
     TerminalUnavailable,
     TerminalEnded,

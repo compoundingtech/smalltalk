@@ -80,8 +80,6 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
     ("GET /v1/attention", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
-    // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
-    ("GET /v1/client/runtimes", 6.0),
     // Doctor checks the whole store, as it must (11.4x full-scan steps).
     ("GET /v1/doctor", 17.0),
     // Fleet and replication status count every replica record (9.7x).
@@ -2079,6 +2077,11 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
     };
+    let seeded_cut = store.index().unwrap();
+    st3::api::start_published_lists(&state);
+    tokio::time::timeout(Duration::from_secs(120),
+        st3::api::wait_published_lists_at_least(&store, seeded_cut))
+        .await.expect("cost census lists publish the seeded store cut").unwrap();
     let server_socket = socket.clone();
     let server =
         tokio::spawn(

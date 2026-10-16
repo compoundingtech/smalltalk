@@ -1515,8 +1515,15 @@ Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe
 `forbidden`, `unsupported-capability`, `validation-failed`, `idempotency-conflict`, `stale-fence`,
 `cursor-gap`, `page-cursor-expired`, `projection-detail-too-large`,
 `projection-detail-invalid-source`, `rate-limited`, `runtime-not-local`,
-`runtime-authority-indeterminate`, `remote-unavailable`, `terminal-unavailable`, `terminal-ended`,
-and `internal`.
+`runtime-authority-indeterminate`, `runtime-list-not-ready`, `runtime-list-ended`,
+`remote-unavailable`, `terminal-unavailable`, `terminal-ended`, and `internal`.
+
+Current runtime lists return HTTP 503 `runtime-list-not-ready` with `retryable: true`
+until their first complete publication. `runtime-list-ended` is HTTP 503 with
+`retryable: false` and requires daemon restart. Both codes are typed in the generated clients.
+An embedded `api::router` owns routes, not daemon background tasks: its owner calls
+`start_published_lists` before serving and can await `wait_published_lists_at_least` for a
+seeded store cut. A bare router refuses unpublished runtime reads rather than folding on demand.
 
 Revoking a pairing from a non-issuer returns HTTP 409 with `code: issuer-required`,
 `retryable: false`, and `details.issuer_host_id` naming the authoritative issuer.

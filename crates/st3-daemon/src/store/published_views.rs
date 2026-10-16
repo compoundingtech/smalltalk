@@ -6,8 +6,8 @@
 use super::*;
 
 /// The collections a refresher may publish. Agents keep their own roster signal.
-pub(crate) const PUBLISHED_COLLECTIONS: [&str; 6] =
-    ["missions", "work", "attention", "summary", "glasses", "arrangements"];
+pub(crate) const PUBLISHED_COLLECTIONS: [&str; 7] =
+    ["missions", "work", "attention", "summary", "glasses", "arrangements", "runtimes"];
 
 /// One collection's publication state.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]

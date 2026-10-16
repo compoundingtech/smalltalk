@@ -868,6 +868,10 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::RuntimeAuthorityIndeterminate => {
             "st cannot tell yet which host runs this".into()
         }
+        ErrorCode::RuntimeListNotReady => {
+            "st is still preparing the runtime list; try again shortly".into()
+        }
+        ErrorCode::RuntimeListEnded => "the runtime list stopped updating; restart st".into(),
         ErrorCode::IdempotencyConflict => {
             "this was already sent once in another form, so it was not sent again".into()
         }
