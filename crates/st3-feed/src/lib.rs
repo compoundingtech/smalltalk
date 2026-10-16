@@ -39,8 +39,10 @@ const QUIET_BEFORE_PING: Duration = Duration::from_secs(10);
 const PONG_WAIT: Duration = Duration::from_secs(8);
 
 /// The waits between attempts to reach st again, reset once st answers.
-/// How long a window must stay unserved before st's reason for it is reported.
-const REPORT_AFTER: Duration = Duration::from_secs(1);
+/// How long a window must stay unserved before st's reason for it is reported. A resync or a
+/// slow answer from a daemon that is catching up clears itself within this; saying it sooner puts
+/// an error in front of a person for something that mends before they could read it.
+const REPORT_AFTER: Duration = Duration::from_secs(20);
 
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
@@ -675,9 +677,11 @@ async fn connected(
                             && !(left(window, *missions) || matches!(window, Window::Inventory(inventory) if !inventory_granted || !inventories.contains(inventory)))
                         {
                             if matches!(window, Window::Inventory(_)) {
-                                if let Some(message) = message {
+                                if let Some(message) = message
+                                    && !pending_reports.iter().any(|(pending, _, _)| *pending == window)
+                                {
                                     let plain = st3_client::plain_message(code.as_ref(), &message);
-                                    if updates.send(Update::WindowFailed(window, plain)).is_err() { return Ended::Closed; }
+                                    pending_reports.push((window, Instant::now() + REPORT_AFTER, plain));
                                 }
                                 continue;
                             }
@@ -717,16 +721,16 @@ async fn connected(
                                 continue;
                             }
                             if matches!(window, Window::Inventory(_)) {
-                                let plain = st3_client::plain_message(code.as_ref(), &message);
-                                if updates.send(Update::WindowFailed(window, plain)).is_err() { return Ended::Closed; }
+                                if !pending_reports.iter().any(|(pending, _, _)| *pending == window) {
+                                    let plain = st3_client::plain_message(code.as_ref(), &message);
+                                    pending_reports.push((window, Instant::now() + REPORT_AFTER, plain));
+                                }
                                 continue;
                             }
-                            // Said once; the retries are quiet until it loads.
+                            // Said once, and only if it lasts; the retries are quiet until it loads.
                             if window_retries.failed(window, Instant::now()) {
                                 let message = st3_client::plain_message(code.as_ref(), &message);
-                                if updates.send(Update::WindowFailed(window, message)).is_err() {
-                                    return Ended::Closed;
-                                }
+                                pending_reports.push((window, Instant::now() + REPORT_AFTER, message));
                             }
                         } else if id == TERMINAL {
                             terminal_failed(updates, following, code, message);

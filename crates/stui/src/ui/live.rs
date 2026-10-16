@@ -310,6 +310,10 @@ fn terminal_rows(items: Vec<Resource>) -> Vec<super::resource_sidebar::ResourceR
     }).collect()
 }
 
+/// How long a polled inventory must keep failing before its error is shown (the feed's windows
+/// wait the same before reporting).
+const LEGACY_REPORT_AFTER: Duration = Duration::from_secs(20);
+
 fn window_label(window: Window) -> String {
     match window { Window::Inventory(inventory) => inventory.collection().into(), _ => format!("{window:?}") }
 }
@@ -579,6 +583,9 @@ pub fn run(context: Context) -> Result<()> {
     let mut inventory_sent: Option<Inventories> = None;
     let mut usage_wanted_hours = None;
     let mut legacy_requested = BTreeSet::new();
+    // When each polled inventory first failed on this run of failures: a read that fails for a
+    // moment (a daemon catching up) is not said; one that keeps failing is.
+    let mut legacy_failing: BTreeMap<&'static str, Instant> = BTreeMap::new();
     let mut legacy_pending = BTreeSet::new();
     // The palette's conversation search: what st was last asked, and what is typed since when.
     let mut said_asked: Option<String> = None;
@@ -876,7 +883,10 @@ pub fn run(context: Context) -> Result<()> {
                 feed::Update::WindowFailed(window, error) => {
                     if let Window::Inventory(Inventory::Clients) = window && model.clients.is_none() { model.clients = Some(Err(error.clone())); }
                     if let Window::Inventory(Inventory::Usage(hours)) = window && hours == ui.usage_hours && model.usage.is_none() { model.usage = Some(Err(error.clone())); }
-                    ui.flash(format!("Could not load {}: {error}", window_label(window)));
+                    // Not flashed: a window that fails is retried quietly and the last good view
+                    // stays. What is left to say (it has not loaded, or has stayed unserved past
+                    // `REPORT_AFTER`, which the feed waits before sending this) goes where the
+                    // window is shown.
                     extras.window_errors.insert(window_label(window), error);
                     changed = true;
                 }
@@ -1130,30 +1140,39 @@ pub fn run(context: Context) -> Result<()> {
                         InventoryRead::Clients(outcome) => outcome.as_ref().err(),
                         InventoryRead::Usage(_, outcome) => outcome.as_ref().err(),
                     };
-                    if let Some(error) = error { extras.window_errors.insert(name.into(), error.clone()); }
-                    else { extras.window_errors.remove(name); }
+                    match error {
+                        Some(error) => {
+                            let since = *legacy_failing.entry(name).or_insert_with(Instant::now);
+                            if since.elapsed() >= LEGACY_REPORT_AFTER { extras.window_errors.insert(name.into(), error.clone()); }
+                        }
+                        None => {
+                            legacy_failing.remove(name);
+                            extras.window_errors.remove(name);
+                        }
+                    }
                     match result {
-                        InventoryRead::Rows(inventory, outcome) => match outcome {
-                            Ok(rows) => match inventory {
+                        // A failed read keeps the last good rows; the stale note says so if it lasts.
+                        InventoryRead::Rows(inventory, outcome) => if let Ok(rows) = outcome {
+                            match inventory {
                                 Inventory::Machines => model.machines = rows,
                                 Inventory::Devices => model.devices = rows,
                                 Inventory::Sessions => model.sessions = rows,
                                 _ => unreachable!(),
-                            },
-                            Err(error) => ui.flash(format!("Could not load {}: {error}", inventory.collection())),
+                            }
                         },
-                        InventoryRead::Terminals(outcome) => match outcome {
-                            Ok((rows, has_more)) => { ui.resource_sidebar.terminals = terminal_rows(rows); ui.resource_sidebar.terminals_has_more = has_more; },
-                            Err(error) => ui.flash(format!("Could not load terminals: {error}")),
+                        InventoryRead::Terminals(outcome) => if let Ok((rows, has_more)) = outcome {
+                            ui.resource_sidebar.terminals = terminal_rows(rows);
+                            ui.resource_sidebar.terminals_has_more = has_more;
                         },
                         InventoryRead::Clients(outcome) => match outcome {
                             Ok(clients) => model.clients = Some(Ok(clients)),
-                            Err(error) if matches!(model.clients, Some(Ok(_))) => ui.flash(format!("Could not read clients again: {error}")),
+                            // The last good list stays; the stale note says so if it keeps failing.
+                            Err(_) if matches!(model.clients, Some(Ok(_))) => {}
                             Err(error) => model.clients = Some(Err(error)),
                         },
                         InventoryRead::Usage(hours, outcome) if hours == ui.usage_hours => match outcome {
                             Ok(period) => model.usage = Some(Ok(period)),
-                            Err(error) if matches!(model.usage, Some(Ok(_))) => ui.flash(format!("Could not read usage again: {error}")),
+                            Err(_) if matches!(model.usage, Some(Ok(_))) => {}
                             Err(error) => model.usage = Some(Err(error)),
                         },
                         InventoryRead::Usage(_, _) => {},
