@@ -51,6 +51,7 @@ pub mod harness_events;
 /// The lifecycle hook set st3 publishes beneath its own state directory.
 pub mod hooks;
 pub mod incremental;
+pub mod demo;
 pub mod instance;
 pub mod lane;
 pub mod mailbox;

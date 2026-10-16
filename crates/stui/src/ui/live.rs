@@ -174,6 +174,8 @@ pub struct Context {
     pub initial_subject: Option<String>,
     /// Where seats on this machine leave requests to show something; none for a paired device.
     pub requests: Option<std::path::PathBuf>,
+    /// The demo `st demo play` runs in this interface: its advance key and typing.
+    pub playback: Option<super::playback::Playback>,
 }
 
 // Setup's initial destination waits for a live inventory, rather than cached agent data.
@@ -358,6 +360,8 @@ enum Fetched {
         took: Duration,
     },
     Preview(String, Load<MissionPreview>),
+    /// A document's text, by the reference its pane names, or why it could not be read.
+    Document(String, Result<String, String>),
     /// The message behind an unread-message item: sender, title and text.
     Body(String, String, Option<String>, String),
     Notice(String),
@@ -463,6 +467,7 @@ pub fn run(context: Context) -> Result<()> {
         process_started,
         mut initial_subject,
         requests,
+        playback,
     } = context;
     let (fetched_tx, fetched) = mpsc::channel::<Fetched>();
     // What seats ask this terminal to show (`st ui open`); a paired device has no seats here.
@@ -495,6 +500,11 @@ pub fn run(context: Context) -> Result<()> {
     let mut pending: Vec<Pending> = Vec::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
     ui.load_prefs();
+    // A demo's agents are scripted stand-ins whose terminals stay empty: they open on their
+    // conversation, without changing this device's choice.
+    if playback.is_some() {
+        ui.conversation_first = Some(true);
+    }
     ui.drafts_path = super::drafts_store::path();
     let (_run, earlier) = super::lastrun::begin(&crate::version::short(crate::version::now()));
     ui.load_drafts();
@@ -966,6 +976,15 @@ pub fn run(context: Context) -> Result<()> {
                     content_reads.complete(&key);
                     ui.content.complete(key, result);
                 }
+                Fetched::Document(reference, result) => {
+                    ui.documents.insert(
+                        reference,
+                        match result {
+                            Ok(text) => Load::Ready(text),
+                            Err(why) => Load::Failed(why),
+                        },
+                    );
+                }
                 Fetched::Read(id, result) => {
                     read_receipts.completed(id, result, Instant::now());
                 }
@@ -1245,6 +1264,22 @@ pub fn run(context: Context) -> Result<()> {
             });
         }
         resources_shown = showing_resources;
+        // A document is read once, when its pane is first shown.
+        if let Some(super::pane::Pane::Document(reference)) = ui.focused_pane()
+            && !ui.documents.contains_key(&reference)
+        {
+            ui.documents.insert(reference.clone(), Load::Loading);
+            let reader = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let outcome = reader
+                    .document_get(&reference)
+                    .await
+                    .map(|document| String::from_utf8_lossy(&document.value.bytes).into_owned())
+                    .map_err(|error| error.plain());
+                let _ = tx.send(Fetched::Document(reference, outcome));
+            });
+        }
         if tab != shown_tab {
             // The terminal is followed only while it is on screen: leaving the Agents tab
             // pauses it, and coming back shows the current screen first.
@@ -1817,6 +1852,14 @@ pub fn run(context: Context) -> Result<()> {
             let _ = commands.send(Command::Missions { follow: wanted });
         }
         answer_open_requests(&mut ui, &mut open_requests, agents_live && glasses_ready);
+        for typed in playback.iter().flat_map(super::playback::Playback::typed) {
+            match typed {
+                super::playback::Typed::Text(text) => ui.paste(text),
+                super::playback::Typed::Send => {
+                    ui.input_event(Event::Key(crossterm::event::KeyCode::Enter.into()));
+                }
+            }
+        }
         ui.step_voice();
         ui.step_terminal_hold();
         ui.step_default_view();
@@ -1977,6 +2020,11 @@ pub fn run(context: Context) -> Result<()> {
             |input| {
                 cancel_initial_subject(&mut initial_subject, &input);
                 match input {
+                    Event::Key(key)
+                        if playback.as_ref().is_some_and(|playback| playback.take(&key)) =>
+                    {
+                        false
+                    }
                     Event::Key(key) if reconnect_key(&key, extras.live) => {
                         let _ = commands.send(Command::Reconnect);
                         true
