@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Move main.rs's command implementations into one file per command.",
+  "replay": {
+    "status": "none",
+    "detail": "Source files moved within the st3 crate only; no behaviour, protocol, schema, CLI output or test change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Source files moved within the st3 crate only; no behaviour, protocol, schema, CLI output or test change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Source files moved within the st3 crate only; no behaviour, protocol, schema, CLI output or test change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Source files moved within the st3 crate only; no behaviour, protocol, schema, CLI output or test change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Source files moved within the st3 crate only; no behaviour, protocol, schema, CLI output or test change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Source files moved within the st3 crate only; no behaviour, protocol, schema, CLI output or test change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Source files moved within the st3 crate only; no behaviour, protocol, schema, CLI output or test change."
+  }
+}

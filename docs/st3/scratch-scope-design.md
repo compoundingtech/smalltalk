@@ -18,8 +18,8 @@ membership change, document write, credential use or service operation.
 This read uses main `2bc2ed54a900d884c99781b2a0ebc531e531d2e5` on 2026-10-14. It is source
 evidence, not an installed-build or runtime test receipt.
 
-* [main.rs](../../crates/st3/src/main.rs): `fleet_person` requires a person path for invite;
-  `run_fleet` can found a fleet without that helper. Create and join already lock the state
+* [main.rs](../../crates/st3/src/main.rs) and [fleet_cli.rs](../../crates/st3/src/fleet_cli.rs): `fleet_person`
+  requires a person path for invite; `run_fleet` can found a fleet without that helper. Create and join already lock the state
   admission boundary. A separate state directory alone supplies no agent bootstrap authority.
 * [api.rs](../../crates/st3/src/api.rs): `harness_ancestor` and `guard_bound_request` bind Linux
   harness requests to their agent. Invite creation and revocation require `concrete_person`.
