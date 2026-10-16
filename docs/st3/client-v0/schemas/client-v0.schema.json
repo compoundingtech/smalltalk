@@ -716,7 +716,32 @@
         "until_ms": { "type": "integer", "minimum": 0 },
         "rows": { "type": "array", "items": { "$ref": "#/$defs/UsageRow" } },
         "limits": { "type": "array", "items": { "$ref": "#/$defs/UsageLimit" } },
+        "accounts": { "type": "array", "items": { "$ref": "#/$defs/UsageAccount" }, "description": "Every declared account in name order, so each panel lists the same accounts. Absent on older servers." },
         "agent_messages": { "$ref": "#/$defs/AgentMessageEstimate" }
+      }
+    },
+    "UsageAccount": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "provider", "kind"],
+      "properties": {
+        "name": { "type": "string", "description": "The declared name, like nathan/claude-1." },
+        "account": { "type": "string", "description": "The label its usage rows and limits carry, joining them to this account." },
+        "driver": { "type": "string" },
+        "provider": { "type": "string" },
+        "kind": { "enum": ["subscription", "api-key"] },
+        "plan": { "type": "string" },
+        "credits": { "$ref": "#/$defs/UsageCredits" }
+      }
+    },
+    "UsageCredits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["budget_microusd", "used_microusd", "unpriced_tokens", "period_start_ms"],
+      "description": "An api-key account's spend so far in the UTC calendar month of the period's end, against its monthly budget. Costs are API-equivalent; tokens with no price are counted apart, never as free.",
+      "properties": {
+        "budget_microusd": { "type": "integer", "minimum": 0 },
+        "used_microusd": { "type": "integer", "minimum": 0 },
+        "unpriced_tokens": { "type": "integer", "minimum": 0 },
+        "period_start_ms": { "type": "integer", "minimum": 0 }
       }
     },
     "AgentMessageEstimate": {
@@ -803,6 +828,7 @@
         "step": { "$ref": "#/$defs/Id" },
         "model": { "type": "string" },
         "account": { "type": "string" },
+        "account_ref": { "type": "string", "description": "The declared account this row's spend is read against, when one claims its label. Absent on older servers." },
         "host": { "type": "string" },
         "pricing": { "type": "string" },
         "native_session_id": { "type": "string" },

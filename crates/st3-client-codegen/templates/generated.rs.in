@@ -520,6 +520,10 @@ pub struct UsagePeriod {
     /// Each account's freshest limits reading; empty from a daemon that reports none.
     #[serde(default)]
     pub limits: Vec<UsageLimit>,
+    /// Every declared account in name order, so each panel lists the same accounts; empty from a
+    /// daemon that reports none.
+    #[serde(default)]
+    pub accounts: Vec<UsageAccount>,
     /// Daily planning estimate, including useful work; absent on older daemons.
     #[serde(default)]
     pub agent_messages: Option<AgentMessageEstimate>,
@@ -551,6 +555,37 @@ pub struct AgentMessageDay {
     pub low_percent: Option<f64>,
     #[serde(default)]
     pub high_percent: Option<f64>,
+}
+/// A declared account, listed whether or not it spent or reported limits in the period.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsageAccount {
+    /// The declared name, like `nathan/claude-1`.
+    pub name: String,
+    /// The label its usage rows and limits carry, joining them to this account.
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub driver: Option<String>,
+    pub provider: String,
+    pub kind: UsageAccountKind,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub credits: Option<UsageCredits>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageAccountKind {
+    Subscription,
+    ApiKey,
+}
+/// An api-key account's spend so far in the UTC calendar month of the period's end.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsageCredits {
+    pub budget_microusd: u64,
+    pub used_microusd: u64,
+    pub unpriced_tokens: u64,
+    pub period_start_ms: u64,
 }
 /// An account's 5-hour and weekly limits, as the seat that measured it most recently read them.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -591,6 +626,9 @@ pub struct UsageRow {
     pub model: Option<String>,
     #[serde(default)]
     pub account: Option<String>,
+    /// The declared account this row's spend is read against, when one claims its label.
+    #[serde(default)]
+    pub account_ref: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]

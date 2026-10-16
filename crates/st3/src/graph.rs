@@ -1681,11 +1681,38 @@ fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
             "owner",
             "plan",
             "login",
+            "harness",
+            "monthly-credits-usd",
+            "identity",
         ],
         "account",
         "account",
     )?;
     required_child_string(body, "provider", "account")?;
+    child_string(body, "harness")?;
+    if let Some(credits) = child_integer(body, "monthly-credits-usd")?
+        && !(1..=1_000_000).contains(&credits)
+    {
+        return Err(St3Error::new(
+            "invalid-account-credits",
+            "an account's monthly credits are whole dollars, from 1 to 1000000",
+        ));
+    }
+    // An identity is the opaque provider label a reading carried before the account was declared.
+    for identity in repeated_child_strings(body, "identity")? {
+        let valid = identity.split_once('/').is_some_and(|(driver, digest)| {
+            !driver.is_empty()
+                && driver.bytes().all(|byte| byte.is_ascii_lowercase())
+                && digest.len() == 16
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        if !valid {
+            return Err(St3Error::new(
+                "invalid-account-identity",
+                format!("an account identity is a provider label like `claude/0123456789abcdef`; got `{identity}`"),
+            ));
+        }
+    }
     child_string(body, "external-account")?;
     if let Some(auth) = child_string(body, "auth-type")?
         && !matches!(auth.as_str(), "subscription" | "api-key")
@@ -5910,6 +5937,38 @@ agent "seat" {
             "node",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn an_account_may_claim_provider_labels_and_name_a_key_harness_and_monthly_credits() {
+        let account = |body: &str| {
+            format!("version 2\naccount \"ada/key\" {{\n  provider \"anthropic\"\n{body}\n}}\n")
+        };
+        let intent = parse_intent(
+            &account(
+                "auth-type \"api-key\"\nharness \"omp\"\nmonthly-credits-usd 200\nidentity \"claude/0123456789abcdef\"\nidentity \"claude/fedcba9876543210\"\nlogin \"~/.config/anthropic/api-key\" host=\"alder\"",
+            ),
+            "node",
+        )
+        .unwrap();
+        let declared = crate::accounts::parse_account(
+            "account/ada/key",
+            &intent.subjects["account/ada/key"].desired,
+        )
+        .unwrap();
+        assert!(declared.is_api_key());
+        assert_eq!(declared.driver(), Some("omp"));
+        assert_eq!(declared.monthly_credits_usd, Some(200));
+        assert_eq!(declared.identities.len(), 2);
+
+        for (body, code) in [
+            ("monthly-credits-usd 0", "invalid-account-credits"),
+            ("monthly-credits-usd \"200\"", "expected-integer"),
+            ("identity \"someone@example.com\"", "invalid-account-identity"),
+            ("identity \"claude/short\"", "invalid-account-identity"),
+        ] {
+            assert_eq!(parse_intent(&account(body), "node").unwrap_err().code, code, "{body}");
+        }
     }
 
     #[test]

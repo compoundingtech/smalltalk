@@ -121,6 +121,58 @@ reported both under a provider identity and under a declared account, that ident
 the declared account's, so `st usage` and the pool show the account once, with the live reading.
 Identity readings that share no seat with a declared account are never assigned to one.
 
+A seat that sets no login variable runs on the harness's default login (`~/.claude` for Claude Code,
+`~/.codex` for Codex), so when a declared account's login on that host is that directory the seat
+runs on the account too. A seat for a harness that reads a key file instead (`omp`) runs on the one
+`api-key` account that names its `harness` and has a login on the host.
+
+### Every panel lists the declared accounts
+
+`st usage`, the terminal UI, the phone and the web monitor list the same accounts: every declared
+account, in name order, whether or not it spent or reported limits, then anything st recorded that
+no declaration claims. Nothing is hidden to make the list tidy. Two more declaration children keep
+history and unrestarted seats attributed:
+
+```kdl
+account "ada/claude-1" {
+  provider "anthropic"
+  identity "claude/0123456789abcdef"      // the provider label older readings carried
+  login "~/.claude"
+}
+
+account "ada/api-key" {
+  provider "anthropic"
+  auth-type "api-key"
+  harness "omp"                            // the harness that reads the key
+  monthly-credits-usd 200                  // what it may spend each calendar month
+  login "~/.config/anthropic/api-key" host="alder"   // the key file's path, never the key
+}
+```
+
+- `identity` names a provider label (`claude/<digest>`, `codex/<digest>`) as this account's own. A
+  usage row or limits reading under it is read as the account, whichever seat produced it. It is the
+  one explicit exception to "identity readings that share no seat with a declared account are never
+  assigned to one": a person said so. The label is an opaque digest, never an email or a provider
+  account ID. Naming an account does not change whether it is exempt from the weekly stop: the
+  `[limits] exempt_accounts` entry that listed its provider label keeps matching.
+- A usage row that carries no account is read as the one declared account its seat's harness has on
+  the row's host, when there is exactly one. With two it stays unattributed.
+- `auth-type "api-key"` marks an account that pays per token. It has no weekly limits; with
+  `monthly-credits-usd` the panels show `credits used of $200 this month`: the account's spend in
+  the UTC calendar month of the period's end, at API-equivalent list prices, with a `+` when some
+  tokens had no price.
+
+These readings are made when the report is read, from today's declarations, so they are a view of
+spend and not an invoice. Declaring a second account for a harness on a host (or removing one)
+changes which account the past unlabelled rows there are read as, because "exactly one" no longer
+holds or now does. An `omp` row is read as the one `api-key` account that names `omp` on its host,
+whichever key that seat really used; credits used is therefore the spend of those seats at API list
+prices, not what the provider billed. A report reads its rows, limits and the month's rows in
+separate snapshots, which is harmless for a display.
+
+`st --json usage` and the client's `usage.period` return these as `accounts`, and each row carries
+`account_ref` when a declaration claims it.
+
 A limits reading older than the limits cadence (`[limits] fresh`, one hour unless configured) is the
 last known reading, not the current one. `st --json usage` marks it `stale: true`, and `st usage`
 ends its row with `stale`. The pool chooses by the account's freshest reading.
