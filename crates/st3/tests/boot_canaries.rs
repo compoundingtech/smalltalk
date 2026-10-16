@@ -97,6 +97,22 @@ fn interrupted_tests_keep_logs_and_pending_observations() {
     );
 }
 
+#[test]
+fn event_waits_find_transient_states_and_fail_at_once_when_waiting_cannot_help() {
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(repo.join("scripts/st3-events-test"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn canary(harness: &str, scenario: &str) {
     let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let in_ci = std::env::var_os("CI_RUN_ID").is_some();

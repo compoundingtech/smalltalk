@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Prove the test-side event wait (st3_events): history from a mark, not snapshots."""
+from http.server import BaseHTTPRequestHandler
+import json
+import os
+from pathlib import Path
+import socketserver
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from urllib.parse import parse_qs, urlparse
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from st3_events import EventWaitFailed, Events, claim
+
+
+class FakeDaemon(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """`/v1/health` and `/v1/events/page` as the daemon answers them: the subject filter runs
+    after the row limit, so a filtered page can be empty while `next_after` moves on."""
+    daemon_threads = True
+
+    def __init__(self, path):
+        self.log, self.changed, self.pages = [], threading.Condition(), []
+        self.gone = self.hang = self.dead = self.malformed = False
+        super().__init__(str(path), Handler)
+
+    def append(self, kind, subject, **fields):
+        with self.changed:
+            self.log.append({"store_index": len(self.log) + 1, "kind": kind, "subject": subject,
+                             "body": {"fields": fields}})
+            self.changed.notify_all()
+
+    def page(self, after, subject, limit, wait, timeout_ms):
+        deadline = time.monotonic() + timeout_ms / 1000
+        with self.changed:
+            while wait and len(self.log) <= after and not self.hang:
+                if not self.changed.wait(max(0, deadline - time.monotonic())) and time.monotonic() >= deadline:
+                    break
+            while self.hang:
+                self.changed.wait(0.05)
+            if self.dead:
+                return None
+            scanned = self.log[after:after + limit]
+            items = [row for row in scanned if subject is None or row["subject"] == subject]
+            return {"items": items, "next_after": scanned[-1]["store_index"] if scanned else None,
+                    "has_more": len(self.log) > after + limit, "frontier": len(self.log)}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def answer(self, status, payload):
+        # The daemon's envelope: the answer is under `value`.
+        if status == 200:
+            payload = {"api_version": "st3.v1", "store_index": len(self.server.log), "value": payload}
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        query = {key: values[0] for key, values in parse_qs(url.query).items()}
+        server = self.server
+        if url.path == "/v1/health":
+            return self.answer(200, {"status": "ready", "store_index": len(server.log)})
+        if url.path == "/v1/events/page":
+            if server.gone:
+                return self.answer(410, {"code": "cursor-gap", "details": {"resume_floor": 7}})
+            if server.malformed:
+                return self.answer(200, {"rows": []})
+            page = server.page(int(query["after"]), query.get("subject"), int(query.get("limit", 200)),
+                               query.get("wait") == "true", int(query.get("timeout_ms", 30000)))
+            if page is None:
+                # A daemon that dies drops the connection without an answer.
+                self.close_connection = True
+                return
+            server.pages.append((int(query["after"]), len(page["items"]), page["next_after"]))
+            return self.answer(200, page)
+        self.answer(404, {})
+
+    # Readers connect through an address the server cannot report; give it one.
+    def address_string(self):
+        return "unix"
+
+
+class EventWaitTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.socket = Path(self.directory.name) / "st.sock"
+        self.daemon = FakeDaemon(self.socket)
+        self.thread = threading.Thread(target=self.daemon.serve_forever, args=(0.02,), daemon=True)
+        self.thread.start()
+        self.events = Events(self.socket)
+
+    def tearDown(self):
+        with self.daemon.changed:
+            self.daemon.hang = False
+            self.daemon.changed.notify_all()
+        self.daemon.shutdown()
+        self.daemon.server_close()
+        self.directory.cleanup()
+
+    def later(self, seconds, action):
+        timer = threading.Timer(seconds, action)
+        timer.start()
+        self.addCleanup(timer.cancel)
+
+    def test_a_state_gone_after_100_ms_is_still_found_from_a_mark_taken_before_it(self):
+        self.daemon.append("harness.observed", "agent/a", state="running")
+        mark = self.events.mark()
+
+        def blink():
+            self.daemon.append("harness.diagnostic", "agent/a", status="blocked", incarnation_id="new")
+            time.sleep(0.1)
+            self.daemon.append("harness.diagnostic", "agent/a", status="recovered", incarnation_id="new")
+        blink()
+        # A snapshot now shows only the recovered state; the blocked one existed for 100 ms.
+        self.assertEqual(self.daemon.log[-1]["body"]["fields"]["status"], "recovered")
+        found = mark.wait(claim("harness.diagnostic", "agent/a", status="blocked",
+                                incarnation_id=lambda value: value != "old"), 5, "never blocked")
+        self.assertEqual(found["store_index"], 2)
+        # The mark continues after the match, so the later state is the next one found.
+        after = mark.wait(claim("harness.diagnostic", "agent/a", status="recovered"), 5, "never recovered")
+        self.assertEqual(after["store_index"], 3)
+
+    def test_a_wait_returns_when_the_event_is_appended_not_on_an_interval(self):
+        mark = self.events.mark()
+        self.later(0.2, lambda: self.daemon.append("message.read", "message/m1"))
+        started = time.monotonic()
+        mark.wait(claim("message.read", "message/m1"), 20, "never read")
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(len(self.daemon.pages), 1, "one long poll, answered by the append")
+
+    def test_an_empty_filtered_page_advances_the_cursor_to_next_after(self):
+        mark = self.events.mark()
+        for _ in range(450):
+            self.daemon.append("runtime.observed", "agent/other")
+        self.daemon.append("message.read", "message/m1")
+        found = mark.wait(claim("message.read", "message/m1"), 5, "never read")
+        self.assertEqual(found["store_index"], 451)
+        self.assertEqual([page[:2] for page in self.daemon.pages], [(0, 0), (200, 0), (400, 1)])
+
+    def test_a_cursor_gap_fails_at_once_as_a_test_bug(self):
+        mark = self.events.mark()
+        self.daemon.gone = True
+        started = time.monotonic()
+        with self.assertRaisesRegex(EventWaitFailed, "outside the retained event log"):
+            mark.wait(claim("message.read"), 30, "never read")
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_a_daemon_that_exits_fails_the_wait_at_once(self):
+        mark = self.events.mark()
+        exited = threading.Event()
+
+        def alive():
+            if exited.is_set():
+                raise EventWaitFailed("the daemon exited")
+        self.events.alive = alive
+        with self.daemon.changed:
+            self.daemon.hang = True
+
+        def die():
+            exited.set()
+            with self.daemon.changed:
+                self.daemon.dead, self.daemon.hang = True, False
+                self.daemon.changed.notify_all()
+        self.later(0.3, die)
+        started = time.monotonic()
+        with self.assertRaisesRegex(EventWaitFailed, "^the daemon exited$"):
+            mark.wait(claim("message.read"), 30, "never read")
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_the_ceiling_failure_names_the_predicate_and_the_last_20_events(self):
+        mark = self.events.mark()
+        for number in range(25):
+            self.daemon.append("runtime.observed", "agent/a", n=number)
+        wanted = claim("harness.diagnostic", "agent/a", status="blocked")
+        started = time.monotonic()
+        with self.assertRaises(EventWaitFailed) as failure:
+            mark.wait(wanted, 0.6, "the seat never blocked")
+        self.assertGreaterEqual(time.monotonic() - started, 0.6)
+        message = str(failure.exception)
+        self.assertIn("the seat never blocked", message)
+        self.assertIn("claim('harness.diagnostic', subject='agent/a', status='blocked')", message)
+        seen = json.loads(message.split("events seen: ", 1)[1].rstrip(")"))
+        self.assertEqual([row["fields"]["n"] for row in seen], list(range(5, 25)))
+
+    def test_an_unreadable_page_fails_at_once_instead_of_asking_again(self):
+        mark = self.events.mark()
+        self.daemon.malformed = True
+        started = time.monotonic()
+        with self.assertRaisesRegex(EventWaitFailed, "the event page answered 200"):
+            mark.wait(claim("message.read"), 30, "never read")
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_wait_state_rechecks_only_after_new_events(self):
+        mark = self.events.mark()
+        checks = []
+
+        def ready():
+            checks.append(len(self.daemon.log))
+            return len(self.daemon.log) >= 2 and "ready"
+        self.later(0.2, lambda: self.daemon.append("work.claimed", "step-run/x"))
+        self.later(0.4, lambda: self.daemon.append("work.claimed", "step-run/x"))
+        self.assertEqual(mark.wait_state(ready, 10, "never ready", subject="step-run/x"), "ready")
+        self.assertLessEqual(len(checks), 3, f"rechecked without an event: {checks}")
+
+
+if __name__ == "__main__":
+    unittest.main()
