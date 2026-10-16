@@ -23,6 +23,8 @@ interface HumanTimeProps {
   readonly suffix?: string
   /** Show the exact timestamp in a hover tooltip; off inside rows that own their own hover card. */
   readonly tooltip?: boolean
+  /** Milliseconds of hover before the tooltip opens; defaults to 400. */
+  readonly hoverDelay?: number
   /** Accessible name prefix; the visible text follows it, and exact text remains the description. */
   readonly 'aria-label'?: string
   readonly 'data-testid'?: string
@@ -36,7 +38,7 @@ const labelFor = (kind: TimeKind, at: number, now: number, zone: HumanTimeZone, 
  * A self-updating time label (leaf clock). Renders `<time>` with the machine instant, the readable
  * label, and the exact local timestamp as accessible description and optional tooltip.
  */
-export const HumanTime = React.memo(function HumanTime({ at, kind = 'relative', maxUnits = 2, prefix = '', suffix = '', tooltip = true, style, ...aria }: HumanTimeProps) {
+export const HumanTime = React.memo(function HumanTime({ at, kind = 'relative', maxUnits = 2, prefix = '', suffix = '', tooltip = true, hoverDelay = 400, style, ...aria }: HumanTimeProps) {
   const label = useClockLabel((now, zone) => labelFor(kind, at, now, zone, maxUnits))
   const zone = useHumanTimeZone()
   const exact = Number.isFinite(at) ? kind === 'day' ? formatExactDay(at, zone) : formatExact(at, zone) : undefined
@@ -44,12 +46,19 @@ export const HumanTime = React.memo(function HumanTime({ at, kind = 'relative', 
   const visibleLabel = `${prefix}${label}${suffix}`
   const ref = React.useRef<HTMLTimeElement>(null)
   const tooltipEnabled = tooltip && exactText !== undefined
-  const tip = useHoverTooltip(tooltipEnabled)
+  const tip = useHoverTooltip(tooltipEnabled, hoverDelay)
+  // While the tooltip is mounted the anchor names it as its description; the text equals
+  // aria-description, which aria-describedby supersedes, so the description is announced once.
+  const tooltipId = React.useId()
+  const describedBy = tooltipEnabled && tip.state.isOpen ? tooltipId : undefined
+  // RAC's Tooltip forwards `id` through its DOM-prop filter but leaves it out of TooltipProps.
+  const tooltipDom: { readonly id: string } = { id: tooltipId }
   const time = <time
       ref={ref}
       dateTime={exact === undefined ? undefined : kind === 'day' ? formatDayValue(at, zone) : new Date(at).toISOString()}
       aria-label={aria['aria-label'] === undefined ? undefined : `${aria['aria-label']} ${visibleLabel}`}
       aria-description={exactText}
+      aria-describedby={describedBy}
       data-testid={aria['data-testid']}
       data-human-time={kind}
       {...tip.hoverProps}
@@ -59,7 +68,7 @@ export const HumanTime = React.memo(function HumanTime({ at, kind = 'relative', 
   return <ThemePortal>
     {time}
     {tip.state.isOpen && <TooltipTriggerStateContext.Provider value={tip.state}>
-      <Tooltip triggerRef={ref} placement="top" offset={geometryNumbers.tooltipOffset} {...stylex.props(tooltipStyles.tooltip, styles.tooltip)}>{exactText}</Tooltip>
+      <Tooltip {...tooltipDom} triggerRef={ref} placement="top" offset={geometryNumbers.tooltipOffset} {...stylex.props(tooltipStyles.tooltip, styles.tooltip)}>{exactText}</Tooltip>
     </TooltipTriggerStateContext.Provider>}
   </ThemePortal>
 })
@@ -68,14 +77,14 @@ export const HumanTime = React.memo(function HumanTime({ at, kind = 'relative', 
  * Pointer-hover tooltip state. RAC's TooltipTrigger requires a focusable trigger, which would add a
  * Tab stop per timestamp; keyboard and screen-reader users get the same text as `aria-description`.
  */
-const useHoverTooltip = (enabled: boolean): { readonly state: TooltipTriggerState; readonly hoverProps: React.DOMAttributes<Element> } => {
+const useHoverTooltip = (enabled: boolean, delay: number): { readonly state: TooltipTriggerState; readonly hoverProps: React.DOMAttributes<Element> } => {
   const [isOpen, setOpen] = React.useState(false)
   const timer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const clear = () => { clearTimeout(timer.current); timer.current = undefined }
   React.useEffect(() => clear, [])
   const { hoverProps } = useHover({
     isDisabled: !enabled,
-    onHoverStart: () => { clear(); timer.current = setTimeout(() => setOpen(true), 400) },
+    onHoverStart: () => { clear(); timer.current = setTimeout(() => setOpen(true), delay) },
     onHoverEnd: () => { clear(); setOpen(false) },
   })
   const state: TooltipTriggerState = { isOpen, shouldSkipAnimation: false, open: () => setOpen(true), close: () => { clear(); setOpen(false) } }

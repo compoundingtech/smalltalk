@@ -20,6 +20,9 @@ zone supplied to `HumanClockProvider` (for example `{ locale: 'en-GB', timeZone:
 Neither bare ISO-date parsing nor machine-local midnight respects a pinned zone.
 `aria-label` is a name prefix; `HumanTime` appends the complete visible text, including
 visible prefix/suffix, exactly once. Callers must not repeat the formatted value.
+The tooltip is pointer-only and opens after `hoverDelay` (default 400 ms). While it is
+mounted, the time names it through `aria-describedby`, with the same text as its
+`aria-description`.
 String projections must receive a ticking `now`; the host may intentionally pause an
 observation clock while disconnected so retained facts do not imply that fresh
 observations are arriving.
@@ -45,6 +48,7 @@ Every `ci-fractal-web` proof discovers every story from the built `index.json` a
 The runner uses one Chromium with up to six concurrent isolated pages, bounded by the available CPU allowance. The receipt records the actual worker count; every indexed case is still required.
 Before selecting stories, the gate validates every index entry: its type must be `story` or `docs`, and both `id` and `importPath` must be nonempty strings. Unknown or malformed entries fail the gate instead of silently shrinking its required matrix. The CI index-contract test includes a malformed built-index fixture that must exit nonzero before browser execution.
 Navigation waits for DOM readiness, then the unchanged strict guard waits for the story's lifecycle completion; global network idleness is not substituted for a successful play.
+Plays look up a tooltip with `tooltipFor(anchor, name)` from `src/story-play.ts`, never with a document-wide `findByRole('tooltip')`. The helper resolves the tooltip through the anchor's `aria-describedby` and asserts its role, exact accessible name and visibility. Its cost does not grow with the page size.
 
 To run only the gate after building Storybook, inside `nix develop .#web`:
 
@@ -62,7 +66,7 @@ node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook
 - **Fractal UI / Sync Line**: every observation across both schemes; `TransitionSequence` asserts fixed-height slots and CLS 0 across all transitions.
 - **Fractal UI / Transcript**: the locked U2·F3·Y3 transcript in dark and light: settled/expanded work, streamed answers, failed/interrupted/unknown work, loading, retained-history synchronization, answer metadata, unavailable conversations, the older-history boundary with and without a load action, pending and failed sends (including Pending→Sent identity) and the read-only empty state.
 - **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
-- **Fractal UI / Human time**: all four kinds and unreported time, pinned to New York, at 440/1440 in light/dark plus a host-theme tooltip and a fake-timer live tick.
+- **Fractal UI / Human time**: all four kinds and unreported time, pinned to New York, at 440/1440 in light/dark plus a host-theme tooltip and a fake-timer live tick. Strict plays hover with `hoverDelay` 0; `DefaultHoverDelay` asserts that the default tooltip mounts no earlier than 400 ms after the pointer enters.
 - **Fractal UI / Sidebar/Roster**: a deterministic 100-row roster rendered on demand, for fitting cost.
 
 ## Families

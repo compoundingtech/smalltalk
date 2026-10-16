@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Kit Storybook plays find a tooltip through its anchor's aria-describedby with one shared tooltipFor helper, and assert its role, exact accessible name and visibility. Composer tooltip plays open tooltips with keyboard focus. HumanTime gains an optional hoverDelay, used at 0 by its strict plays, and points its time element to the tooltip while the tooltip is mounted.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No storage changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "none", "detail": "Additive: HumanTime accepts optional hoverDelay, which defaults to the previous 400 ms. While its tooltip is open, the time element adds aria-describedby that points to the tooltip. The tooltip text equals the existing aria-description, so the accessible description stays the same." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}
