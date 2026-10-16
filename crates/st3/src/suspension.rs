@@ -26,17 +26,11 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The environment variable that names the native session a resumed driver must relaunch.
-pub const RESUME_ENV: &str = "ST3_NATIVE_RESUME_SESSION";
+pub use crate::native_resume::{CONTINUE_ENV, CONTINUE_PATH_ENV, RESUME_ENV};
 /// Launcher-owned declaration identity forwarded into the durable native binding.
 pub const LAUNCH_DESIRED_TOKEN_ENV: &str = "ST3_LAUNCH_DESIRED_TOKEN";
 /// The diagnostic code a driver records when it cannot relaunch the named native session.
 pub const RESUME_UNAVAILABLE_CODE: &str = "native-resume-unavailable";
-/// The environment variable that names the native session a relaunched driver continues when
-/// it can. Unlike [`RESUME_ENV`], a driver that cannot continue it starts a new session.
-pub const CONTINUE_ENV: &str = "ST3_NATIVE_CONTINUE_SESSION";
-/// Where the harness kept that session, when its driver reported a path.
-pub const CONTINUE_PATH_ENV: &str = "ST3_NATIVE_CONTINUE_PATH";
 /// The diagnostic code a driver records when it starts a new session instead of continuing.
 pub const CONTINUE_UNAVAILABLE_CODE: &str = "native-continue-unavailable";
 /// How long a resumed driver may take to bind its native session before the resume fails.
