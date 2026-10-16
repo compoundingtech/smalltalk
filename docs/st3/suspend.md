@@ -72,8 +72,19 @@ seat stays suspended on the same snapshot, with the code and reason.
 
 ## Leaving an existing suspension when resume refuses
 
-Older daemons accepted suspends whose declaration already selects a session. If resume reports
-`authored-session-selection`, the exit is to stop the seat and then start it:
+Older daemons accepted suspends whose declaration already selects a session. For omp and pi, resume
+accepts such a declaration when its one selector (omp `--resume TRANSCRIPT`, `--resume=TRANSCRIPT`
+or `-r TRANSCRIPT`; pi `--session TRANSCRIPT` or `--session=TRANSCRIPT`) is an absolute path of
+the suspended session's own transcript: the file name and the header both name that session, and
+the seat's transcript inventory resolves to the same file. st then replaces the authored selector
+with its single selector for the checked path. A selector that names another session, a relative
+path, a missing, unreadable or mismatched transcript, an inventory entry that is a different file
+(`transcript-ambiguous`), a second or conflicting selection flag, or any other harness is refused
+before the harness starts, as `authored-session-selection`, `resume-path-relative`,
+`transcript-missing`, `transcript-unreadable`, `authored-session-mismatch` or
+`transcript-ambiguous`. Suspend itself still refuses a declaration that selects a session.
+
+If resume reports `authored-session-selection`, the exit is to stop the seat and then start it:
 
 ```sh
 st agents stop agent/example/worker --as person/ada

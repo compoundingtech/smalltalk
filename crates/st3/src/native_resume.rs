@@ -346,11 +346,14 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
         .take_while(|argument| argument.as_str() != "--");
     let mut selected = None;
     while let Some(argument) = arguments.next() {
-        if argument == "--resume" {
+        if argument == "--resume" || argument == "--session" {
             selected = arguments.next().map(String::as_str);
             break;
         }
-        if let Some(path) = argument.strip_prefix("--resume=") {
+        if let Some(path) = argument
+            .strip_prefix("--resume=")
+            .or_else(|| argument.strip_prefix("--session="))
+        {
             selected = Some(path);
             break;
         }
@@ -514,24 +517,128 @@ fn exchange_transcript_inventory(prepared: &Path, sessions: &Path) -> std::io::R
     if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
+/// The one authored transcript selector of a pi-family launch, as `(first, end, transcript)`: the
+/// argv range it occupies and the value it names. omp reads `--resume X`, `--resume=X` and `-r X`;
+/// pi reads `--session X` and `--session=X` (its `--resume` opens a picker and takes no value).
+/// Any other selection flag, a second selector or a selector without a value is refused.
+fn authored_resume<'a>(
+    driver: &str,
+    argv: &'a [String],
+) -> Result<Option<(usize, usize, &'a str)>, Refusal> {
+    let (flag, short) = if driver == "omp" { ("--resume", Some("-r")) } else { ("--session", None) };
+    let inline = format!("{flag}=");
+    let flags = selection_flags("pi");
+    let mut found = None;
+    let mut index = 1;
+    while index < argv.len() && argv[index] != "--" {
+        let argument = argv[index].as_str();
+        let selection = flags
+            .iter()
+            .any(|flag| argument == *flag || argument.starts_with(&format!("{flag}=")));
+        if !selection {
+            index += 1;
+            continue;
+        }
+        let unsupported = || {
+            Refusal::new(
+                "authored-session-selection",
+                format!("the seat declares its own session selection ({argument}), so st cannot resume"),
+            )
+        };
+        let (end, value) = if argument == flag || Some(argument) == short {
+            match argv.get(index + 1).map(String::as_str) {
+                Some(value) if value != "--" && !value.starts_with('-') => (index + 2, value),
+                _ => return Err(unsupported()),
+            }
+        } else if let Some(value) = argument.strip_prefix(&inline) {
+            (index + 1, value)
+        } else {
+            return Err(unsupported());
+        };
+        if found.replace((index, end, value)).is_some() {
+            return Err(unsupported());
+        }
+        index = end;
+    }
+    Ok(found)
+}
+
+/// An authored transcript selector is acceptable only when it names the recorded session: an
+/// absolute path of a transcript whose file name and header both carry `id`.
+fn check_authored_transcript(transcript: &str, id: &str) -> Result<PathBuf, Refusal> {
+    let path = Path::new(transcript);
+    if !path.is_absolute() {
+        return Err(Refusal::new(
+            "resume-path-relative",
+            "the authored resume is not an absolute transcript path, so st cannot resume",
+        ));
+    }
+    if !path.is_file() {
+        return Err(Refusal::new(
+            "transcript-missing",
+            format!("the authored resume {transcript} is not a transcript file"),
+        ));
+    }
+    let Some(header) = pi_family_header_id(path) else {
+        return Err(Refusal::new(
+            "transcript-unreadable",
+            format!("the authored resume {transcript} has no readable session header"),
+        ));
+    };
+    let named = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&format!("_{id}.jsonl")));
+    if header != id || !named {
+        return Err(Refusal::new(
+            "authored-session-mismatch",
+            format!("the authored resume {transcript} is not the recorded session {id}"),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
 /// Both pi and omp resume by the transcript path checked here. omp's own session-ID lookup does
 /// not follow symlinks, so it cannot find the individual-file link st stages in the inventory;
 /// the checked path is passed as is, without a second resolution. pi silently starts a new
 /// session at a path that does not exist, so both check the transcript first.
+///
+/// A seat may declare its own `--resume TRANSCRIPT` when that transcript is the recorded
+/// session: the selector is replaced by st's single selector for the staged inventory entry.
 pub fn pi_family_argv(
     driver: &str,
-    argv: Vec<String>,
+    mut argv: Vec<String>,
     sessions: &Path,
     id: &str,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
-    refuse_authored(&argv, selection_flags("pi"))?;
+    let authored = match authored_resume(driver, &argv)? {
+        Some((first, end, transcript)) => {
+            Some((first..end, check_authored_transcript(transcript, id)?))
+        }
+        None => None,
+    };
     let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
             format!("{driver} session {id} has no transcript in {}", sessions.display()),
         )
     })?;
+    if let Some((range, declared)) = authored {
+        // st links the declared transcript into the inventory; any other entry for this session
+        // would leave two candidates for the same ID.
+        if fs::canonicalize(&declared).ok() != fs::canonicalize(&transcript).ok() {
+            return Err(Refusal::new(
+                "transcript-ambiguous",
+                format!(
+                    "{driver} session {id} is in {} but the authored resume names {}",
+                    transcript.display(),
+                    declared.display()
+                ),
+            ));
+        }
+        argv.drain(range);
+    }
     let path = transcript.to_string_lossy();
     Ok(match driver {
         "omp" => insert_after_program(argv, &["--resume", &path]),
@@ -1135,6 +1242,204 @@ sed -n '1s/.*"id":"\([^"]*\)".*/\1/p' "$file"
             pi_family_argv("omp", argv(&["omp"]), &sessions, id).unwrap_err().code,
             "transcript-missing"
         );
+    }
+
+    /// A seat that declares `--resume TRANSCRIPT`: the authored transcript in `legacy/` and the
+    /// symlink st stages for it in `provider-sessions/`, as the seat's driver does before resume.
+    #[cfg(unix)]
+    struct AuthoredSeat {
+        root: tempfile::TempDir,
+        id: String,
+        transcript: PathBuf,
+        sessions: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl AuthoredSeat {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let legacy = root.path().join("legacy");
+            fs::create_dir(&legacy).unwrap();
+            let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6".to_owned();
+            let transcript = legacy.join(format!("2026-10-04_{id}.jsonl"));
+            fs::write(&transcript, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
+            let sessions = root.path().join("provider-sessions");
+            let seat = Self { root, id, transcript, sessions };
+            assert!(pi_family_link_transcript(&seat.launch(&["--resume", seat.transcript.to_str().unwrap()]), &seat.sessions).unwrap());
+            seat
+        }
+
+        fn launch(&self, arguments: &[&str]) -> Vec<String> {
+            let mut launch = vec!["omp".to_owned()];
+            launch.extend(arguments.iter().map(|argument| (*argument).to_owned()));
+            launch
+        }
+
+        fn staged(&self) -> PathBuf {
+            self.sessions.join(self.transcript.file_name().unwrap())
+        }
+
+        /// Everything under the seat's root, so a refusal can prove it created nothing.
+        fn files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+            let mut found = Vec::new();
+            let mut pending = vec![self.root.path().to_owned()];
+            while let Some(directory) = pending.pop() {
+                for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(path);
+                    } else {
+                        found.push((path.clone(), fs::read(&path).unwrap_or_default()));
+                    }
+                }
+            }
+            found.sort();
+            found
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_resume_accepts_an_authored_transcript_that_names_the_recorded_session() {
+        let seat = AuthoredSeat::new();
+        let staged = seat.staged();
+        assert!(fs::symlink_metadata(&staged).unwrap().file_type().is_symlink());
+        let transcript = seat.transcript.to_str().unwrap();
+        for authored in [
+            vec!["--resume", transcript, "--model", "m"],
+            vec!["--model", "m", "--resume", transcript],
+            vec!["-r", transcript, "--model", "m"],
+        ] {
+            // Exactly one selector, st's own, for the staged inventory entry.
+            let resumed = pi_family_argv("omp", seat.launch(&authored), &seat.sessions, &seat.id).unwrap();
+            assert_eq!(resumed.iter().filter(|a| matches!(a.as_str(), "--resume" | "-r")).count(), 1, "{resumed:?}");
+            assert_eq!(resumed, argv(&["omp", "--resume", &staged.to_string_lossy(), "--model", "m"]));
+            let output = stub_omp(seat.root.path(), &seat.sessions, &resumed);
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), seat.id);
+        }
+        let inline = format!("--resume={transcript}");
+        assert_eq!(
+            pi_family_argv("omp", seat.launch(&[&inline, "--model", "m"]), &seat.sessions, &seat.id).unwrap(),
+            argv(&["omp", "--resume", &staged.to_string_lossy(), "--model", "m"])
+        );
+        // pi selects a transcript by `--session`; its `--resume` opens a picker, so it is no selector.
+        let inline = format!("--session={transcript}");
+        for authored in [vec!["--session", transcript], vec![&inline, "--model", "m"]] {
+            let resumed = pi_family_argv("pi", seat.launch(&authored), &seat.sessions, &seat.id).unwrap();
+            assert_eq!(resumed.iter().filter(|a| a.starts_with("--session")).count(), 1, "{resumed:?}");
+            assert_eq!(resumed[..3], argv(&["omp", "--session", &staged.to_string_lossy()])[..]);
+        }
+        for refused in [vec!["--resume", transcript], vec!["-r", transcript]] {
+            assert_eq!(
+                pi_family_argv("pi", seat.launch(&refused), &seat.sessions, &seat.id).unwrap_err().code,
+                "authored-session-selection"
+            );
+        }
+        assert_eq!(
+            pi_family_argv("omp", seat.launch(&["--session", transcript]), &seat.sessions, &seat.id).unwrap_err().code,
+            "authored-session-selection"
+        );
+        // The declared flags after a `--` belong to the program, not to st.
+        assert_eq!(
+            pi_family_argv("omp", seat.launch(&["--", "--resume", "other"]), &seat.sessions, &seat.id).unwrap(),
+            argv(&["omp", "--resume", &staged.to_string_lossy(), "--", "--resume", "other"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pi_session_selector_is_staged_like_an_omp_resume() {
+        let seat = AuthoredSeat::new();
+        fs::remove_dir_all(&seat.sessions).unwrap();
+        let transcript = seat.transcript.to_str().unwrap();
+        assert!(pi_family_link_transcript(&seat.launch(&["--session", transcript]), &seat.sessions).unwrap());
+        let resumed = pi_family_argv("pi", seat.launch(&["--session", transcript]), &seat.sessions, &seat.id).unwrap();
+        assert_eq!(resumed, argv(&["omp", "--session", &seat.staged().to_string_lossy()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_resume_refuses_an_authored_selector_that_is_not_the_recorded_session() {
+        let seat = AuthoredSeat::new();
+        let transcript = seat.transcript.to_str().unwrap().to_owned();
+        let other = "6f9a6e16-5e30-4bce-b327-9a8241321bd7";
+        // A valid transcript of another session, a name that does not match its header, a
+        // malformed header, a directory and a relative path.
+        let other_transcript = seat.root.path().join("legacy").join(format!("2026-10-04_{other}.jsonl"));
+        fs::write(&other_transcript, format!("{{\"type\":\"session\",\"id\":\"{other}\"}}\n")).unwrap();
+        let renamed = seat.root.path().join("legacy").join(format!("2026-10-05_{}.jsonl", seat.id));
+        fs::write(&renamed, format!("{{\"type\":\"session\",\"id\":\"{other}\"}}\n")).unwrap();
+        let malformed = seat.root.path().join("legacy").join(format!("2026-10-06_{}.jsonl", seat.id));
+        fs::write(&malformed, "not json\n").unwrap();
+        let before = seat.files();
+        let missing = seat.root.path().join("legacy/gone.jsonl");
+        let directory = seat.root.path().join("legacy");
+        let (other_transcript, renamed, malformed, missing, directory) = (
+            other_transcript.to_str().unwrap(),
+            renamed.to_str().unwrap(),
+            malformed.to_str().unwrap(),
+            missing.to_str().unwrap(),
+            directory.to_str().unwrap(),
+        );
+        let cases: &[(&[&str], &str)] = &[
+            (&["--resume", other_transcript], "authored-session-mismatch"),
+            (&["--resume", renamed], "authored-session-mismatch"),
+            (&["--resume", malformed], "transcript-unreadable"),
+            (&["--resume", missing], "transcript-missing"),
+            (&["--resume", directory], "transcript-missing"),
+            (&["--resume", "relative.jsonl"], "resume-path-relative"),
+            (&["--resume", &seat.id], "resume-path-relative"),
+            (&["--resume", &transcript, "--resume", &transcript], "authored-session-selection"),
+            (&["--resume", &transcript, "-r", &transcript], "authored-session-selection"),
+            (&["--resume", &transcript, "--continue"], "authored-session-selection"),
+            (&["--resume", &transcript, "-c"], "authored-session-selection"),
+            (&["--resume", &transcript, "--session", &transcript], "authored-session-selection"),
+            (&["--resume", &transcript, "--session-id", "x"], "authored-session-selection"),
+            (&["--resume", &transcript, "--fork", "x"], "authored-session-selection"),
+            (&["--resume", &transcript, "--no-session"], "authored-session-selection"),
+            (&["--continue"], "authored-session-selection"),
+            (&["--session", &transcript], "authored-session-selection"),
+            (&["--resume"], "authored-session-selection"),
+            (&["--resume", "--model", "m"], "authored-session-selection"),
+            (&["-r", &format!("{transcript}-")], "transcript-missing"),
+            (&[&format!("-r={transcript}")], "authored-session-selection"),
+        ];
+        for (authored, code) in cases {
+            let refusal = pi_family_argv("omp", seat.launch(authored), &seat.sessions, &seat.id).unwrap_err();
+            assert_eq!(refusal.code, *code, "{authored:?}: {}", refusal.reason);
+            assert_eq!(seat.files(), before, "{authored:?} changed files");
+        }
+        // The same declaration for another recorded session, and for a session with no inventory entry.
+        assert_eq!(
+            pi_family_argv("omp", seat.launch(&["--resume", &transcript]), &seat.sessions, other).unwrap_err().code,
+            "authored-session-mismatch"
+        );
+        assert_eq!(seat.files(), before);
+        // The inventory holds a different file for the recorded session than the declared one.
+        let elsewhere = seat.root.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let copy = elsewhere.join(seat.transcript.file_name().unwrap());
+        fs::copy(&seat.transcript, &copy).unwrap();
+        let copied = seat.files();
+        assert_eq!(
+            pi_family_argv("omp", seat.launch(&["--resume", copy.to_str().unwrap()]), &seat.sessions, &seat.id)
+                .unwrap_err()
+                .code,
+            "transcript-ambiguous"
+        );
+        assert_eq!(seat.files(), copied);
+    }
+
+    #[test]
+    fn other_drivers_keep_refusing_an_authored_selection() {
+        let refusal = claude_argv(argv(&["claude", "--resume", "/transcript"]), "abc", Path::new("/w"), Some(Path::new("/h"))).unwrap_err();
+        assert_eq!(refusal.code, "authored-session-selection");
+        assert_eq!(
+            opencode_argv(argv(&["opencode", "--session", "ses_1"]), "ses_1", None).unwrap_err().code,
+            "authored-session-selection"
+        );
+        assert_eq!(codex_check(&argv(&["codex", "resume", "thread"]), "abc").unwrap_err().code, "authored-session-selection");
     }
 
     #[test]

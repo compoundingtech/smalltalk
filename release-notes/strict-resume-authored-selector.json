@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Accept an authored omp/pi transcript selector that names the suspended session on strict resume (st2#3040)",
+  "replay": {
+    "status": "none",
+    "detail": "Strict resume of an omp or pi seat whose declaration selects a transcript accepts that selector when it is the suspended session's own transcript, and launches st's single selector for the checked inventory path. Every other authored selector is still refused before the harness starts. Internal launch argument and refusal codes only: no contract, storage, replay, rules or protocol change; suspend still refuses such declarations."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Strict resume of an omp or pi seat whose declaration selects a transcript accepts that selector when it is the suspended session's own transcript, and launches st's single selector for the checked inventory path. Every other authored selector is still refused before the harness starts. Internal launch argument and refusal codes only: no contract, storage, replay, rules or protocol change; suspend still refuses such declarations."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Strict resume of an omp or pi seat whose declaration selects a transcript accepts that selector when it is the suspended session's own transcript, and launches st's single selector for the checked inventory path. Every other authored selector is still refused before the harness starts. Internal launch argument and refusal codes only: no contract, storage, replay, rules or protocol change; suspend still refuses such declarations."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Strict resume of an omp or pi seat whose declaration selects a transcript accepts that selector when it is the suspended session's own transcript, and launches st's single selector for the checked inventory path. Every other authored selector is still refused before the harness starts. Internal launch argument and refusal codes only: no contract, storage, replay, rules or protocol change; suspend still refuses such declarations."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Strict resume of an omp or pi seat whose declaration selects a transcript accepts that selector when it is the suspended session's own transcript, and launches st's single selector for the checked inventory path. Every other authored selector is still refused before the harness starts. Internal launch argument and refusal codes only: no contract, storage, replay, rules or protocol change; suspend still refuses such declarations."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Strict resume of an omp or pi seat whose declaration selects a transcript accepts that selector when it is the suspended session's own transcript, and launches st's single selector for the checked inventory path. Every other authored selector is still refused before the harness starts. Internal launch argument and refusal codes only: no contract, storage, replay, rules or protocol change; suspend still refuses such declarations."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Strict resume of an omp or pi seat whose declaration selects a transcript accepts that selector when it is the suspended session's own transcript, and launches st's single selector for the checked inventory path. Every other authored selector is still refused before the harness starts. Internal launch argument and refusal codes only: no contract, storage, replay, rules or protocol change; suspend still refuses such declarations."
+  }
+}
