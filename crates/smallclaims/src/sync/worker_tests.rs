@@ -106,7 +106,7 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
                 let (parts, body) = request.into_parts();
                 let bytes = to_bytes(body, MAX_EXCHANGE_BYTES).await.unwrap();
                 let decoded = if deflated(&parts.headers) {
-                    inflate(&bytes).unwrap()
+                    inflate(&bytes, "test").unwrap()
                 } else {
                     bytes.to_vec()
                 };
@@ -464,12 +464,22 @@ fn exchange_bodies_deflate_and_refuse_a_body_that_inflates_too_far() {
     let body = serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
     let compressed = deflate(&body).unwrap();
     assert!(compressed.len() * 10 < body.len());
-    assert_eq!(inflate(&compressed).unwrap(), body);
+    assert_eq!(inflate(&compressed, "test").unwrap(), body);
 
     let bomb = deflate(&vec![0_u8; MAX_EXCHANGE_BYTES + 1]).unwrap();
     assert!(bomb.len() < 1024 * 1024);
-    assert!(inflate(&bomb).is_err());
-    assert!(inflate(b"not deflate").is_err());
+    let refused = inflate(&bomb, "the answer to `/v1/peer/exchange` from peer invented-peer")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        refused,
+        format!(
+            "the exchange body inflates past {MAX_EXCHANGE_BYTES} bytes (the answer to \
+             `/v1/peer/exchange` from peer invented-peer, {} compressed bytes)",
+            bomb.len()
+        )
+    );
+    assert!(inflate(b"not deflate", "test").is_err());
 
     let mut headers = HeaderMap::new();
     assert!(!accepts_deflate(&headers));
@@ -569,7 +579,7 @@ async fn the_peer_route_deflates_only_for_a_requester_that_asks() {
         assert_eq!(deflated(&headers), ask);
         let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let response_body = if ask {
-            inflate(&response_body).unwrap()
+            inflate(&response_body, "test").unwrap()
         } else {
             response_body.to_vec()
         };

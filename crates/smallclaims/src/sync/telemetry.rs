@@ -329,6 +329,14 @@ mod tests {
             error_reason(&anyhow::anyhow!("the peer API version differs")),
             ErrorReason::Invalid
         );
+        // An inflate refusal that names its path and size is still an invalid body.
+        assert_eq!(
+            error_reason(&anyhow::anyhow!(
+                "the exchange body inflates past 67108864 bytes (the answer to \
+                 `/v1/peer/exchange` from peer invented-peer, 912345 compressed bytes)"
+            )),
+            ErrorReason::Invalid
+        );
         assert_eq!(
             error_reason(&anyhow::anyhow!("bad signature")),
             ErrorReason::AuthFailed

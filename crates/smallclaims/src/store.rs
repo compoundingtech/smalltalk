@@ -41,6 +41,8 @@ pub mod prepared_envelope;
 mod replica_record;
 pub use operation_metadata::OperationMetadata;
 #[cfg(test)]
+mod full_inventory_tests;
+#[cfg(test)]
 mod projection_busy_tests;
 #[cfg(test)]
 mod receive_writer_tests;
@@ -3732,6 +3734,33 @@ const ADMISSION_WRITER_BUDGET: std::time::Duration = std::time::Duration::from_m
 /// queued lease renewals and messages behind its entire incremental projection.
 pub const PROJECTION_CHUNK_CLAIMS: usize = 128;
 
+/// Full-inventory answers since the daemon started: each lists every identity this node holds,
+/// which on a large store can pass `MAX_EXCHANGE_BYTES` and fail the peer's inflate.
+pub static FULL_INVENTORY_ANSWERS: AtomicU64 = AtomicU64::new(0);
+static FULL_INVENTORY_LOGGED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Count a full-inventory answer and say so at most once a minute: how many identities it lists,
+/// and what the request carried, so the request that reached this path can be told apart (an
+/// older build's complete listing, or a digest with nothing listed).
+fn note_full_inventory_answer(identities: usize, listed: usize, complete: bool) {
+    FULL_INVENTORY_ANSWERS.fetch_add(1, Ordering::Relaxed);
+    let now = now_ms() as u64;
+    let last = FULL_INVENTORY_LOGGED_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 60_000
+        || FULL_INVENTORY_LOGGED_AT
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    eprintln!(
+        "st: warning: answering a replication exchange with the full inventory ({identities} \
+         identities): the request had no range digests and no digest or a different one, listing \
+         {listed} identities ({})",
+        if complete { "a complete listing" } else { "not a complete listing" }
+    );
+}
+
 /// The most envelopes this build takes in one exchange, which it says in each inventory it
 /// sends. Admission commits once per pass, so a page this size admits well within the peer
 /// request timeout, and a first sync needs a few dozen exchanges instead of hundreds.
@@ -5816,6 +5845,13 @@ impl Store {
         } else {
             remote.digest == replication_inventory_digest(&remote.envelopes)
         };
+        if !same {
+            note_full_inventory_answer(
+                snapshot.inventory.envelopes.len(),
+                remote.envelopes.len(),
+                remote_is_complete,
+            );
+        }
         let missing = if same || !remote_is_complete {
             Vec::new()
         } else {

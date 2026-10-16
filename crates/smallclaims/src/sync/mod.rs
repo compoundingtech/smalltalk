@@ -69,17 +69,21 @@ fn deflate(body: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
-/// Inflate an exchange body, refusing one that would expand past `MAX_EXCHANGE_BYTES`.
-fn inflate(body: &[u8]) -> Result<Vec<u8>> {
+/// Inflate an exchange body, refusing one that would expand past `MAX_EXCHANGE_BYTES`. `what`
+/// names the body (which path, request or answer, and the peer when known) so a refusal says
+/// which part of an exchange grew past the limit; the message keeps its leading words, which
+/// error classification reads.
+fn inflate(body: &[u8], what: &str) -> Result<Vec<u8>> {
     use std::io::Read as _;
     let mut inflated = Vec::with_capacity(body.len() * 3);
     flate2::read::ZlibDecoder::new(body)
         .take(MAX_EXCHANGE_BYTES as u64 + 1)
         .read_to_end(&mut inflated)
-        .context("inflate the exchange body")?;
+        .with_context(|| format!("inflate the exchange body ({what})"))?;
     anyhow::ensure!(
         inflated.len() <= MAX_EXCHANGE_BYTES,
-        "the exchange body inflates past {MAX_EXCHANGE_BYTES} bytes"
+        "the exchange body inflates past {MAX_EXCHANGE_BYTES} bytes ({what}, {} compressed bytes)",
+        body.len()
     );
     Ok(inflated)
 }
