@@ -181,6 +181,17 @@ export const nixCacheStep = {
   },
 } as const
 
+// A Genie hit must contain the entire shell, including upstream-signed stdenv inputs.
+// Never accept the old selective archive as a hit or a restore-prefix match.
+export const genieNixCacheStep = {
+  ...nixCacheStep,
+  with: {
+    ...nixCacheStep.with,
+    key: "nix6-genie-closure-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', 'scripts/ci-nix-cache', 'scripts/ci-genie-cache-verify') }}",
+    'restore-keys': '',
+  },
+} as const
+
 /** Keep shared dependency entries on protected main; PR builds have exact-source artifacts. */
 export const saveMainDependencyCaches = (setup: readonly unknown[]) => setup
   .filter((value: any) => value.id === 'cargo-cache' || value.id === 'nix-cache')
@@ -229,6 +240,11 @@ printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_ST
     run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"',
   },
 ]
+
+export const genieSetupSteps = commonSetupSteps
+  .filter((step) => step !== cargoCacheStep && step !== buildSnapshotRestore && step !== buildSnapshotPrepare)
+  .map((step) => step === nixCacheStep ? genieNixCacheStep
+    : 'name' in step && step.name === 'Use the cached Nix outputs' ? { ...step, run: 'bash scripts/ci-nix-cache use' } : step)
 
 /** Provider fixtures, rendered hooks, and the standalone workspace test build. */
 export const testBuildSteps = [

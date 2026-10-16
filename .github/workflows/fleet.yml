@@ -994,10 +994,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: |
-            nix5-${{ github.job }}-${{ runner.os }}-
-            nix4-${{ github.job }}-${{ runner.os }}-
+          key: "nix6-genie-closure-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', 'scripts/ci-nix-cache', 'scripts/ci-genie-cache-verify') }}"
+          restore-keys: ""
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -1022,7 +1020,7 @@ jobs:
         if: needs.evidence-gate-genie-freshness.outputs.skip != 'true'
       - name: Use the cached Nix outputs
         if: (env.CI_LOCAL_CACHES != '1') && needs.evidence-gate-genie-freshness.outputs.skip != 'true'
-        run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+        run: bash scripts/ci-nix-cache use
       - name: Check license coverage, runner selection and generated files
         shell: bash
         run: "nix develop '.#genie' -c bash scripts/ci-genie-freshness"

@@ -6,6 +6,8 @@ import {
   cargoCacheStep,
   commonSetupSteps,
   fractalWebStoreCache,
+  genieNixCacheStep,
+  genieSetupSteps,
   linuxRunner,
   linuxStageJob,
   linuxStageRunner,
@@ -33,7 +35,7 @@ const warmJob = (stage: string, setup: readonly unknown[], nixOnly = false) => (
   env: { ...buildEnv, CI_CACHE_DEV_SHELL: stage === 'genie' ? 'genie' : 'default' },
   steps: [
     { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
-    ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
+    ...(nixOnly ? [genieNixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
       ...step,
       if: 'success()',
       id: step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe',
@@ -54,7 +56,7 @@ fi`,
       { name: 'Save Nix outputs', run: 'bash scripts/ci-nix-cache save' },
       // PR/merge builds restore these entries and retain exact-source artifacts. Only
       // protected main fills the shared dependency quota, including after eviction.
-      ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
+      ...(nixOnly ? [genieNixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
         name: `Save the missing main ${step.id}`,
         if: `github.ref == 'refs/heads/main' && steps.${step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe'}.outputs.cache-hit != 'true'`,
         uses: 'actions/cache/save@v4',
@@ -104,7 +106,7 @@ export default githubWorkflow(auditCaches({
     'linux-tests': warmJob('tests', workspacePreparationSteps),
     'linux-clippy': warmJob('clippy', commonSetupSteps),
     'linux-fleet-compat': warmJob('fleet-compat', commonSetupSteps),
-    'genie-freshness': warmJob('genie', commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')), true),
+    'genie-freshness': warmJob('genie', genieSetupSteps, true),
     'isolation-vm': warmJob('isolation-vm', commonSetupSteps),
     'typescript-cache': {
       name: 'warm-typescript',

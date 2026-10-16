@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Retain and verify the complete Genie CI shell in the binary cache.",
+  "replay": {
+    "status": "none",
+    "detail": "CI cache contents and validation only; no runtime, storage, client contract or host configuration change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI cache contents and validation only; no runtime, storage, client contract or host configuration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI cache contents and validation only; no runtime, storage, client contract or host configuration change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI cache contents and validation only; no runtime, storage, client contract or host configuration change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI cache contents and validation only; no runtime, storage, client contract or host configuration change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "The existing protected-main Genie warmer seeds the new nix6-genie-closure key after merge; old selective entries cannot satisfy it. Cold seeds and eviction still require upstream downloads. No Namespace quota, label, priority or runner change."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "An incomplete Genie shell cache fails the isolated restore control and is not published; no retries, skip or source-build fallback. Reverting the source restores the earlier selective cache policy and its public-fetch dependency."
+  }
+}

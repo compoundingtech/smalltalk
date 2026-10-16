@@ -247,6 +247,18 @@ copies reference-free downloads and sources fetched by the run, plus the closure
 baseline, historical messaging channel and provider components. It leaves the installer-managed
 `/nix` directory intact. Cache failures emit a warning and let the job build normally.
 
+Genie uses a separate `nix6-genie-closure-...` entry keyed on its locked shell and cache policy.
+It retains the complete `nix print-dev-env .#genie` profile closure, including upstream-signed
+stdenv inputs such as Linux headers. The older selective archives cannot satisfy this key.
+Workspace CI and main's existing Genie warmer share it; only protected main publishes the archive.
+Genie's local cache initialization and closure save fail visibly. After saving, a hosted control
+copies the closure into an empty store with public substituters and builders disabled, checks
+every path's NAR hash, and verifies that removing a required cache entry makes the copy fail.
+The summary reports closure bytes, cache file bytes, path count and verification time; these are
+not billed cost or a claim of lower wall time. Cold seeds and evicted entries still need upstream
+downloads. A valid warm archive supplies the entire shell without the public NAR fetch that failed
+in run 38922273766/job 117046015044.
+
 The [original trial measurements](https://github.com/compoundingtech/smalltalk/pull/849#issuecomment-5936374396)
 recorded a warm run of 6m59s with this design, versus 8m49s to 9m30s with only the Cargo cache.
 That trial excluded the messaging matrix; current CI includes it. Caching the entire Nix store

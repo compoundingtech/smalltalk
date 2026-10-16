@@ -52,6 +52,12 @@ case "$cmd" in
       xargs nix copy --to "$to" --no-check-sigs --no-recursive < "$cache.paths"
     fi
     roots=()
+    if [ "${CI_CACHE_DEV_SHELL:-}" = genie ]; then
+      # The shell's stdenv (including linux-headers) is needed before Genie can run.
+      # Saving only unsigned packages left an exact cache hit dependent on public NAR fetches.
+      nix print-dev-env .#genie --profile "$dir/genie-shell" > /dev/null
+      roots+=("$dir/genie-shell")
+    fi
     # Cache locally built shell tools (PTY, collector, etc.), not the upstream-signed
     # compiler/Node closure, which cache.nixos.org serves faster than another archive.
     if [ -n "${CI_CACHE_DEV_SHELL:-}" ]; then
@@ -77,6 +83,9 @@ case "$cmd" in
     if [ "${#roots[@]}" -gt 0 ]; then
       printf 'Nix cache: closures of %s\n' "${roots[*]}"
       nix copy --to "$to" --no-check-sigs "${roots[@]}"
+    fi
+    if [ "${CI_CACHE_DEV_SHELL:-}" = genie ]; then
+      bash scripts/ci-genie-cache-verify "$cache" "$(readlink -f "$dir/genie-shell")" "$key.pub"
     fi
     printf 'Nix cache %s: %s store paths after saving (%ss)\n' "$cache" \
       "$(python3 -c 'import pathlib,sys; print(sum(1 for _ in pathlib.Path(sys.argv[1]).glob("*.narinfo")))' "$cache")" "$((SECONDS - start))"

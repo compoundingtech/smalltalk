@@ -92,7 +92,7 @@ for workflow in sorted((root / '.github/workflows').glob('*.yml')):
             if re.search(r'(?m)^        id: (cargo|nix)-cache$', step):
                 dependency_restores += 1
                 assert 'uses: actions/cache/restore@v4' in step, 'PR/queue dependency archives must not auto-save branch copies'
-            if 'uses: actions/cache/save@v4' in step and re.search(r'(?m)^          key: .*?(cargo-|nix5-)', step):
+            if 'uses: actions/cache/save@v4' in step and re.search(r'(?m)^          key: .*?(cargo-|nix5-|nix6-genie-closure-)', step):
                 main_dependency_saves += 1
                 assert "github.ref == 'refs/heads/main'" in step.replace("''", "'"), 'dependency writes require protected main'
 assert dependency_restores >= 10, dependency_restores

@@ -643,7 +643,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          key: "nix6-genie-closure-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', 'scripts/ci-nix-cache', 'scripts/ci-genie-cache-verify') }}"
           restore-keys: ""
           lookup-only: true
       - name: Report cache coverage
@@ -671,10 +671,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
-          restore-keys: |
-            nix5-${{ github.job }}-${{ runner.os }}-
-            nix4-${{ github.job }}-${{ runner.os }}-
+          key: "nix6-genie-closure-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', 'scripts/ci-nix-cache', 'scripts/ci-genie-cache-verify') }}"
+          restore-keys: ""
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -699,7 +697,7 @@ jobs:
         if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (success())
       - name: Use the cached Nix outputs
         if: success() && (steps.nix-probe.outputs.cache-hit != 'true') && (env.CI_LOCAL_CACHES != '1')
-        run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+        run: bash scripts/ci-nix-cache use
       - name: Build missing cache contents
         shell: bash
         run: "nix develop '.#genie' -c bash scripts/ci-cache-warm genie"
@@ -712,7 +710,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
-          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          key: "nix6-genie-closure-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', 'scripts/ci-nix-cache', 'scripts/ci-genie-cache-verify') }}"
       - name: Report job cache coverage
         if: always()
         shell: bash
