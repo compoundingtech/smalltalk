@@ -23,9 +23,9 @@ REQUIRED = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package-only", action="store_true", help="local compatibility: build only st3")
+    parser.add_argument("--package-only", action="store_true", help="local compatibility: build only st3 and the st3-daemon library")
     args = parser.parse_args()
-    selection = ["-p", "st3"] if args.package_only else ["--workspace", "--exclude", "st2"]
+    selection = ["-p", "st3", "-p", "st3-daemon"] if args.package_only else ["--workspace", "--exclude", "st2"]
     filters = " or ".join(f"test(={name})" for name in sorted(REQUIRED))
     common = selection + ["--locked", "--profile", "ci", "-E", filters]
     if os.environ.get("CI_TEST_EXTRACTED"):

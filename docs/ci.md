@@ -283,7 +283,7 @@ environment variable that enables this behavior, even if the executable is renam
 Fixture command helpers clear inherited `ST_AGENT`/`ST3_*`; temporary-repository Git helpers
 isolate global/system config, hooks, signing and author identity on each command. Real
 repository commits keep the host's Git policy. Run the same suite from an agent seat with
-`nix develop --command cargo nextest run -p st3 --locked --profile ci --retries 0`.
+`nix develop --command cargo nextest run -p st3 -p st3-daemon --locked --profile ci --retries 0`.
 Provider fixtures that load st3 extensions publish their isolated hook set with
 `st3::hooks::ensure_installed`, preserving every declared asset and relative import.
 

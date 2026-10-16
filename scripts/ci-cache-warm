@@ -18,6 +18,7 @@ case "${1:?usage: scripts/ci-cache-warm tests|clippy|fleet-compat|genie|isolatio
       [ "$attempt" -lt 3 ] || exit 1
     done
     cargo test -p st3 --locked --test integration --no-run
+    cargo test -p st3-daemon --locked --lib --no-run
     ;;
   genie) true ;; # nix develop .#genie has already populated the shell.
   isolation-vm)
