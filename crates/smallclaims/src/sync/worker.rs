@@ -1062,6 +1062,10 @@ fn start_outbound<B: Backend>(
     });
 }
 
+#[cfg(test)]
+#[path = "authority_guard_tests.rs"]
+mod authority_guard_tests;
+
 /// Exchange with one peer for as long as it stays a target, trying its routes in order.
 #[allow(clippy::too_many_arguments)]
 async fn dial_peer<B: Backend>(
@@ -1130,13 +1134,13 @@ async fn dial_peer<B: Backend>(
                     .cloned();
                 if let Some(offered) = offered
                     && let Ok(current) = backend
-                        .guard_summary(auth.fleet_id())
+                        .authority_digest(auth.fleet_id())
                         .await
                 {
                     // The other side already knows this inventory and is draining both
                     // queues. Notifications from that exchange must not trigger a reverse
                     // connection. A genuinely new local envelope still requests a push.
-                    if current.exchange.authority_digest == offered {
+                    if !current.is_empty() && current == offered {
                         must_send = false;
                     }
                 }

@@ -9603,7 +9603,11 @@ async fn replication_export(
     blocking_store(move || {
         let exchange = if request.summary_only {
             record_replication_summary(request.authority_guard, || {
-                store.export_replication_summary(&request.fleet_id)
+                if request.authority_guard && request.authority_digest_only {
+                    store.export_replication_authority_guard(&request.fleet_id)
+                } else {
+                    store.export_replication_summary(&request.fleet_id)
+                }
             })?
         } else {
             store.export_replication_exchange_answering(

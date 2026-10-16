@@ -5660,6 +5660,21 @@ impl Store {
     }
 
     pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
+        self.replication_summary(fleet_id, true)
+    }
+
+    /// A local scalar guard reads only `authority_digest`. Keep the full summary's fresh
+    /// snapshot, metadata and errors, but avoid cloning/serializing its unused bucket list.
+    /// This reduced inventory must not be used to construct a signed peer exchange.
+    pub fn export_replication_authority_guard(&self, fleet_id: &str) -> Result<ReplicationExchange> {
+        self.replication_summary(fleet_id, false)
+    }
+
+    fn replication_summary(
+        &self,
+        fleet_id: &str,
+        include_buckets: bool,
+    ) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
         let _timing = time_stage(&self.replication_timers.export);
         let signature_requests = self.replication_signature_requests()?;
@@ -5675,7 +5690,11 @@ impl Store {
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
-                buckets: snapshot.buckets.clone(),
+                buckets: if include_buckets {
+                    snapshot.buckets.clone()
+                } else {
+                    Vec::new()
+                },
                 accepts: Some(replication_accepts()),
                 checkpoint: self.trimmed_checkpoint()?,
             },

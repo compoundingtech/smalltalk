@@ -1510,6 +1510,7 @@ impl Backend for MainBackend {
                     inventory: inventory.clone(),
                     summary_only,
                     authority_guard: false,
+                    authority_digest_only: false,
                     signature_requests: signature_requests.to_vec(),
                 },
             )
@@ -1527,10 +1528,31 @@ impl Backend for MainBackend {
                     inventory: ReplicationInventory::default(),
                     summary_only: true,
                     authority_guard: true,
+                    authority_digest_only: false,
                     signature_requests: Vec::new(),
                 },
             )
             .await
+    }
+
+    async fn authority_digest(&self, fleet_id: &str) -> Result<String> {
+        // New daemons omit only the unused buckets. An old daemon ignores the additive
+        // option and returns its full response; consume its digest from this same call.
+        let response: ReplicationExportResponse = self
+            .client
+            .post(
+                "/v1/internal/replication/export",
+                &ReplicationExportRequest {
+                    fleet_id: fleet_id.to_owned(),
+                    inventory: ReplicationInventory::default(),
+                    summary_only: true,
+                    authority_guard: true,
+                    authority_digest_only: true,
+                    signature_requests: Vec::new(),
+                },
+            )
+            .await?;
+        Ok(response.exchange.authority_digest)
     }
 
     async fn receive(

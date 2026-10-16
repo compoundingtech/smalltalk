@@ -117,6 +117,11 @@ pub struct ReplicationExportRequest {
     /// Older local daemons ignore this field; it never changes the exported exchange.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub authority_guard: bool,
+    /// Local-daemon only: the scalar guard does not consume inventory buckets. Honored only
+    /// for a summary with `authority_guard`; ordinary/default and peer exchanges stay full.
+    /// Older local daemons ignore this option and return the complete response in one call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub authority_digest_only: bool,
     /// The other side's signature requests, to answer in the exported exchange.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signature_requests: Vec<ReplicaEnvelopeId>,
