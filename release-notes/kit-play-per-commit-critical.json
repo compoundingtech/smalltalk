@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Pull requests run only the 94 kit stories tagged critical, without axe and within a 420-second budget; merge groups and manual runs keep every story with the a11y check.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "No application or API change. CI only: per-PR kit plays shrink to the critical set without axe; merge groups keep the full matrix with axe and every strict assertion. Stories gain a critical tag only." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Revert the workflow environment to run all stories with a11y on." }
+}

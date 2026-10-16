@@ -42,7 +42,7 @@ export default meta
 type Story = StoryObj<typeof meta>
 
 /** Observe the actual render task and its first 1.5s of fitting, not Storybook module/bootstrap work. */
-export const HundredAgentRender: Story = { render: () => <RosterRender />, play: async ({ canvasElement }) => {
+export const HundredAgentRender: Story = { tags: ['critical'], render: () => <RosterRender />, play: async ({ canvasElement }) => {
   await document.fonts.ready
   await expect(PerformanceObserver.supportedEntryTypes).toContain('longtask')
   performance.clearMarks('sidebar-roster-render-start')

@@ -127,7 +127,7 @@ export const StreamingHeadingLight: Story = { ...StreamingHeading, args: { schem
 export const StreamingTableLight: Story = { ...StreamingTable, args: { scheme: 'light' } }
 export const StreamingTightListLight: Story = { ...StreamingTightList, args: { scheme: 'light' } }
 export const StreamingParagraphLight: Story = { ...StreamingParagraph, args: { scheme: 'light' } }
-export const RichText: Story = {
+export const RichText: Story = { tags: ['critical'],
   play: async ({ canvasElement }) => {
     const root = requireElement(canvasElement, '[data-testid="markdown"]')
     const title = requireElement<HTMLAnchorElement>(root, 'h1 a')
@@ -143,7 +143,7 @@ export const RichText: Story = {
     if (canvasElement.querySelector('[data-testid="opened-resource"]')?.textContent !== 'Opened src/model.ts') throw new Error('Resource chip lost its open callback')
   },
 }
-export const Languages: Story = {
+export const Languages: Story = { tags: ['critical'],
   args: { scenario: 'languages' },
   play: async ({ canvasElement }) => {
     const fences = [...canvasElement.querySelectorAll<HTMLElement>('[data-testid="markdown-code-block"]')]
@@ -164,7 +164,7 @@ export const Light: Story = { ...RichText, args: { scheme: 'light' } }
 export const AllStates: Story = { args: { scenario: 'all' } }
 export const LanguagesLight: Story = { ...Languages, args: { scenario: 'languages', scheme: 'light' } }
 export const AllStatesLight: Story = { args: { scenario: 'all', scheme: 'light' } }
-export const StreamingControlsPersistence: Story = {
+export const StreamingControlsPersistence: Story = { tags: ['critical'],
   args: { scenario: 'streaming' },
   play: async ({ canvasElement }) => {
     await document.fonts.ready
@@ -207,7 +207,7 @@ export const StreamingControlsPersistence: Story = {
   },
 }
 export const StreamingControlsPersistenceLight: Story = { ...StreamingControlsPersistence, args: { scenario: 'streaming', scheme: 'light' } }
-export const StreamingInlineMarkup: Story = {
+export const StreamingInlineMarkup: Story = { tags: ['critical'],
   args: { scenario: 'inline-streaming' },
   play: async ({ canvasElement }) => {
     const adversarial = '['.repeat(50_000)
@@ -246,7 +246,7 @@ export const StreamingInlineMarkup: Story = {
   },
 }
 
-export const CopyFailure: Story = {
+export const CopyFailure: Story = { tags: ['critical'],
   args: { scenario: 'streaming' },
   play: async ({ canvasElement }) => {
     const fence = requireElement<HTMLElement>(canvasElement, '[data-testid="markdown-code-block"]')
