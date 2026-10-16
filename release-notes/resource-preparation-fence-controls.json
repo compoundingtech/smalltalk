@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prepare resource observation history outside the writer with conservative native validation",
+  "replay": {
+    "status": "none",
+    "detail": "No projection replay or rebuild; preparation reads existing canonical state."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, layout or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No retention, authority or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No public API, wire, claim or effect format change; exactly two internal prepare/validate attempts then the existing canonical writer path."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No runtime installation or activation is part of this private unit."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action or live capture is requested."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, deployment, restore or rollback change."
+  }
+}

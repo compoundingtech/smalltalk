@@ -75,6 +75,12 @@ retries = 0
 filter = 'package(=st3) and test(/^api::tests::roster_fresh::traced_unchanged_proof_reports_work_for_each_churn_interval$/)'
 success-output = "immediate"
 
+# Retain private resource preparation's seed/read/validate/fallback work and replay
+# counters in ordinary hosted logs. Visibility only: no selection, retry or budget change.
+[[profile.ci.overrides]]
+filter = 'package(=st3) and (test(/^store::resource_preparation::tests::quiet_preparation_and_two_stale_attempts_report_separate_writer_work$/) or test(/^store::resource_preparation::tests::no_change_fast_writer_work_does_not_grow_with_resource_history$/) or test(/^store::resource_preparation::tests::changed_and_attempt_outcomes_match_the_canonical_path_and_retry_receipts$/))'
+success-output = "immediate"
+
 # Keep both measured control intervals visible even when the idle positive passes.
 # A CPU regression or a broken busy negative must remain a failure without retry.
 [[profile.ci.overrides]]

@@ -32,6 +32,9 @@ mod owned_sets_tests;
 #[cfg(test)]
 mod usage_fold_tests;
 mod resources;
+mod resource_preparation;
+#[cfg(test)]
+mod resource_preparation_fence_tests;
 mod github_workflow_failures;
 pub mod git_changes;
 pub(crate) mod message_subscriptions;
@@ -15710,6 +15713,77 @@ impl Store {
         subscriptions: &[(String, SubscriptionSpec)],
         current: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Result<ResourceObservationOutcome, St3Error> {
+        let fence = resource_preparation::Fence::new(self);
+        for pass in 0..2 {
+            let prepared = fence.prepare(self, |connection| {
+                resource_preparation::inputs(
+                    connection,
+                    observer,
+                    desired_revision,
+                    attempt,
+                    resource,
+                    &canonical_json_value(facts),
+                    subscriptions,
+                )
+            });
+            #[cfg(test)]
+            resource_preparation::before_validate(self, pass);
+            #[cfg(not(test))]
+            let _ = pass;
+            let outcome = self.record_resource_observation_attempt(
+                observer,
+                desired_revision,
+                attempt,
+                resource,
+                cursor,
+                facts,
+                next_check_unix_ms,
+                subscriptions,
+                current,
+                Some((&fence, prepared)),
+            )?;
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
+            }
+            #[cfg(test)]
+            resource_preparation::COUNTS.with(|counts| counts.borrow_mut().invalidated += 1);
+        }
+        // Exactly two unusable/stale preparations, then ONE invocation of the existing
+        // canonical writer path. This preserves API progress, not a writer-hold cap.
+        #[cfg(test)]
+        resource_preparation::COUNTS.with(|counts| counts.borrow_mut().fallback += 1);
+        self.record_resource_observation_attempt(
+            observer,
+            desired_revision,
+            attempt,
+            resource,
+            cursor,
+            facts,
+            next_check_unix_ms,
+            subscriptions,
+            current,
+            None,
+        )?
+        .ok_or_else(|| St3Error::new("internal", "canonical observation returned no outcome"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_resource_observation_attempt(
+        &self,
+        observer: &str,
+        desired_revision: &str,
+        attempt: Option<&str>,
+        resource: &str,
+        cursor: Option<&str>,
+        facts: &Value,
+        next_check_unix_ms: u128,
+        subscriptions: &[(String, SubscriptionSpec)],
+        current: Option<&(dyn Fn() -> bool + Sync)>,
+        preparation: Option<(
+            &resource_preparation::Fence,
+            resource_preparation::Prepared<Result<resource_preparation::Inputs, St3Error>>,
+        )>,
+    ) -> Result<Option<ResourceObservationOutcome>, St3Error> {
         let facts = canonical_json_value(facts);
         let operation_hash = canonical_hash(&(
             observer,
@@ -15721,191 +15795,54 @@ impl Store {
         ))
         .map_err(internal)?;
         let idempotency_key = format!("resource-observation:{operation_hash}");
-        self.connection
-            .batched(|transaction| -> Result<ResourceObservationOutcome, St3Error> {
+        #[cfg(test)]
+        let measurement = Mutex::new(None);
+        #[cfg(test)]
+        let pending = Mutex::new(None);
+        #[cfg(test)]
+        let enqueued = std::time::Instant::now();
+        #[cfg(test)]
+        let canonical = preparation.is_none();
+        #[cfg(test)]
+        let cached = std::sync::atomic::AtomicBool::new(false);
+        let result = self.connection
+            .batched(|transaction| -> Result<Option<ResourceObservationOutcome>, St3Error> {
+                #[cfg(test)]
+                let _measurement = resource_preparation::WriterMeasure::new(&measurement);
+                #[cfg(test)]
+                { *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(enqueued.elapsed()); }
                 check_observer_completion(transaction, observer, desired_revision, current)?;
                 let outcome = (|| {
                 if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, &idempotency_key)?
                 {
-                    return serde_json::from_str(&response).map_err(internal);
+                    #[cfg(test)]
+                    cached.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return serde_json::from_str(&response).map(Some).map_err(internal);
                 }
-                let mut active_subscriptions = Vec::new();
-                for (subject, expected) in subscriptions {
-                    let Some(desired) = current_desired_row_tx(transaction, subject).map_err(internal)?
-                    else {
-                        continue;
-                    };
-                    if desired.kind != "subscription" {
-                        continue;
+                let resource_preparation::Inputs { active_subscriptions, normalized_observation, previous, baseline, repository_facts, legacy_collections, changed_fields, repository_changed_fields, recorded_items, discovered, observer_health_is_current, subscription_states, changed, should_record } = match preparation {
+                    Some((fence, mut prepared)) => {
+                        if !fence.current(self, transaction, &prepared) {
+                            return Ok(None);
+                        }
+                        prepared.value.take().expect("validated preparation has a value")?
                     }
-                    let value = serde_json::from_str(&desired.body).map_err(internal)?;
-                    if crate::graph::subscription_spec(&value).as_ref() == Some(expected)
-                        && !expected.stopped
-                    {
-                        active_subscriptions.push((subject.clone(), expected.clone()));
-                    }
-                }
-                let normalized_observation = normalize_resource_observation(
-                    transaction,
-                    &ClaimInput {
-                        subject: resource.into(),
-                        kind: "resource.observed".into(),
-                        actor: None,
-                        fields: BTreeMap::from([("facts".into(), facts.clone())]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: None,
-                    },
-                )?
-                .expect("a resource observation is normalized");
-                let resource_kind = normalized_observation
-                    .get("kind")
-                    .cloned()
-                    .expect("a normalized resource observation has a kind");
-                let facts = normalized_observation
-                    .get("facts")
-                    .expect("a normalized resource observation has facts");
-                let previous = latest_actual(transaction, resource)
-                    .map_err(internal)?
-                    .and_then(|actual| actual.get("facts").cloned());
-                let baseline = previous.is_none();
-                let previous_object = previous.as_ref().and_then(Value::as_object);
-                let current_object = facts.as_object().ok_or_else(|| {
-                    St3Error::new(
-                        "invalid-resource-observation",
-                        "resource observation facts must be an object",
-                    )
-                })?;
-                // A repository's collections name the items an observation saw. Each item is its
-                // own resource, so the repository resource keeps only its own facts and a change
-                // to one item records only that item.
-                let collection = |field: &str| {
-                    REPOSITORY_COLLECTIONS
-                        .iter()
-                        .any(|(name, _, _)| *name == field)
+                    None => resource_preparation::inputs(transaction, observer, desired_revision,
+                        attempt, resource, &facts, subscriptions)?,
                 };
-                let repository_facts = Value::Object(
-                    current_object
-                        .iter()
-                        .filter(|(field, _)| !collection(field))
-                        .map(|(field, value)| (field.clone(), value.clone()))
-                        .collect(),
-                );
-                let legacy_collections = previous_object
-                    .is_some_and(|previous| previous.keys().any(|field| collection(field)));
-                let mut changed_fields = BTreeSet::new();
-                for field in current_object
-                    .keys()
-                    .chain(previous_object.into_iter().flat_map(serde_json::Map::keys))
-                    .filter(|field| !collection(field))
-                {
-                    if previous_object.and_then(|object| object.get(field)) != current_object.get(field) {
-                        changed_fields.insert(field.clone());
-                    }
-                }
-                let repository_changed_fields = changed_fields.iter().cloned().collect::<Vec<_>>();
-                let mut recorded_items = HashMap::new();
-                for (field, segment, _) in REPOSITORY_COLLECTIONS {
-                    for number in current_object
-                        .get(field)
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|item| item.get("number").and_then(Value::as_u64))
-                    {
-                        let subject = format!("{resource}/{segment}/{number}");
-                        let recorded = latest_actual(transaction, &subject)
-                            .map_err(internal)?
-                            .and_then(|actual| actual.get("facts").cloned());
-                        let observed_at = transaction
-                            .query_row(
-                                &canonical_sql(
-                                    "SELECT accepted_at_unix_ms FROM claims
-                                     WHERE subject=?1 AND kind='resource.observed'
-                                     ORDER BY COALESCE(json_extract(body, '$.fields.attribution_only'), 0), CANONICAL_DESC(claims) LIMIT 1",
-                                ),
-                                [&subject],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .optional()
-                            .map_err(internal)?
-                            .and_then(|at| at.parse::<u128>().ok())
-                            .unwrap_or_default();
-                        recorded_items.insert(subject, recorded.map(|facts| (facts, observed_at)));
-                    }
-                }
-                let mut discovered = Vec::new();
-                for (field, _, _) in REPOSITORY_COLLECTIONS {
-                    let items = discovered_collection_items(
-                        resource,
-                        field,
-                        previous.as_ref(),
-                        &facts,
-                        &mut |subject| {
-                            recorded_items
-                                .get(subject)
-                                .cloned()
-                                .flatten()
-                                .map(|(facts, _)| facts)
-                        },
-                    );
-                    changed_fields.extend(items.iter().flat_map(|item| item.data_types.iter().cloned()));
-                    discovered.extend(items.into_iter().map(|item| (field, item)));
-                }
-                let changed_fields = changed_fields.into_iter().collect::<Vec<_>>();
-                let observer_health_is_current = latest_actual(transaction, observer)
-                    .map_err(internal)?
-                    .is_some_and(|actual| {
-                        actual.get("state").and_then(Value::as_str) == Some("healthy")
-                            && actual.get("revision").and_then(Value::as_str) == Some(desired_revision)
-                            && actual.get("reason").is_none()
-                    });
-                let mut subscription_states = BTreeMap::new();
-                for (subscription_subject, subscription) in &active_subscriptions {
-                    let target_exists = if subscription.delivery == "message" {
-                        transaction
-                            .query_row(
-                                "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
-                                [&subscription.to],
-                                |_| Ok(()),
-                            )
-                            .optional()
-                            .map_err(internal)?
-                            .is_some()
-                    } else {
-                        true
-                    };
-                    let status = if target_exists { "active" } else { "pending" };
-                    let current_status = latest_actual(transaction, subscription_subject)
-                        .map_err(internal)?
-                        .and_then(|actual| {
-                            actual
-                                .get("state")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        });
-                    subscription_states.insert(
-                        subscription_subject.clone(),
-                        (
-                            target_exists,
-                            status,
-                            current_status.as_deref() != Some(status),
-                        ),
-                    );
-                }
-                let changed = baseline || !changed_fields.is_empty() || !discovered.is_empty();
-                let should_record = changed
-                    || legacy_collections
-                    || attempt.is_some()
-                    || !observer_health_is_current
-                    || subscription_states.values().any(|(_, _, changed)| *changed);
+                let resource_kind = normalized_observation.get("kind").cloned()
+                    .expect("a normalized resource observation has a kind");
+                let facts = normalized_observation.get("facts")
+                    .expect("a normalized resource observation has facts");
+                let previous_object = previous.as_ref().and_then(Value::as_object);
+                let current_object = facts.as_object()
+                    .expect("prepared resource facts are an object");
                 if !should_record {
-                    return Ok(ResourceObservationOutcome {
+                    return Ok(Some(ResourceObservationOutcome {
                         baseline,
                         changed_fields,
                         observation_claim: None,
                         message_subjects: Vec::new(),
-                    });
+                    }));
                 }
                 let now = write_time(transaction, &self.origin).map_err(internal)?;
                 let sequence = next_replica_sequence(transaction, &self.origin).map_err(internal)?;
@@ -16704,12 +16641,34 @@ impl Store {
                         ],
                     )
                     .map_err(internal)?;
-                Ok(outcome)
+                Ok(Some(outcome))
                 })()?;
                 check_observer_completion(transaction, observer, desired_revision, current)?;
                 Ok(outcome)
             })
-            .map_err(|error| St3Error::new("internal", error))?
+            .map_err(|error| St3Error::new("internal", error));
+        #[cfg(test)]
+        if let Some((elapsed, work)) = measurement
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            resource_preparation::COUNTS
+                .with(|counts| counts.borrow_mut().writer.push((canonical, elapsed, work)));
+        }
+        #[cfg(test)]
+        resource_preparation::COUNTS.with(|counts| {
+            let mut counts = counts.borrow_mut();
+            if cached.load(std::sync::atomic::Ordering::Relaxed) {
+                counts.cached += 1;
+            } else if !canonical && matches!(&result, Ok(Ok(Some(_)))) {
+                counts.fast += 1;
+            }
+            counts.acknowledged.push(enqueued.elapsed());
+            counts
+                .until_callback
+                .push(pending.into_inner().unwrap_or_else(PoisonError::into_inner));
+        });
+        result?
     }
 
     /// Every mission request that a subscription recorded, oldest first, with its disposition.
@@ -20687,7 +20646,7 @@ fn select_desired_row(rows: Vec<(String, String, String)>) -> Result<Option<Desi
 }
 
 fn current_desired_row_tx(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     subject: &str,
 ) -> Result<Option<DesiredRow>> {
     transaction
@@ -21003,7 +20962,7 @@ fn validate_claim_cardinality(
 }
 
 fn normalize_resource_observation(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     input: &ClaimInput,
 ) -> Result<Option<BTreeMap<String, Value>>, St3Error> {
     if input.kind != "resource.observed" {
@@ -21122,7 +21081,7 @@ fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, V
 }
 
 fn latest_resource_kind(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     subject: &str,
 ) -> Result<Option<String>, St3Error> {
     let bodies = {
