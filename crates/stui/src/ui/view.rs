@@ -261,6 +261,8 @@ pub enum AttentionKind {
         /// A structured ask's typed fields (#1010): summary, reasons, links, named answers and
         /// a recommendation. Absent on a free-text ask.
         structured: Option<Box<st3_client::StructuredRequest>>,
+        /// The images it carries, read from st through the ask.
+        images: Vec<st3_conversation_ui::MailImage>,
     },
     /// Information the person asked an agent for (`st work update`): it asks nothing, and it
     /// clears once they read it.

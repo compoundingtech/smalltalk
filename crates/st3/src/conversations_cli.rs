@@ -135,7 +135,7 @@ async fn follow_conversation(
     }
 }
 
-async fn upload_attachments(
+pub(super) async fn upload_attachments(
     endpoint: &Endpoint,
     actor: &str,
     files: &[PathBuf],

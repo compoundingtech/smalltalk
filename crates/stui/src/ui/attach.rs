@@ -39,6 +39,57 @@ pub fn graphics_terminal() -> bool {
         || std::env::var_os("KITTY_WINDOW_ID").is_some()
 }
 
+/// Whether the terminal answers a status report (`ESC [ 5 n`) within `timeout`, as every
+/// terminal that answers queries does, tmux included. It reads only what is already waiting,
+/// so a terminal that answers nothing leaves nothing reading stdin to swallow keys later.
+/// Raw mode must be on.
+#[cfg(unix)]
+pub fn terminal_answers(timeout: std::time::Duration) -> bool {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    let mut out = std::io::stdout();
+    if out
+        .write_all(b"\x1b[5n")
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        return false;
+    }
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    while let Some(left) = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
+    {
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = left.as_millis().clamp(1, 1000) as libc::c_int;
+        // SAFETY: one valid pollfd, and a buffer that outlives the read.
+        if unsafe { libc::poll(&mut poll, 1, millis) } <= 0 {
+            continue;
+        }
+        let mut buffer = [0u8; 64];
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read <= 0 {
+            return false;
+        }
+        seen.extend_from_slice(&buffer[..read as usize]);
+        if seen.windows(4).any(|window| window == b"\x1b[0n" || window == b"\x1b[3n") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+pub fn terminal_answers(_timeout: std::time::Duration) -> bool {
+    false
+}
+
 /// Where pasted images are kept: `$XDG_STATE_HOME/st3/stui/attachments`.
 pub fn dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
@@ -292,6 +343,82 @@ pub fn received(
     Ok(path)
 }
 
+/// Where the person keeps downloads: `ST3_DOWNLOADS`, else their XDG download directory
+/// (`XDG_DOWNLOAD_DIR`, or `~/.config/user-dirs.dirs`), else `~/Downloads`.
+pub fn downloads() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let configured = std::env::var_os("ST3_DOWNLOADS")
+        .or_else(|| std::env::var_os("XDG_DOWNLOAD_DIR"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            std::fs::read_to_string(config.join("user-dirs.dirs"))
+                .ok()?
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("XDG_DOWNLOAD_DIR="))
+                .map(|value| {
+                    let value = value.trim_matches('"');
+                    match value.strip_prefix("$HOME") {
+                        Some(rest) => home.join(rest.trim_start_matches('/')),
+                        None => PathBuf::from(value),
+                    }
+                })
+        });
+    Some(
+        configured
+            .filter(|dir| dir.is_absolute())
+            .unwrap_or_else(|| home.join("Downloads")),
+    )
+}
+
+/// Save an image a person opened where they keep downloads, under the name it was sent with
+/// (its last path part only, never a directory it names), or its hash. An existing file is
+/// never replaced: a second save of other bytes takes the next free `name-2.png`.
+pub fn save(dir: &Path, image: &st3_conversation_ui::MailImage, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let extension = match image.media_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    let leaf: String = image
+        .name
+        .as_deref()
+        .and_then(|name| name.rsplit(['/', '\\']).next())
+        .unwrap_or_default()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect();
+    let leaf = leaf.trim().trim_start_matches('.');
+    let stem = Path::new(leaf)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map_or_else(|| image.sha256.chars().take(16).collect(), str::to_owned);
+    std::fs::create_dir_all(dir)?;
+    for attempt in 1..1000 {
+        let name = if attempt == 1 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem}-{attempt}.{extension}")
+        };
+        let path = dir.join(name);
+        if path.exists() {
+            if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+                return Ok(path);
+            }
+            continue;
+        }
+        let partial = dir.join(format!(".{stem}.partial"));
+        std::fs::write(&partial, bytes)?;
+        std::fs::rename(&partial, &path)?;
+        return Ok(path);
+    }
+    Err(std::io::Error::other("no free name to save the image under"))
+}
+
 /// Show a file with this machine's own viewer, when it has one: `open` on macOS, `xdg-open` on
 /// a Linux desktop. False when nothing here can show it (a server reached over SSH).
 pub fn show(path: &Path) -> bool {
@@ -340,6 +467,25 @@ pub fn mention(attachments: &[Attachment]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_opened_image_is_saved_by_its_name_never_a_path_and_never_over_another() {
+        let root = tempfile::tempdir().unwrap();
+        let image = |name: Option<&str>| st3_conversation_ui::MailImage {
+            sha256: "ef".repeat(32),
+            message: "message/picture".into(),
+            media_type: "image/png".into(),
+            name: name.map(str::to_owned),
+            size: 3,
+        };
+        let first = save(root.path(), &image(Some("../../etc/north bed.png")), b"one").unwrap();
+        assert_eq!(first, root.path().join("north bed.png"));
+        assert_eq!(save(root.path(), &image(Some("north bed.png")), b"one").unwrap(), first, "the same bytes are the same file");
+        let second = save(root.path(), &image(Some("north bed.png")), b"two").unwrap();
+        assert_eq!(second, root.path().join("north bed-2.png"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(save(root.path(), &image(None), b"three").unwrap(), root.path().join(format!("{}.png", "ef".repeat(8))));
+    }
 
     #[test]
     fn an_image_read_from_st_is_kept_once_by_its_hash() {

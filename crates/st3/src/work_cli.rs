@@ -123,11 +123,17 @@ pub(super) async fn run_work(
         }
         WorkCommand::Ask(args) => {
             reject_foreign_agent_actor(&args.actor)?;
-            let request = args
+            let mut request = args
                 .request
                 .as_deref()
                 .map(read_structured_request)
                 .transpose()?;
+            if let Some(request) = request.as_mut().filter(|_| !args.attach.is_empty()) {
+                let uploaded = upload_attachments(endpoint, &args.actor, &args.attach).await?;
+                let mut attachments = request["attachments"].as_array().cloned().unwrap_or_default();
+                attachments.extend(uploaded.iter().map(|attachment| serde_json::json!(attachment)));
+                request["attachments"] = serde_json::Value::Array(attachments);
+            }
             let reason = match (args.reason, &request) {
                 (Some(reason), _) => reason,
                 (None, Some(request)) => request["question"]

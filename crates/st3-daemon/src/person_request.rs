@@ -6,6 +6,10 @@
 //! ID instead of reading prose. An `update` asks nothing: it brings the person information they
 //! asked for, names the work or message where they asked (`about`), and clears once read. An
 //! ask without a request stays a free-text ask.
+//!
+//! A request may carry up to four images, as a message does (`docs/st3/attachments.md`): the
+//! asker names its uploads (`{blob, media_type, name}`), the daemon completes each with its size
+//! and the member that holds the bytes, and the person reads them by the ask's step.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -92,6 +96,9 @@ pub struct StructuredRequest {
     /// A choice may also take a custom answer in the person's words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub custom: bool,
+    /// Images the person looks at to answer, completed by the daemon from the asker's uploads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::model::MessageAttachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -157,6 +164,20 @@ fn answer_id(id: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+/// A request as clients read it: each image also names its `blob/<sha256>` reference, as a
+/// message's attachments do, so a client reads it with the same blob route and the ask's step.
+pub fn client_view(request: &Value) -> Value {
+    let mut view = request.clone();
+    if let Some(attachments) = view.get_mut("attachments").and_then(Value::as_array_mut) {
+        for attachment in attachments {
+            if let Some(sha256) = attachment.get("sha256").and_then(Value::as_str) {
+                attachment["blob"] = json!(format!("blob/{sha256}"));
+            }
+        }
+    }
+    view
 }
 
 impl StructuredRequest {
@@ -234,6 +255,30 @@ impl StructuredRequest {
                 if let Some(value) = value {
                     line(&format!("subject {name}"), value)?;
                 }
+            }
+        }
+        if self.request_type == RequestType::Update && !self.attachments.is_empty() {
+            return Err(invalid("an update carries no images; ask with them instead"));
+        }
+        if self.attachments.len() > crate::blobs::MAX_ATTACHMENTS {
+            return Err(invalid(format!(
+                "at most {} images",
+                crate::blobs::MAX_ATTACHMENTS
+            )));
+        }
+        for attachment in &self.attachments {
+            if !crate::blobs::is_sha256(&attachment.sha256)
+                || !crate::blobs::MEDIA_TYPES.contains(&attachment.media_type.as_str())
+                || attachment.size == 0
+                || attachment.size > crate::blobs::MAX_BLOB_BYTES as u64
+                || attachment.origin.trim().is_empty()
+            {
+                return Err(invalid(
+                    "an image names an uploaded PNG, JPEG, GIF or WebP of at most 10 MiB",
+                ));
+            }
+            if let Some(name) = &attachment.name {
+                line("an image name", name)?;
             }
         }
         let mut ids = std::collections::BTreeSet::new();

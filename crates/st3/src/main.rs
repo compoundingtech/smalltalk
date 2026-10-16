@@ -82,7 +82,7 @@ mod uninstall_cli;
 mod work_cli;
 use agents_cli::run_agents;
 use attention_cli::run_attention;
-use conversations_cli::run_message;
+use conversations_cli::{run_message, upload_attachments};
 use driver_cli::{run_driver, run_driver_hook};
 use fleet_cli::run_fleet;
 use launch_cli::{run_launch, run_mission_view};
@@ -3349,6 +3349,10 @@ struct WorkAskArgs {
     /// feedback, with named answers the person picks and you read back as data.
     #[arg(long, value_name = "FILE", long_help = STRUCTURED_REQUEST_HELP)]
     request: Option<PathBuf>,
+    /// Show the person an image with the request (PNG, JPEG, GIF or WebP, at most 10 MiB, up
+    /// to 4). It is uploaded to this member and read by the person through the ask.
+    #[arg(long = "attach", value_name = "FILE", requires = "request")]
+    attach: Vec<PathBuf>,
     #[arg(long, conflicts_with = "new_run")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     step: Option<String>,
@@ -12316,7 +12320,8 @@ and `"custom": true` also takes the person's own words. `feedback` asks for text
 answers. `why_person` says why no runtime fact or standing instruction settles it. Omit
 `recommendation` to make none. An `update` asks nothing: it names `about`, the person's own
 run or step or their message to you, and clears once read (`st work update` builds one). Subject kinds: pull_request, issue, document, mission, run,
-step, agent, host, commit, link; `revision` pins what was reviewed.
+step, agent, host, commit, link; `revision` pins what was reviewed. `--attach FILE` shows the
+person an image with the request (up to 4), as `st conversations send --attach` does.
 
   {"version": 1, "type": "decision",
    "question": "Land #11 then #12?",

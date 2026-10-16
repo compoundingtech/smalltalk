@@ -405,6 +405,7 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                                 .map_or(&item.detail, |request| &request.question),
                         ),
                         structured: item.request.clone().map(Box::new),
+                        images: request_images(item.request.as_ref().map(|request| &request.attachments), &item.source_id),
                     },
                 ),
                 custom if custom.starts_with("custom.") => (
@@ -419,6 +420,7 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             item.source_id
                         ),
                         structured: None,
+                        images: Vec::new(),
                     },
                 ),
                 // A prompt the seat's harness shows and waits on. Claude's permission prompts
@@ -930,6 +932,26 @@ use st3_conversation_ui::adapt::from_harness;
 pub use st3_conversation_ui::adapt::unreadable_transcript;
 
 /// Standalone native images need a focusable row even when the text adapter has no words.
+/// The images an ask carries, read from st by its person step (`source_id`), the way a
+/// message's images are read by the message.
+fn request_images(
+    attachments: Option<&Vec<st3_client::Attachment>>,
+    step: &str,
+) -> Vec<st3_conversation_ui::MailImage> {
+    attachments
+        .into_iter()
+        .flatten()
+        .filter(|attachment| attachment.media_type.starts_with("image/"))
+        .map(|attachment| st3_conversation_ui::MailImage {
+            sha256: attachment.sha256.clone(),
+            message: step.to_owned(),
+            media_type: attachment.media_type.clone(),
+            name: attachment.name.clone(),
+            size: attachment.size,
+        })
+        .collect()
+}
+
 pub fn conversation(timeline: &[st3_client::TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
     let mut entries = st3_conversation_ui::adapt::conversation(timeline, names);
     for (index, source) in timeline.iter().enumerate() {
