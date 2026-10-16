@@ -166,9 +166,8 @@ pub struct Context {
     pub person: String,
     pub cache_path: Option<std::path::PathBuf>,
     pub cached: Option<Model>,
-    /// `st ui --glasses` / `--glass NAME`: open glasses instead of the sidebar layout, at the
-    /// named glass or the last one used on this device.
-    pub glass: Option<Option<String>>,
+    /// `st ui --space NAME`: the space to open; otherwise the last one used on this device.
+    pub space: Option<String>,
     pub(crate) open_timing: Option<super::open_timing::Trace>,
     pub(crate) process_started: Instant,
     pub initial_subject: Option<String>,
@@ -458,7 +457,7 @@ pub fn run(context: Context) -> Result<()> {
         person,
         cache_path,
         cached,
-        glass,
+        space,
         mut open_timing,
         process_started,
         mut initial_subject,
@@ -502,22 +501,14 @@ pub fn run(context: Context) -> Result<()> {
     if earlier.is_some() {
         super::slo::METRICS.add("drafts_restored_unclean", ui.drafts_saved.len() as u64);
     }
-    if glass.is_some() {
-        ui.resource_sidebar.load(&person);
-    }
+    ui.resource_sidebar.load(&person);
     ui.resource_sidebar.observe(&ui.world);
     ui.build = true;
     ui.live = true;
-    ui.glasses = glass.map(|name| {
-        super::glass::Glasses::open(name, super::glass_store::path(&person))
-    });
-    // A glass opens where this device left it.
+    ui.glasses = super::glass::Glasses::open(space, super::glass_store::path(&person));
+    // A space opens where this device left it.
     ui.show_focused();
-    if ui.glasses.is_none() {
-        ui.flash(
-            "The classic layout is going away: plain st opens spaces, with Ctrl+S for this list",
-        );
-    } else if std::env::args().any(|arg| arg == "--old") {
+    if std::env::args().any(|arg| arg == "--old") {
         ui.flash("The old screens are gone: this is spaces, and ? shows its keys");
     }
 
@@ -526,7 +517,7 @@ pub fn run(context: Context) -> Result<()> {
         // Long enough to read: the usual flash ends after four seconds.
         ui.flash = Some((note, Instant::now() + Duration::from_secs(26)));
     }
-    let _guard = Guard::enter(ui.glasses.is_some())?;
+    let _guard = Guard::enter(true)?;
     // The release smoke test's probe: the terminal is restored after a panic too.
     #[cfg(debug_assertions)]
     if std::env::var_os("STUI_TEST_PANIC_AFTER_ENTER").is_some() {
@@ -632,7 +623,7 @@ pub fn run(context: Context) -> Result<()> {
             match update {
                 feed::Update::GlassesVersion(version) => {
                     super::set_glasses_version(version);
-                    glasses_ready = ui.glasses.is_none();
+                    glasses_ready = false;
                 }
                 feed::Update::Connected(member) => {
                     limit_next = Instant::now();
@@ -665,9 +656,8 @@ pub fn run(context: Context) -> Result<()> {
                         _ => None,
                     }).collect();
                     if ui.resource_sidebar.arrangements.iter().any(|a| a.body.folders.values().any(|folder| folder.tombstone.is_none()))
-                        && let Some(glasses) = ui.glasses.as_mut()
-                        && !glasses.sidebar.configured {
-                        glasses.sidebar.shown = true;
+                        && !ui.glasses.sidebar.configured {
+                        ui.glasses.sidebar.shown = true;
                     }
                     changed = true;
                 }
@@ -1232,11 +1222,11 @@ pub fn run(context: Context) -> Result<()> {
         let (tab, selected) = ui.focus();
         // What a tab needs when it opens: harness sessions st did not start (Agents), and the
         // machines and devices (Fleet). They are read then, never on a timer.
-        let showing_resources = ui.glasses.as_ref().is_some_and(|g| g.sidebar.shown);
+        let showing_resources = ui.glasses.sidebar.shown;
         let focused_resource = match ui.focused_pane() { Some(super::pane::Pane::Resource(id)) => Some(id), _ => None };
         if tab != shown_tab || showing_resources && !resources_shown || focused_resource.is_some() && focused_resource != resource_pane { resources_stale = true; }
         resource_pane = focused_resource.clone();
-        if ui.glasses.is_some() && extras.live && resources_stale && !resources_reading {
+        if extras.live && resources_stale && !resources_reading {
             resources_stale = false; resources_reading = true;
             let reader = client.clone(); let tx = fetched_tx.clone(); let generation = resources_generation;
             runtime.spawn(async move {
@@ -2007,9 +1997,11 @@ pub fn run(context: Context) -> Result<()> {
     Ok(())
 }
 
+/// Saves once st has sent Now, the window every layout follows; missions arrive only while a
+/// mission list or card is on screen, so they cannot be what makes a reading worth keeping.
 fn save_cache(path: Option<&std::path::Path>, person: &str, model: &Model) {
     if let Some(path) = path
-        && model.missions.snapshot.is_some()
+        && model.now.snapshot.is_some()
     {
         let _ = crate::cache::save(path, person, model);
     }
@@ -3157,7 +3149,7 @@ mod tests {
         world.link = super::super::view::Link::Live;
         let known = world.agents.items()[1].id.clone();
         let mut ui = Ui::new(world);
-        ui.glasses = Some(super::super::glass::Glasses::open(None, None));
+        ui.glasses = super::super::glass::Glasses::open(None, None);
         ui.show_focused();
         let mut inbox = Inbox::new(Some(dir.clone()));
         let early = requests::enqueue(&dir, &known, Place::Right, false, None).unwrap();
@@ -3191,24 +3183,15 @@ mod tests {
     }
 
     #[test]
-    fn a_request_the_layout_cannot_show_without_moving_focus_is_not_called_opened() {
+    fn a_name_another_process_wrote_cannot_put_control_characters_in_the_flash() {
         use super::super::pane::Pane;
-        use super::super::requests::{Answer, Place};
+        use super::super::requests::Place;
         let mut world = super::super::demo::world();
         world.link = super::super::view::Link::Live;
         let known = world.agents.items()[1].id.clone();
         let mut ui = Ui::new(world);
-        ui.glasses = None;
-        let pane = || Pane::Agent(Some(known.clone()));
-        // The classic layout has no tabs or splits: only the list can show it, which moves focus.
-        let kept = ui.open_requested(pane(), Place::Tab, true, None);
-        assert_eq!(kept, Answer::NotShown);
-        let moved = ui.open_requested(pane(), Place::Tab, false, None);
-        assert_eq!(moved, Answer::Opened { focused: true });
-        // A name another process wrote cannot put control characters in the flash.
-        ui.glasses = Some(super::super::glass::Glasses::open(None, None));
         ui.show_focused();
-        ui.open_requested(pane(), Place::Right, false, Some("agent/x/bad\x1b[2Jname\n"));
+        ui.open_requested(Pane::Agent(Some(known)), Place::Right, false, Some("agent/x/bad\x1b[2Jname\n"));
         let (shown, _) = ui.flash.clone().unwrap();
         assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
         assert!(shown.contains("bad[2Jname"), "{shown:?}");
@@ -3228,47 +3211,42 @@ mod tests {
 
     #[test]
     fn initial_subject_waits_for_live_inventory_and_opens_only_once() {
-        for spaces in [false, true] {
-            let mut world = super::super::demo::world();
-            let mut assistant = world.agents.items()[0].clone();
-            assistant.id = "agent/st/assistant".into();
-            assistant.name = "Smalltalk Assistant".into();
-            let other = world.agents.items()[0].id.clone();
-            let mut ui = Ui::new(world.clone());
-            if spaces {
-                ui.glasses = Some(super::super::glass::Glasses::open(None, None));
-                ui.show_focused();
-                ui.open_home();
-            }
-            let before = ui.focus();
-            let mut requested = Some(assistant.id.clone());
-            focus_initial_subject(&mut ui, &mut requested, false, true);
-            assert_eq!(
-                ui.focus(), before,
-                "waiting inventory must not open another agent"
-            );
-            assert!(requested.is_some());
-            world.agents = Load::Ready(vec![world.agents.items()[0].clone(), assistant.clone()]);
-            ui.set_world(world.clone());
-            let before = ui.focus();
-            focus_initial_subject(&mut ui, &mut requested, false, true);
-            assert_eq!(
-                ui.focus(), before,
-                "cached inventory must not consume the request"
-            );
-            focus_initial_subject(&mut ui, &mut requested, true, true);
-            assert_eq!(ui.focus(), (1, Some(assistant.id.clone())));
-            assert_eq!(ui.live_conversations()[0], assistant.id);
-            assert!(!ui.home_open());
-            assert!(requested.is_none());
-            ui.open(&other);
-            ui.set_world(world);
-            focus_initial_subject(&mut ui, &mut requested, true, true);
-            assert_eq!(
-                ui.focus(), (1, Some(other)),
-                "later updates preserve navigation"
-            );
-        }
+        let mut world = super::super::demo::world();
+        let mut assistant = world.agents.items()[0].clone();
+        assistant.id = "agent/st/assistant".into();
+        assistant.name = "Smalltalk Assistant".into();
+        let other = world.agents.items()[0].id.clone();
+        let mut ui = Ui::new(world.clone());
+        ui.show_focused();
+        ui.open_home();
+        let before = ui.focus();
+        let mut requested = Some(assistant.id.clone());
+        focus_initial_subject(&mut ui, &mut requested, false, true);
+        assert_eq!(
+            ui.focus(), before,
+            "waiting inventory must not open another agent"
+        );
+        assert!(requested.is_some());
+        world.agents = Load::Ready(vec![world.agents.items()[0].clone(), assistant.clone()]);
+        ui.set_world(world.clone());
+        let before = ui.focus();
+        focus_initial_subject(&mut ui, &mut requested, false, true);
+        assert_eq!(
+            ui.focus(), before,
+            "cached inventory must not consume the request"
+        );
+        focus_initial_subject(&mut ui, &mut requested, true, true);
+        assert_eq!(ui.focus(), (1, Some(assistant.id.clone())));
+        assert_eq!(ui.live_conversations()[0], assistant.id);
+        assert!(!ui.home_open());
+        assert!(requested.is_none());
+        ui.open(&other);
+        ui.set_world(world);
+        focus_initial_subject(&mut ui, &mut requested, true, true);
+        assert_eq!(
+            ui.focus(), (1, Some(other)),
+            "later updates preserve navigation"
+        );
     }
 
     #[test]
@@ -3301,7 +3279,6 @@ mod tests {
     #[test]
     fn no_initial_subject_preserves_the_restored_space() {
         let mut ui = Ui::new(super::super::demo::world());
-        ui.glasses = Some(super::super::glass::Glasses::open(None, None));
         let agent = ui.world.agents.items()[0].id.clone();
         ui.open(&agent);
         ui.open_home();
@@ -3977,7 +3954,8 @@ mod tests {
             ]),
         );
         let mut ui = Ui::new(world);
-        ui.switch_tab(1);
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open(&agent);
         assert!(
             ui.visible_messages().is_empty(),
             "cached conversations are not evidence"

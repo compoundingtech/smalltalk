@@ -11,7 +11,7 @@ use st3::{api::AppState, model::PersonAskRequest, store::Store};
 use st3_client::{Client, PairingBegin};
 use std::{
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
@@ -62,8 +62,8 @@ impl Tui {
             })
             .unwrap();
         let mut command = CommandBuilder::new(test_env!("CARGO_BIN_EXE_st3"));
-        // This proves pairing and control, read off the classic layout's screens.
-        command.args(["ui", "--classic"]);
+        // This proves pairing and control, read off Now, which fills a space with nothing open.
+        command.args(["ui"]);
         command.env_clear();
         command.env("HOME", root);
         command.env("XDG_CONFIG_HOME", root.join("config"));
@@ -393,6 +393,20 @@ async fn stui_pair_persists_a_real_signing_key_and_leaves_read_only_devices_with
     http_server.abort();
 }
 
+/// Every file under `root`, or none when it does not exist.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() { files_under(&path) } else { vec![path] }
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member() {
     let member = tempfile::tempdir().unwrap();
@@ -428,8 +442,10 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     pair(device.path(), &local, &url).await;
     let online_step = person_ask(&state, "online-proof", "Online proof");
     let mut tui = Tui::start(device.path());
+    // Each ask exists on one member only, so seeing it names the member reached; answering it
+    // as the paired person proves the grant.
     tui.wait("paired live view", |screen| {
-        screen.contains("live") && screen.contains("Online proof") && screen.contains("avery")
+        screen.contains("live") && screen.contains("Online proof")
     })
     .await;
     tui.send("cConfirmed on the remote member\r");
@@ -462,9 +478,15 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
         "offline keys must queue no mutation"
     );
     assert!(!device.path().join("absent.sock").exists());
+    // stui keeps this device's spaces and preferences under state/st3/stui; nothing else.
+    let kept = device.path().join("state/st3/stui");
+    let others = files_under(&device.path().join("state"))
+        .into_iter()
+        .filter(|path| !path.starts_with(&kept))
+        .collect::<Vec<_>>();
     assert!(
-        !device.path().join("state").exists(),
-        "the device must create no daemon or replica"
+        others.is_empty(),
+        "the device must create no daemon or replica: {others:?}"
     );
     drop(tui);
     let mut tui = Tui::start(device.path());
@@ -555,9 +577,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     let alternate_step = person_ask(&alternate, "alternate-proof", "Alternate proof");
     let mut tui = Tui::start(device.path());
     tui.wait("another reachable member", |screen| {
-        screen.contains("live")
-            && screen.contains("Alternate proof")
-            && screen.contains("member-willow")
+        screen.contains("live") && screen.contains("Alternate proof")
     })
     .await;
     tui.send("cConfirmed on the remote member\r");
@@ -580,9 +600,7 @@ async fn daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member(
     alternate_route.abort();
     let _ = alternate_route.await;
     tui.wait("live failover", |screen| {
-        screen.contains("live")
-            && screen.contains("Returned member proof")
-            && screen.contains("member-cedar")
+        screen.contains("live") && screen.contains("Returned member proof")
     })
     .await;
     tui.send("cConfirmed on the remote member\r");
@@ -629,12 +647,13 @@ async fn inventory_screens_send_no_request_after_their_first_frames_for_more_tha
     .unwrap();
     let repo = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     for (key, label, windows) in [
+        // The palette opens the Fleet list as a tab, and Usage over the space.
         (
-            "4",
+            "\\x0bfleet\\r",
             "inventory-fleet",
             vec!["clients", "machines", "devices", "sessions"],
         ),
-        ("5", "inventory-usage", vec!["usage-24"]),
+        ("\\x0busage\\r", "inventory-usage", vec!["usage-24"]),
     ] {
         let device = tempfile::tempdir().unwrap();
         let log = device.path().join("timing.jsonl");
@@ -645,7 +664,6 @@ async fn inventory_screens_send_no_request_after_their_first_frames_for_more_tha
             .args([
                 "--binary",
                 test_env!("CARGO_BIN_EXE_st3"),
-                "--classic",
                 "--seconds",
                 "72",
                 "--label",
@@ -809,13 +827,12 @@ async fn an_older_member_reads_fleet_on_focus_without_attempting_inventory_subsc
         .args([
             "--binary",
             test_env!("CARGO_BIN_EXE_st3"),
-            "--classic",
             "--seconds",
             "4",
             "--label",
             "older-inventory",
             "--keys",
-            "4",
+            "\\x0bfleet\\r",
         ])
         .arg("--timing")
         .arg(&log)

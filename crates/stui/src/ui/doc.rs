@@ -44,7 +44,6 @@ pub enum Hit {
     Usage,
     /// The top bar's connection word ("live"): this machine, or why it is not reached.
     Connection,
-    Tab(usize),
     Row(usize),
     /// A conversation entry: left drag selects text; right click opens message actions.
     Message,

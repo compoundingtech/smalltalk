@@ -315,16 +315,6 @@ impl Ui {
             Hit::Split(true) => "Split right [Ctrl+V]",
             Hit::Split(false) => "Split below [Ctrl+X]",
             Hit::Help => "Show help [F1]",
-            Hit::Key('s') => "Show or hide the list [s]",
-            Hit::Tab(index) => {
-                return Some((
-                    "section".into(),
-                    vec![(
-                        format!("Open {} [{}]", TABS.get(*index)?, index + 1),
-                        activate(None, hit.clone()),
-                    )],
-                ));
-            }
             Hit::Link(_) => "Copy link",
             _ => return None,
         };
@@ -463,15 +453,15 @@ impl Ui {
                 .as_deref()
                 .map(|id| id.trim_start_matches("actions:").to_owned())
                 .or_else(|| {
-                    self.glasses
-                        .as_ref()
-                        .filter(|glasses| glasses.sidebar.focused && glasses.sidebar.shown)
-                        .and_then(|glasses| {
-                            self.listing_for(glasses.sidebar.section, 40)
+                    let sidebar = &self.glasses.sidebar;
+                    (sidebar.focused && sidebar.shown)
+                        .then(|| {
+                            self.listing_for(sidebar.section, 40)
                                 .ids
-                                .get(glasses.sidebar.selected[glasses.sidebar.section])
+                                .get(sidebar.selected[sidebar.section])
                                 .cloned()
                         })
+                        .flatten()
                 })
                 .or_else(|| self.attention_focus())
                 .or_else(|| self.selected_id());
@@ -540,69 +530,63 @@ mod tests {
         mouse(ui, MouseButton::Left, rect.x + 2, rect.y);
     }
 
-    fn agent_rows(spaces: bool) -> Ui {
+    /// The sidebar's agent rows, shown with Ctrl+S.
+    fn agent_rows() -> Ui {
         let mut ui = Ui::new(demo::world());
-        if spaces {
-            ui.glasses = Some(glass::Glasses::open(None, None));
-            ui.toggle_sidebar();
-        } else {
-            ui.switch_tab(1);
-        }
+        ui.toggle_sidebar();
         ui
     }
 
     #[test]
     fn a_right_click_targets_its_row_without_selecting_and_outside_clicks_only_close() {
-        for spaces in [false, true] {
-            let mut ui = agent_rows(spaces);
-            draw(&ui, 160, 48);
-            let before = ui.selected_id();
-            let subject = ui
-                .frame
-                .borrow()
-                .context_rows
+        let mut ui = agent_rows();
+        draw(&ui, 160, 48);
+        let before = ui.selected_id();
+        let subject = ui
+            .frame
+            .borrow()
+            .context_rows
+            .iter()
+            .find(|(_, id, _)| Some(id) != before.as_ref())
+            .unwrap()
+            .1
+            .clone();
+        let rect = row(&ui, &subject);
+        let focus = ui.focus();
+        mouse(&mut ui, MouseButton::Right, rect.x + 2, rect.y);
+        assert_eq!(ui.selected_id(), before);
+        assert_eq!(ui.focus(), focus);
+        assert!(ui.effects.is_empty() && ui.conversation_state.selection.is_none());
+        let menu = ui.context.as_ref().unwrap();
+        assert!(menu.items[0].0.starts_with("Open conversation"));
+        assert!(
+            menu.items
                 .iter()
-                .find(|(_, id, _)| Some(id) != before.as_ref())
-                .unwrap()
-                .1
-                .clone();
-            let rect = row(&ui, &subject);
-            let focus = ui.focus();
-            mouse(&mut ui, MouseButton::Right, rect.x + 2, rect.y);
-            assert_eq!(ui.selected_id(), before);
-            assert_eq!(ui.focus(), focus);
-            assert!(ui.effects.is_empty() && ui.conversation_state.selection.is_none());
-            let menu = ui.context.as_ref().unwrap();
-            assert!(menu.items[0].0.starts_with("Open conversation"));
-            assert!(
-                menu.items
-                    .iter()
-                    .any(|(label, _)| label.contains("Copy its path [c]"))
-            );
-            assert!(
-                menu.items
-                    .iter()
-                    .any(|(label, _)| label.contains("Terminal [t]"))
-            );
-            draw(&ui, 160, 48);
-            mouse(&mut ui, MouseButton::Left, 0, 47);
-            assert!(ui.context.is_none());
-            assert_eq!(ui.selected_id(), before);
-            assert_eq!(ui.focus(), focus);
-            draw(&ui, 160, 48);
-            mouse(&mut ui, MouseButton::Right, rect.x + 2, rect.y);
-            choose(
-                &mut ui,
-                |action| matches!(action, MenuAction::Activate { hit, .. } if hit.as_ref() == &Hit::Open(subject.clone())),
-            );
-            assert_eq!(ui.selected_id().as_deref(), Some(subject.as_str()));
-            assert!(ui.context.is_none());
-        }
+                .any(|(label, _)| label.contains("Copy its path [c]"))
+        );
+        assert!(
+            menu.items
+                .iter()
+                .any(|(label, _)| label.contains("Terminal [t]"))
+        );
+        draw(&ui, 160, 48);
+        mouse(&mut ui, MouseButton::Left, 0, 47);
+        assert!(ui.context.is_none());
+        assert_eq!(ui.selected_id(), before);
+        assert_eq!(ui.focus(), focus);
+        draw(&ui, 160, 48);
+        mouse(&mut ui, MouseButton::Right, rect.x + 2, rect.y);
+        choose(
+            &mut ui,
+            |action| matches!(action, MenuAction::Activate { hit, .. } if hit.as_ref() == &Hit::Open(subject.clone())),
+        );
+        assert_eq!(ui.selected_id().as_deref(), Some(subject.as_str()));
+        assert!(ui.context.is_none());
     }
 
     #[test]
     fn agent_changes_and_interrupts_use_the_existing_y_only_confirmation() {
-        let mut ui = agent_rows(true);
+        let mut ui = agent_rows();
         ui.live = true;
         let subject = ui.world.agents.items()[0].id.clone();
         if let Load::Ready(agents) = &mut ui.world.agents {
@@ -640,7 +624,7 @@ mod tests {
     #[test]
     fn mission_rows_open_their_own_declaration_and_home_reuses_every_card_key() {
         let mut ui = Ui::new(demo::world());
-        ui.switch_tab(2);
+        ui.open_in_glass(Pane::List(2), glass::Open::Tab);
         draw(&ui, 160, 48);
         let subject = ui.frame.borrow().context_rows[1].1.clone();
         let rect = row(&ui, &subject);
@@ -690,7 +674,7 @@ mod tests {
                 }
             }
         }
-        ui.switch_tab(0);
+        ui.open_home();
         ui.live = true;
         if let Load::Ready(items) = &mut ui.world.attention {
             for item in items {
@@ -795,38 +779,36 @@ mod tests {
 
     #[test]
     fn all_bar_targets_reuse_their_click_and_a_small_menu_keeps_every_row_reachable() {
-        for spaces in [false, true] {
-            let mut ui = agent_rows(spaces);
-            draw(&ui, 160, 48);
-            let bar = ui
-                .frame
-                .borrow()
-                .hits
-                .iter()
-                .filter(|(rect, _)| rect.y == 0)
-                .cloned()
-                .collect::<Vec<_>>();
-            press(&mut ui, KeyCode::F(10));
-            let menu = ui.context.as_ref().unwrap();
-            for (_, hit) in &bar {
-                assert!(
-                    menu.items
-                        .iter()
-                        .any(|(_, action)| *action == activate(None, hit.clone())),
-                    "the keyboard reaches bar target {hit:?}"
-                );
-            }
-            press(&mut ui, KeyCode::Esc);
-            for (rect, hit) in bar {
-                mouse(&mut ui, MouseButton::Right, rect.x, rect.y);
-                assert!(ui.context.is_some(), "bar target {hit:?} has a menu");
-                let (_, action) = &ui.context.as_ref().unwrap().items[0];
-                assert_eq!(*action, activate(None, hit));
-                press(&mut ui, KeyCode::Esc);
-                draw(&ui, 160, 48);
-            }
+        let mut ui = agent_rows();
+        draw(&ui, 160, 48);
+        let bar = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .filter(|(rect, _)| rect.y == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        press(&mut ui, KeyCode::F(10));
+        let menu = ui.context.as_ref().unwrap();
+        for (_, hit) in &bar {
+            assert!(
+                menu.items
+                    .iter()
+                    .any(|(_, action)| *action == activate(None, hit.clone())),
+                "the keyboard reaches bar target {hit:?}"
+            );
         }
-        let mut ui = agent_rows(false);
+        press(&mut ui, KeyCode::Esc);
+        for (rect, hit) in bar {
+            mouse(&mut ui, MouseButton::Right, rect.x, rect.y);
+            assert!(ui.context.is_some(), "bar target {hit:?} has a menu");
+            let (_, action) = &ui.context.as_ref().unwrap().items[0];
+            assert_eq!(*action, activate(None, hit));
+            press(&mut ui, KeyCode::Esc);
+            draw(&ui, 160, 48);
+        }
+        let mut ui = agent_rows();
         ui.key(KeyEvent::new(KeyCode::F(10), KeyModifiers::SHIFT));
         assert!(ui.context.as_ref().unwrap().items.len() > 4);
         press(&mut ui, KeyCode::End);
@@ -853,7 +835,6 @@ mod tests {
         use std::io::{Read as _, Write as _};
         use std::os::unix::net::UnixStream;
         let mut ui = Ui::new(demo::world());
-        ui.glasses = Some(glass::Glasses::open(None, None));
         let shell = "terminal/copper-shell";
         ui.open_in_glass(Pane::Terminal(shell.into()), glass::Open::Tab);
         let (client, mut peer) = UnixStream::pair().unwrap();

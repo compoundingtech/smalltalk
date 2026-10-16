@@ -407,11 +407,7 @@ impl Ui {
 
     /// Open an alert's whole card in Now, selected.
     pub(super) fn open_alert(&mut self, id: &str) {
-        if self.glasses.is_some() {
-            self.open_home();
-        } else {
-            self.switch_tab(0);
-        }
+        self.open_home();
         if let Some(index) = self
             .listing_for(0, 40)
             .ids
@@ -745,7 +741,7 @@ mod tests {
     fn open_selects_the_alert_in_now() {
         let mut ui = with_alerts(vec![prompt("attention/a", &[]), prompt("attention/b", &[])]);
         ui.click(Hit::Alert("attention/b".into(), AlertTap::Open));
-        assert_eq!(ui.tab, 0);
+        assert_eq!(ui.tab(), 0);
         assert_eq!(ui.attention_focus().as_deref(), Some("attention/b"));
     }
 

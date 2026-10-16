@@ -13,6 +13,10 @@ use ratatui::style::Color;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
+/// The lists every client offers, by name. Worktrees stays hidden until the graph models
+/// worktrees: its screens only have invented data to show (Nathan, 2026-09-28).
+const LISTS: [&str; 5] = ["Now", "Agents", "Missions", "Fleet", "Usage"];
+
 fn root() -> PathBuf {
     PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../../fixtures/clients")
 }
@@ -120,7 +124,7 @@ pub fn words() -> Value {
         .iter()
         .map(|tier| json!({ "id": serde_json::to_value(tier).unwrap(), "title": tier.title() }))
         .collect::<Vec<_>>();
-    json!({ "mission": mission, "agent": agent, "tier": tier, "tabs": super::screens::TABS })
+    json!({ "mission": mission, "agent": agent, "tier": tier, "tabs": LISTS })
 }
 
 /// The cleaned conversation. `at` is a local display time, so it is left out: it depends on
