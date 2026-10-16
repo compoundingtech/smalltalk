@@ -50,7 +50,7 @@ pub struct Request {
     /// The file's name without its extension; time ordered.
     #[serde(skip)]
     pub id: String,
-    /// What to show: `agent/…`, `mission/…`, `mission-run/…` or `machine/…`.
+    /// What to show: `agent/…`, `mission/…`, `mission-run/…`, `machine/…` or `doc/…`.
     pub subject: String,
     #[serde(default)]
     pub place: Place,
@@ -102,7 +102,10 @@ pub fn pane_for(subject: &str) -> Result<Pane, String> {
             return Ok(make(Some(subject.to_owned())));
         }
     }
-    Err("st ui open shows agent/…, mission/…, mission-run/… or machine/…".into())
+    if subject.len() > "doc/".len() && subject.starts_with("doc/") {
+        return Ok(Pane::Document(subject.to_owned()));
+    }
+    Err("st ui open shows agent/…, mission/…, mission-run/…, machine/… or doc/…".into())
 }
 
 /// Where this person's requests wait on this device.
@@ -354,9 +357,15 @@ mod tests {
             pane("mission-run/garden/notes/2026-10-08"),
             Ok("mission:mission/garden/notes".into())
         );
+        // A document opens as the version named, as `st documents put` prints it.
+        assert_eq!(
+            pane("doc/garden/notes@4f2a"),
+            Ok("document:doc/garden/notes@4f2a".into())
+        );
         for refused in [
             "",
             "agent/",
+            "doc/",
             "attention/one",
             "person/ada",
             "agent/with space",

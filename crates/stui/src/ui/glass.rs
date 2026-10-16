@@ -2011,8 +2011,9 @@ impl Ui {
                     theme::dim(),
                 );
             }
-            // A usage tab names its group whatever the list groups by, so it draws from its key.
-            Some(pane @ Pane::Usage(_)) => self.draw_pane(buf, content, &pane),
+            // A usage tab names its group whatever the list groups by, so it draws from its key;
+            // a document has no list at all.
+            Some(pane @ (Pane::Usage(_) | Pane::Document(_))) => self.draw_pane(buf, content, &pane),
             // A session has no sidebar agent selection: render the tab's subject directly.
             Some(Pane::Agent(Some(id))) if id.starts_with("session/") => {
                 self.draw_pane(buf, content, &Pane::Agent(Some(id)))
@@ -2415,6 +2416,7 @@ impl Ui {
             }
             Pane::Machine(id) => find(id).trim_start_matches("machine/").to_owned(),
             Pane::Resource(id) => self.resource_sidebar.observations.iter().find(|row| &row.id == id).map(super::observed_resources::title).unwrap_or_else(|| id.clone()),
+            Pane::Document(name) => document_title(name),
             Pane::Usage(None) => "Usage".into(),
             Pane::Usage(Some(id)) => format!("Usage · {}", super::usage::label(&self.world, id)),
             other => other.key(),
@@ -3107,6 +3109,8 @@ impl Ui {
                 let name = id.trim_start_matches("machine/");
                 self.world.machines.items().iter().any(|m| m.name == name)
             }
+            // A document is read when its pane opens; one st does not have says so there.
+            Pane::Document(_) => true,
             _ => false,
         }
     }
@@ -4209,6 +4213,12 @@ fn new_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+/// A document pane's title: its name, without `doc/` and the version's hash.
+pub(crate) fn document_title(reference: &str) -> String {
+    let name = reference.rsplit_once('@').map_or(reference, |(name, _)| name);
+    name.trim_start_matches("doc/").to_owned()
+}
+
 /// The pane a graph subject opens as, for links followed inside a glass.
 pub(crate) fn pane_for(id: &str) -> Option<Pane> {
     let id = id.to_owned();
@@ -4220,6 +4230,8 @@ pub(crate) fn pane_for(id: &str) -> Option<Pane> {
         Some(Pane::Agent(Some(id)))
     } else if id.starts_with("resource/") {
         Some(Pane::Resource(id))
+    } else if id.starts_with("doc/") {
+        Some(Pane::Document(id))
     } else if id.starts_with("machine/") {
         Some(Pane::Machine(Some(id)))
     } else {
@@ -7851,5 +7863,15 @@ mod tests {
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         assert!(ui.glasses.as_ref().unwrap().palette.is_none());
         assert_eq!(ui.tab, 0, "the sidebar's tabs do not change underneath");
+    }
+
+    #[test]
+    fn a_document_tab_is_named_without_its_prefix_or_version() {
+        assert_eq!(document_title("doc/garden/notes@4f2a"), "garden/notes");
+        assert_eq!(document_title("doc/REVIEW.md"), "REVIEW.md");
+        assert_eq!(
+            Pane::parse(&Pane::Document("doc/garden/notes@4f2a".into()).key()),
+            Some(Pane::Document("doc/garden/notes@4f2a".into()))
+        );
     }
 }

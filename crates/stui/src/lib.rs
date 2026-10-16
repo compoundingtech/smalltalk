@@ -10,6 +10,7 @@ mod voice;
 
 pub use ui::screens::{HOME_IDLE_TEXT, HOME_UNKNOWN_TEXT};
 pub use ui::checklist;
+pub use ui::playback;
 pub use version::display_version;
 
 use st3_feed as feed;
@@ -692,6 +693,8 @@ pub struct Args {
     endpoint: Option<PathBuf>,
     #[arg(skip)]
     initial_subject: Option<String>,
+    #[arg(skip)]
+    playback: Option<ui::playback::Playback>,
     /// Open a named space instead of the last space used on this device.
     #[arg(long, alias = "glass", conflicts_with = "classic")]
     pub space: Option<String>,
@@ -735,7 +738,8 @@ pub enum Action {
     /// or a split. For a seat to use; it opens nothing when no terminal interface is running.
     ///
     /// `agent/NAME` opens the conversation. `mission/NAME` and `mission-run/NAME/RUN` open the
-    /// mission view, which stays open and follows the mission from step to step. An item that
+    /// mission view, which stays open and follows the mission from step to step.
+    /// `doc/NAME@HASH`, as `st documents put` prints it, shows that document's text. An item that
     /// is already open is shown again, never opened twice. The pane takes the person's focus,
     /// unless they are typing a message or `--keep-focus` says to leave it. The request waits
     /// for st to know the subject, so an agent made a moment ago can be opened.
@@ -744,7 +748,7 @@ pub enum Action {
 
 #[derive(clap::Args, Debug)]
 pub struct OpenArgs {
-    /// `agent/NAME`, `mission/NAME`, `mission-run/NAME/RUN` or `machine/NAME`.
+    /// `agent/NAME`, `mission/NAME`, `mission-run/NAME/RUN`, `machine/NAME` or `doc/NAME@HASH`.
     pub subject: String,
     /// Open it in a split to the right of the focused one, not in a tab.
     #[arg(long)]
@@ -764,6 +768,12 @@ impl Args {
     /// Override local socket discovery with the CLI's global endpoint option.
     pub fn with_endpoint(mut self, endpoint: PathBuf) -> Self {
         self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Play a demo in this interface: `st demo play` hears its advance key and types through it.
+    pub fn with_playback(mut self, playback: ui::playback::Playback) -> Self {
+        self.playback = Some(playback);
         self
     }
 
@@ -989,6 +999,7 @@ pub fn run(mut options: Args) -> Result<()> {
         process_started,
         initial_subject: options.initial_subject.filter(|_| profile.is_none()),
         requests,
+        playback: options.playback,
     })
     .inspect_err(|error| ui::lastrun_note_exit(format!("error: {error:#}")))
 }

@@ -38,6 +38,7 @@ pub mod layout;
 pub mod live;
 pub(crate) mod slo;
 pub mod pane;
+pub mod playback;
 mod drafts_store;
 mod prefs;
 mod resource_sidebar;
@@ -406,6 +407,8 @@ pub struct Ui {
     help: bool,
     sidebar: bool,
     resource_sidebar: resource_sidebar::Sidebar,
+    /// The documents open in a pane, by name: their text once st has sent it.
+    pub(crate) documents: std::collections::BTreeMap<String, Load<String>>,
     system: bool,
     frame: RefCell<FrameInfo>,
     hover: hover::Hover,
@@ -736,6 +739,7 @@ impl Ui {
         resource_sidebar.observe(&world);
         Self {
             world,
+            documents: std::collections::BTreeMap::new(),
             tab: 0,
             selected: [0; 6],
             list_top: RefCell::new([0; 6]),
@@ -2589,6 +2593,7 @@ impl Ui {
                 screens::worktree_detail(&self.world, id.as_deref(), width, self.spinner())
             }
             Pane::Resource(id) => observed_resources::detail(id, self.resource_sidebar.observations.iter().find(|row| &row.id == id), width),
+            Pane::Document(name) => document_detail(name, self.documents.get(name), width),
             Pane::Usage(id) => usage::detail(&self.world, id.as_deref(), self.usage_hours, width),
         };
         self.pane(buf, &pane.key(), area, doc, false);
@@ -7037,6 +7042,23 @@ fn dump(args: &[String]) -> Result<()> {
     let _ = terminal.backend_mut().flush();
     print!("{out}");
     Ok(())
+}
+
+/// A stored document: its name, then its text as Markdown.
+fn document_detail(name: &str, text: Option<&Load<String>>, width: usize) -> Doc {
+    let mut doc = Doc::new();
+    let (title, version) = name.rsplit_once('@').unwrap_or((name, ""));
+    doc.field("Document", title.trim_start_matches("doc/"), width, theme::fg(theme::TEXT));
+    if !version.is_empty() {
+        doc.field("Version", &version[..version.len().min(12)], width, theme::fg(theme::OVERLAY1));
+    }
+    doc.blank();
+    match text {
+        Some(Load::Ready(text)) => doc.lines(text::markdown(text, width, theme::fg(theme::TEXT))),
+        Some(Load::Failed(why)) => doc.field("Status", why, width, theme::fg(theme::RED)),
+        _ => doc.field("Status", "Loading…", width, theme::fg(theme::OVERLAY1)),
+    }
+    doc
 }
 
 #[cfg(test)]

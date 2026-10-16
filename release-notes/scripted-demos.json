@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add st demo play and st demo check: a seeded, scripted demo of st in the terminal interface, in its own instance, with timed and key-paced beats.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay, projection rebuild or store recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema transitions."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or coordinated fleet-upgrade changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New commands st demo play FILE and st demo check FILE, and a hidden st demo seat that scripted agents run. st demo play refuses to run outside an instance (st --instance NAME). It erases only an instance a demo made, marked by a .st-demo file in the instance's folder: an instance that holds a graph, interface cache or config without the mark is refused untouched unless st demo play --reset. In a demo's instance it rewrites config.toml and erases the graph on every play, then runs its own daemon in the foreground until the terminal interface quits. A demo's declarations hold only names and the shape of its missions (no harness, command, environment or gate), and it reads only files in its own folder. The terminal interface gains an optional playback link that only st demo play sets, and a document pane: st ui open doc/NAME@HASH (as st documents put prints it) shows that document's text. Plain st ui is otherwise unchanged; an older terminal interface answers a doc/ request as not found. No daemon, wire or phone change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon lifecycle changes or additional service restart requirement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step or persisted-state migration."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "A demo's instance holds only demo data; st --instance NAME uninstall --yes --erase-local-graph removes it."
+  }
+}
