@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 /// A seat gets this long after the daemon starts before a missing poll counts as stale. Drivers
 /// retry every second while the daemon restarts, and a replaced driver re-executes within two.
@@ -27,6 +28,7 @@ const STARTUP_GRACE: Duration = Duration::from_secs(20);
 const POLL_STALE_AFTER: Duration = Duration::from_secs(45);
 /// The Claude channel refreshes its presence every second.
 const CHANNEL_STALE_AFTER_MS: u64 = 10_000;
+const CHANNEL_STALE_AFTER: Duration = Duration::from_millis(CHANNEL_STALE_AFTER_MS);
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct Report {
@@ -54,7 +56,8 @@ struct ChannelReport {
 }
 
 struct Beat {
-    at: Instant,
+    /// Tokio's clock, so a paused test clock and a stream's deadline share one timeline.
+    at: tokio::time::Instant,
     report: Report,
     fence: Option<crate::mailbox::Fence>,
 }
@@ -64,6 +67,10 @@ struct Presence {
     image: Option<String>,
     beats: Mutex<HashMap<String, Beat>>,
     monitors: Mutex<HashMap<String, Beat>>,
+    /// Attachment-push title streams waiting on a subject, one sender per watched subject.
+    watchers: Mutex<HashMap<String, watch::Sender<u64>>>,
+    /// The title binding of each live stream that has been sent an attachment frame.
+    pushed: Mutex<HashMap<String, crate::mailbox::Fence>>,
 }
 
 fn presence() -> &'static Presence {
@@ -73,6 +80,8 @@ fn presence() -> &'static Presence {
         image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
         beats: Mutex::new(HashMap::new()),
         monitors: Mutex::new(HashMap::new()),
+        watchers: Mutex::new(HashMap::new()),
+        pushed: Mutex::new(HashMap::new()),
     })
 }
 
@@ -86,17 +95,14 @@ pub(crate) fn record(recipient: &str, report: &str) {
     let Ok(report) = serde_json::from_str::<Report>(report) else {
         return;
     };
-    let presence = presence();
-    if let Ok(mut beats) = presence.beats.lock() {
-        beats.insert(
-            recipient.to_owned(),
-            Beat {
-                at: Instant::now(),
-                report,
-                fence: None,
-            },
-        );
-    }
+    replace_beat(
+        recipient,
+        Beat {
+            at: tokio::time::Instant::now(),
+            report,
+            fence: None,
+        },
+    );
 }
 
 /// Title updates cannot establish delivery readiness. They can report the outer driver's
@@ -105,43 +111,264 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) -> bool {
     let Ok(report) = serde_json::from_str::<Report>(raw) else {
         return false;
     };
-    let target = if fence.component == "delivery" {
-        if report.transport.as_deref() != Some("claude-channel")
+    let beat = Beat {
+        at: tokio::time::Instant::now(),
+        report,
+        fence: Some(fence.clone()),
+    };
+    if fence.component == "delivery" {
+        if beat.report.transport.as_deref() != Some("claude-channel")
             && let Ok(mut monitors) = presence().monitors.lock()
         {
             monitors.remove(&fence.subject);
         }
-        &presence().beats
-    } else if report.transport.as_deref() == Some("claude-channel") {
-        &presence().monitors
-    } else {
+        return replace_beat(&fence.subject, beat);
+    }
+    if beat.report.transport.as_deref() != Some("claude-channel") {
         return false;
-    };
-    if let Ok(mut beats) = target.lock() {
-        beats.insert(
-            fence.subject.clone(),
-            Beat {
-                at: Instant::now(),
-                report,
-                fence: Some(fence.clone()),
-            },
-        );
+    }
+    if let Ok(mut monitors) = presence().monitors.lock() {
+        monitors.insert(fence.subject.clone(), beat);
         return true;
     }
     false
 }
 
 pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
-    let beats = presence().beats.lock().ok()?;
-    let beat = beats.get(recipient)?;
+    attachment_window(recipient, incarnation)
+        .filter(|(_, until)| tokio::time::Instant::now() <= *until)
+        .map(|(fence, _)| fence)
+}
+
+/// The one attachment predicate, shared by the poll and by the push stream's deadline: the
+/// delivery binding a beat proves and the instant that proof lapses. The report's `age_ms` is
+/// fixed when the channel sends it, so it gates the proof without moving the deadline.
+fn window<'a>(
+    beat: &'a Beat,
+    incarnation: &str,
+) -> Option<(&'a crate::mailbox::Fence, tokio::time::Instant)> {
     let fence = beat.fence.as_ref()?;
     (fence.incarnation == incarnation
-        && beat.at.elapsed() <= Duration::from_millis(CHANNEL_STALE_AFTER_MS)
         && beat.report.transport.as_deref() == Some("claude-channel")
         && beat.report.ready == Some(true)
-        && beat.report.channel.as_ref().is_some_and(|channel|
-            channel.age_ms.is_some_and(|age| age <= CHANNEL_STALE_AFTER_MS)))
-    .then(|| fence.clone())
+        && beat.report.channel.as_ref().is_some_and(|channel| {
+            channel
+                .age_ms
+                .is_some_and(|age| age <= CHANNEL_STALE_AFTER_MS)
+        }))
+    .then(|| (fence, beat.at + stale_after(&fence.subject)))
+}
+
+/// How long a beat proves attachment. Always the constant in production; a test may shorten it
+/// for its own recipient, and the poll and the deadline still read the same window.
+fn stale_after(recipient: &str) -> Duration {
+    #[cfg(test)]
+    if let Some(window) = WINDOW_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|overrides| overrides.get(recipient).copied())
+    {
+        return window;
+    }
+    let _ = recipient;
+    CHANNEL_STALE_AFTER
+}
+
+#[cfg(test)]
+static WINDOW_OVERRIDES: std::sync::LazyLock<Mutex<HashMap<String, Duration>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Shorten the proof window for one test recipient, so a stream test need not wait ten seconds.
+#[cfg(test)]
+pub(super) fn shorten_window(recipient: &str, window: Duration) {
+    WINDOW_OVERRIDES
+        .lock()
+        .unwrap()
+        .insert(recipient.to_owned(), window);
+}
+
+/// The proving delivery binding for `incarnation` and when it lapses, whether or not it has.
+pub(super) fn attachment_window(
+    recipient: &str,
+    incarnation: &str,
+) -> Option<(crate::mailbox::Fence, tokio::time::Instant)> {
+    let beats = presence().beats.lock().ok()?;
+    let (fence, until) = window(beats.get(recipient)?, incarnation)?;
+    Some((fence.clone(), until))
+}
+
+/// What a beat proves at `now`, under any incarnation. Watchers look again only when it changes;
+/// a beat that merely refreshes the same proof leaves it equal.
+fn proof(beat: Option<&Beat>, now: tokio::time::Instant) -> Option<(String, u64, String)> {
+    let beat = beat?;
+    let incarnation = beat.fence.as_ref()?.incarnation.as_str();
+    window(beat, incarnation)
+        .filter(|(_, until)| now <= *until)
+        .map(|(fence, _)| (fence.incarnation.clone(), fence.epoch, fence.token.clone()))
+}
+
+/// Replace a recipient's delivery beat, and wake its attachment watchers if what it proves
+/// changed: an attach, a ready flip, a new binding, or a fresh proof after a lapsed one.
+fn replace_beat(recipient: &str, beat: Beat) -> bool {
+    let Ok(mut beats) = presence().beats.lock() else {
+        return false;
+    };
+    let now = tokio::time::Instant::now();
+    let changed = proof(beats.get(recipient), now) != proof(Some(&beat), now);
+    beats.insert(recipient.to_owned(), beat);
+    drop(beats);
+    if changed {
+        notify(recipient);
+    }
+    true
+}
+
+fn notify(recipient: &str) {
+    if let Ok(watchers) = presence().watchers.lock()
+        && let Some(sender) = watchers.get(recipient)
+    {
+        sender.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
+fn same_binding(a: &crate::mailbox::Fence, b: &crate::mailbox::Fence) -> bool {
+    a.subject == b.subject
+        && a.incarnation == b.incarnation
+        && a.component == b.component
+        && a.epoch == b.epoch
+        && a.token == b.token
+}
+
+/// One push title stream's subscription to its subject's attachment changes. The map keeps a
+/// subject only while a live stream watches it; dropping the last watch removes the entry.
+pub(super) struct AttachmentWatch {
+    subject: String,
+    receiver: Option<watch::Receiver<u64>>,
+}
+
+impl AttachmentWatch {
+    /// Wait for the next change. Never resolves if the watch could not be registered.
+    pub(super) async fn changed(&mut self) {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return std::future::pending().await;
+        };
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl Drop for AttachmentWatch {
+    fn drop(&mut self) {
+        let Ok(mut watchers) = presence().watchers.lock() else {
+            return;
+        };
+        drop(self.receiver.take());
+        if watchers
+            .get(&self.subject)
+            .is_some_and(|sender| sender.receiver_count() == 0)
+        {
+            watchers.remove(&self.subject);
+        }
+    }
+}
+
+pub(super) fn watch_attachment(subject: &str) -> AttachmentWatch {
+    let receiver = presence().watchers.lock().ok().map(|mut watchers| {
+        watchers
+            .entry(subject.to_owned())
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe()
+    });
+    AttachmentWatch {
+        subject: subject.to_owned(),
+        receiver,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn watched(subject: &str) -> bool {
+    presence()
+        .watchers
+        .lock()
+        .is_ok_and(|watchers| watchers.contains_key(subject))
+}
+
+/// Age a recipient's delivery beat, or its title monitor, as if it arrived `by` earlier.
+#[cfg(test)]
+pub(super) fn backdate(recipient: &str, monitor: bool, by: Duration) {
+    let presence = presence();
+    let mut beats = if monitor {
+        presence.monitors.lock()
+    } else {
+        presence.beats.lock()
+    }
+    .unwrap();
+    let beat = beats.get_mut(recipient).expect("a recorded beat");
+    beat.at -= by;
+}
+
+#[cfg(test)]
+impl AttachmentWatch {
+    pub(super) fn has_changed(&self) -> bool {
+        self.receiver
+            .as_ref()
+            .is_some_and(|receiver| receiver.has_changed().unwrap_or(false))
+    }
+}
+
+/// Record that this daemon sent a live title stream an attachment frame.
+pub(super) fn note_pushed(fence: &crate::mailbox::Fence) {
+    if let Ok(mut pushed) = presence().pushed.lock() {
+        pushed.insert(fence.subject.clone(), fence.clone());
+    }
+}
+
+/// The title stream ended; forget it unless a newer binding has already been pushed to.
+pub(super) fn forget_pushed(fence: &crate::mailbox::Fence) {
+    if let Ok(mut pushed) = presence().pushed.lock()
+        && pushed
+            .get(&fence.subject)
+            .is_some_and(|held| same_binding(held, fence))
+    {
+        pushed.remove(&fence.subject);
+    }
+}
+
+/// Whether this exact title binding has a live stream that negotiated push and was sent a
+/// frame. This proves only a push-capable binding, not that a request from it was an admission.
+pub(super) fn push_capable(fence: &crate::mailbox::Fence) -> bool {
+    presence().pushed.lock().is_ok_and(|pushed| {
+        pushed
+            .get(&fence.subject)
+            .is_some_and(|held| same_binding(held, fence))
+    })
+}
+
+/// A Claude seat's attachment-push inventory: `negotiated` when its current title stream has
+/// been pushed to, `not-negotiated` when a fresh title report exists without push, otherwise
+/// `unknown`.
+pub(crate) fn attachment_push(recipient: &str, incarnation: Option<&str>) -> &'static str {
+    let current = |fence: &crate::mailbox::Fence| {
+        incarnation.is_none_or(|incarnation| fence.incarnation == incarnation)
+    };
+    if presence()
+        .pushed
+        .lock()
+        .is_ok_and(|pushed| pushed.get(recipient).is_some_and(current))
+    {
+        return "negotiated";
+    }
+    let reported = presence().monitors.lock().is_ok_and(|monitors| {
+        monitors.get(recipient).is_some_and(|beat| {
+            beat.at.elapsed() <= POLL_STALE_AFTER && beat.fence.as_ref().is_some_and(current)
+        })
+    });
+    if reported {
+        "not-negotiated"
+    } else {
+        "unknown"
+    }
 }
 
 /// A metadata-free poll from a Unix peer proven to be this seat's native delivery process.
@@ -151,21 +378,19 @@ pub(crate) fn record_legacy(recipient: &str, transport: &str, pid: u32) {
     if let Ok(mut monitors) = presence().monitors.lock() {
         monitors.remove(recipient);
     }
-    if let Ok(mut beats) = presence().beats.lock() {
-        beats.insert(
-            recipient.into(),
-            Beat {
-                at: Instant::now(),
-                fence: None,
-                report: Report {
-                    transport: Some(transport.into()),
-                    pid: Some(pid),
-                    legacy: true,
-                    ..Report::default()
-                },
+    replace_beat(
+        recipient,
+        Beat {
+            at: tokio::time::Instant::now(),
+            fence: None,
+            report: Report {
+                transport: Some(transport.into()),
+                pid: Some(pid),
+                legacy: true,
+                ..Report::default()
             },
-        );
-    }
+        },
+    );
 }
 
 /// How one seat's delivery path looks from this daemon.
@@ -447,7 +672,7 @@ mod tests {
             .unwrap()
             .get_mut(recipient)
             .unwrap()
-            .at = Instant::now() - Duration::from_secs(11);
+            .at = tokio::time::Instant::now() - Duration::from_secs(11);
         assert!(attachment(recipient, "current").is_none());
     }
 
@@ -675,6 +900,161 @@ mod tests {
                 reason(&assessment).contains(words),
                 "{assessment:?} should say {words}"
             );
+        }
+    }
+
+    fn claude_report(ready: bool, age_ms: u64) -> String {
+        json!({"transport":"claude-channel", "ready":ready,
+            "channel":{"pid":8,"image":"new","age_ms":age_ms}})
+        .to_string()
+    }
+
+    // The poll and the push stream's deadline read one predicate: attached through
+    // `at + 10 s` inclusive, and the report's own age is a gate fixed when it was sent.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_and_the_deadline_share_one_predicate() {
+        let recipient = "agent/attachment-window";
+        let mut delivery = crate::mailbox::Fence::new(recipient, "current", "delivery");
+        delivery.epoch = 3;
+        for (age_ms, attached) in [(9_999, true), (10_000, true), (10_001, false)] {
+            record_fenced(&delivery, &claude_report(true, age_ms));
+            assert_eq!(
+                attachment(recipient, "current").is_some(),
+                attached,
+                "{age_ms}"
+            );
+            assert_eq!(
+                attachment_window(recipient, "current").is_some(),
+                attached,
+                "{age_ms}"
+            );
+        }
+        record_fenced(&delivery, &claude_report(true, 0));
+        let (fence, until) = attachment_window(recipient, "current").unwrap();
+        assert_eq!(fence.epoch, 3);
+        assert_eq!(until, tokio::time::Instant::now() + CHANNEL_STALE_AFTER);
+        tokio::time::advance(CHANNEL_STALE_AFTER - Duration::from_millis(1)).await;
+        assert!(attachment(recipient, "current").is_some());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            attachment(recipient, "current").is_some(),
+            "the last instant still holds"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(attachment(recipient, "current").is_none());
+        assert_eq!(
+            attachment_window(recipient, "current").unwrap().1,
+            until,
+            "a lapse moves no deadline"
+        );
+    }
+
+    // Planned T11: a beat that only refreshes the same proof wakes no push stream, so a
+    // steadily attached seat costs its title stream nothing until the deadline.
+    #[test]
+    fn only_a_change_in_what_presence_proves_wakes_a_watcher() {
+        let recipient = "agent/attachment-watch-wakes";
+        let mut delivery = crate::mailbox::Fence::new(recipient, "current", "delivery");
+        delivery.epoch = 1;
+        let watch = watch_attachment(recipient);
+        assert!(!watch.has_changed());
+        record_fenced(&delivery, &claude_report(true, 0));
+        assert!(watch.has_changed(), "an attach wakes");
+        let mut watch = watch;
+        if let Some(receiver) = watch.receiver.as_mut() {
+            receiver.borrow_and_update();
+        }
+        for _ in 0..1_000 {
+            record_fenced(&delivery, &claude_report(true, 0));
+        }
+        assert!(
+            !watch.has_changed(),
+            "refreshing the same proof wakes nothing"
+        );
+        record_fenced(&delivery, &claude_report(false, 0));
+        assert!(watch.has_changed(), "a ready flip wakes");
+        if let Some(receiver) = watch.receiver.as_mut() {
+            receiver.borrow_and_update();
+        }
+        let mut rebound = delivery.clone();
+        rebound.epoch = 2;
+        record_fenced(&rebound, &claude_report(true, 0));
+        assert!(watch.has_changed(), "a new binding wakes");
+        if let Some(receiver) = watch.receiver.as_mut() {
+            receiver.borrow_and_update();
+        }
+        backdate(recipient, false, Duration::from_secs(11));
+        record_fenced(&rebound, &claude_report(true, 0));
+        assert!(
+            watch.has_changed(),
+            "a fresh proof after a lapsed one wakes"
+        );
+    }
+
+    // Planned T14: the watcher map holds a subject only while a live watch exists, and a
+    // change for a subject nobody watches creates no entry.
+    #[test]
+    fn watchers_exist_only_for_live_watches() {
+        let watches = (0..1_000)
+            .map(|seat| watch_attachment(&format!("agent/attachment-watch-bound-{seat}")))
+            .collect::<Vec<_>>();
+        assert!(watched("agent/attachment-watch-bound-999"));
+        drop(watches);
+        assert!((0..1_000).all(|seat| !watched(&format!("agent/attachment-watch-bound-{seat}"))));
+        for seat in 0..1_000 {
+            let recipient = format!("agent/attachment-unwatched-{seat}");
+            let mut delivery = crate::mailbox::Fence::new(&recipient, "current", "delivery");
+            delivery.epoch = 1;
+            record_fenced(&delivery, &claude_report(true, 0));
+            assert!(!watched(&recipient));
+        }
+        let recipient = "agent/attachment-watch-shared";
+        let first = watch_attachment(recipient);
+        let second = watch_attachment(recipient);
+        drop(first);
+        assert!(watched(recipient), "a second live watch keeps the entry");
+        drop(second);
+        assert!(!watched(recipient));
+    }
+
+    // Planned T13: once the driver reports only on change and at each 10-second Ping, its title
+    // report is up to about ten seconds old. That age never changes what the seat shows: an
+    // unattached monitor is stale at any age, and an attached one is never consulted.
+    #[test]
+    fn title_report_age_never_changes_the_assessment() {
+        let recipient = "agent/attachment-monitor-age";
+        let mut delivery = crate::mailbox::Fence::new(recipient, "current", "delivery");
+        delivery.epoch = 1;
+        let mut title = crate::mailbox::Fence::new(recipient, "current", "title");
+        title.epoch = 1;
+        record_fenced(&delivery, &claude_report(true, 0));
+        let without_monitor = assess_current(recipient, "claude", Some("current"));
+        record_fenced(
+            &title,
+            &json!({"transport":"claude-channel", "ready":false,
+                "reason":"claude-channel-unattached: mail held"})
+            .to_string(),
+        );
+        let mut aged = Duration::ZERO;
+        for age in [0, 9, 11, 44, 46] {
+            let age = Duration::from_secs(age);
+            backdate(recipient, true, age - aged);
+            aged = age;
+            let assessment = assess_current(recipient, "claude", Some("current"));
+            assert!(assessment.stale(), "{age:?}: {assessment:?}");
+        }
+        record_fenced(
+            &title,
+            &json!({"transport":"claude-channel", "ready":true}).to_string(),
+        );
+        for age in [0, 11, 46] {
+            backdate(recipient, true, Duration::from_secs(age));
+            let mut assessment = assess_current(recipient, "claude", Some("current"));
+            let mut expected = without_monitor.clone();
+            // Only the delivery beat's own age moves between the two readings.
+            assessment.polled_seconds_ago = None;
+            expected.polled_seconds_ago = None;
+            assert_eq!(assessment, expected, "{age}");
         }
     }
 

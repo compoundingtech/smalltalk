@@ -20014,6 +20014,9 @@ struct NativeLoopState {
     claude_attachment_terminal: Option<ClaudeAttachmentTerminal>,
     #[serde(default)]
     claude_readiness_fallback: ClaudeReadinessFallback,
+    /// Admissions for attachment-dependent writes, carried across re-exec with the binding.
+    #[serde(default)]
+    claude_attachment_admissions: AdmissionBucket,
     /// This image's own settle. A replacement image draws a new one, so it is never carried.
     #[serde(skip)]
     settle: ResumeSettle,
@@ -20025,6 +20028,58 @@ struct PendingClaudeAttachment {
     phase: String,
     input: ClaimInput,
     input_digest: String,
+    /// Whether this operation may have reached the daemon. A sent operation is always resolved
+    /// as it is; only one never sent can be withdrawn. A resume file from before this field
+    /// cannot say, so it counts as sent.
+    #[serde(default = "pending_attachment_was_sent")]
+    attempted: bool,
+}
+
+fn pending_attachment_was_sent() -> bool {
+    true
+}
+
+/// Every attachment-dependent write is preceded by a GET that runs the endpoint's full authority
+/// check. A pushed value never replaces that admission, and a flapping channel must not turn it
+/// back into a once-a-second poll: each mailbox binding gets a burst of two admissions, then one
+/// every ten seconds. An empty bucket waits, and the next admission publishes the latest phase,
+/// so intermediate phases coalesce. Keyed by binding and carried across re-exec, so neither a
+/// reconnect nor a re-exec grants a fresh burst.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct AdmissionBucket {
+    binding: Option<(String, u64, String)>,
+    tokens: u32,
+    refilled_at_ms: u64,
+}
+
+const ADMISSION_BURST: u32 = 2;
+const ADMISSION_REFILL_MS: u64 = 10_000;
+
+impl AdmissionBucket {
+    fn take(&mut self, fence: &st3::mailbox::Fence, now_ms: u64) -> bool {
+        let binding = Some((fence.incarnation.clone(), fence.epoch, fence.token.clone()));
+        if self.binding != binding {
+            *self = Self {
+                binding,
+                tokens: ADMISSION_BURST,
+                refilled_at_ms: now_ms,
+            };
+        }
+        // A wall clock stepped backwards grants nothing and restarts the interval.
+        if now_ms < self.refilled_at_ms {
+            self.refilled_at_ms = now_ms;
+        }
+        let earned = (now_ms - self.refilled_at_ms) / ADMISSION_REFILL_MS;
+        if earned > 0 {
+            self.tokens = (u64::from(self.tokens) + earned).min(u64::from(ADMISSION_BURST)) as u32;
+            self.refilled_at_ms += earned * ADMISSION_REFILL_MS;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 // One terminal rejection inhibits publication for this binding, including re-exec.
@@ -22408,6 +22463,7 @@ async fn run_pi_channel(
                     Some(st3::mailbox::Frame::Drain { operation }) => {
                         if let Some(subscription) = &subscription { subscription.acknowledge_drain(operation); }
                     },
+                    Some(st3::mailbox::Frame::Attachment { .. }) => {},
                     Some(st3::mailbox::Frame::Seat { seat }) => {
                         let frame = json!({"type":"seat", "seat":seat});
                         stdout.write_all(format!("{}\n", serde_json::to_string(&frame)?).as_bytes()).await?;
@@ -24729,6 +24785,13 @@ async fn publish_claude_readiness_fallback(
             return Ok(false);
         }
     }
+    // Publishing readiness is a write: on a push connection the pushed value only says whether
+    // to try, and the GET below, under the admission bucket, still admits it.
+    if let Some(pushed) = mailbox.pushed_attachment()
+        && (!pushed.attached || !state.claude_attachment_admissions.take(fence, now_ms))
+    {
+        return Ok(false);
+    }
     let checked =
         checked_claude_attachment(client, &fence.subject, &fence.incarnation, fence).await;
     state
@@ -24788,8 +24851,19 @@ async fn check_claude_attachment(
     state: &mut NativeLoopState,
 ) -> Result<()> {
     let fence = &mailbox.fence;
-    let mut checked = checked_claude_attachment(client, subject, incarnation, fence).await;
-    state.claude_readiness_fallback.observe_attachment(&checked, current_unix_ms()? as u64);
+    // On a connection that has pushed attachment, the pushed value alone feeds the phase. Until
+    // it has (an older daemon, or a new connection), the GET does, as before; never both.
+    let pushed = mailbox.pushed_attachment();
+    // Admissions are rationed only where the phase comes from push; without push every tick
+    // already makes its GET, exactly as before.
+    let mut from_push = pushed.is_some();
+    let mut checked = match pushed {
+        Some(attachment) => Ok(attachment),
+        None => checked_claude_attachment(client, subject, incarnation, fence).await,
+    };
+    state
+        .claude_readiness_fallback
+        .observe_attachment(&checked, current_unix_ms()? as u64);
     // Readiness is independent of diagnostic publication. A rejected or uncertain
     // POST must not silence a current subscription's readiness report.
     report_claude_attachment(mailbox, &checked, state.claude_attachment_terminal.as_ref())?;
@@ -24798,21 +24872,56 @@ async fn check_claude_attachment(
             return Err(claude_attachment_parked_error(terminal));
         }
         // A changed binding is not sufficient: the endpoint must admit its current
-        // ownership before this publisher leaves its parked state.
-        checked.as_ref().map_err(|error| {
-            anyhow::anyhow!("validating replacement Claude attachment ownership: {error:#}")
-        })?;
+        // ownership before this publisher leaves its parked state. A pushed value is
+        // not that admission.
+        if from_push {
+            if !state
+                .claude_attachment_admissions
+                .take(fence, current_unix_ms()? as u64)
+            {
+                return Ok(());
+            }
+            checked_claude_attachment(client, subject, incarnation, fence)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("validating replacement Claude attachment ownership: {error:#}")
+                })?;
+        } else {
+            checked.as_ref().map_err(|error| {
+                anyhow::anyhow!("validating replacement Claude attachment ownership: {error:#}")
+            })?;
+        }
         state.claude_attachment_terminal = None;
         state.claude_attachment_reconciled = false;
     }
     if state.claude_attachment_pending.is_some() {
+        if from_push
+            && !state
+                .claude_attachment_admissions
+                .take(fence, current_unix_ms()? as u64)
+        {
+            return Ok(());
+        }
         // Resolve the identical operation before advancing the acknowledged episode.
-        let published =
-            publish_pending_claude_attachment(client, subject, incarnation, fence, state).await;
+        let published = publish_pending_claude_attachment(
+            client,
+            subject,
+            incarnation,
+            fence,
+            from_push,
+            state,
+        )
+        .await;
         finish_claude_attachment_publication(published, mailbox, &checked, state)?;
         // Recovery publication needs an admission check AFTER the pending operation
-        // resolved; the earlier check was only used to keep readiness reporting.
-        checked = checked_claude_attachment(client, subject, incarnation, fence).await;
+        // resolved; the earlier check was only used to keep readiness reporting. The
+        // publication below makes that admission itself before it posts.
+        let pushed = mailbox.pushed_attachment();
+        from_push = pushed.is_some();
+        checked = match pushed {
+            Some(attachment) => Ok(attachment),
+            None => checked_claude_attachment(client, subject, incarnation, fence).await,
+        };
         report_claude_attachment(mailbox, &checked, state.claude_attachment_terminal.as_ref())?;
     }
     let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
@@ -24828,6 +24937,14 @@ async fn check_claude_attachment(
     if state.claude_attachment_reconciled && state.claude_attachment_phase == phase {
         return Ok(());
     }
+    if from_push
+        && !state
+            .claude_attachment_admissions
+            .take(fence, current_unix_ms()? as u64)
+    {
+        // Not reconciled: a later tick publishes whatever the phase is by then.
+        return Ok(());
+    }
     let reason = claude_attachment_reason(&checked);
     let input =
         claude_attachment_diagnostic(fence, state.claude_attachment_episode, phase, &reason);
@@ -24839,10 +24956,12 @@ async fn check_claude_attachment(
         phase: phase.into(),
         input,
         input_digest,
+        attempted: false,
     });
     state.claude_attachment_reconciled = false;
     let published =
-        publish_pending_claude_attachment(client, subject, incarnation, fence, state).await;
+        publish_pending_claude_attachment(client, subject, incarnation, fence, from_push, state)
+            .await;
     finish_claude_attachment_publication(published, mailbox, &checked, state)
 }
 
@@ -24912,6 +25031,8 @@ fn report_claude_attachment(
     let terminal =
         terminal.filter(|fault| same_claude_attachment_binding(&fault.fence, &mailbox.fence));
     let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
+    // This driver takes attachment pushed on its title stream; see check_claude_attachment.
+    report["attachment_push"] = json!(true);
     report["ready"] = json!(checked.as_ref().is_ok_and(|attachment| attachment.attached));
     report["reason"] = json!(match terminal {
         Some(fault) => format!(
@@ -24927,8 +25048,9 @@ fn report_claude_attachment(
         }
         None => Value::Null,
     };
+    // Sent when it changes; the daemon's ten-second Ping echoes it meanwhile.
     if let Some(subscription) = &mailbox.subscription {
-        subscription.report(report);
+        subscription.report_if_changed(report);
     }
     Ok(())
 }
@@ -24999,6 +25121,7 @@ async fn publish_pending_claude_attachment(
     subject: &str,
     incarnation: &str,
     fence: &st3::mailbox::Fence,
+    push: bool,
     state: &mut NativeLoopState,
 ) -> Result<()> {
     let Some(pending) = state.claude_attachment_pending.as_ref() else {
@@ -25048,6 +25171,11 @@ async fn publish_pending_claude_attachment(
             "the pending Claude attachment diagnostic request was changed or malformed",
         ));
     }
+    let (phase, input, attempted) = (
+        pending.phase.clone(),
+        pending.input.clone(),
+        pending.attempted,
+    );
     let Some(next_episode) = state.claude_attachment_episode.checked_add(1) else {
         return Err(retire_claude_attachment(
             state,
@@ -25057,11 +25185,28 @@ async fn publish_pending_claude_attachment(
     };
     // Validate the current title binding before retrying a retained operation.
     // This result is not reused as recovery proof.
-    let result: Result<ClaimRecord> = async {
-        let _ = checked_claude_attachment(client, subject, incarnation, fence).await?;
-        client.post("/v1/claims", &pending.input).await
+    let result: Result<Option<ClaimRecord>> =
+        match checked_claude_attachment(client, subject, incarnation, fence).await {
+            Err(error) => Err(error),
+            // On a push connection this admission can withdraw a write it disagrees with, never
+            // choose a phase. Only a never-sent operation is withdrawn; a sent one is resolved as
+            // it is, so its outcome stays exactly once.
+            Ok(admitted) if push && !attempted && admitted.attached != (phase == "attached") => {
+                Ok(None)
+            }
+            Ok(_) => {
+                if let Some(pending) = state.claude_attachment_pending.as_mut() {
+                    pending.attempted = true;
+                }
+                client.post("/v1/claims", &input).await.map(Some)
+            }
+        };
+    if matches!(result, Ok(None)) {
+        // Withdrawn before sending: a later tick recomputes and publishes the current phase.
+        state.claude_attachment_pending = None;
+        state.claude_attachment_reconciled = false;
+        return Ok(());
     }
-    .await;
     if let Err(error) = result {
         // A mismatch of this SAME immutable request/key or a checkpointed claim cannot
         // be resolved by reposting it; park visibly without assuming whether it committed.
@@ -25088,7 +25233,7 @@ async fn publish_pending_claude_attachment(
         }
         return Err(error);
     }
-    state.claude_attachment_phase = pending.phase.clone();
+    state.claude_attachment_phase = phase;
     state.claude_attachment_episode = next_episode;
     state.claude_attachment_reconciled = true;
     state.claude_attachment_pending = None;
@@ -25190,6 +25335,12 @@ impl NativeMailbox {
             None => std::future::pending().await,
         }
     }
+    /// The Claude channel attachment pushed on the current connection, if it has pushed one.
+    fn pushed_attachment(&self) -> Option<st3::mailbox::Attachment> {
+        self.subscription
+            .as_ref()
+            .and_then(st3::mailbox::Subscription::attachment)
+    }
     fn accept(&mut self, frame: Option<st3::mailbox::Frame>, runtime_id: &str) -> Result<()> {
         match frame {
             Some(st3::mailbox::Frame::Replay { nonce }) => {
@@ -25228,6 +25379,8 @@ impl NativeMailbox {
                 self.replayed = true;
                 Ok(())
             }
+            // The subscription keeps attachment apart from this queue.
+            Some(st3::mailbox::Frame::Attachment { .. }) => Ok(()),
             Some(st3::mailbox::Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
             None => anyhow::bail!("native mailbox subscription ended"),
         }
@@ -28728,6 +28881,11 @@ mod tests {
                 claude_attachment_reconciled: false,
                 claude_attachment_terminal: None,
                 claude_readiness_fallback: ClaudeReadinessFallback::default(),
+                claude_attachment_admissions: AdmissionBucket {
+                    binding: Some(("incarnation".into(), 4, "token".into())),
+                    tokens: 0,
+                    refilled_at_ms: 1_234,
+                },
                 settle: ResumeSettle::resumed(),
             },
         };
@@ -28739,6 +28897,13 @@ mod tests {
         assert_eq!(back.loop_state.delivery_episode, 2);
         assert_eq!(back.loop_state.claude_attachment_phase, "blocked");
         assert_eq!(back.loop_state.claude_attachment_episode, 3);
+        // An empty admission bucket survives re-exec: a re-exec grants no fresh burst.
+        let admissions = &back.loop_state.claude_attachment_admissions;
+        assert_eq!(
+            admissions.binding,
+            Some(("incarnation".into(), 4, "token".into()))
+        );
+        assert_eq!((admissions.tokens, admissions.refilled_at_ms), (0, 1_234));
         assert_eq!(
             back.loop_state.published_timeline,
             resume.loop_state.published_timeline

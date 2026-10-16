@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Push the Claude channel attachment over the driver's title stream instead of polling it every second",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes. Diagnostic publication keeps its idempotency keys, episodes and exactly-once resolution of a sent operation."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites. Push state is in daemon memory only."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "changed", "detail": "The mailbox stream gains an Attachment frame, sent only on a title stream whose driver reports attachment_push, so older drivers never receive it. A new driver on an older daemon receives no frame and keeps the per-second GET, which is unchanged and still served. The agent view gains delivery.attachment_push for Claude seats; clients ignore the unknown field."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption. A driver re-executing into the new binary uses the GET until its connection pushes the first frame."},
+  "manual": {"status": "none", "detail": "No operator actions or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No database or graph state changes. The driver's graceful re-exec resume file (a JSON file written to disk by st_drivers::reexec::write_state) gains an admission bucket and a per-operation attempted flag. An older binary ignores both: DriverResume, NativeLoopState and PendingClaudeAttachment derive Deserialize without deny_unknown_fields, and st_drivers::reexec::decode_state reads them with serde_json. Swapping back to an older daemon or driver returns to the per-second GET."}
+}

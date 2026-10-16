@@ -116,6 +116,19 @@ pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation:
         .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
 }
 
+/// The same answer as `claude_channel_attached`, with the delivery binding that proves it and
+/// the instant the proof lapses by itself. Both come from one presence predicate, so a push
+/// stream's deadline cannot drift from what the poll answers.
+pub(crate) fn claude_channel_attachment(
+    store: &Store,
+    subject: &str,
+    incarnation: &str,
+) -> Option<(crate::mailbox::Fence, tokio::time::Instant)> {
+    delivery_presence::attachment_window(subject, incarnation)
+        .filter(|(_, until)| tokio::time::Instant::now() <= *until)
+        .filter(|(fence, _)| store.check_mailbox(fence).is_ok())
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -3119,11 +3132,17 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     let Some(recipient) = item.get("id").and_then(Value::as_str) else {
         return;
     };
-    let assessment = delivery_presence::assess_current(recipient, &driver, item["incarnation_id"].as_str());
+    let assessment =
+        delivery_presence::assess_current(recipient, &driver, item["incarnation_id"].as_str());
+    let attachment_push = (driver == "claude")
+        .then(|| delivery_presence::attachment_push(recipient, item["incarnation_id"].as_str()));
     if assessment.stale() {
         item["state"] = Value::String("waiting".into());
     }
     item["delivery"] = assessment.to_value();
+    if let Some(attachment_push) = attachment_push {
+        item["delivery"]["attachment_push"] = Value::String(attachment_push.into());
+    }
 }
 
 pub(crate) const AGENT_QUEUE_FIELDS: [&str; 8] = [

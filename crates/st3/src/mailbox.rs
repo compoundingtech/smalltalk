@@ -98,6 +98,14 @@ pub enum Frame {
     Drain {
         operation: Option<String>,
     },
+    /// Whether the seat's Claude channel is attached, sent on a title stream only after its
+    /// driver reported `attachment_push`, and again only when the value changes. Readiness and
+    /// diagnostics only: it never authorizes a write. `delivery_epoch` names the delivery
+    /// binding that proved the attachment.
+    Attachment {
+        attached: bool,
+        delivery_epoch: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -118,6 +126,10 @@ pub struct Attachment {
 pub struct Subscription {
     pub receiver: tokio::sync::mpsc::Receiver<Frame>,
     report: tokio::sync::watch::Sender<Value>,
+    /// The latest attachment pushed on the current connection. `None` until that connection's
+    /// first `Attachment` frame and from the moment it ends, so a value from an earlier
+    /// connection is never current. Kept out of `receiver`, so it never waits behind mail.
+    attachment: tokio::sync::watch::Receiver<Option<Attachment>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Subscription {
@@ -130,10 +142,12 @@ impl Subscription {
         report["mailbox_replay_ack"] = serde_json::json!(true);
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let (report_tx, mut report_rx) = tokio::sync::watch::channel(report);
+        let (attachment_tx, attachment) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
             let mut retry = crate::client::MailboxRetry::default();
             loop {
                 retry.begin_attempt();
+                attachment_tx.send_replace(None);
                 let result: Result<()> = async {
                     let mut socket = client.open_mailbox(&fence).await?;
                     // open_mailbox returns only after HTTP 101, before the first snapshot.
@@ -148,6 +162,10 @@ impl Subscription {
                                     tokio_tungstenite::tungstenite::Message::Text(text) => {
                                         let frame: Frame = serde_json::from_str(&text)?;
                                         retry.received_frame();
+                                        if let Frame::Attachment { attached, .. } = frame {
+                                            attachment_tx.send_replace(Some(Attachment { attached }));
+                                            continue;
+                                        }
                                         let fenced = matches!(frame, Frame::Fenced { .. });
                                         sender.send(frame).await.context("mailbox receiver ended")?;
                                         if fenced { return Ok(()); }
@@ -169,6 +187,7 @@ impl Subscription {
                         }
                     }
                 }.await;
+                attachment_tx.send_replace(None);
                 if let Err(error) = &result
                     && matches!(crate::client::api_error_code(error), Some(
                         "stale-mailbox-session" | "foreign-mailbox" | "unbound-mailbox" | "invalid-mailbox-token"
@@ -189,8 +208,13 @@ impl Subscription {
         Self {
             receiver,
             report: report_tx,
+            attachment,
             task,
         }
+    }
+    /// The attachment pushed on the current connection, if it has pushed one.
+    pub fn attachment(&self) -> Option<Attachment> {
+        self.attachment.borrow().clone()
     }
     pub fn acknowledge_replay(&self, nonce: String) {
         self.report.send_modify(|report| report["mailbox_replay_nonce"] = serde_json::json!(nonce));
@@ -207,6 +231,20 @@ impl Subscription {
             value["drain_operation"] = current["drain_operation"].clone();
             *current = value;
         });
+    }
+    /// Like `report`, but sends nothing when the report is unchanged. The server's Ping still
+    /// echoes the current report every ten seconds. Returns whether it changed.
+    pub fn report_if_changed(&self, mut value: Value) -> bool {
+        value["mailbox_replay_ack"] = serde_json::json!(true);
+        self.report.send_if_modified(|current| {
+            value["mailbox_replay_nonce"] = current["mailbox_replay_nonce"].clone();
+            value["drain_operation"] = current["drain_operation"].clone();
+            if *current == value {
+                return false;
+            }
+            *current = value;
+            true
+        })
     }
 }
 

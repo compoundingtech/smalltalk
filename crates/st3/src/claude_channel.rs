@@ -150,6 +150,7 @@ pub async fn run(
                 Some(Frame::Replay { nonce }) => subscription.acknowledge_replay(nonce),
                 Some(Frame::Drain { operation }) => subscription.acknowledge_drain(operation),
                 Some(Frame::Seat { .. }) => {}, // the outer driver owns the PTY title
+                Some(Frame::Attachment { .. }) => {}, // sent only to the outer driver's title stream
                 Some(Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
                 None => return Ok(()),
             },

@@ -102,6 +102,27 @@ impl Wakes {
 }
 
 impl Subscription {
+    /// Also wake on ownership changes of another component of the same seat. A title stream that
+    /// pushes attachment needs its seat's delivery binding changes, which are not graph claims.
+    pub(crate) fn owner_of(&mut self, subject: &str, component: &str) {
+        let key = Dependency::Owner(subject.into(), component.into());
+        if !self.base.insert(key.clone()) {
+            return;
+        }
+        let mut registry = self
+            .wakes
+            .registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.dependencies.insert(key.clone()) {
+            registry
+                .subscribers
+                .entry(key)
+                .or_default()
+                .insert(self.id, self.sender.clone());
+        }
+    }
+
     /// Replace message dependencies under the same lock used by the dispatcher. The recipient
     /// dependency also routes every message mutation, covering a newly read message whose
     /// subject has not been registered yet.
