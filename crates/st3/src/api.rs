@@ -1536,6 +1536,28 @@ fn a_publication_far_behind_its_previous_one_is_not_a_freshness_sample() {
     assert!(publish_sampled(7, 8));
     assert!(publish_sampled(7, 7 + PUBLISH_SAMPLE_CLAIMS));
     assert!(!publish_sampled(7, 8 + PUBLISH_SAMPLE_CLAIMS), "after a catch-up");
+    assert_eq!(publish_collection("attention"), "attention");
+    assert_eq!(publish_collection("sessions"), "other");
+}
+
+/// Publications more than [`PUBLISH_SAMPLE_CLAIMS`] claims after the previous one, which
+/// `projection-fresh` does not sample, by `collection` (docs/st3/observability.md).
+static PUBLISH_SAMPLES_SKIPPED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        opentelemetry::global::meter("st3")
+            .u64_counter("st.slo.projection_fresh.skipped")
+            .with_unit("{publication}")
+            .build()
+    });
+
+/// A publication's `collection` as a closed metric attribute.
+fn publish_collection(collection: &str) -> &'static str {
+    match collection {
+        "missions" => "missions",
+        "agents" => "agents",
+        "attention" => "attention",
+        _ => "other",
+    }
 }
 
 /// A refresher published `collection` at `cut`, after a publication at `previous`: time it
@@ -1553,6 +1575,15 @@ pub(crate) fn record_publish_latency(
     published_at_unix_ms: u128,
 ) {
     if !publish_sampled(previous, cut) {
+        if cut > previous && crate::otel::metrics_enabled() {
+            PUBLISH_SAMPLES_SKIPPED.add(
+                1,
+                &[opentelemetry::KeyValue::new(
+                    "collection",
+                    publish_collection(collection),
+                )],
+            );
+        }
         return;
     }
     let committed = match store.first_local_commit_after(previous, cut) {

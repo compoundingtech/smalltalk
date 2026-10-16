@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A counter, st.slo.projection_fresh.skipped, counts each publication projection-fresh does not sample because it follows a catch-up",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites; no contract change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Adds one OpenTelemetry counter with a collection attribute of at most four values; no served field or SLO sample changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or swap-back restrictions."
+  }
+}

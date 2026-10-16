@@ -334,7 +334,8 @@ p99 1500 ms, since refreshers fold at most once a second. Its paths are `publish
 `publish agents` and `publish attention`, timed by the refresher: each publication that advances
 its cut is one sample, from the first claim this node committed after the previous cut to the
 new publication. Replicated claims carry another node's clock and start no sample, a
-publication more than 10,000 claims after the previous one (a catch-up) is none, and
+publication more than 10,000 claims after the previous one (a catch-up) is none (the
+`st.slo.projection_fresh.skipped` counter counts each, by collection), and
 attention's first publication after no window read it (attention folds only while one does)
 is none either. Both targets appear on
 `GET /v1/client/request-latency` and in `st doctor`. `daemon_load` keeps its 300 ms
