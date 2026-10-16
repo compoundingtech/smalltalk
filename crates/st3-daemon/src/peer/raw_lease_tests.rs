@@ -104,7 +104,7 @@ async fn lease_pair() -> LeasePair {
         smallclaims::sync::FleetContext::legacy(BTreeSet::from(["lease-gateway".into()])),
     );
     let peer_task = tokio::spawn(async move {
-        axum::serve(listener, peer_router(peer, smalltalk_routes()))
+        axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice)))
             .await
             .unwrap();
     });

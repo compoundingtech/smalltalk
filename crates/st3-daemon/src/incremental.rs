@@ -433,18 +433,7 @@ impl Incremental {
     }
 }
 
-/// CPU time this thread has used.
-pub fn thread_cpu() -> std::time::Duration {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: time points to a valid timespec; the clock reads this thread only.
-    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } != 0 {
-        return std::time::Duration::ZERO;
-    }
-    std::time::Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
-}
+pub use crate::otel::thread_cpu;
 
 /// When a run's result could next change with time alone: the earliest lease expiry, retry
 /// backoff, step timeout or run deadline still ahead of `now`.

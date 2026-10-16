@@ -7,27 +7,8 @@ use tokio::time::Instant;
 pub(crate) const IDLE: Duration = Duration::from_secs(60);
 pub(crate) const ABSOLUTE: Duration = Duration::from_secs(300);
 pub(crate) const WATCH: Duration = Duration::from_secs(5);
-pub(crate) const ORIGIN_HEADER: &str = "x-st3-raw-origin";
+pub(crate) use crate::peer::{RAW_ORIGIN_HEADER as ORIGIN_HEADER, RawLeaseBinding as Binding};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Binding {
-    pub lease_id: String,
-    pub gateway: String,
-    pub gateway_epoch: String,
-    pub actor: String,
-    pub person: String,
-    pub authorization_epoch: String,
-    pub grant_subject: Option<String>,
-    pub grant_digest: Option<String>,
-    pub gateway_member_key: Option<String>,
-    pub owner_member_key: Option<String>,
-    pub terminal: String,
-    pub owner: String,
-    pub incarnation: String,
-    pub mode: String,
-    pub absolute_deadline_unix_ms: u128,
-}
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
@@ -601,6 +582,28 @@ impl Lease {
             };
             tokio::select! { biased; result = cancelled.changed() => { if result.is_err() || cancelled.borrow().is_some() { return; } }, () = tokio::time::sleep_until(deadline) => {} }
         }
+    }
+}
+
+impl crate::peer::RawTerminalLease for Lease {
+    fn binding(&self) -> &Binding {
+        &self.binding
+    }
+
+    fn revalidate(&self) -> anyhow::Result<()> {
+        Lease::revalidate(self)
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        Lease::check(self)
+    }
+
+    fn proof(&self, epoch: &str, sequence: u64) -> anyhow::Result<()> {
+        Lease::proof(self, epoch, sequence)
+    }
+
+    fn expired(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(Lease::expired(self))
     }
 }
 
