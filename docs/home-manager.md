@@ -36,6 +36,34 @@ Package references in the systemd unit or launchd plist still trigger daemon res
 Seats started from store paths before this change remain stale until restarted; see
 [seats across deploys](st3/seat-deploys.md).
 
+## Optional Fractal command
+
+Neither the default Nix package nor the default Home Manager configuration installs
+`fractal`; updating a Smalltalk pin does not claim that command name. To opt in for
+the Home Manager-owned stable executable:
+
+```nix
+programs.smalltalk.fractalBinary.enable = true;
+```
+
+With `services.smalltalk.enable = true` and `binary.path = null`, activation creates
+`stateDir/bin/fractal -> st3`. Add that stable bin directory to your interactive PATH
+to use it. `fractal` and `fractal tui` open the terminal UI, `fractal web` opens the web
+UI, and other arguments behave like `st`. The existing `st` and `st3` commands do not
+change.
+
+Activation leaves foreign files, directories, and symlinks at `stateDir/bin/fractal`
+untouched and prints guidance; `st` remains usable. A relative `fractal -> st3` link
+is recognized as Smalltalk-owned. Disabling the option removes only that recognized
+link, not a foreign command. With an externally deployed `binary.path`, this option
+is ignored: the external deployer remains responsible for aliases.
+
+For a standalone Nix-profile installation, explicitly select the flake's `#fractal`
+package instead of the default package. It contains only `bin/fractal`, a symlink to
+the same `st3` executable; install `#st3` alongside it if you also want the existing
+commands in your profile. Unlike module activation, Nix profile collision handling
+governs profile-installed commands.
+
 ## Externally deployed binary
 
 If another deployer updates your Nix profile or installs the executable, set

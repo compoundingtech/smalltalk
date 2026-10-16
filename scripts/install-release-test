@@ -22,6 +22,7 @@ ln -s /missing/old-ui "$work/installed/stui"
 "$work/package/install.sh" --bin-dir "$work/installed"
 test "$(readlink "$work/installed/st")" = st3
 test "$("$work/installed/st")" = new-st3
+test "$(readlink "$work/installed/fractal")" = st3
 for binary in st3 pty; do
   test "$("$work/installed/$binary")" = "new-$binary"
 done
@@ -35,6 +36,37 @@ cp "$work/package/bin/st3" "$work/package/bin/pty"
 mkdir -p "$work/blocked/st"
 if "$work/package/install.sh" --bin-dir "$work/blocked"; then exit 1; fi
 test ! -e "$work/blocked/st3"
+# Existing fractal commands are not ours, even if their target happens to be st3 elsewhere.
+for kind in file link dangling directory; do
+  bin="$work/collision-$kind"
+  mkdir -p "$bin"
+  case $kind in
+    file) printf foreign > "$bin/fractal" ;;
+    link) ln -s "$work/package/bin/st3" "$bin/fractal" ;;
+    dangling) ln -s /missing/fractal "$bin/fractal" ;;
+    directory) mkdir "$bin/fractal" ;;
+  esac
+  "$work/package/install.sh" --bin-dir "$bin" --quiet > "$work/collision.out" 2> "$work/collision.err"
+  test ! -s "$work/collision.out"
+  test "$("$bin/st")" = new-st3
+  grep -q 'leaving fractal unchanged:.*use st' "$work/collision.err"
+  case $kind in
+    file) test "$(cat "$bin/fractal")" = foreign ;;
+    link) test "$(readlink "$bin/fractal")" = "$work/package/bin/st3" ;;
+    dangling) test "$(readlink "$bin/fractal")" = /missing/fractal ;;
+    directory) test -d "$bin/fractal"; test -z "$(ls -A "$bin/fractal")" ;;
+  esac
+done
+ln -sfn "$work/installed/st3" "$work/installed/fractal"
+"$work/package/install.sh" --bin-dir "$work/installed" --quiet
+test "$(readlink "$work/installed/fractal")" = st3
+mkdir -p "$work/foreign-path"
+cp "$work/package/bin/st3" "$work/foreign-path/fractal"
+PATH="$work/foreign-path:$PATH" "$work/package/install.sh" --bin-dir "$work/path-collision" --quiet 2> "$work/path.err"
+test ! -e "$work/path-collision/fractal"
+test ! -L "$work/path-collision/fractal"
+test "$("$work/path-collision/st")" = new-st3
+grep -q 'PATH contains a foreign command' "$work/path.err"
 # A macOS helper receipt is a notice: quiet installs suppress it, errors survive.
 # This fixture checks the caller; real app transactions are tested separately.
 printf '#!/bin/sh\necho Darwin\n' > "$work/platform-bin/uname"
@@ -58,7 +90,7 @@ printf '#!/bin/sh\necho Linux\n' > "$work/platform-bin/uname"
 # Fail one rename after st3 was replaced, then allow real rollback renames.
 real_mv=$(command -v mv)
 cat > "$work/platform-bin/mv" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 set -eu
 if [[ ${!#} == "$INSTALL_FAIL_DEST" && ! -e $INSTALL_FAIL_MARKER ]]; then
   : > "$INSTALL_FAIL_MARKER"
@@ -149,7 +181,7 @@ export INSTALL_FOREIGN_APP="$ST_MACOS_INSTALL_HOME/Applications/SmallTalk.app"
 # caller never attempts this ownership read or a late helper restore.
 real_cat=$(command -v cat)
 cat > "$work/platform-bin/cat" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 set -eu
 if [[ ${INSTALL_OWNER_READ_RACE:-} == 1 && $1 == */caller-owner.json ]]; then
   owner=$("$INSTALL_REAL_CAT" "$@")

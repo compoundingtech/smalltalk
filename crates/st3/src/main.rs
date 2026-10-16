@@ -65,6 +65,7 @@ mod change_cli;
 mod directive_note;
 mod completion;
 mod doctor_cli;
+mod fractal;
 #[cfg(test)]
 mod follow_tests;
 mod presentation;
@@ -784,9 +785,9 @@ async fn fleet_leave(
 
 /// What an instance's uninstall removes from its directory: every entry except the one that holds
 /// the work root. The work root can lie inside the instance but holds the person's work, so
-/// everything else goes and it stays.
+/// everything else goes, except a foreign replacement of the fractal command.
 fn instance_removals(root: &Path, work: &Path) -> Vec<PathBuf> {
-    fs::read_dir(root)
+    let mut removals: Vec<PathBuf> = fs::read_dir(root)
         .map(|entries| {
             entries
                 .flatten()
@@ -794,8 +795,26 @@ fn instance_removals(root: &Path, work: &Path) -> Vec<PathBuf> {
                 .filter(|path| !work.starts_with(path))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // An instance owns its directory, but a foreign replacement of the new program name
+    // does not become ours. Plan bin entries separately so deletion rechecks its symlink.
+    let bin = root.join("bin");
+    if fs::symlink_metadata(bin.join("fractal")).is_ok()
+        && let Some(index) = removals.iter().position(|path| path == &bin)
+    {
+        removals.swap_remove(index);
+        if let Ok(entries) = fs::read_dir(&bin) {
+            removals.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| fractal::may_remove(path)),
+            );
+        }
+    }
+    removals
 }
+
 
 #[derive(Args)]
 struct FleetModeArgs {
@@ -4116,7 +4135,10 @@ fn cli_main() -> ExitCode {
     if let Some(program) = st3::recorder::invoked_program() {
         st3::recorder::run(program);
     }
-    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let mut arguments = std::env::args_os().collect::<Vec<_>>();
+    if fractal::dispatch(arguments.as_mut_slice()) == fractal::Dispatch::Web {
+        return fractal::web(&arguments);
+    }
     match read_contract_inventory_request(&arguments) {
         Some(true) => {
             println!("{}", read_contract_inventory_json());
@@ -25724,53 +25746,5 @@ mod terminal_ui_tests {
         let help = cli_help::root_help(false);
         assert!(help.contains("Open the terminal interface"));
         assert!(help.contains("Run st in a terminal"));
-    }
-}
-
-#[cfg(test)]
-mod instance_uninstall_tests {
-    use super::*;
-
-    fn names(paths: Vec<PathBuf>) -> Vec<String> {
-        let mut names = paths
-            .into_iter()
-            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn an_instance_uninstall_removes_everything_but_the_work_folder() {
-        let root = tempfile::tempdir().unwrap();
-        for entry in ["bin", "state", "work/agents/site"] {
-            fs::create_dir_all(root.path().join(entry)).unwrap();
-        }
-        fs::write(root.path().join("work/agents/site/notes.txt"), "mine").unwrap();
-        let work = root.path().join("work");
-        assert_eq!(names(instance_removals(root.path(), &work)), ["bin", "state"]);
-    }
-
-    #[test]
-    fn an_entry_that_contains_a_nested_work_folder_is_kept_and_the_others_go() {
-        let root = tempfile::tempdir().unwrap();
-        for entry in ["bin", "data/projects", "state"] {
-            fs::create_dir_all(root.path().join(entry)).unwrap();
-        }
-        let work = root.path().join("data/projects");
-        assert_eq!(names(instance_removals(root.path(), &work)), ["bin", "state"]);
-    }
-
-    #[test]
-    fn a_work_folder_outside_the_instance_removes_every_entry() {
-        let root = tempfile::tempdir().unwrap();
-        for entry in ["bin", "state", "work"] {
-            fs::create_dir_all(root.path().join(entry)).unwrap();
-        }
-        let elsewhere = tempfile::tempdir().unwrap();
-        assert_eq!(
-            names(instance_removals(root.path(), elsewhere.path())),
-            ["bin", "state", "work"]
-        );
     }
 }

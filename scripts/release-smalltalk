@@ -21,7 +21,11 @@ cd "$repo"
 if $dry_run; then
   printf 'cargo build --release --locked --target %s -p st3\n' "$target"
   printf 'stage bin/%s\n' "${runtime_binaries[@]}"
-  printf 'link bin/st -> st3\narchive %s/smalltalk-%s.tar.gz\n' "$out" "$target"
+  printf 'link bin/fractal -> st3\n'
+  # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+  printf 'link bin/st -> st3\n'
+  # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
+  printf 'archive %s/smalltalk-%s.tar.gz\n' "$out" "$target"
   printf 'verify manifest, install in isolated destination, run st ui PTY smoke\n'
   exit 0
 fi
@@ -99,7 +103,10 @@ if [[ $target == *apple* ]]; then
     rm -rf "$work/$package/bin/StListen.app" "$speech"
   fi
 fi
+ln -s st3 "$work/$package/bin/fractal"
+# LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
 ln -s st3 "$work/$package/bin/st"
+# LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
 install -m 0755 scripts/install-release "$work/$package/install.sh"
 install -m 0755 scripts/install-macos.py "$work/$package/install-macos.py"
 cp docs/st3/binary-releases.md "$work/$package/README.md"
@@ -133,6 +140,7 @@ tar -C "$work" -czf "$archive" "$package"
 # Verify the delivered bytes, not just the pre-archive staging directory.
 mkdir "$work/extracted"
 tar -C "$work/extracted" -xzf "$archive"
+test "$(readlink "$work/extracted/$package/bin/fractal")" = st3
 mkdir -p "$work/install-home"
 ST_MACOS_INSTALL_HOME="$work/install-home" ST_MACOS_APP_PATH="$work/installed/SmallTalk.app" \
   "$work/extracted/$package/install.sh" --bin-dir "$work/installed"

@@ -68,6 +68,8 @@ done < "$work/members"
 tar -xzf "$work/$archive" -C "$work"
 # Older retained releases predate --quiet; keep their installer spelling and
 # suppress notices here while preserving failures and stderr.
+# Current archive installers add fractal only when neither the destination nor
+# PATH contains a foreign fractal command; keep their collision guidance on stderr.
 "$work/$package/install.sh" --bin-dir "$bin_dir" >/dev/null
 bin_dir=$(cd "$bin_dir" && pwd)
 rm -rf "$work"
