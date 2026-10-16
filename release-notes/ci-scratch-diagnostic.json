@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The linux-tests stage prints the tests' scratch usage and the runner's /dev/shm size; diagnostic only",
+  "replay": {"status": "none", "detail": "CI tooling only."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "No product or test behaviour change."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "none", "detail": "No operator step."},
+  "recovery": {"status": "none", "detail": "Revert the commit."}
+}

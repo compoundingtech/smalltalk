@@ -72,6 +72,31 @@ python3 scripts/sccache-evidence-test
 python3 scripts/check-st-boundary-test
 python3 scripts/check-st-boundary
 
+# Diagnostic only, no behaviour change: how much scratch space the tests use, and how much tmpfs
+# the runner has, so a later change can decide per runner class whether the tests' temporary files
+# belong in /dev/shm (file-backed SQLite stores wait on fsync on a disk). `du` is of everything
+# under TMPDIR, polled every five seconds, so it is an upper bound of the tests' own use.
+scratch_diagnostic_start() {
+  scratch="${TMPDIR:-/tmp}"
+  scratch_peak_file=$(mktemp)
+  echo 0 > "$scratch_peak_file"
+  (
+    peak=0
+    while sleep 5; do
+      used=$(du -sm "$scratch" 2>/dev/null | cut -f1)
+      if [[ "${used:-0}" -gt "$peak" ]]; then peak=$used; echo "$peak" > "$scratch_peak_file"; fi
+    done
+  ) >/dev/null 2>&1 &
+  scratch_poller=$!
+}
+scratch_diagnostic_finish() {
+  # The poller holds no pipe of the stage (its output is /dev/null), so the stage never waits for it.
+  pkill -P "$scratch_poller" 2>/dev/null || true
+  kill "$scratch_poller" 2>/dev/null || true
+  echo "Test scratch: TMPDIR=$scratch on $(stat -f -c %T "$scratch"), filesystem $(df -Pm "$scratch" | awk 'NR==2 {print $2}') MiB, peak du of TMPDIR $(cat "$scratch_peak_file") MiB; /dev/shm $(stat -f -c %T /dev/shm 2>/dev/null || echo absent), $(df -Pm /dev/shm 2>/dev/null | awk 'NR==2 {print $2}') MiB, $(df -Pm /dev/shm 2>/dev/null | awk 'NR==2 {print $3}') MiB used at the end; memory $(awk '/MemTotal/ {printf "%d", $2 / 1024}' /proc/meminfo) MiB, peak RSS of the tests not measured"
+  rm -f "$scratch_peak_file"
+}
+
 start=$SECONDS status=0
 # Both native test jobs and the standalone mail canaries use the existing runner
 # tmpfs, with short socket paths and evidence retained until job cleanup.
@@ -87,7 +112,11 @@ case "$stage" in
     # The standalone feature check is independent of the workspace's unified test build.
     # Only shard 1 (or an unpartitioned local run) needs to perform it.
     if [[ -z "${CI_TEST_EXTRACTED:-}" && "${CI_TEST_PARTITION:-}" != hash:2/2 ]]; then conversation_model || exit $?; fi
-    bash scripts/ci-nextest run --test-threads "${CI_TEST_THREADS:-${CI_LOCAL_TEST_THREADS:-$(nproc)}}" --status-level pass
+    scratch_diagnostic_start
+    tests_status=0
+    bash scripts/ci-nextest run --test-threads "${CI_TEST_THREADS:-${CI_LOCAL_TEST_THREADS:-$(nproc)}}" --status-level pass || tests_status=$?
+    scratch_diagnostic_finish
+    exit "$tests_status"
   } 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   conversation-model) conversation_model 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
