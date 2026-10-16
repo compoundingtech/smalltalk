@@ -935,6 +935,22 @@ pub fn channel_transcript_paths(
         .map(|binding| binding.transcript_path))
 }
 
+/// A receipt may name a native user record only in the same verified binding that
+/// supplied the channel's transcript. This accessor grants no new binding authority.
+pub fn channel_receipt_session(
+    session_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    incarnation: &str,
+    transcript: &Path,
+) -> Result<Option<String>> {
+    Ok(load_binding(session_dir, identity, runtime_id)?
+        .filter(|binding| {
+            binding.runtime_incarnation == incarnation && binding.transcript_path == transcript
+        })
+        .map(|binding| binding.native_session_id))
+}
+
 /// Recover a SessionStart binding that ran before Claude created its transcript.
 /// The lightweight hook binding is fenced by this wrapper; never discover a
 /// session by recency or use an older wrapper's transcript as receipt evidence.
@@ -2109,6 +2125,21 @@ mod tests {
     use super::*;
     use crate::harness_state::harness_state_path;
     use crate::provider_session::run_provider;
+
+    #[test]
+    fn receipt_identity_requires_the_same_current_binding_and_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = root.path().join("native.jsonl");
+        let binding = ClaudeSessionBinding {
+            schema: BINDING_SCHEMA.into(), agent: "agent/fixture".into(), runtime_id: "fixture-runtime".into(),
+            runtime_incarnation: "wrapper-current".into(), native_session_id: "00000000-0000-0000-0000-000000000001".into(),
+            canonical_workspace: root.path().to_path_buf(), transcript_path: transcript.clone(), resume_generation: None,
+        };
+        std::fs::write(root.path().join(BINDING_FILE), serde_json::to_vec(&binding).unwrap()).unwrap();
+        assert_eq!(channel_receipt_session(root.path(), "agent/fixture", "fixture-runtime", "wrapper-current", &transcript).unwrap(), Some(binding.native_session_id));
+        assert!(channel_receipt_session(root.path(), "agent/fixture", "fixture-runtime", "wrapper-old", &transcript).unwrap().is_none());
+        assert!(channel_receipt_session(root.path(), "agent/fixture", "fixture-runtime", "wrapper-current", &root.path().join("other.jsonl")).unwrap().is_none());
+    }
 
     #[test]
     fn st3_plugin_admission_uses_development_without_policy_and_preserves_other_channels() {

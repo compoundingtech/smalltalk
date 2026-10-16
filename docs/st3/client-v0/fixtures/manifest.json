@@ -11,6 +11,7 @@
     { "file": "timeline-views.json", "definition": "Envelope" },
     { "file": "timeline-conformance.json", "definition": "TimelinePage" },
     { "file": "timeline-relay-omission.json", "definition": "Envelope" },
+    { "file": "timeline-delivery-links.json", "definition": "Envelope" },
     { "file": "normalized-conversation-legacy.json", "definition": "Envelope" },
     { "file": "events.json", "definition": "Envelope" },
     { "file": "action.json", "definition": "ActionRequest" },
