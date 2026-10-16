@@ -13,6 +13,7 @@ use tower::ServiceExt as _;
 
 fn state(root: &Path) -> AppState {
     AppState {
+        owning_person: None,
         store: Arc::new(Store::open_memory("glasses-test").unwrap()),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,
@@ -496,27 +497,21 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
         .unwrap();
     assert!(matches!(change,CollectionEvent::Changes{removes,..} if removes.len()==1));
     stream.close().await;
-    let challenge = client
-        .pairing_begin(&st3_client::PairingBegin {
-            api_version: "st3.client.v0".into(),
-            device_name: "Fixture phone".into(),
-            person_id: "person/ada".into(),
-            full_control: None,
-            scopes: None,
-        })
+    let challenge = client.pairing_begin_person(&st3_client::PersonPairingBegin { api_version: "st3.client.v0".into(),
+    device_name: "Fixture phone".into(),
+    person_id: "person/ada".into(),
+    full_control: None,
+    scopes: None, })
         .await
         .unwrap()
         .value;
-    let paired = client
-        .pairing_complete(
-            &challenge.pairing_id,
-            &st3_client::PairingComplete {
-                api_version: "st3.client.v0".into(),
-                code: challenge.code,
-                device_public_key: "a".repeat(64),
-                key_storage: None,
-            },
-        )
+    let paired = client.pairing_complete_person(&challenge.pairing_id,
+    &st3_client::PairingComplete {
+        api_version: "st3.client.v0".into(),
+        code: challenge.code,
+        device_public_key: "a".repeat(64),
+        key_storage: None,
+    },)
         .await
         .unwrap()
         .value;

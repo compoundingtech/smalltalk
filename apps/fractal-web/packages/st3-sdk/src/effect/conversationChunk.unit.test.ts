@@ -25,7 +25,7 @@ describe('native conversation empty evidence', () => {
   it('does not infer native emptiness from a payload rejected by the entry schema', () => {
     const decoded = decodeConversationChunk({ ...frame, has_more: false, items: [{
       id: 'entry/1', sequence: 1, revision: 1, final: true, role: 'assistant',
-      timestamp: 'not-a-timestamp', type: 'content', body: { text: 'Native row' },
+      timestamp: 'not-a-timestamp', type: 'content', body: { media_type: 'text/plain', text: 'Native row' },
     }] })
     expect(decoded.entries[0]?.type).toBe('unrecognized')
     expect(decoded.observation).toEqual({ empty: false })

@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     )?);
     let socket = root.join("st3.sock");
     let state = AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

@@ -35,6 +35,7 @@ async fn provider_incarnation(
         })
         .unwrap();
     let state = AppState {
+        owning_person: None,
         store,
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

@@ -14,6 +14,7 @@ use tokio::sync::{Notify, watch};
 
 fn test_state(root: &Path) -> AppState {
     AppState {
+        owning_person: None,
         store: Arc::new(Store::open_memory("client-v0-cli").unwrap()),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,
@@ -35,7 +36,7 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
         rand::SystemRandom,
         signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair},
     };
-    use st3_client::{Client, Fence, MessageSendParameters, PairingBegin, device::Profile};
+    use st3_client::{Client, Fence, MessageSendParameters, PersonPairingBegin, device::Profile};
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Stdio;
@@ -90,14 +91,11 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
     };
     for algorithm in ["ed25519", "p256"] {
         for import in [false, true] {
-            let challenge = local
-                .pairing_begin(&PairingBegin {
-                    api_version: st3_client::API_VERSION.into(),
-                    device_name: "CLI device".into(),
-                    person_id: "person/avery".into(),
-                    full_control: Some(true),
-                    scopes: None,
-                })
+            let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+            device_name: "CLI device".into(),
+            person_id: "person/avery".into(),
+            full_control: Some(true),
+            scopes: None, })
                 .await
                 .unwrap()
                 .value;
@@ -242,14 +240,11 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
             );
         }
     }
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Display".into(),
-            person_id: "person/avery".into(),
-            full_control: None,
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Display".into(),
+    person_id: "person/avery".into(),
+    full_control: None,
+    scopes: None, })
         .await
         .unwrap()
         .value;
@@ -276,10 +271,8 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
     assert!(!loaded.devices[0].allow_public_http);
     assert!(loaded.devices[0].session.device_key_chain.is_empty());
     assert!(loaded.devices[0].person_root_fingerprint.is_some());
-    let challenge = local.pairing_begin(&PairingBegin {
-        api_version: st3_client::API_VERSION.into(), device_name: "Explicit unpinned CLI".into(),
-        person_id: "person/avery".into(), full_control: Some(true), scopes: None,
-    }).await.unwrap().value;
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(), device_name: "Explicit unpinned CLI".into(),
+    person_id: "person/avery".into(), full_control: Some(true), scopes: None, }).await.unwrap().value;
     let unpinned_profile = root.path().join("unpinned/devices.json");
     let output = run(vec!["devices".into(), "complete".into(), base.clone(), challenge.pairing_id,
         "--unpinned".into(), "--profile".into(), unpinned_profile.to_str().unwrap().into()], challenge.code).await.unwrap();

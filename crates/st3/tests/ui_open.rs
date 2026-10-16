@@ -146,6 +146,7 @@ impl Tui {
 fn state(root: &Path, node: &str) -> AppState {
     let store = Store::open_memory(node).unwrap();
     AppState {
+        owning_person: None,
         store: Arc::new(store),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,

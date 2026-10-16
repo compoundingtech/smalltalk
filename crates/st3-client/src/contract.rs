@@ -125,6 +125,12 @@ pub const READ_OPERATIONS: &[(&str, &str)] = &[
     ("arrangements.get", "/v1/client/arrangements/{person_name}/{uuid}"),
     ("glasses.list", "/v1/client/glasses"),
     ("glasses.get", "/v1/client/glasses/{id}"),
+    ("assistant.summary", "/v1/client/assistant/summary"),
+    ("assistant.attention", "/v1/client/assistant/attention"),
+    ("assistant.missions", "/v1/client/assistant/missions"),
+    ("assistant.agents", "/v1/client/assistant/agents"),
+    ("assistant.conversation-content", "/v1/client/assistant/conversation-content"),
+    ("assistant.terminal-content", "/v1/client/assistant/terminal-content"),
 ];
 /// Each person's one Sidebar arrangement is arrangement/person/NAME/<this UUID> (#2043).
 #[rustfmt::skip]

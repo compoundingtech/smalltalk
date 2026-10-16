@@ -350,6 +350,7 @@ impl Store {
                 admission: Some(&admission),
                 signature: None,
                 retirement_writer: true,
+                assistant: None,
             },
         )
     }

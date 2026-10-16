@@ -118,6 +118,8 @@ pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation:
 
 #[derive(Clone)]
 pub struct AppState {
+    /// Configured owning person for trusted-local assistant grant administration.
+    pub owning_person: Option<String>,
     pub store: Arc<Store>,
     pub notify: Arc<Notify>,
     pub event_notify: watch::Sender<u64>,
@@ -661,6 +663,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::collection_stream),
         )
         .route("/v1/client/actions", post(client_v0::action))
+        .route("/v1/client/assistant/propose", post(client_v0::assistant::propose))
+        .route("/v1/client/assistant/attention-content", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/attention-rich", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/missions-rich", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/agents-rich", get(client_v0::assistant::read_projection))
         .route(
             "/v1/client/blobs",
             post(client_blobs::upload).layer(DefaultBodyLimit::max(client_blobs::UPLOAD_BODY_LIMIT)),
@@ -670,6 +677,20 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/adapter/import", post(client_adapters::import_message))
         .route("/v1/client/adapter/deliveries", get(client_adapters::deliveries))
         .route("/v1/client/pairings", post(client_v0::pairing_begin))
+        .route("/v1/client/assistant/grants/{id}", get(client_v0::assistant::inspect))
+        .route("/v1/client/assistant/grants/{id}/revoke", post(client_v0::assistant::revoke))
+        .route("/v1/client/assistant/grants/{id}/read-trust", post(client_v0::assistant::pin_read_trust))
+        .route("/v1/client/assistant/grants/assistant-grant/{id}", get(client_v0::assistant::inspect))
+        .route("/v1/client/assistant/grants/assistant-grant/{id}/revoke", post(client_v0::assistant::revoke))
+        .route("/v1/client/assistant/grants/assistant-grant/{id}/read-trust", post(client_v0::assistant::pin_read_trust))
+        .route("/v1/client/assistant/grants/assistant-grant/{id}/policy", post(client_v0::assistant::update_policy))
+        .route("/v1/client/assistant/summary", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/attention", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/missions", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/agents", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/conversation-content", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/terminal-content", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/grants/{id}/policy", post(client_v0::assistant::update_policy))
         .route(
             "/v1/client/pairings/{id}/complete",
             post(client_v0::pairing_complete),
@@ -1081,13 +1102,16 @@ async fn response_envelope_unbounded(
     });
     // Authentication can scan pairing claims, and creating a snapshot reads the store. Both
     // must leave the async acceptor free to admit independent requests when SQLite is busy.
-    let (client_authentication, client_snapshot) = if client_request {
+    // Bearers on native Unix routes must not evade the assistant route boundary.
+    let (client_authentication, client_snapshot) = if client_request
+        || request.headers().contains_key(axum::http::header::AUTHORIZATION) {
         let mut auth_request = Request::builder()
             .method(request.method().clone())
             .uri(request.uri().clone())
             .body(Body::empty())
             .expect("the incoming request has a valid method and URI");
         *auth_request.headers_mut() = request.headers().clone();
+        *auth_request.extensions_mut() = request.extensions().clone();
         let auth_state = state.clone();
         let transport = transport.as_str();
         let auth_profile = profile.clone();
@@ -1824,6 +1848,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "database-busy"
         | "database-locked"
         | "message-send-unconfirmed"
+        | "response-budget-exceeded"
+        | "content-not-text"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "too-many-attachments" | "invalid-blob-reference" | "invalid-slo-period" => "validation-failed".into(),
         "launch-review-not-authorized"
@@ -2304,7 +2330,7 @@ async fn client_capabilities(
         blocking_store(move || store.read_snapshot(|_| store.event_bounds())).await?;
     let oldest = oldest.saturating_sub(1);
     let cursor = format!("event-cursor/{}/{newest}", state.node);
-    let capabilities = client_v0::capabilities(&session);
+    let capabilities = client_v0::capabilities(&state, &session);
     // The longest message body this daemon takes, so a composer shows a limit only when told.
     let max_message_bytes = message_body::MAX_BYTES;
     Ok(Json(json!({
@@ -2316,6 +2342,8 @@ async fn client_capabilities(
         "limits": {
             "max_page_items": CLIENT_MAX_PAGE_ITEMS,
             "max_event_items": 500,
+            "max_assistant_response_bytes": 16384,
+            "default_assistant_response_bytes": 4096,
             "max_response_bytes": CLIENT_MAX_RESPONSE_BYTES,
             "max_wait_ms": 30_000,
             "max_message_bytes": max_message_bytes,
@@ -7821,7 +7849,8 @@ async fn guard_bound_request(
     let Some(bound_agent) = bound_agent else {
         return Ok(request);
     };
-    if request.method() == axum::http::Method::GET {
+    if request.method() == axum::http::Method::GET
+        && !client_v0::administrative_get(&request) {
         return Ok(request);
     }
     // Free mode lets an agent do what its person may do, but always as itself: a harness never
@@ -14224,6 +14253,7 @@ fn check_device_signature(
     Ok(())
 }
 
+#[cfg(test)]
 fn accept_message(
     state: &AppState,
     request: MessageSendRequest,
@@ -14242,7 +14272,7 @@ fn accept_message_receipt(
     session_id: Option<String>,
     device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<MessageSendReceipt, ApiError> {
-    accept_message_receipt_with_upload_owner(state, request, session_id, device_signature, None)
+    accept_message_receipt_with_upload_owner(state, request, session_id, device_signature, None, None)
 }
 
 fn accept_message_receipt_with_upload_owner(
@@ -14251,6 +14281,7 @@ fn accept_message_receipt_with_upload_owner(
     session_id: Option<String>,
     device_signature: Option<smallclaims::principal::ClaimSignature>,
     upload_owner: Option<&str>,
+    assistant_authorization: Option<&crate::store::assistant_write::AssistantWriteAuthorization>,
 ) -> Result<MessageSendReceipt, ApiError> {
     if request.from.starts_with("external/") && upload_owner.is_none() {
         return Err(ApiError::bad(St3Error::new(
@@ -14484,7 +14515,10 @@ fn accept_message_receipt_with_upload_owner(
     // A repeated key returns the first claim and says it appended nothing.
     let (record, appended) = match &device_signature {
         Some(signature) => state.store.append_signed_message(&input, signature),
-        None => state.store.append_claim_outcome(&input),
+        None => match assistant_authorization {
+            Some(authorization) => state.store.append_assistant_claim_outcome(&input, authorization),
+            None => state.store.append_claim_outcome(&input),
+        },
     }
     .map_err(|error| {
         if let Some(staged) = staged.as_ref() {
@@ -14547,6 +14581,9 @@ fn accept_message_receipt_with_upload_owner(
             body_ref: body.as_ref().map(|body| message_body::reference(&body.sha256)),
             body_bytes: body.as_ref().map(|body| body.size),
             body_origin: body.map(|body| body.origin),
+            // Provenance markers never originate on the ordinary send path.
+            sender_class: None,
+            assistant_grant_id: None,
         },
         idempotency_key: request.idempotency_key,
         already_sent: !appended,
@@ -19526,6 +19563,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
 
     pub(super) fn state(root: &Path) -> AppState {
         AppState {
+            owning_person: None,
             store: Arc::new(Store::open_memory("node").unwrap()),
             notify: Arc::new(Notify::new()),
             event_notify: watch::channel(0_u64).0,

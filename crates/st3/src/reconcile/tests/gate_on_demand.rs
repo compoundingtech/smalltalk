@@ -631,6 +631,7 @@ async fn gate_on_demand_builder_message_waits_in_the_gate_mailbox() {
     use tower::ServiceExt;
     let root = tempfile::tempdir().unwrap();
     let state = crate::api::AppState {
+        owning_person: None,
         store: fixture.store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: tokio::sync::watch::channel(0_u64).0,
