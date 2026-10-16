@@ -356,13 +356,13 @@ fn run_dependencies(tx: &Transaction<'_>, source: &str, initial: &str) -> Result
 }
 
 fn resource(item: &AttentionItemView) -> Result<Value> {
-    let id = crate::api::client_attention_id(&item.subject, &item.person, &item.episode)?;
+    let id = crate::client_values::client_attention_id(&item.subject, &item.person, &item.episode)?;
     let mut row = json!({"id":id,"kind":"attention","attention_kind":item.kind,
       "source_id":item.subject,"source_kind":item.kind,"episode":item.episode,"person_id":item.person,
-      "revision":item.episode,"updated_at":crate::api::client_timestamp(item.requested_at_unix_ms),
+      "revision":item.episode,"updated_at":crate::client_values::client_timestamp(item.requested_at_unix_ms),
       "title":item.title,"detail":item.detail,"priority":item.priority,"state":"open",
-      "requested_at":crate::api::client_timestamp(item.requested_at_unix_ms),"targets":item.targets,
-      "actions":crate::api::client_attention_actions(&item.kind,item.review_mode.as_deref()),
+      "requested_at":crate::client_values::client_timestamp(item.requested_at_unix_ms),"targets":item.targets,
+      "actions":crate::client_values::client_attention_actions(&item.kind,item.review_mode.as_deref()),
       "operational":{"layer":"current","actionable":true,"reasons":[]},"alert":item.is_alert()});
     if item.conversation.is_some() {
         row["conversation_ids"] = json!(item.conversations());

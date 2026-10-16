@@ -2,11 +2,11 @@
 use std::collections::BTreeMap;
 
 use kdl::{KdlDocument, KdlNode};
-use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
-use serde_json::{Value, json};
+use rusqlite::{Connection, OptionalExtension as _, params};
+use serde_json::Value;
 pub use st3_schema::provenance::{Provenance, Source};
 
-use crate::model::{ClaimRecord, MissionSpec, NormalizedIntent, St3Error};
+use crate::model::{NormalizedIntent, St3Error};
 
 fn invalid(message: impl Into<String>) -> St3Error {
     St3Error::new("invalid-mission-provenance", message)
@@ -133,7 +133,7 @@ pub(crate) fn parse(document: &KdlDocument) -> Result<BTreeMap<String, Provenanc
     Ok(result)
 }
 
-fn subject(mission: &str, revision: &str) -> String {
+pub(crate) fn subject(mission: &str, revision: &str) -> String {
     format!(
         "mission/{}@{revision}",
         mission.strip_prefix("mission/").unwrap_or(mission)
@@ -186,26 +186,7 @@ pub(crate) fn validate_publication(
     Ok(())
 }
 
-pub(crate) fn record(
-    transaction: &Transaction<'_>,
-    origin: &str,
-    mission: &MissionSpec,
-    provenance: &Provenance,
-    actor: Option<&str>,
-    batch: &str,
-) -> Result<Option<ClaimRecord>, St3Error> {
-    if read(transaction, &mission.id, &mission.revision)
-        .map_err(internal)?
-        .is_some()
-    {
-        return Ok(None);
-    }
-    let claim = crate::store::append_claim_tx(transaction, origin, &subject(&mission.id, &mission.revision), "mission.provenance", actor,
-        &json!({"fields": {"mission": mission.subject, "revision": mission.revision, "provenance": provenance}}), &[], Some(batch)).map_err(internal)?;
-    Ok(Some(claim))
-}
-
-fn internal(error: impl std::fmt::Display) -> St3Error {
+pub(crate) fn internal(error: impl std::fmt::Display) -> St3Error {
     St3Error::new("internal", error.to_string())
 }
 
