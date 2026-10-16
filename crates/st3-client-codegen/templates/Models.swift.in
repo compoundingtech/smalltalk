@@ -51,81 +51,166 @@ public struct ErrorEnvelope: Codable, Error, Sendable {
 }
 
 public enum ErrorCode: Codable, Sendable, Equatable {
-    case recipientRetired, lifecycleUnavailable, retirementUpgradeRequired
-    case notFound, forbidden, unsupportedCapability, validationFailed, idempotencyConflict
+    case recipientRetired
+    case lifecycleUnavailable
+    case retirementUpgradeRequired
+    case notFound
+    case forbidden
+    case unsupportedCapability
+    case validationFailed
+    case idempotencyConflict
     case attentionMigrated
     case issuerRequired
     case suspendAuthoredSessionSelection
     case arrangementExists
-    case arrangementFolderExists, arrangementRetired, arrangementLimit, arrangementFolderDeleted
-    case arrangementCycle, arrangementBodyTooLarge, arrangementOwnerForbidden
-    case invalidArrangementSubject, invalidArrangementAction, invalidArrangementOperations
-    case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
-    case staleFence, cursorGap, pageCursorExpired, rateLimited
-    case projectionDetailTooLarge, projectionDetailInvalidSource
-    case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
-    case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
-    case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge, messageStoreFull, longMessageSignatureUnsupported
+    case arrangementFolderExists
+    case arrangementRetired
+    case arrangementLimit
+    case arrangementFolderDeleted
+    case arrangementCycle
+    case arrangementBodyTooLarge
+    case arrangementOwnerForbidden
+    case invalidArrangementSubject
+    case invalidArrangementAction
+    case invalidArrangementOperations
+    case invalidArrangementFolder
+    case invalidArrangementName
+    case invalidArrangementKey
+    case invalidSubjectReference
+    case staleFence
+    case cursorGap
+    case pageCursorExpired
+    case rateLimited
+    case projectionDetailTooLarge
+    case projectionDetailInvalidSource
+    case runtimeNotLocal
+    case runtimeAuthorityIndeterminate
+    case remoteUnavailable
+    case `internal`
+    case terminalUnavailable
+    case terminalEnded
+    case timelineHistoryIncomplete
+    case conversationContentInvalidated
+    case transcriptUnavailable
+    case blobTooLarge
+    case unsupportedMediaType
+    case blobContentMismatch
+    case blobQuotaExceeded
+    case blobNotFound
+    case blobExpired
+    case messageTooLarge
+    case messageStoreFull
+    case longMessageSignatureUnsupported
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
         self = switch raw {
-        case "recipient-retired": .recipientRetired; case "lifecycle-unavailable": .lifecycleUnavailable; case "retirement-upgrade-required": .retirementUpgradeRequired
-        case "attention-migrated": .attentionMigrated; case "not-found": .notFound; case "forbidden": .forbidden
-        case "unsupported-capability": .unsupportedCapability; case "validation-failed": .validationFailed
-        case "idempotency-conflict": .idempotencyConflict; case "stale-fence": .staleFence
+        case "recipient-retired": .recipientRetired
+        case "lifecycle-unavailable": .lifecycleUnavailable
+        case "retirement-upgrade-required": .retirementUpgradeRequired
+        case "attention-migrated": .attentionMigrated
+        case "not-found": .notFound
+        case "forbidden": .forbidden
+        case "unsupported-capability": .unsupportedCapability
+        case "validation-failed": .validationFailed
+        case "idempotency-conflict": .idempotencyConflict
+        case "stale-fence": .staleFence
         case "issuer-required": .issuerRequired
         case "suspend-authored-session-selection": .suspendAuthoredSessionSelection
         case "arrangement-exists": .arrangementExists
         case "arrangement-folder-exists": .arrangementFolderExists
-        case "arrangement-retired": .arrangementRetired; case "arrangement-limit": .arrangementLimit
-        case "arrangement-folder-deleted": .arrangementFolderDeleted; case "arrangement-cycle": .arrangementCycle
-        case "arrangement-body-too-large": .arrangementBodyTooLarge; case "arrangement-owner-forbidden": .arrangementOwnerForbidden
-        case "invalid-arrangement-subject": .invalidArrangementSubject; case "invalid-arrangement-action": .invalidArrangementAction
-        case "invalid-arrangement-operations": .invalidArrangementOperations; case "invalid-arrangement-folder": .invalidArrangementFolder
-        case "invalid-arrangement-name": .invalidArrangementName; case "invalid-arrangement-key": .invalidArrangementKey
+        case "arrangement-retired": .arrangementRetired
+        case "arrangement-limit": .arrangementLimit
+        case "arrangement-folder-deleted": .arrangementFolderDeleted
+        case "arrangement-cycle": .arrangementCycle
+        case "arrangement-body-too-large": .arrangementBodyTooLarge
+        case "arrangement-owner-forbidden": .arrangementOwnerForbidden
+        case "invalid-arrangement-subject": .invalidArrangementSubject
+        case "invalid-arrangement-action": .invalidArrangementAction
+        case "invalid-arrangement-operations": .invalidArrangementOperations
+        case "invalid-arrangement-folder": .invalidArrangementFolder
+        case "invalid-arrangement-name": .invalidArrangementName
+        case "invalid-arrangement-key": .invalidArrangementKey
         case "invalid-subject-reference": .invalidSubjectReference
-        case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
-        case "projection-detail-too-large": .projectionDetailTooLarge; case "projection-detail-invalid-source": .projectionDetailInvalidSource
-        case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
+        case "cursor-gap": .cursorGap
+        case "page-cursor-expired": .pageCursorExpired
+        case "projection-detail-too-large": .projectionDetailTooLarge
+        case "projection-detail-invalid-source": .projectionDetailInvalidSource
+        case "rate-limited": .rateLimited
+        case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
-        case "conversation-content-invalidated": .conversationContentInvalidated; case "transcript-unavailable": .transcriptUnavailable
-        case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
-        case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
-        case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
-        case "message-too-large": .messageTooLarge; case "message-store-full": .messageStoreFull; case "long-message-signature-unsupported": .longMessageSignatureUnsupported
-        case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
+        case "conversation-content-invalidated": .conversationContentInvalidated
+        case "transcript-unavailable": .transcriptUnavailable
+        case "terminal-unavailable": .terminalUnavailable
+        case "terminal-ended": .terminalEnded
+        case "blob-too-large": .blobTooLarge
+        case "unsupported-media-type": .unsupportedMediaType
+        case "blob-content-mismatch": .blobContentMismatch
+        case "blob-quota-exceeded": .blobQuotaExceeded
+        case "blob-not-found": .blobNotFound
+        case "blob-expired": .blobExpired
+        case "message-too-large": .messageTooLarge
+        case "message-store-full": .messageStoreFull
+        case "long-message-signature-unsupported": .longMessageSignatureUnsupported
+        case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate
+        case "remote-unavailable": .remoteUnavailable
+        case "internal": .internal
         default: .unknown(raw)
         }
     }
     public func encode(to encoder: Encoder) throws {
         let raw = switch self {
-        case .recipientRetired: "recipient-retired"; case .lifecycleUnavailable: "lifecycle-unavailable"; case .retirementUpgradeRequired: "retirement-upgrade-required"
-        case .attentionMigrated: "attention-migrated"; case .notFound: "not-found"; case .forbidden: "forbidden"
-        case .unsupportedCapability: "unsupported-capability"; case .validationFailed: "validation-failed"
-        case .idempotencyConflict: "idempotency-conflict"; case .staleFence: "stale-fence"
+        case .recipientRetired: "recipient-retired"
+        case .lifecycleUnavailable: "lifecycle-unavailable"
+        case .retirementUpgradeRequired: "retirement-upgrade-required"
+        case .attentionMigrated: "attention-migrated"
+        case .notFound: "not-found"
+        case .forbidden: "forbidden"
+        case .unsupportedCapability: "unsupported-capability"
+        case .validationFailed: "validation-failed"
+        case .idempotencyConflict: "idempotency-conflict"
+        case .staleFence: "stale-fence"
         case .issuerRequired: "issuer-required"
         case .suspendAuthoredSessionSelection: "suspend-authored-session-selection"
         case .arrangementExists: "arrangement-exists"
         case .arrangementFolderExists: "arrangement-folder-exists"
-        case .arrangementRetired: "arrangement-retired"; case .arrangementLimit: "arrangement-limit"
-        case .arrangementFolderDeleted: "arrangement-folder-deleted"; case .arrangementCycle: "arrangement-cycle"
-        case .arrangementBodyTooLarge: "arrangement-body-too-large"; case .arrangementOwnerForbidden: "arrangement-owner-forbidden"
-        case .invalidArrangementSubject: "invalid-arrangement-subject"; case .invalidArrangementAction: "invalid-arrangement-action"
-        case .invalidArrangementOperations: "invalid-arrangement-operations"; case .invalidArrangementFolder: "invalid-arrangement-folder"
-        case .invalidArrangementName: "invalid-arrangement-name"; case .invalidArrangementKey: "invalid-arrangement-key"
+        case .arrangementRetired: "arrangement-retired"
+        case .arrangementLimit: "arrangement-limit"
+        case .arrangementFolderDeleted: "arrangement-folder-deleted"
+        case .arrangementCycle: "arrangement-cycle"
+        case .arrangementBodyTooLarge: "arrangement-body-too-large"
+        case .arrangementOwnerForbidden: "arrangement-owner-forbidden"
+        case .invalidArrangementSubject: "invalid-arrangement-subject"
+        case .invalidArrangementAction: "invalid-arrangement-action"
+        case .invalidArrangementOperations: "invalid-arrangement-operations"
+        case .invalidArrangementFolder: "invalid-arrangement-folder"
+        case .invalidArrangementName: "invalid-arrangement-name"
+        case .invalidArrangementKey: "invalid-arrangement-key"
         case .invalidSubjectReference: "invalid-subject-reference"
-        case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
-        case .projectionDetailTooLarge: "projection-detail-too-large"; case .projectionDetailInvalidSource: "projection-detail-invalid-source"
-        case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
+        case .cursorGap: "cursor-gap"
+        case .pageCursorExpired: "page-cursor-expired"
+        case .projectionDetailTooLarge: "projection-detail-too-large"
+        case .projectionDetailInvalidSource: "projection-detail-invalid-source"
+        case .rateLimited: "rate-limited"
+        case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
-        case .conversationContentInvalidated: "conversation-content-invalidated"; case .transcriptUnavailable: "transcript-unavailable"
-        case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
-        case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
-        case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
-        case .messageTooLarge: "message-too-large"; case .messageStoreFull: "message-store-full"; case .longMessageSignatureUnsupported: "long-message-signature-unsupported"
-        case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
+        case .conversationContentInvalidated: "conversation-content-invalidated"
+        case .transcriptUnavailable: "transcript-unavailable"
+        case .terminalUnavailable: "terminal-unavailable"
+        case .terminalEnded: "terminal-ended"
+        case .blobTooLarge: "blob-too-large"
+        case .unsupportedMediaType: "unsupported-media-type"
+        case .blobContentMismatch: "blob-content-mismatch"
+        case .blobQuotaExceeded: "blob-quota-exceeded"
+        case .blobNotFound: "blob-not-found"
+        case .blobExpired: "blob-expired"
+        case .messageTooLarge: "message-too-large"
+        case .messageStoreFull: "message-store-full"
+        case .longMessageSignatureUnsupported: "long-message-signature-unsupported"
+        case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"
+        case .remoteUnavailable: "remote-unavailable"
+        case .internal: "internal"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)
