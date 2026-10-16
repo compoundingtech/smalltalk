@@ -132,7 +132,12 @@ runs in, then asks `Start the built-in Smalltalk Assistant now?` (default yes). 
 want it.` On yes, setup creates `agent/st/assistant` and starts `mission/st/onboarding`, and says
 what it created and how to stop it. When setup publishes the Assistant during a plain `st`
 launch, the interface opens that conversation. You can also open its conversation from the sidebar or **Ctrl+K**.
-Follow its guidance for your first mission; the Assistant stays available afterward.
+The Assistant greets you and plays three short acts, in about five minutes. First, two agents
+talk to each other (a Claude and a Codex when both are ready). Second, a small mission runs in a split
+beside the conversation. Third, an alert from the Assistant appears above the message input, where you
+can read it and dismiss it, and the Assistant asks what you want to accomplish in Smalltalk today. That
+question ends onboarding; it starts real work only if you answer. Say `skip` at any point to stop, and
+`st setup --onboarding` brings the tour back. The Assistant stays available afterward.
 The follow-on [mission guide](missions-in-practice.md) explains how to declare
 the `garden/worker` seat used in its examples.
 

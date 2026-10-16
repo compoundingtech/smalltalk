@@ -548,14 +548,15 @@ async fn stages(
     }
 
     // The Assistant starts while the screen is still up, once something is ready to run it.
-    let (harness, started) = {
+    let (harness, ready, started) = {
         let shared = shared.lock().expect("result lock");
-        (shared.ready.first().cloned(), shared.started_assistant)
+        (shared.ready.first().cloned(), shared.ready.clone(), shared.started_assistant)
     };
     if let (Some(harness), false) = (harness, started) {
         if daemon_ready(&next).await {
             reporter.step("Starting the Assistant");
-            let subject = crate::onboarding::start(&next, &harness, start.args.onboarding).await?;
+            let subject =
+                crate::onboarding::start(&next, &harness, &ready, start.args.onboarding).await?;
             let mut shared = shared.lock().expect("result lock");
             shared.started_assistant = true;
             shared.harness = Some(harness);

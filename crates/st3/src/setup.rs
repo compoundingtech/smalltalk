@@ -271,7 +271,13 @@ pub async fn run(args: SetupArgs) -> Result<PreparedSetup> {
             None
         } else if daemon_ready(&config).await {
             if confirm_assistant(&config, harness, &args)? {
-                let started = crate::onboarding::start(&config, harness, args.onboarding).await?;
+                let started = crate::onboarding::start(
+                    &config,
+                    harness,
+                    std::slice::from_ref(harness),
+                    args.onboarding,
+                )
+                .await?;
                 if started.is_some() {
                     print_assistant_summary(&config, harness)?;
                 }
