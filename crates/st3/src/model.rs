@@ -1223,6 +1223,10 @@ pub struct MissionResponse {
     pub resolved_intent: IntentInput,
     pub changes: Vec<SubjectChange>,
     pub predicted_actions: Vec<PlannedAction>,
+    #[serde(default)]
+    pub running_restart_count: usize,
+    #[serde(default)]
+    pub running_restarts: Vec<PlannedAction>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub subject_tokens: BTreeMap<String, Vec<String>>,
@@ -1424,6 +1428,9 @@ pub struct ApplyRequest {
     pub idempotency_key: String,
     #[serde(default)]
     pub actor: Option<String>,
+    /// Missing uses the safe-point default; explicit null requests immediate restart.
+    #[serde(default = "crate::rollout::default_restart_policy")]
+    pub defer_restart: Option<crate::rollout::Policy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3191,3 +3198,4 @@ mod person_inbox_tests {
         assert!(!PERSON_HAS_NO_INBOX.contains("NO REPLY"));
     }
 }
+

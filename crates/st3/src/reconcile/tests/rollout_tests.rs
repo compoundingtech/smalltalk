@@ -1,4 +1,5 @@
 use super::*;
+use parking_lot::Mutex;
 use crate::rollout::{self, Policy};
 use crate::store::owned_sets::{Options, Source};
 use serde_json::json;
@@ -11,26 +12,24 @@ struct Runtime {
 }
 impl RuntimeControl for Runtime {
     fn start_operation(&self, id: &str, _: bool, incarnation: &str) -> Result<Option<String>> {
-        Ok(self.starts.lock().unwrap().iter().enumerate()
+        Ok(self.starts.lock().iter().enumerate()
             .find(|(index, member)| member.runtime_id == id && incarnation == format!("replacement-{}", index + 1))
             .and_then(|(_, member)| member.tags.get(start_jobs::OPERATION_TAG).cloned()))
     }
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
         Ok(self
-            .observation
-            .lock()
-            .unwrap()
+            .observation.lock()
             .clone()
             .into_iter()
             .collect())
     }
     fn observe_exec(&self, _: &str) -> Result<Option<RuntimeObservation>> {
-        Ok(self.observation.lock().unwrap().clone())
+        Ok(self.observation.lock().clone())
     }
     fn start(&self, member: &MemberSpec) -> Result<()> {
-        let mut starts = self.starts.lock().unwrap();
+        let mut starts = self.starts.lock();
         starts.push(member.clone());
-        *self.observation.lock().unwrap() = Some(RuntimeObservation {
+        *self.observation.lock() = Some(RuntimeObservation {
             runtime_id: member.runtime_id.clone(),
             terminal: member.terminal,
             status: "running".into(),
@@ -40,13 +39,13 @@ impl RuntimeControl for Runtime {
         Ok(())
     }
     fn stop(&self, _: &str, _: bool, expected: Option<&str>) -> Result<()> {
-        let mut state = self.observation.lock().unwrap();
+        let mut state = self.observation.lock();
         let observed = state.as_mut().unwrap();
         anyhow::ensure!(
             observed.incarnation_id.as_deref() == expected,
             "stale incarnation"
         );
-        self.stops.lock().unwrap().push(expected.unwrap().into());
+        self.stops.lock().push(expected.unwrap().into());
         observed.status = "exited".into();
         Ok(())
     }
@@ -97,30 +96,12 @@ impl Seat {
         if owned {
             seat.publish(1, "first", None, false);
         } else {
-            let input = parse_intent(&seat.source("first", ""), "amber").unwrap();
-            let preview = seat
-                .store
-                .mission(
-                    &input,
-                    crate::model::IntentInput {
-                        kdl: String::new(),
-                        source_name: None,
-                    },
-                )
-                .unwrap();
-            seat.store
-                .apply_as(
-                    &input,
-                    &preview.subject_tokens,
-                    "initial",
-                    Some("person/operator"),
-                )
-                .unwrap();
+            seat.publish_plain("first", None, "plain-first");
         }
         let desired = seat.desired();
         let member = desired.member.unwrap();
         let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
-        *seat.runtime.observation.lock().unwrap() = Some(RuntimeObservation {
+        *seat.runtime.observation.lock() = Some(RuntimeObservation {
             runtime_id: member.runtime_id.clone(),
             terminal: member.terminal,
             status: "running".into(),
@@ -283,7 +264,7 @@ impl Seat {
             "amber".into(),
             Arc::new(Notify::new()),
         );
-        let observed = self.runtime.observation.lock().unwrap().clone();
+        let observed = self.runtime.observation.lock().clone();
         assert!(
             reconciler
                 .reconcile_rollout(&self.desired(), observed.as_ref(), None)
@@ -376,6 +357,721 @@ impl Seat {
     }
 }
 
+impl Seat {
+    fn publish_plain_default(&self, model: &str, key: &str) {
+        self.publish_plain(model, rollout::default_restart_policy().as_ref(), key);
+    }
+
+    fn publish_plain(&self, model: &str, policy: Option<&Policy>, key: &str) {
+        let source = format!(
+            "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; harness \"claude\" {{ model {model:?}; }} }}",
+            self.root.path().display().to_string(),
+        );
+        self.publish_plain_source(source, policy, key);
+    }
+    fn publish_plain_source(&self, source: String, policy: Option<&Policy>, key: &str) {
+        let intent = parse_intent(&source, "amber").unwrap();
+        let preview = self.store.mission(&intent, crate::model::IntentInput {
+            kdl: source, source_name: None,
+        }).unwrap();
+        self.store.apply_as_with_restart_policy(
+            &intent, &preview.subject_tokens, key, Some("person/operator"), policy,
+        ).unwrap();
+    }
+    /// One pass. A planned restart of a ready seat first sends "Prepare for restart" and waits
+    /// for its handoff; the fixture seat never answers, so the deadline is zero and the pass
+    /// after the prepare goes ahead (see `prepare_pass`).
+    fn plain_step(&self) {
+        Reconciler::new(
+            self.store.clone(), self.runtime.clone(), "amber".into(), Arc::new(Notify::new()),
+        ).with_restart_prepare_deadline(std::time::Duration::ZERO).reconcile_once().unwrap();
+    }
+    /// The pass that sends the prepare message and holds the stop.
+    fn prepare_pass(&self) {
+        self.plain_step();
+        assert!(self.runtime.stops.lock().is_empty(), "the stop waits for the prepare pass");
+    }
+}
+
+#[test]
+fn acceptance_2888_working_launch_change_waits_until_idle_then_restarts_exactly_once() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain_default("second", "acceptance-working");
+    let expected = seat.desired().member.unwrap();
+    for _ in 0..3 {
+        seat.plain_step();
+        assert!(seat.runtime.stops.lock().is_empty());
+        assert!(seat.runtime.starts.lock().is_empty());
+    }
+    let status = rollout::status(&seat.store, SUBJECT).unwrap().unwrap();
+    assert_eq!(status["phase"], "pending");
+    assert_eq!(status["status"], "restart pending: launch changed");
+    assert!(status["alert"].is_null());
+    seat.busy(false);
+    for _ in 0..6 {
+        seat.plain_step();
+    }
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    let starts = seat.runtime.starts.lock();
+    assert_eq!(starts.len(), 1);
+    assert_launch(&starts[0], &expected);
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().is_none());
+}
+
+#[test]
+fn acceptance_2888_idle_launch_change_restarts_without_waiting_for_deadline() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.busy(false);
+    seat.publish_plain_default("second", "acceptance-idle");
+    let expected = seat.desired().member.unwrap();
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    seat.prepare_pass();
+    seat.plain_step();
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    seat.plain_step();
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
+    assert_launch(&seat.runtime.starts.lock()[0], &expected);
+    for _ in 0..3 {
+        seat.plain_step();
+    }
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
+}
+
+#[test]
+fn acceptance_2888_explicit_restart_now_restarts_a_working_seat() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", None, "acceptance-restart-now");
+    let expected = seat.desired().member.unwrap();
+    assert!(rollout::deferred_restart(&seat.store, SUBJECT).unwrap().is_none());
+    seat.prepare_pass();
+    seat.plain_step();
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    for _ in 0..5 {
+        seat.plain_step();
+    }
+    let starts = seat.runtime.starts.lock();
+    assert_eq!(starts.len(), 1);
+    assert_launch(&starts[0], &expected);
+}
+
+#[test]
+fn acceptance_2888_pending_changes_coalesce_into_exactly_one_newest_model_restart() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain_default("second", "acceptance-pending-second");
+    seat.plain_step();
+    seat.publish_plain_default("third", "acceptance-pending-third");
+    let expected = seat.desired().member.unwrap();
+    for _ in 0..3 {
+        seat.plain_step();
+    }
+    assert!(seat.runtime.stops.lock().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
+    seat.busy(false);
+    for _ in 0..6 {
+        seat.plain_step();
+    }
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    let starts = seat.runtime.starts.lock();
+    assert_eq!(starts.len(), 1);
+    assert_launch(&starts[0], &expected);
+    let crate::model::LaunchSpec::Argv(argv) = &starts[0].launch else {
+        panic!("the fixture uses an argv native launch");
+    };
+    assert!(argv.windows(2).any(|pair| pair[0] == "--model" && pair[1] == "third"));
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().is_none());
+}
+
+#[test]
+fn apply_restart_defers_work_and_asks_then_restarts_at_idle_across_reopen() {
+    let mut seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "plain-defer");
+    seat.plain_step();
+    assert!(seat.runtime.stops.lock().is_empty());
+    assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["phase"], "pending");
+    seat.append("harness.observed", json!({
+        "state":"idle", "driver":"claude", "incarnation_id":"original-1",
+        "blocked_on":"human", "ask":"question", "quiescent":false, "blocking":["pending-ask"],
+    }));
+    seat.plain_step();
+    assert!(seat.runtime.stops.lock().is_empty());
+    assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["blocking"], json!(["pending-ask"]));
+    seat.reopen();
+    seat.busy(false);
+    seat.plain_step();
+    assert!(seat.runtime.stops.lock().is_empty());
+    assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["phase"], "stopping");
+    seat.prepare_pass();
+    seat.plain_step();
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    seat.plain_step();
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
+}
+
+#[test]
+fn apply_restart_pending_keeps_incumbent_ready_work_wakes() {
+    let seat = Seat::new_with_owned_publication(false);
+    let run = seat.work();
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "pending-work");
+    seat.plain_step();
+    let wakes = seat.store.work_wake_messages_for_reconcile(SUBJECT).unwrap();
+    assert!(wakes.iter().any(|message| work_message_target(message)
+        .is_some_and(|(step, _, _, incarnation)| step == run.steps[0].subject
+            && incarnation == harness_incarnation_key("original-1"))), "{wakes:?}");
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
+#[test]
+fn apply_restart_waits_for_ask_person_and_answered_work() {
+    let seat = Seat::new_with_owned_publication(false);
+    let run = seat.work();
+    let request = |key: &str| crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: Some("tending".into()), reason: None, evidence: Vec::new(),
+        idempotency_key: key.into(),
+        wait_ms: None,
+    };
+    seat.store.work_action(&run.steps[0].subject, "claim", &request("claim")).unwrap();
+    let ask = seat.store.ask_person(&crate::model::PersonAskRequest {
+        legacy_request: None, person: "person/operator".into(), title: "Which bed?".into(),
+        reason: "Choose the next bed".into(), actor: SUBJECT.into(),
+        step: Some(run.steps[0].subject.clone()), new_run: None,
+        incarnation: Some("original-1".into()), request: None, idempotency_key: "bed".into(),
+    }).unwrap();
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-ask");
+    seat.busy(false);
+    seat.plain_step();
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["blocking"]
+        .as_array().unwrap().contains(&json!("pending-person-work")));
+    assert!(seat.runtime.stops.lock().is_empty());
+    seat.store.finish_person_step(&crate::model::PersonStepResponse {
+        delegation: None, subject: ask.subject, actor: "person/operator".into(),
+        summary: "The north bed".into(), evidence: Vec::new(), episode: None,
+        answer: None, idempotency_key: "north".into(),
+    }, false).unwrap();
+    seat.store.reconcile_person_asks().unwrap();
+    seat.plain_step();
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    seat.store.work_action(&run.steps[0].subject, "claim", &request("resume")).unwrap();
+    seat.store.work_action(&run.steps[0].subject, "complete", &request("done")).unwrap();
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
+#[test]
+fn apply_restart_cutover_serializes_with_claim_and_expires_with_incarnation() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "fenced");
+    seat.busy(false);
+    let frontier = seat.store.restart_frontier().unwrap();
+    let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    let deadline = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap().deadline_unix_ms;
+    assert!(rollout::restart_blockers(&seat.store, SUBJECT, "original-1").unwrap().is_empty());
+    let run = seat.work();
+    let request = |key: &str| crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: Some("tending".into()), reason: None, evidence: Vec::new(),
+        idempotency_key: key.into(),
+        wait_ms: None,
+    };
+    seat.store.work_action(&run.steps[0].subject, "claim", &request("claim-before")).unwrap();
+    assert!(!seat.store.commit_restart_cutover(&seat.desired(), &token, "original-1", frontier, deadline).unwrap());
+    seat.store.work_action(&run.steps[0].subject, "complete", &request("done")).unwrap();
+    let frontier = seat.store.restart_frontier().unwrap();
+    assert!(rollout::restart_blockers(&seat.store, SUBJECT, "original-1").unwrap().is_empty());
+    assert!(seat.store.commit_restart_cutover(&seat.desired(), &token, "original-1", frontier, deadline).unwrap());
+    assert_eq!(seat.store.work_action(&run.steps[1].subject, "claim", &request("claim-after"))
+        .unwrap_err().code, "seat-rollout-draining");
+    seat.append("runtime.observed", json!({
+        "status":"running","runtime_id":seat.desired().member.unwrap().runtime_id,
+        "host":"amber","terminal":true,"incarnation_id":"replacement-1",
+    }));
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    seat.store.work_action(&run.steps[1].subject, "claim", &crate::model::WorkRequest {
+        incarnation: Some("replacement-1".into()), ..request("replacement-claim")
+    }).unwrap();
+}
+
+#[test]
+fn apply_restart_aborts_cutover_when_render_or_workspace_preparation_fails() {
+    for missing_workspace in [false, true] {
+        let seat = Seat::new_with_owned_publication(false);
+        let workspace = if missing_workspace {
+            seat.root.path().join("missing")
+        } else {
+            fs::write(seat.root.path().join("blocked"), "not a directory").unwrap();
+            seat.root.path().to_path_buf()
+        };
+        seat.publish_plain_source(format!(
+            "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; harness \"claude\" {{ model \"second\"; }}; render {{ file \"blocked/output\" \"new\"; }} }}",
+            workspace.display().to_string(),
+        ), Some(&Policy::when_idle(1_800_000, false)), "broken-target");
+        seat.busy(false);
+        let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+        let deadline = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap().deadline_unix_ms;
+        assert!(seat.store.commit_restart_cutover(
+            &seat.desired(), &token, "original-1", seat.store.restart_frontier().unwrap(), deadline,
+        ).unwrap());
+        seat.plain_step();
+        assert!(seat.runtime.stops.lock().is_empty());
+        assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+        assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["phase"], "pending");
+        assert!(seat.store.claims_for(SUBJECT, Some("runtime.action.failed")).unwrap().iter()
+            .any(|claim| claim.body["fields"]["action"] == "apply-restart-cutover"
+                && claim.body["fields"]["operation_status"] == "aborted"));
+        let run = seat.work();
+        seat.store.work_action(&run.steps[0].subject, "claim", &crate::model::WorkRequest {
+            actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+            summary: Some("keep tending".into()), reason: None, evidence: Vec::new(),
+            idempotency_key: "after-abort".into(),
+            wait_ms: None,
+        }).unwrap();
+    }
+}
+
+#[test]
+fn apply_restart_superseding_revert_rejects_stale_proof_and_releases_hidden_barrier() {
+    let seat = Seat::new_with_owned_publication(false);
+    let policy = Policy::when_idle(1_800_000, false);
+    seat.publish_plain("second", Some(&policy), "changed");
+    let evaluated = seat.desired();
+    let changed_token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    seat.publish_plain("first", Some(&policy), "reverted");
+    seat.busy(false);
+    let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    let deadline = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap().deadline_unix_ms;
+    let frontier = seat.store.restart_frontier().unwrap();
+    assert!(!seat.store.commit_restart_cutover(
+        &evaluated, &changed_token, "original-1", frontier, deadline,
+    ).unwrap());
+    // Even a newly re-fetched token cannot relabel the stale evaluated declaration.
+    assert!(!seat.store.commit_restart_cutover(
+        &evaluated, &token, "original-1", frontier, deadline,
+    ).unwrap());
+    assert!(!seat.store.commit_restart_cutover(
+        &seat.desired(), &token, "original-1", frontier, deadline,
+    ).unwrap());
+    let reconciler = Reconciler::new(
+        seat.store.clone(), seat.runtime.clone(), "amber".into(), Arc::new(Notify::new()),
+    );
+    assert!(reconciler.defer_declared_restart(
+        &evaluated, &seat.runtime.observation.lock().clone().unwrap(), now_ms(), None,
+    ).unwrap());
+    // Upgrade/recovery of an old buggy barrier must preserve the same invariant.
+    seat.append("runtime.action.requested", json!({
+        "action":"apply-restart-cutover","incarnation_id":"original-1",
+        "rollout":{"desired_token":token},
+    }));
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().is_none());
+    let run = seat.work();
+    seat.store.work_action(&run.steps[0].subject, "claim", &crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: Some("keep tending".into()), reason: None, evidence: Vec::new(),
+        idempotency_key: "after-revert".into(),
+        wait_ms: None,
+    }).unwrap();
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
+fn independent_ask_request(key: &str) -> crate::model::PersonAskRequest {
+    crate::model::PersonAskRequest {
+        legacy_request: None, person: "person/operator".into(), title: "Which bed?".into(),
+        reason: "Choose the next bed".into(), actor: SUBJECT.into(), step: None,
+        new_run: Some("independent-bed".into()), incarnation: Some("original-1".into()),
+        request: None, idempotency_key: key.into(),
+    }
+}
+
+#[test]
+fn apply_restart_waits_for_live_independent_asks_before_and_after_publication() {
+    for ask_before_publication in [false, true] {
+        let seat = Seat::new_with_owned_publication(false);
+        let policy = Policy::when_idle(1_800_000, false);
+        if !ask_before_publication {
+            seat.publish_plain("second", Some(&policy), "defer-independent");
+        }
+        let ask = seat.store.ask_person(&independent_ask_request("bed")).unwrap();
+        if ask_before_publication {
+            seat.publish_plain("second", Some(&policy), "defer-independent");
+        }
+        seat.busy(false);
+        seat.publish_plain("second", Some(&Policy::when_idle(3_600_000, false)), "renew-independent-wait");
+        seat.store.reconcile_person_asks().unwrap();
+        assert!(seat.store.attention_items(Some("person/operator")).unwrap().iter()
+            .any(|item| item.subject == ask.subject));
+        seat.plain_step();
+        assert!(seat.runtime.stops.lock().is_empty());
+        assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+        assert!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["blocking"]
+            .as_array().unwrap().contains(&json!("pending-person-work")));
+        seat.store.finish_person_step(&crate::model::PersonStepResponse {
+            delegation: None, subject: ask.subject, actor: SUBJECT.into(),
+            summary: "No longer needed".into(), evidence: Vec::new(), episode: None,
+            answer: None, idempotency_key: "cancel-bed".into(),
+        }, true).unwrap();
+        assert!(!seat.store.restart_person_work_pending(SUBJECT).unwrap());
+        seat.plain_step();
+        assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+        seat.prepare_pass();
+        seat.plain_step();
+        assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    }
+}
+
+#[test]
+fn apply_restart_fences_independent_ask_admission_but_preserves_recorded_retries() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-ask-intake");
+    seat.busy(false);
+    let input = independent_ask_request("original-bed");
+    let ask = seat.store.ask_person(&input).unwrap();
+    seat.store.finish_person_step(&crate::model::PersonStepResponse {
+        delegation: None, subject: ask.subject.clone(), actor: SUBJECT.into(),
+        summary: "No longer needed".into(), evidence: Vec::new(), episode: None,
+        answer: None, idempotency_key: "cancel-original".into(),
+    }, true).unwrap();
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    assert_eq!(seat.store.ask_person(&input).unwrap().subject, ask.subject);
+    assert_eq!(seat.store.ask_person(&crate::model::PersonAskRequest {
+        idempotency_key: "new-bed".into(), ..input.clone()
+    }).unwrap_err().code, "seat-rollout-draining");
+    // Creating queued work does not execute it; its claim and origin-ask admissions remain fenced.
+    let queued = seat.store.start_work(&crate::model::WorkStartRequest {
+        actor: SUBJECT.into(), title: "Continue later".into(), idempotency_key: "queued-work".into(),
+    }).unwrap();
+    assert_eq!(queued.status, "ready");
+    assert_eq!(seat.store.work_action(&queued.subject, "claim", &crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: None, reason: None, evidence: Vec::new(), idempotency_key: "queued-claim".into(), wait_ms: None,
+    }).unwrap_err().code, "seat-rollout-draining");
+    assert_eq!(seat.store.ask_person(&crate::model::PersonAskRequest {
+        step: Some(queued.subject), new_run: None, idempotency_key: "origin-ask".into(), ..input
+    }).unwrap_err().code, "seat-rollout-draining");
+}
+
+#[test]
+fn apply_restart_blocks_native_and_legacy_delivery_admission_and_keeps_receipt_retries() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-mail-intake");
+    seat.busy(false);
+    let binding = seat.store.bind_mailbox(&crate::mailbox::Fence::new(
+        SUBJECT, "original-1", "delivery",
+    )).unwrap();
+    let mail = |subject: &str| {
+        seat.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "message.sent".into(), actor: Some("person/operator".into()),
+            fields: serde_json::from_value(json!({
+                "status":"sent","from":"person/operator","to":SUBJECT,"content":"Tend the garden",
+            })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    };
+    let receipt = |subject: &str, kind: &str, key: &str| ClaimInput {
+        subject: subject.into(), kind: format!("message.{kind}"), actor: Some(SUBJECT.into()),
+        fields: BTreeMap::from([("status".into(), json!(kind))]),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: Some(key.into()),
+    };
+    mail("message/already-read");
+    let staged = receipt("message/already-read", "staged", "recorded-stage");
+    let committed = seat.store.append_mailbox_receipt(&staged, &binding).unwrap();
+    seat.store.append_mailbox_receipt(
+        &receipt("message/already-read", "delivered", "recorded-delivery"), &binding,
+    ).unwrap();
+    seat.store.append_mailbox_receipt(
+        &receipt("message/already-read", "read", "recorded-read"), &binding,
+    ).unwrap();
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    assert_eq!(seat.store.append_mailbox_receipt(&staged, &binding).unwrap().id, committed.id);
+    assert_eq!(seat.store.append_claim(&staged).unwrap().id, committed.id);
+    let settled = seat.store.message("message/already-read").unwrap().unwrap();
+    assert!(seat.store.rollout_message_allowed(&settled).unwrap());
+    let hold = seat.store.rollout_intake_hold(SUBJECT).unwrap();
+    assert!(seat.store.rollout_message_allowed_under(&hold, &settled).unwrap());
+    for kind in ["staged", "delivered"] {
+        let input = receipt("message/already-read", kind, &format!("settled-{kind}"));
+        assert!(seat.store.append_mailbox_receipt(&input, &binding).is_ok());
+        assert!(seat.store.append_claim(&input).is_ok());
+        assert_eq!(seat.store.message("message/already-read").unwrap().unwrap().status, "read");
+    }
+    for (subject, native) in [("message/new-native", true), ("message/new-legacy", false)] {
+        mail(subject);
+        for kind in ["staged", "delivered"] {
+            let input = receipt(subject, kind, &format!("{subject}:{kind}"));
+            let error = if native {
+                seat.store.append_mailbox_receipt(&input, &binding).unwrap_err()
+            } else {
+                seat.store.append_claim(&input).unwrap_err()
+            };
+            assert_eq!(error.code, "seat-rollout-draining");
+        }
+        assert_eq!(seat.store.message(subject).unwrap().unwrap().status, "sent");
+    }
+}
+
+#[test]
+fn ordinary_rollout_drain_preserves_unfenced_staged_and_delivered_receipts() {
+    let seat = Seat::new();
+    let binding = seat.store.bind_mailbox(&crate::mailbox::Fence::new(
+        SUBJECT, "original-1", "delivery",
+    )).unwrap();
+    seat.publish(2, "second", Some(Policy::when_idle(1_800_000, false)), false);
+    seat.step();
+    seat.ack();
+    seat.step();
+    assert_eq!(seat.operation().phase, "draining");
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    for kind in ["staged", "delivered"] {
+        let subject = format!("message/legacy-drain-{kind}");
+        seat.store.append_claim(&ClaimInput {
+            subject: subject.clone(), kind: "message.sent".into(),
+            actor: Some("person/operator".into()),
+            fields: serde_json::from_value(json!({
+                "status":"sent","from":"person/operator","to":SUBJECT,"content":"Tend the garden",
+            })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let receipt = ClaimInput {
+            subject: subject.clone(), kind: format!("message.{kind}"), actor: Some(SUBJECT.into()),
+            fields: BTreeMap::from([("status".into(), json!(kind))]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        };
+        assert!(!seat.store.rollout_message_allowed(&seat.store.message(&subject).unwrap().unwrap()).unwrap());
+        assert_eq!(seat.store.append_mailbox_receipt(&receipt, &binding).unwrap_err().code,
+            "seat-rollout-draining");
+        seat.store.append_claim(&receipt).unwrap();
+        let message = seat.store.message(&subject).unwrap().unwrap();
+        assert_eq!(message.status, kind);
+        assert!(seat.store.rollout_message_allowed(&message).unwrap());
+        let hold = seat.store.rollout_intake_hold(SUBJECT).unwrap();
+        assert!(seat.store.rollout_message_allowed_under(&hold, &message).unwrap());
+    }
+}
+
+#[test]
+fn apply_restart_cutover_allows_only_authentic_restart_prepare_control_mail() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "prepare-mail-intake");
+    seat.busy(false);
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    let binding = seat.store.bind_mailbox(&crate::mailbox::Fence::new(
+        SUBJECT, "original-1", "delivery",
+    )).unwrap();
+    let prepare = seat.store.append_claim(&ClaimInput {
+        subject: SUBJECT.into(), kind: "runtime.reconcile-decision".into(), actor: None,
+        fields: serde_json::from_value(json!({
+            "key":"restart-prepare","decision":"prepare","reason":"apply",
+            "restart_at_unix_ms":"9999999999999",
+        })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    for (case, tag, title, allowed) in [
+        ("prepare", Some(format!("{}{}", crate::handoff::PREPARE_TAG_PREFIX, prepare.id)),
+            "Prepare for restart", true),
+        ("ordinary-daemon", None, "Prepare for restart", false),
+        ("unknown-prepare", Some(format!("{}missing", crate::handoff::PREPARE_TAG_PREFIX)),
+            "Prepare for restart", false),
+        ("unrelated-daemon", Some(format!("{}{}", crate::handoff::PREPARE_TAG_PREFIX, prepare.id)),
+            "Unrelated work", false),
+    ] {
+        for kind in ["staged", "delivered"] {
+            for fenced in [false, true] {
+                let subject = format!("message/{case}-{kind}-{fenced}");
+                seat.store.append_claim(&ClaimInput {
+                    subject: subject.clone(), kind: "message.sent".into(), actor: Some("daemon/runtime".into()),
+                    fields: serde_json::from_value(json!({
+                        "status":"sent","from":"daemon/runtime","to":SUBJECT,"title":title,
+                        "content":crate::handoff::render_prepare("apply", 9999999999999, 0),
+                        "in_reply_to":null,"tags":tag.iter().collect::<Vec<_>>(),
+                    })).unwrap(), evidence: vec![prepare.id.clone()], expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                let message = seat.store.message(&subject).unwrap().unwrap();
+                assert_eq!(seat.store.rollout_message_allowed(&message).unwrap(), allowed, "{case}");
+                let hold = seat.store.rollout_intake_hold(SUBJECT).unwrap();
+                assert_eq!(seat.store.rollout_message_allowed_under(&hold, &message).unwrap(), allowed, "{case}");
+                let receipt = ClaimInput {
+                    subject: subject.clone(), kind: format!("message.{kind}"), actor: Some(SUBJECT.into()),
+                    fields: BTreeMap::from([("status".into(), json!(kind))]),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                };
+                let result = if fenced {
+                    seat.store.append_mailbox_receipt(&receipt, &binding)
+                } else {
+                    seat.store.append_claim(&receipt)
+                };
+                if allowed {
+                    result.unwrap();
+                    assert_eq!(seat.store.message(&subject).unwrap().unwrap().status, kind);
+                } else {
+                    assert_eq!(result.unwrap_err().code, "seat-rollout-draining");
+                    assert_eq!(seat.store.message(&subject).unwrap().unwrap().status, "sent");
+                }
+            }
+        }
+    }
+}
+
+
+fn prepare_decision(seat: &Seat) -> crate::model::ClaimRecord {
+    seat.store.append_claim(&ClaimInput {
+        subject: SUBJECT.into(), kind: "runtime.reconcile-decision".into(), actor: None,
+        fields: serde_json::from_value(json!({
+            "key":"restart-prepare","decision":"prepare","reason":"apply",
+            "restart_at_unix_ms":"9999999999999",
+        })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap()
+}
+
+/// Appends a "Prepare for restart" message the way the given sender would produce it.
+fn prepare_message(seat: &Seat, name: &str, actor: &str, prepare: &crate::model::ClaimRecord, evidence: Vec<String>) -> crate::model::MessageView {
+    let subject = format!("message/{name}");
+    seat.store.append_claim(&ClaimInput {
+        subject: subject.clone(), kind: "message.sent".into(), actor: Some(actor.into()),
+        fields: serde_json::from_value(json!({
+            "status":"sent","from":"daemon/runtime","to":SUBJECT,"title":"Prepare for restart",
+            "content":crate::handoff::render_prepare("apply", 9999999999999, 0),
+            "in_reply_to":null,
+            "tags":[format!("{}{}", crate::handoff::PREPARE_TAG_PREFIX, prepare.id)],
+        })).unwrap(), evidence, expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    seat.store.message(&subject).unwrap().unwrap()
+}
+
+#[test]
+fn apply_restart_cutover_refuses_a_stale_restart_prepare() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "stale-prepare-intake");
+    seat.busy(false);
+    // An earlier cycle's prepare decision exists before this cutover is committed. (Its message
+    // is sent afterwards: unread mail to the seat would itself keep the safe point from opening.)
+    let stale = prepare_decision(&seat);
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    let stale_message = prepare_message(&seat, "stale", "daemon/runtime", &stale, vec![stale.id.clone()]);
+    assert!(!seat.store.rollout_message_allowed(&stale_message).unwrap());
+    let hold = seat.store.rollout_intake_hold(SUBJECT).unwrap();
+    assert!(!seat.store.rollout_message_allowed_under(&hold, &stale_message).unwrap());
+    // A message written for the same cutover, naming the same seat, is still admitted.
+    let current = prepare_decision(&seat);
+    let current_message = prepare_message(&seat, "current", "daemon/runtime", &current, vec![current.id.clone()]);
+    assert!(seat.store.rollout_message_allowed(&current_message).unwrap());
+    // A current message cannot borrow the stale decision either.
+    let borrowed = prepare_message(&seat, "borrowed", "daemon/runtime", &stale, vec![stale.id.clone()]);
+    assert!(!seat.store.rollout_message_allowed(&borrowed).unwrap());
+}
+
+#[test]
+fn apply_restart_cutover_refuses_a_restart_prepare_not_written_by_the_daemon() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "spoof-prepare-intake");
+    seat.busy(false);
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    let prepare = prepare_decision(&seat);
+    // `send_message` takes `from` from the request, records it as the claim actor and never
+    // records evidence: a conversation sender naming `daemon/runtime` produces these claims.
+    let spoofed_by_send = prepare_message(&seat, "spoof-send", "daemon/runtime", &prepare, Vec::new());
+    // A claim acted by another identity cannot pass even with the daemon's evidence.
+    let spoofed_actor = prepare_message(&seat, "spoof-actor", "agent/mallory", &prepare, vec![prepare.id.clone()]);
+    // Evidence naming some other claim is not the prepare decision.
+    let other = prepare_decision(&seat);
+    let other_evidence = prepare_message(&seat, "spoof-evidence", "daemon/runtime", &prepare, vec![other.id.clone()]);
+    for message in [&spoofed_by_send, &spoofed_actor, &other_evidence] {
+        assert_eq!(message.from, "daemon/runtime");
+        assert!(!seat.store.rollout_message_allowed(message).unwrap(), "{}", message.subject);
+        let hold = seat.store.rollout_intake_hold(SUBJECT).unwrap();
+        assert!(!seat.store.rollout_message_allowed_under(&hold, message).unwrap(), "{}", message.subject);
+    }
+    // The genuine message for the same decision is admitted.
+    let genuine = prepare_message(&seat, "genuine", "daemon/runtime", &prepare, vec![prepare.id.clone()]);
+    assert!(seat.store.rollout_message_allowed(&genuine).unwrap());
+}
+
+#[test]
+fn apply_restart_blocked_leased_work_is_not_a_safe_point() {
+    let seat = Seat::new_with_owned_publication(false);
+    let run = seat.work();
+    seat.store.work_action(&run.steps[0].subject, "claim", &crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: None, reason: None, evidence: Vec::new(), idempotency_key: "blocked-claim".into(), wait_ms: None,
+    }).unwrap();
+    seat.store.set_step_state(&run.steps[0].subject, "blocked", Some("waiting for a gate")).unwrap();
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-blocked-lease");
+    seat.busy(false);
+    seat.plain_step();
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["blocking"]
+        .as_array().unwrap().contains(&json!("claimed-work")));
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
+#[test]
+fn apply_restart_now_interrupts_work_immediately() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", None, "plain-now");
+    seat.prepare_pass();
+    seat.plain_step();
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+}
+
+#[test]
+fn apply_restart_deadline_keeps_change_held_until_explicit_restart_now() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("third", Some(&Policy::when_idle(1_800_000, false)), "plain-held");
+    seat.busy(false);
+    let pending = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap();
+    let reconciler = Reconciler::new(
+        seat.store.clone(), seat.runtime.clone(), "amber".into(), Arc::new(Notify::new()),
+    );
+    let observed = seat.runtime.observation.lock().clone().unwrap();
+    assert!(reconciler.defer_declared_restart(
+        &seat.desired(), &observed, pending.deadline_unix_ms, None,
+    ).unwrap());
+    assert_eq!(
+        seat.store.latest_observation(SUBJECT, "runtime.reconcile-decision")
+            .unwrap().unwrap().body["fields"]["decision"],
+        "restart-held",
+    );
+    assert!(seat.runtime.stops.lock().is_empty());
+    seat.busy(true);
+    seat.publish_plain("third", None, "plain-release-now");
+    assert!(rollout::deferred_restart(&seat.store, SUBJECT).unwrap().is_none());
+    seat.prepare_pass();
+    seat.plain_step();
+    assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+}
+
+#[test]
+fn apply_restart_reverting_to_incumbent_ignores_another_incarnations_receipt() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "pending-second");
+    let second = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    seat.append("runtime.action.succeeded", json!({
+        "action":"start", "desired_token":second, "incarnation_id":"another-incarnation",
+    }));
+    seat.publish_plain("first", None, "back-to-incumbent");
+    seat.plain_step();
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
+#[test]
+fn apply_restart_republication_preserves_deadline_and_can_change_only_the_policy() {
+    let seat = Seat::new_with_owned_publication(false);
+    let policy = Policy::when_idle(1_800_000, false);
+    seat.publish_plain("second", Some(&policy), "defer-initial");
+    let first = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap();
+    seat.publish_plain("second", Some(&policy), "defer-identical");
+    let identical = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap();
+    assert_eq!(first.deadline_unix_ms, identical.deadline_unix_ms);
+    seat.publish_plain("second", Some(&Policy::when_idle(1, false)), "defer-shorter");
+    let shorter = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap();
+    assert_eq!(shorter.policy.deadline_ms, 1);
+    assert!(shorter.deadline_unix_ms < first.deadline_unix_ms);
+    seat.publish_plain("second", None, "defer-now");
+    assert!(rollout::deferred_restart(&seat.store, SUBJECT).unwrap().is_none());
+}
+
 #[test]
 fn rollout_drains_then_resumes_once_across_disk_reopens() {
     let mut seat = Seat::new();
@@ -390,7 +1086,7 @@ fn rollout_drains_then_resumes_once_across_disk_reopens() {
     assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
     seat.ack();
     seat.step();
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
     seat.busy(false);
     seat.reopen();
     seat.step();
@@ -401,14 +1097,14 @@ fn rollout_drains_then_resumes_once_across_disk_reopens() {
     );
     seat.reopen();
     seat.step();
-    assert_eq!(*seat.runtime.stops.lock().unwrap(), vec!["original-1"]);
+    assert_eq!(*seat.runtime.stops.lock(), vec!["original-1"]);
     seat.reopen();
     seat.step();
     assert_eq!(seat.operation().phase, "starting");
     seat.reopen();
     seat.step();
-    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
-    let launch = seat.runtime.starts.lock().unwrap()[0].clone();
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
+    let launch = seat.runtime.starts.lock()[0].clone();
     assert_eq!(
         launch.environment[crate::suspension::RESUME_ENV],
         "native-one"
@@ -457,7 +1153,7 @@ fn rollout_drains_then_resumes_once_across_disk_reopens() {
     seat.step();
     assert_eq!(seat.operation().phase, "running");
     assert!(!seat.operation().holds_intake());
-    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
 }
 
 #[test]
@@ -474,17 +1170,15 @@ fn rollout_wrong_incarnation_never_terminates_its_successor() {
     seat.busy(false);
     seat.step();
     seat.runtime
-        .observation
-        .lock()
-        .unwrap()
+        .observation.lock()
         .as_mut()
         .unwrap()
         .incarnation_id = Some("someone-else".into());
     seat.step();
     assert_eq!(seat.operation().phase, "blocked");
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
     seat.step();
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
 }
 
 #[test]
@@ -504,7 +1198,7 @@ fn rollout_default_deadline_holds_and_force_only_overrides_busy_work() {
         if !force {
             assert!(!seat.operation().holds_intake());
             seat.step();
-            assert!(seat.runtime.stops.lock().unwrap().is_empty());
+            assert!(seat.runtime.stops.lock().is_empty());
         }
     }
 }
@@ -534,13 +1228,13 @@ fn rollout_session_mismatch_stops_only_failed_replacement_and_never_falls_back()
     seat.step();
     assert_eq!(seat.operation().phase, "failed");
     assert_eq!(
-        *seat.runtime.stops.lock().unwrap(),
+        *seat.runtime.stops.lock(),
         vec!["original-1", "replacement-1"]
     );
     for _ in 0..3 {
         seat.step();
     }
-    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
 }
 
 #[test]
@@ -556,7 +1250,7 @@ fn rollout_omission_drains_before_retiring_without_a_replacement() {
     seat.step();
     seat.step();
     assert_eq!(seat.operation().phase, "retired");
-    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
 }
 
 #[test]
@@ -703,7 +1397,7 @@ fn rollout_unchanged_newer_receipts_keep_the_deadline_and_labels_do_not_restart(
     assert_eq!(seat.operation().phase, "superseded");
     seat.step();
     assert_ne!(seat.operation().id, original.id);
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
 }
 
 #[test]
@@ -748,7 +1442,7 @@ fn rollout_recovers_a_spawn_receipt_gap_from_the_exact_driver_marker() {
     seat.reopen();
     seat.step();
     assert_eq!(seat.operation().phase, "running");
-    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
 }
 
 #[test]
@@ -780,7 +1474,7 @@ fn rollout_supersession_after_positive_exit_starts_only_the_new_winner() {
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
-    let launches = seat.runtime.starts.lock().unwrap();
+    let launches = seat.runtime.starts.lock();
     assert_eq!(launches.len(), 1);
     assert!(format!("{:?}", launches[0].launch).contains("third"));
 }
@@ -832,7 +1526,7 @@ fn rollout_retry_after_failed_verification_keeps_the_original_conversation() {
         seat.operation().reason
     );
     assert_eq!(
-        seat.runtime.starts.lock().unwrap()[1].environment[crate::suspension::RESUME_ENV],
+        seat.runtime.starts.lock()[1].environment[crate::suspension::RESUME_ENV],
         "native-one"
     );
     seat.binding("replacement-2", "native-one");
@@ -873,12 +1567,12 @@ fn rollout_newer_identical_receipt_before_spawn_verifies_the_captured_launch_tok
         !reconciler
             .reconcile_rollout(
                 &seat.desired(),
-                seat.runtime.observation.lock().unwrap().as_ref(),
+                seat.runtime.observation.lock().as_ref(),
                 None
             )
             .unwrap()
     );
-    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
 }
 
 #[test]
@@ -913,7 +1607,7 @@ fn rollout_rechecks_pending_replies_and_the_physical_render_fence() {
         fields:serde_json::from_value(json!({"from":"person/operator","to":SUBJECT,"content":"answer","status":"sent","in_reply_to":"message/question-at-boundary"})).unwrap(),
         evidence:Vec::new(),expected_subject:None,idempotency_key:None }).unwrap();
     seat.step();
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
     let reconciler = Reconciler::new(
         seat.store.clone(),
         seat.runtime.clone(),
@@ -1049,8 +1743,8 @@ fn rollout_refuses_to_move_the_original_conversation_between_login_accounts() {
             .contains("native login accounts")
     );
     assert_eq!(seat.operation().native_account.as_deref(), Some("cloud"));
-    assert!(seat.runtime.starts.lock().unwrap().is_empty());
-    assert_eq!(*seat.runtime.stops.lock().unwrap(), vec!["original-1"]);
+    assert!(seat.runtime.starts.lock().is_empty());
+    assert_eq!(*seat.runtime.stops.lock(), vec!["original-1"]);
 }
 
 #[test]
@@ -1070,8 +1764,8 @@ fn manual_rollout_without_set_policy_survives_receipts_reopens_and_idle_passes()
     }
     seat.publish_mode(3, "second", None, false, true);
     seat.step();
-    assert!(seat.runtime.starts.lock().unwrap().is_empty());
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
     // A manual pending publication does not hold ordinary work intake.
     let run = seat.work();
     let request = |key: &str| crate::model::WorkRequest {
@@ -1137,7 +1831,7 @@ fn adding_manual_policy_supersedes_automatic_drain_without_stopping_incumbent() 
     seat.busy(false);
     seat.step();
     assert_eq!(seat.operation().phase, "superseded");
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
     assert_eq!(
         rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
         "manual"
@@ -1157,7 +1851,7 @@ fn omitting_a_manual_seat_keeps_its_incarnation_until_explicit_retirement() {
             .unwrap()
             .manual
     );
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
     assert_eq!(
         rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
         "manual"
@@ -1186,7 +1880,7 @@ fn omitting_a_manual_seat_keeps_its_incarnation_until_explicit_retirement() {
         seat.step();
     }
     assert_eq!(seat.operation().phase, "retired");
-    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
 }
 
 #[test]
@@ -1227,7 +1921,7 @@ fn manual_rollout_keeps_ready_work_wakes_on_the_original_incarnation() {
                 .is_some_and(|(step, _, _, _)| step == run.steps[0].subject)),
         "{wakes:?}"
     );
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().is_empty());
 }
 
 #[test]
@@ -1235,9 +1929,7 @@ fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
     let seat = Seat::new();
     seat.publish_mode(2, "second", None, false, true);
     seat.runtime
-        .observation
-        .lock()
-        .unwrap()
+        .observation.lock()
         .as_mut()
         .unwrap()
         .status = "exited".into();
@@ -1249,7 +1941,7 @@ fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
         Arc::new(Notify::new()),
     );
     reconciler.reconcile_once().unwrap();
-    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
     assert_eq!(
         rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"],
         "manual"
@@ -1296,8 +1988,8 @@ fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
-    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
-    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
+    assert!(seat.runtime.stops.lock().is_empty());
 }
 
 #[test]
@@ -1317,7 +2009,7 @@ fn manual_publication_preserves_completed_suspension_across_reopens() {
         assert_eq!(suspended.phase, "suspended");
         assert_eq!(suspended.operation_id, operation);
         seat.reconcile();
-        assert!(seat.runtime.starts.lock().unwrap().is_empty());
+        assert!(seat.runtime.starts.lock().is_empty());
         assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"], "manual");
         assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
         assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
@@ -1336,12 +2028,11 @@ fn suspended_non_launch_publications_preserve_hold_and_resume_updated_environmen
                         seat.runtime
                             .observation
                             .lock()
-                            .unwrap()
                             .as_mut()
                             .unwrap()
                             .status = status.into()
                     }
-                    None => *seat.runtime.observation.lock().unwrap() = None,
+                    None => *seat.runtime.observation.lock() = None,
                 }
                 assert!(seat.store.latest_actual_value(SUBJECT).unwrap().is_some());
                 let source = seat.source("first", edit);
@@ -1403,7 +2094,7 @@ fn suspended_non_launch_publications_preserve_hold_and_resume_updated_environmen
                     .unwrap();
                 seat.reconcile();
                 assert!(
-                    seat.runtime.starts.lock().unwrap().is_empty(),
+                    seat.runtime.starts.lock().is_empty(),
                     "{edit}: {observation:?}"
                 );
                 assert_eq!(
@@ -1427,7 +2118,7 @@ fn suspended_non_launch_publications_preserve_hold_and_resume_updated_environmen
                     None,
                 );
                 seat.reconcile();
-                let started = seat.runtime.starts.lock().unwrap()[0].clone();
+                let started = seat.runtime.starts.lock()[0].clone();
                 assert_eq!(
                     started.environment[crate::suspension::RESUME_ENV],
                     "native-one"
@@ -1486,7 +2177,7 @@ fn explicit_stop_preview_names_and_discards_completed_suspension() {
             .is_none()
     );
     seat.reconcile();
-    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
 }
 
 #[test]
@@ -1521,7 +2212,7 @@ fn immediate_publication_ends_completed_suspension() {
             .is_none()
     );
     seat.reconcile();
-    let starts = seat.runtime.starts.lock().unwrap();
+    let starts = seat.runtime.starts.lock();
     assert_eq!(starts.len(), 1);
     assert_launch(&starts[0], &seat.desired().member.unwrap());
     assert!(
@@ -1544,13 +2235,13 @@ fn manual_publication_allows_in_flight_suspension_to_complete() {
         "snapshotting"
     );
     seat.reconcile();
-    assert_eq!(*seat.runtime.stops.lock().unwrap(), vec!["original-1"]);
+    assert_eq!(*seat.runtime.stops.lock(), vec!["original-1"]);
     seat.reopen();
     seat.reconcile();
     let suspended = crate::suspension::current(&seat.store, SUBJECT).unwrap().unwrap();
     assert_eq!(suspended.phase, "suspended");
     assert_eq!(suspended.operation_id, operation);
-    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
 }
 
 #[test]
@@ -1574,7 +2265,7 @@ fn suspended_manual_rollout_refuses_then_resumes_old_before_explicit_cutover() {
     seat.reopen();
     seat.reconcile();
     {
-        let starts = seat.runtime.starts.lock().unwrap();
+        let starts = seat.runtime.starts.lock();
         assert_eq!(starts.len(), 1);
         assert_launch(&starts[0], &old);
         assert_eq!(starts[0].environment[crate::suspension::RESUME_ENV], "native-one");
@@ -1604,7 +2295,7 @@ fn suspended_manual_rollout_refuses_then_resumes_old_before_explicit_cutover() {
         seat.step();
     }
     {
-        let starts = seat.runtime.starts.lock().unwrap();
+        let starts = seat.runtime.starts.lock();
         assert_eq!(starts.len(), 2);
         assert_launch(&starts[1], &seat.desired().member.unwrap());
         assert_eq!(starts[1].environment[crate::suspension::RESUME_ENV], "native-one");
@@ -1630,7 +2321,7 @@ fn resume_with_pending_manual_publication_launches_old_and_keeps_pending() {
     seat.reopen();
     seat.reconcile();
     {
-        let starts = seat.runtime.starts.lock().unwrap();
+        let starts = seat.runtime.starts.lock();
         assert_eq!(starts.len(), 1, "resume must launch the old declaration");
         assert_launch(&starts[0], &old);
         assert_eq!(starts[0].environment[crate::suspension::RESUME_ENV], "native-one");
@@ -1650,5 +2341,22 @@ fn resume_with_pending_manual_publication_launches_old_and_keeps_pending() {
     assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
     assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
     seat.reconcile();
-    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
+    assert_eq!(seat.runtime.starts.lock().len(), 1);
+}
+
+#[test]
+fn apply_restart_overdue_status_alerts_without_forcing_a_working_seat() {
+    let seat = Seat::new_with_owned_publication(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1, false)), "overdue-alert");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    seat.plain_step();
+    let status = rollout::status(&seat.store, SUBJECT).unwrap().unwrap();
+    assert_eq!(status["status"], "restart pending: launch changed");
+    assert_eq!(status["phase"], "held");
+    assert!(status["alert"].as_str().is_some());
+    for _ in 0..3 {
+        seat.plain_step();
+    }
+    assert!(seat.runtime.stops.lock().is_empty());
+    assert!(seat.runtime.starts.lock().is_empty());
 }

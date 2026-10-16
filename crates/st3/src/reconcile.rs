@@ -2847,7 +2847,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                     let ((result, due), reads) = smallclaims::touched::record(|| {
                         smallclaims::touched::record_due(|| {
-                            caught(|| self.reconcile_placement_away(subject, ptys.as_ref()))
+                            caught(|| self.reconcile_placement_away(
+                                subject, ptys.as_ref(), &mut work_message_agents,
+                            ))
                         })
                     });
                     if result.is_ok() {
@@ -3003,78 +3005,87 @@ impl<R: RuntimeControl> Reconciler<R> {
                             }
                             return Ok(());
                         }
-                        if self.reconcile_claude_channel_recovery(
-                            subject,
-                            member,
-                            observed.as_ref(),
-                            blocked.as_ref(),
-                            now_ms(),
-                        )? {
-                            return Ok(());
-                        }
-                        if self.reconcile_requested_restart(
-                            subject,
-                            member,
-                            observed.as_ref(),
-                            blocked.as_ref(),
-                        )? {
+                        if observed.as_ref().is_none_or(|o| o.status != "running")
+                            && (self.reconcile_claude_channel_recovery(
+                                subject, member, observed.as_ref(), blocked.as_ref(), now_ms(),
+                            )? || self.reconcile_requested_restart(
+                                subject, member, observed.as_ref(), blocked.as_ref(),
+                            )?)
+                        {
                             return Ok(());
                         }
                         match observed {
                             Some(observation) if observation.status == "running" => {
                                 self.record_member(subject, &observation, true)?;
+                                let mut incumbent = None;
                                 if let Some(changes) =
                                     self.declared_launch_changes(subject, &observation)?
                                 {
-                                    // Rendering must succeed before we shut down a still-running seat.
-                                    if let Some(error) = blocked.take() {
-                                        return Err(error);
-                                    }
-                                    let reason = format!(
-                                        "the declared {} changed",
-                                        changes.join(" and ")
-                                    );
-                                    let trigger = format!(
-                                        "declared:{}:{}",
-                                        self.store
-                                            .selected_desired_token(&subject.subject)?
-                                            .unwrap_or_default(),
-                                        observation.incarnation_id.as_deref().unwrap_or("")
-                                    );
-                                    if !self.restart_may_proceed(
-                                        &subject.subject,
-                                        &observation,
-                                        &trigger,
-                                        &reason,
-                                    )? {
+                                    if self.defer_declared_restart(subject, &observation, now_ms(), blocked.as_ref())? {
+                                        incumbent = observation.incarnation_id.as_deref()
+                                            .map(|incarnation| crate::rollout::launched_member(
+                                                &self.store, &subject.subject, incarnation,
+                                            )).transpose()?.flatten().map(|(_, old)| old);
+                                    } else {
+                                        // Rendering must succeed before shutting down a running seat.
+                                        if let Some(error) = blocked.take() { return Err(error); }
+                                        let reason = format!(
+                                            "the declared {} changed",
+                                            changes.join(" and ")
+                                        );
+                                        let trigger = format!(
+                                            "declared:{}:{}",
+                                            self.store
+                                                .selected_desired_token(&subject.subject)?
+                                                .unwrap_or_default(),
+                                            observation.incarnation_id.as_deref().unwrap_or("")
+                                        );
+                                        if !self.restart_may_proceed(
+                                            &subject.subject,
+                                            &observation,
+                                            &trigger,
+                                            &reason,
+                                        )? {
+                                            return Ok(());
+                                        }
+                                        self.record_once(
+                                            &subject.subject,
+                                            "runtime.reconcile-decision",
+                                            BTreeMap::from([
+                                                ("decision".into(), Value::String("restart".into())),
+                                                (
+                                                    "reachability".into(),
+                                                    Value::String("reachable".into()),
+                                                ),
+                                                (
+                                                    "reason".into(),
+                                                    Value::String(format!(
+                                                        "the declared {} changed",
+                                                        changes.join(" and ")
+                                                    )),
+                                                ),
+                                            ]),
+                                        )?;
+                                        self.reconcile_runtime_stop(
+                                            &subject.subject,
+                                            &member.runtime_id,
+                                            member.terminal,
+                                            observation.incarnation_id.as_deref(),
+                                            member.shutdown_timeout_ms,
+                                            Some(&observation),
+                                        )?;
                                         return Ok(());
                                     }
-                                    self.record_once(
-                                        &subject.subject,
-                                        "runtime.reconcile-decision",
-                                        BTreeMap::from([
-                                            ("decision".into(), Value::String("restart".into())),
-                                            (
-                                                "reachability".into(),
-                                                Value::String("reachable".into()),
-                                            ),
-                                            (
-                                                "reason".into(),
-                                                Value::String(format!(
-                                                    "the declared {} changed",
-                                                    changes.join(" and ")
-                                                )),
-                                            ),
-                                        ]),
-                                    )?;
-                                    self.reconcile_runtime_stop(
-                                        &subject.subject,
-                                        &member.runtime_id,
-                                        member.terminal,
-                                        observation.incarnation_id.as_deref(),
-                                        member.shutdown_timeout_ms,
-                                        Some(&observation),
-                                    )?;
+                                }
+                                let member = incumbent.as_ref().unwrap_or(member);
+                                if self.reconcile_claude_channel_recovery(
+                                    subject, member, Some(&observation), blocked.as_ref(), now_ms(),
+                                )? {
+                                    return Ok(());
+                                }
+                                if self.reconcile_requested_restart(
+                                    subject, member, Some(&observation), blocked.as_ref(),
+                                )? {
                                     return Ok(());
                                 }
                                 let screen = member

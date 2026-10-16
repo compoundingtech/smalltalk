@@ -266,7 +266,7 @@ impl MailboxOrder {
     }
 }
 /// The seat's rollout intake hold, read at most once per update; `None` until first needed.
-type IntakeHold = Option<Option<crate::rollout::Operation>>;
+type IntakeHold = Option<crate::store::IntakeHold>;
 type SnapshotUpdate = (crate::store::MailboxWatermark, Snapshot, bool, MaintenanceIds);
 
 /// Recover only recent mail which has never been offered. A prior staging claim is
@@ -423,7 +423,7 @@ fn filter_messages(
             if hold.is_none() {
                 *hold = Some(store.rollout_intake_hold(&binding.subject)?);
             }
-            store.rollout_message_allowed_under(hold.as_ref().and_then(Option::as_ref), &message)?
+            store.rollout_message_allowed_under(hold.as_ref().expect("hold was just read"), &message)?
         } {
             allowed.push(message);
         } else {

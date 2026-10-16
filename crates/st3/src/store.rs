@@ -55,6 +55,7 @@ mod github_workflow_failures;
 pub mod git_changes;
 pub(crate) mod message_subscriptions;
 mod rollouts;
+pub use rollouts::IntakeHold;
 pub(crate) mod publication;
 mod publication_facts;
 mod seat_status;
@@ -859,6 +860,8 @@ WHERE kind='work.person-asked';
 CREATE INDEX IF NOT EXISTS claims_person_ask_owner_index ON claims(json_extract(body, '$.fields.owner_run'))
 WHERE kind='work.person-asked';
 CREATE INDEX IF NOT EXISTS claims_person_ask_origin_step_index ON claims(json_extract(body, '$.fields.origin_step'))
+WHERE kind='work.person-asked';
+CREATE INDEX IF NOT EXISTS claims_person_ask_requester_index ON claims(actor)
 WHERE kind='work.person-asked';
 
 CREATE TABLE IF NOT EXISTS mission_run_requests (
@@ -10354,6 +10357,7 @@ impl Store {
         warnings.sort();
         warnings.dedup();
 
+        let mut running_restarts = Vec::new();
         for (subject, desired) in &intent.subjects {
             let current = desired_row_at(&connection, subject, at_index).map_err(internal)?;
             let revision = desired_revision(desired);
@@ -10361,6 +10365,10 @@ impl Store {
                 subject.clone(),
                 intent_leaves_at(&connection, subject, at_index).map_err(internal)?,
             );
+            let restart = running_restart_at(&connection, desired, Some(store_index))?;
+            if let Some(restart) = &restart {
+                running_restarts.push(restart.clone());
+            }
             let changed = current.as_ref().is_none_or(|row| row.revision != revision);
             if changed {
                 changes.push(SubjectChange {
@@ -10394,12 +10402,16 @@ impl Store {
                     action: "stop".into(),
                     reason: "the desired state explicitly stops this member".into(),
                 });
-            } else if desired.member.is_some() && changed {
-                actions.push(PlannedAction {
-                    subject: subject.clone(),
-                    action: "observe-or-start".into(),
-                    reason: "the desired member is active".into(),
-                });
+            } else if desired.member.is_some() {
+                if changed {
+                    actions.push(restart.unwrap_or_else(|| PlannedAction {
+                        subject: subject.clone(),
+                        action: "observe-or-start".into(),
+                        reason: "the desired member is active".into(),
+                    }));
+                } else if let Some(restart) = restart {
+                    actions.push(restart);
+                }
             }
         }
         for mission in intent.missions.values() {
@@ -10552,6 +10564,8 @@ impl Store {
             resolved_intent,
             changes,
             predicted_actions: actions,
+            running_restart_count: running_restarts.len(),
+            running_restarts,
             blockers,
             warnings,
             subject_tokens: tokens,
@@ -10603,13 +10617,55 @@ impl Store {
         idempotency_key: &str,
         actor: Option<&str>,
     ) -> Result<ApplyResponse, St3Error> {
+        self.apply_as_with_restart_policy(intent, expected, idempotency_key, actor, None)
+    }
+
+    pub fn apply_as_with_restart_policy(
+        &self,
+        intent: &NormalizedIntent,
+        expected: &BTreeMap<String, Vec<String>>,
+        idempotency_key: &str,
+        actor: Option<&str>,
+        defer_restart: Option<&crate::rollout::Policy>,
+    ) -> Result<ApplyResponse, St3Error> {
+        if let Some(policy) = defer_restart {
+            policy.validate().map_err(|e| St3Error::new("invalid-restart-policy", e.to_string()))?;
+            if policy.force_after_deadline {
+                return Err(St3Error::new("invalid-restart-policy", "deferred apply never interrupts a busy seat at its deadline"));
+            }
+            let mut checked_hosts = BTreeSet::<String>::new();
+            for desired in intent.subjects.values().filter(|d| d.kind == "agent" && d.owner_run.is_none()) {
+                let Some(member) = &desired.member else { continue };
+                let previous_host: Option<String> = self.readers.get().query_row(
+                    "SELECT json_extract(member,'$.host') FROM desired WHERE subject=?1",
+                    [&desired.subject], |row| row.get(0),
+                ).optional().map_err(internal)?.flatten();
+                for host in std::iter::once(member.host.as_str()).chain(previous_host.as_deref()) {
+                    if host == self.origin || checked_hosts.contains(host) {
+                        continue;
+                    }
+                    let supported = self.latest_claim(&format!("daemon/{host}"), Some("daemon.started"))
+                        .map_err(internal)?
+                        .is_some_and(|claim| claim.origin == host
+                            && claim.body["fields"]["features"]["apply_deferred_restart"] == 1);
+                    if !supported {
+                        return Err(St3Error::new("restart-defer-unsupported",
+                            format!("host/{host} has not advertised deferred-apply support; upgrade it before publication")));
+                    }
+                    checked_hosts.insert(host.to_owned());
+                }
+            }
+        }
         self.apply_as_impl(
             intent,
             expected,
             idempotency_key,
             actor,
             None,
-            publication::CommitChecks::default(),
+            publication::CommitChecks {
+                defer_restart,
+                ..publication::CommitChecks::default()
+            },
         )
     }
 
@@ -10631,8 +10687,8 @@ impl Store {
             actor,
             None,
             publication::CommitChecks {
-                owned: None,
                 guard: Some(guard),
+                ..publication::CommitChecks::default()
             },
         )
     }
@@ -10667,7 +10723,7 @@ impl Store {
         local_receipt: Option<(&str, &Value)>,
         checks: publication::CommitChecks<'_>,
     ) -> Result<ApplyResponse, St3Error> {
-        let publication::CommitChecks { owned, guard } = checks;
+        let publication::CommitChecks { owned, guard, defer_restart } = checks;
         self.connection
             .batched(|transaction| -> Result<ApplyResponse, St3Error> {
                 message_subscriptions::validate_publisher(transaction, intent, actor)?;
@@ -10899,7 +10955,25 @@ impl Store {
                         ));
                     }
                 }
-                let desired_changed = intent.subjects.iter().any(|(subject, desired)| {
+                let mut restart_policy_changes = BTreeSet::new();
+                let requested_policy = json!(defer_restart);
+                for (subject, _) in intent.subjects.iter().filter(|(_, d)| {
+                    owned_plan.is_none() && d.kind == "agent" && d.owner_run.is_none()
+                }) {
+                    let Some(current) = current_desired_row_tx(transaction, subject).map_err(internal)? else {
+                        continue;
+                    };
+                    let selected_policy: Option<String> = transaction.query_row(
+                        "SELECT json_extract(body,'$.deferred_restart.policy') FROM claims WHERE id=?1",
+                        [&current.claim_id], |row| row.get(0),
+                    ).optional().map_err(internal)?.flatten();
+                    let selected_policy = selected_policy.map(|body| serde_json::from_str::<Value>(&body))
+                        .transpose().map_err(internal)?.unwrap_or(Value::Null);
+                    if selected_policy != requested_policy {
+                        restart_policy_changes.insert(subject.as_str());
+                    }
+                }
+                let desired_changed = !restart_policy_changes.is_empty() || intent.subjects.iter().any(|(subject, desired)| {
                     current_desired_row_tx(transaction, subject)
                         .map(|current| {
                             current
@@ -11109,7 +11183,9 @@ impl Store {
                 for (subject, desired) in &intent.subjects {
                     let revision = desired_revision(desired);
                     let current = current_desired_row_tx(transaction, subject).map_err(internal)?;
+                    let policy_changed = restart_policy_changes.contains(subject.as_str());
                     if current.as_ref().is_some_and(|row| row.revision == revision)
+                        && !policy_changed
                         && !owned_plan.as_ref().is_some_and(|p| p.materialize.contains(subject)) {
                         tokens.insert(
                             subject.clone(),
@@ -11119,6 +11195,14 @@ impl Store {
                     }
                     let predecessors = intent_leaves_tx(transaction, subject).map_err(internal)?;
                     let mut body = serde_json::to_value(desired).map_err(internal)?;
+                    if owned_plan.is_none() && desired.kind == "agent" && desired.owner_run.is_none()
+                        && let Some(policy) = defer_restart
+                    {
+                        body["deferred_restart"] = json!({
+                            "policy": policy,
+                            "deadline_unix_ms": smallclaims::store::now_ms().saturating_add(u128::from(policy.deadline_ms)),
+                        });
+                    }
                     if let Some(plan) = &owned_plan { body["owned_set"] = json!(plan.preview.set); }
                     if let Some(set) = one_shot_sets.get(subject) { body["owned_set"] = json!(set); }
                     if !receipt_attached {
@@ -23401,6 +23485,100 @@ fn message_view_tx(
         body_origin: body.map(|body| body.origin),
         created_index,
     })
+}
+
+/// Compare the running incarnation's start receipt, not the latest desired declaration.
+/// The same fixed connection and index serve plain and owned-set publication previews.
+fn running_restart_at(
+    connection: &Connection,
+    desired: &DesiredSubject,
+    at_index: Option<u64>,
+) -> Result<Option<PlannedAction>, St3Error> {
+    if desired.kind != "agent" {
+        return Ok(None);
+    }
+    let Some(member) = &desired.member else {
+        return Ok(None);
+    };
+    let (runtime, _, conflict) = selected_actual_source_at(
+        connection, &desired.subject, at_index, Some(&member.host),
+    ).map_err(internal)?;
+    if conflict {
+        return Ok(None);
+    }
+    let Some(runtime_id) = runtime else {
+        return Ok(None);
+    };
+    let Some(runtime) = owned_sets::claim(connection, &runtime_id, at_index)? else {
+        return Ok(None);
+    };
+    if runtime.kind != "runtime.observed" {
+        return Ok(None);
+    }
+    let actual = runtime.body.get("fields").unwrap_or(&runtime.body);
+    if actual["status"] != "running" {
+        return Ok(None);
+    }
+    let Some(incarnation) = actual["incarnation_id"].as_str() else {
+        return Ok(None);
+    };
+    let Some(launched) = running_member_at(connection, &desired.subject, incarnation, at_index)? else {
+        return Ok(None);
+    };
+    let changes = member.launch_changes(&launched);
+    Ok((!changes.is_empty()).then(|| PlannedAction {
+        subject: desired.subject.clone(),
+        action: "restart".into(),
+        reason: format!("the declared {} differs from the running launch receipt", changes.join(" and ")),
+    }))
+}
+
+/// Resolve only the start receipt for this exact incumbent, including driver-local receipts.
+fn running_member_at(
+    connection: &Connection, subject: &str, incarnation: &str, at_index: Option<u64>,
+) -> Result<Option<crate::model::MemberSpec>, St3Error> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT body, store_index, 0 AS local_id FROM claims
+             WHERE subject=?1 AND kind='runtime.action.succeeded' AND store_index<=?2
+               AND NOT EXISTS (SELECT 1 FROM replica_records
+                   WHERE replica_records.claim_id=claims.id AND replica_records.state='repaired')
+             UNION ALL
+             SELECT body, after_store_index, id FROM local_observations
+             WHERE subject=?1 AND kind='runtime.action.succeeded' AND after_store_index<=?2
+             ORDER BY store_index DESC, local_id DESC",
+        )
+        .map_err(internal)?;
+    let mut rows = statement
+        .query(params![
+            subject,
+            at_index.unwrap_or(i64::MAX as u64).min(i64::MAX as u64)
+        ])
+        .map_err(internal)?;
+    while let Some(row) = rows.next().map_err(internal)? {
+        let body: String = row.get(0).map_err(internal)?;
+        let body: Value = serde_json::from_str(&body).map_err(internal)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        if fields["action"] != "start"
+            || fields["incarnation_id"].as_str() != Some(incarnation)
+        {
+            continue;
+        }
+        let Some(token) = fields["desired_token"].as_str() else {
+            continue;
+        };
+        let Some(receipt) = owned_sets::claim(connection, token, at_index)? else {
+            continue;
+        };
+        let Ok(launched) = serde_json::from_value::<DesiredSubject>(receipt.body) else {
+            continue;
+        };
+        let Some(launched) = launched.member else {
+            continue;
+        };
+        return Ok(Some(launched));
+    }
+    Ok(None)
 }
 
 fn latest_actual(connection: &Connection, subject: &str) -> Result<Option<Value>> {
@@ -62087,7 +62265,7 @@ fn append_claim_with_commit_context(
             }
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
-            let settled_receipt = if let Some(fence) = fence {
+            let receipt_message = if let Some(fence) = fence {
                 check_mailbox_fence(transaction, fence, &graph.origin)?;
                 let index = transaction.query_row(
                     "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
@@ -62097,12 +62275,8 @@ fn append_claim_with_commit_context(
                 if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
                     return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
                 }
-                if input.kind == "message.staged" && !rollouts::message_allowed(transaction, &message)? {
-                    return Err(St3Error::new("seat-rollout-draining", "new independent delivery waits for the seat rollout"));
-                }
-                matches!((input.kind.as_str(), message.status.as_str()),
-                    ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
-            } else { false };
+                Some(message)
+            } else { None };
             if let Some((operation_id, request_digest)) = &operation
                 && let Some((stored_digest, canonical_claim, state)) =
                     operation_tx(transaction, operation_id).map_err(internal)?
@@ -62250,7 +62424,35 @@ fn append_claim_with_commit_context(
                 );
                 stored_fields = Some(fields);
             }
-            if settled_receipt || validate_message_transition(transaction, input)? {
+            let settled_receipt = receipt_message.as_ref().is_some_and(|message| {
+                matches!((input.kind.as_str(), message.status.as_str()),
+                    ("message.staged", "delivered" | "read" | "closed")
+                    | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
+            }) || validate_message_transition(transaction, input)?;
+            // Fenced mailbox receipts honor rollout intake; legacy posts retain ordinary-drain
+            // behavior. Both routes fence fresh cutover delivery, not retries or settled receipts.
+            if !settled_receipt && matches!(input.kind.as_str(), "message.staged" | "message.delivered") {
+                let unfenced;
+                let message = if let Some(message) = receipt_message.as_ref() {
+                    message
+                } else {
+                    let index = transaction.query_row(
+                        "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
+                        [&input.subject], |row| row.get::<_, Option<u64>>(0),
+                    ).map_err(internal)?.ok_or_else(|| St3Error::new("missing-message", "message does not exist"))?;
+                    unfenced = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
+                    &unfenced
+                };
+                let allowed = if receipt_message.is_some() {
+                    rollouts::message_allowed(transaction, message)?
+                } else {
+                    rollouts::message_allowed_at_cutover(transaction, message)?
+                };
+                if !allowed {
+                    return Err(St3Error::new("seat-rollout-draining", "new delivery waits for the seat cutover"));
+                }
+            }
+            if settled_receipt {
                 let latest_id = latest_claim_id_tx(transaction, &input.subject)
                     .map_err(internal)?
                     .ok_or_else(|| {
