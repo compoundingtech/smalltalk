@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Stopping or retiring a headless root now stops every exec and PTY task it declared, and the root settles only after they end",
+  "replay": {"status": "none", "detail": "No replay or projection changes; the reconciler reads the existing declarations and their st3.agent tags."},
+  "schema": {"status": "none", "detail": "No database, claim kind or schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; members may upgrade in any order."},
+  "compatibility": {"status": "changed", "detail": "Behaviour change: a stopped or retired root now also stops its tasks, so a task can no longer outlive a stop of its root. Each member stops the tasks it hosts; an older member keeps leaving them running."},
+  "downtime": {"status": "none", "detail": "A daemon restart to install the build; tasks of an already stopped root end on the first pass after it."},
+  "manual": {"status": "none", "detail": "Nothing to configure. Starting the root again declares its tasks again."},
+  "recovery": {"status": "none", "detail": "Swap back to the previous binary freely; nothing is persisted."}
+}
