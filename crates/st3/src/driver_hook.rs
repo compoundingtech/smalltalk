@@ -568,8 +568,7 @@ fn allow_approved_call(env: &dyn HookEnv, identity: &str, agent_dir: &Path, raw:
     }
 }
 
-/// The diagnostic code of a call Claude's auto mode classifier denied.
-pub(crate) const PERMISSION_DENIED_CODE: &str = "permission-denied";
+pub(crate) use crate::model::PERMISSION_DENIED_CODE;
 
 /// The diagnostic code that names the call a shown prompt asks about.
 pub const PROMPT_CALL_CODE: &str = "native-prompt-call";

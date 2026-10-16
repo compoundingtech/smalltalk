@@ -6791,6 +6791,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         st3::otel::Unit::Daemon,
         Some(if state_identity.is_ok() { &config.node } else { &configured_node }),
     );
+    if st3::otel::metrics_enabled() {
+        st3::reconcile::init_metrics();
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     st3::malloc_trim::spawn()?;
     let startup_telemetry =

@@ -326,7 +326,7 @@ fn subject_references(
             }
         }
         "message" => {
-            if let Some(to) = crate::store::canonical_child_string(&desired.desired, "to") {
+            if let Some(to) = crate::model::canonical_child_string(&desired.desired, "to") {
                 let recipient = if to == "requester" || to.contains('/') {
                     to
                 } else {
