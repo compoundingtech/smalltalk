@@ -26,6 +26,15 @@ impl EnvelopePayload {
         }
     }
 
+    /// An upper bound on this payload's length on the wire inside its JSON string: its base64,
+    /// or stored text escaped at no more than six bytes per byte. Computed without encoding.
+    pub fn wire_len_bound(&self) -> usize {
+        match &self.0 {
+            Repr::Bytes(bytes) => bytes.len().div_ceil(3) * 4,
+            Repr::InvalidBase64(text) => 6 * text.len(),
+        }
+    }
+
     pub fn base64(&self) -> String {
         match &self.0 {
             Repr::Bytes(bytes) => STANDARD.encode(bytes),

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Cut each replication exchange to the envelopes whose serialized body fits under the 64 MiB a peer inflates to, so a backlog page of large envelopes no longer fails as 'the exchange body inflates past 67108864 bytes' on every attempt and moves nothing",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "No database changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; members may upgrade in any order."},
+  "compatibility": {"status": "changed", "detail": "An exchange carries fewer envelopes when they would not fit; the rest go in later exchanges. Older peers receive smaller bodies and need no change. An envelope that cannot fit alone fails the exchange with the typed error replication-envelope-too-large instead of an oversized body. No wire change."},
+  "downtime": {"status": "none", "detail": "A daemon restart to install the build; no extra interruption."},
+  "manual": {"status": "none", "detail": "Nothing to configure."},
+  "recovery": {"status": "none", "detail": "Swap back to the previous binary freely; nothing is persisted."}
+}
