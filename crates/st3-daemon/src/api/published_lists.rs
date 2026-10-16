@@ -139,13 +139,14 @@ pub fn start_published_lists(state: &AppState) {
     if !enabled() {
         return;
     }
+    client_v0::published_missions::register_metrics(&state.store);
     spawn(
         state.store.clone(),
         |store| store.published_missions_list(),
         "missions",
         "missions/refresh",
         fold_missions,
-        false,
+        true,
         true,
     );
     spawn(
@@ -356,6 +357,18 @@ fn fold_missions(
     store: &Store,
     base: Option<&Publication<MissionRows>>,
 ) -> anyhow::Result<Option<(Publication<MissionRows>, bool)>> {
+    let started = Instant::now();
+    let result = fold_missions_inner(store, base);
+    if !matches!(&result, Ok(None)) {
+        client_v0::published_missions::record_rebuild(started.elapsed());
+    }
+    result
+}
+
+fn fold_missions_inner(
+    store: &Store,
+    base: Option<&Publication<MissionRows>>,
+) -> anyhow::Result<Option<(Publication<MissionRows>, bool)>> {
     let advance = match base {
         Some(base) => missions_since(store, base)?,
         None => Advance::Rebuild,
@@ -391,6 +404,7 @@ fn fold_missions(
 struct Plan {
     cut: u64,
     frontier: u64,
+    time_unix_ms: u128,
     /// When the plan was read: the earliest time any refolded card holds at, from which the
     /// next fold looks for ended leases.
     at: u128,
@@ -426,6 +440,7 @@ impl Plan {
         rows.next_lease_end_unix_ms = store.read_snapshot(|_| store.next_lease_end(self.at))?;
         rows.leases = self.leases;
         rows.frontier = self.frontier;
+        rows.time_unix_ms = self.time_unix_ms;
         rows.sort();
         Ok(Publication { cut: self.cut, published_at_unix_ms: now_ms(), valid_until_unix_ms: None, rows })
     }
@@ -438,6 +453,7 @@ fn missions_from_nothing(store: &Store) -> anyhow::Result<Publication<MissionRow
         let now = now_ms();
         let (attention_runs, gates) = store.human_attention()?;
         let rows = MissionRows {
+            time_unix_ms: store.projection_time_at(cut)?,
             attention_runs,
             gates,
             roster: roster_fleet(store, None),
@@ -622,7 +638,10 @@ fn missions_since(
         }
         let attention = attention.map(|attention| (attention, now));
         if missions.len() > FOLD_CHUNK {
-            return Ok(Advance::TooMany(Plan { cut, frontier, at: now, leases, missions, attention, roster }));
+            return Ok(Advance::TooMany(Plan {
+                cut, frontier, time_unix_ms: store.projection_time_at(cut)?,
+                at: now, leases, missions, attention, roster,
+            }));
         }
         let changed = !missions.is_empty();
         let mut rows = rows.clone();
@@ -636,6 +655,7 @@ fn missions_since(
         rows.next_lease_end_unix_ms = store.next_lease_end(now)?;
         rows.leases = leases;
         rows.frontier = frontier;
+        rows.time_unix_ms = store.projection_time_at(cut)?;
         refold(store, &mut rows, &missions, now)?;
         rows.sort();
         let valid_until = valid_until(&rows, now);

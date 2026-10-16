@@ -7,6 +7,22 @@ incomplete step preview.
 the preview is incomplete. A page also respects a byte budget; its cursor resumes after the last
 returned mission. Full step details remain available by exact run subject.
 
+The default `GET /v1/client/missions` page serves the background-published current list,
+including its already-folded attention, run counts and step previews. Polling does not fold
+missions again. The snapshot reports the publication's graph cut and `published_at`; a bounded
+TTL cache keeps continuations on that publication across refreshes. Projection replacement,
+expiry or cache eviction requires restarting pagination. Before a first complete publication,
+or while none can be served, the API returns retryable HTTP 503 `mission-list-not-ready`.
+If its refresher stops, HTTP 503 `mission-list-ended` is not retryable and requires a daemon
+restart. History (`history=true`) and exact detail reads remain direct. Explicitly disabling
+published lists with `ST3_PUBLISHED_LISTS=off` retains direct reads.
+
+With metrics enabled, `st.mission_list.publication.age` is a seconds gauge of the newest served
+publication's age (absent before publication); `st.mission_list.rebuild.duration` is a seconds
+histogram of rebuild attempts, including failed attempts. The existing single-flight refresher
+coalesces commits, reads large folds in chunks, and pauses between attempts rather than letting
+polling increase rebuild concurrency.
+
 ```sh
 st missions ls --all
 st missions ls --all --cursor 'CURSOR'

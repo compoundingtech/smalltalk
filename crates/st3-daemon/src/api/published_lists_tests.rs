@@ -650,9 +650,9 @@ fn a_forgotten_list_keeps_its_rows_until_refolded_and_withdraws_its_view_too() {
     store.publish_collection_view("missions");
     assert!(store.collection_view_published("missions"));
     list.forget();
-    assert!(store.published_missions().is_some(), "readers keep the rows until the refold");
+    assert!(list.newest().is_some(), "readers keep the rows until the refold");
     // A fold under way when the projections were replaced publishes nothing.
-    let (stale, _) = fold_missions(&store, store.published_missions().as_deref()).unwrap().unwrap_or_else(|| {
+    let (stale, _) = fold_missions(&store, list.newest().as_deref()).unwrap().unwrap_or_else(|| {
         fold_missions(&store, None).unwrap().unwrap()
     });
     assert_eq!(list.publish(stale, generation), None);
@@ -660,10 +660,10 @@ fn a_forgotten_list_keeps_its_rows_until_refolded_and_withdraws_its_view_too() {
     assert!(list.withdraw());
     withdraw(&store, |store| store.published_missions_list(), "missions");
     assert!(!store.collection_view_published("missions"));
-    assert!(store.published_missions().is_none());
+    assert!(list.newest().is_none());
     // Its next fold, from nothing, serves the list again.
     fold(&store);
-    assert!(store.published_missions().is_some());
+    assert!(list.newest().is_some());
 }
 
 #[test]
@@ -675,7 +675,7 @@ fn a_refresher_that_ends_withdraws_its_list_and_view() {
     store.publish_collection_view("missions");
     let guard = Withdraw { store: Arc::clone(&store), list: |store| store.published_missions_list(), name: "missions" };
     drop(guard);
-    assert!(store.published_missions().is_none());
+    assert!(store.published_missions_list().newest().is_none());
     assert!(!store.collection_view_published("missions"));
 }
 
@@ -1570,6 +1570,142 @@ fn a_warm_fold_probes_only_the_named_runs_of_the_seats_it_reads() {
     assert!(store.last_seats_read().contains(b));
     assert!(crate::store::named_run_probes() > probes, "B's named run probed");
     fold_work_checked(&store);
+}
+
+fn mission_page(state: &AppState, query: &ClientListQuery) -> Result<ClientPageResponse, ApiError> {
+    let snapshot = query.cursor.as_deref().map(decode_client_cursor_snapshot)
+        .transpose()?.unwrap_or_else(|| new_client_snapshot(state));
+    client_v0::published_missions::page(state, snapshot, query)
+}
+
+#[test]
+fn mission_http_pages_read_only_published_cards_and_keep_their_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    for name in ["garden/alpha", "garden/beta", "garden/gamma"] {
+        mission(&state.store, name);
+        start(&state.store, name, &format!("start-{name}"));
+    }
+    let (publication, _) = fold(&state.store);
+    let expected = publication.rows.order.iter()
+        .map(|id| (*publication.rows.cards[id]).clone()).collect::<Vec<_>>();
+    let query = ClientListQuery { limit: Some(1), ..Default::default() };
+    let snapshot = new_client_snapshot(&state);
+    let statements = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+    let (Extension(first_snapshot), Json(first)) =
+        client_v0::published_missions::page(&state, snapshot, &query).unwrap();
+    assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), statements,
+        "a published page does no SQL, including attention, definition, overview, step or fault reads");
+    assert_eq!(first.items, expected[..1]);
+    assert_eq!(first_snapshot.store_index, publication.cut);
+    assert!(first_snapshot.published_at.is_some());
+    let original_cursor = first.page.next_cursor.clone().unwrap();
+    // Polling the first page beyond cache capacity must not evict its continuation.
+    for _ in 0..CLIENT_PAGE_CACHE_CAPACITY + 2 {
+        let (_, Json(polled)) = mission_page(&state, &query).unwrap();
+        assert_eq!(polled.page.next_cursor.as_ref(), Some(&original_cursor));
+    }
+    mission(&state.store, "garden/newer");
+    fold(&state.store);
+    let mut items = first.items;
+    let mut cursor = Some(original_cursor.clone());
+    while let Some(encoded) = cursor {
+        let continued = ClientListQuery { cursor: Some(encoded), ..query.clone() };
+        let (Extension(snapshot), Json(page)) = mission_page(&state, &continued).unwrap();
+        assert_eq!(snapshot.store_index, first_snapshot.store_index);
+        items.extend(page.items);
+        cursor = page.page.next_cursor;
+    }
+    assert_eq!(items, expected, "continuations never mix publications");
+    for query in [
+        ClientListQuery { cursor: Some(original_cursor.clone()), limit: Some(2), ..Default::default() },
+        ClientListQuery { cursor: Some(original_cursor.clone()), actor: Some("agent/other".into()), ..query.clone() },
+        ClientListQuery { cursor: Some(original_cursor.clone()), history: true, ..query.clone() },
+    ] {
+        assert_eq!(mission_page(&state, &query).unwrap_err().code, "page-cursor-expired");
+    }
+    let mut expired = decode_client_cursor(&original_cursor).unwrap();
+    expired.expires_at_unix_ms = 0;
+    assert_eq!(mission_page(&state, &ClientListQuery {
+        cursor: Some(encode_client_cursor(&expired).unwrap()), ..query.clone()
+    }).unwrap_err().code, "page-cursor-expired");
+    state.store.forget_current_views();
+    assert_eq!(mission_page(&state, &query).unwrap_err().code, client_v0::published_missions::NOT_READY);
+    fold(&state.store);
+    assert_eq!(mission_page(&state, &ClientListQuery {
+        cursor: Some(original_cursor), ..query
+    }).unwrap_err().code, "page-cursor-expired");
+}
+
+async fn missions_http(state: &AppState, path: &str) -> (StatusCode, Value) {
+    use tower::ServiceExt as _;
+    let response = router(state.clone()).oneshot(
+        axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap()
+    ).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn mission_http_not_ready_and_ended_keep_public_codes_and_history_and_detail_stay_direct() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    mission(&state.store, "garden/alpha");
+    // The collection must be registered: holding an unregistered view panics in debug builds.
+    state.store.hold_collection_view("missions");
+    assert!(state.store.collection_view_published("missions"));
+    let (status, error) = missions_http(&state, "/v1/client/missions").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+    assert_eq!(error["code"], "mission-list-not-ready", "{error}");
+    assert_eq!(error["retryable"], true, "{error}");
+    state.store.published_missions_list().start();
+    let (status, error) = missions_http(&state, "/v1/client/missions").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+    assert_eq!(error["code"], "mission-list-not-ready", "{error}");
+    for path in ["/v1/client/missions?history=true", "/v1/client/missions/garden/alpha"] {
+        let (status, page) = missions_http(&state, path).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+    }
+    let (publication, _) = fold(&state.store);
+    let (status, first) = missions_http(&state, "/v1/client/missions?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["value"]["items"][0], *publication.rows.cards[&publication.rows.order[0]]);
+    state.store.published_missions_list().withdraw();
+    let (_, error) = missions_http(&state, "/v1/client/missions").await;
+    assert_eq!(error["code"], "mission-list-not-ready", "{error}");
+    state.store.published_missions_list().end();
+    let (status, error) = missions_http(&state, "/v1/client/missions").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+    assert_eq!(error["code"], "mission-list-ended", "{error}");
+    assert_eq!(error["retryable"], false, "{error}");
+}
+
+#[test]
+fn mission_publication_pages_keep_the_existing_byte_budget_and_resume_after_returned_cards() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    for name in ["garden/alpha", "garden/beta", "garden/gamma"] {
+        mission(&state.store, name);
+    }
+    let (base, _) = fold(&state.store);
+    let mut rows = base.rows.clone();
+    for id in &rows.order {
+        let mut card = (*rows.cards[id]).clone();
+        card["run_details"] = json!([{"description": "x".repeat(CLIENT_MAX_RESPONSE_BYTES / 2)}]);
+        rows.cards.insert(id.clone(), Arc::new(card));
+    }
+    let list = state.store.published_missions_list();
+    list.publish(Publication { cut: base.cut, published_at_unix_ms: base.published_at_unix_ms,
+        valid_until_unix_ms: None, rows }, list.generation()).unwrap();
+    let (_, Json(first)) = mission_page(&state, &ClientListQuery { limit: Some(3), ..Default::default() }).unwrap();
+    assert_eq!(first.items.len(), 1, "the byte budget, not the requested count, bounds this page");
+    assert!(first.page.has_more);
+    let (_, Json(next)) = mission_page(&state, &ClientListQuery {
+        limit: Some(3), cursor: first.page.next_cursor, ..Default::default()
+    }).unwrap();
+    assert_eq!(next.items[0]["id"], base.rows.order[1]);
+    assert!(serde_json::to_vec(&first.items).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES - 128_000);
 }
 
 /// A mission's presentation reads its gates and the agents its steps name, so a change to either

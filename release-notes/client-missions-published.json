@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Serve current client mission pages from the existing background publication instead of folding cards on every poll",
+  "replay": {"status": "none", "detail": "No claim replay or startup migration. The existing chunked mission refresher still prepares the first complete publication off the request path."},
+  "schema": {"status": "none", "detail": "No durable schema changes. The in-memory publication also captures its graph cut acceptance time."},
+  "rules": {"status": "none", "detail": "Mission visibility, counts, attention, run headers, step previews and faults use the same existing card fold in the background."},
+  "compatibility": {"status": "changed", "detail": "The default client missions page reports its publication snapshot and publication time. Continuations remain bound to that publication across refreshes until TTL, eviction or projection replacement. Before publication, HTTP 503 mission-list-not-ready is retryable; mission-list-ended is non-retryable. History and detail routes are unchanged."},
+  "downtime": {"status": "none", "detail": "Normal binary restart only. Reads refuse promptly until the first publication rather than folding missions during startup."},
+  "manual": {"status": "none", "detail": "No operator action. Existing published-list disabling remains available for diagnostics. Publication-age and rebuild-duration metrics expose refresher health."},
+  "recovery": {"status": "none", "detail": "Publications and continuation cache are local ephemeral state. Projection replacement invalidates old cursors; refresher termination requires restarting the daemon."}
+}
