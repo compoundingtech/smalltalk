@@ -5,6 +5,34 @@ new one such as a new Nix store path. The daemon adopts every running seat; it d
 This document explains how each seat's message path follows the new binary without ending the
 provider session, and how st reports a seat whose message path did not.
 
+## Self-restarts at a turn boundary
+
+`st agents restart agent/example/worker --as agent/example/worker` returns
+`Restart pending` immediately when that seat's fresh harness report shows a turn in flight.
+The daemon preserves the request across its own restarts and waits for a fresh report from the
+same incarnation saying both idle and quiescent. It then uses the ordinary restart path, keeping
+the declaration, restart budget, receipts and native-session continuation behavior.
+The request is superseded by a later explicit restart, a stop, a replacement declaration or a new
+incarnation. Slice 1 exposes the pending result in the CLI response; show, roster and cancellation
+surfaces are deferred to a later change.
+
+Another actor's restart remains immediate. `--now` also requests an immediate restart, including
+from the seat itself. A dead runtime, stale report, missing report or report from another
+incarnation does not qualify a new request for deferral. Once accepted as pending, a request
+never forces a restart: if no fresh idle and quiescent boundary arrives within 30 minutes, the
+daemon raises one attention item for that request. It stays pending even if the harness stops
+reporting. The attention item clears when the request reaches the boundary or is superseded.
+
+The pending request uses the existing `runtime.action.requested` vocabulary with the string
+`action="restart-when-idle"`, its declaration evidence and old incarnation. No registry, SQL
+schema, checkpoint rule or client-v0 field changes. An older reconciler only selects
+`action="restart"`, so it leaves this pending request alone indefinitely: it neither restarts
+the seat nor raises the 30-minute attention item. Only an upgraded reconciler supplies those
+behaviors. A pending request recorded through an upgraded API and routed to an older runtime
+owner therefore silently does nothing until that owner upgrades; use an explicit immediate
+restart if interruption is intended. Older APIs also lack self-deferral, so upgrade the API
+and the runtime owner before relying on the turn boundary.
+
 ## Harness admission at the next launch
 
 Before starting an unseen installed omp or OpenCode build, st measures its native delivery

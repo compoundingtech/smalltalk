@@ -7655,16 +7655,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if subject.kind != "agent" {
             return Ok(false);
         }
-        let Some(request) = self
-            .store
-            .claims_for(&subject.subject, Some("runtime.action.requested"))?
-            .into_iter()
-            .rev()
-            .find(|claim| {
-                claim.actor.is_some()
-                    && claim.body.pointer("/fields/action").and_then(Value::as_str)
-                        == Some("restart")
-            })
+        let Some(request) = crate::restart::latest_request(&self.store, &subject.subject)?
         else {
             return Ok(false);
         };
@@ -7697,6 +7688,76 @@ impl<R: RuntimeControl> Reconciler<R> {
         let previous = request.body["fields"]["incarnation_id"]
             .as_str()
             .unwrap_or("");
+        if request.body["fields"]["action"] == crate::restart::WHEN_IDLE
+            && attempted.is_none()
+            && self
+                .store
+                .operation_claim(&crate::restart::release_key(&request))?
+                .is_none()
+            && observation.is_none_or(|item| {
+                item.incarnation_id
+                    .as_deref()
+                    .is_none_or(|incarnation| incarnation == previous)
+            })
+        {
+            let now = now_ms();
+            let quiet = observation.is_some_and(|item| item.status == "running")
+                && crate::restart::fresh_harness(&self.store, &subject.subject, previous, now)?
+                    .as_ref()
+                    .is_some_and(crate::restart::quiet);
+            if !quiet {
+                let deadline = request
+                    .accepted_at_unix_ms
+                    .saturating_add(crate::restart::ATTENTION_AFTER_MS);
+                if now < deadline {
+                    // Harness transitions invalidate this member's tracked reads. This one
+                    // deadline raises attention; it never polls or forces a restart.
+                    self.arm_restart(&format!("self-restart:{}", request.id), deadline);
+                } else {
+                    self.store.record_runtime_failure(
+                        &crate::restart::attention_episode(&request),
+                        &AttentionRequest {
+                            reviewer: self
+                                .store
+                                .agent_person(&subject.subject)?
+                                .unwrap_or_else(|| "person/operator".into()),
+                            title: "A self-restart is still waiting for its turn to end".into(),
+                            reason: format!(
+                                "{} requested restart {} at {}ms and has not reported a fresh idle, quiescent boundary for 30 minutes. The restart remains pending and is never forced. Inspect its harness; to interrupt explicitly, run `st agents restart {} --now --as PERSON_OR_AGENT`.",
+                                subject.subject, request.id, request.accepted_at_unix_ms, subject.subject,
+                            ),
+                            severity: "warning".into(),
+                            targets: vec![subject.subject.clone()],
+                            actor: RECONCILER_ACTOR.into(),
+                            idempotency_key: format!("agent-restart-attention:{}", request.id),
+                        },
+                        crate::restart::WHEN_IDLE,
+                    )?;
+                }
+                // The incumbent still receives ordinary observations, work and mail.
+                return Ok(false);
+            }
+            // Persist the quiet boundary before normal shutdown. A daemon restarting between
+            // shutdown and launch must finish this same request without requiring a report from
+            // the harness it just stopped.
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.succeeded".into(),
+                actor: request.actor.clone(),
+                fields: BTreeMap::from([
+                    ("action".into(), Value::String("restart".into())),
+                    ("operation_status".into(), Value::String("quiesced".into())),
+                    ("incarnation_id".into(), Value::String(previous.into())),
+                    (
+                        "reason".into(),
+                        Value::String("the self-restart reached an idle, quiescent boundary".into()),
+                    ),
+                ]),
+                evidence: vec![request.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(crate::restart::release_key(&request)),
+            })?;
+        }
         // An unidentified prior target supplies no replacement proof. In
         // particular, an older exited runtime after a closed failed attempt
         // cannot complete a new request that has not admitted any start yet.

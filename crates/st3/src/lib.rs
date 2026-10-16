@@ -83,6 +83,7 @@ pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod provenance;
 pub mod reconcile;
+pub(crate) mod restart;
 mod reconcile_telemetry;
 mod relay_trace;
 pub mod rules;

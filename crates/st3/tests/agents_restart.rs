@@ -2415,6 +2415,526 @@ agent "example/worker" {{
     );
 }
 
+struct RestartClock;
+impl Drop for RestartClock {
+    fn drop(&mut self) {
+        smallclaims::store::set_thread_clock(None);
+    }
+}
+
+fn report_harness(
+    fixture: &Fixture,
+    subject: &str,
+    incarnation: &str,
+    state: &str,
+    quiescent: bool,
+    observed_at: u128,
+) {
+    fixture.store.append_claim(&st3::model::ClaimInput {
+        subject: subject.into(),
+        kind: "harness.observed".into(),
+        actor: Some(subject.into()),
+        fields: serde_json::from_value(json!({
+            "driver":"claude", "incarnation_id":incarnation, "state":state,
+            "quiescent":quiescent, "blocking":if quiescent {json!([])} else {json!(["turn-in-flight"])},
+            "observed_at_ms":observed_at as u64,
+        })).unwrap(),
+        evidence: vec![],
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap();
+}
+
+async fn self_restart(fixture: &Fixture, subject: &str, key: &str, now: bool) -> ClaimRecord {
+    fixture
+        .client()
+        .post(
+            "/v1/agents/restart",
+            &json!({
+                "subject":subject, "actor":subject, "now":now, "idempotency_key":key,
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn self_restart_defers_the_cli_and_restarts_once_on_the_same_native_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for shape in [Shape::TopLevel, Shape::Mission, Shape::Step] {
+        let (fixture, subject) = Fixture::claude(shape, "never").await;
+        bind_session(&fixture, &subject, "fixture:1", "session-one").await;
+        report_harness(
+            &fixture,
+            &subject,
+            "fixture:1",
+            "working",
+            false,
+            smallclaims::store::now_ms(),
+        );
+        let token = fixture.store.selected_desired_token(&subject).unwrap();
+        let output = st(
+            &fixture.root.path().join("st3.sock"),
+            &[
+                "agents",
+                "restart",
+                &subject,
+                "--as",
+                &subject,
+                "--timeout",
+                "1ms",
+            ],
+        )
+        .await;
+        succeeded(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Restart pending"),
+            "{output:?}"
+        );
+        let request = fixture
+            .store
+            .claims_for(&subject, Some("runtime.action.requested"))
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|c| c.body["fields"]["action"] == "restart-when-idle")
+            .unwrap();
+        // The previous implementation's exact selector cannot execute this pending action.
+        assert!(
+            !fixture
+                .store
+                .claims_for(&subject, Some("runtime.action.requested"))
+                .unwrap()
+                .iter()
+                .any(|c| c.actor.is_some() && c.body["fields"]["action"] == "restart")
+        );
+        for _ in 0..3 {
+            fixture.reconciler.reconcile_once().unwrap();
+        }
+        assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+        assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .latest_actual_value(&subject)
+                .unwrap()
+                .unwrap()["incarnation_id"],
+            "fixture:1"
+        );
+
+        // A daemon restart preserves deferral. Neither readiness nor idle without quiescence
+        // may release it; only the driver's fresh idle AND quiescent report does.
+        let daemon = restarted_daemon(&fixture);
+        for (state, quiet) in [("ready", true), ("idle", false)] {
+            report_harness(
+                &fixture,
+                &subject,
+                "fixture:1",
+                state,
+                quiet,
+                smallclaims::store::now_ms(),
+            );
+            daemon.reconcile_once().unwrap();
+            assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+        }
+        report_harness(
+            &fixture,
+            &subject,
+            "fixture:1",
+            "idle",
+            true,
+            smallclaims::store::now_ms()
+                - st_drivers::harness_state::HARNESS_STATE_STALE.as_millis(),
+        );
+        daemon.reconcile_once().unwrap();
+        assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+        report_harness(
+            &fixture,
+            &subject,
+            "fixture:1",
+            "idle",
+            true,
+            smallclaims::store::now_ms(),
+        );
+        daemon.reconcile_once().unwrap();
+        assert_eq!(
+            fixture.runtime.stops.lock().unwrap().as_slice(),
+            ["fixture:1"]
+        );
+        // Restart the daemon after shutdown too: the persisted quiet receipt releases launch.
+        let daemon = restarted_daemon(&fixture);
+        daemon.reconcile_once().unwrap();
+        report_harness(
+            &fixture,
+            &subject,
+            "fixture:2",
+            "idle",
+            true,
+            smallclaims::store::now_ms(),
+        );
+        for _ in 0..4 {
+            daemon.reconcile_once().unwrap();
+        }
+        let starts = fixture.runtime.starts.lock().unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(continued(&starts[1]), Some("session-one"));
+        assert_eq!(
+            fixture.runtime.stops.lock().unwrap().as_slice(),
+            ["fixture:1"]
+        );
+        assert_eq!(
+            token,
+            fixture.store.selected_desired_token(&subject).unwrap()
+        );
+        let completions = fixture
+            .store
+            .claims_for(&subject, Some("runtime.action.succeeded"))
+            .unwrap()
+            .into_iter()
+            .filter(|c| {
+                c.body["evidence"] == json!([request.id])
+                    && c.body["fields"]["operation_status"].is_null()
+            })
+            .count();
+        assert_eq!(completions, 1);
+    }
+}
+
+#[tokio::test]
+async fn self_restart_now_and_other_actors_interrupt_immediately() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for case in ["now", "person", "other-agent"] {
+        let (fixture, subject) = Fixture::claude(Shape::TopLevel, "never").await;
+        report_harness(
+            &fixture,
+            &subject,
+            "fixture:1",
+            "working",
+            false,
+            smallclaims::store::now_ms(),
+        );
+        let request: ClaimRecord = fixture.client().post("/v1/agents/restart", &json!({
+            "subject":subject, "actor":match case {"now"=>subject.as_str(), "person"=>"person/avery", _=>"agent/example/helper"},
+            "now":case == "now", "idempotency_key":case,
+        })).await.unwrap();
+        assert_eq!(request.body["fields"]["action"], "restart");
+        fixture.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            fixture.runtime.stops.lock().unwrap().as_slice(),
+            ["fixture:1"],
+            "{case}"
+        );
+        for _ in 0..3 {
+            fixture.reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 2, "{case}");
+    }
+    // Exercise the CLI flag as well, with a command fixture whose replacement needs no driver.
+    let (fixture, subject) = Fixture::new(false).await;
+    report_harness(
+        &fixture,
+        &subject,
+        "fixture:1",
+        "working",
+        false,
+        smallclaims::store::now_ms(),
+    );
+    let driver = fixture.drive();
+    let output = st(
+        &fixture.root.path().join("st3.sock"),
+        &[
+            "agents",
+            "restart",
+            &subject,
+            "--as",
+            &subject,
+            "--now",
+            "--timeout",
+            "3s",
+        ],
+    )
+    .await;
+    driver.abort();
+    let _ = driver.await;
+    succeeded(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Restarted"),
+        "{output:?}"
+    );
+}
+
+#[tokio::test]
+async fn self_restart_does_not_defer_dead_stale_missing_or_wrong_incarnation_reports() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for case in [
+        "dead",
+        "stale",
+        "missing",
+        "wrong-incarnation",
+        "future",
+        "idle",
+    ] {
+        let (fixture, subject) = Fixture::claude(Shape::TopLevel, "never").await;
+        let now = smallclaims::store::now_ms();
+        if case != "missing" {
+            report_harness(
+                &fixture,
+                &subject,
+                if case == "wrong-incarnation" {
+                    "old"
+                } else {
+                    "fixture:1"
+                },
+                if case == "idle" { "idle" } else { "working" },
+                case == "idle",
+                match case {
+                    "stale" => now - st_drivers::harness_state::HARNESS_STATE_STALE.as_millis(),
+                    "future" => {
+                        now + st_drivers::harness_state::HARNESS_STATE_FUTURE_SKEW.as_millis()
+                            + 10_000
+                    }
+                    _ => now,
+                },
+            );
+        }
+        if case == "dead" {
+            hang_up(&fixture);
+            fixture.reconciler.reconcile_once().unwrap();
+        }
+        let request = self_restart(&fixture, &subject, case, false).await;
+        assert_eq!(request.body["fields"]["action"], "restart", "{case}");
+    }
+}
+
+#[tokio::test]
+async fn self_restart_idempotency_keeps_the_accepted_pending_response() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let (fixture, subject) = Fixture::new(false).await;
+    report_harness(
+        &fixture,
+        &subject,
+        "fixture:1",
+        "working",
+        false,
+        smallclaims::store::now_ms(),
+    );
+    let request = self_restart(&fixture, &subject, "pending", false).await;
+    assert_eq!(request.body["fields"]["action"], "restart-when-idle");
+    let output = cli(
+        &fixture.root.path().join("st3.sock"),
+        &subject,
+        &subject,
+        "1ms",
+    )
+    .await;
+    succeeded(&output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["body"]["fields"]["action"],
+        "restart-when-idle"
+    );
+    report_harness(
+        &fixture,
+        &subject,
+        "fixture:1",
+        "idle",
+        true,
+        smallclaims::store::now_ms(),
+    );
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::to_value(self_restart(&fixture, &subject, "pending", true).await).unwrap()
+    );
+    let output = cli(
+        &fixture.root.path().join("st3.sock"),
+        &subject,
+        &subject,
+        "1ms",
+    )
+    .await;
+    // Idle self-restarts use the immediate wait, so without reconciliation this times out.
+    assert!(!output.status.success());
+}
+
+#[tokio::test]
+async fn self_restart_pending_is_superseded_by_now_stop_declaration_and_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for case in ["now", "stop", "declaration", "incarnation"] {
+        let (fixture, subject) = Fixture::new(false).await;
+        report_harness(
+            &fixture,
+            &subject,
+            "fixture:1",
+            "working",
+            false,
+            smallclaims::store::now_ms(),
+        );
+        let pending = self_restart(&fixture, &subject, "pending", false).await;
+        let _clock = RestartClock;
+        let bound = pending.accepted_at_unix_ms + 30 * 60 * 1_000;
+        smallclaims::store::set_thread_clock(Some(bound));
+        fixture.store.set_write_clock_at(bound).unwrap();
+        fixture.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .fault_snapshot(smallclaims::store::now_ms())
+                .unwrap()
+                .iter()
+                .filter(|a| a.item.title == "A self-restart is still waiting for its turn to end")
+                .count(),
+            1
+        );
+        match case {
+            "now" => {
+                self_restart(&fixture, &subject, "immediate", true).await;
+            }
+            "stop" | "declaration" => {
+                let source = if case == "stop" {
+                    format!("version 2\nstop {subject:?}")
+                } else {
+                    format!(
+                        "version 2\nagent \"example/worker\" {{ workspace {:?}; command \"sleep 1000\"; restart never; shutdown-timeout \"1s\"; env {{ ORIGINAL \"kept\" }}; name \"Replacement declaration\" }}",
+                        fixture.root.path()
+                    )
+                };
+                let intent = st3::parse_intent(&source, "restart-test").unwrap();
+                let preview = fixture
+                    .store
+                    .mission(
+                        &intent,
+                        st3::model::IntentInput {
+                            kdl: source,
+                            source_name: None,
+                        },
+                    )
+                    .unwrap();
+                fixture
+                    .store
+                    .apply_as(&intent, &preview.subject_tokens, case, Some("person/avery"))
+                    .unwrap();
+            }
+            "incarnation" => {
+                let member = fixture.runtime.starts.lock().unwrap()[0].clone();
+                fixture.runtime.start(&member).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        for _ in 0..4 {
+            fixture.reconciler.reconcile_once().unwrap();
+        }
+        report_harness(
+            &fixture,
+            &subject,
+            "fixture:1",
+            "idle",
+            true,
+            smallclaims::store::now_ms(),
+        );
+        for _ in 0..3 {
+            fixture.reconciler.reconcile_once().unwrap();
+        }
+        assert!(
+            fixture
+                .store
+                .operation_claim(&format!("agent-restart-quiesced:{}", pending.id))
+                .unwrap()
+                .is_none(),
+            "{case}"
+        );
+        assert_eq!(
+            fixture.runtime.starts.lock().unwrap().len(),
+            if matches!(case, "stop" | "declaration") {
+                1
+            } else {
+                2
+            },
+            "{case}"
+        );
+        assert_eq!(
+            fixture.runtime.stops.lock().unwrap().len(),
+            usize::from(case == "now" || case == "stop"),
+            "{case}"
+        );
+        assert!(
+            !fixture
+                .store
+                .fault_snapshot(smallclaims::store::now_ms())
+                .unwrap()
+                .iter()
+                .any(|a| a.item.title == "A self-restart is still waiting for its turn to end"),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn self_restart_raises_one_attention_after_thirty_minutes_and_never_forces() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let (fixture, subject) = Fixture::new(false).await;
+    let now = smallclaims::store::now_ms();
+    report_harness(&fixture, &subject, "fixture:1", "working", false, now);
+    let request = self_restart(&fixture, &subject, "pending", false).await;
+    let bound = request.accepted_at_unix_ms + 30 * 60 * 1_000;
+    let _clock = RestartClock;
+    for at in [bound - 1, bound, bound + 1, bound + 86_400_000] {
+        smallclaims::store::set_thread_clock(Some(at));
+        fixture.store.set_write_clock_at(at).unwrap();
+        let daemon = restarted_daemon(&fixture);
+        daemon.reconcile_once().unwrap();
+        assert!(fixture.runtime.stops.lock().unwrap().is_empty());
+        assert_eq!(fixture.runtime.starts.lock().unwrap().len(), 1);
+        let faults = fixture
+            .store
+            .claims_for(&subject, Some("operational.failure"))
+            .unwrap();
+        assert_eq!(faults.len(), usize::from(at >= bound), "at {at}");
+        let attention = fixture
+            .store
+            .fault_snapshot(smallclaims::store::now_ms())
+            .unwrap();
+        assert_eq!(
+            attention
+                .iter()
+                .filter(|a| a.item.title == "A self-restart is still waiting for its turn to end")
+                .count(),
+            usize::from(at >= bound)
+        );
+        if at < bound {
+            assert!(daemon.next_deadline().is_some_and(|due| due <= bound));
+        }
+    }
+    // No fresh evidence means it stays pending even after the report goes stale. Fresh idle
+    // evidence releases it and removes the attention item at the quiet boundary.
+    let at = bound + 86_400_001;
+    smallclaims::store::set_thread_clock(Some(at));
+    fixture.store.set_write_clock_at(at).unwrap();
+    report_harness(&fixture, &subject, "fixture:1", "idle", true, at);
+    restarted_daemon(&fixture).reconcile_once().unwrap();
+    assert_eq!(
+        fixture.runtime.stops.lock().unwrap().as_slice(),
+        ["fixture:1"]
+    );
+    assert!(
+        !fixture
+            .store
+            .fault_snapshot(smallclaims::store::now_ms())
+            .unwrap()
+            .iter()
+            .any(|a| a.item.title == "A self-restart is still waiting for its turn to end")
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_retirement_stops_running_root_and_mission_seats_without_rematerializing() {

@@ -3433,6 +3433,7 @@ enum AgentsCommand {
     /// Permanently retire an agent identity; later starts and first sends are refused.
     Retire(AgentRetireArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
+    /// A self-restart during a turn returns pending until the harness is idle and quiescent.
     Restart(AgentRestartArgs),
     /// Acknowledge an interrupted seed attempt and its warning; never gate launch or rearm seed.
     AcknowledgeSeed(AgentAcknowledgeSeedArgs),
@@ -4058,6 +4059,7 @@ struct AgentRestartArgs {
     timeout: String,
     /// Restart at once. By default a seat that is up and ready is first asked for its handoff and
     /// restarted at its acknowledgement or after two minutes; use this for a seat that cannot answer.
+    /// Also interrupts immediately when restarting yourself during a turn.
     #[arg(long)]
     now: bool,
 }
@@ -14424,6 +14426,14 @@ async fn run_agents(
                     }),
                 )
                 .await?;
+            if request.body["fields"]["action"] == "restart-when-idle" {
+                return if json_output {
+                    print_value(&request, true)
+                } else {
+                    println!("Restart pending for {subject}: waiting for the turn to end and the harness to be idle and quiescent");
+                    Ok(())
+                };
+            }
             let previous = request.body["fields"]["incarnation_id"]
                 .as_str()
                 .unwrap_or("");

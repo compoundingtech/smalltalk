@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Defer a seat's self-restart until its harness reports idle and quiescent",
+  "replay": {"status": "none", "detail": "No replay, migration or heal change. Pending requests and quiet-boundary receipts use existing runtime action claims."},
+  "schema": {"status": "none", "detail": "No SQL schema, index, trigger or registry field change. The pending action uses the existing string action field with value restart-when-idle."},
+  "rules": {"status": "none", "detail": "No checkpoint or retention rule changes."},
+  "compatibility": {"status": "changed", "detail": "A self-restart with a fresh in-flight harness report returns a pending ClaimRecord immediately; the CLI prints Restart pending. Optional API input now and CLI --now preserve immediate interruption. Other actors remain immediate. No roster or client-v0 field changes. An older runtime owner ignores restart-when-idle forever and raises no attention; only the upgraded reconciler restarts at quiescence and raises one item after 30 minutes. Older APIs still restart immediately. Upgrade both API and runtime owner before relying on deferral."},
+  "downtime": {"status": "none", "detail": "Daemon deployment adopts running seats. Only an accepted restart stops the requesting seat at its quiet boundary or an explicit immediate restart interrupts it."},
+  "manual": {"status": "none", "detail": "No manual migration. Use --now when an immediate restart is intended."},
+  "recovery": {"status": "none", "detail": "Pending requests survive a daemon restart and are fenced by declaration and incarnation. A later explicit restart or stop supersedes the pending request. Deferral never forces a restart; after 30 minutes it raises one attention item."}
+}

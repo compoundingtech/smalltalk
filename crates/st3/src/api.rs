@@ -12140,6 +12140,21 @@ async fn restart_agent(
         .and_then(|fields| fields.get("incarnation_id"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let defer = actor == subject
+        && !request.now
+        && current.actual.as_ref().is_some_and(|actual| {
+            actual.get("fields").unwrap_or(actual)["status"] == "running"
+        })
+        && crate::restart::fresh_harness(
+            &state.store,
+            &subject,
+            incarnation,
+            smallclaims::store::now_ms(),
+        )
+        .map_err(ApiError::internal)?
+        .as_ref()
+        .is_some_and(crate::restart::turn_in_flight);
+    let action = if defer { crate::restart::WHEN_IDLE } else { "restart" };
     let claim = state
         .store
         .append_claim(&ClaimInput {
@@ -12147,7 +12162,7 @@ async fn restart_agent(
             kind: "runtime.action.requested".into(),
             actor: Some(actor),
             fields: BTreeMap::from([
-                ("action".into(), Value::String("restart".into())),
+                ("action".into(), Value::String(action.into())),
                 (
                     "runtime_id".into(),
                     Value::String(member.runtime_id.clone()),

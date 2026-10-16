@@ -1298,6 +1298,22 @@ impl Store {
                 continue;
             }
             let f = &claim.body["fields"];
+            if f["condition"] == crate::restart::WHEN_IDLE {
+                let Some(request) = crate::restart::latest_request(self, source)? else {
+                    continue;
+                };
+                if request.body["fields"]["action"] != crate::restart::WHEN_IDLE
+                    || failure.subject != crate::restart::attention_episode(&request)
+                    || self
+                        .operation_claim(&crate::restart::release_key(&request))?
+                        .is_some()
+                    || self
+                        .operation_claim(&format!("agent-restart-completed:{}", request.id))?
+                        .is_some()
+                {
+                    continue;
+                }
+            }
             // Upgrades retain historical operational episodes. A current login with a concrete
             // person has one derived person item; the old agent fault must not ask again.
             if f["condition"] == "provider-auth"
