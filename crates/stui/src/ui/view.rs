@@ -421,6 +421,8 @@ impl Subagent {
 /// What the details pane shows about an agent. Every field is optional: st may not say.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct AgentDetails {
+    /// Pending mailbox custody shown on retired agents.
+    pub mail_custody: Option<String>,
     /// The goal of the step it holds now.
     pub goal: Option<String>,
     pub claimed: Option<String>,

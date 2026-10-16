@@ -96,6 +96,7 @@ impl CardReads {
         if missing.is_empty() {
             return Ok(());
         }
+        let loaded = missing.iter().cloned().collect::<Vec<_>>();
         if self.owned.is_none() {
             self.owned = Some(
                 owned_sets::owners_at(connection, Some(self.index)).map_err(anyhow::Error::new)?,
@@ -143,6 +144,36 @@ impl CardReads {
             for subject in chunk {
                 let row = select_desired_row(rows.remove(subject).unwrap_or_default())?;
                 self.desired.insert(subject.clone(), row);
+            }
+        }
+        // Both owned-set and intent declarations need the single-subject reader's
+        // terminal overlay. Read the accepted retirements once per chunk, while this
+        // card fold is cold, rather than querying each row on every presentation.
+        for chunk in loaded.chunks(CHUNK) {
+            let mut retirements = connection.prepare_cached(&format!(
+                "SELECT claims.subject, claims.id FROM json_each(?1) subjects
+                 CROSS JOIN claims INDEXED BY claims_subject_kind_index
+                   ON claims.subject=subjects.value AND claims.kind='agent.retired'
+                 JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.store_index<=?2
+                   AND NOT EXISTS (SELECT 1 FROM replica_records
+                                   WHERE claim_id=claims.id AND state='repaired')
+                 ORDER BY claims.subject, {CANONICAL_ORDER_DESC}"
+            ))?;
+            let mut seen = BTreeSet::new();
+            for retirement in retirements.query_map(params![json_list(chunk)?, self.index], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (subject, id) = retirement?;
+                if !seen.insert(subject.clone()) { continue; }
+                if let Some(Some(row)) = self.desired.get_mut(&subject) {
+                    row.kind = "stop".into();
+                    row.member = None;
+                    row.body = canonical_json_text(&json!({
+                        "name":"stop", "arguments":[subject], "properties":{},
+                        "children":[], "retirement":id,
+                    }))?;
+                }
             }
         }
         Ok(())

@@ -3544,8 +3544,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("transport", string()),
             ("runtime_id", string()),
         ],
-        "message.read" => &[("status", required_enum(&["read"]))],
-        "message.closed" => &[("status", required_enum(&["closed"]))],
+        "message.read" => &[("status", required_enum(&["read"])), ("acting_for", reference_to(&["agent"]))],
+        "message.closed" => &[("status", required_enum(&["closed"])), ("acting_for", reference_to(&["agent"]))],
         "planning-session.started" => &[
             ("mission", reference()),
             ("request", reference()),

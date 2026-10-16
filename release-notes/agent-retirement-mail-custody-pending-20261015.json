@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Let a retiring agent owner name one successor to read and close its retained mail as itself, with signed acting_for audit and pending custody visibility.",
+  "replay": {"status": "none", "detail": "No message is forwarded or rewritten. Existing durable mail, including late replicated sends, remains visible in OLD's mailbox."},
+  "schema": {"status": "changed", "detail": "Optional successor on agent.retired, optional acting_for on message.read and message.closed, and optional client agent mail_custody. Registry digest changes; no new stored claim kind, index, table, trigger or storage migration."},
+  "rules": {"status": "none", "detail": "Durable claim retention and checkpoint rules remain unchanged."},
+  "compatibility": {"status": "changed", "detail": "All configured and active members must advertise this registry before a retirement naming a successor. Old reducers retain unknown optional fields and old readers retain OLD's mailbox view. New writers fence OLD and wrong successors at lifecycle admission. Pending custody has no completion command in this increment."},
+  "manual": {"status": "changed", "detail": "Upgrade every member before use. Until completion ships, a custodian cannot retire or take another custody. No live retirement or roster rollover is part of this source change."},
+  "recovery": {"status": "none", "detail": "No numeric unread count in this increment; no message migration or forwarding."},
+  "downtime": {"status": "none", "detail": "No new startup DDL, backfill or unread-count query."}
+}

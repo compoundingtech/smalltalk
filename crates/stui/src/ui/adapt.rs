@@ -733,6 +733,7 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                     .first()
                     .map(|relation| relation.agent_id.clone()),
                 details: AgentDetails {
+                    mail_custody: agent.mail_custody.as_ref().map(|custody| format!("retired; mail held for {}", custody.successor)),
                     progress: work
                         .and_then(|work| {
                             let reported = step_progress(missions, &work.id);
@@ -963,6 +964,20 @@ pub fn conversation(timeline: &[st3_client::TimelineEntry], names: &BTreeMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_agent_card_shows_pending_mail_custodian_in_plain_words() {
+        let mut model = Model::default();
+        model.agents = window(vec![serde_json::json!({
+            "id":"agent/example/old", "kind":"agent", "revision":"retirement",
+            "updated_at":"2026-10-15T10:00:00Z", "name":"example/old",
+            "state":"retired", "reachability":"unknown", "runtime_ids":[], "under":[],
+            "mail_custody":{"successor":"agent/example/new","state":"pending"}
+        })]);
+        let cards = agents(&model, &[]);
+        assert_eq!(cards[0].details.mail_custody.as_deref(),
+            Some("retired; mail held for agent/example/new"));
+    }
 
     #[test]
     fn standalone_native_image_blocks_get_a_focusable_inline_row() {

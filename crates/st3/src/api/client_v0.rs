@@ -11594,7 +11594,7 @@ async fn dispatch_action(
                 .ok_or_else(|| validation("agent.retire needs fence.runtime_desired_revision"))?;
             state
                 .store
-                .retire_agent(
+                .retire_agent_with_successor(
                     &agent,
                     authority_actor,
                     &parameters.reason,
@@ -11602,6 +11602,7 @@ async fn dispatch_action(
                     request.fence.runtime_incarnation.as_deref(),
                     &request.idempotency_key,
                     &state.configured_peers,
+                    parameters.successor.as_deref(),
                 )
                 .map_err(ApiError::bad)?;
             signal_changed(state);

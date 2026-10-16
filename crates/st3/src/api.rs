@@ -399,6 +399,7 @@ impl ApiError {
             "recipient-retired"
             | "lifecycle-unavailable"
             | "retirement-upgrade-required"
+            | "custody-pending"
             | "stale-subject"
             | "owned-set-refused"
             | "set-managed-subject"
@@ -1753,6 +1754,8 @@ fn client_error_code(code: Option<&str>) -> String {
         "recipient-retired"
         | "lifecycle-unavailable"
         | "retirement-upgrade-required"
+        | "invalid-custody-successor"
+        | "custody-pending"
         | "not-found"
         | "forbidden"
         | "attention-migrated"
@@ -3501,6 +3504,13 @@ fn client_agent_cards_presented(
                     None
                 },
             });
+            // Fold the point read into a cached card. Presentation of a warm roster page
+            // must not repeat one retirement query for every retired row.
+            if state == "retired"
+                && let Some(custody) = store.mail_custody_status(&subject.subject).map_err(anyhow::Error::new)?
+            {
+                value["mail_custody"] = custody;
+            }
             if mailbox_faults.is_none() && fault.is_none() {
                 value["fault"] = previous_faults.get(&subject.subject).cloned()
                     .unwrap_or_else(|| json!("fault status unknown"));
@@ -14470,6 +14480,7 @@ struct MessagesQuery {
 #[derive(Deserialize)]
 struct MessagesPageQuery {
     to: Option<String>,
+    acting_as: Option<String>,
     #[serde(default)]
     include_closed: bool,
     cursor: Option<String>,
@@ -14483,6 +14494,7 @@ struct MessagesPageCursor {
     after: u64,
     through: u64,
     to: Option<String>,
+    acting_as: Option<String>,
     include_closed: bool,
     limit: usize,
 }
@@ -14494,6 +14506,25 @@ async fn list_messages_page(
 ) -> Result<Json<MessagePage>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     let to = query.to.as_deref().map(normalize_message_party);
+    let acting_as = query.acting_as.as_deref().map(normalize_message_party);
+    if acting_as.is_some() && to.is_none() {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed", "acting_as needs one explicit mailbox",
+        )));
+    }
+    if let (Some(to), Some(actor)) = (to.as_deref(), acting_as.as_deref()) {
+        let retirement = if to.starts_with("agent/") {
+            state.store.agent_retirement(to).map_err(ApiError::bad)?
+        } else { None };
+        let permitted = if let Some(retirement) = retirement.as_ref() {
+            retirement.body["fields"]["successor"].as_str() == Some(actor)
+        } else { to == actor };
+        if !permitted {
+            return Err(ApiError::bad(St3Error::new("wrong-message-recipient", format!(
+                "`{actor}` has no mail custody for `{to}`"
+            ))));
+        }
+    }
     if let (Some(to), Some(report)) = (to.as_deref(), query.delivery.as_deref()) {
         delivery_presence::record(to, report);
     } else {
@@ -14516,6 +14547,7 @@ async fn list_messages_page(
                 ApiError::bad(St3Error::new("validation-failed", "invalid message cursor"))
             })?;
             if cursor.to != to
+                || cursor.acting_as != acting_as
                 || cursor.include_closed != query.include_closed
                 || cursor.limit != limit
             {
@@ -14555,6 +14587,7 @@ async fn list_messages_page(
                 after,
                 through,
                 to: query.to.as_deref().map(normalize_message_party),
+                acting_as: query.acting_as.as_deref().map(normalize_message_party),
                 include_closed: query.include_closed,
                 limit,
             };
@@ -14680,7 +14713,15 @@ async fn post_message_claim(
             ))
         })?;
         let actor = normalize_message_party(&actor);
-        if actor != message.to
+        let retirement = if message.to.starts_with("agent/") {
+            store.agent_retirement(&message.to).map_err(ApiError::bad)?
+        } else { None };
+        let acting_for = retirement.as_ref().and_then(|claim| {
+            (matches!(kind, "message.read" | "message.closed")
+                && claim.body["fields"]["successor"].as_str() == Some(actor.as_str()))
+                .then(|| message.to.clone())
+        });
+        if acting_for.is_none() && (retirement.is_some() || actor != message.to)
             && !request
                 .delegation
                 .as_ref()
@@ -14697,6 +14738,10 @@ async fn post_message_claim(
         let mut fields =
             BTreeMap::from([("status".into(), Value::String(request.lifecycle.clone()))]);
         let mut evidence = request.evidence;
+        if let Some(acting_for) = acting_for {
+            fields.insert("acting_for".into(), Value::String(acting_for));
+            evidence.push(retirement.as_ref().unwrap().id.clone());
+        }
         if let Some(proof) = &request.delegation {
             crate::store::delegation::add_fields(&mut fields, proof);
             store.delegation_evidence(&mut evidence, proof).map_err(ApiError::bad)?;
@@ -25385,6 +25430,87 @@ version 2
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn retired_mailbox_successor_lists_reads_and_closes_as_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"example/old\" { command \"true\"; workspace \"/tmp\"; restart \"never\"; }\nagent \"example/new\" { command \"true\"; workspace \"/tmp\"; restart \"never\"; }\n";
+        let intent = crate::parse_intent(source, state.store.origin()).unwrap();
+        state.store.apply_internal(&intent, "custody-api-fixture").unwrap();
+        let sent = state.store.append_claim(&ClaimInput {
+            subject: "message/custody-api".into(), kind: "message.sent".into(),
+            actor: Some("person/avery".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/avery")),
+                ("to".into(), json!("agent/example/old")),
+                ("content".into(), json!("A note kept for the new custodian.")),
+                ("status".into(), json!("sent")),
+            ]), evidence: vec![], expected_subject: None,
+            idempotency_key: Some("custody-api-send".into()),
+        }).unwrap();
+        let token = state.store.selected_desired_token("agent/example/old").unwrap().unwrap();
+        let retirement = state.store.retire_agent_with_successor(
+            "agent/example/old", "person/avery", "Rollover", &token, None,
+            "custody-api-retire", &[], Some("agent/example/new"),
+        ).unwrap().0;
+        let app = router(state.clone());
+        let (status, detail) = get_request(app.clone(), "/v1/client/agents/example/old").await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["mail_custody"], json!({"successor":"agent/example/new","state":"pending"}));
+        let (status, _) = get_request(app.clone(), "/v1/messages/page?acting_as=agent/example/new").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, denied) = get_request(app.clone(),
+            "/v1/messages/page?to=agent/example/old&acting_as=agent/example/wrong&limit=1").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, denied) = get_request(app.clone(),
+            "/v1/messages/page?to=agent/example/old&acting_as=agent/example/old&limit=1").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, page) = get_request(app.clone(),
+            "/v1/messages/page?to=agent/example/old&acting_as=agent/example/new&limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["items"][0]["subject"], sent.subject);
+        let path = "/v1/messages/custody-api/claims";
+        let (status, denied) = json_request(app.clone(), path,
+            json!({"lifecycle":"read","actor":"agent/example/old","idempotency_key":"old-custody-read"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, read) = json_request(app.clone(), path,
+            json!({"lifecycle":"read","actor":"agent/example/new","idempotency_key":"new-custody-read"})).await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["actor"], "agent/example/new");
+        assert_eq!(read["body"]["fields"]["acting_for"], "agent/example/old");
+        assert!(read["body"]["evidence"].as_array().unwrap().iter().any(|id| id == &retirement.id));
+        let (status, closed) = json_request(app, path,
+            json!({"lifecycle":"closed","actor":"agent/example/new","idempotency_key":"new-custody-close"})).await;
+        assert_eq!(status, StatusCode::OK, "{closed}");
+        assert_eq!(closed["body"]["fields"]["acting_for"], "agent/example/old");
+    }
+
+    #[test]
+    fn retired_agent_cached_card_refolds_custody_once_at_new_cut() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"example/old\" { command \"true\"; workspace \"/tmp\"; restart \"never\"; }\nagent \"example/new\" { command \"true\"; workspace \"/tmp\"; restart \"never\"; }\n";
+        let intent = crate::parse_intent(source, state.store.origin()).unwrap();
+        state.store.apply_internal(&intent, "custody-card-fixture").unwrap();
+        let index = state.store.index().unwrap();
+        let before = client_agent_resources_cached(&state.store, false, index).unwrap();
+        let old = before.iter().find(|card| card["id"] == "agent/example/old").unwrap();
+        assert!(old.get("mail_custody").is_none());
+        let token = state.store.selected_desired_token("agent/example/old").unwrap().unwrap();
+        state.store.retire_agent_with_successor(
+            "agent/example/old", "person/avery", "Rollover", &token, None,
+            "custody-card-retire", &[], Some("agent/example/new"),
+        ).unwrap();
+        let after_index = state.store.index().unwrap();
+        let after = client_agent_resources_cached(&state.store, false, after_index).unwrap();
+        let old = after.iter().find(|card| card["id"] == "agent/example/old").unwrap();
+        assert_eq!(old["mail_custody"], json!({"successor":"agent/example/new","state":"pending"}));
+        let refolds = state.store.agent_resources_refolded_cards_for_test();
+        let warm = client_agent_resources_cached(&state.store, false, after_index).unwrap();
+        assert_eq!(warm, after);
+        assert_eq!(state.store.agent_resources_refolded_cards_for_test(), refolds);
     }
 
     #[tokio::test]

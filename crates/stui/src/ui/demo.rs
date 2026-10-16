@@ -668,6 +668,7 @@ fn agents() -> Vec<Agent> {
     });
     let detail =
         |goal: &str, claimed: &str, next: Option<&str>, queue: &[&str], state: &str| AgentDetails {
+            mail_custody: None,
             goal: Some(s(goal)),
             claimed: Some(s(claimed)),
             next: next.map(s),
@@ -698,6 +699,7 @@ fn agents() -> Vec<Agent> {
         "idle, waiting for feedback",
     );
     list[2].details = AgentDetails {
+        mail_custody: None,
         goal: Some(s("Tag this week's release.")),
         claimed: Some(s("1h ago")),
         next: Some(s("Weekly release › publish")),
