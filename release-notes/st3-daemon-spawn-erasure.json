@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Build the st3-daemon library with one copy of the per-request task machinery instead of one per route handler, and build its unit test without debug info; the daemon compiles and tests in about 40 percent less memory, with no change to behavior",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "No database changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; members may upgrade in any order."},
+  "compatibility": {"status": "none", "detail": "No wire, client or harness change. Handlers return the same values; the closure and its result are boxed once per request."},
+  "downtime": {"status": "none", "detail": "A daemon restart to install the build; no extra interruption."},
+  "manual": {"status": "none", "detail": "Nothing to configure."},
+  "recovery": {"status": "none", "detail": "Swap back to the previous binary freely; nothing is persisted."}
+}

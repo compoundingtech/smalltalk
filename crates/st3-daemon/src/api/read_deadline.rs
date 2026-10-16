@@ -571,12 +571,29 @@ where
     spawn(move || with_handler(work), false, roster, writer)
 }
 
+type Erased = Box<dyn std::any::Any + Send>;
+type ErasedWork = Box<dyn FnOnce() -> Erased + Send>;
+
+/// Every handler reaches `spawn` with its own closure type. Boxing the closure and its
+/// result here keeps one copy of the task, blocking-pool and panic machinery below
+/// instead of one per handler; the result is downcast back to the handler's own type.
 #[track_caller]
 fn spawn<F, T>(work: F, query: bool, roster: Option<tracing::Span>, writer: Option<Arc<super::Store>>) -> impl Future<Output = Result<T, WorkError>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let work: ErasedWork = Box::new(move || Box::new(work()) as Erased);
+    let erased = spawn_erased(work, query, roster, writer);
+    async move {
+        erased
+            .await
+            .map(|value| *value.downcast::<T>().expect("spawn returns its own work's type"))
+    }
+}
+
+#[track_caller]
+fn spawn_erased(work: ErasedWork, query: bool, roster: Option<tracing::Span>, writer: Option<Arc<super::Store>>) -> impl Future<Output = Result<Erased, WorkError>> {
     let budget = read_budget::current().map(|parent| {
         if query && long_poll_route(parent.route()) {
             parent.child(ORDINARY)

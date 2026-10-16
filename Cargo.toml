@@ -76,6 +76,11 @@ debug = 1
 [profile.test.package."*"]
 debug = 0
 
+# The st3-daemon library unit test is the largest rustc in the workspace; its debug info costs
+# about 2 GB of peak memory and a third of its executable. Backtraces keep function names.
+[profile.test.package.st3-daemon]
+debug = 0
+
 # Optimize hot third-party code in dev/test while preserving assertions and the
 # existing no-debug-info dependency policy. Workspace crates retain opt-level 0.
 
