@@ -8,6 +8,11 @@ const TEXT_BYTES: usize = 16 * 1024 * 1024;
 const ENTRIES: usize = 50_000;
 static REFRESHERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SEARCH_OWNER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, Default, Deserialize)]
 pub(in crate::api) struct SearchQuery {
     text: String,
@@ -209,12 +214,17 @@ fn inventory(
             continue;
         };
         let owner = resource["owner_id"].as_str().unwrap_or_default();
-        let remote = match conversation_owner_host(
-            &state,
-            &session,
-            id,
-            owner.starts_with("agent/").then_some(owner),
-        ) {
+        #[cfg(test)]
+        BEFORE_SEARCH_OWNER.with(|before| {
+            if let Some(before) = before.borrow_mut().take() { before(); }
+        });
+        let managed = if owner.starts_with("agent/") {
+            super::super::managed_session_owner_for_subject_at(&state.store, snapshot.store_index, id, owner)
+        } else {
+            super::super::managed_session_owner_at(&state.store, snapshot.store_index, id)
+        };
+        let remote = match managed.map_err(ApiError::internal)
+            .and_then(|managed| conversation_owner_host(&state, &session, managed.as_ref())) {
             Ok(remote) => remote,
             Err(error) => {
                 incomplete.push(format!("{id}: {}", error.message));
@@ -769,6 +779,36 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn conversation_search_owner_resolution_error_marks_resource_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = crate::api::tests::state(root.path());
+        let database = root.path().join("graph.db");
+        state.store = Arc::new(Store::open(&database, "tester").unwrap());
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        state.native_session_home = Some(home);
+        claim(&state, "agent/ada", "runtime.observed", json!({
+            "status":"running", "runtime_id":"runtime", "incarnation_id":"first",
+        }));
+        let session_id = client_session_id("agent/ada", "first");
+        BEFORE_SEARCH_OWNER.with(|before| {
+            *before.borrow_mut() = Some(Box::new(move || {
+                rusqlite::Connection::open(database).unwrap().execute_batch(
+                    "DROP INDEX claims_identity_runtime_id_accepted_index",
+                ).unwrap();
+            }));
+        });
+        let inventory = inventory(
+            state, ClientSession::local(Some("person/alex")).unwrap(),
+            BTreeMap::new(), BTreeMap::new(),
+        ).expect("an owner-resolution failure must not fail the search refresh");
+        assert!(inventory.sources.is_empty());
+        assert_eq!(inventory.incomplete.len(), 1);
+        assert!(inventory.incomplete[0].starts_with(&format!("{session_id}: ")));
+        assert!(inventory.incomplete[0].contains("no such index"));
     }
 
     #[tokio::test]

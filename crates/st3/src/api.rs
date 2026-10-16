@@ -3573,8 +3573,8 @@ fn managed_session_owner_for_subject_at(
     owner: &str,
 ) -> anyhow::Result<Option<ManagedSessionOwner>> {
     crate::performance::task("conversation/owner", || {
-        let owners = store.conversation_owners_at(snapshot_index)?;
-        let Some(owner) = owners.get(owner) else {
+        let owner = store.conversation_owner_at(owner, snapshot_index)?;
+        let Some(owner) = owner else {
             return Ok(None);
         };
         let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
@@ -3583,7 +3583,7 @@ fn managed_session_owner_for_subject_at(
         if managed_session_id(&owner.subject, identity) != session_id {
             return Ok(None);
         }
-        Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())))
+        Ok(Some((owner.subject, owner.incarnation, owner.origin)))
     })
 }
 
@@ -27927,6 +27927,10 @@ mission "agent-health" state="ready" {
             .unwrap();
         materialize_run_agents(&state, &run);
         let subject = format!("agent/{}/worker", run.id);
+        // This test isolates harness evidence. Supply the independent local delivery proof:
+        // absent polls become stale after the process-wide startup grace, so relying on that
+        // grace makes the running assertions depend on which tests ran before this one.
+        delivery_presence::record_legacy(&subject, "app-server", std::process::id());
         let queued = run.steps[0].subject.clone();
         store.set_step_state(&queued, "ready", None).unwrap();
         store
@@ -27976,7 +27980,8 @@ mission "agent-health" state="ready" {
             .unwrap();
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
-        assert_eq!(resources[0]["state"], "running");
+        assert_eq!(resources[0]["delivery"]["state"], "legacy", "{}", resources[0]);
+        assert_eq!(resources[0]["state"], "running", "{}", resources[0]);
 
         let healthy_cut = store.index().unwrap();
         let harness = |driver: &str, incarnation: &str, key: &str| {

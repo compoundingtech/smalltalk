@@ -64,12 +64,10 @@ fn invalidated() -> ApiError {
         details: Box::new(serde_json::Map::from_iter([("full_resync".into(), json!(true))])) }
 }
 
-pub(super) fn source(state: &AppState, session_id: &str) -> Result<ExternalSession, ApiError> {
-    let snapshot = new_client_snapshot(state);
-    if let Some((owner, incarnation, origin)) =
-        super::super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
-            .map_err(ApiError::internal)?
-    {
+pub(super) fn source(
+    state: &AppState, session_id: &str, managed: Option<&super::super::ManagedSessionOwner>,
+) -> Result<ExternalSession, ApiError> {
+    if let Some((owner, incarnation, origin)) = managed {
         if origin
             .as_deref()
             .is_some_and(|origin| origin != state.store.origin())
@@ -79,9 +77,9 @@ pub(super) fn source(state: &AppState, session_id: &str) -> Result<ExternalSessi
             )));
         }
         if let Some(incarnation) = incarnation
-            && let Some(managed) = managed_transcript(state, &owner, &incarnation)?
+            && let Some(transcript) = managed_transcript(state, owner, incarnation)?
         {
-            return managed
+            return transcript
                 .transcript
                 .map_err(|missing| transcript_unavailable(&missing.reason));
         }
@@ -872,13 +870,8 @@ pub(in crate::api) async fn chunk(
     Query(query): Query<ChunkQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    let session_id = conversation_session_id(&state, &id)?;
-    if let Some(owner) = conversation_owner_host(
-        &state,
-        &session,
-        &session_id,
-        id.starts_with("agent/").then_some(id.as_str()),
-    )? {
+    let (session_id, resolved) = resolve_conversation(&state, &id)?;
+    if let Some(owner) = conversation_owner_host(&state, &session, resolved.managed.as_ref())? {
         let value = state
             .client_relay
             .as_ref()
@@ -929,7 +922,7 @@ pub(super) async fn chunk_local(
             let source = if native {
                 locator.source.session(&request_session)
             } else {
-                source(&request_state, &request_session)?
+                source(&request_state, &request_session, super::super::managed_session_owner_at(&request_state.store, request_state.store.index().map_err(ApiError::internal)?, &request_session).map_err(ApiError::internal)?.as_ref())?
             };
             let value = located_value(&source, &locator)?;
             let result = if locator.image {
@@ -946,7 +939,7 @@ pub(super) async fn chunk_local(
             let rebound = if native {
                 source
             } else {
-                self::source(&request_state, &request_session)?
+                self::source(&request_state, &request_session, super::super::managed_session_owner_at(&request_state.store, request_state.store.index().map_err(ApiError::internal)?, &request_session).map_err(ApiError::internal)?.as_ref())?
             };
             if basis(&rebound)? != locator.basis {
                 return Err(invalidated());
@@ -2507,7 +2500,7 @@ mod tests {
         // With discovery disabled, source() cannot find even this session. An issued ref
         // must still fetch the pinned record directly, independent of other sessions.
         assert!(state.native_session_home.is_none());
-        assert!(source(&state, &native.id).is_err());
+        assert!(source(&state, &native.id, None).is_err());
         let mut session = ClientSession::local(Some("person/example")).unwrap();
         session.conversation_blocks = true;
         let page = read(&native, &session, &native.id).unwrap();

@@ -259,6 +259,15 @@ Local opening captures the first page and replay boundary together, using the na
 keyset fold and reusing its bounded head for the header. Remote opening retains the
 two established owner reads (changes with no cursor and zero wait, then timeline);
 profile those reads separately before attributing repeated fold work to local opening.
+The opening admission pins one graph frontier for routing and managed session identity.
+An `agent/` target reads that subject directly, rather than constructing the fleet owner map.
+The local first page carries that owner and its incarnation through transcript selection,
+the follower mark, native ordering and stored-message overlay; those stages do not resolve
+the owner again. Transcript selection is shared with the mark rather than repeated for it.
+Identity fields and runtime-source selection use newest-first indexed seeks; only genuine
+rival runtime origins require the causal conflict proof. The daemon-cost owner regressions
+compare short and long mixed-origin histories without increasing a growth allowance.
+
 For representative receipts, pin the daemon build and capture five successful initial,
 tab-switch and reconnect frames on the used collections route, with client receipt/render
 time beside the internal profile. Record local versus relayed ownership and cold versus
