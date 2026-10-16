@@ -68,6 +68,38 @@ class CleanupTests(unittest.TestCase):
                 node.cleanup.assert_awaited_once()
             self.assertEqual(list(parent.iterdir()), [])
 
+    def test_a_slow_pty_registry_does_not_fail_cleanup_and_the_sweep_still_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stopped = []
+            process = SimpleNamespace(pid=0)
+            node = SimpleNamespace(name='amber', root=Path(directory), env={}, logs=[], processes=[process],
+                                   down=AsyncMock(), seats=lambda: [])
+            async def stop(target):
+                stopped.append(target)
+            with patch.object(runner, 'capture', new=AsyncMock(side_effect=asyncio.TimeoutError)), \
+                 patch.object(runner, 'stop', new=stop):
+                asyncio.run(runner.Node.cleanup(node))
+            node.down.assert_awaited_once()
+            self.assertEqual(stopped, [process])
+
+    def test_a_timeout_stopping_reconciliation_still_propagates_after_the_sweep(self):
+        # `down()` stops reconciliation; if it timed out, restart=always may still start a
+        # replacement, so the case must not pass as if cleanup had worked.
+        with tempfile.TemporaryDirectory() as directory:
+            stopped = []
+            process = SimpleNamespace(pid=0)
+            node = SimpleNamespace(name='amber', root=Path(directory), env={}, logs=[], processes=[process],
+                                   down=AsyncMock(side_effect=asyncio.TimeoutError), seats=lambda: [])
+            async def stop(target):
+                stopped.append(target)
+            capture = AsyncMock()
+            with patch.object(runner, 'capture', new=capture), \
+                 patch.object(runner, 'stop', new=stop):
+                with self.assertRaises(asyncio.TimeoutError):
+                    asyncio.run(runner.Node.cleanup(node))
+            capture.assert_not_awaited()
+            self.assertEqual(stopped, [process])
+
     def test_provider_shutdown_bounds_a_stuck_extension_and_kills_its_channel(self):
         with tempfile.TemporaryDirectory(prefix='mfe-provider-proof-') as directory:
             root = Path(directory)

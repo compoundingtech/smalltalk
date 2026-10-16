@@ -12,6 +12,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sys
 import secrets
 import tempfile
 import time
@@ -306,12 +307,21 @@ class Node:
         # launch a replacement while the registry is being drained.
         try:
             await self.down()
-            # PTY servers are detached, so first close the exact private registry.
-            stdout, _ = await capture("pty", "list", "--json",
-                env={**self.env, "PTY_ROOT": str(self.root / "pty")})
-            for row in json.loads(stdout):
-                await capture("pty", "kill", row["name"],
+            try:
+                # PTY servers are detached, so first close the exact private registry.
+                stdout, _ = await capture("pty", "list", "--json",
                     env={**self.env, "PTY_ROOT": str(self.root / "pty")})
+                for row in json.loads(stdout):
+                    await capture("pty", "kill", row["name"],
+                        env={**self.env, "PTY_ROOT": str(self.root / "pty")})
+            except asyncio.TimeoutError:
+                # Closing the registry is a courtesy ahead of the sweep below, which kills every
+                # process with this eval's endpoint, and the guardian removes the roots. A slow
+                # `pty` call (it waits for the seat's process tree to exit) is not the property
+                # under test and must not fail a case whose verdict is already decided. A
+                # timeout in `down()` above is not covered: it still propagates, because
+                # reconciliation may still be running and could start a replacement.
+                print(f"{self.name}: pty cleanup exceeded its 5 s bound; sweeping the node's processes instead", file=sys.stderr, flush=True)
         except (ValueError, KeyError):
             pass
         finally:
