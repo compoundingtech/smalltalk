@@ -1612,6 +1612,9 @@ pub struct ClientPageInfo {
     pub next_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_expires_at: Option<String>,
+    /// Unreadable history candidates skipped on this page. Nonzero means incomplete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_items: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1994,6 +1997,9 @@ pub struct AttentionResolveRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionWithdrawRequest {
+    /// The original work.person-asked claim for an informational update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<String>,
     pub reason: String,
     pub actor: String,
     pub idempotency_key: String,

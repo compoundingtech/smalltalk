@@ -118,6 +118,9 @@ pub(super) fn validate_write(
         if fields.contains_key("acted_for")
             || (kind == "work.person-done"
                 && actor.is_some_and(|actor| actor.starts_with("agent/")))
+            || (kind == "harness.diagnostic"
+                && fields.get("code") == Some(&json!("native-prompt-answered"))
+                && actor.is_some_and(|actor| actor.starts_with("agent/")))
         {
             return Err(denied(
                 "an agent completing person work needs explicit delegation evidence",
@@ -223,6 +226,12 @@ pub(super) fn validate_write(
             }
             "close-item"
         }
+        "harness.diagnostic" => {
+            super::attention_snapshot::validate_delegated_denial(
+                tx, subject, fields, evidence, &proof,
+            )?;
+            "close-item"
+        }
         _ => {
             return Err(denied(
                 "this operation is outside the allowed delegation list",
@@ -237,6 +246,7 @@ pub(super) fn validate_write(
     let instruction = message_sent(tx, &proof.message)?;
     if instruction.actor.as_deref() != Some(&proof.person)
         || instruction.body["fields"]["from"] != proof.person
+        || (kind == "harness.diagnostic" && instruction.body["fields"]["to"].as_str() != actor)
     {
         return Err(denied(
             "the instruction's recorded sender must be the person acted for",

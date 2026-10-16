@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Record granted agent dismissal of denied harness calls and let senders withdraw their own informational updates",
+  "replay": {
+    "status": "none",
+    "detail": "No historical claim rewriting. Source cancellation and denial answers remain durable claims; no synthetic Home tombstones."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Add optional acted_for/delegation fields to the harness.diagnostic claim schema. No SQL table, index or migration."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Expand existing close-item policy meaning to dismissal of a current auto-denial only, with writer checks of agent actor, represented person, instruction, policy and episode. This interpretation requires recorded authority acceptance even though no new policy claim is written. No call/kind approval; unproved agent answers are refused."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Optional proof and public dismiss enum on prompt.respond; dismiss already worked for person callers. An old server ignores proof then refuses the agent via person-only checks. An old registry holds the new diagnostic as unknown-claim-field, but may admit the known seat notice; no mixed-fleet delegated use. alerts withdraw formerly refused; it now takes exact episode/key and returns a step disposition. The expected receive outcomes have an authored UNRUN fixture."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment or restart is performed by this source change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Before any real delegated denial answer, Operations must verify that every admitted replication member and eligible receiver, including offline/rejoining members, runs this schema/rule. Mixed or unverified receivers keep dismissal unavailable. No membership or policy change is performed."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Delegated denial close and its source notification commit together; source withdrawals preserve provenance and unrelated claims. No production/native mailbox recovery or original1894 acceptance follows."
+  }
+}

@@ -4,6 +4,24 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('prompt answers keep ordinary text bounds and optional delegation across the main carry', async () => {
+    const [{ Schema }, Rich] = await modules;
+    for (const mode of ['strict', 'tolerant']) {
+        const decode = Rich.decodeUnknownSync(Rich.PromptRespondParameters, mode);
+        for (const answer of ['allow', 'deny', 'dismiss', 'approve', 'use-all', 'trust', '{"0":[1],"1":[0,2]}', 'x'.repeat(16384)]) {
+            const wire = { target_id: 'agent/example/worker', episode: 'claim/prompt', answer };
+            assert.deepEqual(Schema.encodeSync(Rich.PromptRespondParameters)(decode(wire)), wire);
+        }
+        for (const answer of ['', 'x'.repeat(16385)]) {
+            assert.throws(() => decode({ target_id: 'agent/example/worker', episode: 'claim/prompt', answer }));
+        }
+        const wire = { target_id: 'agent/example/worker', episode: 'claim/prompt', answer: 'dismiss',
+            delegation: { person: 'person/avery', policy: 'claim/policy', message: 'message/instruction',
+                quote: 'Dismiss that notice.', episode: 'claim/prompt' } };
+        assert.deepEqual(Schema.encodeSync(Rich.PromptRespondParameters)(decode(wire)), wire);
+    }
+});
+
 test('queued mission deadlines decode null and admission timestamps', async () => {
     const [{ Option, Schema }, Rich] = await modules;
     const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');

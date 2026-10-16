@@ -535,6 +535,7 @@ async fn act_on_card(
                     idem,
                     fence,
                     st3_client::PromptRespondParameters {
+                        delegation: None,
                         target_id: source,
                         episode: attention.episode.clone(),
                         answer,

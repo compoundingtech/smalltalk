@@ -165,7 +165,7 @@ public struct Capabilities: Codable, Sendable {
     enum CodingKeys: String, CodingKey { case machineVersion = "machine_version", kind, sessionActor = "session_actor", transport, capabilities, limits, eventCursor = "event_cursor", oldestEventCursor = "oldest_event_cursor", schemas }
 }
 
-public struct PageInfo: Codable, Sendable { public let limit: Int; public let hasMore: Bool; public let nextCursor: String?; public let cursorExpiresAt: String?; enum CodingKeys: String, CodingKey { case limit, hasMore = "has_more", nextCursor = "next_cursor", cursorExpiresAt = "cursor_expires_at" } }
+public struct PageInfo: Codable, Sendable { public let limit: Int; public let hasMore: Bool; public let nextCursor: String?; public let cursorExpiresAt: String?; public let omittedItems: Int?; enum CodingKeys: String, CodingKey { case limit, hasMore = "has_more", nextCursor = "next_cursor", cursorExpiresAt = "cursor_expires_at", omittedItems = "omitted_items" } }
 public struct Operational: Codable, Sendable { public let layer: String; public let actionable: Bool; public let reasons: [String]?; public let ownerGeneration: String?; public let runtimeIncarnation: String?; enum CodingKeys: String, CodingKey { case layer, actionable, reasons, ownerGeneration = "owner_generation", runtimeIncarnation = "runtime_incarnation" } }
 public struct StructuredDiff: Codable, Sendable { public let changes: [JSONValue]; public let predictedActions: [JSONValue]; enum CodingKeys: String, CodingKey { case changes, predictedActions = "predicted_actions" } }
 public struct VisualizationNode: Codable, Sendable { public let id, kind, label, path: String; public let goals, constraints: [String]; public let assignment: JSONValue?; public let timeoutMS: UInt64?; public let retry: JSONValue; public let gates: [JSONValue]; public let loopSpec: JSONValue?; public let resources, sourceReferences: [JSONValue]; public let runtime: JSONValue; enum CodingKeys: String, CodingKey { case id, kind, label, path, goals, constraints, assignment, timeoutMS = "timeout_ms", retry, gates, loopSpec = "loop", resources, sourceReferences = "source_references", runtime } }
@@ -678,10 +678,16 @@ public struct GlassCollectionFrame: Codable, Sendable {
 public struct StatusHistory: Codable, Sendable { public let kind, seat, retainedFrom: String; public let items: [StatusTransition]; public let complete: Bool; enum CodingKeys: String, CodingKey { case kind, seat, items, retainedFrom = "retained_from", complete } }
 public struct StatusTransition: Codable, Sendable { public let seat, runtimeIncarnation, observedAt: String; public let state: String?; public let reset: Bool; enum CodingKeys: String, CodingKey { case seat, runtimeIncarnation = "runtime_incarnation", state, observedAt = "observed_at", reset } }
 
+public struct DelegationProof: Codable, Sendable {
+    public var person, policy, message, quote, episode: String
+    public init(person: String, policy: String, message: String, quote: String, episode: String) { self.person = person; self.policy = policy; self.message = message; self.quote = quote; self.episode = episode }
+}
+
 public struct PromptRespondParameters: Codable, Sendable {
     public var targetID, episode, answer: String
-    public init(targetID: String, episode: String, answer: String) { self.targetID = targetID; self.episode = episode; self.answer = answer }
-    enum CodingKeys: String, CodingKey { case targetID = "target_id", episode, answer }
+    public var delegation: DelegationProof?
+    public init(targetID: String, episode: String, answer: String, delegation: DelegationProof? = nil) { self.targetID = targetID; self.episode = episode; self.answer = answer; self.delegation = delegation }
+    enum CodingKeys: String, CodingKey { case targetID = "target_id", episode, answer, delegation }
 }
 
 public struct CustomReplyParameters: Codable, Sendable {

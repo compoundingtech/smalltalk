@@ -631,8 +631,31 @@ waiting episode. `source_kind`, `episode`, `source_id`, `priority`, `requested_a
 `action_parameters` describe the source and its current remedy. Completed, cancelled, removed,
 retired, or replaced sources disappear before cleanup; a failed run can retain its own fault.
 Pending held subscription requests are not attention sources. Historical `attention.*` claims
-remain audit data. Both raw legacy mutation routes and `attention.resolve` return
-`attention-migrated`; capabilities mark that action unsupported.
+remain audit data. `attention.resolve` returns `attention-migrated`; capabilities mark
+that client action unsupported. The raw resolve and withdraw routes support only the
+narrow source adapters in [person delegation](../person-delegation.md).
+
+`GET /v1/client/attention?history=true` (also `/alerts`) and
+`GET /v1/client/now?history=true` without `actor` or `owner_run` now return **only closed
+source resolutions**, separate from open Home. Previously the history flag was ignored
+and these reads returned the open list; older daemons still do so. An older daemon's
+open result is not closed-history evidence. No in-repository caller currently sends
+these history requests. Attention history returns 422 `validation-failed` for `actor`, `owner_run`, `status`,
+`owner`, `native_only=true`, or a `state` other than `resolved`. Unfiltered Now history
+returns 422 `validation-failed` for `status`, `owner`, `native_only=true`, or a non-resolved state. Now with
+`actor` or `owner_run` keeps the existing work-filtered open/combined behavior and its
+validation even with `history=true`; that request does not enter the closed-history path.
+
+Only closed history sends the optional `page.omitted_items`. This count is approximate:
+it can undercount decoded rows that fail to bind to their original, and overcount damaged
+rows whose owner or relevance is unknown. Zero does not establish complete history.
+Sparse pages can be empty with `has_more=true`; follow the bounded cursor and preserve
+incomplete-history information. SQL still classifies bounded JSON per candidate, while
+known noise rows skip Rust body decoding; the existing indexed plan is not a measured
+SQL-cost guarantee. A known owner's oversized original returns 503 on exact detail,
+while another person's detail is 404; an unreadable row with no established owner is
+also 404 for a person session. The [delegation guide](../person-delegation.md) gives
+the row, byte, cursor and all-receiver Operations rollout boundaries.
 
 An agent asks through `work.ask` (`person_id`, `title`, `reason`, and exactly one of `step_id` or
 `new_run`). Claimed work requires its current generation, definition, attempt, readiness, and

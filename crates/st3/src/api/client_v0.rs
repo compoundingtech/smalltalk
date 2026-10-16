@@ -4870,6 +4870,7 @@ pub(super) async fn missions(
             has_more,
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+            omitted_items: None,
         },
         sync: client_sync_notice(&state),
         replicated: None,
@@ -5216,6 +5217,9 @@ pub(super) async fn now(
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
     let (history, actor, owner_run) = (query.history, query.actor.clone(), query.owner_run.clone());
+    if history && actor.is_none() && owner_run.is_none() {
+        return super::attention_history::page(state, snapshot, effective_query, "now").await;
+    }
     client_snapshot_page(
         &state,
         snapshot,
@@ -6140,6 +6144,7 @@ fn native_slice_page_at_generation(
         "page": ClientPageInfo {
             limit, has_more, next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+            omitted_items: None,
         },
     });
     if let Some(header) = header {
@@ -11040,13 +11045,21 @@ async fn dispatch_action(
         ))),
         // A person's answer to a native harness prompt, which the prompt's hook delivers.
         "prompt.respond" => {
+            let delegation = p
+                .get("delegation")
+                .map(|value| {
+                    serde_json::from_value::<crate::model::DelegationProof>(value.clone())
+                        .map_err(|_| validation("invalid delegation proof"))
+                })
+                .transpose()?;
             let answered = state
                 .store
-                .answer_native_prompt(
+                .respond_native_prompt(
                     &parameter_string(p, "target_id")?,
                     &parameter_string(p, "episode")?,
                     &parameter_string(p, "answer")?,
                     authority_actor,
+                    delegation.as_ref(),
                 )
                 .map_err(ApiError::bad)?;
             signal_changed(state);
@@ -12523,6 +12536,10 @@ async fn action_inner(
 #[cfg(test)]
 #[path = "client_v0/published_attention_tests.rs"]
 mod published_attention_tests;
+
+#[cfg(test)]
+#[path = "client_v0/alert_action_tests.rs"]
+mod alert_action_tests;
 
 #[cfg(test)]
 mod tests {
