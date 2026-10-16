@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, RefreshControl, View, type FlatList, type ScrollView, type SectionList } from 'react-native';
 import { useFocusEffect, useIsFocused } from '@react-navigation/native';
-import { syncLine, syncView } from '@smalltalk/st3-views';
+import { syncBannerText } from './syncWatch';
 import { offlinePresentation } from './projectionCache';
 import { useStore, type OnDemand } from './store';
 import { theme } from './theme';
@@ -40,11 +40,11 @@ export function StatusLine() {
 
 /** Errors, load failures, and the offline state, each once, at the top of the content. */
 export function Banners() {
-  const { error, setError, pairingIssue, setPairingIssue, loadErrors, status, hasSynced, connectionIssue, busy, actions, sync } = useStore();
+  const { error, setError, pairingIssue, setPairingIssue, loadErrors, status, hasSynced, connectionIssue, busy, actions, sync, syncStale } = useStore();
   const appearance = useTextAppearance();
   const failed = Object.entries(loadErrors);
   // This phone shows what its host holds; while the host lacks records a peer has, that can be out of date.
-  const behind = status === 'online' ? syncLine(syncView(sync)) : undefined;
+  const behind = status === 'online' ? syncBannerText(sync, syncStale) : undefined;
   return <View>
     {error ? <Banner text={error} onPress={() => setError('')} /> : null}
     {pairingIssue ? <Banner text={pairingIssue} onPress={() => setPairingIssue('')} /> : null}

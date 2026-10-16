@@ -137,6 +137,8 @@ function useAppStore(proof?: FabricProfile) {
   // The page `sync` notice (this host lacks records a peer holds): the socket's frames carry none, so a
   // small page read supplies it while online. Unread is `undefined`, and level with its peers is `null`.
   const [sync, setSync] = useState<SyncRead>(undefined);
+  // A read that failed while a behind notice was up: that notice stays, marked as not refreshed.
+  const [syncStale, setSyncStale] = useState(false);
   // Whether the missions window (followed only while a missions screen shows) has delivered its rows.
   const [missionsLoaded, setMissionsLoaded] = useState(false);
   const [error, setError] = useState(''), [pairingIssue, setPairingIssue] = useState(''), [busy, setBusy] = useState(false);
@@ -396,9 +398,9 @@ function useAppStore(proof?: FabricProfile) {
   }, [client]);
 
   useEffect(() => {
-    setSync(undefined);
+    setSync(undefined); setSyncStale(false);
     if (!client || status !== 'online' || proofRef.current) return;
-    return watchSync(async () => (await client.attentionList({ limit: 1 })).value.sync ?? null, setSync);
+    return watchSync(async () => (await client.attentionList({ limit: 1 })).value.sync ?? null, (value, stale) => { setSync(value); setSyncStale(stale); });
   }, [client, status]);
 
   // One collections socket per paired gateway and credential keeps attention, missions, and agents
@@ -1063,7 +1065,7 @@ function useAppStore(proof?: FabricProfile) {
   const canControlTerminal = caps?.capabilities.some(capability => capability.id === 'terminal.input' && capability.state === 'granted') ?? false;
 
   return {
-    actor: caps?.session_actor ?? cachedActor.current, cachedAt: cacheSavedAt.current, order, url, urlDraft, setUrlDraft, credential, data, truncated, loadErrors, feed, connectionIssue, caps, snapshot, status, hasSynced, sync, missionsLoaded,
+    actor: caps?.session_actor ?? cachedActor.current, cachedAt: cacheSavedAt.current, order, url, urlDraft, setUrlDraft, credential, data, truncated, loadErrors, feed, connectionIssue, caps, snapshot, status, hasSynced, sync, syncStale, missionsLoaded,
     error, setError, pairingIssue, setPairingIssue, pairDraft, busy, historicalSessions, conversationCache, draftCache, draftsReady, client,
     gatewayMachineId, gatewayHost, canControlTerminal, loadLists, watchLists, inventoryGranted, actions,
     saveDrafts: () => { if (!proof) void localDrafts.save(draftsOwner.current, draftCache.current); },
