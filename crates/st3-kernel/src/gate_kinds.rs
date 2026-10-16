@@ -237,7 +237,7 @@ fn git(directory: &Path, arguments: &[&str]) -> Result<String, String> {
 }
 
 /// One shell word, quoted unless it needs no quoting.
-pub(crate) fn shell_word(value: &str) -> String {
+pub fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value
             .chars()

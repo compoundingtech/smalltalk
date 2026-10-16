@@ -4,6 +4,7 @@ use crate::backup::{Header, PAGE, Record, RestoreReport, TableDigest, write_reco
 use crate::model::{ReplicaEnvelope, ReplicaEnvelopeId, ReplicaEnvelopeSignature};
 use std::io::Write;
 use std::sync::atomic::Ordering;
+use crate::message_body::BodyAttachment as _;
 
 impl Store {
     pub fn backup_header(&self) -> Result<Header> {

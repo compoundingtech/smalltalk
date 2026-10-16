@@ -33,7 +33,7 @@ normally serves one run, so its queue has one entry.
 
 ## One selector
 
-`crates/st3-daemon/src/seat_queue.rs` holds the only next-work selector, `seat_queue::select`. It is used by:
+`crates/st3-kernel/src/seat_queue.rs` holds the only next-work selector, `seat_queue::select`. It is used by:
 
 - `Store::agent_work_queues`, which feeds `NEXT WORK`, `QUEUED WORK`, and `UPCOMING` in
   `st agents show` and the `agents` client resource;

@@ -1,68 +1,66 @@
 //! st3 claims graph, API, reconciliation, and CLI support.
 
-pub mod cli_output;
+pub use st3_kernel::cli_output;
+// cli_output exports these macros at its crate root; this crate exported them at its own.
+pub use st3_kernel::{cli_print, cli_println};
 
 #[cfg(any(test, feature = "test-support"))]
 #[macro_use]
 #[path = "../../../scripts/ci-test-paths.rs"]
 mod ci_test_paths;
 
-pub mod accounts;
+pub use st3_kernel::accounts;
 pub mod api;
-pub mod archive;
+pub use st3_kernel::archive;
 pub mod attach_image;
 pub mod backup;
 pub mod blobs;
-pub mod boot;
+pub use st3_kernel::boot;
 /// Git-backed change metadata and exact-OID atomic state transitions.
 pub mod changes;
 pub(crate) mod checkout;
 pub mod claude_channel;
 pub mod client;
 pub mod config;
-pub mod conversation_search;
+pub use st3_kernel::conversation_search;
 pub mod creation;
 pub mod repositories;
-pub(crate) mod disk;
+pub(crate) use st3_kernel::disk;
 /// Answers the hooks an st3 seat's harness runs: `st driver-hook NAME`.
 pub mod delivery_hold;
 pub mod driver_hook;
 pub mod environment;
-/// Offline signed gate observations in immutable git notes refs.
-pub mod evidence;
+pub use st3_kernel::evidence;
 pub(crate) mod external_sessions;
-pub(crate) mod native_views;
-pub(crate) mod conversation_header;
+pub(crate) use st3_kernel::native_views;
+pub(crate) use st3_kernel::conversation_header;
 pub(crate) mod subagent_sessions;
-pub mod fleet;
+pub use st3_kernel::fleet;
 /// Silent messages are stored and readable without waking the recipient.
 pub mod silent;
 /// `st missions check`: run a mission file's exec gates once, now, the way a run would.
 pub mod gate_check;
-/// Built-in gate kinds: what gates shelled out for most, answered by st itself.
-pub mod gate_kinds;
-/// What an `st` command run inside an exec gate reports about itself.
-pub mod gate_report;
+pub use st3_kernel::gate_kinds;
+pub use st3_kernel::gate_report;
 pub mod github_watch;
 pub mod graph;
 pub mod handoff;
 pub(crate) mod graph_watch_ivm;
-pub mod harness_events;
-/// The lifecycle hook set st3 publishes beneath its own state directory.
-pub mod hooks;
+pub use st3_kernel::harness_events;
+pub use st3_kernel::hooks;
 pub mod incremental;
-pub mod instance;
-pub mod lane;
+pub use st3_kernel::instance;
+pub use st3_kernel::lane;
 pub mod mailbox;
 pub mod message_body;
 /// Bounded local maintenance workers shared by daemon startup and lifecycle fixtures.
 pub mod maintenance;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod malloc_trim;
-pub(crate) mod memory;
-pub mod read_cache;
+pub(crate) use st3_kernel::memory;
+pub use st3_kernel::read_cache;
 pub mod mission;
-pub mod model;
+pub use st3_kernel::model;
 /// A driver relaunches its harness on the native session a suspended seat resumes.
 pub mod native_resume;
 /// Durable seat-scoped first native launch outcomes.
@@ -78,14 +76,14 @@ pub mod otlp;
 pub mod peer;
 pub mod placement;
 pub mod person_request;
-pub mod pricing;
+pub use st3_kernel::pricing;
 pub use smallclaims::{performance, profile};
-pub mod projection;
+pub use st3_kernel::projection;
 pub mod provenance;
 pub mod reconcile;
 mod reconcile_telemetry;
 mod relay_trace;
-pub mod rules;
+pub use st3_kernel::rules;
 /// Observes git and gh calls without changing their command behavior.
 pub mod recorder;
 /// Imports local command receipts into durable resource observations.
@@ -99,12 +97,11 @@ pub mod remote_terminal;
 pub mod render;
 pub mod resource;
 pub mod rollout;
-pub mod seat_queue;
+pub use st3_kernel::seat_queue;
 /// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
 pub mod sekrets;
 pub mod service;
-/// The st agent skill bundled in this binary and installed for each harness.
-pub mod skill;
+pub use st3_kernel::skill;
 pub mod slo;
 pub mod slo_history;
 pub mod startup;
@@ -113,14 +110,16 @@ pub mod store;
 pub mod subagents;
 /// Suspends a quiet seat and resumes its own native session.
 pub mod suspension;
-pub(crate) mod publication;
+pub(crate) use st3_kernel::publication;
 pub mod seat_snapshot;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+#[cfg(test)]
+mod kernel_tests;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
-pub mod terminal_binding;
+pub use st3_kernel::terminal_binding;
 /// Runs each agent as its own Unix user, in its own namespaces and root-owned cgroup.
 pub mod tiles;
 
@@ -129,4 +128,4 @@ pub use model::{NormalizedIntent, St3Error};
 
 /// Shared authentication and transport for daemon GitHub callers.
 mod github_http;
-mod github_admission;
+use st3_kernel::github_admission;

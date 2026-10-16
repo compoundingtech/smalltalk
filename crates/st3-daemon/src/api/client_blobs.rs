@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crate::peer::{ClientReadOperation, ClientReadRejected, ClientReadRequest};
 use axum::body::Bytes;
 use axum::http::HeaderMap;
+use crate::message_body::BodyAttachment as _;
 
 /// An upload is checked against its own limit so a too-large one answers in the API's own error
 /// vocabulary; the route's body limit is just above it.

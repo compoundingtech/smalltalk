@@ -430,10 +430,16 @@ pub fn parse_reference(reference: &str) -> Option<&str> {
     crate::blobs::is_sha256(hash).then_some(hash)
 }
 
-impl MessageView {
+/// A long body as the attachment record it is kept as. st3-kernel defines `MessageView`; the
+/// body reference format lives here, so the method is an extension trait.
+pub trait BodyAttachment {
     /// A long body as the attachment record it is kept as: a file on the member that took the
     /// send, fetched from there like an image.
-    pub fn body_attachment(&self) -> Option<MessageAttachment> {
+    fn body_attachment(&self) -> Option<MessageAttachment>;
+}
+
+impl BodyAttachment for MessageView {
+    fn body_attachment(&self) -> Option<MessageAttachment> {
         Some(MessageAttachment {
             sha256: parse_reference(self.body_ref.as_deref()?)?.to_owned(),
             media_type: MEDIA_TYPE.into(),

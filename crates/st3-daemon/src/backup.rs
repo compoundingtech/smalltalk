@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::client::Endpoint;
 use crate::model::{ReplicaEnvelope, ReplicaEnvelopeSignature};
 use crate::store::{CheckpointManifest, CheckpointManifestPage, Store};
+use crate::message_body::BodyAttachment as _;
 
 pub const FORMAT: &str = "st3.claim-backup";
 pub const VERSION: u32 = 1;

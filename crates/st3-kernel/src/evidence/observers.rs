@@ -98,7 +98,7 @@ pub fn produce_ci(
     )
 }
 
-pub(crate) fn produce_ci_linked(
+pub fn produce_ci_linked(
     repo: &Path,
     binding: &CiBinding,
     run: &Value,

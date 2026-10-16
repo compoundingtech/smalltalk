@@ -4,15 +4,15 @@ use serde_json::{Value, json};
 // Wire size limits and owner references are applied by api/client_v0/conversation_blocks.
 // Typed OMP event views also bound each native value independently; timeline pagination
 // separately budgets encoded entries and response metadata against the gateway's ceiling.
-pub(crate) const MAX_TIMELINE_VALUE_BYTES: usize = 8 * 1024;
+pub const MAX_TIMELINE_VALUE_BYTES: usize = 8 * 1024;
 /// Native kind and attribution are identities, not payload: a wide one must not crowd out the
 /// rest of a view.
-pub(crate) const MAX_OMP_EVENT_IDENTITY_BYTES: usize = 256;
+pub const MAX_OMP_EVENT_IDENTITY_BYTES: usize = 256;
 
 /// Bound a native value to `limit` bytes. A string is clipped as text, so a value of exactly
 /// `limit` bytes is kept whole; any other value that encodes to more than `limit` becomes
 /// marked JSON text, so the view that carries it stays valid JSON.
-pub(crate) fn bounded_value(value: &Value, limit: usize) -> Value {
+pub fn bounded_value(value: &Value, limit: usize) -> Value {
     let text = match value {
         Value::String(text) => std::borrow::Cow::Borrowed(text.as_str()),
         _ => std::borrow::Cow::Owned(serde_json::to_string(value).unwrap_or_default()),
@@ -137,7 +137,7 @@ fn items(source: &Value) -> Value {
     )
 }
 
-pub(crate) fn tool_call_view(tool: &str, args: &Value) -> Value {
+pub fn tool_call_view(tool: &str, args: &Value) -> Value {
     let mut out = json!({"type":tool,"tool":tool});
     fields(&mut out, args, &[("intent", "i")]);
     match tool {
@@ -377,7 +377,7 @@ fn search_output(out: &mut Value, tool: &str, details: &Value) {
     );
 }
 
-pub(crate) fn tool_output_view(
+pub fn tool_output_view(
     tool: &str,
     call_id: &str,
     is_error: bool,
@@ -510,7 +510,7 @@ fn omp_event_view(
     }
 }
 
-pub(crate) fn omp_record_view(
+pub fn omp_record_view(
     record: &Value,
 ) -> Option<(&'static str, Value, Option<&'static str>)> {
     let record_type = record.get("type")?.as_str()?;
@@ -678,7 +678,7 @@ fn metadata_numbers(out: &mut Value, source: &Value, names: &[(&str, &str)]) {
     }
 }
 
-pub(crate) fn assistant_metadata(message: &Value) -> Option<Value> {
+pub fn assistant_metadata(message: &Value) -> Option<Value> {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return None;
     }

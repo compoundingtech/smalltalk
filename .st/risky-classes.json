@@ -25,7 +25,7 @@
     },
     {
       "name": "authorization",
-      "globs": ["crates/st3-daemon/src/api/client_v0*", "crates/st3-daemon/src/api/client_web*", "crates/st3-daemon/src/sekrets/**", "crates/st3-daemon/src/sekrets.rs", "crates/st3-daemon/src/accounts.rs", "crates/st3-daemon/src/store/accounts.rs", "crates/st3-daemon/src/store/roster_admission.rs", "crates/st3-daemon/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
+      "globs": ["crates/st3-daemon/src/api/client_v0*", "crates/st3-daemon/src/api/client_web*", "crates/st3-daemon/src/sekrets/**", "crates/st3-daemon/src/sekrets.rs", "crates/st3-kernel/src/accounts.rs", "crates/st3-daemon/src/store/accounts.rs", "crates/st3-daemon/src/store/roster_admission.rs", "crates/st3-daemon/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
       "content": [
         {"globs": ["crates/**"], "pattern": "(?i)\\b(trusted[_ ]keys?|pairing|device[_ ]key|signing[_ ]key|verify_signature)\\b"}
       ],
@@ -33,7 +33,7 @@
     },
     {
       "name": "claim-folding-and-replay",
-      "globs": ["crates/st3-daemon/src/store/card_fold.rs", "crates/st3-daemon/src/store/*_ivm.rs", "crates/st3-daemon/src/store/*_ivm/**", "crates/st3-daemon/src/store/checkpoint*", "crates/st3-daemon/src/projection.rs", "crates/smallclaims/src/**/replay*", "crates/smallclaims/src/ivm*", "crates/smallclaims/src/ivm/**"],
+      "globs": ["crates/st3-daemon/src/store/card_fold.rs", "crates/st3-daemon/src/store/*_ivm.rs", "crates/st3-daemon/src/store/*_ivm/**", "crates/st3-daemon/src/store/checkpoint*", "crates/st3-kernel/src/projection.rs", "crates/smallclaims/src/**/replay*", "crates/smallclaims/src/ivm*", "crates/smallclaims/src/ivm/**"],
       "forces": ["integration", "purity and convergence suites"]
     },
     {

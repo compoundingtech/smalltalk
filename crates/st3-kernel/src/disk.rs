@@ -7,7 +7,7 @@ const GIB: u64 = 1 << 30;
 
 /// The space an unprivileged process can still use on one filesystem.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DiskSpace {
+pub struct DiskSpace {
     /// Identifies the filesystem, so paths on one filesystem are counted once.
     pub filesystem: u64,
     pub available: u64,
@@ -16,17 +16,17 @@ pub(crate) struct DiskSpace {
 
 impl DiskSpace {
     /// Under 2 GiB or 2% left. A cargo build or a claim store write can fail from here on.
-    pub(crate) fn is_low(&self) -> bool {
+    pub fn is_low(&self) -> bool {
         self.available < 2 * GIB || self.available.saturating_mul(50) < self.total
     }
 
     /// At least 4 GiB and 4% left. Between low and recovered, a raised item stays open, so a
     /// filesystem near the line does not raise and close an item on every build.
-    pub(crate) fn has_recovered(&self) -> bool {
+    pub fn has_recovered(&self) -> bool {
         self.available >= 4 * GIB && self.available.saturating_mul(25) >= self.total
     }
 
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         let percent = if self.total == 0 {
             0.0
         } else {
@@ -44,7 +44,7 @@ impl DiskSpace {
 // The statvfs field types differ by platform, so a cast that is a no-op on one is needed on
 // another.
 #[allow(clippy::unnecessary_cast)]
-pub(crate) fn disk_space(path: &Path) -> std::io::Result<DiskSpace> {
+pub fn disk_space(path: &Path) -> std::io::Result<DiskSpace> {
     use std::os::unix::ffi::OsStrExt as _;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;

@@ -3,6 +3,7 @@
 use super::client_v0::ClientSession;
 use super::*;
 use crate::message_body::{INLINE_MAX_BYTES, MAX_BYTES};
+use crate::message_body::BodyAttachment as _;
 
 fn text(bytes: usize) -> String {
     // Multi-byte characters, so a cut at the wrong byte would show.

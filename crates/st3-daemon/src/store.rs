@@ -117,9 +117,11 @@ use crate::model::{
 };
 #[cfg(test)]
 use crate::model::{
-    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRange, ReplicationBatch, ReplicationExchange,
-    ReplicationInventory, ReplicationReceipt, ReplicationResponse,
+    ReplicaEnvelope, ReplicaEnvelopeId, ReplicationExchange, ReplicationInventory,
+    ReplicationReceipt,
 };
+#[cfg(test)]
+use smallclaims::replication::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 #[cfg(test)]
