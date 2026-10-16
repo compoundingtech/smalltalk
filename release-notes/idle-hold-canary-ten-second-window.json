@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prove per driver tick that an idle Codex or OpenCode driver reads no delivery hold, and shorten the idle-hold boot canary's real idle window from 60 s to 10 s",
+  "replay": {
+    "status": "none",
+    "detail": "Only a unit test and the boot canary script change. No runtime replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers, schema versions or migration code change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination behavior change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, protocol, provider or harness contract changes. Delivery hold reads are unchanged. The canary's evidence field calls_per_idle_minute is now calls_while_idle, over a 10 s window."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "A test-only change adds no service interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation steps or starting-state transitions are required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No runtime recovery or database swap-back behavior changes."
+  }
+}

@@ -22,7 +22,7 @@ step it names. SCENARIO is one of
                     and restart, while a stale copy exists in the daemon's default environment
     utf8            Codex recovers a receipt from a split UTF-8 transcript and keeps delivering
                     through discovery I/O failures, with private, rate-limited warnings.
-    idle-hold       Codex/OpenCode make zero hold calls during a real idle minute, then deliver
+    idle-hold       Codex/OpenCode make zero hold calls during a real idle window, then deliver
                     fresh mail and retain native consumption across hold, release and expiry.
 
 Every seat must, within the time bound, claim its step with its current incarnation and read an
@@ -873,7 +873,7 @@ def prove_codex_import(node, seats, native, origin):
 
 
 def idle_delivery_control(node, seats):
-    """Count real API calls for an idle minute, then prove hold/release/expiry on native mail."""
+    """Count real API calls for an idle window, then prove hold/release/expiry on native mail."""
     if node.harness not in ("codex", "opencode"):
         fail("the idle hold canary requires Codex or OpenCode")
     subject = seat_subject("a")
@@ -912,14 +912,17 @@ def idle_delivery_control(node, seats):
         return counts() == first
 
     until(quiet, seats.bound, "the driver kept reading delivery hold after boot mail was read")
+    # Ten idle seconds are ten driver ticks: a hold read on any tick shows here. That each idle
+    # tick reads no delivery control, for both transports and both mailbox sources, is proved per
+    # tick by driver_cli's native_delivery_control_reads_hold_only_while_mail_waits.
     original = set(driver_processes(node))
     before = calls()
     start = time.monotonic()
-    time.sleep(60)
+    time.sleep(10)
     after = calls()
     measured = {"idle_seconds": round(time.monotonic() - start, 3),
                 "hold_calls_before": before, "hold_calls_after": after,
-                "calls_per_idle_minute": after - before}
+                "calls_while_idle": after - before}
     node.idle_delivery_control = measured
     if after != before:
         fail(f"idle provider polled delivery hold: {measured}")
@@ -931,7 +934,7 @@ def idle_delivery_control(node, seats):
                          "--subject", label, "--body", label)["subject"]
 
     # Each delivery waits on its event within the phase bound. That the first mail after the
-    # minute gets its permit at once, not after a poll, now rests on the idle minute alone (no
+    # idle window gets its permit at once, not after a poll, rests on the idle window alone (no
     # hold poll runs); after_idle_seconds records the latency. The hold below outlasts the
     # bound, so only its release can deliver the held message, and only expiry the last one.
     def finish(reference, label):
