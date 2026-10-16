@@ -3,6 +3,28 @@
 filter = 'package(st3) and test(/^messaging_faults::/)'
 priority = 100
 
+# Start the longest tests first. The partition logs of 2026-10-16 (#3133 and #3137, two shards
+# each, 8 threads) show tests of 100 to 260 seconds starting 270 to 680 seconds into a 700 to 760
+# second run, so the last 30 to 90 seconds ran one or two tests on an otherwise idle machine.
+# These are the tests of 75 seconds or more that had no priority (the messaging, boot and fleet
+# tests above already do). Order only: no selection, retry, thread or assertion change.
+[[profile.default.overrides]]
+filter = '''
+(package(=st3) and (
+    test(/^convergence::(every_seed_converges_[0-3]|the_checks_catch_a_partial_adoption)$/)
+    or test(/^delivery_probe::native_delivery_probe_alerts_and_recovers_without_model_turns$/)
+    or test(/^client_only::inventory_screens_send_no_request_after_their_first_frames_for_more_than_a_minute$/)
+    or test(/^daemon_restart::a_quiet_idle_seat_ages_stale_and_recovers_new_evidence_after_daemon_restart$/)
+    or test(/^subagents_seat::a_seats_subagents_appear_renew_and_end$/)
+    or test(/^revision_seats::isolated_revision_preserves_completed_builder_declarations_and_cleanup$/)
+    or test(/^store::reconcile_work_context::tests::batched_work_/)
+    or test(/^store::tests::mailbox_fence_tests::mailbox_fence_cost_is_bounded_with_sparse_observation_history$/)
+    or test(/^api::client_v0::tests::runtime_roster_fixed_page_cost_ignores_subject_history$/)
+  ))
+  or (binary(=checkpoint_memory) and test(/^a_checkpoint_pass_holds_a_fixed_budget_whatever_the_history$/))
+'''
+priority = 100
+
 [profile.ci]
 # Owned quarantine: merge-queue-flakes runs link_minutes once in optional perf-cost.
 # Its full 10-second/native/authentication oracle stays unchanged while the signed
