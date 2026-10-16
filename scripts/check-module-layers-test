@@ -147,6 +147,19 @@ class ModuleLayers(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("pty in [dependencies] differs", result.stderr)
 
+    def test_a_nextest_filter_naming_only_package_st3_is_caught(self):
+        self.split_packages()
+        self.write(".config/nextest.toml",
+                   '[profile.ci]\ndefault-filter = "all()"\n[[profile.ci.overrides]]\n'
+                   'filter = "package(=st3) and test(/^store::x$/)"\nretries = 0\n'
+                   '[[profile.ci.overrides]]\nfilter = "package(=st3) and binary(=integration) and test(/^a::b$/)"\nretries = 0\n'
+                   '[[profile.ci.overrides]]\nfilter = "(package(=st3) or package(=st3-daemon)) and test(/^c$/)"\nretries = 0\n')
+        result = self.run_script()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("profile.ci.overrides[0] names package st3 but not st3-daemon", result.stderr)
+        self.assertNotIn("overrides[1]", result.stderr)
+        self.assertNotIn("overrides[2]", result.stderr)
+
     def test_the_two_build_scripts_must_be_the_same(self):
         self.split_packages(build=False)
         self.assertIn("build.rs", self.run_script().stderr)
