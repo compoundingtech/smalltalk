@@ -1676,7 +1676,7 @@ fn usage_cost_window_is_shared_and_stays_after_cached_history() {
 /// Every route `api.rs` declares is measured or listed in `NOT_MEASURED`, and nothing is both.
 #[test]
 fn the_cost_check_covers_every_route() {
-    let declared = declared_routes(include_str!("../src/api.rs"));
+    let declared = declared_routes(include_str!("../../st3-daemon/src/api.rs"));
     assert!(declared.len() > 100, "found only {} routes", declared.len());
     let measured = PROBES
         .iter()
@@ -1835,7 +1835,7 @@ fn declared_routes(source: &str) -> BTreeSet<String> {
 
 #[test]
 fn the_cost_route_inventory_resolves_the_client_read_forward_constant() {
-    let declared = declared_routes(include_str!("../src/api.rs"));
+    let declared = declared_routes(include_str!("../../st3-daemon/src/api.rs"));
     assert!(declared.contains("POST /v1/internal/client-read/forward"));
 }
 

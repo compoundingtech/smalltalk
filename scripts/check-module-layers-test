@@ -76,7 +76,7 @@ class ModuleLayers(unittest.TestCase):
 
     def test_reexports_count_toward_their_module(self):
         self.write("crates/st3/src/c.rs", "use crate::parse_intent;\npub fn h() {}\n")
-        self.write("crates/st3/src/graph.rs", "pub fn parse_intent() {}\n")
+        self.write("crates/st3-daemon/src/graph.rs", "pub fn parse_intent() {}\n")
         modules, edges = ml.production_graph(str(self.root))
         self.assertEqual(edges["c"], {"graph": 1})
 
@@ -111,8 +111,8 @@ class ModuleLayers(unittest.TestCase):
         out = self.run_script("--layers").stdout.splitlines()
         self.assertEqual([line.split()[1:] for line in out], [["c"], ["b"], ["a"]])
 
-    def split_packages(self, daemon_version="0.1.0", daemon_deps="", build=True):
-        self.write("crates/st3/Cargo.toml", '[package]\nname = "st3"\nversion = "0.1.0"\n\n[dependencies]\nstui = "1"\n')
+    def split_packages(self, daemon_version="0.1.0", daemon_deps="", build=True, binary_deps=""):
+        self.write("crates/st3/Cargo.toml", f'[package]\nname = "st3"\nversion = "0.1.0"\n\n[dependencies]\nstui = "1"\n{binary_deps}')
         self.write("crates/st3-daemon/Cargo.toml",
                    f'[package]\nname = "st3-daemon"\nversion = "{daemon_version}"\n\n[dependencies]\n{daemon_deps}')
         self.write("crates/st3/build.rs", "fn main() {}\n")
@@ -134,6 +134,31 @@ class ModuleLayers(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 1)
         self.assertIn("depends on stui, which is binary-side", result.stderr)
+
+    def test_a_renamed_binary_side_dependency_is_still_caught(self):
+        self.split_packages(daemon_deps='ui = { package = "st3-conversation-ui", path = "../x" }\n')
+        self.assertIn("depends on st3-conversation-ui, which is binary-side", self.run_script().stderr)
+
+    def test_a_dependency_both_manifests_name_must_be_declared_the_same(self):
+        self.split_packages(daemon_deps='pty = { git = "u", rev = "a" }\n', binary_deps='pty = { git = "u", rev = "a" }\n')
+        self.assertEqual(self.run_script().returncode, 0)
+        self.split_packages(daemon_deps='pty = { git = "u", rev = "a" }\n', binary_deps='pty = { git = "u", rev = "b" }\n')
+        result = self.run_script()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pty in [dependencies] differs", result.stderr)
+
+    def test_a_nextest_filter_naming_only_package_st3_is_caught(self):
+        self.split_packages()
+        self.write(".config/nextest.toml",
+                   '[profile.ci]\ndefault-filter = "all()"\n[[profile.ci.overrides]]\n'
+                   'filter = "package(=st3) and test(/^store::x$/)"\nretries = 0\n'
+                   '[[profile.ci.overrides]]\nfilter = "package(=st3) and binary(=integration) and test(/^a::b$/)"\nretries = 0\n'
+                   '[[profile.ci.overrides]]\nfilter = "(package(=st3) or package(=st3-daemon)) and test(/^c$/)"\nretries = 0\n')
+        result = self.run_script()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("profile.ci.overrides[0] names package st3 but not st3-daemon", result.stderr)
+        self.assertNotIn("overrides[1]", result.stderr)
+        self.assertNotIn("overrides[2]", result.stderr)
 
     def test_the_two_build_scripts_must_be_the_same(self):
         self.split_packages(build=False)

@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn startup_call_site_phases_have_closed_labels() {
-        let main = include_str!("main.rs");
+        let main = include_str!("../../st3/src/main.rs");
         let phases: Vec<_> = main
             .split("startup_telemetry.phase(\"")
             .skip(1)

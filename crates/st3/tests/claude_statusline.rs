@@ -17,7 +17,7 @@ const PAYLOAD: &str = include_str!(
 const IDENTITY: &str = "example/statusline-seat";
 
 fn script() -> PathBuf {
-    Path::new(test_env!("CARGO_MANIFEST_DIR")).join("hooks/claude-statusline.sh")
+    Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../st3-daemon/hooks/claude-statusline.sh")
 }
 
 struct Seat {

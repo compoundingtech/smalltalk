@@ -283,7 +283,7 @@ environment variable that enables this behavior, even if the executable is renam
 Fixture command helpers clear inherited `ST_AGENT`/`ST3_*`; temporary-repository Git helpers
 isolate global/system config, hooks, signing and author identity on each command. Real
 repository commits keep the host's Git policy. Run the same suite from an agent seat with
-`nix develop --command cargo nextest run -p st3 --locked --profile ci --retries 0`.
+`nix develop --command cargo nextest run -p st3 -p st3-daemon --locked --profile ci --retries 0`.
 Provider fixtures that load st3 extensions publish their isolated hook set with
 `st3::hooks::ensure_installed`, preserving every declared asset and relative import.
 
@@ -362,6 +362,10 @@ Any crate/lint count above its baseline fails, including a newly introduced crat
 Removing warnings also requires lowering the baseline in the same pull request, so a later
 change cannot spend the removed warnings. CI checks that the committed counts do not increase
 relative to the event's immutable base SHA (PR base, merge-group base, or preceding main commit).
+When a crate is split out of another one, the new crate's warnings are the origin's: list it in
+`.github/clippy-splits.json` (`{"st3-daemon": "st3"}`), and against a base that lacks the new crate the
+two are compared together, so the split can move warnings between them and never add any. Once the base has the
+new crate it is an ordinary crate and the entry has no effect; `--update` applies the same rule.
 The first rollout permits a base without the file. There is no new required check:
 `linux-gate` already requires `linux-clippy`.
 

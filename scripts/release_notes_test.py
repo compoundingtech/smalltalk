@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from release_notes import FIELDS, ImpactError, check_pull_request, collect, render, validate
+from release_notes import FIELDS, ImpactError, check_pull_request, collect, render, validate, version
 
 ROOT = Path(__file__).resolve().parent.parent
 loader = importlib.machinery.SourceFileLoader('release_daily', str(ROOT / 'scripts/release-smalltalk-daily'))
@@ -42,7 +42,7 @@ class ReleaseNotes(unittest.TestCase):
         self.git('config', 'commit.gpgsign', 'false')
         self.git('config', 'core.hooksPath', '/dev/null')
         self.write('crates/smallclaims/src/store.rs', 'pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 16;";')
-        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 10;')
+        self.write('crates/st3-daemon/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 10;')
         self.write('docs/st3/binary-releases.md', '# Pinned install guide\n')
         self.base = self.commit('Base')
         self.git('tag', 'v0.3.0')
@@ -54,6 +54,17 @@ class ReleaseNotes(unittest.TestCase):
         path = self.repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
+
+    def test_rules_version_reads_the_path_it_had_before_the_library_moved(self):
+        self.git('mv', 'crates/st3-daemon/src/store/checkpoint_rules.rs', 'crates/st3-daemon/src/store/old.rs')
+        (self.repo / 'crates/st3/src/store').mkdir(parents=True)
+        self.git('mv', 'crates/st3-daemon/src/store/old.rs', 'crates/st3/src/store/checkpoint_rules.rs')
+        before_move = self.commit('Library still in crates/st3')
+        self.assertEqual(version(self.repo, before_move, 'rules'), 10)
+        self.assertEqual(version(self.repo, self.base, 'rules'), 10)
+        self.git('rm', '-q', 'crates/st3/src/store/checkpoint_rules.rs')
+        with self.assertRaisesRegex(ImpactError, 'is missing'):
+            version(self.repo, self.commit('No rules file anywhere'), 'rules')
 
     def add_fragment(self, name='change', value=None):
         self.write(f'release-notes/{name}.json', json.dumps(value or fragment()))
@@ -260,7 +271,7 @@ class ReleaseNotes(unittest.TestCase):
         with self.assertRaisesRegex(ImpactError, 'invalid JSON'):
             check_pull_request(self.repo, self.base, source)
         self.git('reset', '--hard', self.base)
-        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
+        self.write('crates/st3-daemon/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
         self.add_fragment()
         source = self.commit('Missing rules transition')
         with self.assertRaisesRegex(ImpactError, 'rules version 10 -> 11'):
@@ -268,7 +279,7 @@ class ReleaseNotes(unittest.TestCase):
 
     def test_pr_accepts_explicit_unknown_and_matching_version_transitions(self):
         self.write('crates/smallclaims/src/store.rs', 'pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";')
-        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
+        self.write('crates/st3-daemon/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
         value = fragment()
         value['replay'] = {'status': 'unknown', 'detail': 'Replay on populated state has not been measured; wait for API readiness.'}
         value['schema'] = {'status': 'changed', 'detail': 'Forward migration; preserve backup.', 'transitions': [[16, 17]]}
@@ -293,7 +304,7 @@ class ReleaseNotes(unittest.TestCase):
         self.assertNotIn('Uncommitted wrong guide', expected)
 
     def test_rules_change_needs_matching_classification(self):
-        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
+        self.write('crates/st3-daemon/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
         self.add_fragment()
         source = self.commit('Unclassified rules change')
         with self.assertRaisesRegex(ImpactError, 'rules version 10 -> 11'):
@@ -328,7 +339,7 @@ class ReleaseNotes(unittest.TestCase):
     def test_intermediate_schema_and_rules_changes_are_preserved(self):
         for schema, rules, name, transitions in [(17, 11, 'first', [16, 17, 10, 11]), (16, 12, 'second', [17, 16, 11, 12])]:
             self.write('crates/smallclaims/src/store.rs', f'pub const SCHEMA_VERSION: &str = "PRAGMA user_version = {schema};";')
-            self.write('crates/st3/src/store/checkpoint_rules.rs', f'pub const RULES_VERSION: u32 = {rules};')
+            self.write('crates/st3-daemon/src/store/checkpoint_rules.rs', f'pub const RULES_VERSION: u32 = {rules};')
             value = fragment(name)
             value['schema'] = {'status': 'changed', 'detail': f'Schema migration {name}; roll forward.', 'transitions': [transitions[:2]]}
             value['rules'] = {'status': 'changed', 'detail': 'Coordinate all members.', 'transitions': [transitions[2:]]}
