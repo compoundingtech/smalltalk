@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+#[cfg(feature = "test-support")]
+pub mod events;
+
 static LOGIN_SHELL: OnceLock<PathBuf> = OnceLock::new();
 
 pub(crate) fn login_shell() -> Option<&'static Path> {
