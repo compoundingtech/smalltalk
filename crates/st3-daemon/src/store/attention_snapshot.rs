@@ -1859,7 +1859,7 @@ impl Store {
         let fields = &denial.body["fields"];
         if denial.subject != seat
             || denial.kind != "harness.diagnostic"
-            || fields["code"] != crate::driver_hook::PERMISSION_DENIED_CODE
+            || fields["code"] != crate::model::PERMISSION_DENIED_CODE
         {
             return Ok(None);
         }

@@ -1102,7 +1102,7 @@ fn merge(items: &mut BTreeMap<u64, Item>, item: Item) {
                 if entry
                     .facts
                     .get("last_comment")
-                    .is_some_and(|known| !crate::store::newer_comment(&value, known)) => {}
+                    .is_some_and(|known| !crate::resource::newer_comment(&value, known)) => {}
             "mentions" => {
                 if let Some(Value::Array(known)) = entry.facts.get_mut("mentions") {
                     known.extend(value.as_array().cloned().unwrap_or_default());

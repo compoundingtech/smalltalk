@@ -175,7 +175,7 @@ pub(crate) fn gateway(
         return None;
     }
     (unix_get && selector.gateway(path, actor, caller)).then(|| {
-        let trace = Trace::new(format!("request/{}", crate::api::new_request_id()));
+        let trace = Trace::new(format!("request/{}", crate::model::new_request_id()));
         if let Some(connection) = connection {
             connection.record(&trace);
         }
@@ -195,7 +195,7 @@ pub(crate) fn forwarded(
     if !tracing::enabled!(target: TARGET, tracing::Level::DEBUG) {
         return None;
     }
-    let actual = selector.forwarding(|| crate::peer::FleetAuth::body_digest(body), caller, unix)?;
+    let actual = selector.forwarding(|| smallclaims::sync::FleetAuth::body_digest(body), caller, unix)?;
     let trace = Trace::new(actual);
     if let Some(connection) = connection {
         connection.record(&trace);

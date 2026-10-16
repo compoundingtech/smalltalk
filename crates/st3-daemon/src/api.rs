@@ -1514,30 +1514,7 @@ fn record_request_latency(
     eprintln!("st3: slow request {path} took {} ms", elapsed.as_millis());
 }
 
-pub(crate) fn new_request_id() -> String {
-    let mut bytes = [0_u8; 16];
-    if getrandom::fill(&mut bytes).is_err() {
-        let fallback = format!(
-            "{}:{}:{:?}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-            std::thread::current().id()
-        );
-        bytes.copy_from_slice(&Sha256::digest(fallback.as_bytes())[..16]);
-    }
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes")),
-        u16::from_be_bytes(bytes[4..6].try_into().expect("two bytes")),
-        u16::from_be_bytes(bytes[6..8].try_into().expect("two bytes")),
-        u16::from_be_bytes(bytes[8..10].try_into().expect("two bytes")),
-        u64::from_be_bytes([
-            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ])
-    )
-}
+pub(crate) use crate::model::new_request_id;
 
 fn client_now_ms() -> u128 {
     std::time::SystemTime::now()
