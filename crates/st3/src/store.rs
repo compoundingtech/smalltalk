@@ -35,6 +35,7 @@ mod resources;
 mod resource_preparation;
 #[cfg(test)]
 mod resource_preparation_fence_tests;
+mod message_versions;
 mod github_workflow_failures;
 pub mod git_changes;
 pub(crate) mod message_subscriptions;
@@ -14356,12 +14357,24 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut messages = Vec::with_capacity(subjects.len());
-        for (subject, created_index) in subjects {
-            let message = self.message_view_cached(&connection, &subject, created_index)?;
-            if message.to == recipient
-                && message.tags.iter().any(|tag| tag.starts_with("st3-work:"))
-            {
-                messages.push(message);
+        for chunk in subjects.chunks(message_versions::CHUNK) {
+            let requested = chunk
+                .iter()
+                .map(|(subject, _)| subject.as_str())
+                .collect::<Vec<_>>();
+            let versions = message_versions::read(&connection, &requested)?;
+            for ((subject, created_index), version) in chunk.iter().zip(versions) {
+                let message = self.message_view_cached_at_version(
+                    &connection,
+                    subject,
+                    *created_index,
+                    version,
+                )?;
+                if message.to == recipient
+                    && message.tags.iter().any(|tag| tag.starts_with("st3-work:"))
+                {
+                    messages.push(message);
+                }
             }
         }
         sort_messages_canonically(&connection, &mut messages)?;
@@ -14401,6 +14414,28 @@ impl Store {
             Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         drop(statement);
+        self.message_view_cached_at_version(
+            connection,
+            subject,
+            created_index,
+            message_versions::Version {
+                latest_claim_index,
+                desired_claim_id,
+            },
+        )
+    }
+
+    fn message_view_cached_at_version(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        created_index: u64,
+        version: message_versions::Version,
+    ) -> Result<MessageView> {
+        let message_versions::Version {
+            latest_claim_index,
+            desired_claim_id,
+        } = version;
         if let Some(view) = self
             .smalltalk
             .message_cache
