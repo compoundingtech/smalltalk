@@ -43,6 +43,11 @@ mod waits;
 
 pub use idle_nudge::{IDLE_NUDGE_AFTER_MS, IDLE_NUDGE_QUIET_WATCH_MS, IdleNudgeSettings};
 
+/// Register the reconciler's daemon metrics with the meter provider `otel` installed.
+pub fn init_metrics() {
+    crate::reconcile_telemetry::init();
+}
+
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
 const OWNERSHIP_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -12567,7 +12572,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             && self.store.selected_desired_kind(agent)?.is_none()
             && intent.subjects.values().any(|desired| {
                 desired.kind == "message"
-                    && crate::store::canonical_child_string(&desired.desired, "to").as_deref()
+                    && crate::model::canonical_child_string(&desired.desired, "to").as_deref()
                         == Some(agent)
             })
             && let Some(source) = mission.declarations_kdl.as_deref()
@@ -13019,7 +13024,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if matches!(status.as_deref(), Some("delivered" | "read" | "closed")) {
                         true
                     } else if let Some(agent) = Self::round_gate_agent(run)
-                        && crate::store::canonical_child_string(&subject.desired, "to").as_deref()
+                        && crate::model::canonical_child_string(&subject.desired, "to").as_deref()
                             == Some(agent)
                         && self.store.selected_desired_kind(agent)?.is_none()
                     {

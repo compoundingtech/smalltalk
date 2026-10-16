@@ -43,6 +43,17 @@ pub const PROVIDER_CONTINUE_MS: u128 = 1_000;
 
 pub use crate::github_admission::ProviderRateLimit;
 
+/// Whether `seen` is the same comment as `known` or one created after it.
+pub(crate) fn newer_comment(seen: &Value, known: &Value) -> bool {
+    let created = |comment: &Value| {
+        comment
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    seen.get("id") == known.get("id") || created(seen) >= created(known)
+}
+
 /// GitHub rejected the token itself. Nothing changes until a person signs in again.
 #[derive(Debug)]
 pub struct ProviderUnauthenticated {
