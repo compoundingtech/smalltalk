@@ -5518,7 +5518,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_only_inventory_accepts_a_physical_path_beneath_symlinked_session_root() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_support::canonical_tempdir();
         let physical = home.path().join("cold-storage/2026/09/30");
         fs::create_dir_all(&physical).unwrap();
         fs::create_dir_all(home.path().join(".codex")).unwrap();

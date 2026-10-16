@@ -29189,6 +29189,12 @@ fn catch_up_projection_cannot_clear_an_admission_deferred_after_its_index_read()
                     .unwrap();
                 assert!(target.validate_replication_backlog().unwrap().changed);
                 assert!(target.replication_catching_up());
+                // Pass A stamped its start before this closure. On a slow host the receive
+                // above can outlast the deferral window, and pass B would then project, and
+                // wait on A's own projection lock. Stamp now so the window is still open.
+                target
+                    .last_replication_projection_unix_ms
+                    .store(now_ms() as u64, Ordering::Release);
                 assert_eq!(
                     target
                         .project_replication_backlog_unless_catching_up()

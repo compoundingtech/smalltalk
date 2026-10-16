@@ -61,6 +61,7 @@ impl Fixture {
     }
 
     /// A gateway whose authorized requests reach `api` instead of GitHub.
+    #[cfg(target_os = "linux")]
     fn with_github(api: &str) -> Self {
         Self::build(&format!("github_api = {api:?}\n"))
     }
@@ -1020,6 +1021,7 @@ fn a_seat_passes_the_files_gh_reads_and_names_no_file_of_the_profile() {
 
 /// A stand-in for GitHub's API: it records each request and answers 200 with an ETag, or 302
 /// from `/redirect`.
+#[cfg(target_os = "linux")]
 fn api_server() -> (String, Arc<Mutex<Vec<String>>>) {
     use std::io::{BufRead as _, BufReader, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1058,6 +1060,9 @@ fn api_server() -> (String, Arc<Mutex<Vec<String>>>) {
     (base, seen)
 }
 
+// The gateway identifies a caller by its Linux cgroup and /proc start time, and refuses to run
+// anywhere else (`gateway::serve`), so there is nothing here to prove on macOS.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
     use super::authorized::{AuthorizedError, AuthorizedRequest, request_from_cgroup};
@@ -1217,8 +1222,11 @@ fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
     assert!(!log.to_string().contains("example-token"));
 }
 
+// The tile tests read the caller's identity from the socket's peer credentials (SO_PEERCRED),
+// which exists only on Linux; the gateway refuses to run anywhere else.
 /// A second gateway over `fixture`'s store whose configuration names `people`, and whose tile
 /// registry has one tile, atlas, whose launcher-allocated user ID is `tile_uid`. Its socket.
+#[cfg(target_os = "linux")]
 fn tile_gateway(fixture: &Fixture, people: &str, tile_uid: u32) -> PathBuf {
     let socket = fixture.root.join(format!(
         "run/tiles-{}.sock",
@@ -1254,9 +1262,11 @@ fn tile_gateway(fixture: &Fixture, people: &str, tile_uid: u32) -> PathBuf {
     socket
 }
 
+#[cfg(target_os = "linux")]
 const TILE_AGENT: &str = "agent/fleet/fixture-web/atlas";
 
 /// A registry with one tile, whose launcher-allocated user ID is `uid`.
+#[cfg(target_os = "linux")]
 fn tile_registry(uid: u32) -> String {
     format!(
         "uids = {{ first = {uid}, last = {uid} }}\n\
@@ -1264,6 +1274,7 @@ fn tile_registry(uid: u32) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_tile_is_its_agent_by_the_kernels_word_alone() {
     let fixture = Fixture::new();
@@ -1364,6 +1375,7 @@ fn a_tile_is_its_agent_by_the_kernels_word_alone() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_unix_user_that_is_both_a_person_and_a_tile_is_refused() {
     let fixture = Fixture::new();
@@ -1393,6 +1405,7 @@ fn a_unix_user_that_is_both_a_person_and_a_tile_is_refused() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_tiles_directory_is_never_bound_into_a_command() {
     let fixture = Fixture::new();

@@ -174,7 +174,7 @@ impl Fixture {
         make_router: impl FnOnce(AppState) -> axum::Router,
     ) -> (Self, String) {
         let mission = matches!(shape, Shape::Mission | Shape::Step);
-        let root = tempfile::tempdir().unwrap();
+        let root = st3::test_support::canonical_tempdir();
         let store = Arc::new(Store::open(&root.path().join("graph.db"), "restart-test").unwrap());
         let notify = Arc::new(Notify::new());
         let runtime = Arc::new(Runtime::default());

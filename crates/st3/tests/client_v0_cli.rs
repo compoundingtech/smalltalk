@@ -3722,7 +3722,7 @@ async fn agent_declaration(socket: &Path, subject: &str) -> st3::model::DesiredS
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agents_start_preserves_command_declarations_and_refuses_harness_options() {
-    let root = tempfile::tempdir().unwrap();
+    let root = st3::test_support::canonical_tempdir();
     let (socket, server) = serve_creation_api(root.path(), None).await;
     for (name, launch) in [
         ("command", r#"command "omp --model original""#),
@@ -3991,7 +3991,7 @@ async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json
         (Some("blocked"), false),
         (Some("ready"), true),
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = st3::test_support::canonical_tempdir();
         let (socket, server) = serve_creation_api(root.path(), harness).await;
         let workspace = root.path().to_str().unwrap();
         let output = run_cli_mode(

@@ -79,7 +79,7 @@ mod tests {
     use crate::checkout::test_support::{git, repository};
     #[test]
     fn git_workspaces_and_linked_worktrees_name_the_shared_repository() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::canonical_tempdir();
         let repository = repository(root.path());
         std::fs::create_dir(repository.join("nested")).unwrap();
         assert_eq!(

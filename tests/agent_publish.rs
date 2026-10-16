@@ -1697,6 +1697,16 @@ fn catalog_root_of_length(temp: &Path, target_len: usize) -> PathBuf {
 /// Publication must judge the socket-path bound against the catalog that will RUN, not against the
 /// disposable admission projection it validates.
 ///
+/// A temporary directory whose path is already canonical: macOS puts temporary directories below
+/// the `/var` and `/tmp` symlinks, and st2 resolves the catalog it is given, so a path built
+/// from the unresolved spelling is shorter and different from the one st2 uses.
+fn canonical_tempdir() -> tempfile::TempDir {
+    let parent = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary directory");
+    tempfile::Builder::new()
+        .tempdir_in(parent)
+        .expect("temporary directory")
+}
+
 /// `st2 agent publish` validates a shadow catalog nested inside the live one, so measuring the tree
 /// under inspection charged every identity for the projection's own depth and rejected
 /// declarations whose real socket is bindable. On the pre-fix implementation this fails with
@@ -1709,7 +1719,7 @@ fn catalog_root_of_length(temp: &Path, target_len: usize) -> PathBuf {
 #[test]
 fn publication_judges_the_socket_bound_against_the_runtime_catalog_not_the_projection() {
     for headroom in [0_usize, 4, 8] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let socket_len = st2::run::PORTABLE_SOCKET_PATH_LIMIT - headroom;
         // Everything the canonical socket path adds after the catalog root: the pty directory, the
         // separators and the `.sock` suffix. Probed through the shipped path construction rather
