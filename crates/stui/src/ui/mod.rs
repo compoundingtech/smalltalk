@@ -280,6 +280,10 @@ pub enum Effect {
     CreateTerminal {
         name: String,
     },
+    /// Explicitly reopen a failed conversation, independently of outgoing-message resend.
+    RetryConversation {
+        target: String,
+    },
     /// Send a failed or unconfirmed message again, as the same request.
     Resend {
         entry: String,
@@ -1206,6 +1210,19 @@ impl Ui {
 
     pub(crate) fn conversation_failed(&mut self, target: &str, error: &str) {
         self.stalled.insert(target.to_owned(), error.to_owned());
+    }
+
+    fn retry_conversation(&mut self) -> bool {
+        let Some(target) = self.content_conversation() else {
+            return false;
+        };
+        if !matches!(self.world.conversations.get(&target), Some(Load::Failed(_))) {
+            return false;
+        }
+        self.stalled.remove(&target);
+        self.world.conversations.insert(target.clone(), Load::Loading);
+        self.effects.push(Effect::RetryConversation { target });
+        true
     }
 
     /// What is on screen, as kinds and counts only, for a slow-turn note: which pane has focus,
@@ -2575,6 +2592,23 @@ impl Ui {
         self.pane(buf, &pane.key(), area, doc, false);
     }
 
+    fn conversation_failure(reason: &str, width: usize) -> Doc {
+        let mut doc = Doc::new();
+        doc.blank();
+        let mut inner = Doc::new();
+        inner.wrap(
+            &[text::run(reason, theme::soft())],
+            width.saturating_sub(4),
+        );
+        inner.blank();
+        inner.wrap(
+            &[text::run("Ctrl+R · retry opening this conversation", theme::fg(theme::ACCENT))],
+            width.saturating_sub(4),
+        );
+        doc.card("no conversation to show", theme::OVERLAY1, false, inner, width);
+        doc
+    }
+
     fn draw_agent(&self, buf: &mut Buffer, area: Rect, id: Option<&str>) {
         let width = area.width.saturating_sub(1) as usize;
         let Some(agent) = id.and_then(|id| {
@@ -2584,6 +2618,12 @@ impl Ui {
                 .iter()
                 .find(|agent| agent.id == id)
         }) else {
+            if let Some(target) = id
+                && let Some(Load::Failed(reason)) = self.world.conversations.get(target)
+            {
+                self.pane(buf, target, area, Self::conversation_failure(reason, width), false);
+                return;
+            }
             let message = if id.is_some_and(|id| id.starts_with("session/")) {
                 "Loading conversation…".into()
             } else {
@@ -2737,21 +2777,7 @@ impl Ui {
                 doc
             }
             Some(Load::Failed(reason)) => {
-                let mut doc = Doc::new();
-                doc.blank();
-                let mut inner = Doc::new();
-                inner.wrap(
-                    &[text::run(reason.clone(), theme::soft())],
-                    width.saturating_sub(4),
-                );
-                doc.card(
-                    "no conversation to show",
-                    theme::OVERLAY1,
-                    false,
-                    inner,
-                    width,
-                );
-                doc
+                Self::conversation_failure(reason, width)
             }
             Some(Load::Ready(entries)) if entries.is_empty() => {
                 let mut doc = Doc::new();
@@ -3846,6 +3872,7 @@ impl Ui {
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
                 ("ctrl+f", "find in this conversation"),
+                ("ctrl+r", "retry opening a failed conversation (outside the message box)"),
                 (
                     "ctrl+a",
                     "the agent's actions: restart, suspend, retire, terminal…",
@@ -4649,6 +4676,13 @@ impl Ui {
                 }
             }
             KeyCode::Char(letter @ ('r' | 'x')) if self.tab == 1 && self.live => {
+                if letter == 'r'
+                    && self.glasses.is_none()
+                    && key.modifiers == KeyModifiers::CONTROL
+                    && self.retry_conversation()
+                {
+                    return;
+                }
                 match self.undelivered() {
                     Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
                     Some(entry) => self.effects.push(Effect::Forget { entry }),
@@ -7006,6 +7040,30 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_open_retry_does_not_act_inside_a_draft_or_on_a_ready_conversation() {
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        let target = ui.selected_id().unwrap();
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        ui.key(key);
+        assert!(ui.effects.is_empty(), "a ready conversation is not reopened");
+
+        ui.world.conversations.insert(target.clone(), Load::Failed("access refused".into()));
+        ui.conversation_failed(&target, "previous transient failure");
+        ui.conversation_state.drafts.insert(target.clone(), "saved draft".into());
+        ui.editing = true;
+        ui.key(key);
+        assert!(ui.effects.is_empty(), "the message box retains its editing keys");
+        assert!(matches!(ui.world.conversations[&target], Load::Failed(_)));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ui.key(key);
+        assert_eq!(ui.effects, vec![Effect::RetryConversation { target: target.clone() }]);
+        assert!(!ui.stalled.contains_key(&target));
+        assert_eq!(ui.conversation_state.drafts[&target], "saved draft");
+    }
 
     #[test]
     fn first_useful_conversation_requires_a_rendered_entry_not_a_placeholder() {

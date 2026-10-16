@@ -2454,6 +2454,14 @@
   ],
   "stui_effects": [
     {
+      "effect": "RetryConversation",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::conversation_open_retry_does_not_act_inside_a_draft_or_on_a_ready_conversation",
+        "crates/stui/src/ui/live.rs::failed_conversation_hint_and_key_resubscribe_without_resending_messages"
+      ],
+      "verification": "failed-conversation reducer and feed resubscription transport; explicit retry preserves drafts and sends no outgoing message"
+    },
+    {
       "effect": "LoadContent",
       "tests": [
         "crates/stui/src/ui/mod.rs::content_controls_emit_load_effects_once_and_release_on_collapse_or_hide",
