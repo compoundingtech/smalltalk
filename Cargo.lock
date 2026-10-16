@@ -4623,6 +4623,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "portable-pty",
  "predicates",
  "proptest",
