@@ -4082,7 +4082,7 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
             .is_err()
     );
 
-    for (label, sleep, age_ms) in [("minutes", 120, 120_000), ("hours", 2, 4 * 3_600_000)] {
+    for (label, sleep, age_ms) in [("minutes", 2, 120_000), ("hours", 2, 4 * 3_600_000)] {
         // Leave its local daemon alive so it can record work while the network worker sleeps.
         let mut worker = traveller.worker.take().unwrap();
         worker.kill().unwrap();
@@ -4095,8 +4095,10 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
         b.note(&format!("beacon-{label}")).await;
         expected.insert(format!("custom/fleet-test/beacon-{label}"));
         tokio::time::sleep(Duration::from_secs(sleep)).await;
-        // The minutes case uses real elapsed time. The hours case ages persistent evidence;
-        // virtual-clock worker tests separately exercise the full four-hour retry schedule.
+        // Both cases age persistent evidence instead of sleeping through the absence. The worker
+        // test isolated_outbound_only_node_converges_after_two_minutes_and_four_hours runs the
+        // real worker timers over both absences on a virtual clock, with its attempt bounds and
+        // the return through the servers' backoff.
         for node in [&a, &b] {
             let db = rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
             db.busy_timeout(Duration::from_secs(5)).unwrap();

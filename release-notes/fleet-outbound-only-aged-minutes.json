@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The outbound-only fleet test ages its two-minute absence in persistent evidence, as its four-hour case does, instead of sleeping two real minutes",
+  "replay": {
+    "status": "none",
+    "detail": "No stored history or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, claim or configuration schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination version change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test only; no product behavior, declaration or command changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration and no restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting restores the real two-minute absence."
+  }
+}
