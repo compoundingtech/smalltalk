@@ -2305,24 +2305,49 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    async fn idle_long_poll_keeps_its_normal_empty_answer(path: &'static str, route: &'static str) {
+    /// The handler idles for the longest wait on the paused clock (callers run `start_paused`), so
+    /// the ordinary 15 s deadline still has to give way to the 30 s wait, without 30 real seconds.
+    /// The handler runs on a blocking poll, which keeps the paused clock from advancing by itself,
+    /// so the test advances it once the handler has started.
+    async fn idle_long_poll_keeps_its_normal_empty_answer(
+        path: &'static str,
+        route: &'static str,
+        paused: bool,
+    ) {
         use axum::{Router, middleware::from_fn_with_state, routing::get};
         use tower::ServiceExt;
         let root = tempfile::tempdir().unwrap();
         let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started = Arc::new(std::sync::Mutex::new(Some(started_tx)));
         let app = Router::new()
             .route(
                 route,
-                get(|| async {
-                    tokio::time::sleep(Duration::from_millis(MAX_WAIT_MS)).await;
-                    Json(json!({ "items": [] }))
+                get(move || {
+                    let started = started.clone();
+                    async move {
+                        // The wait starts counting when it is created, so create it before
+                        // signalling: the test advances the clock as soon as it hears.
+                        let wait = tokio::time::sleep(Duration::from_millis(MAX_WAIT_MS));
+                        let _ = started.lock().unwrap().take().unwrap().send(());
+                        wait.await;
+                        Json(json!({ "items": [] }))
+                    }
                 }),
             )
             .layer(from_fn_with_state(
                 (state, ClientTransportBoundary::Unix),
                 super::super::response_envelope,
             ));
-        let response = app.oneshot(request(Method::GET, path)).await.unwrap();
+        let response = tokio::spawn(app.oneshot(request(Method::GET, path)));
+        started_rx.await.unwrap();
+        if paused {
+            let past_ordinary = ORDINARY + Duration::from_secs(1);
+            tokio::time::advance(past_ordinary).await;
+            assert!(!response.is_finished(), "{path} was cut at the ordinary deadline");
+            tokio::time::advance(Duration::from_millis(MAX_WAIT_MS) - past_ordinary).await;
+        }
+        let response = response.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1_000_000)
             .await
@@ -2332,49 +2357,70 @@ mod tests {
         assert_eq!(value["items"], json!([]), "{body}");
     }
 
+    /// The one idle read-deadline test on the real clock: 30 real seconds, so the paused-clock
+    /// tests below are not the only proof that the envelope really waits past the ordinary deadline.
     #[tokio::test]
+    async fn an_idle_conversation_poll_is_not_cut_at_the_ordinary_deadline_on_the_real_clock() {
+        idle_long_poll_keeps_its_normal_empty_answer(
+            "/v1/client/conversations/test/changes?wait_ms=30000",
+            "/v1/client/conversations/{id}/changes",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_idle_conversation_poll_is_not_cut_at_the_ordinary_deadline() {
         idle_long_poll_keeps_its_normal_empty_answer(
             "/v1/client/conversations/test/changes?wait_ms=30000",
             "/v1/client/conversations/{id}/changes",
+            true,
         )
         .await;
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_idle_client_event_poll_is_not_cut_at_the_ordinary_deadline() {
         idle_long_poll_keeps_its_normal_empty_answer(
             "/v1/client/events?wait_ms=30000",
             "/v1/client/events",
+            true,
         )
         .await;
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_idle_screen_poll_is_not_cut_at_the_ordinary_deadline() {
         idle_long_poll_keeps_its_normal_empty_answer(
             "/v1/client/terminals/test/screen?after=cursor&wait_ms=30000",
             "/v1/client/terminals/{id}/screen",
+            true,
         )
         .await;
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_idle_log_poll_is_not_cut_at_the_ordinary_deadline() {
         idle_long_poll_keeps_its_normal_empty_answer(
             "/v1/sessions/logs/test?wait=true",
             "/v1/sessions/logs/{*subject}",
+            true,
         )
         .await;
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_idle_legacy_event_poll_is_not_cut_at_the_ordinary_deadline() {
-        idle_long_poll_keeps_its_normal_empty_answer("/v1/events?timeout_ms=30000", "/v1/events")
-            .await;
+        idle_long_poll_keeps_its_normal_empty_answer(
+            "/v1/events?timeout_ms=30000",
+            "/v1/events",
+            true,
+        )
+        .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_idle_paged_event_poll_is_not_cut_at_the_ordinary_deadline() {
         idle_long_poll_keeps_its_normal_empty_answer(
             "/v1/events/page?wait=true&timeout_ms=30000",
             "/v1/events/page",
+            true,
         )
         .await;
     }
