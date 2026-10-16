@@ -11,6 +11,7 @@ use crate::fleet::transport::is_permitted_route_address;
 pub use smallclaims::fleet::file::{FleetFile, FleetMode, FleetRemoval, PeerConfig};
 use crate::model::PlannerSpec;
 
+pub mod changes;
 mod client;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -51,8 +52,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "GithubConfig::is_default")]
     pub github: GithubConfig,
     /// Git change pilot: explicit repositories and one designated discovery owner.
-    #[serde(skip_serializing_if = "crate::changes::config::Config::is_default")]
-    pub changes: crate::changes::config::Config,
+    #[serde(skip_serializing_if = "changes::Config::is_default")]
+    pub changes: changes::Config,
     /// Checkpoints that trim replicated history. Written only when it differs from the
     /// default, so a config this build writes still loads in a build without checkpoints.
     #[serde(skip_serializing_if = "CheckpointConfig::is_default")]
@@ -474,7 +475,7 @@ impl Default for Config {
             planner: PlannerSpec::default(),
             observations: ObservationsConfig::default(),
             github: GithubConfig::default(),
-            changes: crate::changes::config::Config::default(),
+            changes: changes::Config::default(),
             checkpoint: CheckpointConfig::default(),
             limits: LimitsConfig::default(),
             reconcile: ReconcileConfig::default(),
