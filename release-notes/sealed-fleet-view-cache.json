@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Reuse the sealed fleet membership view between fleet changes",
+  "replay": {"status": "none", "detail": "The same admitted membership is folded only when its fleet generation changes."},
+  "schema": {"status": "changed", "detail": "Idempotent fleet-generation triggers also cover envelope deletion, signer updates and identity changes in claims, envelopes and batches."},
+  "rules": {"status": "none", "detail": "Membership authority and checkpoint rules are unchanged."},
+  "compatibility": {"status": "none", "detail": "No wire or client contract change. The sealed view still excludes the unsealed local-signer fallback."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "None."},
+  "recovery": {"status": "none", "detail": "The process-local cache is discarded on restart. Its generation and fold are read from the same SQLite snapshot."}
+}

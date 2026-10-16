@@ -55,7 +55,7 @@ fn wire_and_sql_preserve_every_byte_and_malformed_evidence() {
 }
 
 #[test]
-fn interrupted_conversion_reopens_with_identical_authority_and_heals_old_and_new_peers() {
+fn interrupted_conversion_reopens_with_identical_authority_and_syncs_old_and_new_peers() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.sqlite3");
     let store = Store::open(&path, "alder", Arc::new(Plain)).unwrap();
@@ -158,8 +158,6 @@ fn interrupted_conversion_reopens_with_identical_authority_and_heals_old_and_new
             .unwrap();
         peer.validate_replication_backlog().unwrap();
         peer.project_replication_backlog().unwrap();
-        peer.readmit_envelopes("alder", &exchange.envelopes)
-            .unwrap();
         assert_eq!(
             peer.replication_status(true, Some("sample-fleet"), &[])
                 .unwrap()

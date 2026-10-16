@@ -5872,7 +5872,7 @@ fn two_approvals_wait_in_turn_and_each_binds_to_its_own_transition() {
     };
     let request = |id: u64, method: &str| {
         json!({"id": id, "method": method,
-            "params": {"threadId": "thread-main", "turnId": "turn-1"}})
+            "params": {"threadId": "thread-main", "turnId": "turn-1", "itemId": format!("item-{id}")}})
     };
     let mut approval = CodexApprovalAnswer::default();
     let mut at = Instant::now();
@@ -5908,6 +5908,8 @@ fn two_approvals_wait_in_turn_and_each_binds_to_its_own_transition() {
         Some(json!({"id": 1, "result": {"decision": "accept"}}))
     );
     assert_eq!(asked, vec![first]);
+    // Binding the request names the call it asks about: its item, as the conversation shows it.
+    assert_eq!(approval.bound_call.take(), Some((first.0, first.1, "item-1".into())));
 
     // Codex resolves the first; the second is the prompt now, and its own transition.
     let resolved = json!({"method": "serverRequest/resolved",
@@ -8430,6 +8432,327 @@ fn the_control_pump_reports_the_recorded_usage_limit_failure_over_its_socket() {
     assert_eq!(failure.reason, driver_diagnostic::Reason::TurnUsageLimit);
 }
 
+/// Real Codex 0.160.1 emits a typed retryable disconnect, systemError, then an
+/// unclassified final error. Its thread accepts a new turn after the failed one.
+#[test]
+fn the_control_pump_keeps_a_retryable_disconnect_alive_for_the_next_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let server_config = config.clone();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TEST_EVENT_TIMEOUT)).unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({"id": 0, "result": {"userAgent": "fake"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        for frame in [
+            json!({"method":"thread/started", "params":{"thread":{"id":"thread-main", "status":{"type":"idle"}}}}),
+            json!({"method":"turn/started", "params":{"threadId":"thread-main", "turn":{"id":"turn-failed"}}}),
+            error_frame(
+                "turn-failed",
+                json!({"responseStreamDisconnected":{"httpStatusCode":null}}),
+                true,
+            ),
+            json!({"method":"thread/status/changed", "params":{"threadId":"thread-main", "status":{"type":"systemError"}}}),
+            error_frame("turn-failed", json!("other"), false),
+            json!({"method":"turn/completed", "params":{"threadId":"thread-main", "turn":{"id":"turn-failed", "status":"failed", "error":{"codexErrorInfo":"other"}}}}),
+        ] {
+            write_json_message(&mut websocket, &frame).unwrap();
+        }
+        // Wait for the test to inspect the terminal record before admitting more work.
+        finished_rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap();
+        let filename = message::send_to_inbox(
+            &server_config.inbox,
+            "h.sender",
+            None,
+            None,
+            &[],
+            "next turn",
+        )
+        .unwrap();
+        loop {
+            let request = read_json_message(&mut websocket).unwrap().unwrap();
+            match request["method"].as_str().unwrap() {
+                "account/read" => write_json_message(&mut websocket, &json!({"id":request["id"], "result":{"account":{"type":"apiKey"}}})).unwrap(),
+                "thread/read" => write_json_message(&mut websocket, &json!({"id":request["id"], "result":{"thread":{"id":"thread-main", "status":{"type":"systemError"}, "turns":[]}}})).unwrap(),
+                "turn/start" => {
+                    assert_eq!(request["params"]["threadId"], "thread-main");
+                    write_json_message(&mut websocket, &json!({"id":request["id"], "result":{"turn":{"id":"turn-next"}}})).unwrap();
+                    for frame in [
+                        json!({"method":"turn/started", "params":{"threadId":"thread-main", "turn":{"id":"turn-next"}}}),
+                        json!({"method":"item/completed", "params":{"threadId":"thread-main", "turnId":"turn-next", "item":{"type":"userMessage", "id":"item-next", "clientId":request["params"]["clientUserMessageId"], "content":[]}}}),
+                        json!({"method":"thread/status/changed", "params":{"threadId":"thread-main", "status":{"type":"idle"}}}),
+                        json!({"method":"turn/completed", "params":{"threadId":"thread-main", "turn":{"id":"turn-next", "status":"completed"}}}),
+                    ] {
+                        write_json_message(&mut websocket, &frame).unwrap();
+                    }
+                    // Keep the connection open until the completed turn has been inspected.
+                    finished_rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap();
+                    return filename;
+                }
+                other => panic!("unexpected request: {other}"),
+            }
+        }
+    });
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream).unwrap().unwrap();
+    let control_path = tmp.path().join("state/control-state.json");
+    let pump_path = control_path.clone();
+    let binding_path = tmp.path().join("state/binding.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_path,
+            &pump_path,
+            &runtime,
+            None,
+            Some(config),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+    });
+    assert!(matches!(
+        rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
+        ControlEvent::Bound
+    ));
+    // Each transition is published before Observed is sent: initial idle, active,
+    // system-error hold, then terminal completion. Reading on an earlier event can race it.
+    for _ in 0..4 {
+        assert!(matches!(
+            rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
+            ControlEvent::Observed
+        ));
+    }
+    let state: CodexControlState =
+        serde_json::from_slice(&fs::read(&control_path).unwrap()).unwrap();
+    assert!(matches!(
+        state.observed(),
+        CodexObservedState::TerminalError { .. }
+    ));
+    let failed = observed_record(&agent_dir);
+    let failed_state = failed.state;
+    let failed_reason = failed.reason.clone();
+    let failed_diagnostic = turn_diagnostic(&agent_dir);
+    finished_tx.send(()).unwrap();
+    // The next turn publishes active, then idle. Its successful completion restates idle.
+    for _ in 0..2 {
+        assert!(matches!(
+            rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
+            ControlEvent::Observed
+        ));
+    }
+    let recovered = observed_record(&agent_dir);
+    finished_tx.send(()).unwrap();
+    let filename = server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
+    assert_eq!(
+        failed_state,
+        harness_state::Activity::Idle,
+        "a failed network turn must not end the incarnation"
+    );
+    assert_eq!(failed_reason.as_deref(), Some("connection"));
+    let driver_diagnostic::Observed::Failure(failure) = failed_diagnostic else {
+        panic!("the completed connection failure must retain its diagnostic")
+    };
+    assert_eq!(failure.reason, driver_diagnostic::Reason::TurnConnection);
+    assert_eq!(recovered.state, harness_state::Activity::Idle);
+    assert_eq!(recovered.reason, None);
+    assert_eq!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Absent
+    );
+    assert_eq!(
+        ledger_entry(tmp.path(), &filename).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+}
+
+#[test]
+fn retryable_connection_projection_requires_a_completed_turn_and_typed_evidence() {
+    for final_error in [
+        None,
+        Some(json!("other")),
+        Some(json!("internalServerError")),
+        Some(json!("responseStreamDisconnected")),
+        Some(json!("futureFatalError")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::Active {
+            turn_id: "turn-a".into(),
+        });
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &error_frame("turn-a", json!("responseStreamDisconnected"), true),
+        );
+        assert_eq!(
+            observed_record(&agent_dir).state,
+            harness_state::Activity::Active,
+            "Codex owns retries while the turn is active"
+        );
+        if let Some(info) = final_error.as_ref() {
+            pump_frame(
+                &mut state,
+                &mut delivery,
+                &error_frame("turn-a", info.clone(), false),
+            );
+        }
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &json!({"method":"thread/status/changed", "params":{"threadId":"thread-main", "status":{"type":"systemError"}}}),
+        );
+        assert!(matches!(
+            state.observed(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                ..
+            }
+        ));
+        assert!(delivery.maybe_request(&state).unwrap().is_none());
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &json!({"method":"turn/completed", "params":{"threadId":"thread-main", "turn":{"id":"turn-a", "status":"failed"}}}),
+        );
+        let observation = observed_record(&agent_dir);
+        let retryable = final_error.is_none() || final_error == Some(json!("other"));
+        assert_eq!(
+            observation.state,
+            if retryable {
+                harness_state::Activity::Idle
+            } else {
+                harness_state::Activity::Ended
+            }
+        );
+        assert_eq!(
+            observation.reason.as_deref(),
+            Some(if retryable {
+                "connection"
+            } else if final_error == Some(json!("internalServerError")) {
+                "internal"
+            } else if final_error == Some(json!("responseStreamDisconnected")) {
+                "connection"
+            } else {
+                "unclassified"
+            })
+        );
+    }
+}
+
+#[test]
+fn non_retryable_and_foreign_turn_errors_cannot_inherit_connection_recovery() {
+    for (retry, final_turn) in [(false, "turn-a"), (true, "turn-other")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::Active {
+            turn_id: "turn-a".into(),
+        });
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &error_frame("turn-a", json!("responseStreamDisconnected"), retry),
+        );
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &error_frame(final_turn, json!("other"), false),
+        );
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &json!({"method":"thread/status/changed", "params":{"threadId":"thread-main", "status":{"type":"systemError"}}}),
+        );
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &json!({"method":"turn/completed", "params":{"threadId":"thread-main", "turn":{"id":"turn-a", "status":"failed"}}}),
+        );
+        let observation = observed_record(&agent_dir);
+        assert_eq!(observation.state, harness_state::Activity::Ended);
+        assert_eq!(observation.reason.as_deref(), Some("unclassified"));
+    }
+}
+
+#[test]
+fn transcript_proven_completion_keeps_the_retryable_connection_class() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "next").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-a".into(),
+    });
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("responseStreamDisconnected"), true),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("other"), false),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method":"thread/status/changed", "params":{"threadId":"thread-main", "status":{"type":"systemError"}}}),
+    );
+    let mut delivery = Some(delivery);
+    let (events, received) = mpsc::channel();
+    recover_transcript_turn_from_frames(
+        &mut state,
+        &mut delivery,
+        &[
+            json!({"type":"event_msg", "payload":{"type":"task_started", "turn_id":"turn-a"}}),
+            json!({"type":"event_msg", "payload":{"type":"task_complete", "turn_id":"turn-a", "error":{"codex_error_info":"other"}}}),
+        ],
+        &tmp.path().join("control-state.json"),
+        &events,
+    ).unwrap();
+    assert!(matches!(
+        received.try_recv().unwrap(),
+        ControlEvent::Observed
+    ));
+    let observation = observed_record(&agent_dir);
+    assert_eq!(observation.state, harness_state::Activity::Idle);
+    assert_eq!(observation.reason.as_deref(), Some("connection"));
+    assert_eq!(
+        delivery
+            .as_mut()
+            .unwrap()
+            .maybe_request(&state)
+            .unwrap()
+            .unwrap()["method"],
+        "turn/start"
+    );
+}
 #[test]
 fn an_error_with_no_optional_codex_error_info_reports_an_unclassified_failure() {
     // The generated ErrorNotification schema requires error/threadId/turnId/willRetry;

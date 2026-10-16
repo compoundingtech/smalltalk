@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -44,7 +45,7 @@ import traceback
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.dont_write_bytecode = True
-from st_boundary import fresh_seat_findings, output_findings
+from st_boundary import fresh_seat_findings, isolated_path, output_findings
 from st3_test_evidence import register, capture, write_json
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
@@ -87,7 +88,10 @@ def install_stub(bin_dir, harness):
     if not interpreter:
         raise SystemExit(f"{harness}'s stand-in needs {'node' if harness in ('pi', 'omp') else 'python3'} on PATH")
     wrapper = bin_dir / harness
-    wrapper.write_text(f'#!/bin/sh\nexec env PYTHONDONTWRITEBYTECODE=1 STUB_HARNESS={harness} "{interpreter}" "{HERE / script}" "$@"\n')
+    shell = shutil.which("bash")
+    if not shell:
+        raise SystemExit("bash must be on PATH")
+    wrapper.write_text(f'#!{shell}\nexport PYTHONDONTWRITEBYTECODE=1 STUB_HARNESS={harness}\nexec {shlex.quote(interpreter)} {shlex.quote(str(HERE / script))} "$@"\n')
     wrapper.chmod(0o755)
 
 
@@ -109,9 +113,12 @@ class Node:
                 raise SystemExit(f"{tool} must be on PATH")
             (root / "bin" / tool).symlink_to(executable)
         install_stub(root / "bin", harness)
-        self.path = f"{root / 'bin'}:/usr/bin:/bin"
+        self.path = isolated_path(root / "bin")
+        shell = shutil.which("bash", path=self.path)
+        if not shell:
+            raise SystemExit("bash must be on the isolated PATH")
         self.endpoint = root / "run/st.sock"
-        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": "/bin/bash",
+        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": shell,
                     "USER": os.environ.get("USER", "eval"), "LOGNAME": os.environ.get("USER", "eval"),
                     "LANG": "C.UTF-8", "XDG_STATE_HOME": str(root / "home/.local/state"),
                     "XDG_CONFIG_HOME": str(root / "home/.config"),
@@ -119,7 +126,7 @@ class Node:
                     "XDG_RUNTIME_DIR": str(root / "run"), "ST3_ENDPOINT": str(self.endpoint),
                     "ST3_DAEMON_WAIT": "0"}
         # The daemon rebuilds PATH from a login shell; pin it to the isolated one.
-        profile = f"export PATH='{self.path}'\n"
+        profile = f"export PATH={shlex.quote(self.path)}\n"
         for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
             (root / "home" / name).write_text(profile)
         (root / "config.toml").write_text(f'''node = "canary"
@@ -422,6 +429,22 @@ def native_sessions(node, letter):
     return found
 
 
+def stage_symlinked_inventory(node, harness, session):
+    """Make the suspended seat's omp transcript what st stages for an authored one: an
+    individual-file symlink in the inventory, the file itself kept elsewhere (st2#3021)."""
+    if harness != "omp":
+        return None
+    found = list((node.root / "state").rglob(f"provider-sessions/*_{session}.jsonl"))
+    if len(found) != 1 or found[0].is_symlink():
+        fail(f"expected one regular omp transcript for {session}, found {found}")
+    authored = node.root / "authored-transcripts"
+    authored.mkdir(exist_ok=True)
+    kept = authored / found[0].name
+    os.replace(found[0], kept)
+    found[0].symlink_to(kept)
+    return found[0]
+
+
 def forget_native_session(node, harness, session):
     """Remove what the harness resumes `session` from, as a lost transcript would."""
     home = node.root / "home"
@@ -509,6 +532,9 @@ def suspend_and_resume(node, seats, harness):
     until(lambda: not node.seat_processes(), 60, "a suspended seat still has processes: "
           + json.dumps(node.seat_processes()))
 
+    staged = stage_symlinked_inventory(node, harness, native)
+    starts_before = len([row for row in receipts(node, "a") if row.get("event") == "started"])
+
     # Mail to a suspended seat waits, and its restart policy does not wake it.
     sent = node.json("conversations", "send", subject, "--from", "person/eval",
                      "--subject", "while suspended", "--body", "boot canary suspended")["subject"]
@@ -531,6 +557,17 @@ def suspend_and_resume(node, seats, harness):
     latest = native_sessions(node, "a")[-1]
     if latest != (native, True):
         fail(f"the resumed harness ran {latest}, not session {native} resumed")
+    if staged is not None:
+        # omp's session-ID lookup does not follow symlinks, so only the path st checked finds it.
+        started = [row for row in receipts(node, "a") if row.get("event") == "started"]
+        if len(started) <= starts_before:
+            fail("the resumed omp launch left no start receipt")
+        argv = started[-1].get("argv") or []
+        selected = argv[argv.index("--resume") + 1] if "--resume" in argv[:-1] else None
+        if not selected or Path(selected).name != staged.name or Path(selected).parent.name != "provider-sessions":
+            fail(f"the resumed omp was not given the staged transcript path {staged}: {argv}")
+        if not Path(selected).is_symlink():
+            fail(f"the staged transcript {selected} is no longer the symlink the control installed")
     # Recent never-offered mail survives the boot, while hour-old mail stays listable.
     until(lambda: (node.api("/v1/messages/read/" + recent) or {}).get("status") in ("read", "closed"),
           seats.bound, "the resumed seat did not recover recent unoffered mail")
@@ -653,7 +690,7 @@ def claude_attachment(node, seats, mode):
     control = node.root / "ws/claude-channel-mode"
     control.write_text("missing-once" if mode == "missing" else mode)
     old = seats.incarnations["a"]
-    node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
     early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
                       "--subject", "early attachment probe", "--body", "mail immediately after restart")["subject"]
 
@@ -697,7 +734,7 @@ def claude_attachment(node, seats, mode):
             fail(f"channel recovery replayed a boot probe: {probe}")
     # Restart twice more and send within startup, while retaining the first probe's proof.
     for index in range(2):
-        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+        node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
         fresh = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
                           "--subject", f"immediate probe {index}", "--body", "early fresh mail")["subject"]
         seats.prove(f"channel-restart-{index}")
@@ -714,21 +751,28 @@ def claude_attachment(node, seats, mode):
 def claude_channel_parked(node, seats):
     """A permanently missing channel exhausts a durable budget and keeps mail held."""
     (node.root / "ws/claude-channel-mode").write_text("missing")
-    node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
     early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
                       "--subject", "parked attachment probe", "--body", "mail while unattached")["subject"]
     processes = until(
         lambda: replacement_processes(node, seat_subject("a"), seats.incarnations["a"]),
         seats.bound, "the replacement generation never supplied fresh seat processes")
     check_boundary(node, processes=processes)
-    until(lambda: parked(node, seat_subject("a")), 180, "permanent channel failure never parked")
-    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
-          10, "parked channel failure lost its visible reason")
 
     def attempts():
         claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=500") or {}).get("claims", [])
         return [row for row in claims if row.get("kind") == "runtime.action.requested"
                 and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+
+    # Each incarnation needs the driver's 20 s detection window, then the reconciler's
+    # 10/20/40 s backoff, then a restart: about 170 s in all before any load. Bound each
+    # recovery step on its own event, not the whole schedule by one wall-clock budget.
+    for attempt in range(1, 4):
+        until(lambda: len(attempts()) >= attempt, seats.bound,
+              f"channel recovery attempt {attempt} was never requested")
+    until(lambda: parked(node, seat_subject("a")), seats.bound, "permanent channel failure never parked")
+    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
+          10, "parked channel failure lost its visible reason")
 
     if len(attempts()) != 3:
         fail(f"channel failure used {len(attempts())} recovery attempts, expected three")
@@ -803,16 +847,37 @@ def idle_delivery_control(node, seats):
     def read(reference):
         return (node.api("/v1/messages/read/" + reference) or {}).get("status") in ("read", "closed")
 
-    def calls():
+    def counts():
         result = subprocess.run(["curl", "-sf", "--max-time", "10", "--unix-socket", str(node.endpoint),
                                  "-H", "x-st3-person: person/eval",
                                  "http://localhost/v1/client/request-latency"],
                                 capture_output=True, text=True, check=True)
         report = json.loads(result.stdout)["value"]
-        return sum(row["count"] for row in report["routes"] if row["route"] == "/v1/delivery/hold")
+        return {route: sum(row["count"] for row in report["routes"] if row["route"] == route)
+                for route in ("/v1/delivery/hold", "/v1/mailbox/receipts")}
 
-    # Let the boot receipt settle before measuring. Its permit must expire without fresh mail.
-    time.sleep(4)
+    def calls():
+        return counts()["/v1/delivery/hold"]
+
+    # Let the boot mail settle before measuring: the driver renews its hold permit every tick
+    # while any offered message still waits, and a message stays waiting for the driver until
+    # its own receipts land. Wait until each offered message is read, then for one permit lease
+    # (3 s) plus a tick with neither a hold read nor a driver receipt, instead of a fixed pause
+    # that a slow daemon outlasts.
+    def offered():
+        return {"message/" + row["text"].split('<smalltalk-message id="', 1)[1].split('"', 1)[0]
+                for row in receipts(node, "a")
+                if row.get("event") == "turn" and '<smalltalk-message id="' in row.get("text", "")}
+
+    until(lambda: offered() and all(read(reference) for reference in offered()), seats.bound,
+          "boot mail was never read")
+
+    def quiet():
+        first = counts()
+        time.sleep(4)
+        return counts() == first
+
+    until(quiet, seats.bound, "the driver kept reading delivery hold after boot mail was read")
     original = set(driver_processes(node))
     before = calls()
     start = time.monotonic()
@@ -831,19 +896,22 @@ def idle_delivery_control(node, seats):
         return node.json("conversations", "send", subject, "--from", "person/eval",
                          "--subject", label, "--body", label)["subject"]
 
+    # Each delivery waits on its event within the phase bound. That the first mail after the
+    # minute gets its permit at once, not after a poll, now rests on the idle minute alone (no
+    # hold poll runs); after_idle_seconds records the latency. The hold below outlasts the
+    # bound, so only its release can deliver the held message, and only expiry the last one.
     def finish(reference, label):
         start = time.monotonic()
-        until(lambda: read(reference), 10, label + " did not reach consumption/read")
+        until(lambda: read(reference), seats.bound, label + " did not reach consumption/read")
         measured[label + "_seconds"] = round(time.monotonic() - start, 3)
         until(lambda: sum(row.get("event") == "read" and row.get("reference") == reference
                           for row in receipts(node, "a")) == 1,
-              10, label + " has no unique native read receipt")
+              seats.bound, label + " has no unique native read receipt")
 
-    # First mail after the minute must obtain a fresh permit immediately, not wait for a poll.
     fresh = send("after-idle")
     finish(fresh, "after_idle")
-    node.cli("agents", "hold", subject, "--for", "30s", "--reason", "fixture quiet interval",
-             "--as", "person/eval")
+    node.cli("agents", "hold", subject, "--for", f"{int(seats.bound) + 60}s",
+             "--reason", "fixture quiet interval", "--as", "person/eval")
     held = send("held-delivery")
     time.sleep(4)
     if read(held) or any(row.get("reference") == held for row in receipts(node, "a")):
@@ -851,11 +919,17 @@ def idle_delivery_control(node, seats):
     node.cli("agents", "hold", subject, "--release", "--reason", "fixture release", "--as", "person/eval")
     finish(held, "released")
     node.cli("agents", "hold", subject, "--for", "4s", "--reason", "fixture expiry", "--as", "person/eval")
+    claims = (node.api("/v1/claims?subject=" + subject + "&limit=500") or {}).get("claims", [])
+    hold = max((row for row in claims if row.get("kind") == "delivery.hold"),
+               key=lambda row: row.get("store_index", 0))["body"]["fields"]
     expiry = send("expiry-delivery")
-    time.sleep(1)
-    if read(expiry) or any(row.get("reference") == expiry for row in receipts(node, "a")):
-        fail("a message reached the native provider before hold expiry")
     finish(expiry, "expired")
+    # A slow send can outlast a 4 s hold, so compare the provider's turn with the recorded
+    # expiry instead of checking a fixed second after sending.
+    turns = [row["at"] for row in receipts(node, "a")
+             if row.get("event") == "turn" and expiry.removeprefix("message/") in row.get("text", "")]
+    if not hold.get("held") or not turns or min(turns) * 1000 < hold["until_unix_ms"]:
+        fail(f"a message reached the native provider before hold expiry: {hold} {turns}")
     time.sleep(3)
     counts = Counter(row.get("reference") for row in receipts(node, "a") if row.get("event") == "read")
     for reference in seats.read_probes | {fresh, held, expiry}:
@@ -893,11 +967,11 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
     if name == "import":
         native, origin = node.import_selection
         prove_codex_import(node, seats, native, origin)
-        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval")
+        node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval")
         seats.prove("import-restart")
         prove_codex_import(node, seats, native, origin)
     elif name in ("restart", "access-auto", "access-bypass"):
-        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+        node.cli("agents", "restart", seat_subject("a"), "--now", "--as", "person/eval", check=False)
         seats.prove("restart")
         continued_session(node, "restart")
     elif name == "daemon-restart":

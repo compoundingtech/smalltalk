@@ -238,7 +238,11 @@ A mission can contain direct declarations. Direct agents in the mission can revi
 A mission can contain zero steps. Missions default to `completion { when "all-steps-exhausted" }`,
 so a zero-step mission completes immediately.
 
-`timeout` is optional for an ordinary mission. It starts when the mission run is created and applies to the complete run, not one step or generation. A revision cannot extend or reset the stored deadline.
+`timeout` is optional for an ordinary mission and counts run time from admission. A direct
+run is admitted at creation. A run started with `after` retains its timeout budget while it
+waits, with no armed deadline; completing its synthetic `after-run` step admits it and arms
+the full budget from that completion. The timeout covers the complete run. Retries and
+revisions cannot extend or reset an armed deadline.
 
 The daemon arms an exact wake for the nearest deadline. It does not depend on a client process or periodic polling. At expiry, st fails the run, terminates descendant runs, skips remaining normal and final work, removes run-owned runtime state, and records the timeout as the eval failure reason when the run is an eval.
 
@@ -2219,3 +2223,26 @@ The planning-mode eval uses one real Codex planner. A controller waits on the ev
 The launch variant and stale-generation paths are deterministic API tests. They do not spend a model run.
 
 The run-generation revision eval proves an approved cutover, lineage, state carry-over, and automatic generation context. It uses no model run.
+
+
+Admission deadlines use projection definition version 3. Replication still advertises every
+shared-table digest and admits signed claims across builds; comparisons skip a table only
+when its definition versions differ. Other compatible tables remain checked. An older
+member uses its existing layout comparison to avoid graph heals against this definition.
+Current claims sync never repairs a projection from a peer; comparisons remain diagnostic.
+Operations upgrades each reachable member normally and records that older owners still
+count timeout from creation until upgraded; deployment never waits for an offline member.
+
+Back up before upgrading. The deadline table rebuild is not reversible in place. Replacing
+this build with an older binary over a nullable deadline table is unsupported: the older
+active-deadline read fails with `Invalid column type Null`. Recover forward, or use an
+Operations plan that accounts for claims accepted after the pre-upgrade backup.
+
+An admitted run whose retained after-run completion history is unavailable keeps its admission time unknown and raises a `Run admission time unavailable` fault: its timeout is not armed. Restore its original admission history and rebuild the projection, or cancel the run; duplicate completions and retries cannot restart that budget. Corrupt accepted timestamps stop opening with run-specific context and leave the previous deadline table intact.
+
+Current pending work names `daemon/runtime` as the owner of readiness evaluation in its
+operational reasons, including runs that have already completed other steps. This waiter
+is visible from read-only work detail and history reads even while the store writer is busy.
+It does not claim dependency predicates have been evaluated. Existing blockers remain
+visible. The waiter disappears on promotion and is excluded for terminal, superseded and
+cleanup owners. Readiness priority is unchanged.

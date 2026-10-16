@@ -51,6 +51,11 @@ pub struct World {
     /// contract while empty: the phone shows this on its own.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale: Vec<String>,
+    /// Peers whose newer records this host has not received yet, each as st words it: what shows
+    /// here is that much behind and can be out of date until it has caught up. Left out of the
+    /// shared contract while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behind: Vec<String>,
     /// Whether the missions window is followed now. Not part of the shared contract.
     #[serde(skip)]
     pub missions_followed: bool,
@@ -358,6 +363,7 @@ pub enum AgentState {
     /// details say since when. Never shown as starting or working.
     Down,
     Stopped,
+    Retired,
     Unknown,
 }
 
@@ -382,6 +388,10 @@ pub struct Agent {
     /// The subagents its harness runs now, oldest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<Subagent>,
+    /// st's own state for an agent when this host's st is too old to serve its presentation.
+    /// The client shows it as reported and derives nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported: Option<String>,
 }
 
 /// A subagent an agent's harness runs inside its own session. It belongs to the agent and is not

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { keyBetween, folderCreate, placeResource, moveFolder, folderLocation, folderName, sidebarArrangement, sidebarSubject, uuid7 } from './sidebarEdits.ts';
+import { keyBetween, folderCreate, placeResource, moveFolder, folderLocation, folderName, sidebarArrangement, sidebarRetired, sidebarSubject, uuid7 } from './sidebarEdits.ts';
+import { ClientError } from '../../clients/typescript/st3-client/index.ts';
 const valid = key => /^[A-Za-z][0-9A-Za-z]+$/.test(key) && key.length <= 128 && key.length >= (key[0] >= 'a' ? key.charCodeAt(0) - 95 : 92 - key.charCodeAt(0)) && (key.length === (key[0] >= 'a' ? key.charCodeAt(0) - 95 : 92 - key.charCodeAt(0)) || !key.endsWith('0'));
 for (const [low, high] of [[null, null], [null, 'a0'], ['a0', null], ['Zz', 'a0'], ['a0', 'a1'], ['a0', 'a0V'], ['a0V', 'a1'], ['azz', 'b00'], ['Z0', 'Z1'], ['Yzz', 'Z0'], [null, 'Z0']]) {
   const key = keyBetween(low, high); assert.ok(valid(key), key); assert.ok(low === null || low < key); assert.ok(high === null || key < high);
@@ -41,3 +42,9 @@ assert.ok(unfiled.find(op => op.subject === 'agent/new').key < unfiled.find(op =
 for (const name of ["", "  ", "a\n", "a\u0085b", "é".repeat(129)]) assert.throws(() => folderName(name));
 assert.equal(folderName(" é "), "é");
 assert.equal(folderName("é".repeat(128)).length, 128);
+
+// A retired Sidebar is learned from st's refusal to create it again.
+const refused = code => new ClientError({ api_version: 'st3.client.v0', error_version: 'st3.client.error.v0', request_id: 'request/x', code, message: 'm', retryable: false, details: {} }, 409);
+assert.equal(sidebarRetired(refused('arrangement-retired')), true);
+assert.equal(sidebarRetired(refused('arrangement-exists')), false);
+assert.equal(sidebarRetired(new Error('offline')), false);

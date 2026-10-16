@@ -2,16 +2,17 @@ import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { colorVars as c, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 import type { AgentRowData, AgentStatus, FolderGroupData } from '../composition-model'
+import { Icon } from './Icons'
 
 const spin = stylex.keyframes({ to: { transform: 'rotate(360deg)' } })
 
 /** One glyph per agent/run state; color lives on the glyph only. */
 export function StatusGlyph({ status, elapsed }: { status: AgentStatus; elapsed?: string }) {
-  const mark = status === 'done' ? '✓' : status === 'attention' ? '!' : status === 'failed' ? '✕' : status === 'input' ? '…' : ''
+  const mark = status === 'done' ? 'check' : status === 'attention' ? 'alert' : status === 'failed' ? 'x' : status === 'input' ? 'message' : undefined
   const dot = status === 'working' ? styles.dotWorking : status === 'done' ? styles.dotDone : status === 'attention' ? styles.dotAttention : status === 'failed' ? styles.dotFailed : status === 'input' ? styles.dotInput : styles.dotIdle
   return <span data-status={status} title={status} {...stylex.props(styles.glyphWrap)}>
     <span {...stylex.props(styles.glyphDot, dot)}>
-      {mark}
+      {mark === undefined ? null : <Icon name={mark} size={8} />}
       {status === 'working' ? <span aria-hidden="true" {...stylex.props(styles.glyphRing)} /> : null}
     </span>
     {elapsed ? <span {...stylex.props(styles.glyphElapsed)}>{elapsed}</span> : null}
@@ -37,7 +38,7 @@ export function FolderGroup({ group, activeId, onSelect }: { group: FolderGroupD
     <button type="button" aria-expanded={open} onClick={() => setOpen(value => !value)} {...stylex.props(styles.groupHeader)}>
       <span {...stylex.props(styles.groupLabel)}>{group.label}</span>
       <span aria-hidden="true" {...stylex.props(styles.groupRule)} />
-      <span aria-hidden="true" {...stylex.props(styles.groupChevron, open && styles.groupChevronOpen)}>▾</span>
+      <span aria-hidden="true" {...stylex.props(styles.groupChevron, open && styles.groupChevronOpen)}><Icon name="chevron-down" size={12} /></span>
     </button>
     {open ? <div {...stylex.props(styles.groupRows)}>{group.rows.map(row => <AgentRow key={row.id} row={row} active={row.id === activeId} onSelect={() => onSelect(row.id)} />)}</div> : null}
   </section>
@@ -108,7 +109,7 @@ const styles = stylex.create({
   footer: { height: 40, display: 'flex', alignItems: 'center', gap: s.xs, paddingInline: s.lg, flexShrink: 0 },
   ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.sidebarFgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
   ghostLg: { width: 32, height: 32, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.sidebarFgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
-  dotIdle: { backgroundColor: c.fgFaint },
+  dotIdle: { backgroundColor: c.fgMuted },
   dotWorking: { backgroundColor: c.running },
   dotDone: { backgroundColor: c.done, color: c.sidebar },
   dotAttention: { backgroundColor: c.attention, color: c.sidebar },

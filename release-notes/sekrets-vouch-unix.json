@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "`st sekrets` refuses an http(s) --endpoint or ST3_ENDPOINT with a clear error, since only this host's own daemon, over its Unix socket, may vouch for a seat and supply the node key `enable` registers. The sekrets doc says how the daemon is found.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim kind or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or graph schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No smallclaims rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Client-side only. An http(s) endpoint was never a working vouching daemon for sekrets; it now fails before connecting instead of after. Unix-socket endpoints and the unset case are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or migration."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to do on upgrade."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

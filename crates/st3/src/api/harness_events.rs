@@ -52,6 +52,36 @@ pub(super) async fn prompt_state(
     Ok(Json(prompt))
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct PromptAnswerQuery {
+    agent: String,
+    /// The claim that raised the prompt or denial.
+    episode: String,
+}
+
+/// The person's answer to a prompt or denial the seat's hook raised, once recorded. A hook asks
+/// its own host's daemon, which holds the answer once it replicates.
+pub(super) async fn prompt_answer(
+    State(state): State<AppState>,
+    Query(query): Query<PromptAnswerQuery>,
+) -> Result<Json<crate::store::PromptAnswer>, ApiError> {
+    let store = state.store.clone();
+    let answer = blocking_action(move || {
+        // Only an episode of this seat answers its hook.
+        let claim = store
+            .claim_by_id(&query.episode)
+            .map_err(|error| St3Error::new("internal", format!("{error:#}")))?;
+        if claim.is_none_or(|claim| claim.subject != query.agent) {
+            return Ok(crate::store::PromptAnswer { answer: None });
+        }
+        store
+            .prompt_answer(&query.episode)
+            .map_err(|error| St3Error::new("internal", format!("{error:#}")))
+    })
+    .await?;
+    Ok(Json(answer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

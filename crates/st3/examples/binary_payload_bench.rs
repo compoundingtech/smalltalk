@@ -248,14 +248,6 @@ fn main() -> anyhow::Result<()> {
         (process_time() - cpu_started).as_secs_f64() * 1000.0
     );
     target.project_replication_backlog()?;
-    let cpu_started = process_time();
-    let started = Instant::now();
-    target.readmit_envelopes(&origin, &exchange.envelopes)?;
-    println!("heal_ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-    println!(
-        "heal_cpu_ms={:.3}",
-        (process_time() - cpu_started).as_secs_f64() * 1000.0
-    );
     Ok(())
 }
 

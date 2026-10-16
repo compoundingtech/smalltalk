@@ -25,8 +25,39 @@ WORKFLOW = 'release-smalltalk.yml'
 SEMVER = re.compile(r'v(\d+)\.(\d+)\.(\d+)')
 
 
+DIAGNOSTIC_LIMIT = 2000
+# GitHub token shapes, authorization headers and bearer credentials. Ordinary words such as "token"
+# stay readable, because the cause is often a permission message. The actual token in the
+# environment is also removed by value, whatever shape it has.
+SECRET = re.compile(r'(?i)\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}|'
+                    r'\bauthorization\s*[:=][^\n]*|'
+                    r'\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}')
+
+
+class CommandFailed(Exception):
+    """A command failed; the message names the command and the cause it printed."""
+
+
+def diagnostic(text):
+    """The end of a command's output, credential-safe and bounded; the cause is printed last."""
+    for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
+        value = os.environ.get(name)
+        if value and len(value) >= 8:
+            text = text.replace(value, '***')
+    text = SECRET.sub('***', text).strip()
+    if len(text) > DIAGNOSTIC_LIMIT:
+        text = '...' + text[-DIAGNOSTIC_LIMIT:]
+    return text
+
+
 def run(*cmd, cwd=None):
-    return subprocess.run(cmd, check=True, text=True, capture_output=True, cwd=cwd).stdout.strip()
+    done = subprocess.run(cmd, check=False, text=True, capture_output=True, cwd=cwd)
+    if done.returncode != 0:
+        # Name the command by its program and subcommands, never its other arguments.
+        words = [word for word in cmd[:3] if re.fullmatch(r'[a-z][a-z0-9-]*', word)]
+        cause = diagnostic(done.stderr) or diagnostic(done.stdout) or 'no output'
+        raise CommandFailed(f'{" ".join(words)} exited {done.returncode}: {cause}')
+    return done.stdout.strip()
 
 
 def say(message):
@@ -107,5 +138,13 @@ def main():
     return 0
 
 
+def entry():
+    try:
+        return main()
+    except CommandFailed as error:
+        say(str(error))
+        return 1
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(entry())

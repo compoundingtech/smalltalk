@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui and the phone keep a refused message in the box, show the size limit before send, and sign messages past 8 KiB in the long form; the phone reads a long message whole",
+  "replay": {
+    "status": "none",
+    "detail": "No projection or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No claim field, table or index is added."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and admission rules are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The Rust device signer (st devices, stui on a paired profile) signs a message past 8 KiB over its preview, the whole text's hash and its length, the form the daemon already requires since long message bodies; messages up to 8 KiB are signed as before (new vector case 'long' in device-signing-v1.json). stui reads limits.max_message_bytes from capabilities when the daemon states it and blocks an over-limit send before it leaves; an older daemon that states none blocks nothing and its refusal brings the text back to the box. A conversation shows a long message's preview with a note that says where the rest is read. The phone signs a message past 8 KiB the same way (same vector), keeps the text in the box on any refused send with a plain reason, and reads the whole text of a long message from the member that took it. A phone paired with a daemon that predates long messages is told in words that the daemon takes 4 KiB."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Rolling back stui or the phone restores the earlier behaviour: a refused message stays in the conversation as a failed message with resend and forget."
+  }
+}

@@ -76,6 +76,7 @@ pub fn change_keys(change: &Change) -> Vec<String> {
             keys.extend(field("root_mission_run").map(|root| format!("children:{root}")));
             keys.extend(field("parent_step_run").map(|step| format!("children-of-step:{step}")));
         }
+        "agent.retired" => keys.push("kind:intent.desired".into()),
         "owned-set.revised" => {
             keys.push("kind:intent.desired".into());
             if let Ok(body) = serde_json::from_str::<Value>(&change.body) {
@@ -109,7 +110,7 @@ pub fn change_keys(change: &Change) -> Vec<String> {
         }
         _ => {}
     }
-    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised")
+    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised" | "agent.retired")
         && keys.iter().any(|key| key.starts_with("agent/"))
     {
         keys.push("desired-kind:agent".into());
@@ -554,6 +555,9 @@ mod tests {
 
     #[test]
     fn a_change_marks_only_the_items_that_read_it() {
+        let retirement = change_keys(&change("agent/a", "agent.retired", None, "{}"));
+        assert!(retirement.contains(&"kind:intent.desired".to_owned()));
+        assert!(retirement.contains(&"desired-kind:agent".to_owned()));
         let incremental = Incremental::default();
         incremental.evaluated(
             "mission-run/a",

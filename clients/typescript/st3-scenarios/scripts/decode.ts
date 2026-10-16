@@ -6,11 +6,16 @@
  */
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 
 import * as Schema from '@smalltalk/st3-client/schema'
 
 import { ANCHOR_MS, catalog, loadWorld, SLICE_KINDS, wireValues, type AnySlice, type SliceKind, type World } from '../src/index.ts'
 import { FIXTURES_DIR, SLICE_FORMAT, type SliceFile } from './emit.ts'
+import { decodeRecording, decodeScript, importRecording, normalizeRecording } from './recordings.ts'
+
+export const RECORDINGS_DIR = fileURLToPath(new URL('../recordings/', import.meta.url))
 
 export interface DecodeFailure {
   readonly world: string
@@ -163,9 +168,36 @@ export const decodeFixtures = (dir: string): DecodeFailure[] =>
     .flatMap((entry) => readdirSync(join(dir, entry.name)).filter((name) => name.endsWith('.json')).sort()
       .flatMap((name) => decodeFile(entry.name, join(dir, entry.name, name))))
 
+/** Validate all three committed inputs independently, freshness, and capture-derived wire slices. */
+export const decodeRecordings = (dir = RECORDINGS_DIR, nows: readonly number[] = [ANCHOR_MS]): DecodeFailure[] => {
+  const failures: DecodeFailure[] = []
+  for (const name of readdirSync(dir).filter((name) => name.endsWith('.script.json')).sort()) {
+    const world = 'recorded-' + name.slice(0, -'.script.json'.length)
+    try {
+      const script = decodeScript(JSON.parse(readFileSync(join(dir, name), 'utf8')))
+      const stem = name.slice(0, -'.script.json'.length)
+      const raw = decodeRecording(readFileSync(join(dir, stem + '.recording.jsonl'), 'utf8'))
+      const oracle = decodeRecording(readFileSync(join(dir, stem + '.normalized.json'), 'utf8'))
+      const normalized = normalizeRecording(script, raw, ANCHOR_MS)
+      if (!isDeepStrictEqual(normalized, oracle)) {
+        failures.push({ world, slice: 'recording', variant: 'default', pointer: '', message: 'normalized recording is stale or corrupt' })
+      }
+      for (const now of nows) {
+        const imported = importRecording(script, normalizeRecording(script, raw, now))
+        for (const kind of SLICE_KINDS) failures.push(...decodeSlice(world, imported.slices[kind]))
+      }
+      const importedOracle = importRecording(script, oracle)
+      for (const kind of SLICE_KINDS) failures.push(...decodeSlice(world, importedOracle.slices[kind]))
+    } catch (error) {
+      failures.push({ world, slice: 'recording', variant: 'default', pointer: '', message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  return failures
+}
+
 if (import.meta.main) {
   const random = ANCHOR_MS + Math.round((Math.random() - 0.5) * 2 * 400 * 365 * 86_400_000)
-  const failures = [...decodeCatalog([ANCHOR_MS, random]), ...decodeFixtures(FIXTURES_DIR)]
+  const failures = [...decodeCatalog([ANCHOR_MS, random]), ...decodeFixtures(FIXTURES_DIR), ...decodeRecordings(RECORDINGS_DIR, [ANCHOR_MS, random])]
   for (const failure of failures) {
     console.error(`${failure.world}/${failure.slice}:${failure.variant} ${failure.pointer}\n  ${failure.message.split('\n').join('\n  ')}`)
   }

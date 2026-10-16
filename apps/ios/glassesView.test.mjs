@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { glassChoices, glassGroups, groupBoxes, groups, paneTarget } from './glassesView.ts';
 
-const agent = (id, name) => ({ id, kind: 'agent', name, state: 'running' });
+const served = (state) => ({ state, group: state, because: null, now: null, next: [], queued: 0 });
+const agent = (id, name) => ({ id, kind: 'agent', name, state: 'running', presentation: served('idle') });
 const mission = (id, title) => ({ id, kind: 'mission', title, state: 'running' });
 const lists = {
   agents: [agent('agent/example/harbor/keeper', 'example/harbor/keeper')],
@@ -30,7 +31,7 @@ assert.deepEqual([audit.kind, audit.title, audit.needsYou], ['mission', 'Audit',
 assert.equal(paneTarget('agent:agent/example/retired', lists).gone, true);
 // Agents and missions carry their state as their own lists mark it (Nathan, 2026-10-02).
 assert.equal(keeper.status?.word, 'idle');
-const busy = paneTarget('agent:agent/example/harbor/keeper', { ...lists, agents: [{ ...lists.agents[0], harness_state: 'working' }] });
+const busy = paneTarget('agent:agent/example/harbor/keeper', { ...lists, agents: [{ ...lists.agents[0], presentation: served('working') }] });
 assert.equal(busy.status?.word, 'working');
 assert.ok(audit.status?.glyph);
 assert.equal(paneTarget('agent:agent/example/retired', lists).status, undefined);

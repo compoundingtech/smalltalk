@@ -21,7 +21,7 @@ case "${1:?usage: scripts/ci-cache-warm tests|clippy|fleet-compat|genie|isolatio
     ;;
   genie) true ;; # nix develop .#genie has already populated the shell.
   isolation-vm)
-    cargo nextest archive --locked -p st2 --test integration --archive-file "$RUNNER_TEMP/isolation.tar.zst"
+    cargo nextest archive --workspace --locked -E "$(python3 scripts/ci-nextest-targets)" --archive-file "$RUNNER_TEMP/isolation.tar.zst"
     nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackages.x86_64-linux.transport-isolation-vm.driver
     ;;
   *) exit 2 ;;

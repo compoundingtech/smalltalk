@@ -162,6 +162,8 @@ mod tests {
             "it is not a security boundary",
             "`\"$ST3_BIN\" agents handoff write --as \"$ST_AGENT\"`",
             "only this seat writes its own",
+            "Prepare for restart",
+            "`\"$ST3_BIN\" agents handoff ready --as \"$ST_AGENT\"`",
             "Session restarted: where you were",
             "carry on from it without waiting to be told",
         ] {

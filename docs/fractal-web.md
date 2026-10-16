@@ -75,6 +75,47 @@ remote site. With CSP enforced the route is never reached and `img-src` reports
 the violation. Browser sessions, listeners and temporary build files are closed
 and removed on exit. There is no production CSP-disable switch.
 
+## Hosting the web app on a tailnet
+
+`apps/fractal-web/server/main.mts` runs the built app for one person. It listens on loopback
+only, and `tailscale serve` publishes it over HTTPS on the tailnet. The server injects one paired
+bearer into every admitted request, so admission is the whole authorization. With a full-control
+pairing, any script running in the app holds that person's full st authority. A request must
+carry an allowed `Tailscale-User-Login`, which `tailscale serve` attaches for tailnet users. Any
+browser `Origin` must be exactly the published origin, and upgrades and unsafe methods must
+carry one. An Origin-less read is refused when the browser's `Sec-Fetch-Site` says another site sent it. Never publish it with Funnel, which carries no tailnet identity. Anything else that
+can reach the loopback port could claim a login, so run it only on a host where every local
+user is already trusted with that person's st.
+
+```sh
+pnpm --dir apps/fractal-web build            # writes dist/web, including build-identity.json
+WF_PORT=7410 \
+WF_PUBLIC_ORIGIN=https://atlas.example.ts.net:8443 \
+WF_TAILNET_LOGINS=river@example.com \
+WF_ST_GATEWAY=$XDG_RUNTIME_DIR/st3-client.sock \
+WF_ST_AUTHORIZATION_FILE=/path/to/paired-bearer \
+  pnpm --dir apps/fractal-web start
+tailscale serve --bg --https=8443 http://127.0.0.1:7410
+```
+
+The settings:
+
+- `WF_ST_GATEWAY` names st's paired client gateway socket, never the privileged `st3.sock`.
+- `WF_ST_AUTHORIZATION_FILE` holds the paired device's bearer. The composer needs a full-control pairing.
+  The host refuses to start unless the file belongs to its user and nobody else can read it.
+- `WF_DIST` defaults to `dist/web`.
+- `WF_HOST` must be a loopback address.
+- `WF_DEPLOYMENT_ID` defaults to the published host.
+
+Before relying on a published endpoint, prove that `tailscale serve` replaces a forged login. A request
+to the published HTTPS address carrying `Tailscale-User-Login: <an allowed login>` from a tailnet
+user who is not on the list must still get `403`. Also check that `tailscale funnel status` shows
+nothing for the port.
+
+The build records `rev`, `dirty`, `commitTs` and `buildTs` from git. The bundle embeds them, and
+the host serves them at `/build-identity.json`. That response names the exact commit that is
+running.
+
 ## Fractal web transcript switch paint
 
 The conversation pane reports `ux.transcriptCommitted(ref)` only after its scoped DOM

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Make the evidence gate's sampling test deterministic: it hashed the checkout's real commit id, so one pull request in about a hundred failed genie-freshness by chance",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this changes one test of a CI script."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No command, frame, scope or stored-format change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent product state changes or new swap-back restrictions."
+  }
+}

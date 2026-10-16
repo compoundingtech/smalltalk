@@ -125,4 +125,13 @@ assert.ok(!isFabricGatewayId('http://100.64.1.2:8443') && !isFabricGatewayId('')
   assert.equal(credentialFor(true, c, 'spare-bearer', 'device-bearer'), 'spare-bearer', 'a member paired on its own gets its own');
   assert.equal(credentialFor(true, b, null, 'device-bearer'), null, 'a member not paired yet gets none, never this device\'s');
   assert.equal(credentialFor(true, null, 'spare-bearer', 'device-bearer'), null, 'a member that cannot be named gets none');
+
+  // A build's default target is the member that uses this device's own pairing (it was the only target before the
+  // list), so a phone paired through its form has it to walk; it is not a member waiting for its own pairing.
+  const { builtFabricMembers } = await import('./fabricTarget.ts');
+  const built = buildFabricDefault(`node=${'d'.repeat(64)}&service=st3-client%2Fdemo`);
+  const opened = builtFabricMembers(built);
+  assert.deepEqual(opened.map(m => [m.name, m.device]), [['member 1', true]]);
+  assert.deepEqual(walkableMembers(opened, true, new Set()).map(m => m.name), ['member 1'], 'a paired phone dials the built target at once');
+  assert.deepEqual(builtFabricMembers(null), []);
 }

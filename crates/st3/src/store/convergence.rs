@@ -4,16 +4,16 @@
 //! admission or between admission and projection, lose their links for a while, carry history
 //! an older build wrote under older retention rules, and suffer an older build's faults: claims
 //! it could not admit, claims it lost, and graphs it projected by another rule. Each run ends
-//! with every link up and every node restarted on this build. After exchanges and heals, every
-//! node must hold the same envelopes and project the same graph, and a run without faults must
-//! agree before any heal without ever replaying its graph from nothing.
+//! with every link up and every node restarted on this build. After exchanges, every node must
+//! hold the same envelopes. A run without faults must also project the same graph on every node
+//! without ever replaying its graph from nothing. Sync never repairs a faulted node's graph from a
+//! peer: projections are each node's own functions of its claims.
 //!
 //! `ST3_CONVERGENCE_RUNS` (default 8) and `ST3_CONVERGENCE_STEPS` (default 80) size the test;
 //! `ST3_CONVERGENCE_SEED` repeats one run. A failing run names its seed.
 
 use super::*;
 use crate::graph::parse_test_intent;
-use crate::model::{ReplicationHealQuery, ReplicationHealStep};
 
 const FLEET: &str = "5b4b1a8e-7c3d-4e2f-9a1b-0c6d5e4f3a2b";
 const PERSON: &str = "person/avery";
@@ -679,34 +679,6 @@ impl Simulation {
         panic!("envelopes still move after 32 rounds of exchanges");
     }
 
-    /// Heal every pair whose graphs differ, as their workers would.
-    fn heal(&mut self) -> Vec<ReplicationHealReport> {
-        let mut reports = Vec::new();
-        for _ in 0..4 {
-            let mut healed_any = false;
-            for asker in 0..self.nodes.len() {
-                for peer in 0..self.nodes.len() {
-                    if asker == peer
-                        || self.nodes[asker].graph_digest() == self.nodes[peer].graph_digest()
-                    {
-                        continue;
-                    }
-                    let report = heal_session(&self.nodes[asker], &self.nodes[peer]);
-                    self.log.push(format!(
-                        "heal {} asks {}: {report:?}",
-                        self.nodes[asker].name, self.nodes[peer].name
-                    ));
-                    reports.push(report);
-                    healed_any = true;
-                }
-            }
-            if !healed_any {
-                break;
-            }
-        }
-        reports
-    }
-
     fn digests(&self) -> Vec<(String, String, String)> {
         self.nodes
             .iter()
@@ -719,18 +691,6 @@ impl Simulation {
             })
             .collect()
     }
-}
-
-fn heal_session(asker: &Node, peer: &Node) -> ReplicationHealReport {
-    let mut query = ReplicationHealQuery::Ranges;
-    for _ in 0..48 {
-        let answer = peer.store().heal_answer(&asker.name, &query).unwrap();
-        match asker.store().heal_next(&peer.name, answer).unwrap() {
-            ReplicationHealStep::Ask { query: next } => query = next,
-            ReplicationHealStep::Done { report } => return report,
-        }
-    }
-    panic!("a heal did not end");
 }
 
 /// The graph tables whose rows differ between two nodes, for a failing run's report.
@@ -782,7 +742,7 @@ fn env_number(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// One run: random steps with or without faults, then settle, then heal.
+/// One run: random steps with or without faults, then settle.
 fn run(seed: u64, steps: u64) -> std::result::Result<(), String> {
     let directory = tempfile::tempdir().unwrap();
     FULL_REPLAYS.with(|replays| replays.set(0));
@@ -826,27 +786,15 @@ fn run(seed: u64, steps: u64) -> std::result::Result<(), String> {
             &format!("without faults, projections replayed the graph from nothing {replays} times"),
         ));
     }
-    let graphs_before_heal = simulation
-        .digests()
-        .into_iter()
-        .map(|(_, _, graph)| graph)
-        .collect::<BTreeSet<_>>();
-    if simulation.faults.is_empty() && graphs_before_heal.len() != 1 {
-        return Err(report(
-            &simulation,
-            "without faults, the same envelopes projected different graphs",
-        ));
-    }
-    let heals = simulation.heal();
     let graphs = simulation
         .digests()
         .into_iter()
         .map(|(_, _, graph)| graph)
         .collect::<BTreeSet<_>>();
-    if graphs.len() != 1 {
+    if simulation.faults.is_empty() && graphs.len() != 1 {
         return Err(report(
             &simulation,
-            &format!("the graphs still differ after {} heals", heals.len()),
+            "without faults, the same envelopes projected different graphs",
         ));
     }
     Ok(())

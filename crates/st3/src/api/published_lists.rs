@@ -34,7 +34,7 @@ const FAILURES_BEFORE_WITHDRAWING: usize = 3;
 const FAILURE_RETRY: Duration = Duration::from_secs(5);
 
 /// The most claims one fold reads to say which rows changed. Past this many since the last
-/// publication, as after a replication backlog or a heal, the list folds from nothing in chunks.
+/// publication, as after a replication backlog or a replay, the list folds from nothing in chunks.
 const FOLD_CLAIMS: u64 = 10_000;
 
 /// Stop serving a list and withdraw its view, whether or not the list was being served, as after
@@ -251,9 +251,17 @@ fn spawn<R: Send + Sync + 'static>(
                     }
                     match folded? {
                         Some((publication, changed)) => {
+                            let timing = base.as_ref().map(|base| {
+                                (base.cut, publication.cut, publication.published_at_unix_ms)
+                            });
                             // A fold that began before projections were replaced publishes
                             // nothing; the next one folds from nothing.
                             if let Some(served) = list.publish(publication, generation) {
+                                if let Some((previous, cut, at)) = timing {
+                                    crate::api::record_publish_latency(
+                                        &reader, name, previous, cut, at,
+                                    );
+                                }
                                 // Windows reread only when a row changed, or the list is served
                                 // again; an advanced cut alone shows them nothing new.
                                 if changed || !served {

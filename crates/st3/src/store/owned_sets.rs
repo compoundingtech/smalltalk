@@ -12,7 +12,9 @@ pub(super) const STAGED_SUBJECTS_QUERY: &str =
 const EMPTY_DESIRED_AUTHORITY_QUERY: &str =
     "SELECT NOT EXISTS(SELECT 1 FROM claims WHERE kind='owned-set.revised')
         AND NOT EXISTS(SELECT 1 FROM claims WHERE subject=?1
-                       AND json_extract(body,'$.owned_set') IS NOT NULL)";
+                       AND json_extract(body,'$.owned_set') IS NOT NULL)
+        AND NOT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='agent.retired'
+                       AND NOT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=claims.id AND state='repaired'))";
 
 struct SnapshotRows {
     connection: usize,
@@ -1317,6 +1319,12 @@ impl Store {
             self.with_owned_set_snapshot_reads(|| {
                 let connection = self.readers.get();
                 let history = rows(&connection, None)?;
+                let mut terminal = BTreeSet::new();
+                for declaration in desired.iter().filter(|d| d.desired.get("retirement").is_some()) {
+                    if retirements::terminal_selection(&connection, declaration)? == Some(true) {
+                        terminal.insert(declaration.subject.clone());
+                    }
+                }
                 let mut owners = BTreeMap::<String, BTreeSet<String>>::new();
                 for view in &history {
                     for subject in view
@@ -1356,6 +1364,9 @@ impl Store {
                 let eligible = desired
                     .iter()
                     .filter(|declaration| {
+                        if declaration.desired.get("retirement").is_some() {
+                            return terminal.contains(&declaration.subject);
+                        }
                         let Some(sets) = owners.get(&declaration.subject) else {
                             return !staged.contains(&declaration.subject);
                         };
@@ -1397,6 +1408,11 @@ impl Store {
         };
         if empty {
             return Ok(());
+        }
+        if let Some(current) = retirements::terminal_selection(&self.readers.get(), desired)? {
+            return if current { Ok(()) } else {
+                Err(St3Error::new("stale-set-member", "terminal retirement replaced this declaration"))
+            };
         }
         // A negative probe is not authorization. Start another current snapshot for the full
         // fence and reuse receipt rows only within it, never across invocations or effects.

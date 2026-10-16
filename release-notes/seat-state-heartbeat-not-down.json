@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A seat that keeps reporting at its idle heartbeat is no longer called down when its runtime row is stuck pending",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes; the card is computed from existing claims at read time."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites; no client contract change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Behavior change on the status contract only: a declared seat without a running runtime row whose latest harness report is under 11 minutes old reads running or waiting instead of down. Clients that already render those states need nothing."},
+  "downtime": {"status": "none", "detail": "Normal binary restart; no additional startup work."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new swap-back restrictions."}
+}

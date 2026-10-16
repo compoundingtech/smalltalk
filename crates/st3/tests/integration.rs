@@ -16,6 +16,7 @@ mod binary_payloads;
 mod boot_canaries;
 mod broken_gates;
 mod claude_idle;
+mod claude_statusline;
 mod client_creation;
 mod client_glasses;
 mod client_presence;
@@ -78,6 +79,7 @@ mod hermetic;
 mod hook_telemetry;
 mod human_gates;
 mod idle_budget;
+mod invariants;
 mod log_diet;
 mod message_send_once;
 mod message_wait;
@@ -85,6 +87,7 @@ mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;
 mod node_identity_cli;
+mod onboarding_eval;
 mod operation_audit;
 mod operation_audit_perf;
 mod operational_state_contract;
@@ -102,8 +105,10 @@ mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;
 mod terminal_binding;
+mod tiles_root;
 mod version;
 mod typed_keys;
+mod ui_open;
 
 #[test]
 fn every_test_file_is_built() {

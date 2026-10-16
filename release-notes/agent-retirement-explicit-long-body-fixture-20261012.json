@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Use the same explicitly qualified recipient in the long-body retirement fixture's declaration and sends.",
+  "replay": { "status": "none", "detail": "Test fixture only." },
+  "schema": { "status": "none", "detail": "No contract change." },
+  "rules": { "status": "none", "detail": "No rule change." },
+  "compatibility": { "status": "none", "detail": "No runtime change." },
+  "manual": { "status": "none", "detail": "No operator action." },
+  "recovery": { "status": "none", "detail": "No recovery change." },
+  "downtime": { "status": "none", "detail": "No startup work." }
+}

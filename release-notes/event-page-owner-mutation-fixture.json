@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Check owner-filtered event pages after reassignment and restoration, including stable unrelated subject events.",
+  "replay": {"status": "none", "detail": "Only an invented test fixture changes; existing store replay is unchanged."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, claim definitions, or schema version changes."},
+  "rules": {"status": "none", "detail": "No checkpoint, digest, sealing, or authorization rule changes."},
+  "compatibility": {"status": "none", "detail": "No runtime client, peer, wire, or CLI contract changes."},
+  "downtime": {"status": "none", "detail": "No daemon or deployment behavior changes."},
+  "manual": {"status": "none", "detail": "No installation action is required; the extended fixture runs in the ordinary test suite."},
+  "recovery": {"status": "none", "detail": "Removing the assertions changes no stored data or runtime recovery behavior."}
+}

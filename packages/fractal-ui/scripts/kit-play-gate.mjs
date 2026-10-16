@@ -5,6 +5,7 @@ import { performance } from 'node:perf_hooks'
 import { strictStoryGuard } from './details-strict-story-guard.mjs'
 import { availableParallelism } from 'node:os'
 import { storyIdsFromIndex } from './kit-play-index.mjs'
+import { createIsolatedKitWorker } from './kit-play-isolation.mjs'
 
 // Own an ephemeral localhost server: missing assets remain real, standard 404s.
 const [buildDirectory, outputDirectory] = process.argv.slice(2)
@@ -21,7 +22,12 @@ const server = createServer(async (request, response) => {
     }
     if ((await stat(file)).isDirectory()) file = join(file, 'index.html')
     const bytes = await readFile(file)
-    response.writeHead(200, { 'Content-Type': mime[extname(file)] ?? 'application/octet-stream' }).end(bytes)
+    // This server owns one immutable build for the job's lifetime. Context reuse
+    // may cache resources, never the mutable storage belonging to a story.
+    response.writeHead(200, {
+      'Content-Type': mime[extname(file)] ?? 'application/octet-stream',
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    }).end(bytes)
   } catch (error) {
     const missing = error.code === 'ENOENT' || error.code === 'ENOTDIR'
     response.writeHead(missing ? 404 : 500).end(missing ? 'Not Found' : 'Internal Server Error')
@@ -38,12 +44,28 @@ const workers = Math.min(6, availableParallelism())
 let ids = [], browser, fatalError
 await mkdir(outputDirectory, { recursive: true })
 const writeReceipt = async () => {
+  const elapsedSeconds = (performance.now() - started) / 1000
+  const phaseTotals = new Map()
+  for (const row of rows) {
+    for (const [name, value] of Object.entries(row.timings ?? {})) {
+      if (!Number.isFinite(value)) continue
+      const previous = phaseTotals.get(name) ?? { sum: 0, count: 0 }
+      phaseTotals.set(name, { sum: previous.sum + value, count: previous.count + 1 })
+    }
+  }
+  const phaseMeanMilliseconds = Object.fromEntries([...phaseTotals].map(([name, { sum, count }]) => [name, sum / count]))
   const receipt = {
     pass: !fatalError && ids.length > 0 && rows.length === ids.length * 4 && rows.every(row => row.pass),
     stories: ids.length, expectedCases: ids.length * 4, cases: rows.length, workers,
-    elapsedSeconds: (performance.now() - started) / 1000, fatalError, rows: rows.toSorted((a, b) => a.id.localeCompare(b.id) || a.scheme.localeCompare(b.scheme) || a.width - b.width),
+    isolation: 'reused-context-fresh-page-cleared-storage',
+    elapsedSeconds, fatalError, rows: rows.toSorted((a, b) => a.id.localeCompare(b.id) || a.scheme.localeCompare(b.scheme) || a.width - b.width),
+    effectiveWorkerSecondsPerCase: rows.length ? elapsedSeconds * workers / rows.length : null,
+    meanCaseSeconds: rows.length ? rows.reduce((sum, row) => sum + row.elapsedSeconds, 0) / rows.length : null,
+    phaseMeanMilliseconds,
   }
   await writeFile(join(outputDirectory, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n')
+  const { rows: _rows, ...summary } = receipt
+  console.log(`KIT_PLAY_SUMMARY ${JSON.stringify(summary)}`)
   return receipt
 }
 try {
@@ -54,32 +76,63 @@ try {
   browser = await chromium.launch(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {})
   const cases = ids.flatMap(id => ['dark', 'light'].flatMap(scheme => [440, 1440].map(width => ({ id, scheme, width }))))
   let nextCase = 0
-  const runCase = async ({ id, scheme, width }) => {
+  const runCase = async (worker, { id, scheme, width }) => {
     const caseStarted = performance.now()
-    const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: scheme })
+    const { resetMilliseconds } = await worker.reset()
+    const createStarted = performance.now()
+    const page = await worker.newPage({ viewport: { width, height: 900 }, colorScheme: scheme })
+    const pageCreated = performance.now()
     const guard = await strictStoryGuard(page, base)
-    const row = { id, scheme, width, height: 900, pass: false }
+    const guardReady = performance.now()
+    const row = {
+      id, scheme, width, height: 900, pass: false,
+      timings: {
+        resetMilliseconds, pageCreateMilliseconds: pageCreated - createStarted,
+        guardMilliseconds: guardReady - pageCreated,
+      },
+    }
+    let domLoaded
+    page.once('domcontentloaded', () => { domLoaded = performance.now() })
     try {
       // The guard awaits strict storyFinished; unrelated network idleness is not play readiness.
       await page.goto(`${base}/iframe.html?id=${encodeURIComponent(id)}&viewMode=story&args=${encodeURIComponent(`scheme:${scheme}`)}`, { waitUntil: 'domcontentloaded' })
+      const storyReady = performance.now()
+      row.timings.navigationToDomMilliseconds = domLoaded - guardReady
+      row.timings.readinessAfterDomMilliseconds = storyReady - domLoaded
       await guard.check()
       if (!guard.records.every(record => record.finished.every(event => event.payload.storyId === id))) {
         throw new Error('storyFinished evidence belongs to a different story')
       }
+      row.timings.assertionsMilliseconds = performance.now() - storyReady
       row.pass = true
     } catch (error) {
       row.error = String(error)
       row.events = await page.evaluate(() => window.__dt10StrictEvents ?? []).catch(() => [])
     } finally {
       row.strict = guard.records
+      // Keep the original elapsed definition (before page.close) for comparison.
       row.elapsedSeconds = (performance.now() - caseStarted) / 1000
-      rows.push(row)
-      await page.close()
-      console.log(JSON.stringify(row))
+      const closeStarted = performance.now()
+      try {
+        await page.close()
+      } catch (error) {
+        row.pass = false
+        row.error = `${row.error ?? ''} page cleanup: ${error}`
+        throw error
+      } finally {
+        row.timings.closeMilliseconds = performance.now() - closeStarted
+        rows.push(row)
+        console.log(JSON.stringify(row))
+      }
     }
   }
   const results = await Promise.allSettled(Array.from({ length: workers }, async () => {
-    while (nextCase < cases.length) await runCase(cases[nextCase++])
+    const worker = await createIsolatedKitWorker(browser, base)
+    try {
+      while (nextCase < cases.length) await runCase(worker, cases[nextCase++])
+    } finally {
+      await worker.close()
+    }
   }))
   const rejected = results.filter(result => result.status === 'rejected')
   if (rejected.length) throw new AggregateError(rejected.map(result => result.reason), 'Kit play workers failed')

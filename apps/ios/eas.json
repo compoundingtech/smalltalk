@@ -4,11 +4,13 @@
   },
   "build": {
     "simulator": {
+      "env": { "APP_VARIANT": "dev" },
       "ios": {
         "simulator": true
       }
     },
     "preview": {
+      "env": { "APP_VARIANT": "daily" },
       "distribution": "internal"
     }
   }

@@ -388,3 +388,114 @@ nextest setting, production table/trigger/library/Runtime/factory/worker or
 authority/lifetime proof is added, and all earlier controls and ceilings remain
 unchanged. Metadata growth remains adverse and the original strict page has
 zero statement headroom; any current-main failure must retain its actual tuple.
+
+## Two-consumer journal outer rollback (fixture only)
+
+One appended control calls the production `Installer::prune_journal` inside an
+existing managed background writer transaction, with two distinct installed
+prefix roots at A=32 and B=16. The library alone selects the cutoff and deletes
+journal references; the single-consumer image-prune helper is not called.
+An owned within-transaction witness must contain the byte-identical original
+references 17..32 and their independently summed row/byte counters, while both
+consumers' complete root/job/coverage/output states stay unchanged. A no-op
+prune cannot satisfy the changed-rowset and changed-counter assertions.
+
+Separate checked WAL readers must see the original committed state while that
+transaction is open. After explicit successful rollback and an idle-writer
+assertion, the physical writer loan ends before fresh readers compare all
+source/native/image/journal/counter state and both complete consumer states.
+The owned changed witness survives rollback. Payload width validation is a
+post-copy oracle bound, not production pre-copy eligibility. There are no
+sleeps, timing assertions, callbacks or hook replacements.
+
+A predetermined committing arm then removes 16 references; a second prune must
+remove zero while B is still at 16. B consumes the original retained references
+to reach 32 and matches native-derived ID/subject/kind/digest output with A;
+only then may the final 16 references be pruned. All 32 images remain unchanged.
+Any transaction/check/rollback error fails the control without a fallback.
+
+The new name is UNRUN at source authoring. This covers successful outer rollback
+only after hosted qualification. Two-consumer refused COMMIT, crash/reopen,
+image reclamation, whole-prune accounting and unsafe-cleanup containment remain
+unverified, alongside source authority/lifetime and production adoption. All
+previous controls, helpers, strict/growth/crash bodies, limits and nextest
+settings remain unchanged. The original strict page has zero statement
+headroom and eight characterized growth pages remain over 128; no old work or
+crash receipt qualifies this new two-consumer path.
+
+## Two-consumer journal refused COMMIT (fixture only)
+
+One appended normal control uses the same fixed A=32/B=16 installed prefix
+roots, actual production journal prune and copied-reference oracle as the
+outer-rollback control. It records an owned changed journal/payload/counter
+witness before COMMIT and requires both consumer states unchanged. Separate
+checked physical readers see the original committed state while the write
+transaction is open. Only the private Plain/no-observer fixture installs a
+refusing SQLite commit hook: an external marker records invocation, the hook
+returns true, and the error must downcast to SQLITE_CONSTRAINT_COMMITHOOK.
+An arbitrary error, a no-op prune, delete-only or decrement-only maintenance,
+or unexpected successful COMMIT cannot satisfy those combined assertions.
+
+All fallible work is inside catch_unwind after installing the hook. The hook
+is removed before the idle check and any result/panic classification; an
+unexpected panic resumes after cleanup. The physical writer loan ends before
+fresh reads require full source/native/image/journal/counter conservation and
+both complete root/job/coverage/output states. An owned changed witness must
+survive the refused commit. This fault is restricted to the fixture's ordinary
+writer with no existing hook/observer owner; it adds no production hook API or
+quarantine contract. Post-copy payload length checks remain oracle bounds.
+
+A predetermined committing arm then removes 16 references and must remove
+zero on the next call while B is still at 16. It also detects a refusing hook
+left installed. B consumes the original remaining references and reaches the
+native-derived output at 32 before the final 16+0 prune. All 32 images stay
+unchanged. The second zero rejects a fast-root-only cutoff, but this fixed
+ordering cannot distinguish an implementation that only considers slow B;
+complete minimum selection for arbitrary consumer orderings is not claimed.
+
+The new control is UNRUN at source authoring. It is a discriminating fixture
+fault, not a production mechanism, storage change or GLOBAL-VIEW qualification.
+Crash/reopen with two consumers, image reclamation, whole-prune accounting,
+failed-cleanup containment, source authority/lifetime/restore and production
+adoption remain deferred. All earlier prefixes, helpers, strict/growth/crash
+controls, limits and nextest settings are unchanged. The strict 128-statement
+ceiling still has zero headroom and eight growth pages remain over it; no
+old work/crash result qualifies this new path.
+
+## Mirrored installed-root journal cutoff (fixture only)
+
+One appended normal control reverses the fixed ordering: primary A is at 16,
+while follower B is at 32, over 32 original admissions and distinct installed
+namespaces. A's stored prefix-ready bit remains true, but current-source status
+and its current getter refuse. A's 16 expected ID/subject/kind/digest rows come
+from the original images' revisions joined to native rows, with native bodies
+canonicalized independently of produced output. B matches the full native
+oracle at 32. Complete physical root/job/coverage/output snapshots are retained.
+
+The actual production journal prune must remove 16 and then zero while A is
+still at 16. A B-only, MAX or source-head cutoff can hide behind the first call's
+16-row page cap but fails the second call. Together with the opposite ordering
+in the existing controls, this rejects either fixed-consumer choice; it is not
+a minimum proof for arbitrary consumer orderings, registry sizes or active jobs.
+Copied original references and their payload-byte sums define the entire pinned
+retention state; the oracle never passes a cutoff to the library. Both complete
+consumer states and all 32 original images must remain unchanged by pruning.
+
+Before A consumes the original remaining references, the test derives its full
+expected advanced state from the validated pinned state and native output.
+Only primary revision/generation, coverage and output may change; physical
+root bindings/status and the full job row are checked against their previous
+values. Source, journal payloads, image/lifetime counters, images, native rows
+and B's complete state stay fixed. Both current getters must then match the
+native oracle at 32 before the final 16+0 drain. The old equal-image/reference
+helpers are intentionally not used after journal-only pruning and remain
+unchanged. No advanced actual snapshot is accepted as its own oracle.
+
+The new name is UNRUN at source authoring. It adds no hook, copied minimum,
+production SQL, library/helper change, nextest setting, worker or activation.
+Image reclamation across two consumers, crash/reopen, whole-prune work/hold/CPU,
+failed-cleanup containment, source authority/lifetime/restore and production
+adoption remain deferred. Original strict/growth/crash controls and bounds are
+unchanged: the 128-statement strict page has zero headroom and eight growth
+pages remain adverse over that ceiling. No previous work or crash receipt
+qualifies the mirrored path, and oracle bounds are not pre-copy certification.

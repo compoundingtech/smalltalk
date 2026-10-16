@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Stage 1: keep actual-state history bodies out of the SQLite sorter and stream the fold",
+  "replay": {
+    "status": "none",
+    "detail": "Actual-state reads sort only canonical keys and integer claim identities, fetch each body on the same read cut, and fold it immediately. Existing canonical ordering, repaired-ID exclusion, historical cuts, field merging, indexes and admission/retention rules are unchanged. No new projection, source cap, migration or startup replay. Stage 1 of #2849(a): canonical key storage remains O(claims); every cache miss still reads/parses each history body. This does not implement an incremental actual-state projection or close the issue."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Actual-state reads sort only canonical keys and integer claim identities, fetch each body on the same read cut, and fold it immediately. Existing canonical ordering, repaired-ID exclusion, historical cuts, field merging, indexes and admission/retention rules are unchanged. No new projection, source cap, migration or startup replay. Stage 1 of #2849(a): canonical key storage remains O(claims); every cache miss still reads/parses each history body. This does not implement an incremental actual-state projection or close the issue."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Actual-state reads sort only canonical keys and integer claim identities, fetch each body on the same read cut, and fold it immediately. Existing canonical ordering, repaired-ID exclusion, historical cuts, field merging, indexes and admission/retention rules are unchanged. No new projection, source cap, migration or startup replay. Stage 1 of #2849(a): canonical key storage remains O(claims); every cache miss still reads/parses each history body. This does not implement an incremental actual-state projection or close the issue."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Actual-state reads sort only canonical keys and integer claim identities, fetch each body on the same read cut, and fold it immediately. Existing canonical ordering, repaired-ID exclusion, historical cuts, field merging, indexes and admission/retention rules are unchanged. No new projection, source cap, migration or startup replay. Stage 1 of #2849(a): canonical key storage remains O(claims); every cache miss still reads/parses each history body. This does not implement an incremental actual-state projection or close the issue."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Actual-state reads sort only canonical keys and integer claim identities, fetch each body on the same read cut, and fold it immediately. Existing canonical ordering, repaired-ID exclusion, historical cuts, field merging, indexes and admission/retention rules are unchanged. No new projection, source cap, migration or startup replay. Stage 1 of #2849(a): canonical key storage remains O(claims); every cache miss still reads/parses each history body. This does not implement an incremental actual-state projection or close the issue."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Actual-state reads sort only canonical keys and integer claim identities, fetch each body on the same read cut, and fold it immediately. Existing canonical ordering, repaired-ID exclusion, historical cuts, field merging, indexes and admission/retention rules are unchanged. No new projection, source cap, migration or startup replay. Stage 1 of #2849(a): canonical key storage remains O(claims); every cache miss still reads/parses each history body. This does not implement an incremental actual-state projection or close the issue."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Actual-state reads sort only canonical keys and integer claim identities, fetch each body on the same read cut, and fold it immediately. Existing canonical ordering, repaired-ID exclusion, historical cuts, field merging, indexes and admission/retention rules are unchanged. No new projection, source cap, migration or startup replay. Stage 1 of #2849(a): canonical key storage remains O(claims); every cache miss still reads/parses each history body. This does not implement an incremental actual-state projection or close the issue."
+  }
+}

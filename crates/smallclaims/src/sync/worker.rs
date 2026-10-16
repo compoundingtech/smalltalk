@@ -1,5 +1,5 @@
-//! The sync worker: who it dials and how it backs off, the exchange, heal and checkpoint
-//! adoption it runs with each peer, and the signed routes it answers on.
+//! The sync worker: who it dials and how it backs off, the exchange and checkpoint adoption it
+//! runs with each peer, and the signed routes it answers on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -22,7 +22,7 @@ use tokio::sync::watch;
 
 use super::{
     Backend, CHECKPOINT_PATH, DEFLATE_MIN_BYTES, EXCHANGE_ENCODING, EXCHANGE_PATH, FleetAuth,
-    HEADER_SIGNATURE, HEAL_PATH, JOIN_PATH, MAX_EXCHANGE_BYTES, MAX_JOIN_BYTES, PEER_API_VERSION,
+    HEADER_SIGNATURE, JOIN_PATH, MAX_EXCHANGE_BYTES, MAX_JOIN_BYTES, PEER_API_VERSION,
     PeerResponse, accepts_deflate, deflate, deflated, inflate,
 };
 use crate::fleet::transport::{
@@ -31,10 +31,7 @@ use crate::fleet::transport::{
     routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetFile, FleetView, MemberKey, PeerConfig, Refusal, Sender};
-use crate::replication::{
-    InventoryCheckpoint, ReplicationExchange, ReplicationHealAnswer, ReplicationHealQuery,
-    ReplicationHealRequest, ReplicationHealStep, ReplicationInventory,
-};
+use crate::replication::{InventoryCheckpoint, ReplicationExchange, ReplicationInventory};
 use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
 
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -73,13 +70,6 @@ const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Recently working HTTP routes can return without any transport presence event. Probe
 /// briefly without exporting inventories or writing failures; long absences stay quiet.
 const PEER_PROBE_WINDOW: Duration = Duration::from_secs(5 * 60);
-
-/// A heal question can make the peer replay its graph from nothing, which takes 41 seconds on a
-/// 2 GB store and longer under load.
-const HEAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-/// Questions one heal asks before it gives up until the next.
-const HEAL_QUESTION_LIMIT: usize = 48;
 
 /// What every route on the peer listener shares: the store, this node, its fleet auth, and
 /// what it knows of the fleet. A runtime adds its own routes with this as their state.
@@ -406,7 +396,7 @@ impl WorkerConfig {
 }
 
 /// Keep `backend`'s store in step with the fleet until the process ends: dial every listening
-/// member, answer members that dial in, heal, adopt checkpoints, and redeem joins. Bump `wake`
+/// member, answer members that dial in, adopt checkpoints, and redeem joins. Bump `wake`
 /// whenever the store has something new to send. `routes` serve beside the sync routes on the
 /// same listener, with the same state.
 pub async fn run<B: Backend>(
@@ -532,7 +522,7 @@ pub async fn run<B: Backend>(
                 tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
                 super::telemetry::record_error(&name, super::telemetry::ErrorReason::Down);
                 let _ = backend
-                    .record_failure(&name, "down", "no recent inbound exchange")
+                    .record_failure(&name, "down", "no recent inbound exchange", None)
                     .await;
             }
         });
@@ -988,7 +978,6 @@ async fn keep_fleet_view_current<B: Backend>(
 pub fn peer_router<B: Backend>(state: PeerState<B>, routes: Router<PeerState<B>>) -> Router {
     Router::new()
         .route(EXCHANGE_PATH, post(receive_exchange))
-        .route(HEAL_PATH, post(receive_heal))
         .route(
             CHECKPOINT_PATH,
             post(receive_checkpoint_request).layer(DefaultBodyLimit::max(16_384)),
@@ -1096,6 +1085,9 @@ async fn dial_peer<B: Backend>(
     let mut moving = false;
     let mut route = 0_usize;
     let mut last_http_success = None;
+    // Routes whose one early attempt after an outage is spent, until a probe sees them down again
+    // or an exchange over them succeeds. See `wait_peer_retry`.
+    let mut early_spent = BTreeSet::new();
     let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
     let mut last_attempt_unix_ms = crate::store::now_ms();
     loop {
@@ -1200,7 +1192,11 @@ async fn dial_peer<B: Backend>(
         }
         last_attempt_unix_ms = attempt_unix_ms;
         record_worker(&backend, &name, "exchange", attempt_unix_ms, None).await;
+        let carrier = selected.as_ref().map(Route::carrier).unwrap_or_default();
         let is_http = matches!(selected, Some(Route::Http(_)));
+        let fabric_route = selected
+            .clone()
+            .filter(|route| matches!(route, Route::Fabric { .. }));
         let url = match selected {
             Some(Route::Http(url)) => Some(url),
             Some(selected @ Route::Fabric { .. }) => {
@@ -1220,7 +1216,12 @@ async fn dial_peer<B: Backend>(
                                     &name, super::telemetry::ErrorReason::Refused,
                                 );
                                 let _ = backend
-                                    .record_failure(&name, "refused", &error.to_string())
+                                    .record_failure(
+                                        &name,
+                                        "refused",
+                                        &error.to_string(),
+                                        Some(carrier),
+                                    )
                                     .await;
                                 route = route.wrapping_add(1);
                                 continue;
@@ -1229,7 +1230,7 @@ async fn dial_peer<B: Backend>(
                                 &name, super::telemetry::ErrorReason::Down,
                             );
                             let _ = backend
-                                .record_failure(&name, "down", &error.to_string())
+                                .record_failure(&name, "down", &error.to_string(), Some(carrier))
                                 .await;
                             None
                         }
@@ -1256,6 +1257,9 @@ async fn dial_peer<B: Backend>(
                 attempt_started,
                 last_http_success.as_ref(),
                 &http,
+                // No route was dialled, so no route was found unanswering.
+                None,
+                &mut early_spent,
             )
             .await
             {
@@ -1267,17 +1271,14 @@ async fn dial_peer<B: Backend>(
             name: name.clone(),
             url,
         };
-        match exchange(&http, &backend, &node, &peer, &auth, &fleet).await {
-            Ok((moved, heal_now)) => {
+        match exchange_via(&http, &backend, &node, &peer, &auth, &fleet, carrier).await {
+            Ok(moved) => {
                 if is_http {
                     last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
                 }
+                early_spent.remove(&peer.url);
                 backoff = PeerBackoff::default();
                 must_send = false;
-                if heal_now {
-                    record_worker(&backend, &name, "heal", attempt_unix_ms, None).await;
-                    heal(&backend, &node, &peer, &auth, &fleet).await;
-                }
                 record_worker(&backend, &name, "idle", attempt_unix_ms, None).await;
                 if moved {
                     // One exchange carries a bounded batch. Keep going at once while envelopes
@@ -1311,6 +1312,27 @@ async fn dial_peer<B: Backend>(
                 // a fresh stream, and try the next route.
                 http = replication_http_client();
                 route = route.wrapping_add(1);
+                // `fabric dial` never connects, so the member's refusal reaches us only as a
+                // tunnel that closed. Ask Fabric whether that is what happened.
+                if let (Some(fabric_route), Some(fabric)) = (&fabric_route, &fleet.fabric)
+                    && error.downcast_ref::<reqwest::Error>().is_some()
+                    && let Route::Fabric { node, protocol } = fabric_route
+                    && let Some(refusal) = fabric.refusal(node, protocol).await
+                {
+                    refused.push((
+                        fabric_route.clone(),
+                        tokio::time::Instant::now() + fabric_refusal_delay(),
+                    ));
+                    let _ = backend
+                        .record_failure(
+                            &peer.name,
+                            "refused",
+                            &refusal.to_string(),
+                            Some(carrier),
+                        )
+                        .await;
+                    continue;
+                }
                 let overloaded = error.is::<PeerOverloaded>();
                 let status = if overloaded {
                     "overloaded"
@@ -1322,7 +1344,7 @@ async fn dial_peer<B: Backend>(
                     "down"
                 };
                 let _ = backend
-                    .record_failure(&peer.name, status, &error.to_string())
+                    .record_failure(&peer.name, status, &error.to_string(), Some(carrier))
                     .await;
                 let delay = retry_delay(backoff.next(), &fleet, &name);
                 record_worker(&backend, &name, "backoff", attempt_unix_ms, Some(delay)).await;
@@ -1343,6 +1365,8 @@ async fn dial_peer<B: Backend>(
                     },
                     last_http_success.as_ref(),
                     &http,
+                    (is_http && exchange_unanswered(&error)).then_some(peer.url.as_str()),
+                    &mut early_spent,
                 )
                 .await
                 {
@@ -1402,6 +1426,22 @@ fn fabric_refusal_delay_with_jitter(jitter: u16) -> Duration {
     Duration::from_millis(1800 * (800 + u64::from(jitter) % 401))
 }
 
+/// Whether an exchange failed before the peer sent any response head: its connection could not
+/// be made, or was closed, reset or aborted before an answer. reqwest 0.12.28 with hyper 1.11.0
+/// reports these as a connect error, or as a request error with no status that is not a
+/// timeout. A timeout after connecting is not this: that peer was reached and stalled. Neither
+/// is any answer, however it failed (an error status, a redirect loop, a body cut off after its
+/// head), nor a fault building the request here.
+fn exchange_unanswered(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|error| {
+            error.is_connect()
+                || (error.is_request() && error.status().is_none() && !error.is_timeout())
+        })
+}
+
 /// Failed connections have no graph wake dependency: unrelated local writes must not
 /// turn an absent member into a hot loop. Jitter spreads fleet retries across an hour.
 #[derive(Default)]
@@ -1439,6 +1479,8 @@ async fn wait_peer_retry<B: Backend>(
     attempt_started: tokio::time::Instant,
     last_http_success: Option<&(String, tokio::time::Instant)>,
     http: &reqwest::Client,
+    unanswered: Option<&str>,
+    early_spent: &mut BTreeSet<String>,
 ) -> bool {
     let started = tokio::time::Instant::now();
     let mut deadline = started + delay;
@@ -1503,7 +1545,20 @@ async fn wait_peer_retry<B: Backend>(
                     .timeout(PEER_PROBE_TIMEOUT).send().await.is_ok()
             }, if probe_url.is_some() => {
                 next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
-                if alive {
+                let probed = probe_url.unwrap();
+                if !alive {
+                    // The route is down: its next recovery may be retried early once more.
+                    early_spent.remove(probed.as_str());
+                } else if unanswered == Some(probed.as_str()) && !early_spent.contains(probed.as_str()) {
+                    // The failed exchange got no answer on this route, and the route answers
+                    // now: the outage has ended, so retry now rather than up to 30 seconds after
+                    // the failure. Once per outage: a later failure keeps the cap below until a
+                    // probe sees the route down again. The backoff count is kept.
+                    early_spent.insert(probed.clone());
+                    record_worker(backend, name, "backoff", last_attempt_unix_ms,
+                        Some(Duration::ZERO)).await;
+                    return false;
+                } else {
                     // Transport is alive, but another expensive exchange has just failed.
                     // Retain backoff and allow at most one attempt every 30 seconds at the cap.
                     // A cheap probe is not authenticated activity. It must not refresh
@@ -1648,7 +1703,13 @@ async fn receive_exchange<B: Backend>(
                 let result = async {
                     let received = state
                         .backend
-                        .receive(&relay, state.auth.fleet_id(), &request, None)
+                        .receive(
+                            &relay,
+                            state.auth.fleet_id(),
+                            &request,
+                            None,
+                            Default::default(),
+                        )
                         .await?;
                     if received.changed {
                         state.backend.changed().await;
@@ -1783,78 +1844,6 @@ fn signed_overload<B>(state: &PeerState<B>, request_digest: &str) -> Response {
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-}
-
-async fn receive_heal<B: Backend>(
-    State(state): State<PeerState<B>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let body = if deflated(&headers) {
-        match inflate(&body) {
-            Ok(body) => Bytes::from(body),
-            Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("heal request body: {error:#}"),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        body
-    };
-    let sender = match state
-        .auth
-        .verify_sender(&headers, "POST", HEAL_PATH, &body, None, None)
-    {
-        Ok(sender) => sender,
-        Err(error) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                format!("heal authentication failed: {error:#}"),
-            )
-                .into_response();
-        }
-    };
-    let request_digest = FleetAuth::body_digest(&body);
-    if let Err(refusal) = state.fleet.accept(&sender) {
-        return signed_refusal(&state, &request_digest, &refusal)
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-    }
-    state.fleet.note_activity(&sender.name);
-    let result = async {
-        let request: ReplicationHealRequest =
-            serde_json::from_slice(&body).context("decode the heal request")?;
-        anyhow::ensure!(
-            request.fleet_id == state.auth.fleet_id(),
-            "the peer belongs to another fleet"
-        );
-        let answer = state
-            .backend
-            .heal_answer(&sender.name, state.auth.fleet_id(), &request.query)
-            .await?;
-        if matches!(
-            answer,
-            ReplicationHealAnswer::Swapped { .. } | ReplicationHealAnswer::Replayed { .. }
-        ) {
-            state.backend.changed().await;
-        }
-        let response = signed_response_for(&state, HEAL_PATH, &request_digest, 0, answer)?;
-        deflate_response(response, accepts_deflate(&headers)).await
-    }
-    .await;
-    result.unwrap_or_else(|error| {
-        signed_error_response_for(
-            &state,
-            HEAL_PATH,
-            &request_digest,
-            0,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &format!("heal request failed: {error:#}"),
-        )
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-    })
 }
 
 /// Answer a member or config peer with one page of a checkpoint's manifest. It is authenticated
@@ -2183,8 +2172,7 @@ pub fn signed_error_response_for<B: Backend>(
 }
 
 /// Run one exchange with `peer`: send this node's summary, take what the peer sends, push what
-/// it lacks, and adopt a checkpoint it advertises. Returns whether envelopes moved either way and
-/// whether a heal is due.
+/// it lacks, and adopt a checkpoint it advertises. Returns whether envelopes moved either way.
 pub async fn exchange<B: Backend>(
     http: &reqwest::Client,
     backend: &B,
@@ -2192,13 +2180,39 @@ pub async fn exchange<B: Backend>(
     peer: &PeerConfig,
     auth: &FleetAuth,
     fleet: &FleetContext,
-) -> Result<(bool, bool)> {
+) -> Result<bool> {
+    // This entry point receives only an HTTP URL, which may already be a Fabric tunnel.
+    // Only dial_peer retains the selected Route and can supply defensible carrier evidence.
+    exchange_via(http, backend, node, peer, auth, fleet, Default::default()).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exchange_via<B: Backend>(
+    http: &reqwest::Client,
+    backend: &B,
+    node: &str,
+    peer: &PeerConfig,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    carrier: crate::replication::ReplicationCarrier,
+) -> Result<bool> {
     let mut telemetry = super::telemetry::Round::new(&peer.name);
-    let result = exchange_inner(http, backend, node, peer, auth, fleet, &mut telemetry).await;
+    let result = exchange_inner(
+        http,
+        backend,
+        node,
+        peer,
+        auth,
+        fleet,
+        &mut telemetry,
+        carrier,
+    )
+    .await;
     telemetry.finish(&result);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exchange_inner<B: Backend>(
     http: &reqwest::Client,
     backend: &B,
@@ -2207,8 +2221,8 @@ async fn exchange_inner<B: Backend>(
     auth: &FleetAuth,
     fleet: &FleetContext,
     telemetry: &mut super::telemetry::Round,
-) -> Result<(bool, bool)> {
-    let mut heal_now = false;
+    carrier: crate::replication::ReplicationCarrier,
+) -> Result<bool> {
     // One compact round. Each side lists the ranges that differ a few at a time, from a different
     // range on each answer, so successive rounds compare every range without either side ever
     // sending its whole inventory (a million identities, 228 MB, on a busy fleet). Ranges that
@@ -2229,13 +2243,18 @@ async fn exchange_inner<B: Backend>(
     let round_trip = started.elapsed();
     let different = remote.inventory.digest != query.inventory.digest;
     let received = backend
-        .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
+        .receive(
+            &peer.name,
+            auth.fleet_id(),
+            &remote,
+            Some(round_trip),
+            carrier,
+        )
         .await?;
     telemetry.pull(received.receipt.received);
     // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
     // or keeps being sent, envelopes that are never stored must not keep the worker busy.
     let pulled = received.receipt.received != 0;
-    heal_now |= received.receipt.heal;
     if received.changed {
         backend.changed().await;
     }
@@ -2263,11 +2282,16 @@ async fn exchange_inner<B: Backend>(
             !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
         telemetry.push(push.envelopes.len(), pushed);
         let received = backend
-            .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
+            .receive(
+                &peer.name,
+                auth.fleet_id(),
+                &response,
+                Some(round_trip),
+                carrier,
+            )
             .await?;
         telemetry.pull(received.receipt.received);
         pulled_follow_up = received.receipt.received != 0;
-        heal_now |= received.receipt.heal;
         if received.changed {
             backend.changed().await;
         }
@@ -2292,7 +2316,7 @@ async fn exchange_inner<B: Backend>(
         backend.changed().await;
     }
     let progressed = pulled || pulled_follow_up || pushed || adopted;
-    Ok((progressed, heal_now))
+    Ok(progressed)
 }
 
 /// When an adoption last failed, by this node and the checkpoint's drop digest, so a manifest
@@ -2377,69 +2401,6 @@ async fn adopt_advertised_checkpoint<B: Backend>(
             false
         }
     }
-}
-
-/// Heal with one peer: carry each question the main daemon asks to the peer, and each answer
-/// back, until the main daemon reports the heal. A peer that cannot be asked ends the heal with
-/// the reason, which the main daemon reports.
-pub async fn heal<B: Backend>(
-    backend: &B,
-    node: &str,
-    peer: &PeerConfig,
-    auth: &FleetAuth,
-    fleet: &FleetContext,
-) {
-    let mut telemetry = super::telemetry::Heal::new(&peer.name);
-    heal_inner(backend, node, peer, auth, fleet, &mut telemetry).await;
-    telemetry.finish();
-}
-
-async fn heal_inner<B: Backend>(
-    backend: &B,
-    node: &str,
-    peer: &PeerConfig,
-    auth: &FleetAuth,
-    fleet: &FleetContext,
-    telemetry: &mut super::telemetry::Heal,
-) {
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(HEAL_TIMEOUT)
-        .build()
-        .expect("the heal HTTP client configuration is valid");
-    let mut query = ReplicationHealQuery::Ranges;
-    for _ in 0..HEAL_QUESTION_LIMIT {
-        telemetry.question();
-        let request = ReplicationHealRequest {
-            fleet_id: auth.fleet_id().to_owned(),
-            query,
-        };
-        let answer = match post_signed_to::<_, ReplicationHealAnswer>(
-            &http, peer, node, auth, fleet, HEAL_PATH, &request, true,
-        )
-        .await
-        {
-            Ok((answer, _)) => answer,
-            Err(error) => {
-                telemetry.error(&error);
-                ReplicationHealAnswer::Failed {
-                    message: format!("{} could not answer: {error:#}", peer.name),
-                }
-            }
-        };
-        match backend.heal_next(&peer.name, answer).await {
-            Ok(ReplicationHealStep::Ask { query: next }) => query = next,
-            Ok(ReplicationHealStep::Done { report }) => {
-                telemetry.complete(&report);
-                break;
-            }
-            Err(error) => {
-                telemetry.error(&error);
-                break;
-            }
-        }
-    }
-    backend.changed().await;
 }
 
 #[derive(Debug)]
@@ -2657,3 +2618,6 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
 #[cfg(test)]
 #[path = "worker_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "transport_error_tests.rs"]
+mod transport_error_tests;

@@ -22,6 +22,10 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
+    /// When st last stopped answering, kept until it answers again. A restart of st (a deploy,
+    /// an update) is a gap of seconds, so the screen says it is reconnecting for the first
+    /// `OFFLINE_GRACE` and calls the link offline only after that. Unset means long ago.
+    pub offline_since: Option<std::time::Instant>,
     /// Why the live stream to st is being replaced while st itself answers.
     pub degraded: Option<String>,
     /// Why a window has not loaded though st was asked (its source is not ready, or refused),
@@ -127,13 +131,32 @@ fn missions(model: &Model, person: &str) -> Vec<Mission> {
     )
 }
 
+/// How long st may stay silent before the screen calls the link offline, not reconnecting.
+pub const OFFLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `OFFLINE_GRACE`, unless `STUI_OFFLINE_GRACE_MS` says otherwise. Only the end-to-end tests set it,
+/// so they need not wait a minute to see the offline word.
+pub fn offline_grace() -> std::time::Duration {
+    static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        std::env::var("STUI_OFFLINE_GRACE_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(OFFLINE_GRACE)
+    })
+}
+
 pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
-    let link = if extras.offline.is_some() {
+    let restarting = extras
+        .offline_since
+        .is_some_and(|since| since.elapsed() < offline_grace());
+    let link = if extras.offline.is_some() && !restarting {
         Link::Offline(match &model.last_connected {
-            Some(at) => format!("Last connected at {at} · reconnecting · r retry now"),
-            None => "No member reachable · reconnecting · r retry now".into(),
+            Some(at) => format!("Last connected at {at} · reconnecting · Ctrl+R retry now"),
+            None => "No member reachable · reconnecting · Ctrl+R retry now".into(),
         })
-    } else if extras.live {
+    } else if extras.live && extras.offline.is_none() {
         Link::Live
     } else {
         Link::Connecting
@@ -165,6 +188,13 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         .filter(|peer| peer.diverged_since.is_some())
         .map(|peer| peer.host_id.trim_start_matches("host/").to_owned())
         .collect();
+    let behind = model
+        .sync_notice()
+        .into_iter()
+        .flat_map(|sync| &sync.peers)
+        .filter(|peer| peer.diverged_since.is_none() && peer.peer_only_envelopes > 0)
+        .map(|peer| peer.summary())
+        .collect();
     let loaded_windows = [
         ("Attention", model.now.snapshot.is_some()),
         ("Agents", model.agents.snapshot.is_some()),
@@ -189,6 +219,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         link,
         diverged,
         stale,
+        behind,
         missions_followed: extras.missions_followed,
         settled: extras.attention_live && extras.agents_live,
         active_missions: extras.summary.as_ref().map(|summary| summary.active_missions as usize),
@@ -659,65 +690,29 @@ fn step_progress(missions: &[Mission], step: &str) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// The state st serves for an agent (`presentation.state`, a words.json id). A daemon too old
+/// to serve one leaves it unknown; the client keeps no derivation of its own.
+fn agent_state(agent: &st3_client::Agent) -> AgentState {
+    match agent.presentation.as_ref().map(|p| p.state.as_str()) {
+        Some("needs_you") => AgentState::NeedsYou,
+        Some("needs_login") => AgentState::NeedsLogin,
+        Some("fault") => AgentState::Fault,
+        Some("working") => AgentState::Working,
+        Some("compacting") => AgentState::Compacting,
+        Some("idle") => AgentState::Idle,
+        Some("starting") => AgentState::Starting,
+        Some("down") => AgentState::Down,
+        Some("stopped") => AgentState::Stopped,
+        Some("retired") => AgentState::Retired,
+        _ => AgentState::Unknown,
+    }
+}
+
 fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
     let mut agents = model
         .agents()
         .map(|agent| {
-            let state = match (agent.state.as_str(), agent.harness_state.as_deref()) {
-                _ if agent.fault.is_some() => AgentState::Fault,
-                // A seat whose message path stopped polling or cannot hand off takes no
-                // messages, however ready its harness looks. An `outdated` path still delivers.
-                _ if agent
-                    .delivery
-                    .as_ref()
-                    .is_some_and(|delivery| delivery.state == "stale") =>
-                {
-                    AgentState::Fault
-                }
-                ("failed", _) => AgentState::Fault,
-                // st decides a seat with no session is down, since when; no app re-derives it.
-                ("down", _) => AgentState::Down,
-                // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
-                // its host fixes it, not a restart (Nathan, 2026-10-04).
-                // st's additive detail names the known error outright; the legacy `unauthenticated`
-                // harness state below says the same to clients that predate it.
-                ("waiting", _) if agent.harness_error_state.as_deref() == Some("needs-login") => {
-                    AgentState::NeedsLogin
-                }
-                ("waiting", Some("unauthenticated" | "needs-login")) => AgentState::NeedsLogin,
-                ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
-                    AgentState::NeedsLogin
-                }
-                ("running", _) if agent.activity.as_deref() == Some("compacting") => {
-                    AgentState::Compacting
-                }
-                ("running", Some("working")) => AgentState::Working,
-                ("running", _) => AgentState::Idle,
-                ("waiting", Some("ready" | "working" | "idle"))
-                    if agent.blocked_on.as_deref() == Some("human") =>
-                {
-                    AgentState::NeedsYou
-                }
-                // Blocked on its st channel is the seat's to fix (its mail is held), not the
-                // person's: answering it cannot unblock it (Nathan, 2026-10-06: "why does Stui
-                // show up as needs you?").
-                ("waiting", Some("blocked")) if agent.blocked_on.as_deref() == Some("channel") => {
-                    AgentState::Fault
-                }
-                ("waiting", Some("blocked")) => AgentState::NeedsYou,
-                // st withdraws an idle claim it has not heard renewed lately: the harness reads
-                // "indeterminate" and the seat "waiting", though it is up and reachable. That is an
-                // idle seat nobody has spoken to, not one starting (Nathan, 2026-10-05).
-                ("waiting", Some("indeterminate"))
-                    if agent.observation.as_deref() == Some("stale")
-                        && matches!(agent.reachability.as_str(), "reachable" | "local") =>
-                {
-                    AgentState::Idle
-                }
-                ("waiting" | "starting" | "desired", _) => AgentState::Starting,
-                ("stopped", _) => AgentState::Stopped,
-                _ => AgentState::Unknown,
-            };
+            let state = agent_state(agent);
             let host = agent
                 .host_id
                 .as_deref()
@@ -738,7 +733,7 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                 unmanaged: false,
                 // A running agent with a runtime is worth trying; opening it finds the terminal.
                 terminal: !agent.runtime_ids.is_empty()
-                    && !matches!(agent.state.as_str(), "stopped" | "failed"),
+                    && !matches!(agent.state.as_str(), "stopped" | "failed" | "retired"),
                 parent: agent
                     .under
                     .first()
@@ -786,29 +781,12 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                         .and_then(Value::as_str)
                         .filter(|effort| !effort.is_empty())
                         .map(str::to_owned),
-                    fault: agent.fault.clone().or_else(|| {
-                        agent.down_since.as_deref().filter(|_| agent.state == "down")
-                            .map(|since| format!("No running session since {since}"))
-                    }).or_else(|| {
-                        agent.delivery.as_ref()
-                            .filter(|delivery| delivery.state == "stale")
-                            .and_then(|delivery| delivery.reason.clone())
-                            .filter(|reason| reason.starts_with("delivery-control-unavailable:"))
-                    }).or_else(|| {
-                        (agent.state == "waiting"
-                            && agent.harness_state.as_deref() == Some("blocked")
-                            && agent.blocked_on.as_deref() == Some("channel"))
-                        .then(|| {
-                            format!(
-                                "Its st channel is not attached, so its mail is held{}",
-                                agent
-                                    .reason
-                                    .as_deref()
-                                    .map(|reason| format!(" ({reason})"))
-                                    .unwrap_or_default()
-                            )
-                        })
-                    }),
+                    // st says why a broken or down agent needs someone.
+                    fault: agent
+                        .presentation
+                        .as_ref()
+                        .filter(|presentation| matches!(presentation.state.as_str(), "fault" | "down"))
+                        .and_then(|presentation| presentation.because.clone()),
                     under: agent.under.first().map(|relation| {
                         model
                             .agents()
@@ -827,6 +805,11 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                         age: subagent.started_at.as_deref().map(age).unwrap_or_default(),
                     })
                     .collect(),
+                // An st too old to serve a presentation: show the state it reports.
+                reported: agent
+                    .presentation
+                    .is_none()
+                    .then(|| agent.state.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -862,6 +845,7 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
             details: AgentDetails::default(),
             terminal: false,
             subagents: Vec::new(),
+            reported: None,
         }
     }));
     agents
@@ -1767,11 +1751,21 @@ mod tests {
         }
     }
 
+    /// A collection window as st serves it: an agent row carries the presentation st adds.
     fn window(items: Vec<Value>) -> crate::model::Collection {
         crate::model::Collection {
             items: items
                 .into_iter()
-                .map(|item| serde_json::from_value(item).unwrap())
+                .map(|mut item| {
+                    if item["kind"] == "agent" && item.get("presentation").is_none() {
+                        let facts =
+                            <st3_ui_model::agents::Facts as serde::Deserialize>::deserialize(&item)
+                                .unwrap();
+                        item["presentation"] =
+                            serde_json::to_value(st3_ui_model::agents::present(&facts)).unwrap();
+                    }
+                    serde_json::from_value(item).unwrap()
+                })
                 .collect(),
             snapshot: Some(st3_client::Snapshot {
                 id: "snapshot/1".into(),
@@ -1783,6 +1777,60 @@ mod tests {
             truncated: false,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_peer_with_newer_records_is_behind_and_a_diverged_one_is_not() {
+        let peer = |host: &str, missing: u64, diverged: bool| st3_client::SyncPeer {
+            last_successful_exchange: None,
+            last_failed_exchange: None,
+            host_id: host.into(),
+            peer_only_envelopes: missing,
+            local_only_envelopes: 0,
+            last_exchange_at: None,
+            estimated_catch_up_seconds: Some(840),
+            diverged_since: diverged.then(|| "2026-09-29T10:00:00Z".into()),
+        };
+        let mut model = Model::default();
+        let mut attention = window(Vec::new());
+        attention.sync = Some(st3_client::SyncNotice {
+            state: "catching-up".into(),
+            peers: vec![peer("host/harbor", 26_820, false), peer("host/quay", 0, false)],
+        });
+        model.now = attention;
+        let shown = world(&model, "person/avery", &Extras::default());
+        assert_eq!(shown.behind.len(), 1, "{:?}", shown.behind);
+        assert!(shown.behind[0].starts_with("harbor has 26,820 envelopes"), "{:?}", shown.behind);
+        assert!(shown.diverged.is_empty());
+
+        let mut attention = window(Vec::new());
+        attention.sync = Some(st3_client::SyncNotice {
+            state: "diverged".into(),
+            peers: vec![peer("host/harbor", 5, true)],
+        });
+        model.now = attention;
+        let shown = world(&model, "person/avery", &Extras::default());
+        assert!(shown.behind.is_empty());
+        assert_eq!(shown.diverged, vec!["harbor".to_owned()]);
+    }
+
+    #[test]
+    fn st_silent_for_seconds_is_reconnecting_and_offline_only_after_the_grace() {
+        let model = Model::default();
+        let silent = |ago: std::time::Duration| Extras {
+            offline: Some("st stopped answering".into()),
+            offline_since: Some(std::time::Instant::now() - ago),
+            ..Extras::default()
+        };
+        // A restart for an update: seconds, not offline.
+        assert!(matches!(
+            world(&model, "person/avery", &silent(std::time::Duration::from_secs(5))).link,
+            Link::Connecting
+        ));
+        assert!(matches!(
+            world(&model, "person/avery", &silent(OFFLINE_GRACE + std::time::Duration::from_secs(1))).link,
+            Link::Offline(_)
+        ));
     }
 
     #[test]
@@ -2174,6 +2222,29 @@ mod tests {
         // Signed in again on the same run: it is simply idle, with nothing to restart.
         model.agents = window(vec![resource("running", "idle", None)]);
         assert_eq!(agents(&model, &[])[0].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn an_older_st_without_presentations_shows_the_state_it_reports() {
+        let mut model = Model::default();
+        // An explicit null: st served no presentation for this row.
+        model.agents = window(vec![serde_json::json!({
+            "id": "agent/example/old", "kind": "agent", "revision": "r1",
+            "updated_at": "2026-10-14T09:00:00Z", "name": "example/old", "state": "running",
+            "reachability": "local", "harness_state": "working", "runtime_ids": [], "under": [],
+            "presentation": null,
+        })]);
+        let seat = &agents(&model, &[])[0];
+        assert_eq!((seat.state, seat.reported.as_deref()), (AgentState::Unknown, Some("running")));
+        assert_eq!(super::super::screens::agent_shown_word(seat), "running · older st");
+        let world = world(&model, "person/avery", &Extras::default());
+        let legend = super::super::screens::agents_list(&world, "⠋", 80)
+            .legend
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(legend.contains("This host's st is older"), "{legend}");
     }
 
     #[test]

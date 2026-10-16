@@ -99,7 +99,8 @@ python3 scripts/ci-fractal-web-licenses --check-lockfile
 nix develop .#web -c python3 scripts/ci-fractal-web-licenses --check
 ```
 
-`genie-freshness` runs the lock-only guard and the companion
+`genie-freshness` (`scripts/ci-genie-freshness`, also built as `nix build .#checks.<system>.genie-freshness`
+in the Nix sandbox) runs the lock-only guard and the companion
 `python3 scripts/ci-fractal-web-licenses-test`. The fractal-web execution lane runs the
 full guard immediately after its frozen install. The generator/full guard restore the
 inventory's read-only permissions (Git does not preserve them).

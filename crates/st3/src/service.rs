@@ -30,7 +30,7 @@ struct ServiceNames {
 
 /// A service-manager command. The manager belongs to the real user session, so an instance's
 /// own `XDG_*` directories are put back for it.
-pub(crate) fn host_command(program: &str) -> Command {
+pub fn host_command(program: &str) -> Command {
     let mut command = Command::new(program);
     crate::instance::as_host(&mut command);
     command

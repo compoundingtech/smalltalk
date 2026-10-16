@@ -53,7 +53,7 @@ pub async fn connect_pty_session(
     runtime_id: &str,
     subject: &str,
 ) -> Result<(StdUnixStream, i32)> {
-    let socket = pty_root.join(format!("{runtime_id}.sock"));
+    let socket = pty_core::registry::socket_path_in(pty_root, runtime_id);
     let stream = tokio::time::timeout(
         LOCAL_TERMINAL_CONNECT,
         tokio::net::UnixStream::connect(&socket),
@@ -76,4 +76,28 @@ pub async fn connect_pty_session(
         )
     })?;
     Ok((stream, peer.pid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_connections_use_the_published_socket_for_short_and_long_ids() {
+        let root = tempfile::tempdir().unwrap();
+        for id in ["short".to_owned(), "session".repeat(16)] {
+            let socket = pty_core::registry::socket_path_in(root.path(), &id);
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            assert!(socket.as_os_str().as_encoded_bytes().len() <= 107);
+            if id.len() > 80 {
+                assert_ne!(socket, root.path().join(format!("{id}.sock")));
+            }
+            let (stream, peer) = connect_pty_session(root.path(), &id, "terminal/test")
+                .await
+                .unwrap();
+            assert_eq!(peer, std::process::id() as i32);
+            let (accepted, _) = listener.accept().unwrap();
+            drop((stream, accepted));
+        }
+    }
 }

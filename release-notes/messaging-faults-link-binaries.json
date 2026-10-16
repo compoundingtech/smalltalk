@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Test tooling only: the messaging fault eval hard-links its executables instead of copying them five times per case",
+  "replay": {"status": "none", "detail": "No graph replay; the change is in scripts/st3-messaging-faults-eval and touches no daemon or stored data."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change; the shipped binaries are unchanged."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to roll back; reverting the commit restores the copies."}
+}

@@ -6,6 +6,23 @@ import FoundationNetworking
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testQueuedMissionDeadlineAcceptsNullAndAdmissionTimestamp() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/person-ask-mission.json"))
+        var mission = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var runs = try XCTUnwrap(mission["run_details"] as? [[String: Any]])
+        runs[0]["after"] = "mission-run/predecessor"
+        runs[0]["deadline"] = NSNull()
+        mission["run_details"] = runs
+        let queued = try JSONDecoder().decode(MissionResource.self, from: JSONSerialization.data(withJSONObject: mission))
+        XCTAssertNil(queued.runDetails?.first?.deadline)
+        runs[0]["deadline"] = "2026-09-20T11:05:00Z"
+        mission["run_details"] = runs
+        let admitted = try JSONDecoder().decode(MissionResource.self, from: JSONSerialization.data(withJSONObject: mission))
+        XCTAssertEqual(admitted.runDetails?.first?.deadline, "2026-09-20T11:05:00Z")
+    }
+
     func testDirectiveNoteFixturePreservesCurrentAdvisoryMetadata() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

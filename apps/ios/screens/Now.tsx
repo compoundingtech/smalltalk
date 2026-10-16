@@ -4,27 +4,33 @@ import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Banners, Empty, StatusLine, useDebugScroll, useMissionsOnFocus, useRefresh } from '../chrome';
 import { ContextMenu } from '../menu';
-import { HOME_LEGEND, alertsHeading, homeRows, homeSections, openAlerts, type HomeRow, cleanMessageText, ANSWERS, isRequest, report, spaced, yesNo } from '@smalltalk/st3-views';
+import { alertsHeading, homeRows, homeSections, openAlerts, type HomeRow, cleanMessageText, ANSWERS, isRequest, spaced } from '@smalltalk/st3-views';
 import type { RootParams } from '../navigation';
 import { agentName } from '../agentsView';
+import { alertsEmptyText } from '../alertsEmpty';
 import { attentionActionLabel, attentionKindLabel, blockedLine } from '../presentation';
 import { missionTitle } from '../missionsView';
 import { useStore } from '../store';
 import { randomName } from '../launcher';
 import { AlertBody, RequestAnswers, RequestQuestion, StructuredRequestView } from './Alerts';
 import { theme } from '../theme';
-import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
+import { Button, GroupedHeader, GroupedRow, Markdown, Note, SystemScreen as Screen, T } from '../ui';
 import type { RootScreen } from '../navigation';
 
 // Now: what needs the person, as stui's Home lists it.
 export function NowScreen() {
-  const { data, caps, hasSynced, truncated, loadErrors, busy, status, actions } = useStore();
+  const { data, caps, hasSynced, truncated, loadErrors, busy, status, sync, actions } = useStore();
   const navigation = useNavigation<NativeStackNavigationProp<RootParams>>();
   const list = useRef<SectionList<HomeRow>>(null);
   useDebugScroll(list as never);
   const refresh = useRefresh();
   const agentOf = (row: HomeRow) => [row.item.requester_id, row.item.source_id].find(id => id?.startsWith('agent/'));
   const rows = useMemo(() => homeRows(data.attention, caps?.session_actor), [data.attention, caps?.session_actor]);
+  const requesterOf = (row: HomeRow) => {
+    const id = row.item.requester_id ?? row.item.source_id;
+    const agent = data.agents.find(candidate => candidate.id === id);
+    return agent ? agentName(agent) : id.replace(/^agent\//, '');
+  };
   // Start something, as stui's launcher does: a shell or a mission.
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -65,28 +71,25 @@ export function NowScreen() {
       sections={sections}
       keyExtractor={row => row.item.id}
       stickySectionHeadersEnabled={false}
-      renderSectionHeader={({ section }) => <SectionHeader title={section.title} count={section.count} color={section.tier === 'stopped' ? theme.person : theme.overlay1} />}
+      renderSectionHeader={({ section }) => <GroupedHeader title={section.title} count={section.count} />}
       renderItem={({ item: row }) => <ContextMenu title={row.title} actions={[
         { id: 'open', title: 'Open', symbol: 'arrow.up.right', run: () => navigation.navigate('Attention', { id: row.item.id }) },
         ...(agentOf(row) ? [{ id: 'chat', title: 'Chat with the agent', symbol: 'bubble.left.and.bubble.right', run: () => navigation.navigate('Conversation', { target: agentOf(row)! }) }] : []),
         ...(row.item.mission_id ? [{ id: 'mission', title: 'Open the mission', symbol: 'point.3.connected.trianglepath.dotted', run: () => navigation.navigate('Mission', { id: row.item.mission_id! }) }] : []),
         ...(row.item.actions.includes('work.done') && !row.item.update && !busy && status === 'online' ? [{ id: 'done', title: 'Complete step', symbol: 'checkmark.circle', run: () => Alert.prompt('Complete step', row.title, summary => { if (summary.trim()) void actions.done(row.item, summary); }) }] : []),
-        ...(dismiss(row) && !busy && status === 'online' ? [{ id: 'dismiss', title: 'Dismiss', symbol: 'xmark.circle', run: dismiss(row)! }] : []),
+        ...(dismiss(row) && !busy && status === 'online' ? [{ id: 'dismiss', title: row.item.closedElsewhere ? 'Clear from Now' : row.item.update ? 'Mark read' : 'Dismiss', symbol: 'xmark.circle', run: dismiss(row)! }] : []),
       ]}>
-        <ListRow
-          glyph={row.glyph}
-          glyphColor={theme[row.color]}
-          title={<T numberOfLines={1}><T color={theme[row.color]}>{row.kind.padEnd(9)}</T><T bold>{row.title}</T></T>}
-          second={`${row.waiting ? `${row.waiting} · ` : ''}waited ${row.age}`}
+        <GroupedRow
+          title={row.title}
+          context={[`Kind: ${row.kind}`, `From: ${requesterOf(row)}`, row.waiting, `Waited ${row.age}`].filter(Boolean).join(' · ')}
           onPress={() => navigation.navigate('Attention', { id: row.item.id })}
         />
       </ContextMenu>}
-      ListHeaderComponent={<View><StatusLine />{heading ? <T bold color={theme.person} style={{ paddingHorizontal: 12, paddingTop: 4 }}>◆ {heading}</T> : null}</View>}
+      ListHeaderComponent={<View><StatusLine />{heading ? <T bold style={{ paddingHorizontal: 32, paddingTop: 16 }}>{heading}</T> : null}</View>}
       refreshControl={refresh}
-      ListEmptyComponent={loadErrors.attention ? <Empty text={`Alerts could not be loaded: ${loadErrors.attention}`} /> : hasSynced ? null : <Empty text="Checking for alerts…" />}
+      ListEmptyComponent={<Empty text={alertsEmptyText({ loadError: loadErrors.attention, status, hasSynced, sync })} />}
       ListFooterComponent={<View>
         {truncated.attention ? <Note tone="warning">More items exist beyond these 200. `st now` lists them all.</Note> : null}
-        <Legend entries={HOME_LEGEND.map(entry => ({ ...entry, color: theme[entry.color] }))} />
       </View>}
       style={{ flex: 1 }}
     />
@@ -95,14 +98,14 @@ export function NowScreen() {
 
 // One attention item: what it asks, who raised it, and what can be done here.
 export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) {
-  const { data, busy, status, actions } = useStore();
+  const { data, busy, status, actions, hasSynced, loadErrors } = useStore();
   useMissionsOnFocus();
   const found = data.attention.find(candidate => candidate.id === route.params.id);
   // Nothing leaves Now by itself: an update is read when the person says so, never by opening it.
   const kept = useRef(found);
   if (found) kept.current = found;
   const item = found ?? kept.current;
-  if (!item) return <Screen><Banners /><Empty text="This item is no longer open." /></Screen>;
+  if (!item) return <Screen><Banners /><Empty text={loadErrors.attention ? 'This alert could not be loaded.' : !hasSynced ? 'Checking for this alert…' : status !== 'online' ? 'This alert is not in the offline snapshot. Reconnect to check it.' : 'This item is no longer open.'} /></Screen>;
   const [row] = homeRows([item], undefined);
   const agentId = [item.requester_id, item.source_id].find(id => id?.startsWith('agent/'));
   const agent = agentId ? data.agents.find(candidate => candidate.id === agentId) : undefined;
@@ -172,7 +175,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       <T bold selectable>{row.title}</T>
       {item.attention_kind === 'harness-prompt' || item.attention_kind === 'harness-login'
         // A prompt is allowed from its conversation, where the call it asks about is shown.
-        ? <AlertBody item={item} from={agent ? agentName(agent) : item.source_id} calls={[]} seats={[]} />
+        ? <AlertBody item={item} from={agent ? agentName(agent) : item.source_id} calls={null} seats={[]} />
         : item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
       {item.because ? <T soft>because {item.because}</T> : null}
       {row.waiting ? <T dim>{row.waiting}</T> : null}

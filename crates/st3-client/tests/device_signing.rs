@@ -60,6 +60,19 @@ const SIGNED_FIELDS: [&str; 7] = [
     "to",
 ];
 
+/// What a device signs on a message past 8 KiB: the preview, and the whole text's hash and length.
+const SIGNED_LONG_FIELDS: [&str; 9] = [
+    "body_bytes",
+    "body_sha256",
+    "content",
+    "from",
+    "in_reply_to",
+    "session_id",
+    "tags",
+    "title",
+    "to",
+];
+
 fn encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -708,6 +721,52 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
             assert_eq!(
                 state.store.claim_verdict(&claim.id).unwrap(),
                 Verdict::Verified
+            );
+            // A message past 8 KiB: the device signs its preview with the hash and length of the
+            // whole text, and the daemon, which keeps only the preview, verifies that.
+            let long_idem = format!("{idem}-long");
+            let long_text = "Harbor notes for the ferry list. ".repeat(3_200);
+            let snapshot = client.capabilities().await.unwrap().snapshot.id;
+            client
+                .message_send(
+                    format!("action/{long_idem}"),
+                    &long_idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    MessageSendParameters {
+                        to: "agent/alder".into(),
+                        content: long_text.clone(),
+                        title: None,
+                        in_reply_to: None,
+                        session_id: None,
+                        tags: vec![],
+                        kind: st3_client::MessageKind::Wake,
+                        attachments: vec![],
+                        signature: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let long_claim = state
+                .store
+                .latest_claim(&message_subject(&long_idem), Some("message.sent"))
+                .unwrap()
+                .unwrap();
+            state.store.replication_snapshot().unwrap();
+            assert_eq!(
+                state.store.claim_verdict(&long_claim.id).unwrap(),
+                Verdict::Verified,
+                "a long message signed by the real device verifies"
+            );
+            assert!(
+                long_claim.body["fields"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .len()
+                    < 1100,
+                "the claim holds a preview, not the text"
             );
             let member = Store::open_memory("peer").unwrap();
             member.bind_fleet(FLEET).unwrap();
@@ -1856,11 +1915,16 @@ fn the_shared_vectors_match_the_bytes_the_daemon_verifies() {
         "4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a".to_owned(),
         "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d".to_owned(),
     ];
+    // The long case's text, which a client builds from the unit and the count: past 8 KiB the
+    // device signs the preview with the whole text's hash and length.
+    const LONG_UNIT: &str = "Harbor notes: the tide table, the ferry list and Ωmega's café order.\n";
+    const LONG_REPEAT: usize = 200;
+    let long_text = LONG_UNIT.repeat(LONG_REPEAT);
     let cases = [
         (
             "plain",
             "agent/alder",
-            "on my way",
+            "on my way".to_owned(),
             json!(null),
             json!([]),
             json!(null),
@@ -1868,21 +1932,36 @@ fn the_shared_vectors_match_the_bytes_the_daemon_verifies() {
         (
             "escapes",
             "person/robin",
-            "a/b \"quoted\"\nnext line 🎉 naïve Ωmega\ttab \\ back",
+            "a/b \"quoted\"\nnext line 🎉 naïve Ωmega\ttab \\ back".to_owned(),
             json!("Ünïcödé title"),
             json!(["dictated", "zeta", "alpha"]),
             json!("session/phone-1"),
+        ),
+        (
+            "long",
+            "agent/alder",
+            long_text.clone(),
+            json!("Harbor notes"),
+            json!(["dictated"]),
+            json!(null),
         ),
     ];
     let mut written = Vec::new();
     for (name, to, content, title, tags, session_id) in cases {
         let idempotency_key = format!("vector-message-{name}");
         let subject = message_subject(&idempotency_key);
-        let fields = json!({
-            "content": content, "from": PERSON, "in_reply_to": null, "session_id": session_id,
+        let long = content.len() > st3_client::device::INLINE_MAX_BYTES;
+        let mut fields = json!({
+            "content": if long { st3_client::device::long_message_preview(&content) } else { content.clone() },
+            "from": PERSON, "in_reply_to": null, "session_id": session_id,
             "tags": tags, "title": title, "to": to,
         });
-        let signed_fields = SIGNED_FIELDS.map(str::to_owned).to_vec();
+        let mut signed_fields = SIGNED_FIELDS.map(str::to_owned).to_vec();
+        if long {
+            fields["body_sha256"] = json!(hex::encode(Sha256::digest(content.as_bytes())));
+            fields["body_bytes"] = json!(content.len());
+            signed_fields = SIGNED_LONG_FIELDS.map(str::to_owned).to_vec();
+        }
         let nonce = format!("vector-nonce-{name}-00");
         let bytes = fields_signing_bytes(
             &subject,
@@ -1897,7 +1976,7 @@ fn the_shared_vectors_match_the_bytes_the_daemon_verifies() {
             &nonce,
             1_791_000_000_000,
         );
-        written.push(json!({
+        let mut case = json!({
             "name": name,
             "idempotency_key": idempotency_key,
             "subject": subject,
@@ -1912,7 +1991,12 @@ fn the_shared_vectors_match_the_bytes_the_daemon_verifies() {
             "signed_at_unix_ms": 1_791_000_000_000_u64,
             "signed_bytes": String::from_utf8(bytes.clone()).unwrap(),
             "signature": device.sign(&bytes),
-        }));
+        });
+        if long {
+            // What the person sent: `fields.content` is only its preview.
+            case["body"] = json!({ "unit": LONG_UNIT, "repeat": LONG_REPEAT });
+        }
+        written.push(case);
     }
     let document = json!({
         "format": FIELDS_FORMAT,

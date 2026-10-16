@@ -51,6 +51,12 @@ export const fonts = {
   bold: 'IBMPlexMono_700Bold',
 } as const;
 
+/** System appearance for migrated iPhone surfaces; legacy tabs keep their palette. */
+export const systemColors = {
+  light: { background: '#f2f2f7', grouped: '#ffffff', text: '#000000', secondary: '#59595f', separator: '#c6c6c8', action: '#005fcc', attention: '#9c4400', fault: '#c00f20', success: '#216e35' },
+  dark: { background: '#000000', grouped: '#1c1c1e', text: '#ffffff', secondary: '#b5b5bd', separator: '#48484a', action: '#64aaff', attention: '#ffb15c', fault: '#ff6961', success: '#72d88a' },
+} as const;
+
 // stui colours each harness the same way everywhere.
 export function harnessColor(harness: string): string {
   switch (harness) {

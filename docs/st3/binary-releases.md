@@ -32,11 +32,11 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/compound
 The script detects Linux x86_64 or Apple Silicon macOS, downloads the archive and
 its SHA256 checksum, verifies it before installation, then runs `st`. It restores
 terminal input for the `curl | sh` form. To select an exact release or install
-without opening the interface (v0.3.18 below is an example; choose a published tag):
+without opening the interface (`vX.Y.Z` below is a placeholder; choose a published tag):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/install.sh -o install.sh
-sh install.sh --tag v0.3.18 --no-run
+sh install.sh --tag vX.Y.Z --no-run
 ```
 
 To follow `main` instead, pass `--edge`; it is the same as `--tag edge` and cannot be combined with
@@ -112,7 +112,8 @@ to catch package breakage early.
 
 The st3 Nix check uses nextest to give each test its own process, including CPU-budget and
 delivery-presence fixtures. Python, Node, and the Linux process utilities are declared test inputs;
-the historical messaging binary is pinned in the lockfile and supplied before the sandbox starts.
+the st3 messaging compatibility binary is pinned by the `messaging-baseline` input in `flake.lock`
+and supplied through `ST3_MESSAGING_COMPAT_BIN` by the check’s `preCheck` inside the sandbox.
 The native runtime suite and documentation tests remain covered.
 
 ## Edge releases

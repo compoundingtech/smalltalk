@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Raise a call Claude's auto mode denied as an alert the person can allow once or for its kind",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "New permission-denied diagnostics and a /v1/harness-prompts/answer read for the seat's own hooks; the hook registration is unchanged, so no seat restarts."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or new swap-back restrictions."
+  }
+}

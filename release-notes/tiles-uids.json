@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The tile launcher allocates each tile's user ID from the registry's uids range and records it in the root-owned STATE/uids.toml; `st tiles remove` ends a tile, removes its state and gives its ID back. No tile is a hand-made account.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim kind or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or graph schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No smallclaims rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A tile registry entry no longer takes uid or gid: a registry that names them is refused, since the launcher allocates them. Tiles are opt-in and no host runs a registry yet (/etc/st-tiles is absent on hetz2). The main API socket and every seat are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or migration; the daemon follows the registry and uids.toml as they change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to do on upgrade. The root-only proofs (ST_TILES_ROOT_TEST=1 tiles_root) are not run in CI; they ran 11/11 on hetz2 for this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "`st tiles remove NAME` gives a tile's ID back once its state and processes are gone."
+  }
+}

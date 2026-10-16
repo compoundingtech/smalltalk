@@ -61,6 +61,9 @@ pub struct ErrorEnvelope {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
+    RecipientRetired,
+    LifecycleUnavailable,
+    RetirementUpgradeRequired,
     NotFound,
     Forbidden,
     UnsupportedCapability,
@@ -83,6 +86,7 @@ pub enum ErrorCode {
     ValidationFailed,
     IdempotencyConflict,
     IssuerRequired,
+    SuspendAuthoredSessionSelection,
     StaleFence,
     CursorGap,
     PageCursorExpired,
@@ -230,7 +234,19 @@ impl SyncNotice {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ExchangeTransport {
+    pub at: String,
+    pub carrier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric_route: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SyncPeer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_exchange: Option<ExchangeTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_exchange: Option<ExchangeTransport>,
     pub host_id: String,
     /// Envelopes the peer holds that this host lacks.
     pub peer_only_envelopes: u64,
@@ -458,6 +474,42 @@ pub struct MailBacklog {
     pub count: u64,
     pub threshold_ms: u64,
     pub cleanup_command: String,
+}
+/// Every objective and budget at one moment.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SloList {
+    pub as_of_unix_ms: u64,
+    pub rows: Vec<SloRow>,
+}
+/// One objective (a target with windows and an error budget) or one budget (an allowance that
+/// resets). `remaining_percent` is null when nothing was measured.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SloRow {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    pub about: String,
+    pub target: String,
+    pub current: String,
+    pub window: String,
+    pub remaining_percent: Option<f64>,
+    pub status: String,
+    #[serde(default)]
+    pub resets_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub measured_at_unix_ms: Option<u64>,
+    pub explain: String,
+}
+/// What was left of one objective or budget across a period, in equal steps. A step holds its
+/// lowest reading and is null when nothing was read.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SloHistory {
+    pub id: String,
+    pub since_ms: u64,
+    pub until_ms: u64,
+    pub samples: u64,
+    pub steps: Vec<Option<f64>>,
 }
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1062,6 +1114,43 @@ pub struct MissionWake {
     #[serde(default)]
     pub failure: Option<String>,
 }
+/// st's presentation of an agent (docs/clients/ui-contract.md, Agent). Words are
+/// fixtures/clients/words.json ids.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AgentPresentation {
+    pub state: String,
+    pub group: String,
+    #[serde(default)]
+    pub because: Option<String>,
+    #[serde(default)]
+    pub now: Option<AgentPresentationNow>,
+    #[serde(default)]
+    pub next: Vec<AgentPresentationWork>,
+    #[serde(default)]
+    pub queued: u64,
+}
+/// A step an agent holds or has queued, named for display.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AgentPresentationWork {
+    pub step: String,
+    pub mission: String,
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `mission › path`.
+    pub label: String,
+}
+/// What an agent holds now.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AgentPresentationNow {
+    #[serde(flatten)]
+    pub work: AgentPresentationWork,
+    #[serde(default)]
+    pub goal: Option<String>,
+    pub since: String,
+    #[serde(default)]
+    pub holder_down_since: Option<String>,
+}
 /// A step named for display: its mission, run, path, title and first goal.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct WorkLabel {
@@ -1181,6 +1270,9 @@ pub struct Agent {
     pub current_session_id: Option<String>,
     #[serde(default)]
     pub todo: Option<AgentTodo>,
+    /// st's presentation of this agent; absent from older daemons.
+    #[serde(default)]
+    pub presentation: Option<AgentPresentation>,
     #[serde(default)]
     pub current_work_ids: Vec<String>,
     #[serde(default)]
@@ -2414,6 +2506,8 @@ pub enum ActionType {
     AgentCreate,
     #[serde(rename = "agent.stop")]
     AgentStop,
+    #[serde(rename = "agent.retire")]
+    AgentRetire,
     #[serde(rename = "agent.start")]
     AgentStart,
     #[serde(rename = "agent.suspend")]
@@ -2527,6 +2621,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AgentResume,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn agent_retire(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentRetireParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentRetire,
             idempotency_key,
             fence,
             &parameters,
@@ -3381,6 +3489,13 @@ pub struct PersonAnswerRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRetireParameters {
+    pub agent: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentStopParameters {

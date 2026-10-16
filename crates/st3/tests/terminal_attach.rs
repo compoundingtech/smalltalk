@@ -698,15 +698,15 @@ fn fabric_shim(root: &Path, tunnel: Option<&Path>) {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let dial = match tunnel {
-        Some(tunnel) => format!("echo '{}'", tunnel.display()),
-        None => "echo 'peer unreachable' >&2; exit 2".into(),
+        Some(tunnel) => format!("echo '{{\"socket\":\"{}\"}}'", tunnel.display()),
+        None => "echo '{\"error\":{\"code\":\"unreachable\",\"class\":\"fault\",\"message\":\"peer unreachable\",\"peer\":null,\"service\":null}}'; exit 69".into(),
     };
     let fabric = bin.join("fabric");
     std::fs::write(
         &fabric,
         format!(
             "#!/bin/sh\necho \"$@\" >> '{calls}'\ncase \"$1\" in\n  \
-             peers) printf '{OWNER_NODE}\\towner-node\\tst3/pty/{FLEET_ID}\\n';;\n  \
+             peers) echo '{{\"peers\":[{{\"node\":\"{OWNER_NODE}\",\"name\":\"owner-node\",\"allow\":[\"st3/pty/{FLEET_ID}\"]}}]}}';;\n  \
              dial) {dial};;\n  expose) echo exposed;;\n  *) exit 1;;\nesac\n",
             calls = root.join("fabric-calls").display(),
         ),

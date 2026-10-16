@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Build stamps: watch packed-refs only when the branch ref HEAD names is not a loose file, and watch the directory the loose ref will appear in, so a branch that was packed by gc still sees its next commit",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this narrows and completes which Git files two build scripts tell Cargo to watch."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, wire or harness contract change. The build stamp (revision, dirty flag) is computed exactly as before; only the files that trigger recomputing it change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No upgrade downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery procedure; reverting the change restores the previous build-script behavior."
+  }
+}

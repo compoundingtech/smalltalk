@@ -12,7 +12,6 @@ use opentelemetry::{
 };
 
 use super::worker::{PeerOverloaded, RemovedFromFleet};
-use crate::replication::ReplicationHealReport;
 
 static EXPORT_ENABLED: AtomicBool = AtomicBool::new(false);
 static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -37,8 +36,6 @@ struct Instruments {
     round_duration: Histogram<f64>,
     batch_size: Histogram<u64>,
     errors: Counter<u64>,
-    heals: Counter<u64>,
-    heal_duration: Histogram<f64>,
 }
 static METRICS: LazyLock<Instruments> = LazyLock::new(|| {
     let meter = opentelemetry::global::meter("smallclaims.replication");
@@ -59,14 +56,6 @@ static METRICS: LazyLock<Instruments> = LazyLock::new(|| {
         errors: meter
             .u64_counter("st.replication.errors")
             .with_unit("{error}")
-            .build(),
-        heals: meter
-            .u64_counter("st.replication.heals")
-            .with_unit("{heal}")
-            .build(),
-        heal_duration: meter
-            .f64_histogram("st.replication.heal.duration")
-            .with_unit("s")
             .build(),
     }
 });
@@ -155,15 +144,11 @@ pub(super) fn record_error(peer: &str, reason: ErrorReason) {
     }
 }
 
-fn root_span<T: opentelemetry::trace::Tracer>(tracer: &T, peer: Arc<str>, heal: bool) -> T::Span {
-    let (name, label) = if heal {
-        ("st.replication.heal", "heal")
-    } else {
-        ("st.replication.round", "round")
-    };
+fn root_span<T: opentelemetry::trace::Tracer>(tracer: &T, peer: Arc<str>) -> T::Span {
     // An explicit empty context detaches even from an attached ambient OTel span.
-    let mut span = tracer.start_with_context(name, &opentelemetry::Context::new());
-    span.set_attribute(KeyValue::new("span.label", label));
+    let mut span =
+        tracer.start_with_context("st.replication.round", &opentelemetry::Context::new());
+    span.set_attribute(KeyValue::new("span.label", "round"));
     span.set_attribute(KeyValue::new("st.replication.peer", peer));
     span
 }
@@ -174,12 +159,12 @@ struct Recording {
     metrics: Option<(KeyValue, Instant)>,
 }
 impl Recording {
-    fn new(peer: &str, heal: bool, export: bool, metrics: bool) -> Option<Self> {
+    fn new(peer: &str, export: bool, metrics: bool) -> Option<Self> {
         if !export && !metrics {
             return None;
         }
         let peer = Arc::<str>::from(peer);
-        let span = export.then(|| root_span(&*TRACER, peer.clone(), heal));
+        let span = export.then(|| root_span(&*TRACER, peer.clone()));
         Some(Self {
             span,
             metrics: metrics.then(|| (KeyValue::new("peer", peer), Instant::now())),
@@ -212,24 +197,6 @@ impl RoundOutcome {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HealOutcome {
-    Repaired,
-    Unchanged,
-    Failed,
-    Cancelled,
-}
-impl HealOutcome {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Repaired => "repaired",
-            Self::Unchanged => "unchanged",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
 pub(super) struct Round {
     recording: Option<Recording>,
     moved: u64,
@@ -239,7 +206,6 @@ impl Round {
         Self {
             recording: Recording::new(
                 peer,
-                false,
                 EXPORT_ENABLED.load(Ordering::Relaxed),
                 METRICS_ENABLED.load(Ordering::Relaxed),
             ),
@@ -266,22 +232,15 @@ impl Round {
             );
         }
     }
-    pub(super) fn finish(&mut self, result: &anyhow::Result<(bool, bool)>) {
-        let (outcome, heal_due, error) = match result {
-            Ok((moved, heal_due)) => (
-                if *moved {
-                    RoundOutcome::Moved
-                } else {
-                    RoundOutcome::InSync
-                },
-                *heal_due,
-                None,
-            ),
-            Err(error) => (RoundOutcome::Failed, false, Some(error)),
+    pub(super) fn finish(&mut self, result: &anyhow::Result<bool>) {
+        let (outcome, error) = match result {
+            Ok(true) => (RoundOutcome::Moved, None),
+            Ok(false) => (RoundOutcome::InSync, None),
+            Err(error) => (RoundOutcome::Failed, Some(error)),
         };
-        self.finalize(outcome, heal_due, error);
+        self.finalize(outcome, error);
     }
-    fn finalize(&mut self, outcome: RoundOutcome, heal_due: bool, error: Option<&anyhow::Error>) {
+    fn finalize(&mut self, outcome: RoundOutcome, error: Option<&anyhow::Error>) {
         // Taking the recording makes explicit completion and Drop mutually exclusive.
         let Some(mut recording) = self.recording.take() else {
             return;
@@ -305,7 +264,6 @@ impl Round {
                 "st.replication.moved_envelopes",
                 i64::try_from(self.moved).unwrap_or(i64::MAX),
             ));
-            span.set_attribute(KeyValue::new("st.replication.heal_due", heal_due));
             span.end();
         }
         if let Some((peer, started)) = &recording.metrics {
@@ -319,96 +277,7 @@ impl Round {
 }
 impl Drop for Round {
     fn drop(&mut self) {
-        self.finalize(RoundOutcome::Cancelled, false, None);
-    }
-}
-
-pub(super) struct Heal {
-    recording: Option<Recording>,
-    questions: u64,
-    outcome: HealOutcome,
-    error_recorded: bool,
-}
-impl Heal {
-    pub(super) fn new(peer: &str) -> Self {
-        Self {
-            recording: Recording::new(
-                peer,
-                true,
-                EXPORT_ENABLED.load(Ordering::Relaxed),
-                METRICS_ENABLED.load(Ordering::Relaxed),
-            ),
-            questions: 0,
-            outcome: HealOutcome::Failed,
-            error_recorded: false,
-        }
-    }
-    pub(super) fn question(&mut self) {
-        if self.recording.is_some() {
-            self.questions += 1;
-        }
-    }
-    pub(super) fn error(&mut self, error: &anyhow::Error) {
-        if let Some(recording) = &self.recording {
-            if !self.error_recorded && recording.metrics.is_some() {
-                recording.error(error_reason(error));
-            }
-            self.error_recorded = true;
-        }
-    }
-    pub(super) fn complete(&mut self, report: &ReplicationHealReport) {
-        if self.recording.is_none() {
-            return;
-        }
-        self.outcome = if !report.healed || self.error_recorded {
-            HealOutcome::Failed
-        } else if report.refetched != 0
-            || report.pushed != 0
-            || report.replayed
-            || report.peer_replayed
-        {
-            HealOutcome::Repaired
-        } else {
-            HealOutcome::Unchanged
-        };
-    }
-    pub(super) fn finish(&mut self) {
-        self.finalize(self.outcome);
-    }
-    fn finalize(&mut self, outcome: HealOutcome) {
-        let Some(mut recording) = self.recording.take() else {
-            return;
-        };
-        if outcome == HealOutcome::Failed {
-            if let Some(span) = &mut recording.span {
-                span.set_status(opentelemetry::trace::Status::error(
-                    "replication heal failed",
-                ));
-            }
-            if !self.error_recorded {
-                recording.error(ErrorReason::Other);
-            }
-        }
-        if let Some(span) = &mut recording.span {
-            span.set_attribute(KeyValue::new(
-                "st.replication.questions",
-                i64::try_from(self.questions).unwrap_or(i64::MAX),
-            ));
-            span.set_attribute(KeyValue::new("st.replication.outcome", outcome.as_str()));
-            span.end();
-        }
-        if let Some((peer, started)) = &recording.metrics {
-            let attributes = [peer.clone(), KeyValue::new("outcome", outcome.as_str())];
-            METRICS.heals.add(1, &attributes);
-            METRICS
-                .heal_duration
-                .record(started.elapsed().as_secs_f64(), &attributes);
-        }
-    }
-}
-impl Drop for Heal {
-    fn drop(&mut self) {
-        self.finalize(HealOutcome::Cancelled);
+        self.finalize(RoundOutcome::Cancelled, None);
     }
 }
 
@@ -471,39 +340,6 @@ mod tests {
     }
 
     #[test]
-    fn heal_outcomes_distinguish_repairs_and_unresolved_graphs() {
-        let mut heal = Heal {
-            recording: Some(Recording {
-                span: None,
-                metrics: None,
-            }),
-            questions: 0,
-            outcome: HealOutcome::Failed,
-            error_recorded: false,
-        };
-        let mut report = ReplicationHealReport {
-            healed: true,
-            ..Default::default()
-        };
-        heal.complete(&report);
-        assert_eq!(heal.outcome, HealOutcome::Unchanged);
-        report.refetched = 1;
-        heal.complete(&report);
-        assert_eq!(heal.outcome, HealOutcome::Repaired);
-        report.refetched = 0;
-        report.peer_replayed = true;
-        heal.complete(&report);
-        assert_eq!(heal.outcome, HealOutcome::Repaired);
-        report.healed = false;
-        heal.complete(&report);
-        assert_eq!(heal.outcome, HealOutcome::Failed);
-        report.healed = true;
-        heal.error(&anyhow::anyhow!("request failed"));
-        heal.complete(&report);
-        assert_eq!(heal.outcome, HealOutcome::Failed);
-    }
-
-    #[test]
     fn round_is_detached_from_attached_ambient_context() {
         use opentelemetry::trace::TraceContextExt as _;
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
@@ -517,12 +353,12 @@ mod tests {
             let _context = opentelemetry::Context::current_with_span(ambient).attach();
             let mut round = Round {
                 recording: Some(Recording {
-                    span: Some(root_span(&tracer, Arc::from("cedar"), false)),
+                    span: Some(root_span(&tracer, Arc::from("cedar"))),
                     metrics: None,
                 }),
                 moved: 0,
             };
-            round.finish(&Ok((false, false)));
+            round.finish(&Ok(false));
         }
         provider.force_flush().unwrap();
         let spans = exporter.get_finished_spans().unwrap();
@@ -559,16 +395,6 @@ mod tests {
             .map(RoundOutcome::as_str),
             ["moved", "in_sync", "failed", "cancelled"],
         );
-        assert_eq!(
-            [
-                HealOutcome::Repaired,
-                HealOutcome::Unchanged,
-                HealOutcome::Failed,
-                HealOutcome::Cancelled
-            ]
-            .map(HealOutcome::as_str),
-            ["repaired", "unchanged", "failed", "cancelled"],
-        );
     }
 
     fn capture_guard_spans(
@@ -585,12 +411,9 @@ mod tests {
         exporter.get_finished_spans().unwrap()
     }
 
-    fn test_recording(
-        tracer: &opentelemetry::global::BoxedTracer,
-        heal: bool,
-    ) -> Option<Recording> {
+    fn test_recording(tracer: &opentelemetry::global::BoxedTracer) -> Option<Recording> {
         Some(Recording {
-            span: Some(root_span(tracer, Arc::from("cedar"), heal)),
+            span: Some(root_span(tracer, Arc::from("cedar"))),
             metrics: None,
         })
     }
@@ -599,74 +422,51 @@ mod tests {
     fn dropping_unfinished_guards_exports_cancelled_without_error() {
         let spans = capture_guard_spans(|tracer| {
             drop(Round {
-                recording: test_recording(tracer, false),
+                recording: test_recording(tracer),
                 moved: 3,
             });
-            drop(Heal {
-                recording: test_recording(tracer, true),
-                questions: 2,
-                outcome: HealOutcome::Failed,
-                error_recorded: false,
-            });
         });
-        assert_eq!(spans.len(), 2);
-        for name in ["st.replication.round", "st.replication.heal"] {
-            let matching: Vec<_> = spans.iter().filter(|span| span.name == name).collect();
-            assert_eq!(matching.len(), 1);
-            let span = matching[0];
-            assert_eq!(span.status, opentelemetry::trace::Status::Unset);
-            assert!(
-                span.attributes
-                    .iter()
-                    .any(
-                        |attribute| attribute.key.as_str() == "st.replication.outcome"
-                            && attribute.value.as_str() == "cancelled"
-                    )
-            );
-        }
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "st.replication.round");
+        assert_eq!(span.status, opentelemetry::trace::Status::Unset);
+        assert!(
+            span.attributes
+                .iter()
+                .any(
+                    |attribute| attribute.key.as_str() == "st.replication.outcome"
+                        && attribute.value.as_str() == "cancelled"
+                )
+        );
     }
 
     #[test]
     fn explicit_completion_and_drop_finalize_each_guard_once() {
         let spans = capture_guard_spans(|tracer| {
             let mut round = Round {
-                recording: test_recording(tracer, false),
+                recording: test_recording(tracer),
                 moved: 0,
             };
-            round.finish(&Ok((false, false)));
+            round.finish(&Ok(false));
             assert!(round.recording.is_none());
             round.finish(&Err(anyhow::anyhow!("already finished")));
-            let mut heal = Heal {
-                recording: test_recording(tracer, true),
-                questions: 1,
-                outcome: HealOutcome::Unchanged,
-                error_recorded: false,
-            };
-            heal.finish();
-            assert!(heal.recording.is_none());
-            heal.finish();
         });
-        assert_eq!(spans.len(), 2);
-        for (name, outcome) in [
-            ("st.replication.round", "in_sync"),
-            ("st.replication.heal", "unchanged"),
-        ] {
-            let span = spans.iter().find(|span| span.name == name).unwrap();
-            assert_eq!(span.status, opentelemetry::trace::Status::Unset);
-            assert!(
-                span.attributes
-                    .iter()
-                    .any(
-                        |attribute| attribute.key.as_str() == "st.replication.outcome"
-                            && attribute.value.as_str() == outcome
-                    )
-            );
-        }
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "st.replication.round");
+        assert_eq!(span.status, opentelemetry::trace::Status::Unset);
+        assert!(
+            span.attributes
+                .iter()
+                .any(
+                    |attribute| attribute.key.as_str() == "st.replication.outcome"
+                        && attribute.value.as_str() == "in_sync"
+                )
+        );
     }
 
     #[test]
     fn disabled_operation_has_no_recording() {
-        assert!(Recording::new("cedar", false, false, false).is_none());
-        assert!(Recording::new("cedar", true, false, false).is_none());
+        assert!(Recording::new("cedar", false, false).is_none());
     }
 }

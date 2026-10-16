@@ -1752,9 +1752,23 @@ fn allocator_reclamation_follows_checkpoint_plan_view_and_proof_errors_once() {
     assert_eq!(after.1 - before.1, u64::from(cfg!(all(target_os = "linux", target_env = "gnu"))));
 
     let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    let staged = store.checkpoint_staged_set(cut, None, &scratch.path().join("plan")).unwrap();
+    let staged_path = staged.path.clone();
+    let captured = store.checkpoint_plan_view_from_staged(cut, staged, scratch.path()).unwrap();
+    assert!(!staged_path.exists(), "successful proof removes its dry-run staging file");
+    assert_eq!(serde_json::to_value(&captured).unwrap(), serde_json::to_value(&view).unwrap());
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
+        "the separately scheduled captured plan retains its outer reclamation boundary");
     let plan = plan_drops(&sealed);
     let blocked = scratch.path().join("not-a-directory");
     std::fs::write(&blocked, b"occupied").unwrap();
+    let before = allocator_reclaim_stats_for_test();
+    let staged = store.checkpoint_staged_set(cut, None, &scratch.path().join("plan")).unwrap();
+    let staged_path = staged.path.clone();
+    assert!(store.checkpoint_plan_view_from_staged(cut, staged, &blocked).is_err());
+    assert!(!staged_path.exists(), "failed proof removes its dry-run staging file");
+    assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1);
     let before = allocator_reclaim_stats_for_test();
     assert!(store.prove_checkpoint_plan(&sealed, &plan, &blocked).is_err());
     assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
@@ -1766,6 +1780,35 @@ fn allocator_reclamation_follows_checkpoint_plan_view_and_proof_errors_once() {
     assert!(prove_on_copy(&invalid, &sealed, &plan).is_err());
     assert_eq!(allocator_reclaim_stats_for_test().0 - before.0, 1,
         "failed direct proof also finishes once");
+}
+
+#[test]
+fn staged_plan_finishes_without_borrowing_a_held_live_writer() {
+    let store = Store::open_memory("alder").unwrap();
+    write_history(&store);
+    let scratch = tempfile::tempdir().unwrap();
+    let cut = now_ms() + 1_000;
+    let staged = store.checkpoint_staged_set(cut, None, &scratch.path().join("plan")).unwrap();
+    let staged_path = staged.path.clone();
+    let writer = store.connection.write();
+    std::thread::scope(|scope| {
+        let (done, result) = std::sync::mpsc::channel();
+        let working = &store;
+        let scratch = scratch.path();
+        let proof = scope.spawn(move || {
+            // Test builds normally compare to the full in-memory capture as well.
+            // Exercise only the production staged phase while the live writer is held.
+            let view = smallclaims::store::checkpoint_staging::without_reference_plan(||
+                working.checkpoint_plan_view_from_staged(cut, staged, scratch));
+            let _ = done.send(view);
+        });
+        let completed = result.recv_timeout(std::time::Duration::from_secs(5));
+        drop(writer); // Always free a wrongly borrowed writer before joining/asserting.
+        proof.join().unwrap();
+        let view = completed.expect("staged planning/proof borrowed the live writer").unwrap();
+        assert!(view.proof.passed);
+    });
+    assert!(!staged_path.exists());
 }
 
 #[test]
@@ -2200,7 +2243,10 @@ fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
     use smallclaims::sqlite::WriterJob;
     use std::sync::atomic::Ordering;
     const FLEET: &str = "5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12";
-    let store = Store::open_memory("seal-queue-node").unwrap();
+    // Sealing prepares the next chunk on a read connection while the queued write runs. A
+    // shared-memory store answers that contention with SQLITE_LOCKED, so this uses a file.
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Store::open(&scratch.path().join("claims.sqlite3"), "seal-queue-node").unwrap();
     store.bind_fleet(FLEET).unwrap();
     let key = Arc::new(MemberKey::generate().unwrap().0);
     store.set_member_key(Some(key.clone())).unwrap();
@@ -2900,16 +2946,187 @@ witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
 
 #[test]
-fn the_policy_renders_the_rules_description_with_only_the_limits_rule_changed_since_14() {
-    assert_eq!(super::checkpoint_rules::RULES_VERSION, 15);
+fn the_policy_renders_the_rules_description_with_review_reader_fenced_since_15() {
+    assert_eq!(super::checkpoint_rules::RULES_VERSION, 16);
     assert_eq!(
         super::checkpoint_rules::rules_description(),
         RULES_V14_DESCRIPTION.replace(
             "harness.limits keep=all-source-observations",
             "harness.limits slot=subject keep=newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at\n\
              runtime.reconcile-decision slot=subject,key keep=newest,newest-carrier-of-each-field",
-        )
+        ) + "\nreview=retain-binding,withdrawal,verdict,actor-evidence,attempt-relation-references"
     );
+}
+
+#[test]
+fn review_reader_retains_durable_history_and_every_referenced_drop_candidate() {
+    for kind in st3_schema::review::KINDS {
+        let mut sealed = Sealed::default();
+        let mut refs = serde_json::Map::new();
+        for name in ["binding_claim", "previous_binding", "request", "verdict", "carry_forward_from", "attempt_receipt", "observation"] {
+            let subject = format!("agent/tester/{name}");
+            sealed.add("ada", 0, draft("harness.observed", &subject, json!({"state":"idle","incarnation_id":"tester"})));
+            let referenced = sealed.add("ada", 1, draft("harness.observed", &subject, json!({"state":"idle","incarnation_id":"tester"})));
+            sealed.add("ada", 2, draft("harness.observed", &subject, json!({"state":"idle","incarnation_id":"tester"})));
+            refs.insert(name.into(),json!(referenced));
+        }
+        for name in ["evidence", "finding_refs", "authorization_evidence"] {
+            let subject = format!("agent/tester/{name}");
+            sealed.add("ada", 0, draft("harness.observed", &subject, json!({"state":"idle","incarnation_id":"tester"})));
+            let referenced = sealed.add("ada", 1, draft("harness.observed", &subject, json!({"state":"idle","incarnation_id":"tester"})));
+            sealed.add("ada", 2, draft("harness.observed", &subject, json!({"state":"idle","incarnation_id":"tester"})));
+            refs.insert(name.into(),json!([referenced]));
+        }
+        let history = sealed.add("reviewer",3,draft(kind,"gate-operation/tester",Value::Object(refs.clone())));
+        let mut fixture = sealed.build();
+        let dropped = plan_drops(&fixture).claims.into_iter().map(|claim|claim.id).collect::<BTreeSet<_>>();
+        assert!(!dropped.contains(&history),"{kind}");
+        for value in refs.values() {
+            for id in value.as_array().map_or_else(|| vec![value], |values| values.iter().collect()) {
+                assert!(!dropped.contains(id.as_str().unwrap()),"{kind}");
+            }
+        }
+        fixture.claims.iter_mut().find(|claim| claim.claim.id == history).unwrap().claim.body = json!({"fields":{}});
+        let unprotected = plan_drops(&fixture).claims.into_iter().map(|claim|claim.id).collect::<BTreeSet<_>>();
+        for value in refs.values() {
+            for id in value.as_array().map_or_else(|| vec![value], |values| values.iter().collect()) {
+                assert!(unprotected.contains(id.as_str().unwrap()),"negative control: {kind}");
+            }
+        }
+    }
+    let mut legacy = Sha256::new();
+    legacy.update(b"st3-checkpoint-rules-v1\0");
+    legacy.update(15_u32.to_be_bytes());
+    let description = super::checkpoint_rules::rules_description().split("\nreview=").next().unwrap();
+    legacy.update(description.as_bytes());
+    assert_ne!(hex::encode(legacy.finalize()),rules_digest());
+}
+
+#[test]
+fn staged_review_reader_retains_every_reference_and_predecessor_like_in_memory() {
+    use smallclaims::store::checkpoint_staging::{StagedPlan, without_reference_plan};
+
+    for kind in st3_schema::review::KINDS.into_iter().chain(["gate.requested"]) {
+        for retain_references in [true, false] {
+            let store = Store::open_memory("ada").unwrap();
+            let mut references = serde_json::Map::new();
+            let mut candidates = BTreeSet::new();
+            let mut uncited = BTreeSet::new();
+            let mut predecessor = String::new();
+            for name in [
+                "binding_claim", "previous_binding", "request", "verdict",
+                "carry_forward_from", "attempt_receipt", "observation",
+                "evidence", "finding_refs", "authorization_evidence", "predecessor", "uncited",
+            ] {
+                let array = matches!(name, "evidence" | "finding_refs" | "authorization_evidence");
+                let mut targets = Vec::new();
+                // Two distinct array entries catch extraction of only the first citation.
+                for entry in 0..if array { 2 } else { 1 } {
+                    let subject = format!("agent/tester/{name}-{entry}");
+                    for position in 0..3 {
+                        store.set_write_clock_at(T + position).unwrap();
+                        let claim = store.append_claim(&input(
+                            &subject, "harness.observed", None,
+                            json!({"state":"idle", "incarnation_id":"tester"}),
+                            &format!("{name}-{entry}-{position}"),
+                        )).unwrap();
+                        if position == 1 {
+                            targets.push(claim.id);
+                        }
+                        store.seal_local_batches().unwrap();
+                    }
+                }
+                match name {
+                    "uncited" => uncited.extend(targets),
+                    "predecessor" => {
+                        predecessor = targets.remove(0);
+                        candidates.insert(predecessor.clone());
+                    }
+                    _ => {
+                        candidates.extend(targets.iter().cloned());
+                        references.insert(name.into(), if array {
+                            json!(targets)
+                        } else {
+                            json!(targets[0])
+                        });
+                    }
+                }
+            }
+            if kind == "gate.requested" {
+                references.extend([
+                    ("gate_subject".into(), json!("gate-operation/tester")),
+                    ("generation".into(), json!("run-generation/tester")),
+                    ("episode".into(), json!(1)),
+                    ("change".into(), json!({"kind":"future.review","subject":"resource/tester/review"})),
+                    ("head".into(), json!({"kind":"git.commit","sha":"a".repeat(64)})),
+                    ("scope".into(), json!({"coverage":["implementation"]})),
+                    ("author".into(), json!("agent/alex")),
+                    ("delta_ref".into(), json!(uncited.first().unwrap())),
+                ]);
+                assert!(st3_schema::review::REQUEST_FIELDS.iter().all(|name| references.contains_key(*name)));
+            }
+            store.set_write_clock_at(T + 3).unwrap();
+            let history = store.append_claim(&input(
+                "agent/reviewer", "harness.observed", None,
+                json!({"state":"idle","incarnation_id":"reviewer"}), "review-history",
+            )).unwrap();
+            // Like the hand-built reader fixture above, exercise every reference extractor
+            // independently of admission requirements. Seal after installing the planner input
+            // so the real capture reads its body and predecessor from the sealed envelope.
+            let body = if retain_references {
+                json!({"fields":references})
+            } else {
+                json!({"fields":{}})
+            };
+            let predecessors = if retain_references {
+                vec![predecessor.clone()]
+            } else {
+                Vec::new()
+            };
+            store.connection.write().execute(
+                "UPDATE claims SET subject=?1,kind=?2,body=?3,predecessors=?4 WHERE id=?5",
+                params![
+                    "gate-operation/tester", kind, serde_json::to_string(&body).unwrap(),
+                    serde_json::to_string(&predecessors).unwrap(), history.id,
+                ],
+            ).unwrap();
+            store.seal_local_batches().unwrap();
+            // Keep the writer-newest-envelope guard off all eligible citation targets.
+            store.set_write_clock_at(CUT - 1).unwrap();
+            store.append_claim(&input(
+                "agent/operator", "harness.observed", None,
+                json!({"state":"idle","incarnation_id":"operator"}), "newest-envelope",
+            )).unwrap();
+            store.seal_local_batches().unwrap();
+
+            let sealed = store.checkpoint_sealed_set(CUT).unwrap();
+            let memory = plan_drops(&sealed);
+            let scratch = tempfile::tempdir().unwrap();
+            let staged = store.checkpoint_staged_set(CUT, None, scratch.path()).unwrap();
+            // Compare the actual staged decisions ourselves, not only its summary or the
+            // staging implementation's optional reference-plan assertion.
+            let staged_plan = without_reference_plan(|| store.plan_staged_checkpoint(&staged)).unwrap();
+            assert_eq!(staged_plan, StagedPlan::of(&memory), "{kind}, citations={retain_references}");
+            let staged_dropped = staged.dropped_claims(0, usize::MAX >> 1).unwrap()
+                .into_iter().map(|claim| claim.id).collect::<BTreeSet<_>>();
+            let memory_dropped = dropped(&memory);
+            assert_eq!(staged_dropped, memory_dropped, "{kind}, citations={retain_references}");
+            let all = sealed.claims.iter().map(|claim| claim.claim.id.clone()).collect::<BTreeSet<_>>();
+            let staged_retained = all.difference(&staged_dropped).cloned().collect::<BTreeSet<_>>();
+            let memory_retained = all.difference(&memory_dropped).cloned().collect::<BTreeSet<_>>();
+            assert_eq!(staged_retained, memory_retained, "{kind}, citations={retain_references}");
+            assert!(staged_retained.contains(&history.id), "durable history: {kind}");
+            for candidate in &candidates {
+                // gate.requested citations are preserved, but its ordinary predecessors
+                // are not the durable-review predecessor fence.
+                let retained = retain_references && (kind != "gate.requested" || candidate != &predecessor);
+                assert_eq!(staged_retained.contains(candidate), retained, "{kind}: {candidate}");
+                assert_eq!(memory_retained.contains(candidate), retained, "{kind}: {candidate}");
+            }
+            assert!(uncited.is_subset(&staged_dropped), "uncited eligible claims: {kind}");
+            assert!(uncited.is_subset(&memory_dropped), "uncited eligible claims: {kind}");
+        }
+    }
 }
 
 /// `slot_of` as it was before the policy file, to show the policy groups claims into the same

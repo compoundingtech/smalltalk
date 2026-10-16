@@ -504,6 +504,27 @@ mod tests {
     }
 
     #[test]
+    fn the_clients_cut_the_preview_the_way_the_daemon_does() {
+        // A device signs the preview it computes itself, so the two must agree to the byte,
+        // including at a character boundary and on trailing whitespace.
+        assert_eq!(INLINE_MAX_BYTES, st3_client::device::INLINE_MAX_BYTES);
+        let texts = [
+            "short".to_owned(),
+            "é".repeat(2000),
+            "€".repeat(1000),
+            format!("{}   \n\u{a0}\t{}", "a".repeat(1021), "tail"),
+            format!("{}{}", "a".repeat(1023), "🎉🎉"),
+            "line of notes\n".repeat(900),
+        ];
+        for text in texts {
+            assert_eq!(
+                preview(&text),
+                st3_client::device::long_message_preview(&text)
+            );
+        }
+    }
+
+    #[test]
     fn only_a_hash_is_a_body_reference() {
         let hash = "a".repeat(64);
         assert_eq!(parse_reference(&reference(&hash)), Some(hash.as_str()));

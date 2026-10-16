@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Raise Claude's new-MCP-server and trust dialogs, and Codex's trust selection, as alerts answered with their own keys",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "New native-screen-prompt diagnostics (including -undelivered, a warning when the terminal refused an answer part way); older daemons ignore them. Claude's first-run text-style picker now reads as needing login."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or new swap-back restrictions."
+  }
+}

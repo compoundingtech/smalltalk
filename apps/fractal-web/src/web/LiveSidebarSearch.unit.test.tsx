@@ -7,12 +7,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 // Resolve StyleX variables the way the browser does: each defineVars group gets unique
 // variable names with its defaults, and createTheme records the scheme's overrides.
 const sx = vi.hoisted(() => ({ groups: 0, defaults: new Map<string, string>(), themes: new WeakMap<object, ReadonlyMap<string, string>>() }))
-vi.mock('@stylexjs/stylex', () => {
+vi.mock('@stylexjs/stylex', async () => {
   const flat = (values: readonly unknown[]): Record<string, unknown>[] => values.flatMap(value =>
     Array.isArray(value) ? flat(value) : typeof value === 'object' && value !== null && !sx.themes.has(value) ? [value as Record<string, unknown>] : [])
   return {
-    create: (styles: unknown) => styles,
-    keyframes: () => 'animation',
+    ...await import('../testStylex.ts'),
     defineVars: (vars: Record<string, string>) => {
       const group = sx.groups++
       return Object.fromEntries(Object.entries(vars).map(([key, value]) => {

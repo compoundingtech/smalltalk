@@ -13,7 +13,7 @@ import { initialFeedSync, type FeedSyncObservation } from '../data/feedSync.ts'
 import { observed, waiting, type ConversationPage, type DataSource, type Feed } from '../data/source.ts'
 import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
 
-vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 const gateway = 'gateway.example.invalid'
 const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
@@ -134,10 +134,10 @@ describe.each([1280, 1440, 2980])('sidebar footer at %ipx', width => {
 describe('shipped live sidebar machine query', () => {
   it('applies typed hosts to the real roster and preserves substring text and stripped highlights', async () => {
     const candidates: readonly Agent[] = [
-      { ...agent, id: 'agent/compiler', name: 'Compiler Alpha', host_id: Option.some('host/dev3') },
-      { ...agent, id: 'agent/sidebar', name: 'Sidebar Beta', host_id: Option.some('host/DEV5') },
+      { ...agent, id: 'agent/compiler', name: 'Compiler Alpha', host_id: Option.some('host/synthetic-138/1') },
+      { ...agent, id: 'agent/sidebar', name: 'Sidebar Beta', host_id: Option.some('host/SYNTHETIC-138/2') },
       // Text looks like a matching host but must not satisfy a machine facet.
-      { ...agent, id: 'agent/decoy', name: 'Compiler dev3 decoy', host_id: Option.some('host/laptop24') },
+      { ...agent, id: 'agent/decoy', name: 'Compiler synthetic-138/1 decoy', host_id: Option.some('host/laptop24') },
     ]
     registry.set(agents, observed({ value: candidates }))
     await mount(1440)
@@ -152,25 +152,25 @@ describe('shipped live sidebar machine query', () => {
     const names = () => [...roster().querySelectorAll('[data-testid="taste-agent-row"]')].map(row => row.textContent)
     expect(names()).toHaveLength(3)
     for (const [query, expected] of [
-      ['machine:dev3', ['Compiler Alpha']],
-      ['machine:dev3,dev5', ['Compiler Alpha', 'Sidebar Beta']],
-      ['HOST:DEV', ['Compiler Alpha', 'Sidebar Beta']],
-      ['machine:dev host:dev3', ['Compiler Alpha']],
-      ['machine:dev3 host:dev5', []],
-      ['machine:dev9', []],
-      ['machine: host:,,', ['Compiler Alpha', 'Sidebar Beta', 'Compiler dev3 decoy']],
-      ['Alpha machine:DEV', ['Compiler Alpha']],
-      ['cmp machine:dev', []],
-      ['dev3', ['Compiler Alpha', 'Compiler dev3 decoy']],
-      ['machine:host/dev3', []],
+      ['machine:synthetic-138/1', ['Compiler Alpha']],
+      ['machine:synthetic-138/1,synthetic-138/2', ['Compiler Alpha', 'Sidebar Beta']],
+      ['HOST:SYNTHETIC-138', ['Compiler Alpha', 'Sidebar Beta']],
+      ['machine:synthetic-138 host:synthetic-138/1', ['Compiler Alpha']],
+      ['machine:synthetic-138/1 host:synthetic-138/2', []],
+      ['machine:synthetic-138/9', []],
+      ['machine: host:,,', ['Compiler Alpha', 'Sidebar Beta', 'Compiler synthetic-138/1 decoy']],
+      ['Alpha machine:SYNTHETIC-138', ['Compiler Alpha']],
+      ['cmp machine:synthetic-138', []],
+      ['synthetic-138/1', ['Compiler Alpha', 'Compiler synthetic-138/1 decoy']],
+      ['machine:host/synthetic-138/1', []],
     ] as const) {
       await search(query)
       expect(names()).toHaveLength(expected.length)
       expected.forEach(name => expect(roster().textContent).toContain(name))
     }
-    await search('machine:dev3')
+    await search('machine:synthetic-138/1')
     expect(roster().querySelectorAll('mark')).toHaveLength(0)
-    await search('Alpha machine:dev3')
+    await search('Alpha machine:synthetic-138/1')
     expect([...roster().querySelectorAll('mark')].map(mark => mark.textContent).join('')).toContain('Alpha')
     expect([...roster().querySelectorAll('mark')].some(mark => mark.textContent?.includes('machine:'))).toBe(false)
   })

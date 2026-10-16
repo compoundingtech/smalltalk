@@ -12,15 +12,58 @@ let
   # A stand-in for gh: it says what it was asked and whether it got a token, never the token.
   fakeGh = pkgs.writeShellScriptBin "gh" ''
     echo "gh $* token=''${GH_TOKEN:+set} home=$HOME"
+    if test -f checkout-marker; then
+      echo "checkout=$(pwd):$(cat checkout-marker)"
+      options=$(${pkgs.util-linux}/bin/findmnt -n -o OPTIONS --target .)
+      for flag in ro nosuid nodev; do
+        case ",$options," in
+          *,$flag,*) ;;
+          *) echo "missing-checkout-mount-flag=$flag"; exit 91 ;;
+        esac
+      done
+      echo "checkout-mount-ro-nosuid-nodev"
+      if touch forbidden-checkout-write 2>/dev/null; then exit 90; fi
+      echo "checkout-readonly"
+      cat
+    fi
+  '';
+  # VM-only barrier after the gateway verifies a directory and before bwrap mounts it.
+  # No production hook, environment flag or caller-controlled executable is introduced.
+  checkedBwrap = pkgs.writeShellScript "sekrets-checked-bwrap" ''
+    if test -e /run/st-sekrets/bind-control/watch; then
+      touch /run/st-sekrets/bind-control/invoked
+    fi
+    if test -e /run/st-sekrets/bind-control/pause; then
+      touch /run/st-sekrets/bind-control/ready
+      ${pkgs.coreutils}/bin/timeout 60 cat /run/st-sekrets/bind-control/resume >/dev/null || {
+        echo "VM bind barrier was not released within 60s" >&2
+        exit 124
+      }
+    fi
+    exec ${pkgs.bubblewrap}/bin/bwrap "$@"
   '';
   gatewayConfig = pkgs.writeText "gateway.toml" ''
-    bwrap = "${pkgs.bubblewrap}/bin/bwrap"
+    bwrap = "${checkedBwrap}"
     path = ["/run/current-system/sw/bin"]
     checkout_roots = ["/srv/people"]
 
     [people]
     "1000" = "person/ada"
     "1001" = "person/robin"
+
+    [programs."1002"]
+    principal = "program/ci1/evidence"
+    person = "person/ada"
+    unit = "ci-evidence-caller.service"
+    command = ["gh", "pr", "view", "1"]
+    [programs."1002".checkout]
+    backing_root = "/var/cache/evidence/work"
+    mount_root = "/w"
+    [programs."1003"]
+    principal = "program/ci1/host-evidence"
+    person = "person/ada"
+    unit = "ci-host-evidence.service"
+    command = ["gh", "pr", "view", "1"]
   '';
 in
 pkgs.testers.runNixOSTest {
@@ -47,6 +90,18 @@ pkgs.testers.runNixOSTest {
       group = "sekrets";
     };
     users.groups.sekrets = { };
+    users.users.evidence-caller = {
+      isSystemUser = true;
+      uid = 1002;
+      group = "evidence-caller";
+    };
+    users.groups.evidence-caller = { };
+    users.users.host-evidence-caller = {
+      isSystemUser = true;
+      uid = 1003;
+      group = "host-evidence-caller";
+    };
+    users.groups.host-evidence-caller = { };
     services.openssh.enable = true;
     environment.systemPackages = [
       pty
@@ -129,6 +184,87 @@ pkgs.testers.runNixOSTest {
         "ada", f"{st} sekrets -- gh pr list"
     )
     assert "token=set" in login("ada", f"{st} sekrets --profile ada/agent-gh -- gh pr view 1")
+
+    # A dedicated system UID + exact root-created unit, BEFORE any st daemon exists.
+    # It receives a command grant, never Ada's person authority or profile management.
+    machine.succeed("install -d -m 0755 /var/cache/evidence /w && install -d -o evidence-caller -m 0700 /var/cache/evidence/work && install -d -o evidence-caller -m 0755 /var/cache/evidence/work/smalltalk && printf private-runner-checkout > /var/cache/evidence/work/smalltalk/checkout-marker && setfacl -m u:sekrets:x /var/cache/evidence/work")
+    login("ada", f"{st} sekrets grant ada/agent-gh --to program/ci1/evidence --allow 'gh pr view'")
+    def program(command, unit="ci-evidence-caller.service", user="evidence-caller", succeed=True,
+                cwd="/w/smalltalk", backing="/var/cache/evidence/work"):
+        call = (f"systemd-run --quiet --wait --pipe --collect --unit {unit} "
+                f"--property=User={user} --property=WorkingDirectory={cwd} "
+                f"--property=BindPaths={backing}:/w -- /bin/sh -c "
+                + shlex.quote(f"({command}) </dev/null") + " 2>&1")
+        # --pipe otherwise inherits the driver's open stdin. The fake gh intentionally
+        # reads to EOF; explicit pipelines inside the group still provide their payload.
+        # Bound the call, but never mistake a timeout for an expected refusal.
+        status, output = machine.execute("timeout --kill-after=5 120 " + call)
+        assert status not in (124, 137), f"program call timed out: {output}"
+        assert (status == 0) if succeed else (status != 0), output
+        return output
+    assert "run-only system service" in program(f"{st} sekrets whoami")
+    with subtest("Program first command binds its authorized private checkout"):
+        assert "token=set" in program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1")
+    output = program(f"printf 'structured-stdin-only' | {st} sekrets --profile ada/agent-gh -- gh pr view 1")
+    assert "checkout=/w/smalltalk:private-runner-checkout" in output
+    assert "checkout-readonly" in output and "structured-stdin-only" in output
+    assert "checkout-mount-ro-nosuid-nodev" in output
+    machine.fail("test -e /var/cache/evidence/work/smalltalk/forbidden-checkout-write")
+    machine.fail("test -e /w/smalltalk") # the gateway host has only the empty mount anchor
+
+    with subtest("Program bind retains the verified inode across caller path replacement"):
+        machine.succeed("install -d -o sekrets -m 0700 /run/st-sekrets/bind-control && mkfifo /run/st-sekrets/bind-control/resume && chown sekrets /run/st-sekrets/bind-control/resume && touch /run/st-sekrets/bind-control/pause && install -o evidence-caller -m 0600 /dev/null /var/cache/evidence/swap-output")
+        swap_command = (f"{st} sekrets --profile ada/agent-gh -- gh pr view 1 </dev/null > /var/cache/evidence/swap-output 2>&1; "
+                        "result=$?; printf '\\nexit=%s\\n' \"$result\" >> /var/cache/evidence/swap-output; exit \"$result\"")
+        machine.succeed("systemd-run --quiet --no-block --unit ci-evidence-caller.service "
+                        "--property=Type=oneshot --property=RemainAfterExit=yes "
+                        "--property=User=evidence-caller --property=WorkingDirectory=/w/smalltalk "
+                        "--property=BindPaths=/var/cache/evidence/work:/w -- /bin/sh -c " + shlex.quote(swap_command))
+        machine.wait_for_file("/run/st-sekrets/bind-control/ready")
+        # The caller namespace sees a replacement at /w/smalltalk. The verified descriptor
+        # still names the original directory, now renamed beneath the same backing root.
+        machine.succeed("mv /var/cache/evidence/work/smalltalk /var/cache/evidence/work/verified-original && install -d -o evidence-caller -m 0755 /var/cache/evidence/work/smalltalk && printf swapped-directory > /var/cache/evidence/work/smalltalk/checkout-marker && timeout 10 sh -c 'printf resume > /run/st-sekrets/bind-control/resume'")
+        machine.wait_for_unit("ci-evidence-caller.service")
+        assert machine.succeed("systemctl show --value -p ExecMainStatus ci-evidence-caller.service").strip() == "0"
+        swapped = machine.succeed("cat /var/cache/evidence/swap-output")
+        assert "checkout=/w/smalltalk:private-runner-checkout" in swapped
+        assert "checkout-readonly" in swapped and "exit=0" in swapped
+        assert "checkout-mount-ro-nosuid-nodev" in swapped
+        assert "swapped-directory" not in swapped
+        machine.succeed("systemctl stop ci-evidence-caller.service && rm -rf /run/st-sekrets/bind-control /var/cache/evidence/work/smalltalk && mv /var/cache/evidence/work/verified-original /var/cache/evidence/work/smalltalk")
+    program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", cwd="/tmp", succeed=False)
+    program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", cwd="/w/missing", succeed=False)
+    machine.succeed("install -d -m 0755 /var/cache/evidence/other/smalltalk && ln -s /var/cache/evidence/other /var/cache/evidence/work/escape")
+    program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", cwd="/w/escape/smalltalk", succeed=False)
+    with subtest("Program refuses a private checkout with the wrong inode before bwrap"):
+        machine.succeed("install -d -o sekrets -m 0700 /run/st-sekrets/bind-control && touch /run/st-sekrets/bind-control/watch")
+        assert "passed checkout does not match the configured runner backing directory" in program(
+            f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", backing="/var/cache/evidence/other", succeed=False)
+        machine.fail("test -e /run/st-sekrets/bind-control/invoked")
+        machine.succeed("rm -rf /run/st-sekrets/bind-control")
+    # Reachable private mount but wrong physical-root owner: refusal comes from the gateway,
+    # rather than a client that cannot enter its cwd.
+    machine.succeed("chown robin /var/cache/evidence/work && chmod 0755 /var/cache/evidence/work")
+    assert "runner checkout root has the wrong owner" in program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", succeed=False)
+    machine.succeed("chown evidence-caller /var/cache/evidence/work && chmod 0700 /var/cache/evidence/work && setfacl -m u:sekrets:x /var/cache/evidence/work")
+    # A Program with no private-mount mapping must refuse an out-of-roots cwd too;
+    # the ordinary person's profile-HOME fallback must not apply.
+    login("ada", f"{st} sekrets grant ada/agent-gh --to program/ci1/host-evidence --allow 'gh pr view'")
+    assert "not under a checkout root" in program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", unit="ci-host-evidence.service", user="host-evidence-caller", cwd="/tmp", succeed=False)
+    assert "program/ci1/evidence" in login("ada", f"{st} sekrets log --limit 200")
+    program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 2", succeed=False)
+    program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", unit="other-evidence.service", succeed=False)
+    program(f"{st} sekrets --profile ada/agent-gh -- gh pr view 1", user="robin", succeed=False)
+    program(f"{st} sekrets profile policy ada/agent-gh --preset everything", succeed=False)
+    program(f"{st} sekrets grant ada/agent-gh --to person/robin --preset everything", succeed=False)
+    program(f"printf refused | {st} sekrets put KEY --profile ada/agent-gh", succeed=False)
+    program(f"{st} sekrets log", succeed=False)
+    program("cat /var/lib/st-sekrets/sekrets.db", succeed=False)
+    program("ls /var/lib/st-sekrets/profiles/ada/agent-gh/home", succeed=False)
+    signing_home = "/var/lib/st-sekrets/profiles/ada/agent-gh/home"
+    signing_key = f"{signing_home}/signing-key"
+    machine.succeed(f"printf throwaway > {signing_key} && chown sekrets:sekrets {signing_key} && chmod 0600 {signing_key}")
+    program(f"cat {signing_key}", succeed=False)
     assert "denied by rule `gh auth token`" in login("ada", f"{st} sekrets -- gh auth token", succeed=False)
 
     # No one but the sekrets user reads the store; the token appears in no output or log.
@@ -161,6 +297,14 @@ pkgs.testers.runNixOSTest {
         )
     )
     machine.wait_for_file("/run/user/1000/st3.sock")
+    # The socket file appears while the daemon is still starting ("the API is not ready"), so the
+    # file is not readiness. Ready means a daemon API read answers: `st clients` is read-only and
+    # fails until then.
+    machine.wait_until_succeeds(
+        "ssh -o StrictHostKeyChecking=no -o BatchMode=yes -i /root/.ssh/id_ed25519 "
+        f"ada@localhost {shlex.quote(f'{st} clients')} >/dev/null 2>&1",
+        timeout=120,
+    )
     assert "can now use the profiles granted to them" in login("ada", f"{st} sekrets enable")
     login(
         "ada",

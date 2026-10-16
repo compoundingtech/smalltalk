@@ -217,6 +217,31 @@ fn database(about: &str, target: &Value) -> Value {
     })
 }
 
+/// Open projection divergences, counted fleet-wide from their faults. Each is a P1 bug, so the
+/// target is none, and one open divergence spends the whole allowance.
+pub fn divergence(open: u64) -> Value {
+    let targets = crate::slo::targets();
+    let about = targets.divergence.about.as_str();
+    let max_open = targets.divergence.max_open;
+    let met = open <= max_open;
+    json!({
+        "id": "projection-divergence", "kind": "objective", "about": about,
+        "target": format!("≤ {max_open} open"), "current": format!("{open} open"), "window": "now",
+        "remaining_percent": if met { 100.0 } else { 0.0 }, "status": if met { "met" } else { "missed" },
+        "explain": format!(
+            "{about}. Goal: at most {max_open} open. {}",
+            if open == 0 {
+                "None is open.".to_owned()
+            } else {
+                format!(
+                    "{} open; `st subject daemon/NODE` for the member that found one shows it with the projection, the claim range, both digests and both builds.",
+                    plural(open, "divergence")
+                )
+            }
+        ),
+    })
+}
+
 /// A minimum share (a phone's live time over its foreground time). The budget is the allowed
 /// remainder: with a 99% minimum, 1% of foreground time may be disconnected.
 fn share(id: &str, about: &str, target: &Value) -> Value {

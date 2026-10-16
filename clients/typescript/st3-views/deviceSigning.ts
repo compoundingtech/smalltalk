@@ -6,8 +6,23 @@ import type { DeviceSignature } from '@smalltalk/st3-client';
 
 export const SIGNED_FIELDS = ['content', 'from', 'in_reply_to', 'session_id', 'tags', 'title', 'to'] as const;
 
+/**
+ * What a device signs on a message past `INLINE_MAX_BYTES` (docs/st3/long-messages.md): the claim
+ * keeps only a preview, so the signature covers the preview, the hash and the length of the whole
+ * text. Sorted, as the daemon compares them.
+ */
+export const SIGNED_LONG_FIELDS = ['body_bytes', 'body_sha256', 'content', 'from', 'in_reply_to', 'session_id', 'tags', 'title', 'to'] as const;
+
+/** The longest message, in UTF-8 bytes, whose text stays whole in the claim. */
+export const INLINE_MAX_BYTES = 8192;
+const PREVIEW_BYTES = 1024;
+
 /** A message's fields as the daemon stores them: absent text fields are null, tags `[]`. */
 export type SignedFields = {
+  /** Past INLINE_MAX_BYTES: the whole text's length in UTF-8 bytes (with body_sha256). */
+  body_bytes?: number;
+  /** Past INLINE_MAX_BYTES: the lowercase hex SHA-256 of the whole text's UTF-8 bytes. */
+  body_sha256?: string;
   content: string;
   from: string;
   in_reply_to: string | null;
@@ -24,8 +39,59 @@ export type DeviceKey = { key: string; storage: 'secure-enclave' | 'software'; p
  * A field's value in RFC 8785 (JCS) form. The signed values are strings, null and arrays of
  * strings, for which JSON.stringify is exactly JCS: compact, `/` and non-ASCII not escaped.
  */
-export function canonical(value: string | null | string[]): string {
+export function canonical(value: string | number | null | string[]): string {
   return JSON.stringify(value);
+}
+
+/** A string's length in UTF-8 bytes; a lone surrogate counts as the three bytes of U+FFFD. */
+export function utf8Bytes(text: string): number {
+  let bytes = 0;
+  for (const character of text) {
+    const code = character.codePointAt(0)!;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
+/** Whether the text is past what the claim keeps whole, so a device signs its preview and hash. */
+export function isLongMessage(content: string): boolean {
+  return utf8Bytes(content) > INLINE_MAX_BYTES;
+}
+
+// Rust's `str::trim_end`: Unicode White_Space (not JavaScript's `\s`, which has U+FEFF and lacks U+0085).
+const TRAILING_WHITE_SPACE = /[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/u;
+
+/**
+ * The start of a long message as the daemon keeps it in the claim: the first 1,024 UTF-8 bytes cut
+ * at a character, trailing white space trimmed, then `…`. A device signs exactly this.
+ */
+export function longPreview(text: string): string {
+  let bytes = 0;
+  let end = 0;
+  for (const character of text) {
+    const code = character.codePointAt(0)!;
+    const size = code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    if (bytes + size > PREVIEW_BYTES) break;
+    bytes += size;
+    end += character.length;
+  }
+  return `${text.slice(0, end).replace(TRAILING_WHITE_SPACE, '')}…`;
+}
+
+/**
+ * The fields a device signs for a message with this `content`. Up to INLINE_MAX_BYTES that is the
+ * text itself; past it, the preview with the hash and length of the whole, and `sha256Hex` (the hex
+ * SHA-256 of the UTF-8 text, from the platform's hash) is required.
+ */
+export function signedMessageFields(others: Omit<SignedFields, 'content' | 'body_bytes' | 'body_sha256'>, content: string, sha256Hex?: string): SignedFields {
+  if (!isLongMessage(content)) return { ...others, content };
+  if (!sha256Hex || !/^[0-9a-f]{64}$/.test(sha256Hex)) throw new Error('a message this long needs the hash of its text to be signed');
+  return { ...others, content: longPreview(content), body_bytes: utf8Bytes(content), body_sha256: sha256Hex };
+}
+
+/** The signed field names for these fields: the long form when they carry a body hash. */
+export function signedFieldNames(fields: SignedFields): readonly string[] {
+  return fields.body_sha256 === undefined ? SIGNED_FIELDS : SIGNED_LONG_FIELDS;
 }
 
 /** The message's subject, from the hex SHA-256 of its idempotency key, as the daemon names it. */
@@ -50,7 +116,7 @@ export function signedBytes(message: Unsigned): string {
     message.subject,
     'message.sent',
     message.signer,
-    ...SIGNED_FIELDS.map(field => `${field}=${canonical(message.fields[field])}`),
+    ...signedFieldNames(message.fields).map(field => `${field}=${canonical((message.fields as Record<string, string | number | null | string[]>)[field])}`),
     message.signer,
     '',
     message.key,
@@ -70,7 +136,7 @@ export function signatureParameter(message: Unsigned, signature: string): Device
     signed_at_unix_ms: message.signedAt,
     signature,
     format: 'fields-v1',
-    signed_fields: [...SIGNED_FIELDS],
+    signed_fields: [...signedFieldNames(message.fields)],
   };
 }
 

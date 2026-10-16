@@ -1,4 +1,4 @@
-//! What members exchange to replicate their claims, heal their graphs, and report sync.
+//! What members exchange to replicate their claims and report sync.
 
 use std::collections::BTreeMap;
 
@@ -52,6 +52,10 @@ pub struct ReplicationExchange {
     pub peer: String,
     pub fleet_id: String,
     pub schema_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_registry_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projection_versions: BTreeMap<String, u64>,
     pub authority_digest: String,
     /// Six-table compatibility digest for older peers. Modern peers compare projection_digests.
     pub graph_digest: String,
@@ -66,6 +70,10 @@ pub struct ReplicationExchange {
     /// Signatures answering the other side's `signature_requests`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signatures: Vec<ReplicaEnvelopeSignature>,
+    /// The sender's build, so a member that finds the same claims projecting differently can
+    /// name both builds in the bug it records. Older peers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -76,180 +84,10 @@ pub struct ReplicationReceipt {
     #[serde(default)]
     pub signatures: usize,
     pub inventory: ReplicationInventory,
-    /// The two nodes hold the same envelopes but project different graphs, so the worker should
-    /// heal with this peer now.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub heal: bool,
-}
-
-/// One writer's range of batch sequences, aligned to the replication bucket width.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct ClaimRange {
-    pub writer: String,
-    pub start: u64,
-}
-
-/// The digest of the claims one node projects from one writer range.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ClaimRangeDigest {
-    pub writer: String,
-    pub start: u64,
-    pub count: u64,
-    pub digest: String,
-}
-
-/// The digest of the claims one node projects about one subject from one writer range.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ClaimSubjectDigest {
-    pub writer: String,
-    pub start: u64,
-    pub subject: String,
-    pub count: u64,
-    pub digest: String,
-}
-
-/// One claim a node projects, and the envelope that carries it.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HealClaim {
-    pub writer: String,
-    pub sequence: u64,
-    pub claim_id: String,
-    pub subject: String,
-    /// The envelope that carries the claim, when the node still holds it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub envelope_hash: Option<String>,
-}
-
-/// One question of a heal. When two nodes hold the same envelopes but project different
-/// graphs, one of them narrows the difference: the digests of the claims each projects by
-/// writer range, then by subject within the ranges that differ, then the claims of the subjects
-/// that differ. The envelopes that carry claims one side lacks are then admitted again on that
-/// side. When both project the same claims, a replay from nothing decides the graph.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-// Externally tagged: an internally tagged enum buffers its fields, and the buffer cannot hold
-// the u128 times that envelopes and reports carry.
-#[serde(rename_all = "kebab-case")]
-pub enum ReplicationHealQuery {
-    Ranges,
-    Subjects {
-        ranges: Vec<ClaimRange>,
-    },
-    Claims {
-        ranges: Vec<ClaimRange>,
-        subjects: Vec<String>,
-    },
-    /// Admit `push` again, which carries claims the asker projects and this node lacks, and
-    /// send the envelopes in `want`, which carry claims this node projects and the asker lacks.
-    Swap {
-        push: Vec<ReplicaEnvelope>,
-        want: Vec<ReplicaEnvelopeId>,
-    },
-    /// Replay this node's graph from nothing.
-    Replay,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-// Externally tagged: an internally tagged enum buffers its fields, and the buffer cannot hold
-// the u128 times that envelopes and reports carry.
-#[serde(rename_all = "kebab-case")]
-pub enum ReplicationHealAnswer {
-    Ranges {
-        graph_digest: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        projection_digests: BTreeMap<String, String>,
-        ranges: Vec<ClaimRangeDigest>,
-    },
-    Subjects {
-        ranges: Vec<ClaimRange>,
-        subjects: Vec<ClaimSubjectDigest>,
-    },
-    Claims {
-        ranges: Vec<ClaimRange>,
-        subjects: Vec<String>,
-        claims: Vec<HealClaim>,
-    },
-    Swapped {
-        /// Pushed claims this node now projects.
-        admitted: u64,
-        /// Pushed claims this node still cannot admit, with the reason.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        refused: Option<String>,
-        envelopes: Vec<ReplicaEnvelope>,
-        graph_digest: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        projection_digests: BTreeMap<String, String>,
-    },
-    Replayed {
-        /// False while this node's replay backoff has not passed.
-        replayed: bool,
-        graph_digest: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        projection_digests: BTreeMap<String, String>,
-    },
-    /// The asking node could not reach the peer or the peer could not answer. The worker
-    /// hands it to the main daemon, which ends the heal with it.
-    Failed { message: String },
-}
-
-/// A heal question as it travels between peers.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReplicationHealRequest {
-    pub fleet_id: String,
-    pub query: ReplicationHealQuery,
-}
-
-/// A peer's heal question, handed by the worker to the main daemon to answer.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReplicationHealAnswerRequest {
-    pub peer: String,
-    pub fleet_id: String,
-    pub query: ReplicationHealQuery,
-}
-
-/// A peer's heal answer, handed by the worker to the main daemon to compare with its own claims.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReplicationHealNextRequest {
-    pub peer: String,
-    pub answer: ReplicationHealAnswer,
-}
-
-/// What the worker does next in a heal: ask the peer another question, or stop.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-// Externally tagged: an internally tagged enum buffers its fields, and the buffer cannot hold
-// the u128 times that envelopes and reports carry.
-#[serde(rename_all = "kebab-case")]
-pub enum ReplicationHealStep {
-    Ask { query: ReplicationHealQuery },
-    Done { report: ReplicationHealReport },
-}
-
-/// What the last heal with one peer found and did.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ReplicationHealReport {
-    pub at_unix_ms: u128,
-    /// Writer ranges whose projected claims differed.
-    pub ranges: u64,
-    /// Subjects whose projected claims differed within those ranges.
-    pub subjects: u64,
-    /// Claims the peer projected that this node lacked and admitted again.
-    pub refetched: u64,
-    /// Claims this node projected that the peer lacked and admitted again.
-    pub pushed: u64,
-    /// This node replayed its graph from nothing.
-    #[serde(default)]
-    pub replayed: bool,
-    /// The peer replayed its graph from nothing.
-    #[serde(default)]
-    pub peer_replayed: bool,
-    /// The two graph digests were equal when the heal ended.
-    pub healed: bool,
-    /// Why the graphs still differ.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unresolved: Option<String>,
 }
 
 /// A node's first sync after it joins: it ends once the node holds the same envelopes as a
-/// peer. Matching registries also check the graph; mixed builds verify the wire log.
+/// peer and has admitted them. Mixed builds verify the wire log.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReplicationFirstSync {
     /// `syncing`, `verified`, or `failed`.
@@ -269,9 +107,6 @@ pub struct ReplicationFirstSync {
     /// Mixed builds verify the complete wire log while their projections wait for an upgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_digest: Option<String>,
-    /// The graphs matched only after a heal.
-    #[serde(default)]
-    pub healed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -305,6 +140,9 @@ pub struct ReplicationReceiveRequest {
     /// How long the worker's request that returned this exchange took, when it made one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round_trip_ms: Option<u64>,
+    /// Local dial evidence, never part of the signed or replicated exchange.
+    #[serde(default)]
+    pub carrier: ReplicationCarrier,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -319,6 +157,8 @@ pub struct ReplicationPeerFailureRequest {
     pub peer: String,
     pub status: String,
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<ReplicationCarrier>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -438,8 +278,56 @@ pub struct ReplicationWorkerStatus {
     pub next_retry_at_unix_ms: Option<u128>,
 }
 
+/// The carrier attempted locally, or unknown when this host has no dial evidence.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationCarrier {
+    Tailscale,
+    Fabric,
+    Loopback,
+    #[default]
+    Unknown,
+}
+
+impl ReplicationCarrier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tailscale => "tailscale",
+            Self::Fabric => "fabric",
+            Self::Loopback => "loopback",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One locally initiated exchange observation. Absent after restart; never a replicated claim.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReplicationExchangeTransport {
+    pub at_unix_ms: u128,
+    pub carrier: ReplicationCarrier,
+    /// Fabric exposes no evidence for the direct/relay path of this particular dial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric_route: Option<String>,
+}
+
+impl ReplicationExchangeTransport {
+    pub fn new(at_unix_ms: u128, carrier: ReplicationCarrier) -> Self {
+        Self {
+            at_unix_ms,
+            carrier,
+            fabric_route: (carrier == ReplicationCarrier::Fabric).then(|| "unknown".into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationPeerStatus {
+    /// Last successful locally initiated exchange, with its original dial evidence and time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_exchange: Option<ReplicationExchangeTransport>,
+    /// Last failed locally initiated exchange/attempt, independent of success and last_error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_exchange: Option<ReplicationExchangeTransport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<ReplicationWorkerStatus>,
     pub peer: String,
@@ -455,6 +343,12 @@ pub struct ReplicationPeerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<String>,
     pub schema_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_registry_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projection_versions: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incompatible_projection_tables: Vec<String>,
     pub authority_digest: Option<String>,
     pub graph_digest: Option<String>,
     #[serde(default)]
@@ -531,9 +425,28 @@ pub struct ReplicationPeerSync {
     /// exchanges cannot fix that, so this node's views can be wrong until it is repaired.
     #[serde(default)]
     pub diverged: bool,
-    /// The last heal with this peer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub heal: Option<ReplicationHealReport>,
+}
+
+/// Two members that hold the same envelopes and project one table differently. A projection is
+/// a pure function of the claims, so this is a bug to reproduce and fix, never something to
+/// repair from a peer. It carries what a reproduction needs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectionDivergence {
+    pub peer: String,
+    /// The shared projection (table) whose digests differ, or `graph` for a peer that sends only
+    /// the older whole-graph digest.
+    pub projection: String,
+    /// The claims both members projected: the inventory digest they share and each writer's
+    /// highest sequence in it.
+    pub inventory_digest: String,
+    pub writer_high_water: BTreeMap<String, u64>,
+    pub local_digest: String,
+    pub peer_digest: String,
+    pub local_build: String,
+    /// Absent for a peer whose build does not say.
+    pub peer_build: Option<String>,
+    pub since_unix_ms: u128,
+    pub compared_at_unix_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

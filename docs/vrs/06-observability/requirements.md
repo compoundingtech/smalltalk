@@ -65,36 +65,7 @@ pipeline as one more producer; it does not invent its own.
   `span.label`; raw prompt, message, and path content is forbidden from every
   diagnostic signal.
 
-### st3
+### st
 
-- **O11Y-R10 Process signals:** The st3 daemon, replication worker, and CLI use the OpenTelemetry
-  SDK to produce traces, metrics, and logs. Their `service.name` values are `st-daemon`,
-  `st-replication-worker`, and `st-cli`. Hooks send signals through the daemon and never export
-  directly; hook spans and invocation metrics emitted by the observations exporter use
-  `st-hook`. Harness-timer statusline commands remain exempt from telemetry initialization.
-- **O11Y-R11 No-op when unset:** When `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, st3 builds no
-  exporter or SDK provider, makes no telemetry network calls, and incurs no measurable telemetry
-  overhead. Exporter configuration uses standard `OTEL_*` variables.
-- **O11Y-R12 Reactor isolation:** Export work must not run on the daemon's request reactor.
-- **O11Y-R13 Signal version:** Every st3 signal carries `service.version` from the machine build
-  identity, including signals from the observations exporter.
-- **O11Y-R14 Bounded metrics and attributes:** st3 exposes a bounded rate, error, duration, and
-  saturation metric set with at most 2,000 active series per daemon. Agent, session, message,
-  terminal, attachment, and lease ids are forbidden in metric labels and `span.label`.
-  Capabilities and their hashes are forbidden in every signal.
-- **O11Y-R15 Trace propagation:** W3C `traceparent` and `tracestate` propagate end to end across
-  st3 HTTP and WebSocket upgrades, Rust, TypeScript, and Swift clients, and the signed peer
-  protocol. Peer trace context is covered by the peer signature.
-- **O11Y-R16 Sampling:** st3 exports every span when traces are enabled and performs no
-  in-process sampling. The local collector applies the fleet sampling policy: keep traces
-  with an error, a local root longer than 1 second, a sampled caller, and a deterministic
-  1% of the rest. Sampling never affects metrics.
-- **O11Y-R17 Bounded shutdown:** Telemetry flush and shutdown take at most 250 milliseconds
-  for a CLI process and at most 5 seconds for a daemon or replication worker, including when
-  the collector is unreachable.
-- **O11Y-R18 Overhead budget:** With export enabled at fleet load (4–5 requests per second and
-  0.7 reconcile passes per second), telemetry adds at most 2% daemon CPU, 5% p99 request
-  latency, and 32 MiB RSS. Sampled export traffic is at most 50 KB per second per host.
-
-The [specification](spec.md) owns the crate stack, exporter configuration, trace roots, and PR
-stack. Open items are tracked in [open-questions](open-questions.md).
+The current O11Y-R10–R18 constraints and mechanism are in
+[st observability](../../st3/observability.md).

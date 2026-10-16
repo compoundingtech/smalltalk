@@ -4,4 +4,5 @@
 //! renderer. Widgets and other models can follow once their composition boundaries are agreed.
 #![forbid(unsafe_code)]
 
+pub mod agents;
 pub mod missions;

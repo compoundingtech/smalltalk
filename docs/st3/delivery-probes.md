@@ -175,6 +175,22 @@ route attention, and retains any pending message. After a new replication exchan
 it resumes that same message with a fresh measurement window. Doctor waits for absent
 members before judging missing heartbeats or overdue routes.
 
+The private state keeps one notification episode per route until an actual read by that
+route's recipient. The episode retains its original notice key across resumed measurement
+windows, fresh probe messages, presence flaps and process replacement. Pausing withdraws
+active attention without resetting that episode or claiming delivery recovery. The same
+pending message retains an already observed deadline miss even after its measurement
+window resumes. A real recipient read clears the episode and sends one recovery intent;
+delivered, closed, a different read actor or a successful exchange cannot do so.
+
+Notice and clear request bodies are saved before posting. A lost response replays the
+same key and body; it can cause repeated attempts, but no new logical notice or recovery.
+Each episode retains at most two clear intents (pause and recovery). Migration is lazy
+for the current configured route, preserving existing saved alert bodies and attention
+IDs without scanning the journal or graph. Alerts already cleared by an older version
+cannot be reconstructed. Downgrading to an older probe may resume its old flap behavior;
+the local episode fields do not change the replicated report format or daemon schema.
+
 A direct route refused by a member's Fabric grants does not count as a delivery failure.
 While another peer is exchanging, the probe continues sending real messages to the refused
 member through the fleet, and doctor checks the actual recipient reads and heartbeats.

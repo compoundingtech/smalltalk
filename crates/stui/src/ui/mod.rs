@@ -25,6 +25,9 @@ mod hyperlinks;
 #[cfg(test)]
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
+#[cfg(test)]
+#[path = "../../tests/support/attach_default.rs"]
+mod attach_default;
 pub use glass::set_glasses_version;
 pub use lastrun::log_panics as lastrun_log_panics;
 pub use lastrun::note_exit as lastrun_note_exit;
@@ -41,6 +44,7 @@ mod resource_sidebar;
 mod arrangement_keys;
 mod observed_resources;
 mod pty;
+pub mod requests;
 pub mod screens;
 pub mod text;
 pub mod theme;
@@ -192,7 +196,7 @@ impl AgentControl {
     pub fn verb(self) -> &'static str {
         match self {
             AgentControl::Restart => "Restart",
-            AgentControl::Retire => "Retire",
+            AgentControl::Retire => "Stop",
             AgentControl::Start => "Start",
             AgentControl::Suspend => "Suspend",
             AgentControl::Resume => "Resume",
@@ -286,6 +290,22 @@ pub enum Effect {
     },
 }
 
+/// How much longer than the usual flash a refusal's reason stays up.
+pub(crate) const FLASH_REFUSAL: Duration = Duration::from_secs(20);
+
+/// A byte count as a person reads it: `812 bytes`, `12.5 KiB`, `256 KiB`.
+pub(crate) fn size_text(bytes: usize) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} bytes");
+    }
+    let kib = bytes as f64 / 1024.0;
+    if (kib - kib.round()).abs() < 0.05 {
+        format!("{} KiB", kib.round() as u64)
+    } else {
+        format!("{kib:.1} KiB")
+    }
+}
+
 /// An agent's live terminal screen, drawn in place of its conversation.
 pub(crate) struct TerminalView {
     /// The agent whose terminal this is.
@@ -334,9 +354,22 @@ struct ChatState {
     editing: bool,
 }
 
-/// How long an agent's tab stays in front before its terminal attaches, on a device that opens
-/// agents on their terminal: flicking through tabs attaches nothing.
+/// How long an agent's tab stays in front before its terminal attaches (unless this device
+/// opens agents on their conversation): flicking through tabs attaches nothing.
 const ATTACH_DWELL: Duration = Duration::from_millis(300);
+
+/// What a terminal whose link dropped says while it gets back: the reason, the try it is on or
+/// the wait before the next, and the key to the conversation.
+fn reconnecting_status(reason: &str, tries: u32, next: Option<Instant>) -> String {
+    let doing = match next {
+        None => format!("attaching again (try {tries})"),
+        Some(at) => {
+            let wait = at.saturating_duration_since(Instant::now()).as_secs() + 1;
+            format!("try {} in {wait}s", tries + 1)
+        }
+    };
+    format!("reconnecting: {reason} · {doing} · Ctrl+\\ conversation")
+}
 
 /// How long a second Ctrl+T may follow the first and leave the terminal.
 /// How many closed items Home keeps listed under "Recently closed".
@@ -395,8 +428,9 @@ pub struct Ui {
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
-    /// This device opens an agent's tab on its terminal, not its conversation (a setting).
-    terminal_first: bool,
+    /// This device opens an agent's tab on its conversation rather than attaching its terminal:
+    /// its own choice, or `None` when it never chose and the terminal attaches.
+    conversation_first: Option<bool>,
     /// This device permits the daemon after a failed direct terminal route.
     pub(crate) terminal_fallback: bool,
     /// The agent whose tab just took the focus, and when: its terminal attaches once the tab has
@@ -467,6 +501,10 @@ pub struct Ui {
     find: Option<Find>,
     /// Images attached to each draft, by its key, until it is sent.
     attachments: HashMap<String, Vec<attach::Attachment>>,
+    /// The longest message, in UTF-8 bytes, that st said it takes. None until st says so, and on
+    /// an st that does not say: nothing is blocked here then, and st's own refusal brings the
+    /// text back to the box.
+    pub(crate) message_limit: Option<usize>,
     /// Where typing goes in the input that has the keyboard.
     cursor: edit::Cursor,
     /// Where each pane being read back was, by entry, so it keeps its place.
@@ -725,7 +763,7 @@ impl Ui {
             acted: HashSet::new(),
             closed: HashSet::new(),
             older_wanted: RefCell::default(),
-            terminal_first: false,
+            conversation_first: None,
             terminal_fallback: true,
             attach_when: None,
             popover: None,
@@ -760,6 +798,7 @@ impl Ui {
             details_here: HashSet::new(),
             find: None,
             attachments: HashMap::new(),
+            message_limit: None,
             cursor: edit::Cursor::default(),
             terminal_size: Cell::new((24, 80)),
             terminal_body: Cell::new(None),
@@ -901,7 +940,7 @@ impl Ui {
             // chose the full view keeps it.
             let loaded = prefs::load(&path);
             self.simple = simplified(&loaded);
-            self.terminal_first = loaded.terminal_first == Some(true);
+            self.conversation_first = prefs::conversation_first(&loaded);
             self.terminal_fallback = loaded.terminal_fallback != Some(false);
         }
     }
@@ -987,7 +1026,8 @@ impl Ui {
                 &path,
                 &prefs::Prefs {
                     simple: Some(self.simple),
-                    terminal_first: Some(self.terminal_first),
+                    terminal_first: self.conversation_first.map(|first| !first),
+                    conversation_first: self.conversation_first,
                     terminal_fallback: Some(self.terminal_fallback),
                 },
             );
@@ -1005,30 +1045,33 @@ impl Ui {
         });
     }
 
-    /// Open an agent's tab on its terminal, or on its conversation (the default): this device's
-    /// choice, remembered.
-    pub(crate) fn toggle_terminal_first(&mut self) {
-        self.terminal_first = !self.terminal_first;
+    /// Open an agent's tab on its conversation, or attach its terminal (the default): this
+    /// device's choice, remembered.
+    pub(crate) fn toggle_conversation_first(&mut self) {
+        self.conversation_first = Some(!self.conversation_first());
         self.save_prefs();
-        self.flash(if self.terminal_first {
-            "Agents open on their terminal · the conversation is a key away (Ctrl+\\ leaves the terminal)"
+        self.flash(if self.conversation_first() {
+            "Conversation first: agents open on their conversation · Ctrl+] attaches the terminal"
         } else {
-            "Agents open on their conversation · Ctrl+] attaches the terminal"
+            "Agents attach their terminal when opened · Ctrl+\\ shows the conversation"
         });
     }
 
-    /// Whether this device opens agents on their terminal.
-    pub(crate) fn terminal_first(&self) -> bool {
-        self.terminal_first
+    /// Whether this device opens agents on their conversation instead of attaching.
+    pub(crate) fn conversation_first(&self) -> bool {
+        self.conversation_first == Some(true)
     }
 
-    /// Attach the terminal of an agent whose tab has been in front for a moment, when this device
-    /// opens agents on their terminal.
+    /// Attach the terminal of an agent just opened whose tab has been in front for a moment,
+    /// unless this device opens agents on their conversation. An agent without a terminal (a
+    /// session st did not start, a harness with none) stays on its conversation, and nothing is
+    /// said; Ctrl+] decides the same way.
     pub(crate) fn step_default_view(&mut self) {
         let Some((id, at)) = &self.attach_when else {
             return;
         };
-        if at.elapsed() < ATTACH_DWELL {
+        // Until st has listed the agents, whether this one has a terminal is not known yet.
+        if at.elapsed() < ATTACH_DWELL || self.world.agents.ready().is_none() {
             return;
         }
         let id = id.clone();
@@ -1036,8 +1079,15 @@ impl Ui {
         let still_here = matches!(self.focused_pane(), Some(Pane::Agent(Some(ref now))) if *now == id);
         let attached = self.terminal.as_ref().is_some_and(|view| view.agent == id)
             || self.parked.iter().any(|view| view.agent == id);
-        if still_here && !attached && !self.editing && self.terminal_first {
-            self.attach_terminal(&id);
+        let has_terminal = self
+            .world
+            .agents
+            .items()
+            .iter()
+            .any(|agent| agent.id == id && agent.terminal);
+        if still_here && !attached && !self.editing && !self.conversation_first() && has_terminal {
+            // The tab turns into the terminal, as Ctrl+] does; Ctrl+\ turns it back.
+            self.open_terminal();
         }
     }
 
@@ -1451,9 +1501,18 @@ impl Ui {
                         self.world.stale.join("; ")
                     ));
                 }
+                if !self.world.behind.is_empty() {
+                    self.flash(format!(
+                        "Catching up: {}. What shows here can be out of date until then",
+                        self.world.behind.join("; ")
+                    ));
+                }
                 if known {
                     self.open(&machine);
-                } else if self.world.diverged.is_empty() && self.world.stale.is_empty() {
+                } else if self.world.diverged.is_empty()
+                    && self.world.stale.is_empty()
+                    && self.world.behind.is_empty()
+                {
                     self.flash(format!(
                         "Connected to {} as {}",
                         self.world.host, self.world.person
@@ -1589,6 +1648,59 @@ impl Ui {
 
     fn flash(&mut self, message: impl Into<String>) {
         self.flash = Some((message.into(), Instant::now()));
+    }
+
+    /// A note that stays up `extra` longer than the usual flash.
+    fn flash_for(&mut self, message: impl Into<String>, extra: Duration) {
+        self.flash = Some((message.into(), Instant::now() + extra));
+    }
+
+    /// Put a message st refused back in the box it was sent from, with its images, reply and
+    /// dictation mark, so the person can change it and send it again. Only when the box is
+    /// empty: what was typed while the send was out is theirs, and the failed message stays in
+    /// the conversation instead. Whether it went back.
+    pub(crate) fn restore_refused(
+        &mut self,
+        agent: &str,
+        text: &str,
+        in_reply_to: Option<String>,
+        tags: &[String],
+        images: &[std::path::PathBuf],
+    ) -> bool {
+        let typed = self
+            .conversation_state
+            .drafts
+            .get(agent)
+            .is_some_and(|draft| !draft.is_empty())
+            || self.attachments.get(agent).is_some_and(|list| !list.is_empty());
+        if typed {
+            return false;
+        }
+        if !text.is_empty() {
+            self.conversation_state
+                .drafts
+                .insert(agent.to_owned(), text.to_owned());
+        }
+        let restored: Vec<_> = images
+            .iter()
+            .filter_map(|path| attach::from_path(&path.to_string_lossy()))
+            .collect();
+        // An image that is gone from disk cannot come back, so the text alone would not be
+        // what was sent: leave the failed message where it is.
+        if restored.len() != images.len() {
+            self.conversation_state.drafts.remove(agent);
+            return false;
+        }
+        if !restored.is_empty() {
+            self.attachments.insert(agent.to_owned(), restored);
+        }
+        if let Some(message) = in_reply_to {
+            self.replies.insert(agent.to_owned(), message);
+        }
+        if tags.iter().any(|tag| tag == "dictated") {
+            self.dictated.insert(agent.to_owned());
+        }
+        true
     }
 
     fn draft_key(&self) -> Option<String> {
@@ -1828,6 +1940,7 @@ impl Ui {
             // Live, but showing a graph that exchanges cannot correct.
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
             Link::Live if !self.world.stale.is_empty() => ("◐", "stale", theme::YELLOW),
+            Link::Live if !self.world.behind.is_empty() => ("◐", "behind", theme::YELLOW),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
@@ -3231,8 +3344,15 @@ impl Ui {
                     .terminal
                     .as_ref()
                     .is_some_and(|view| view.agent == agent);
+            // The link dropped while the agent ran: what happened and what comes next, never a
+            // bare spinner, and the conversation one key away.
+            let lost = native.lost().zip(native.reconnecting());
             let status = match (native.ended(), native.attached(), scrolled) {
                 (Some(reason), _, _) => format!("ended: {reason}"),
+                (None, _, _) if lost.is_some() => {
+                    let (reason, (tries, next)) = lost.unwrap_or_default();
+                    reconnecting_status(&reason, tries, next)
+                }
                 (None, false, _) => "attaching…".into(),
                 (None, true, 0) if selection_here => {
                     "selection on · drag copies · ctrl+alt+s resumes program mouse".into()
@@ -3265,9 +3385,11 @@ impl Ui {
             ]);
             buf.set_line(area.x, area.y, &header, area.width);
             self.hit(Rect { height: 1, ..area }, Hit::Detach);
+            // What waits on the person is on top of the terminal, never hidden by it.
+            let band = self.terminal_alert_band(buf, area, agent);
             let body = Rect {
-                y: area.y + 1,
-                height: area.height.saturating_sub(1),
+                y: area.y + 1 + band,
+                height: area.height.saturating_sub(1 + band),
                 ..area
             };
             // Where the mouse maps and where a new attach starts is the focused terminal's body;
@@ -3319,7 +3441,9 @@ impl Ui {
         let status = match (&view.ended, &view.stale) {
             (Some(reason), _) => format!("ended: {reason}"),
             (None, Some(reason)) if view.lines.is_empty() => format!("{reason}…"),
-            (None, Some(reason)) => format!("not current, reconnecting: {reason}"),
+            (None, Some(reason)) => {
+                format!("not current, reconnecting: {reason} · Ctrl+\\ conversation")
+            }
             (None, None) => "Ctrl-C and Ctrl-D need a second press to reach the agent".into(),
         };
         buf.set_stringn(
@@ -3329,6 +3453,20 @@ impl Ui {
             area.width as usize,
             theme::dim(),
         );
+        let band = self.terminal_alert_band(
+            buf,
+            Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1),
+                ..area
+            },
+            agent,
+        );
+        let area = Rect {
+            y: area.y + band,
+            height: area.height.saturating_sub(band),
+            ..area
+        };
         let rows = area.height.saturating_sub(2) as usize;
         let skip = terminal_rows_skipped(view.lines.len(), rows, view.cursor);
         for (offset, line) in view.lines.iter().skip(skip).take(rows).enumerate() {
@@ -3346,6 +3484,38 @@ impl Ui {
                 cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
         }
+    }
+
+    /// Draw `agent`'s alerts under the first row of `area`, the attached terminal's pane, and
+    /// return the rows they take. Only the mouse reaches them, as in the conversation: every key
+    /// still goes to the terminal, so typing can never answer an alert by accident. A shell has
+    /// none; the band never takes more than half the pane.
+    fn terminal_alert_band(&self, buf: &mut Buffer, area: Rect, agent: &str) -> u16 {
+        if !agent.starts_with("agent/") || area.height < 6 {
+            return 0;
+        }
+        let mut band = self.alert_band(agent, area.width as usize);
+        band.truncate((area.height as usize / 2).max(1));
+        for (offset, row) in band.iter().enumerate() {
+            let y = area.y + 1 + offset as u16;
+            buf.set_style(
+                Rect { y, height: 1, ..area },
+                Style::default().bg(theme::SURFACE0),
+            );
+            buf.set_line(area.x, y, &row.line, area.width);
+            for (column, width, hit) in &row.hits {
+                self.hit(
+                    Rect {
+                        x: area.x + column,
+                        y,
+                        width: (*width).min(area.width.saturating_sub(*column)),
+                        height: 1,
+                    },
+                    hit.clone(),
+                );
+            }
+        }
+        band.len() as u16
     }
 
     /// Whether the attached terminal is a shell rather than an agent's.
@@ -3439,6 +3609,9 @@ impl Ui {
             })
             .unwrap_or_default();
         let mut lines = self.composer_text(agent, width, editing, &draft);
+        if let Some(note) = self.size_note(&draft, width) {
+            lines.push(note);
+        }
         if let Some(message) = self.replies.get(&agent.id) {
             lines.insert(
                 0,
@@ -3452,6 +3625,34 @@ impl Ui {
             lines.splice(0..0, chips);
         }
         lines
+    }
+
+    /// How long the draft is against what st takes, said once it is near the limit and in red
+    /// past it, so the person sees it before pressing Send. Nothing when st named no limit.
+    fn size_note(&self, draft: &str, width: usize) -> Option<Line<'static>> {
+        let limit = self.message_limit?;
+        let size = draft.len();
+        if size < limit / 4 * 3 {
+            return None;
+        }
+        let over = size > limit;
+        let note = if over {
+            format!(
+                "  {} is over the {} st takes: shorten it before sending",
+                size_text(size),
+                size_text(limit)
+            )
+        } else {
+            format!("  {} of the {} st takes", size_text(size), size_text(limit))
+        };
+        Some(Line::from(Span::styled(
+            text::truncate(&note, width),
+            if over {
+                theme::fg(theme::RED)
+            } else {
+                theme::dim()
+            },
+        )))
     }
 
     fn composer_text(
@@ -3667,7 +3868,18 @@ impl Ui {
                     "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
                 ),
                 ("drag", "select text in one pane; release copies it"),
-                ("ctrl+]  ctrl+\\  ctrl+t ctrl+t", "attach the agent's terminal; leave it (or Ctrl+T twice)"),
+                (
+                    "ctrl+]  ctrl+\\  ctrl+t ctrl+t",
+                    "attach the agent's terminal; leave it for the conversation (or Ctrl+T twice)",
+                ),
+                (
+                    "opening an agent",
+                    "attaches its terminal; \"Conversation first\" in the palette (ctrl+k) opens the conversation instead, on this device",
+                ),
+                (
+                    "click an alert",
+                    "over an attached terminal too: show it, answer it; every key still goes to the terminal",
+                ),
                 (
                     "ctrl+r  backspace",
                     "a message that was not sent: send it again; take it back to change",
@@ -4926,6 +5138,20 @@ impl Ui {
         }
     }
 
+    /// A terminal whose lost stream is due to attach again, with the incarnation it must be; the
+    /// try is then under way (`pty::NativeTerminal::take_reattach`). One at a time.
+    pub(crate) fn reattach_due(&self) -> Option<(String, String)> {
+        self.terminal
+            .iter()
+            .chain(self.parked.iter())
+            .find_map(|view| {
+                let native = view.native.as_ref()?;
+                native
+                    .take_reattach()
+                    .then(|| (view.agent.clone(), native.incarnation.clone()))
+            })
+    }
+
     /// Let go of `agent`'s terminal wherever it is attached; whether there was one.
     pub(crate) fn drop_terminal(&mut self, agent: &str) -> bool {
         let before = self.parked.len();
@@ -5217,6 +5443,22 @@ impl Ui {
             });
             return;
         };
+        // A message st will not take is not sent, and the box keeps it.
+        if self.live
+            && self.tab == 1
+            && let Some(limit) = self.message_limit
+            && draft.len() > limit
+        {
+            self.flash_for(
+                format!(
+                    "Too long to send: {} where st takes {}. Shorten it or send it in parts; the text is still here",
+                    size_text(draft.len()),
+                    size_text(limit)
+                ),
+                FLASH_REFUSAL,
+            );
+            return;
+        }
         // Live, the images go to st with the message, so an agent on any machine can read them
         // (#1078); the demo, which sends nothing, names them.
         if !images.is_empty() {
@@ -5375,6 +5617,8 @@ impl Ui {
 
     /// A key from an agent's actions menu. What changes the seat asks y first; Esc keeps it.
     fn agent_action(&mut self, agent: String, key: char) {
+        if self.world.agents.items().iter().find(|candidate| candidate.id == agent)
+            .is_some_and(|candidate| !screens::agent_actions(candidate).iter().any(|action| action.key == key)) { return; }
         let name = self
             .world
             .agents
@@ -6021,7 +6265,7 @@ impl Ui {
                 });
             }
             Hit::Split(right) => self.split(right),
-            Hit::GlassTab(group, tab) => self.show_in(group, tab),
+            Hit::GlassTab(group, tab) | Hit::GlassTabMore(group, tab) => self.show_in(group, tab),
             Hit::GlassAdd(group) => {
                 self.focus_group(group);
                 self.open_palette(None, glass::Open::Tab);
@@ -7146,6 +7390,18 @@ mod tests {
         edit_text(&mut lines, key(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(lines, "first");
         assert!(!edit_text(&mut lines, key(KeyCode::Up, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn a_mission_between_steps_says_what_is_next_not_that_the_person_has_no_part() {
+        let mut ui = Ui::new(demo::world());
+        ui.open("mission/fleet/rekey");
+        let shown = frame(&ui, 140, 50).join("\n").to_lowercase();
+        assert!(shown.contains("up next"), "{shown}");
+        assert!(
+            !shown.contains("nothing for you to do"),
+            "a run that is moving never says that:\n{shown}"
+        );
     }
 
     fn frame(ui: &Ui, width: u16, height: u16) -> Vec<String> {
@@ -8275,6 +8531,44 @@ mod tests {
     }
 
     #[test]
+    fn a_host_catching_up_says_behind_and_never_reads_as_no_alerts() {
+        let mut world = demo::world();
+        world.attention = Load::Ready(Vec::new());
+        let mut quiet = Ui::new(world.clone());
+        quiet.live = true;
+        let text = frame(&quiet, 140, 50).join("\n");
+        assert!(text.contains(screens::HOME_IDLE_TEXT) && !text.contains(screens::HOME_UNKNOWN_TEXT), "{text}");
+
+        world.behind = vec!["harbor has 26,820 envelopes this host lacks · caught up in about 14m".into()];
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        let rows = frame(&ui, 140, 50);
+        let text = rows.join("\n");
+        assert!(rows[0].contains("behind") && !rows[0].contains("live"), "{}", rows[0]);
+        assert!(text.contains(screens::HOME_UNKNOWN_TEXT) && text.contains("26,820 envelopes"), "{text}");
+        assert!(!text.contains(screens::HOME_IDLE_TEXT), "{text}");
+        ui.show_connection();
+        assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("Catching up: harbor has 26,820")));
+    }
+
+    #[test]
+    fn an_alerts_list_st_stopped_serving_never_reads_as_no_alerts() {
+        let mut world = demo::world();
+        world.attention = Load::Ready(Vec::new());
+        // Another list going stale does not make the alerts unknown.
+        world.stale = vec!["Agents: collection source is unavailable".into()];
+        let mut ui = Ui::new(world.clone());
+        ui.live = true;
+        let text = frame(&ui, 140, 50).join("\n");
+        assert!(text.contains(screens::HOME_IDLE_TEXT), "{text}");
+        world.stale = vec!["Attention: collection source is unavailable".into()];
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        let text = frame(&ui, 140, 50).join("\n");
+        assert!(text.contains(screens::HOME_UNKNOWN_TEXT) && text.contains("Attention: collection source"), "{text}");
+    }
+
+    #[test]
     fn x_dismisses_whatever_on_home_can_be_dismissed() {
         let mut world = demo::world();
         if let Load::Ready(items) = &mut world.attention {
@@ -8417,6 +8711,93 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn sizes_are_said_in_bytes_and_kib() {
+        assert_eq!(size_text(812), "812 bytes");
+        assert_eq!(size_text(4096), "4 KiB");
+        assert_eq!(size_text(262_144), "256 KiB");
+        assert_eq!(size_text(12_800), "12.5 KiB");
+    }
+
+    #[test]
+    fn a_draft_over_what_st_takes_is_not_sent_and_stays_in_the_box() {
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        ui.message_limit = Some(262_144);
+        let agent = ui.selected_id().unwrap();
+        ui.editing = true;
+        // Multibyte text is counted in bytes: 100,000 of these are 300,000 bytes, not 100,000.
+        let text = "€".repeat(100_000);
+        ui.conversation_state.drafts.insert(agent.clone(), text.clone());
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        assert_eq!(ui.conversation_state.drafts.get(&agent), Some(&text));
+        let said = ui.flash.as_ref().map(|(text, _)| text.clone()).unwrap_or_default();
+        assert!(said.contains("Too long to send") && said.contains("256 KiB"), "{said}");
+        // The box says so before Send is pressed.
+        let lines = ui.size_note(&text, 100).expect("a note past the limit");
+        let note: String = lines.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(note.contains("over the 256 KiB"), "{note}");
+        // Well under the limit, nothing is said.
+        assert!(ui.size_note("a short note", 100).is_none());
+        // Within the limit it goes, and the box clears.
+        ui.conversation_state
+            .drafts
+            .insert(agent.clone(), "€".repeat(80_000));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&ui.effects[..], [Effect::Send { .. }]), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn nothing_is_blocked_before_send_when_st_names_no_limit() {
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        assert_eq!(ui.message_limit, None);
+        let agent = ui.selected_id().unwrap();
+        ui.editing = true;
+        ui.conversation_state
+            .drafts
+            .insert(agent.clone(), "x".repeat(300_000));
+        assert!(ui.size_note(&"x".repeat(300_000), 100).is_none());
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&ui.effects[..], [Effect::Send { .. }]), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn a_refused_message_goes_back_to_the_box_unless_something_newer_is_there() {
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        let agent = ui.selected_id().unwrap();
+        let tags = vec!["dictated".to_owned()];
+        // The box is empty: the text, the reply it answered and its dictation mark return.
+        assert!(ui.restore_refused(&agent, "the long notes", Some("message/abc".into()), &tags, &[]));
+        assert_eq!(
+            ui.conversation_state.drafts.get(&agent).map(String::as_str),
+            Some("the long notes")
+        );
+        assert_eq!(ui.replies.get(&agent).map(String::as_str), Some("message/abc"));
+        assert!(ui.dictated.contains(&agent));
+        // The person has typed since: that is theirs, and the refused one is not put over it.
+        ui.conversation_state
+            .drafts
+            .insert(agent.clone(), "newer words".into());
+        assert!(!ui.restore_refused(&agent, "the long notes", None, &[], &[]));
+        assert_eq!(
+            ui.conversation_state.drafts.get(&agent).map(String::as_str),
+            Some("newer words")
+        );
+        // An image that has gone from disk cannot come back, so the message stays as it was
+        // sent, in the conversation, with nothing half restored.
+        ui.conversation_state.drafts.remove(&agent);
+        ui.replies.remove(&agent);
+        let gone = std::path::PathBuf::from("/nonexistent/picture.png");
+        assert!(!ui.restore_refused(&agent, "with a picture", None, &[], &[gone]));
+        assert!(!ui.conversation_state.drafts.contains_key(&agent));
     }
 
     #[test]

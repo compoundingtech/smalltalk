@@ -589,7 +589,7 @@ const styles = stylex.create({
   composerDock: { flexShrink: 0, paddingBlock: s.sm, backgroundColor: sf.canvas },
   composerLane: { width: '100%', maxWidth: g.lane, boxSizing: 'border-box', paddingInline: s.lg, marginInline: 'auto' },
   placeholderUri: { fontFamily: t.fontMono, fontSize: t.codeSize, color: tx.fgMuted },
-  placeholderHint: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: tx.fgFaint },
+  placeholderHint: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: tx.fgMuted },
   placeholderMeta: { display: 'flex', gap: s.xs },
-  chip: { fontFamily: t.fontMono, fontSize: t.denseSize, color: tx.fgFaint, borderWidth: g.hairline, borderStyle: 'solid', borderColor: bd.border, borderRadius: r.sm, paddingInline: s.xs2 },
+  chip: { fontFamily: t.fontMono, fontSize: t.denseSize, color: tx.fgMuted, borderWidth: g.hairline, borderStyle: 'solid', borderColor: bd.border, borderRadius: r.sm, paddingInline: s.xs2 },
 })

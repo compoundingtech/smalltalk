@@ -204,6 +204,7 @@ fn conversation_with_output_mode(
             let mut body = content_text(content);
             for attachment in &message.attachments {
                 if !attachment.media_type.starts_with("image/")
+                    && !(message.body_bytes.is_some() && attachment.media_type == "text/plain")
                     && content.attachment_id.as_deref() != Some(attachment.blob.as_str())
                     && content.attachment_id.as_deref() != Some(attachment.sha256.as_str())
                 {
@@ -215,6 +216,17 @@ fn conversation_with_output_mode(
                         attachment.media_type, attachment.sha256
                     ));
                 }
+            }
+            // A long message keeps only its start here; say so, and where the rest is read.
+            if let Some(bytes) = message.body_bytes {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(&format!(
+                    "[the start of a {} message · `st conversations read {}` shows all of it]",
+                    size_text(bytes),
+                    message.message_id
+                ));
             }
             let from = message.from.as_deref().unwrap_or_default();
             let body = if from == "daemon/runtime" {
@@ -2144,4 +2156,17 @@ fn short(id: &str) -> String {
     id.trim_start_matches("mission/")
         .trim_start_matches("agent/")
         .to_owned()
+}
+
+/// A message size as a person reads it: `812 bytes`, `12.5 KiB`, `256 KiB`.
+fn size_text(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} bytes");
+    }
+    let kib = bytes as f64 / 1024.0;
+    if (kib - kib.round()).abs() < 0.05 {
+        format!("{} KiB", kib.round() as u64)
+    } else {
+        format!("{kib:.1} KiB")
+    }
 }

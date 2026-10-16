@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -68,6 +69,25 @@ async def stop(process):
                 except asyncio.TimeoutError:
                     pass
         await process.wait()
+
+
+def give_bytes(source, destination):
+    """Make `destination` a file with `source`'s bytes without writing them again.
+
+    The executables here are debug builds of about a gigabyte and a case used to write 5 to 6 of
+    them (5.4 GB), which stalls on writeback when the build host is busy: 40 s of a 85 s baseline
+    case at load 31, and the 90 s readiness deadline of controller_death_cleanup. Nothing here ever
+    writes through a path in place (a swap is os.replace of a new file over the path), so a hard
+    link is a private file as far as the eval can tell. Only a copy that is appended to must stay a
+    copy. Across filesystems, or where the kernel refuses links to files the user does not own
+    (a Nix store path), copy: those are the real reasons a link is impossible.
+    """
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES):
+            raise
+        shutil.copy2(source, destination)
 
 
 async def capture(*command, env):
@@ -158,16 +178,19 @@ def free_port():
 
 
 class Node:
-    def __init__(self, root, name, binary, env, binary_root):
+    def __init__(self, root, name, binary, env, binary_root, bound):
         self.root = root / name
         self.name = name
+        # The eval's phase bound. A fresh daemon's store creation and each CLI request scale
+        # with the runner's disk; a hang still fails within this bound.
+        self.bound = bound
         for sub in ("bin", "state", "pty", "home", "run", "ws"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
         # Keep large mutable executable copies off the socket filesystem (/tmp may have
         # a small per-user quota). Socket, state and provider-fixture paths stay short.
         self.binary = binary_root / name / "bin/st3"
         self.binary.parent.mkdir(parents=True)
-        shutil.copy2(binary, self.binary)
+        give_bytes(binary, self.binary)
         self.endpoint = self.root / "run/st3.sock"
         self.env = {**env, "HOME": str(self.root / "home"),
                     "XDG_STATE_HOME": str(self.root / "home/state"),
@@ -202,7 +225,7 @@ class Node:
         process = await asyncio.create_subprocess_exec(str(self.binary), "--endpoint", str(self.endpoint),
             *args, env=self.env, start_new_session=True, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), 5)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), self.bound)
         finally:
             await stop(process)
         if check and process.returncode:
@@ -243,7 +266,7 @@ class Node:
             if self.daemon.returncode is not None:
                 raise RuntimeError("isolated daemon exited: " + (self.root / "daemon.log").read_text()[-2000:])
             return await self.api("/v1/replication/status")
-        await until(ready)
+        await until(ready, self.bound)
         _PORT_RESERVATIONS.pop(peer_port).close()
         self.worker = await self.spawn(["replication-worker", "--config", str(self.root / "config.toml")], "worker.log")
         async def peer_ready():
@@ -256,7 +279,7 @@ class Node:
                 return True
             except OSError:
                 return False
-        await until(peer_ready)
+        await until(peer_ready, self.bound)
 
     async def down(self):
         await stop(self.worker)
@@ -480,8 +503,8 @@ async def run_case(args, case, directory, candidate, old, replacement):
                "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
         if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
             env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
-        source = Node(root, "amber", candidate, env, binary_root)
-        target = Node(root, "cobalt", candidate, env, binary_root)
+        source = Node(root, "amber", candidate, env, binary_root, args.ready_seconds)
+        target = Node(root, "cobalt", candidate, env, binary_root, args.ready_seconds)
         nodes = [source, target]
         ports = [free_port(), free_port()]
         proxies = [await link.listen(port) for port in ports]
@@ -514,11 +537,15 @@ url = "http://127.0.0.1:{proxies[1 - i]}"
                 f'  exec {provider} "$@"\nfi\nexec setsid {provider} "$@"\n'
             )
             wrapper.chmod(0o755)
-            await node.start()
+        # The nodes are independent until both serve; neither startup waits behind the other.
+        # Let both starts settle before raising, so cleanup never races a start still spawning.
+        for outcome in await asyncio.gather(*(node.start() for node in nodes), return_exceptions=True):
+            if isinstance(outcome, BaseException):
+                raise outcome
         legacy_env = ""
         if case == "old-channel":
             legacy = target.binary.with_name("legacy-st3")
-            shutil.copy2(old, legacy)
+            give_bytes(old, legacy)
             legacy_env = f'  env {{ FAULT_OLD_CHANNEL_BIN "{legacy}"; }}\n'
         seats = target.root / "seats.kdl"
         seats.write_text(f'''version 2
@@ -575,7 +602,7 @@ agent "fault-probe" {{
             subject = await send(source, case)
             # Atomic install at the exact path watched by the existing driver/channel.
             next_binary = target.binary.with_suffix(".next")
-            shutil.copy2(candidate if case == "old-channel" else replacement, next_binary)
+            give_bytes(candidate if case == "old-channel" else replacement, next_binary)
             os.replace(next_binary, target.binary)
             await target.down()
             if case == "old-channel":
@@ -592,7 +619,7 @@ agent "fault-probe" {{
             # path the seat started from keeps its old executable, unchanged.
             deployed = binary_root / "cobalt/next-store/bin/st3"
             deployed.parent.mkdir(parents=True)
-            shutil.copy2(replacement, deployed)
+            give_bytes(replacement, deployed)
             await target.down()
             target.binary = deployed
             await target.start()
@@ -818,9 +845,13 @@ async def main(args):
     inputs = Path(tempfile.mkdtemp(prefix="mfi-", dir=args.scratch))
     try:
         candidate, old, replacement = [inputs / name for name in ("candidate", "old", "replacement")]
-        shutil.copy2(args.binary, candidate)
-        shutil.copy2(args.old_binary, old)
-        shutil.copy2(args.swap_binary or args.binary, replacement)
+        give_bytes(args.binary, candidate)
+        give_bytes(args.old_binary, old)
+        if args.swap_binary:
+            give_bytes(args.swap_binary, replacement)
+        else:
+            # Appended to below, so it must be its own file.
+            shutil.copy2(args.binary, replacement)
         probe = await asyncio.create_subprocess_exec(str(old), "resume-probe",
             env={"PATH": os.environ["PATH"]}, start_new_session=True, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:

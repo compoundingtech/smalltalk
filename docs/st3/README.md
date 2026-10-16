@@ -45,6 +45,7 @@ Use these documents for implementation details:
 - [Attachments](attachments.md) defines the images a message carries between machines: where the
   bytes live (never in sync), the limits, upload and read, and delivery to a seat.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
+- [Terminal agent retirement](agent-retirement.md) explains the owner-local writer fence, cross-peer policy and coordinated upgrade gate.
 - [Suspending a seat](suspend.md) explains `st agents suspend` and `resume`: when a seat is quiet
   enough to stop, and how each harness comes back on its own native session.
 - [Seat handoff](seat-continuity.md) explains the one document a seat leaves for the session after it, and the first
@@ -65,6 +66,8 @@ Use these documents for implementation details:
   with its own state, sockets, service names and harness accounts, and the uninstall that removes it.
 - [Sekrets](sekrets.md) explains the opt-in gateway that runs any CLI with a credential no seat
   can read: profiles, policies, grants, how it tells a seat from its person, and its sandbox.
+- [Tiles](tiles.md) explains how root runs an agent as its own Unix user, in its own namespaces
+  and root-owned cgroup: the registry, launch, cleanup, the endpoint, and what the tests prove.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits

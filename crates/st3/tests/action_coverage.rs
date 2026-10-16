@@ -765,7 +765,7 @@ async fn dispatch(
     actions! {
         "agent.create" => agent_create, "agent.queue-move" => agent_queue_move,
         "agent.resume" => agent_resume, "agent.start" => agent_start,
-        "agent.stop" => agent_stop, "agent.suspend" => agent_suspend,
+        "agent.retire" => agent_retire, "agent.stop" => agent_stop, "agent.suspend" => agent_suspend,
         "custom.reply" => custom_reply, "prompt.respond" => prompt_respond,
         "arrangement.edit" => arrangement_edit,
         "attention.resolve" => attention_resolve,
@@ -945,6 +945,218 @@ mission "example/work" state="ready" {
             assert_eq!(daemon.store().step_run(step).unwrap().unwrap().attempt, 2);
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revise_notes_cli_carries_notes_through_two_revisions_and_retry() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut daemon = Daemon::new().await;
+    daemon.worker();
+    let source = |goal: &str| {
+        format!(
+            r#"version 2
+mission "example/notes" state="ready" {{
+  goal "Preserve the owner's notes."
+  step "done" {{ assigned-to "agent/example/worker"; goal "Deliver the result." }}
+  step "active" {{ assigned-to "agent/example/worker"; goal "Check the result."; retry {{ attempts 2 }} }}
+  step "other" {{ assigned-to "agent/example/worker"; goal {goal:?} }}
+}}
+"#
+        )
+    };
+    daemon.apply(&source("First goal."), "notes-mission");
+    let run = daemon.start("example/notes", "notes-run");
+    let step = |run: &st3::model::MissionRunView, path: &str| {
+        run.steps
+            .iter()
+            .find(|step| step.step == path)
+            .unwrap()
+            .clone()
+    };
+    let done = step(&run, "done").subject;
+    daemon.store().set_step_state(&done, "ready", None).unwrap();
+    for (action, summary) in [
+        ("claim", "Starting"),
+        ("progress", "Decision: retain the result"),
+        ("complete", "Delivered the result"),
+    ] {
+        cli_value(
+            daemon
+                .cli(
+                    WORKER,
+                    &[
+                        "work",
+                        action,
+                        &done,
+                        "--as",
+                        WORKER,
+                        "--incarnation",
+                        "4242:fixture",
+                        "--summary",
+                        summary,
+                    ],
+                )
+                .await,
+        );
+    }
+    // This fixture simulates the reconciler accepting a worker's submitted result.
+    daemon
+        .store()
+        .set_step_state(&done, "completed", None)
+        .unwrap();
+    let active = step(&run, "active").subject;
+    daemon
+        .store()
+        .set_step_state(&active, "ready", None)
+        .unwrap();
+    for (action, summary) in [
+        ("claim", "Starting"),
+        ("progress", "Checking the result"),
+        ("release", "Let the next incarnation continue"),
+        ("claim", "Continuing"),
+    ] {
+        cli_value(
+            daemon
+                .cli(
+                    WORKER,
+                    &[
+                        "work",
+                        action,
+                        &active,
+                        "--as",
+                        WORKER,
+                        "--incarnation",
+                        "4242:fixture",
+                        "--summary",
+                        summary,
+                    ],
+                )
+                .await,
+        );
+    }
+    let original: st3::model::MissionRunView = serde_json::from_value(cli_value(
+        daemon
+            .cli(PERSON, &["missions", "show", &run.subject])
+            .await,
+    ))
+    .unwrap();
+    assert_eq!(step(&original, "active").status, "claimed");
+    assert_eq!(step(&original, "done").status, "completed");
+    let file = daemon.root.path().join("notes-revision.kdl");
+    let mut current = original.clone();
+    for revision in 2..=3 {
+        std::fs::write(&file, source(&format!("Goal {revision}."))).unwrap();
+        cli_value(
+            daemon
+                .cli(
+                    PERSON,
+                    &[
+                        "work",
+                        "revise",
+                        &run.subject,
+                        file.to_str().unwrap(),
+                        "--as",
+                        PERSON,
+                        "--reason",
+                        "Adjust the other step",
+                    ],
+                )
+                .await,
+        );
+        daemon.restart().await;
+        current = serde_json::from_value(cli_value(
+            daemon
+                .cli(PERSON, &["missions", "show", &run.subject])
+                .await,
+        ))
+        .unwrap();
+        for path in ["active", "done"] {
+            let before = step(&original, path);
+            let after = step(&current, path);
+            assert_ne!(after.subject, before.subject);
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.progress_summary, before.progress_summary, "{path}");
+            assert_eq!(
+                after.progress_at_unix_ms, before.progress_at_unix_ms,
+                "{path}"
+            );
+            assert_eq!(
+                after.completion_summary, before.completion_summary,
+                "{path}"
+            );
+        }
+    }
+    let done = step(&current, "done");
+    let refused = daemon
+        .cli(
+            WORKER,
+            &[
+                "work",
+                "progress",
+                &done.subject,
+                "--as",
+                WORKER,
+                "--incarnation",
+                "4242:fixture",
+                "--summary",
+                "Decision: archive the result",
+            ],
+        )
+        .await;
+    assert!(
+        !refused.status.success(),
+        "completed progress must remain refused"
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already completed"));
+    let active = step(&current, "active");
+    cli_value(
+        daemon
+            .cli(
+                WORKER,
+                &[
+                    "work",
+                    "fail",
+                    &active.subject,
+                    "--as",
+                    WORKER,
+                    "--incarnation",
+                    "4242:fixture",
+                    "--reason",
+                    "A new attempt is needed",
+                ],
+            )
+            .await,
+    );
+    cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "work",
+                    "retry",
+                    &active.subject,
+                    "--as",
+                    PERSON,
+                    "--reason",
+                    "Start a fresh attempt",
+                ],
+            )
+            .await,
+    );
+    daemon.restart().await;
+    let retried: st3::model::MissionRunView = serde_json::from_value(cli_value(
+        daemon
+            .cli(PERSON, &["missions", "show", &run.subject])
+            .await,
+    ))
+    .unwrap();
+    let retried = step(&retried, "active");
+    assert_eq!(retried.attempt, 2);
+    assert_eq!(retried.progress_summary, None);
+    assert_eq!(retried.progress_at_unix_ms, None);
+    assert_eq!(retried.completion_summary, None);
 }
 
 /// Reconcile declarations and agentless human gates; these cases launch no processes.
@@ -1605,6 +1817,237 @@ async fn suspension_requests_survive_stale_incarnations_and_restarts() {
         resumed.native_session_id.as_deref(),
         Some("copper-suspended-native")
     );
+}
+
+/// #2286: reject an authored selector before writing a suspension, regardless of whether
+/// the selected transcript exists. Both public mutation routes use the same preflight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspend_refuses_authored_selection_without_writes() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for transcript_exists in [false, true] {
+        let mut daemon = Daemon::new().await;
+        let transcript = daemon.root.path().join("native-copper.jsonl");
+        if transcript_exists {
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"session\",\"id\":\"native-copper\"}\n",
+            )
+            .unwrap();
+        }
+        daemon.apply(&format!(
+            "version 2\nagent \"example/worker\" {{ host {NODE:?}; workspace {:?}; harness \"omp\" {{ args \"--resume\" {:?}; }} }}\n",
+            daemon.root.path().display().to_string(), transcript.display().to_string()
+        ), "authored-worker");
+        daemon.claim(
+            WORKER,
+            "runtime.observed",
+            json!({"status": "running", "runtime_id": "worker", "incarnation_id": "4242:fixture"}),
+        );
+        daemon.claim(WORKER, "harness.session-file", json!({"harness": "omp", "session_id": "native-copper", "agent": WORKER, "incarnation_id": "4242:fixture", "status": "active"}));
+        daemon.claim(WORKER, "harness.observed", json!({"state": "idle", "incarnation_id": "4242:fixture", "quiescent": true, "blocking": []}));
+        for _ in 0..2 {
+            let before = daemon.store().index().unwrap();
+            let refused = daemon
+                .transport()
+                .post::<_, Value>(
+                    "/v1/agents/suspend",
+                    &json!({
+                        "subject": WORKER, "actor": PERSON, "idempotency_key": "authored-rest"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st3::client::api_error_code(&refused),
+                Some("suspend-authored-session-selection")
+            );
+            assert_eq!(st3::client::http_status(&refused), Some(422));
+            assert!(refused.to_string().contains("--resume"), "{refused}");
+            assert_eq!(daemon.store().index().unwrap(), before);
+            let mut fence = daemon.fence(PERSON).await;
+            fence.runtime_desired_revision = daemon.store().selected_desired_token(WORKER).unwrap();
+            fence.runtime_incarnation = Some("4242:fixture".into());
+            let refused = dispatch(
+                &daemon.client(PERSON),
+                "agent.suspend",
+                "authored-suspend-action-request",
+                fence,
+                json!({"agent": WORKER}),
+            )
+            .await
+            .unwrap_err();
+            let ClientError::Api(code, message, envelope) = refused else {
+                panic!("{refused}")
+            };
+            assert_eq!(code, ErrorCode::SuspendAuthoredSessionSelection, "{message}");
+            assert!(message.contains("--resume"), "{message}");
+            assert_eq!(envelope.details["selector"], "--resume");
+            assert!(!envelope.retryable);
+            assert_eq!(daemon.store().index().unwrap(), before);
+            assert!(
+                st3::suspension::current(daemon.store(), WORKER)
+                    .unwrap()
+                    .is_none()
+            );
+            let running = daemon.store().status(Some(WORKER)).unwrap();
+            assert_eq!(
+                st3::model::projected_actual_status(running.subjects[0].actual.as_ref()),
+                Some("running")
+            );
+            daemon.restart().await;
+        }
+    }
+}
+
+/// Recreate a hold accepted by an older daemon and exercise the documented exit over the CLI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_authored_suspension_exits_with_stop_then_start() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let daemon = Daemon::new().await;
+    let transcript = daemon.root.path().join("native-copper.jsonl");
+    let contents = "{\"type\":\"session\",\"id\":\"authored-copper\"}\n";
+    std::fs::write(&transcript, contents).unwrap();
+    daemon.apply(&format!(
+        "version 2\nagent \"example/worker\" {{ host {NODE:?}; workspace {:?}; harness \"omp\" {{ args \"--resume\" {:?}; }} }}\n",
+        daemon.root.path().display().to_string(), transcript.display().to_string()
+    ), "legacy-authored-worker");
+    let declaration = daemon
+        .store()
+        .agent_declaration(WORKER, None)
+        .unwrap()
+        .unwrap();
+    let suspended = daemon
+        .store()
+        .append_claim(&ClaimInput {
+            subject: WORKER.into(),
+            kind: "runtime.action.requested".into(),
+            actor: Some(PERSON.into()),
+            fields: serde_json::from_value(
+                json!({"action": "suspend", "incarnation_id": "4242:fixture"}),
+            )
+            .unwrap(),
+            evidence: vec![declaration.0.clone()],
+            expected_subject: None,
+            idempotency_key: Some(format!("agent-suspend:{WORKER}:legacy-suspend")),
+        })
+        .unwrap();
+    // A retry of a suspend accepted before this preflight was installed still returns its
+    // original claim. It must bypass today's authored-selector and running-state refusals.
+    let before_retry = daemon.store().index().unwrap();
+    let retried: st3::model::ClaimRecord = daemon
+        .transport()
+        .post(
+            "/v1/agents/suspend",
+            &json!({
+                "subject": WORKER, "actor": PERSON, "idempotency_key": "legacy-suspend"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.id, suspended.id);
+    assert_eq!(retried.body, suspended.body);
+    assert_eq!(daemon.store().index().unwrap(), before_retry);
+    for (key, phase) in [
+        (
+            st3::suspension::suspend_snapshot_key(&suspended.id),
+            "snapshotting",
+        ),
+        (
+            st3::suspension::suspend_completed_key(&suspended.id),
+            "suspended",
+        ),
+    ] {
+        daemon.store().append_claim(&ClaimInput {
+            subject: WORKER.into(), kind: "runtime.action.succeeded".into(), actor: Some(PERSON.into()),
+            fields: serde_json::from_value(json!({"action": "suspend", "operation_status": phase, "harness": "omp", "native_session_id": "kept-copper"})).unwrap(),
+            evidence: vec![suspended.id.clone()], expected_subject: None, idempotency_key: Some(key),
+        }).unwrap();
+    }
+    cli_value(
+        daemon
+            .cli(PERSON, &["agents", "start", WORKER, "--as", PERSON])
+            .await,
+    );
+    assert_eq!(
+        st3::suspension::current(daemon.store(), WORKER)
+            .unwrap()
+            .unwrap()
+            .phase,
+        "suspended"
+    );
+    let refused = daemon
+        .transport()
+        .post::<_, Value>(
+            "/v1/agents/restart",
+            &json!({
+                "subject": WORKER, "actor": PERSON, "idempotency_key": "legacy-restart"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        st3::client::api_error_code(&refused),
+        Some("restart-suspended")
+    );
+    let message = refused.to_string();
+    assert!(
+        message.contains("st agents stop") && message.contains("st agents start"),
+        "{message}"
+    );
+    assert!(
+        message.contains("without preserving the suspended session"),
+        "{message}"
+    );
+    cli_value(
+        daemon
+            .cli(PERSON, &["agents", "stop", WORKER, "--as", PERSON])
+            .await,
+    );
+    assert!(
+        st3::suspension::current(daemon.store(), WORKER)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        daemon
+            .store()
+            .selected_desired_kind(WORKER)
+            .unwrap()
+            .as_deref(),
+        Some("stop")
+    );
+    cli_value(
+        daemon
+            .cli(PERSON, &["agents", "start", WORKER, "--as", PERSON])
+            .await,
+    );
+    assert_eq!(
+        daemon
+            .store()
+            .selected_desired_kind(WORKER)
+            .unwrap()
+            .as_deref(),
+        Some("agent")
+    );
+    assert!(
+        st3::suspension::current(daemon.store(), WORKER)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        daemon
+            .store()
+            .agent_declaration(WORKER, None)
+            .unwrap()
+            .unwrap()
+            .1,
+        declaration.1
+    );
+    assert_eq!(std::fs::read_to_string(transcript).unwrap(), contents);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5679,4 +6122,119 @@ async fn onepassword_field_reference_manifest_registers_validates_replicates_and
         vec![json!({"locator":format!("{boundary}a")})],
     )
     .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_retirement_refuses_first_sends_and_survives_cli_retry_and_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut daemon = Daemon::new().await;
+    daemon.apply(
+        "version 2\nagent \"example/worker\" { command \"true\"; workspace \"/tmp\"; }\n",
+        "retirement-declaration",
+    );
+    let parameters = json!({"to":WORKER,"content":"An invented note.","kind":"wake"});
+    let accepted = dispatch(
+        &daemon.client(PERSON),
+        "message.send",
+        "retirement-accepted-message",
+        daemon.fence(PERSON).await,
+        parameters.clone(),
+    )
+    .await
+    .unwrap();
+    let key = "terminal-retirement-operation";
+    let args = [
+        "agents",
+        "retire",
+        WORKER,
+        "--as",
+        PERSON,
+        "--reason",
+        "Work finished",
+        "--idempotency-key",
+        key,
+    ];
+    let retired = cli_value(daemon.cli(PERSON, &args).await);
+    daemon.restart().await;
+    let repeated = cli_value(daemon.cli(PERSON, &args).await);
+    assert_eq!(
+        retired["value"]["action_id"],
+        repeated["value"]["action_id"]
+    );
+    assert_eq!(
+        daemon
+            .store()
+            .claims_for_subject_kind_at(WORKER, "agent.retired", None, false, 10)
+            .unwrap()
+            .claims
+            .len(),
+        1
+    );
+    let retry = dispatch(
+        &daemon.client(PERSON),
+        "message.send",
+        "retirement-accepted-message",
+        daemon.fence(PERSON).await,
+        parameters.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.value.operation_id, accepted.value.operation_id);
+    assert_eq!(retry.value.affected_ids, accepted.value.affected_ids);
+    let before = daemon.store().index().unwrap();
+    let error = dispatch(
+        &daemon.client(PERSON),
+        "message.send",
+        "retirement-fresh-message",
+        daemon.fence(PERSON).await,
+        parameters,
+    )
+    .await
+    .unwrap_err();
+    match error {
+        ClientError::Api(code, _, error) => {
+            assert_eq!(code, ErrorCode::RecipientRetired);
+            assert_eq!(error.details["applied"], "none");
+            assert_eq!(error.details["refusal"]["variant"], "Retired");
+            assert_eq!(error.details["refusal"]["recipient"], WORKER);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(before, daemon.store().index().unwrap());
+    let refused = daemon
+        .cli(
+            PERSON,
+            &[
+                "conversations",
+                "send",
+                WORKER,
+                "--from",
+                PERSON,
+                "--body",
+                "A fresh note.",
+            ],
+        )
+        .await;
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("Retired") && stderr.contains(WORKER),
+        "{stderr}"
+    );
+    let raw = daemon.transport().post::<_,Value>("/v1/messages",&json!({"to":WORKER,"from":PERSON,"content":"An adapter note","idempotency_key":"retirement-adapter-message"})).await.unwrap_err();
+    let (status,code,_,details)=st3::client::api_error_parts(&raw).unwrap();
+    assert_eq!(status,409);assert_eq!(code,"recipient-retired");assert_eq!(details["applied"],"none");
+    let restarted = daemon
+        .cli(PERSON, &["agents", "start", WORKER, "--as", PERSON])
+        .await;
+    assert!(!restarted.status.success());
+    assert!(
+        daemon
+            .store()
+            .desired_subjects()
+            .unwrap()
+            .iter()
+            .all(|subject| subject.subject != WORKER || subject.member.is_none())
+    );
 }

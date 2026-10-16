@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add the client reads slo.list and slo.history (GET /v1/client/slo and /v1/client/slo/history) so the TUI, the phone and the web app show the objectives and budgets that st slo prints",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, projection or replay change; both reads are computed from live windows, limits readings and the local history log."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds two read operations to st3.client.v0 with SloList, SloRow and SloHistory in the schema and generated Rust, Swift and TypeScript clients. Existing operations are unchanged; an older daemon answers the new routes with 404, which a client treats as unavailable."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal restart on deploy."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to configure."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swapping back to an older build removes the routes; clients show the section as unavailable."
+  }
+}

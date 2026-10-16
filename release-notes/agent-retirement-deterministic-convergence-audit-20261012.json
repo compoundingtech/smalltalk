@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Make convergence simulation inputs independent of executable identity and compare a versioned corpus across builds; document conditional index-installation estimates.",
+  "replay": { "status": "none", "detail": "Simulation-only identity override and test corpus; production proof identity is unchanged." },
+  "schema": { "status": "none", "detail": "Versioned fixture is test input, not a production registry or storage change." },
+  "rules": { "status": "none", "detail": "Native retention and admission remain under test without an oracle exception." },
+  "compatibility": { "status": "none", "detail": "Only test-support code and an opt-in audit target." },
+  "manual": { "status": "none", "detail": "Runbook adds a conditional extrapolation, with whole-store restart still unmeasured." },
+  "recovery": { "status": "none", "detail": "No change." },
+  "downtime": { "status": "none", "detail": "No new production startup work." }
+}

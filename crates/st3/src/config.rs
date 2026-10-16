@@ -11,6 +11,8 @@ use crate::fleet::transport::is_permitted_route_address;
 pub use smallclaims::fleet::file::{FleetFile, FleetMode, FleetRemoval, PeerConfig};
 use crate::model::PlannerSpec;
 
+mod client;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -79,12 +81,18 @@ pub struct GithubConfig {
     /// A single-token file readable only by its owner.
     pub token_file: Option<PathBuf>,
     pub sekrets_profile: Option<String>,
+    /// Local observer request ceiling per resource/hour. Unset meters only until
+    /// current usage and freshness are qualified; Factory's proposed cap is1000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observer_requests_per_hour: Option<u32>,
 }
 
 impl GithubConfig {
     pub fn is_default(&self) -> bool { self == &Self::default() }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.observer_requests_per_hour.is_none_or(|cap| (1..=1000).contains(&cap)),
+            "github.observer_requests_per_hour must be1..1000 or omitted for meter-only");
         anyhow::ensure!(self.token_file.is_none() || self.sekrets_profile.is_none(),
             "github.token_file and github.sekrets_profile are mutually exclusive");
         if let Some(profile) = &self.sekrets_profile {
@@ -434,22 +442,75 @@ impl Config {
         Ok(config)
     }
 
+    /// Client configuration only: warn once on unknown names, preserving strict known types.
+    /// Server, startup and policy reloads keep using the strict loaders above.
+    pub fn load_client_unvalidated(path: Option<&Path>) -> Result<(Self, Vec<String>)> {
+        let (config, unknown) = Self::load_selected(path, true)?;
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !unknown.is_empty() && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("st: {}", Self::unknown_client_keys_message(&unknown));
+        }
+        Ok((config, unknown))
+    }
+
+    /// One bounded diagnostic, including shell completion; unknown values are never shown.
+    pub fn unknown_client_keys_message(unknown: &[String]) -> String {
+        const MAX_NAMES: usize = 16;
+        const MAX_PATH_CHARS: usize = 160;
+        let mut names = unknown
+            .iter()
+            .take(MAX_NAMES)
+            .map(|path| {
+                let mut chars = path.chars();
+                let mut shown: String = chars.by_ref().take(MAX_PATH_CHARS).collect();
+                if chars.next().is_some() {
+                    shown.push_str("...");
+                }
+                shown
+            })
+            .collect::<Vec<_>>();
+        if unknown.len() > MAX_NAMES {
+            names.push(format!(
+                "... and {} more key paths",
+                unknown.len() - MAX_NAMES
+            ));
+        }
+        format!(
+            "ignoring unknown client config keys: {}; daemon configuration remains strict",
+            names.join(", ")
+        )
+    }
+
     pub fn load_unvalidated(path: Option<&Path>) -> Result<Self> {
+        Self::load_selected(path, false).map(|(config, _)| config)
+    }
+
+    fn load_selected(path: Option<&Path>, lenient_client: bool) -> Result<(Self, Vec<String>)> {
         let selected = path
             .map(Path::to_path_buf)
             .unwrap_or_else(Self::default_path);
         let bytes = match fs::read_to_string(&selected) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && path.is_none() => {
-                return Ok(Self { access_mode: Some(st_drivers::access::AccessMode::Auto), ..Self::default() });
+                return Ok((
+                    Self {
+                        access_mode: Some(st_drivers::access::AccessMode::Auto),
+                        ..Self::default()
+                    },
+                    Vec::new(),
+                ));
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("read st config {}", selected.display()));
             }
         };
-        let mut config: Self = toml::from_str(&bytes)
-            .with_context(|| format!("parse st config {}", selected.display()))?;
+        let (mut config, unknown) = if lenient_client {
+            client::parse(&bytes)
+        } else {
+            toml::from_str(&bytes).map(|config| (config, Vec::new()))
+        }
+        .with_context(|| format!("parse st config {}", selected.display()))?;
         let defaults = Self::default();
         if config.node.is_empty() {
             config.node = defaults.node;
@@ -467,7 +528,7 @@ impl Config {
         if config.client_gateway_socket.as_os_str().is_empty() {
             config.client_gateway_socket = defaults.client_gateway_socket;
         }
-        Ok(config)
+        Ok((config, unknown))
     }
 
     /// Resolve the daemon's published endpoint when this client lacks its runtime directory.
@@ -944,6 +1005,19 @@ mod tests {
     }
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn github_observer_admission_is_meter_only_until_explicitly_configured() {
+        let mut config=GithubConfig::default();
+        assert_eq!(config.observer_requests_per_hour,None);
+        assert!(config.validate().is_ok());
+        config.observer_requests_per_hour=Some(1000);
+        assert!(config.validate().is_ok());
+        config.observer_requests_per_hour=Some(0);
+        assert!(config.validate().is_err());
+        config.observer_requests_per_hour=Some(1001);
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn github_profile_is_opt_in_and_rejects_empty_configuration() {

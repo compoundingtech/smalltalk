@@ -12,6 +12,28 @@ use ratatui::text::{Line, Span};
 
 /// What Home says when nothing needs the person; setup's first-run test waits for it.
 pub const HOME_IDLE_TEXT: &str = "No alerts right now.";
+/// What Home and the alerts list say instead of "none" while the alerts they would show may be
+/// missing or old: st is catching up with a peer, or stopped serving the list or its live stream.
+pub const HOME_UNKNOWN_TEXT: &str = "No alerts known — this view is out of date.";
+
+/// Whether the alerts shown (or their absence) can be out of date, and why.
+fn alerts_out_of_date(world: &World) -> Option<String> {
+    let stale: Vec<&str> = world
+        .stale
+        .iter()
+        .map(String::as_str)
+        .filter(|why| why.starts_with("Attention") || why.starts_with("live stream"))
+        .collect();
+    if world.behind.is_empty() && stale.is_empty() {
+        return None;
+    }
+    let mut why = Vec::new();
+    if !world.behind.is_empty() {
+        why.push(format!("catching up: {}", world.behind.join("; ")));
+    }
+    why.extend(stale.iter().map(|why| (*why).to_owned()));
+    Some(why.join("; "))
+}
 
 /// The tabs everyone sees. Worktrees stays hidden until the graph models worktrees: its screens
 /// only have invented data to show (Nathan, 2026-09-28).
@@ -74,8 +96,17 @@ pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, C
         AgentState::Idle => ("●", theme::IDLE),
         AgentState::Starting => ("◌", theme::WAITING),
         AgentState::Down => ("⊘", theme::FAULT),
-        AgentState::Stopped => ("○", theme::QUIET),
+        AgentState::Stopped | AgentState::Retired => ("○", theme::QUIET),
         AgentState::Unknown => ("?", theme::QUIET),
+    }
+}
+
+/// The word an agent row shows: st's state word, or, from an st too old to serve one, the state
+/// st reports, marked so.
+pub fn agent_shown_word(agent: &Agent) -> String {
+    match &agent.reported {
+        Some(state) => format!("{state} · older st"),
+        None => agent_word(agent.state).to_owned(),
     }
 }
 
@@ -90,6 +121,7 @@ pub fn agent_word(state: AgentState) -> &'static str {
         AgentState::Starting => "starting",
         AgentState::Down => "down",
         AgentState::Stopped => "stopped",
+        AgentState::Retired => "retired",
         AgentState::Unknown => "not managed",
     }
 }
@@ -254,7 +286,11 @@ pub fn home_list(
         state: state_of(
             &world.attention,
             "Checking for alerts…",
-            "No alerts.",
+            if alerts_out_of_date(world).is_some() {
+                "No alerts known — out of date."
+            } else {
+                "No alerts."
+            },
         ),
         legend: legend(&[
             ("◆", theme::PERSON, "decide"),
@@ -739,10 +775,18 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             ),
             Load::Ready(_) => {
                 doc.blank();
-                doc.line(Line::from(vec![
-                    span("✓ ", theme::strong(theme::GREEN)),
-                    span(HOME_IDLE_TEXT, theme::bold()),
-                ]));
+                if let Some(why) = alerts_out_of_date(world) {
+                    doc.line(Line::from(vec![
+                        span("◐ ", theme::strong(theme::YELLOW)),
+                        span(HOME_UNKNOWN_TEXT, theme::bold()),
+                    ]));
+                    doc.wrap(&[run(why, theme::dim())], width);
+                } else {
+                    doc.line(Line::from(vec![
+                        span("✓ ", theme::strong(theme::GREEN)),
+                        span(HOME_IDLE_TEXT, theme::bold()),
+                    ]));
+                }
                 doc.blank();
                 doc.wrap(
                     &[run(
@@ -1519,6 +1563,7 @@ fn agent_group(agent: &Agent) -> &'static str {
         AgentState::Working | AgentState::Compacting => "working",
         AgentState::Idle | AgentState::Starting => "idle",
         AgentState::Stopped | AgentState::Unknown => "stopped",
+        AgentState::Retired => "retired",
     }
 }
 
@@ -1620,7 +1665,15 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
             ("✕", theme::FAULT, "broken"),
             ("○", theme::QUIET, "stopped"),
             ("?", theme::QUIET, "unmanaged"),
-        ]),
+        ])
+        .into_iter()
+        .chain(world.agents.items().iter().any(|agent| agent.reported.is_some()).then(|| {
+            Line::from(span(
+                "This host's st is older: agent states show as st reports them.",
+                theme::dim(),
+            ))
+        }))
+        .collect(),
     }
 }
 
@@ -1650,7 +1703,7 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
     let mut first = vec![
         span(format!(" {glyph} "), theme::strong(color)),
         span(agent.name.clone(), theme::bold()),
-        span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
+        span(format!("  {}", agent_shown_word(agent)), theme::fg(color)),
     ];
     // The model rides beside the harness, as the harness reported it.
     let model = agent
@@ -2131,7 +2184,7 @@ pub fn mission_detail(
             });
             agents.line(Line::from(vec![
                 span(label, theme::fg(color)),
-                span(format!("{:<11}", agent_word(agent.state)), theme::fg(color)),
+                span(format!("{:<11}", agent_shown_word(agent)), theme::fg(color)),
                 span(
                     format!("{:<8}", agent.harness.name()),
                     theme::fg(harness_color(agent.harness)),
@@ -2246,14 +2299,16 @@ fn what_you_can_do(
     let (title, color) = match mission.word {
         Word::Stalled | Word::Failed => ("what you can do", theme::FAULT),
         Word::Unstaffed => ("what you can do", theme::WAITING),
-        Word::Queued => ("nothing for you to do", theme::OVERLAY1),
+        // Between two steps the run is moving: say what is next, not that the person has no part.
+        Word::Queued => ("up next", theme::OVERLAY1),
         _ => return,
     };
     card.blank();
     if mission.word == Word::Queued {
         let note = stuck
             .and_then(|step| step.note.clone())
-            .unwrap_or_else(|| "It is waiting its turn.".into());
+            .or_else(|| stuck.map(|step| format!("{} is next.", step.name)))
+            .unwrap_or_else(|| "The next step is waiting its turn.".into());
         card.wrap(&text::inline(&note, theme::text()), inner);
         card.blank();
         card.wrap(
@@ -2660,7 +2715,7 @@ pub fn worktree_detail(
             });
             agents.line(Line::from(vec![
                 span(label, theme::fg(color)),
-                span(agent_word(agent.state), theme::fg(color)),
+                span(agent_shown_word(agent), theme::fg(color)),
             ]));
         }
     }
@@ -2740,15 +2795,16 @@ pub struct AgentAction {
 pub fn agent_actions(agent: &Agent) -> Vec<AgentAction> {
     let row = |key, label, what| AgentAction { key, label, what };
     let mut rows = Vec::new();
-    let running = !matches!(agent.state, AgentState::Stopped | AgentState::Unknown);
+    let retired = agent.state == AgentState::Retired;
+    let running = !matches!(agent.state, AgentState::Stopped | AgentState::Retired | AgentState::Unknown);
     if agent.state == AgentState::Working {
         rows.push(row('i', "Interrupt", "stop its current turn, as Esc does in its own screen"));
     }
     if running {
         rows.push(row('r', "Restart", "a new process for the same seat, on its declaration"));
         rows.push(row('p', "Suspend", "stop at a quiet moment, keeping its session to resume"));
-        rows.push(row('x', "Retire", "stop it and take it off the lists; start brings it back"));
-    } else {
+        rows.push(row('x', "Stop", "stop its process; start brings it back"));
+    } else if !retired {
         rows.push(row('s', "Start", "start it again on its declaration"));
         rows.push(row('u', "Resume", "resume a suspended seat on the same session"));
     }
@@ -2769,7 +2825,7 @@ pub fn agent_actions_doc(agent: &Agent, width: usize, spinner: &'static str) -> 
     doc.line(Line::from(vec![
         span(format!("{glyph} "), theme::strong(color)),
         span(agent.name.clone(), theme::bold()),
-        span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
+        span(format!("  {}", agent_shown_word(agent)), theme::fg(color)),
         span(format!("  {} · {}", agent.harness.name(), agent.host), theme::dim()),
     ]));
     doc.blank();
@@ -2812,7 +2868,7 @@ pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -
         doc.line(Line::from(vec![
             span(format!("{glyph} "), theme::strong(color)),
             span(agent.name.clone(), theme::bold()),
-            span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
+            span(format!("  {}", agent_shown_word(agent)), theme::fg(color)),
         ]));
         doc.line(Line::from(span(agent.id.clone(), theme::dim())));
         doc.blank();
@@ -3084,7 +3140,7 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
     let (glyph, color) = agent_glyph(agent.state, spinner);
     doc.line(Line::from(vec![
         span(format!("{glyph} "), theme::fg(color)),
-        span(agent_word(agent.state), theme::fg(color)),
+        span(agent_shown_word(agent), theme::fg(color)),
     ]));
     let field = |doc: &mut Doc, label: &str, value: Option<&str>| {
         let mut spans = vec![span(format!("{label:<9}"), theme::dim())];

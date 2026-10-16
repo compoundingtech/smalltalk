@@ -1,8 +1,78 @@
 #!/usr/bin/env python3
 """Choose roles from the shared owned pool; execute inline on a hosted picker."""
+import datetime as dt
 import json
+import re
+import time
 import os
 import subprocess
+
+
+def queue_waits(env):
+    """Advisory complete live-run snapshot, never a gate or a polling loop.
+
+    Each picker takes a new snapshot. Unknown keeps the idle-role policy. A
+    public repo token reads jobs; the org runner credential is never substituted.
+    """
+    repo = env.get("REPOSITORY", "")
+    token = env.get("GH_REPO_TOKEN", "")
+    if not token or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo):
+        return None, "no repository queue reader"
+    deadline = time.monotonic() + 40
+    def request(path):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("queue snapshot deadline")
+        result = subprocess.run(["gh", "api", path],
+            env={**env, "GH_TOKEN": token}, check=True, capture_output=True,
+            text=True, timeout=min(8, left))
+        return json.loads(result.stdout)
+    def get(path):
+        # GITHUB_TOKEN's 1000/h repository quota is shared with unrelated jobs.
+        # Recheck before EVERY charged call; do not use an initial stale balance
+        # for all 26 calls. This is advisory, not an atomic quota reservation.
+        quota = request("rate_limit")["resources"]["core"]["remaining"]
+        if type(quota) is not int or quota < 300:
+            raise ValueError("repository API reserve below 300 requests")
+        return request(f"repos/{repo}/{path}")
+    def rows(data, field):
+        items = data[field]
+        total = data["total_count"]
+        if type(total) is not int or total < 0 or not isinstance(items, list) or total != len(items):
+            raise ValueError("incomplete " + field)
+        return items
+    try:
+        runs = {}
+        for status in ("queued", "in_progress"):
+            for run in rows(get(f"actions/runs?status={status}&per_page=100"), "workflow_runs"):
+                if type(run.get("id")) is not int or type(run.get("run_attempt")) is not int:
+                    raise ValueError("run identity")
+                if run["id"] in runs:
+                    raise ValueError("run changed during listing")
+                runs[run["id"]] = run
+        if len(runs) > 24:
+            raise ValueError("live-run snapshot exceeds 24-run bound")
+        now = dt.datetime.now(dt.timezone.utc)
+        waits = {"owned": 0.0, "namespace": 0.0}
+        queued = {"owned": 0, "namespace": 0}
+        for run in runs.values():
+            for job in rows(get(f"actions/runs/{run['id']}/jobs?per_page=100"), "jobs"):
+                if job.get("run_attempt") != run["run_attempt"] or job.get("head_sha") != run["head_sha"]:
+                    raise ValueError("job identity changed")
+                if job.get("status") != "queued":
+                    continue
+                labels = job["labels"]
+                if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
+                    raise ValueError("job labels")
+                pool = ("namespace" if any(x.startswith(("nscloud-", "namespace-profile-")) for x in labels)
+                        else "owned" if any(x in ("ci1", "ci1-priority", "ci1-merge") for x in labels) else None)
+                if pool:
+                    created = dt.datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+                    waits[pool] = max(waits[pool], max(0, (now-created).total_seconds()))
+                    queued[pool] += 1
+        return waits, f"complete advisory queue view: {len(runs)} runs, queued={queued}, oldest_seconds={waits}"
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return None, f"queue view UNKNOWN ({type(error).__name__}); idle-role fallback"
 
 
 def main():
@@ -16,8 +86,9 @@ def main():
     output = open(env["GITHUB_OUTPUT"], "a")
     summary = open(env["GITHUB_STEP_SUMMARY"], "a")
     def emit(key, label):
-        print(f'{key}={json.dumps([label], separators=(",", ":"))}', file=output)
-        print(f'{key}: **{label.split("-")[0]}** ({label})', file=summary)
+        labels = [label] if isinstance(label, str) else label
+        print(f'{key}={json.dumps(labels, separators=(",", ":"))}', file=output)
+        print(f'{key}: **{labels[0].split("-")[0]}** ({labels})', file=summary)
     def unavailable(reason):
         print(reason)
         if priority:
@@ -42,9 +113,16 @@ def main():
         if not isinstance(pages, list):
             raise ValueError("runner pages")
         by_id = {}
+        expected = None
+        count = 0
         for page in pages:
             if not isinstance(page, dict) or not isinstance(page.get("runners"), list):
                 raise ValueError("runner page")
+            total = page.get("total_count")
+            if type(total) is not int or total < 0 or (expected is not None and expected != total):
+                raise ValueError("inconsistent runner count")
+            expected = total
+            count += len(page["runners"])
             for runner in page["runners"]:
                 if not isinstance(runner, dict) or type(runner.get("id")) is not int:
                     raise ValueError("runner identity")
@@ -57,12 +135,14 @@ def main():
                 if runner["id"] in by_id and by_id[runner["id"]] != record:
                     raise ValueError("conflicting duplicate runner")
                 by_id[runner["id"]] = record
+        if expected is None or count != expected or len(by_id) != count:
+            raise ValueError("incomplete or duplicate runner view")
         idle = {key: labels for key, (status, busy, labels) in by_id.items()
                 if status == "online" and busy is False}
-    except (subprocess.SubprocessError, ValueError, TypeError, KeyError):
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
         unavailable("runner list unavailable or invalid")
         return
-    if (event == "merge_group" and env.get("MERGE_OVERFLOW") == "on"
+    if (event == "merge_group" and env.get("MERGE_OVERFLOW", "on") != "off"
             and any(key < 1 or status not in ("online", "offline") or type(busy) is not bool
                     for key, (status, busy, labels) in by_id.items())):
         unavailable("unqualified merge capacity status")
@@ -75,15 +155,27 @@ def main():
               f'{len(candidates("ci1"))} general idle, {len(candidates("ci1-priority"))} priority idle')
     print(census)
     print(census, file=summary)
-    if event == "merge_group" and env.get("MERGE_OVERFLOW") == "on":
+    # No queue read can improve a decision with no usable general/priority
+    # admission slot. Preserve tokens for jobs doing actual work.
+    observe_queue = (env.get("MODE") != "priority" and
+                     (len(candidates("ci1-priority")) >= 3 if event == "merge_group"
+                      else bool(candidates("ci1"))))
+    waits, queue_note = queue_waits(env) if observe_queue else (None, "idle-role decision sufficient; queue API not queried")
+    print(queue_note)
+    print(queue_note, file=summary)
+    if event == "merge_group" and env.get("MERGE_OVERFLOW", "on") != "off":
         merge_need = env.get("MERGE_NEED", "3")
         run_id = env.get("RUN_ID", "")
         if (merge_need.isascii() and merge_need.isdigit() and int(merge_need) > 0
                 and run_id.isascii() and run_id.isdigit() and int(run_id) > 0):
-            if len(candidates("ci1-priority")) < int(merge_need):
-                # The existing Linux profile supplies the same tools and KVM.
-                # Every required merge job follows this single, run-bound choice.
-                emit("ci1", f"namespace-profile-linux-x86-64;job.priority=1;github.run-id={run_id}")
+            if (len(candidates("ci1-priority")) < int(merge_need)
+                    or (waits is not None and waits["owned"] > 300
+                        and waits["namespace"] + 60 < waits["owned"])):
+                # Build/test stages use the qualified 8x16 shape, avoiding the
+                # VM profile's smaller concurrency limit. Only VM needs KVM.
+                emit("ci1", ["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1",
+                             f"namespace-features:github.run-id={run_id}"])
+                emit("ci1_profile", f"namespace-profile-linux-x86-64;job.priority=1;github.run-id={run_id}")
                 print('Merge overflow: **Namespace** (qualified pool census below admission minimum)', file=summary)
                 return
         else:
@@ -96,6 +188,9 @@ def main():
             idle.pop(available[0])
         if event == "merge_group" or env.get("MODE") == "priority":
             return
+    elif (waits is not None and waits["owned"] > waits["namespace"] + 60):
+        print('PR admission: **Namespace** (shorter measured queue); merge roles retained', file=summary)
+        return
     elif len(candidates("ci1")) >= int(need):
         emit("ci1", "ci1")
         idle.pop(candidates("ci1")[0])

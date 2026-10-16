@@ -275,6 +275,7 @@ pub fn roster_phase<T>(name: &'static str, work: impl FnOnce() -> T) -> T {
         "membership" => ("st.roster.phase.membership.wall_ms", "st.roster.phase.membership.cpu_ms"),
         "status_fold" => ("st.roster.phase.status_fold.wall_ms", "st.roster.phase.status_fold.cpu_ms"),
         "card_presentation" => ("st.roster.phase.card_presentation.wall_ms", "st.roster.phase.card_presentation.cpu_ms"),
+        "subagent_leases" => ("st.roster.phase.subagent_leases.wall_ms", "st.roster.phase.subagent_leases.cpu_ms"),
         "queue_selection" => ("st.roster.phase.queue_selection.wall_ms", "st.roster.phase.queue_selection.cpu_ms"),
         "serialization" => ("st.roster.phase.serialization.wall_ms", "st.roster.phase.serialization.cpu_ms"),
         _ => unreachable!("roster phases use a closed vocabulary"),
@@ -1001,6 +1002,33 @@ mod tests {
     };
     use opentelemetry::{Key, KeyValue, Value};
     use opentelemetry_sdk::Resource;
+
+    #[test]
+    fn subagent_lease_phase_is_exported_on_the_roster_span() {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let spans = super::capture_test_spans(|| {
+            let span = tracing::info_span!("subagent-roster-proof");
+            let _entered = span.enter();
+            super::roster_scope(|| {
+                assert_eq!(super::roster_phase("subagent_leases", || 7), 7);
+                super::copy_roster_attributes(&span.context());
+            });
+        });
+        let span = spans.iter().find(|span| span.name == "subagent-roster-proof").unwrap();
+        for key in [
+            "st.roster.phase.subagent_leases.wall_ms",
+            "st.roster.phase.subagent_leases.cpu_ms",
+        ] {
+            assert!(
+                span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == key
+                        && matches!(attribute.value, Value::F64(value) if value >= 0.0)
+                }),
+                "missing exported lease phase {key}: {:?}", span.attributes
+            );
+        }
+        println!("exported lease phase: {:?}", span.attributes);
+    }
 
     #[test]
     fn roster_warm_measurements_move_to_the_publication_worker() {

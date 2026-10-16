@@ -472,19 +472,36 @@ impl Store {
             for (rowid, writer, sequence, link) in page {
                 after = rowid;
                 if let Some(link) = link {
-                    anyhow::ensure!(sequence > 0, "backup writer chain has an invalid root");
+                    anyhow::ensure!(sequence > 0,
+                        "backup writer chain has an invalid root: writer={writer:?} sequence={sequence}");
                     // Retained predecessors must match their exact batch hash. A predecessor
                     // removed by a verified checkpoint has only its certified wire identity left.
                     let found: bool =
                         predecessor.query_row(params![writer, sequence - 1, link], |r| r.get(0))?;
-                    anyhow::ensure!(
-                        found,
-                        "backup writer chain has a missing or broken predecessor; retry after replication catches up"
-                    );
+                    if !found {
+                        // Classify only a failure: the accepted path retains exactly its old
+                        // two indexed existence probes and the same checkpoint coverage rule.
+                        let retained: bool = connection.prepare_cached(
+                            "SELECT EXISTS(SELECT 1 FROM batches WHERE origin=?1 AND replica_sequence=?2)"
+                        )?.query_row(params![writer, sequence - 1], |row| row.get(0))?;
+                        let case = if retained { "wrong hash" } else { "absent" };
+                        let arrival = if retained { "" } else {
+                            "; if this writer's history is still arriving, the predecessor may yet arrive; \
+                             settled replication does not prove a complete chain"
+                        };
+                        anyhow::bail!(
+                            "backup writer chain has a missing or broken predecessor: \
+                             writer={writer:?} sequence={sequence} predecessor_sequence={} \
+                             expected_hash={link:?}; retained predecessor {case}; \
+                             not covered by a checkpoint{arrival}",
+                            sequence - 1,
+                        );
+                    }
                 } else {
                     anyhow::ensure!(
                         sequence <= 1,
-                        "backup writer chain starts after a missing predecessor"
+                        "backup writer chain starts after a missing predecessor: \
+                         writer={writer:?} sequence={sequence}; no predecessor hash recorded"
                     );
                 }
             }
@@ -1160,5 +1177,318 @@ mod tests {
             source.backup_header().unwrap().tables["claim_sources"].count,
             2
         );
+    }
+
+    // Incident2994 controls use disposable real Stores. They classify existing boundaries;
+    // they neither certify reported history gaps nor implement a live backup operation.
+    mod incident2994 {
+        use super::*;
+
+        fn accept(source: &Store, authenticated_peer: &str, exchange: &ReplicationExchange) {
+            // The in-process fixture supplies the known exporting Store's identity,
+            // just as the transport supplies its authenticated relay; do not infer it
+            // from an untrusted envelope writer or bypass the real peer-label guard.
+            assert_eq!(exchange.peer, authenticated_peer);
+            source.receive_replication_exchange(authenticated_peer, "test-fleet", exchange).unwrap();
+            let admitted = source.validate_replication_backlog().unwrap();
+            assert_eq!(admitted.invalid, 0);
+            assert_eq!(admitted.held, 0);
+            source.project_replication_backlog().unwrap();
+            for envelope in &exchange.envelopes {
+                let payload: smallclaims::claim::ReplicaEnvelopePayload =
+                    ciborium::from_reader(envelope.payload.bytes().unwrap()).unwrap();
+                for claim in &payload.batch.claims {
+                    assert!(source.claim_by_id(&claim.id).unwrap().is_some(),
+                        "the intended canonical claim reached normal admission");
+                }
+            }
+        }
+
+        #[test]
+        fn settled_record_admission_does_not_certify_an_uncovered_writer_predecessor() {
+            let writer = Store::open_memory("alder").unwrap();
+            diagnostic(&writer, "first");
+            diagnostic(&writer, "second");
+            let mut exchange = writer.export_replication_exchange(
+                "test-fleet", &ReplicationInventory::default(),
+            ).unwrap();
+            let first = exchange.envelopes.remove(0);
+            let source = Store::open_memory("birch").unwrap();
+            accept(&source, "alder", &exchange);
+            let unsettled: u64 = source.readers.get().query_row(
+                "SELECT COUNT(*) FROM replica_envelopes WHERE batch_id IS NULL", [],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(unsettled, 0, "settled admission is deliberately not chain completeness");
+            assert!(source.check_backup_chains().unwrap_err().to_string().contains("predecessor"));
+            assert!(source.write_backup(&mut Vec::new()).is_err());
+            exchange.envelopes = vec![first];
+            accept(&source, "alder", &exchange);
+            source.check_backup_chains().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let archive_path = root.path().join("arrived.jsonl");
+            let header = archive(&source, &archive_path);
+            let restored = backup::restore(&archive_path, &root.path().join("restored.db")).unwrap();
+            assert_eq!(restored.log_digest, header.log_digest);
+            assert!(restored.projections_match);
+        }
+
+        // Rebuild every affected hash/ID through the real format. Admission must succeed so
+        // a malformed envelope cannot select the cause of a chain-checker refusal.
+        fn relink(envelope: &mut ReplicaEnvelope, sequence: u64, link: String) {
+            let mut payload: smallclaims::claim::ReplicaEnvelopePayload =
+                ciborium::from_reader(envelope.payload.bytes().unwrap()).unwrap();
+            payload.batch.replica_sequence = sequence;
+            payload.batch.previous_hash = Some(link.clone());
+            payload.batch.hash = smallclaims::hash::batch_header_hash(
+                &payload.batch.origin, sequence, Some(&link), payload.batch.accepted_at_unix_ms,
+            ).unwrap();
+            payload.batch.id = format!("batch/{}/{}/{}",
+                payload.batch.origin, sequence, payload.batch.hash);
+            for claim in &mut payload.batch.claims {
+                claim.batch_id.clone_from(&payload.batch.id);
+                claim.id = smallclaims::hash::claim_hash(
+                    &claim.batch_id, &claim.subject, &claim.kind, &claim.origin,
+                    claim.actor.as_deref(), &claim.body, &claim.predecessors,
+                ).unwrap();
+            }
+            smallclaims::hash::verify_replica_batch_header(&payload.batch).unwrap();
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&payload, &mut bytes).unwrap();
+            envelope.sequence = sequence;
+            envelope.previous_hash = Some(link);
+            envelope.hash = smallclaims::hash::replica_envelope_hash(
+                &envelope.writer, sequence, envelope.previous_hash.as_deref(),
+                envelope.accepted_at_unix_ms, &bytes,
+            );
+            envelope.payload = bytes.into();
+        }
+
+        #[test]
+        fn valid_payloads_with_wrong_predecessor_hash_or_sequence_still_refuse() {
+            for wrong_sequence in [false, true] {
+                let writer = Store::open_memory("alder").unwrap();
+                diagnostic(&writer, "first");
+                diagnostic(&writer, "second");
+                let mut exchange = writer.export_replication_exchange(
+                    "test-fleet", &ReplicationInventory::default(),
+                ).unwrap();
+                let predecessor: smallclaims::claim::ReplicaEnvelopePayload =
+                    ciborium::from_reader(exchange.envelopes[0].payload.bytes().unwrap()).unwrap();
+                let link = if wrong_sequence { predecessor.batch.hash } else { "ab".repeat(32) };
+                relink(&mut exchange.envelopes[1], if wrong_sequence { 3 } else { 2 }, link);
+                let source = Store::open_memory("birch").unwrap();
+                accept(&source, "alder", &exchange);
+                assert_eq!(source.readers.get().query_row(
+                    "SELECT COUNT(*) FROM batches WHERE origin='alder'", [],
+                    |row| row.get::<_, u64>(0),
+                ).unwrap(), 2, "both well-formed canonical batches reached the checker");
+                let error = source.check_backup_chains().unwrap_err().to_string();
+                assert!(error.contains(if wrong_sequence {
+                    "retained predecessor absent"
+                } else {
+                    "retained predecessor wrong hash"
+                }), "{error}");
+                assert!(error.contains("not covered by a checkpoint"), "{error}");
+                assert_eq!(error.contains("predecessor may yet arrive"), wrong_sequence,
+                    "arrival is only a conditional possibility for an absent row, not wrong hash");
+                assert!(source.write_backup(&mut Vec::new()).is_err());
+            }
+        }
+
+        #[test]
+        fn another_writers_matching_batch_hash_is_not_a_predecessor() {
+            let writer = Store::open_memory("alder").unwrap();
+            diagnostic(&writer, "first");
+            diagnostic(&writer, "second");
+            let other = Store::open_memory("cedar").unwrap();
+            diagnostic(&other, "another writer");
+            let mut exchange = writer.export_replication_exchange(
+                "test-fleet", &ReplicationInventory::default(),
+            ).unwrap();
+            let other_exchange = other.export_replication_exchange(
+                "test-fleet", &ReplicationInventory::default(),
+            ).unwrap();
+            let other_payload: smallclaims::claim::ReplicaEnvelopePayload =
+                ciborium::from_reader(other_exchange.envelopes[0].payload.bytes().unwrap()).unwrap();
+            let other_hash = other_payload.batch.hash;
+            relink(&mut exchange.envelopes[1], 2, other_hash.clone());
+            let source = Store::open_memory("birch").unwrap();
+            accept(&source, "cedar", &other_exchange);
+            accept(&source, "alder", &exchange);
+            assert!(source.readers.get().query_row(
+                "SELECT EXISTS(SELECT 1 FROM batches WHERE origin='cedar' AND replica_sequence=1 AND hash=?1)",
+                [&other_hash], |row| row.get::<_, bool>(0),
+            ).unwrap(), "the hash is present, but belongs to another writer");
+            let own_predecessor: String = source.readers.get().query_row(
+                "SELECT hash FROM batches WHERE origin='alder' AND replica_sequence=1", [],
+                |row| row.get(0),
+            ).unwrap();
+            assert_ne!(own_predecessor, other_hash, "both admitted writers retain different real predecessor hashes");
+            let error = source.check_backup_chains().unwrap_err().to_string();
+            assert!(error.contains("predecessor"));
+            for witness in ["writer=\"alder\"", "sequence=2", "predecessor_sequence=1",
+                "retained predecessor wrong hash", "not covered by a checkpoint"] {
+                assert!(error.contains(witness), "missing {witness:?} from {error}");
+            }
+        }
+
+        #[test]
+        fn create_and_restore_report_the_same_exact_missing_predecessor_witness() {
+            let root = tempfile::tempdir().unwrap();
+            let writer = Store::open_memory("alder").unwrap();
+            diagnostic(&writer, "first");
+            diagnostic(&writer, "second");
+            let archive_path = root.path().join("complete.jsonl");
+            archive(&writer, &archive_path);
+            let mut exchange = writer.export_replication_exchange(
+                "test-fleet", &ReplicationInventory::default(),
+            ).unwrap();
+            exchange.envelopes.remove(0);
+            let source = Store::open_memory("birch").unwrap();
+            accept(&source, "alder", &exchange);
+            let create = source.write_backup(&mut Vec::new()).unwrap_err().to_string();
+            rewrite(&archive_path, |records| records.retain(
+                |record| !matches!(record, Record::Envelope(envelope) if envelope.sequence == 1),
+            ));
+            let target = root.path().join("must-not-publish.db");
+            let restore = backup::restore(&archive_path, &target).unwrap_err().to_string();
+            assert_eq!(create, restore);
+            for part in ["writer=\"alder\"", "sequence=2", "predecessor_sequence=1",
+                "expected_hash=", "retained predecessor absent", "not covered by a checkpoint"] {
+                assert!(create.contains(part), "missing {part:?} from {create}");
+            }
+            assert!(!create.contains("retry"), "unknown history is not a catch-up promise");
+            assert!(create.contains("predecessor may yet arrive"));
+            assert!(create.contains("settled replication does not prove a complete chain"));
+            assert!(!target.exists());
+        }
+
+        #[test]
+        fn a_local_writer_floor_alone_is_not_a_backup_retention_certificate() {
+            let source = Store::open_memory("alder").unwrap();
+            source.set_writer_floor(12).unwrap();
+            diagnostic(&source, "after a floor");
+            let (sequence, link): (u64, Option<String>) = source.readers.get().query_row(
+                "SELECT replica_sequence,previous_hash FROM batches WHERE origin='alder'", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(sequence, 13);
+            assert!(link.is_none());
+            assert_eq!(source.readers.get().query_row(
+                "SELECT COUNT(*) FROM checkpoint_envelopes", [], |row| row.get::<_, u64>(0),
+            ).unwrap(), 0);
+            // Deliberately NOT a signed re-admission/complete old-history control. A bare
+            // local floor cannot stand in for either of those proofs or certify the report.
+            assert!(source.check_backup_chains().unwrap_err().to_string().contains("predecessor"));
+        }
+
+        #[test]
+        fn cancellation_after_header_releases_the_actual_snapshot_and_request_loan() {
+            use smallclaims::read_budget::{self, ReadBudget};
+            let source = Store::open_memory("alder").unwrap();
+            diagnostic(&source, "before cancellation");
+            let budget = ReadBudget::new("/v1/backup", std::time::Duration::from_secs(15));
+            struct CancelAfterHeader { bytes: Vec<u8>, budget: ReadBudget }
+            impl Write for CancelAfterHeader {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.bytes.extend_from_slice(bytes);
+                    self.budget.cancel();
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let mut output = CancelAfterHeader { bytes: vec![], budget: budget.clone() };
+            let result = read_budget::with(Some(budget), || {
+                source.readers.request_read(|| source.write_backup(&mut output))
+            }).unwrap();
+            assert!(result.is_err());
+            assert!(!output.bytes.is_empty(), "cancellation follows a real header write");
+            let report = source.readers.live_read_report();
+            assert_eq!(report.snapshot_checkouts, 0);
+            assert_eq!(report.live_checkouts, 0);
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("interrupted.jsonl");
+            fs::write(&path, output.bytes).unwrap();
+            assert!(backup::verify_file(&path).is_err(), "no completed archive after cancellation");
+            // A normal managed writer on THIS thread also detects an escaped pinned scope.
+            diagnostic(&source, "after cancellation");
+            let good = root.path().join("complete.jsonl");
+            archive(&source, &good);
+            backup::verify_file(&good).unwrap();
+        }
+
+        #[test]
+        fn a_broken_output_releases_the_snapshot_without_a_completed_archive() {
+            let source = Store::open_memory("alder").unwrap();
+            diagnostic(&source, "before broken output");
+            struct BrokenOutput;
+            impl Write for BrokenOutput {
+                fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "invented sink closed"))
+                }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let error = source.write_backup(&mut BrokenOutput).unwrap_err();
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::BrokenPipe);
+            let report = source.readers.live_read_report();
+            assert_eq!(report.snapshot_checkouts, 0);
+            assert_eq!(report.live_checkouts, 0);
+            diagnostic(&source, "after broken output");
+            // This synchronous sink analogue is not an HTTP client-disconnect/worker proof.
+        }
+
+        #[test]
+        fn certified_trim_and_ingest_during_export_preserve_the_old_complete_cut() {
+            let root = tempfile::tempdir().unwrap();
+            let source = Arc::new(Store::open(&root.path().join("source.db"), "alder").unwrap());
+            source.bind_fleet("test-fleet").unwrap();
+            for index in 0..12 { diagnostic(&source, &format!("note-{index}")); }
+            let context = CheckpointContext {
+                now_unix_ms: now_ms() + 3 * 86_400_000,
+                configured_peers: vec![], scratch: root.path().join("scratch"),
+                reviewer: "person/operator".into(),
+            };
+            for _ in 0..2 { source.checkpoint_step(&context).unwrap(); }
+            struct TrimDuringBackup {
+                source: Arc<Store>, context: CheckpointContext, bytes: Vec<u8>, ran: bool,
+            }
+            impl Write for TrimDuringBackup {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    if !self.ran {
+                        self.ran = true;
+                        // Preserve the normal same-thread pinned-read assertion: the writer
+                        // commits on another thread while this actual snapshot stays pinned.
+                        std::thread::scope(|scope| {
+                            scope.spawn(|| {
+                                self.source.checkpoint_step(&self.context).unwrap();
+                                assert!(self.source.trimmed_checkpoint().unwrap().is_some());
+                                assert!(self.source.checkpointed_envelopes().unwrap() > 0);
+                                diagnostic(&self.source, "after the retained backup cut");
+                            }).join().unwrap();
+                        });
+                    }
+                    self.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let mut output = TrimDuringBackup { source: source.clone(), context, bytes: vec![], ran: false };
+            let header = source.write_backup(&mut output).unwrap();
+            assert!(output.ran);
+            assert_eq!(source.readers.live_read_report().snapshot_checkouts, 0);
+            let old = root.path().join("old-cut.jsonl");
+            fs::write(&old, output.bytes).unwrap();
+            let report = backup::restore(&old, &root.path().join("old-restored.db")).unwrap();
+            assert_eq!(report.log_digest, header.log_digest);
+            assert!(report.projections_match);
+            let fresh = root.path().join("fresh.jsonl");
+            let fresh_header = archive(&source, &fresh);
+            assert_ne!(fresh_header.log_digest, header.log_digest);
+            let fresh_report = backup::restore(&fresh, &root.path().join("fresh-restored.db")).unwrap();
+            assert_eq!(fresh_report.log_digest, fresh_header.log_digest);
+            assert!(fresh_report.projections_match);
+        }
     }
 }

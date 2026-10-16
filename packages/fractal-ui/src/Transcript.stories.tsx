@@ -25,7 +25,7 @@ function fixture(state: State, prefix: string): TranscriptStoryData {
   const prompt: TextItem & { role: 'user' } = { _tag: 'Text', id: `${prefix}/prompt`, role: 'user', text: 'Keep the row projection readable and verify that selection survives the change.', attachments: [], streaming: false, at, sender: { kind: 'human', label: 'Operator' }, sendState: state === 'pending-send' ? { _tag: 'Pending' } : state === 'failed-send' ? { _tag: 'Failed', reason: { _tag: 'Failed' }, detail: 'The connection dropped while sending. Your draft is still saved; try again in a moment.' } : state === 'unconfirmed-send' ? { _tag: 'Unconfirmed', detail: 'st may have taken this message and has not confirmed it yet. Sending it again is safe.' } : undefined }
   const calls: ConversationItem[] = [
     { _tag: 'ToolCall', id: `${prefix}/read`, callId: `${prefix}/read`, name: 'read', input: { path: 'src/rows.ts' }, status: 'success', result: { content: source, mediaType: 'text/plain', isError: false, at: '2026-01-15T12:00:03Z' }, callSeen: true, at: '2026-01-15T12:00:01Z' },
-    { _tag: 'ToolCall', id: `${prefix}/run`, callId: `${prefix}/run`, name: 'run', input: { command: 'pnpm test rows' }, status: failed ? 'error' : interrupted ? 'interrupted' : running ? 'running' : 'success', result: running ? undefined : { content: failed ? 'The row assertion did not match the observed selection.' : interrupted ? 'Stopped before the checks completed.' : '✓ selection retained\n✓ visible count matches\n✓ empty rows handled', mediaType: 'text/x-shellscript', isError: failed, at: '2026-01-15T12:00:18Z' }, callSeen: true, at: '2026-01-15T12:00:05Z' },
+    { _tag: 'ToolCall', id: `${prefix}/run`, callId: `${prefix}/run`, name: 'run', input: { command: 'pnpm test rows' }, status: failed ? 'error' : interrupted ? 'interrupted' : running ? 'running' : 'success', result: running ? undefined : { content: failed ? 'The row assertion did not match the observed selection.' : interrupted ? 'Stopped before the checks completed.' : 'Passed: selection retained\nPassed: visible count matches\nPassed: empty rows handled', mediaType: 'text/x-shellscript', isError: failed, at: '2026-01-15T12:00:18Z' }, callSeen: true, at: '2026-01-15T12:00:05Z' },
     { _tag: 'ToolCall', id: `${prefix}/empty`, callId: `${prefix}/empty`, name: 'read', input: { path: 'src/empty.ts' }, status: 'success', result: { content: '', isError: false, at: '2026-01-15T12:00:19Z' }, callSeen: true, at: '2026-01-15T12:00:19Z' },
   ]
   const reasoning: ConversationItem = { _tag: 'Reasoning', id: `${prefix}/thinking`, text: 'Compare the **observed selection** with the projected rows before changing the result.', streaming: running, at }
@@ -62,7 +62,7 @@ export const Settled: Story = { play: async ({ canvasElement }) => {
   const fold = await canvas.findByRole('button', { name: /Worked for 24s/ })
   await expect(fold).toHaveAttribute('aria-expanded', 'false')
   await expect(canvasElement.querySelector('[data-testid="tool-detail-preview"]')).toBeNull()
-  await expect(canvasElement.querySelector('[data-testid="answer-meta"]')).not.toBeNull()
+  await expect(canvasElement.querySelector('[data-testid="message-header"] time')).not.toBeNull()
   await expect(canvasElement.querySelector('[data-testid="live-work"]')).toBeNull()
 } }
 export const SettledLight: Story = { ...Settled, args: { scheme: 'light' } }
@@ -80,10 +80,12 @@ export const Expanded: Story = { args: { state: 'expanded' }, play: async ({ can
   await waitFor(() => expect(previews[0]!.querySelector('[data-syntax-token~="keyword"]')).not.toBeNull())
   await expect(previews[0]).toHaveTextContent('export const visibleRows')
   await expect(previews[1]).toHaveTextContent('selection retained')
-  await expect(canvas.getByTestId('work-log-divider')).toBeInTheDocument()
+  await expect(canvasElement.querySelector('[data-testid="work-log"] hr')).toBeNull()
+  await expect(canvas.getByTestId('work-log-children')).toContainElement(canvas.getByTestId('thinking-entry'))
   await expect(canvas.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
   // A silent success with input stays collapsed: no preview, but it can still be expanded for its raw input.
-  const empty = canvasElement.querySelector('[data-tool-status="success"]:last-child')!
+  // E18/C3: Thinking shares the fold scroller, so the final tool row is no longer its last child.
+  const empty = Array.from(canvasElement.querySelectorAll('[data-tool-status="success"]')).at(-1)!
   await expect(empty.querySelector('button')).toHaveAttribute('aria-expanded', 'false')
   await expect(empty.querySelector('[data-testid="tool-detail-preview"]')).toBeNull()
   await expectNoOutputWithControl(empty as HTMLElement)
@@ -282,7 +284,7 @@ export const Streaming: Story = { args: { state: 'streaming' }, play: async ({ c
   await expect(canvas.getByRole('status', { name: 'Response in progress' })).toBeInTheDocument()
   await expect(canvas.getByRole('progressbar', { name: 'Run in progress' })).toHaveAttribute('aria-valuetext', 'Running')
   await expect(canvasElement.querySelectorAll('[data-streaming-tail="true"]')).toHaveLength(1)
-  await expect(canvasElement.querySelector('[data-testid="answer-meta"]')).toBeNull()
+  await expect(canvasElement.querySelector('[aria-label="Copy answer"]')).toBeNull()
   await expect(canvas.getByRole('button', { name: /Working/ })).toBeDisabled()
 } }
 export const StreamingLight: Story = { ...Streaming, args: { state: 'streaming', scheme: 'light' } }
@@ -312,7 +314,7 @@ export const CatchingUp: Story = { args: { state: 'catching-up' }, play: async (
   await canvas.findByTestId('transcript-turn')
   await expect(canvas.getByRole('progressbar', { name: 'Thread synchronization' })).toHaveAttribute('aria-valuenow', '32')
   await expect(canvas.getByRole('progressbar', { name: 'Thread synchronization' })).toHaveAttribute('aria-valuemax', '64')
-  await expect(canvas.getByTestId('answer-meta')).toBeInTheDocument()
+  await expect(canvas.getAllByTestId('message-header').length).toBeGreaterThan(0)
 } }
 export const CatchingUpLight: Story = { ...CatchingUp, args: { state: 'catching-up', scheme: 'light' } }
 export const Reconnecting: Story = { args: { state: 'reconnecting' } }
@@ -345,11 +347,16 @@ export const SettledAnswerMeta: Story = { render: args => <AnswerMetadataStory s
   await expect(answers).toHaveLength(3)
   await expect(answers[0]!.querySelector('time')?.getAttribute('datetime')).toBe('2026-01-15T12:00:24.000Z')
   await expect(answers[1]!.querySelector('time')).toBeNull()
-  await expect(answers[2]!.querySelector('[data-testid="answer-meta"]')).toBeNull()
-  const footer = answers[0]!.querySelector('[data-testid="answer-meta"]')!
+  await expect(answers[2]!.querySelector('[aria-label="Copy answer"]')).toBeNull()
+  const header = within(answers[0]!).getByTestId('message-header')
+  const copy = within(answers[0]!).getByRole('button', { name: 'Copy answer' })
   const prose = answers[0]!.querySelector('[data-testid="markdown"]')!
-  await expect(footer.getBoundingClientRect().top).toBeGreaterThanOrEqual(prose.getBoundingClientRect().bottom)
-  await expect(getComputedStyle(footer).opacity).toBe('1')
+  await expect(header.getBoundingClientRect().bottom).toBeLessThanOrEqual(prose.getBoundingClientRect().top)
+  await expect(header.getBoundingClientRect().height).toBe(16)
+  await expect(header).toContainElement(answers[0]!.querySelector('time'))
+  await expect(getComputedStyle(copy).opacity).toBe('0')
+  await userEvent.hover(answers[0]!)
+  await waitFor(() => expect(getComputedStyle(copy).opacity).toBe('1'))
   const clipboard = navigator.clipboard
   const original = Object.getOwnPropertyDescriptor(clipboard, 'writeText')
   let copied = ''
@@ -629,9 +636,9 @@ function FailedRetryStory({ scheme = 'dark' }: { scheme?: Scheme }) {
   const [state, setState] = React.useState<State>('failed-send')
   const data = React.useMemo(() => fixture(state, 'retry'), [state])
   const retry = (itemId: string) => { retrySend(itemId); setState('pending-send') }
-  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><h2>Failed → Retry</h2><button type="button" onClick={() => setState('settled')}>Deliver echo</button><div {...stylex.props(styles.frame)}><RuntimeTranscript data={data} onOpenTool={() => {}} onRetry={() => {}} onRetrySend={retry} /></div></main>
+  return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><h2>Failed retry</h2><button type="button" onClick={() => setState('settled')}>Deliver echo</button><div {...stylex.props(styles.frame)}><RuntimeTranscript data={data} onOpenTool={() => {}} onRetry={() => {}} onRetrySend={retry} /></div></main>
 }
-export const FailedRetry: Story = { name: 'Failed → Retry', render: args => <FailedRetryStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+export const FailedRetry: Story = { name: 'Failed Retry', render: args => <FailedRetryStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
   retrySend.mockClear()
   const canvas = within(canvasElement)
   const selector = '[data-testid="user-message"][data-item-id="retry/prompt"]'

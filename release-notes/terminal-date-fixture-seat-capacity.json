@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Use independent fixture seats and sequential child admission under default mission capacity.",
+  "schema": {
+    "status": "none",
+    "detail": "Fixture declarations and setup only: a distinct parent seat preserves child queue order, while separate root/child missions admit and complete children sequentially under unchanged default one-active-run capacity. Production predicates and all input, status, date, lease and digest assertions remain."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Fixture declarations and setup only: a distinct parent seat preserves child queue order, while separate root/child missions admit and complete children sequentially under unchanged default one-active-run capacity. Production predicates and all input, status, date, lease and digest assertions remain."
+  },
+  "replay": {
+    "status": "none",
+    "detail": "Fixture declarations and setup only: a distinct parent seat preserves child queue order, while separate root/child missions admit and complete children sequentially under unchanged default one-active-run capacity. Production predicates and all input, status, date, lease and digest assertions remain."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Fixture declarations and setup only: a distinct parent seat preserves child queue order, while separate root/child missions admit and complete children sequentially under unchanged default one-active-run capacity. Production predicates and all input, status, date, lease and digest assertions remain."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Fixture declarations and setup only: a distinct parent seat preserves child queue order, while separate root/child missions admit and complete children sequentially under unchanged default one-active-run capacity. Production predicates and all input, status, date, lease and digest assertions remain."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Fixture declarations and setup only: a distinct parent seat preserves child queue order, while separate root/child missions admit and complete children sequentially under unchanged default one-active-run capacity. Production predicates and all input, status, date, lease and digest assertions remain."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Fixture declarations and setup only: a distinct parent seat preserves child queue order, while separate root/child missions admit and complete children sequentially under unchanged default one-active-run capacity. Production predicates and all input, status, date, lease and digest assertions remain."
+  }
+}

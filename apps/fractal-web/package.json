@@ -5,7 +5,9 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "dev": "vite --config vite.config.ts --configLoader runner"
+    "dev": "vite --config vite.config.ts --configLoader runner",
+    "build": "vite build --config vite.config.ts --configLoader runner",
+    "start": "node server/main.mts"
   },
   "dependencies": {
     "@smalltalk/st3-client": "file:../../clients/typescript/st3-client",

@@ -92,6 +92,9 @@ pub(crate) struct Sidebar {
     pub writable: bool,
     pub writing: bool,
     draft: Option<(String, bool)>,
+    /// st refused to create the reserved Sidebar because the person retired it. Retired
+    /// arrangements leave the window, so that refusal is how a client learns it.
+    pub reserved_retired: bool,
     seen: BTreeMap<String, ResourceRow>,
     choices: Choices,
     path: Option<PathBuf>,
@@ -100,6 +103,10 @@ pub(crate) struct Sidebar {
     pub filtering: bool,
     pub focused: bool,
 }
+/// What a person reads when their Sidebar was removed and no older one exists to edit.
+pub(super) const SIDEBAR_RETIRED: &str =
+    "This Sidebar was removed; restoring a removed Sidebar is not available yet.";
+
 impl Sidebar {
     /// The person's one Sidebar: the reserved subject whatever its name (#2043), else the oldest
     /// live arrangement named "Sidebar", which clients created before the reserved id. Every
@@ -579,6 +586,10 @@ impl Ui {
             .resource_sidebar
             .arrangement()
             .map(|a| a.header.id.clone());
+        if existing.is_none() && self.resource_sidebar.reserved_retired {
+            self.flash(SIDEBAR_RETIRED);
+            return;
+        }
         let mut operations = operations;
         let (subject, creating) = match existing {
             Some(id) => (id, false),

@@ -51,7 +51,7 @@ pub const COUNTERS: [&str; 18] = [
     "dead_terminal_tabs",
     "measurement_overflow",
 ];
-pub const HISTOGRAMS: [&str; 8] = [
+pub const HISTOGRAMS: [&str; 11] = [
     "first_frame_ms",
     "first_real_state_ms",
     "conversation_open_ms",
@@ -60,9 +60,12 @@ pub const HISTOGRAMS: [&str; 8] = [
     "reconnect_ms",
     "terminal_open_ms",
     "alert_landed_ms",
+    "send_echo_ms",
+    "send_ack_ms",
+    "send_visible_ms",
 ];
 /// Starting guesses, to revisit after one week. Shared with st3-views/slo.ts.
-pub const TARGETS: [(&str, f64); 12] = [
+pub const TARGETS: [(&str, f64); 14] = [
     ("panics_max", 0.0),
     ("silent_exits_per_100_active_hours_lt", 1.0),
     ("first_frame_p95_ms_lt", 300.0),
@@ -75,6 +78,10 @@ pub const TARGETS: [(&str, f64); 12] = [
     ("direct_attach_success_percent_gte", 99.0),
     ("terminal_open_p95_ms_lt", 1000.0),
     ("alert_landed_p95_ms_lt", 2000.0),
+    // A message sent from here: pressing send to the box showing it, to st accepting it, to the
+    // conversation holding it as sent (Nathan, 2026-10-13: sending still feels a little slow).
+    ("send_echo_p99_ms_lt", 100.0),
+    ("send_visible_p99_ms_lt", 200.0),
 ];
 
 pub struct Counters {
@@ -165,7 +172,7 @@ pub fn directory() -> Option<PathBuf> {
     super::drafts_store::path()?.parent().map(|p| p.join("slo"))
 }
 const HOURS: i64 = 14 * 24;
-const MAX_FILE_BYTES: u64 = 128 * 1024;
+const MAX_FILE_BYTES: u64 = 256 * 1024;
 fn read_lines(file: &Path) -> Vec<Line> {
     if !std::fs::metadata(file).is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
         return Vec::new();

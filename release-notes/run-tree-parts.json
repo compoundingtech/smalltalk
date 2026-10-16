@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A claim that reaches a standing mission run tree out of order rebuilds only its own part of the tree, the child run it is about with the runs below it, instead of every run under the root: one late claim about an intake request rebuilt 2,085 runs in a 10.5 s writer hold",
+  "replay": {"status": "changed", "detail": "Incremental projection rebuilds a smaller set of runs. While a tree's root has never ended, each part gives the rows a replay of the whole tree gives; a tree whose root has ended still rebuilds whole. Graph digests are unchanged."},
+  "schema": {"status": "none", "detail": "No database changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; members may upgrade in any order."},
+  "compatibility": {"status": "none", "detail": "No API or wire changes."},
+  "downtime": {"status": "none", "detail": "A daemon restart to install the build; no extra interruption."},
+  "manual": {"status": "none", "detail": "Nothing to configure."},
+  "recovery": {"status": "none", "detail": "Swap back to the previous binary freely; nothing is persisted."}
+}

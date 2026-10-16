@@ -34,7 +34,9 @@ pub(crate) use staged::plan_staged;
 /// than an hour older than their account group's newest, other than each seat's newest. The
 /// proof compares the account fold across every seat. It also keeps only the newest
 /// `runtime.reconcile-decision` of each decision key.
-pub const RULES_VERSION: u32 = 15;
+/// Version 16 preserves exact review binding, withdrawal and author-attempt references.
+/// It ships in the reader release before review-at-head activation.
+pub const RULES_VERSION: u32 = 16;
 
 /// Usage rollups keep their hourly history for this long before the cut, so a usage period that
 /// ends within it is exact to the hour. Before it, each rollup series keeps only its newest
@@ -73,7 +75,8 @@ graph=shared-projection-tables-including-arrangements-and-arrangement_registers-
 replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
-carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
+carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field
+review=retain-binding,withdrawal,verdict,actor-evidence,attempt-relation-references";
 
 /// A canonical description of every rule: one line per rule of the retention policy
 /// (`crates/st3-schema/retention.toml`), then the engine's terms. The rules digest hashes it with
@@ -600,7 +603,8 @@ pub(crate) fn status_source(claim: &ClaimRecord) -> bool {
         && seat_status::history_source(claim)
 }
 
-/// The claim IDs a claim cites as evidence, or pins as a mission run's input. Those claims are
+/// The claim IDs a claim cites as evidence, pins as a mission run's input, or references as a
+/// review record (binding, withdrawal, verdict, attempt relation, predecessors). Those claims are
 /// read by their IDs, so they stay.
 pub(crate) fn cited_by(claim: &ClaimRecord) -> impl Iterator<Item = &str> {
     let body = &claim.body;
@@ -616,7 +620,13 @@ pub(crate) fn cited_by(claim: &ClaimRecord) -> impl Iterator<Item = &str> {
         .into_iter()
         .flat_map(|inputs| inputs.values())
         .filter_map(|input| input.get("claim_id").and_then(Value::as_str));
-    evidence.chain(inputs)
+    let review = st3_schema::review::claim_references(&claim.kind, body);
+    let predecessors = st3_schema::review::KINDS
+        .contains(&claim.kind.as_str())
+        .then_some(claim.predecessors.iter().map(String::as_str))
+        .into_iter()
+        .flatten();
+    evidence.chain(inputs).chain(review).chain(predecessors)
 }
 
 /// Whether claims of `kind` are never dropped, because their validation reads them: a kind that
@@ -1238,7 +1248,7 @@ impl Store {
         Ok(vec![AttentionItemView {
             episode: format!("{}:{writer}", checkpoint_name(first_waiting)), priority: "normal".into(), kind: "fault".into(),
             review_mode: None, subject: checkpoint.clone(), person: "person/operator".into(), requester_id: None,
-            launch_id: None, variant_id: None, message_id: None, answers: Vec::new(), conversation: None, title: format!("Checkpoints are waiting for {}", waiting.join(", ")),
+            launch_id: None, variant_id: None, message_id: None, prompt_call: None, answers: Vec::new(), conversation: None, title: format!("Checkpoints are waiting for {}", waiting.join(", ")),
             detail: "Bring the waiting machines back, upgrade them, or excuse a machine that stays away.".into(),
             mission: None, mission_run: None, step: None, targets: vec![checkpoint.clone()], requested_at_unix_ms: since,
             actions: vec![attention_action("inspect checkpoint", &["st", "replication", "checkpoint", "status"])],

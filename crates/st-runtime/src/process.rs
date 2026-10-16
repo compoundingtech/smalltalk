@@ -176,11 +176,10 @@ impl ExecRuntime {
             .iter()
             .map(OsString::as_os_str)
             .collect::<Vec<_>>();
-        let mut command = crate::wrap_isolated(&unit, program.as_os_str(), &argument_refs);
+        let mut command =
+            crate::isolate::wrap_in(&unit, program.as_os_str(), &argument_refs, Some(env));
         command
             .current_dir(cwd)
-            .env_clear()
-            .envs(env)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);

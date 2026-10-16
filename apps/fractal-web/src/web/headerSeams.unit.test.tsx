@@ -8,13 +8,7 @@ import type { Agent } from '../data/source.ts'
 import { sidebarRow } from './sidebarRow.ts'
 
 // Match the app's node-rendering lane: exercise semantic DOM without the CSS compiler.
-vi.mock('@stylexjs/stylex', () => ({
-  create: (styles: unknown) => styles,
-  defineVars: (variables: unknown) => variables,
-  createTheme: () => ({}),
-  keyframes: () => 'test-animation',
-  props: () => ({}),
-}))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 const unknown = { _tag: 'Unknown' } as const
 const file: ResourceFile = { path: 'captured/file.ts', added: unknown, removed: unknown, lines: unknown }

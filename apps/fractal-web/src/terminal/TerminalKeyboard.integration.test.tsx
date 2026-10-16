@@ -13,7 +13,7 @@ import { keyboardTestModes, makeTerminalInputFixture } from './terminalInputFixt
 import { TerminalKeyboard } from './TerminalKeyboard.tsx'
 import { TerminalKeyboardBinding } from './TerminalKeyboardBinding.tsx'
 
-vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 let registry: AtomRegistry.AtomRegistry
 let host: HTMLDivElement

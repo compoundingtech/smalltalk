@@ -1,7 +1,7 @@
 //! st's Claude channel: daemon push input, native transcript receipts, and no file mailbox.
 use crate::client::Client;
 use crate::mailbox::{Fence, Frame, Receipt, Subscription};
-use crate::model::{ClaimInput, ClaimRecord, MessageView};
+use crate::model::{ClaimInput, ClaimRecord, ClaimsPage, MessageView};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -131,6 +131,9 @@ pub async fn run(
     let mut retries = BTreeMap::<String, Retry>::new();
     let mut unconfirmed_since = BTreeMap::<String, Instant>::new();
     let mut diagnostics = BTreeMap::<String, DiagnosticReport>::new();
+    let mut preparation_errors = BTreeMap::<String, String>::new();
+    let mut preparation_reports = BTreeMap::<String, PreparationReport>::new();
+    let mut preparation_recovery_pending = None::<BTreeSet<String>>;
     loop {
         tokio::select! {
             result = &mut initialization, if state.initialized && initialization_pending => {
@@ -176,7 +179,8 @@ pub async fn run(
                 if state.initialized && replayed {
                     // The stream grants eligibility only to live mail. Retained handoffs can
                     // still acquire missing receipts from native proof, without another offer.
-                    let live: BTreeSet<_> = messages.iter().map(|message| message.subject.clone()).collect();
+                    let live: BTreeSet<_> = messages.iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered"))
+                        .map(|message| message.subject.clone()).collect();
                     let mut tracked = messages.clone();
                     let mut dirty = false;
                     let pending: BTreeSet<_> = state.attempted.iter().chain(&state.accepted).chain(&state.confirmed).cloned().collect();
@@ -226,14 +230,38 @@ pub async fn run(
                                 transcript.body_available(state.attempted.contains(&message.subject) || message.status != "sent");
                                 content.insert(message.subject.clone(), envelope);
                                 retries.remove(&message.subject);
+                                preparation_errors.remove(&message.subject);
                             },
                             Ok(None) => {},
                             Err(error) => {
                                 retry_failed(&mut retries, &message.subject);
-                                diagnostic(client, &state.fence, &message.subject, "claude-message-unforwarded",
-                                    &format!("{message}: preparation failed; retrying with backoff up to 30s: {error:#}", message=message.subject),
-                                    &mut diagnostics).await;
+                                preparation_errors.insert(message.subject.clone(),
+                                    format!("{}: preparation failed; retrying with backoff up to 30s: {error:#}", message.subject));
                             },
+                        }
+                    }
+                    let head = unprepared_fifo_head(&messages, &content, &state.attempted);
+                    // Query durable waiting reports only for the initial mail snapshot:
+                    // reconnects must clear old failures without reporting every healthy arrival.
+                    let recovery_pending = preparation_recovery_pending.get_or_insert_with(|| {
+                        messages.iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")
+                            && !state.attempted.contains(&message.subject))
+                            .map(|message| message.subject.clone()).collect()
+                    });
+                    recovery_pending.retain(|message| live.contains(message));
+                    preparation_errors.retain(|message, _| live.contains(message));
+                    preparation_reports.retain(|message, _| live.contains(message));
+                    for (index, message) in messages.iter().enumerate() {
+                        if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") { continue; }
+                        let reason = head.filter(|head| index >= *head).map(|head| {
+                                format!("{} is queued behind FIFO head {}; {}; later mail cannot overtake it",
+                                    message.subject, messages[head].subject,
+                                    preparation_errors.get(&messages[head].subject)
+                                        .map_or("waiting for preparation", String::as_str))
+                        }).or_else(|| preparation_errors.get(&message.subject).cloned());
+                        if preparation_diagnostic(client, &state.fence, message, reason.as_deref(),
+                            recovery_pending.contains(&message.subject), &mut preparation_reports).await {
+                            recovery_pending.remove(&message.subject);
                         }
                     }
                     // User meta records and explicit mid-turn absorption are native
@@ -268,8 +296,12 @@ pub async fn run(
                             },
                         }
                     }
-                    for message in &tracked {
-                        let Some(envelope) = content.get(&message.subject) else { continue; };
+                    for (index, message) in tracked.iter().enumerate() {
+                        // An unprepared live FIFO head must not be overtaken.
+                        if head == Some(index) { break; }
+                        let Some(envelope) = content.get(&message.subject) else {
+                            continue;
+                        };
                         if state.attempted.contains(&message.subject) {
                             let since = unconfirmed_since.entry(message.subject.clone()).or_insert_with(Instant::now);
                             if !state.confirmed.contains(&message.subject) && message.status != "delivered" && since.elapsed() >= Duration::from_secs(30) {
@@ -280,6 +312,9 @@ pub async fn run(
                             continue;
                         }
                         if !live.contains(&message.subject) { continue; }
+                        // Hold only new offers: proof lookup and receipt publication
+                        // must keep running while Claude waits on a person.
+                        if notifications_held(client, subject, agent_dir, &wrapper).await { break; }
                         // Persist the handoff before stdout. A broken pipe cannot authorize
                         // repeating an uncertain notification. Restart first checks native proof.
                         state.attempted.insert(message.subject.clone());
@@ -345,6 +380,66 @@ pub async fn run(
     }
 }
 
+async fn notifications_held(client: &Client, subject: &str, agent_dir: &Path, wrapper: &str) -> bool {
+    let observed = st_drivers::harness_state::read(
+        &st_drivers::harness_state::harness_state_path(agent_dir),
+        None,
+    );
+    let Some(observed) = observed.as_ref() else { return true; };
+    if !current_notification_observation(observed, wrapper) { return true; }
+    if observed.blocked_on != st_drivers::harness_state::BlockedOn::Human {
+        return observed.blocked_on != st_drivers::harness_state::BlockedOn::None;
+    }
+    if !matches!(observed.ask,
+        st_drivers::harness_state::Ask::Permission
+            | st_drivers::harness_state::Ask::Question
+            | st_drivers::harness_state::Ask::Review)
+    {
+        return true;
+    }
+    let Some((ownership, transition)) = observed.ownership_sequence.zip(observed.transition_sequence) else {
+        return true;
+    };
+    // Esc/No can end a prompt without a hook event. Its episode-specific
+    // daemon release, not the still-blocked driver file, is authoritative.
+    // Lookup failure holds only new mail, never durable receipt recovery.
+    let path = format!(
+        "/v1/harness-prompts/state?agent={}&ownership={ownership}&transition={transition}",
+        urlencoding::encode(subject)
+    );
+    let prompt = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get::<crate::store::NativePromptState>(&path),
+    ).await;
+    // An answer recorded after the permission hook's polling deadline cannot
+    // reach Claude. Only native closure, not an answer request, releases mail.
+    if !matches!(prompt, Ok(Ok(crate::store::NativePromptState::Gone))) {
+        return true;
+    }
+    // An answer to the previous prompt cannot release a new prompt that opened
+    // while the daemon lookup was in flight.
+    let latest = st_drivers::harness_state::read(
+        &st_drivers::harness_state::harness_state_path(agent_dir),
+        None,
+    );
+    !latest.as_ref().is_some_and(|latest| {
+        current_notification_observation(latest, wrapper)
+            && latest.ownership_sequence == observed.ownership_sequence
+            && latest.transition_sequence == observed.transition_sequence
+    })
+}
+
+fn current_notification_observation(observed: &st_drivers::harness_state::Observed, wrapper: &str) -> bool {
+    !wrapper.is_empty()
+        && observed.evidence_incarnation.as_deref() == Some(wrapper)
+        && observed.harness.as_deref() == Some("claude")
+        && matches!(observed.state,
+            st_drivers::harness_state::Activity::Ready
+                | st_drivers::harness_state::Activity::Idle
+                | st_drivers::harness_state::Activity::Active
+                | st_drivers::harness_state::Activity::Child)
+}
+
 async fn announce_initialization(client: &Client, input: &ClaimInput) -> Result<ClaimRecord> {
     client.post("/v1/claims", input).await
 }
@@ -370,6 +465,92 @@ fn retry_delay(failures: u32) -> Duration {
 struct DiagnosticReport {
     reason: String,
     recorded: bool,
+}
+
+struct PreparationReport {
+    input: ClaimInput,
+    recorded: bool,
+}
+
+fn unprepared_fifo_head(
+    messages: &[MessageView],
+    content: &BTreeMap<String, String>,
+    attempted: &BTreeSet<String>,
+) -> Option<usize> {
+    messages.iter().position(|message| {
+        matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+            && !attempted.contains(&message.subject) && !content.contains_key(&message.subject)
+    })
+}
+
+
+pub(crate) const PREPARATION_WAIT_REASON: &str =
+    "waiting for Claude to prepare this message or an earlier FIFO head; body or attachment preparation is unavailable, and durable mail is retained and retried in arrival order";
+async fn preparation_diagnostic(
+    client: &Client,
+    fence: &Fence,
+    mail: &MessageView,
+    reason: Option<&str>,
+    recover_waiting: bool,
+    reports: &mut BTreeMap<String, PreparationReport>,
+) -> bool {
+    let message = mail.subject.as_str();
+    // Finish a lost acknowledgement before changing the diagnostic, so a late
+    // retry cannot reinstate an old blocker after the successful preparation.
+    if let Some(report) = reports.get_mut(message) {
+        if !report.recorded {
+            if client.post::<_, ClaimRecord>("/v1/claims", &report.input).await.is_err() { return true; }
+            report.recorded = true;
+        }
+        if reason.is_none() && report.input.fields.get("status").and_then(Value::as_str) == Some("ready") {
+            reports.remove(message);
+            return true;
+        }
+        if report.input.fields.get("reason").and_then(Value::as_str) == reason {
+            return true;
+        }
+    } else if reason.is_none() {
+        if !recover_waiting { return true; }
+        let Ok(delivery) = client.get::<Value>(&format!("/v1/messages/delivery/{message}")).await else {
+            return false;
+        };
+        if delivery["delivery"]["reason"].as_str() != Some(PREPARATION_WAIT_REASON) {
+            return true;
+        }
+    }
+    // Evidence is a stored claim ID, not the message subject. Fetch exactly the
+    // creation index already carried by the mailbox snapshot, without a scan.
+    let Ok(page) = client.get::<ClaimsPage>(&format!(
+        "/v1/claims?subject={}&after_index={}&before_index={}&limit=1",
+        urlencoding::encode(message),
+        mail.created_index.saturating_sub(1),
+        mail.created_index.saturating_add(1),
+    )).await else { return false; };
+    let Some(creation) = page.claims.into_iter().find(|claim|
+        claim.store_index == mail.created_index && claim.subject == message
+    ) else { return false; };
+    let input = ClaimInput {
+        subject: fence.subject.clone(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(fence.subject.clone()),
+        fields: BTreeMap::from([
+            ("code".into(), json!("claude-message-unforwarded")),
+            ("severity".into(), json!("warning")),
+            ("status".into(), json!(if reason.is_some() { "waiting" } else { "ready" })),
+            ("reason".into(), json!(reason.unwrap_or("preparation succeeded; FIFO blocker cleared"))),
+            ("incarnation_id".into(), json!(fence.incarnation)),
+        ]),
+        evidence: vec![creation.id],
+        expected_subject: None,
+        idempotency_key: Some(format!("claude-preparation:{}", uuid::Uuid::now_v7())),
+    };
+    let recorded = client.post::<_, ClaimRecord>("/v1/claims", &input).await.is_ok();
+    if reason.is_none() && recorded {
+        reports.remove(message);
+    } else {
+        reports.insert(message.into(), PreparationReport { input, recorded });
+    }
+    true
 }
 async fn diagnostic(
     client: &Client,
@@ -687,6 +868,233 @@ fn request(line: &str, initialized: &mut bool) -> Result<Option<Value>> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[tokio::test]
+    async fn claude_preparation_diagnostic_retries_lost_ack_before_clearing_recovered_body() {
+        use axum::{Json, Router, http::StatusCode, routing::get};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+        let store = Arc::new(crate::store::Store::open_memory("claude-preparation-ack").unwrap());
+        let sent = store.append_client_claim(&ClaimInput {
+            subject: "message/head".into(), kind: "message.sent".into(),
+            actor: Some("person/sender".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/sender")),
+                ("to".into(), json!("agent/worker")),
+                ("content".into(), json!("doc/missing")),
+                ("status".into(), json!("sent")),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let fail_ack = Arc::new(AtomicBool::new(true));
+        let fail_clear_ack = Arc::new(AtomicBool::new(true));
+        let app = Router::new().route("/v1/claims", get({
+            let store = Arc::clone(&store);
+            move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
+                let store = Arc::clone(&store);
+                async move {
+                    let page = store.claims_page(
+                        query.get("subject").map(String::as_str), None,
+                        query["after_index"].parse().unwrap(),
+                        Some(query["before_index"].parse().unwrap()), false, 1,
+                    ).unwrap();
+                    Json(json!({"api_version":"st3.v1", "value":page}))
+                }
+            }
+        }).post({
+            let store = Arc::clone(&store);
+            let fail_clear_ack = Arc::clone(&fail_clear_ack);
+            move |Json(input): Json<ClaimInput>| {
+                let store = Arc::clone(&store);
+                let fail_ack = Arc::clone(&fail_ack);
+                let fail_clear_ack = Arc::clone(&fail_clear_ack);
+                async move {
+                    let claim = store.append_client_claim(&input).unwrap();
+                    let clear = input.fields["status"] == "ready";
+                    if fail_ack.swap(false, Ordering::SeqCst)
+                        || clear && fail_clear_ack.swap(false, Ordering::SeqCst) {
+                        Err(StatusCode::INTERNAL_SERVER_ERROR)
+                    } else {
+                        Ok(Json(json!({"api_version":"st3.v1", "value":claim})))
+                    }
+                }
+            }
+        })).route("/v1/messages/delivery/{*subject}", get({
+            let store = Arc::clone(&store);
+            move |axum::extract::Path(subject): axum::extract::Path<String>| {
+                let store = Arc::clone(&store);
+                async move {
+                    let waiting = store.claude_preparation_diagnostic("agent/worker", &subject, "current")
+                        .unwrap().is_some_and(|(body, _)| body["fields"]["status"] == "waiting");
+                    Json(json!({"api_version":"st3.v1", "value":{
+                        "id":subject, "from":"person/sender", "to":"agent/worker",
+                        "delivery":{"reason": if waiting { PREPARATION_WAIT_REASON } else { "waiting for native handoff" }}
+                    }}))
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(crate::client::Endpoint::Http(format!("http://{}", listener.local_addr().unwrap())));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let fence = Fence::new("agent/worker", "current", "delivery");
+        let mut message = MessageView {
+            subject: "message/head".into(), from: "person/sender".into(), to: fence.subject.clone(),
+            content: "doc/missing".into(), status: "staged".into(), title: None, in_reply_to: None,
+            tags: Vec::new(), body_ref: None, body_bytes: None, body_origin: None,
+            created_index: sent.store_index, attachments: Vec::new(),
+        };
+        let error = body(&client, &message).await.unwrap_err();
+        let reason = format!("FIFO head preparation failed; retrying: {error:#}");
+        let mut reports = BTreeMap::new();
+        preparation_diagnostic(&client, &fence, &message, None, true, &mut reports).await;
+        assert!(reports.is_empty());
+        assert!(store.claims_for(&fence.subject, Some("harness.diagnostic")).unwrap().is_empty(),
+            "healthy initial mail must not append a ready claim");
+        preparation_diagnostic(&client, &fence, &message, Some(&reason), false, &mut reports).await;
+        assert!(!reports[&message.subject].recorded);
+        let failure_key = reports[&message.subject].input.idempotency_key.clone();
+        message.content = "recovered body".into();
+        assert_eq!(body(&client, &message).await.unwrap(), "recovered body");
+        preparation_diagnostic(&client, &fence, &message, None, false, &mut reports).await;
+        assert!(!reports[&message.subject].recorded, "the clear acknowledgement was lost");
+        assert_ne!(reports[&message.subject].input.idempotency_key, failure_key);
+        let claims = store.claims_for(&fence.subject, Some("harness.diagnostic")).unwrap();
+        assert_eq!(claims.len(), 2, "lost acknowledgement retries the identical failure claim");
+        assert_eq!(claims[0].body["fields"]["status"], "waiting");
+        assert_eq!(claims[1].body["fields"]["status"], "ready");
+        assert!(claims.iter().all(|claim| claim.body["evidence"] == json!([sent.id])));
+        for _ in 0..100 {
+            preparation_diagnostic(&client, &fence, &message, None, false, &mut reports).await;
+        }
+        assert!(reports.is_empty(), "acknowledged clears must be pruned");
+        assert_eq!(store.claims_for(&fence.subject, Some("harness.diagnostic")).unwrap().len(), 2);
+        // A channel reconnect must clear a durable waiting report in this incarnation,
+        // but may not manufacture clears for healthy mail in its initial snapshot.
+        preparation_diagnostic(&client, &fence, &message, Some(&reason), false, &mut reports).await;
+        reports.clear();
+        preparation_diagnostic(&client, &fence, &message, None, true, &mut reports).await;
+        assert!(reports.is_empty());
+        let claims = store.claims_for(&fence.subject, Some("harness.diagnostic")).unwrap();
+        assert_eq!(claims.len(), 4);
+        assert_eq!(claims[2].body["fields"]["status"], "waiting");
+        assert_eq!(claims[3].body["fields"]["status"], "ready");
+        server.abort();
+    }
+
+    #[test]
+    fn claude_unprepared_fifo_head_preserves_later_mail_until_recovery() {
+        let mut messages: Vec<MessageView> = ["head", "later", "last"].into_iter().enumerate().map(|(index, name)| MessageView {
+            subject: format!("message/{name}"), from: "person/sender".into(), to: "agent/worker".into(),
+            content: name.into(), status: "staged".into(), title: None, in_reply_to: None,
+            tags: Vec::new(), body_ref: None, body_bytes: None, body_origin: None,
+            created_index: index as u64 + 1, attachments: Vec::new(),
+        }).collect();
+        let mut content = BTreeMap::from([
+            ("message/later".into(), "later envelope".into()),
+            ("message/last".into(), "last envelope".into()),
+        ]);
+        let mut attempted = BTreeSet::new();
+        assert_eq!(unprepared_fifo_head(&messages, &content, &attempted), Some(0));
+        for status in ["read", "closed", "unknown"] {
+            messages[0].status = status.into();
+            assert_eq!(unprepared_fifo_head(&messages, &content, &attempted), None,
+                "{status} mail must not become a permanent FIFO head");
+        }
+        for status in ["sent", "staged", "delivered"] {
+            messages[0].status = status.into();
+            assert_eq!(unprepared_fifo_head(&messages, &content, &attempted), Some(0));
+        }
+        messages[0].status = "staged".into();
+        // Repeated permanent body/attachment errors neither consume nor reorder mail.
+        for _ in 0..40 {
+            let offers: Vec<_> = messages.iter().take(unprepared_fifo_head(&messages, &content, &attempted).unwrap())
+                .map(|message| message.subject.as_str()).collect();
+            assert!(offers.is_empty());
+            assert_eq!(content.len(), 2);
+        }
+        content.insert("message/head".into(), "recovered envelope".into());
+        assert_eq!(unprepared_fifo_head(&messages, &content, &attempted), None);
+        let offers: Vec<_> = messages.iter().filter(|message| !attempted.contains(&message.subject))
+            .map(|message| message.subject.clone()).collect();
+        assert_eq!(offers, ["message/head", "message/later", "message/last"]);
+        attempted.extend(offers);
+        // Receipt recovery for an already attempted head needs no new preparation.
+        content.remove("message/head");
+        assert_eq!(unprepared_fifo_head(&messages, &content, &attempted), None);
+    }
+
+    #[tokio::test]
+    async fn claude_new_notification_gate_uses_current_prompt_resolution_and_fails_closed() {
+        use axum::{Json, Router, routing::get};
+        use crate::store::NativePromptState;
+        use st_drivers::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
+
+        let (prompt, response) = tokio::sync::watch::channel(NativePromptState::Open);
+        let app = Router::new().route("/v1/harness-prompts/state", get(move || {
+            let response = response.clone();
+            async move { Json(json!({"api_version":"st3.v1", "value":response.borrow().clone()})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(crate::client::Endpoint::Http(format!("http://{}", listener.local_addr().unwrap())));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let path = st_drivers::harness_state::harness_state_path(dir.path());
+        let now = st_drivers::message::now_ms();
+        let record = |ask: &str, blocked: &str, incarnation: &str, written: u64| json!({
+            "schema":"st.harness-state.v1", "agent":"worker", "harness":"claude",
+            "state":"active", "blockedOn":blocked, "inputBuffer":"unknown", "ask":ask,
+            "incarnation":incarnation, "seq":7, "transitions":11,
+            "sinceMs":now, "writtenAtMs":written
+        });
+        assert!(notifications_held(&client, "agent/worker", dir.path(), "current").await);
+        let mut writer = Writer::new(dir.path(), "worker", "claude", Some("test-pty".into())).with_session("current");
+        for ask in [Ask::Permission, Ask::Question, Ask::Review] {
+            writer.observe(Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                .with_ask(ask)).unwrap();
+            let observed = st_drivers::harness_state::read(&path, None).unwrap();
+            assert!(current_notification_observation(&observed, "current"), "{observed:?}");
+            assert_eq!(observed.ask, ask);
+            let episode = format!("/v1/harness-prompts/state?agent=agent%2Fworker&ownership={}&transition={}",
+                observed.ownership_sequence.unwrap(), observed.transition_sequence.unwrap());
+            prompt.send_replace(NativePromptState::Open);
+            assert_eq!(client.get::<NativePromptState>(&episode).await.unwrap(), NativePromptState::Open);
+            assert!(notifications_held(&client, "agent/worker", dir.path(), "current").await, "{ask:?}");
+            for answer in ["allow", "deny"] {
+                // The permission hook may have expired before this answer was
+                // recorded. The still-open native dialog remains authoritative.
+                prompt.send_replace(NativePromptState::Answered { answer: answer.into() });
+                assert!(notifications_held(&client, "agent/worker", dir.path(), "current").await, "{ask:?}");
+            }
+            prompt.send_replace(NativePromptState::Gone);
+            assert_eq!(client.get::<NativePromptState>(&episode).await.unwrap(), NativePromptState::Gone);
+            assert!(!notifications_held(&client, "agent/worker", dir.path(), "current").await, "{ask:?}");
+            // Heartbeats are not new prompt episodes. More than the former
+            // 16-observation lookup window must not resurrect a closed prompt.
+            for _ in 0..20 {
+                writer.observe(Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                    .with_ask(ask)).unwrap();
+                let heartbeat = st_drivers::harness_state::read(&path, None).unwrap();
+                assert_eq!(heartbeat.ownership_sequence, observed.ownership_sequence);
+                assert_eq!(heartbeat.transition_sequence, observed.transition_sequence);
+                assert!(!notifications_held(&client, "agent/worker", dir.path(), "current").await, "{ask:?}");
+            }
+        }
+        for ask in ["none", "future-ask"] {
+            std::fs::write(&path, serde_json::to_vec(&record(ask, "human", "current", now)).unwrap()).unwrap();
+            assert!(notifications_held(&client, "agent/worker", dir.path(), "current").await, "{ask}");
+        }
+        std::fs::write(&path, serde_json::to_vec(&record("none", "none", "current", now)).unwrap()).unwrap();
+        assert!(!notifications_held(&client, "agent/worker", dir.path(), "current").await);
+        assert!(notifications_held(&client, "agent/worker", dir.path(), "replacement").await);
+        std::fs::write(&path, serde_json::to_vec(&record("none", "none", "replacement", now)).unwrap()).unwrap();
+        assert!(!notifications_held(&client, "agent/worker", dir.path(), "replacement").await);
+        std::fs::write(&path, serde_json::to_vec(&record("question", "human", "replacement", 0)).unwrap()).unwrap();
+        assert!(notifications_held(&client, "agent/worker", dir.path(), "replacement").await);
+        std::fs::write(&path, serde_json::to_vec(&record("permission", "human", "replacement", now)).unwrap()).unwrap();
+        let unavailable = Client::unix(dir.path().join("absent-daemon.sock"));
+        assert!(notifications_held(&unavailable, "agent/worker", dir.path(), "replacement").await);
+        server.abort();
+    }
 
     #[test]
     fn claude_channel_retry_backoff_caps_at_thirty_seconds() {

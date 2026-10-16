@@ -889,6 +889,7 @@ pub(super) fn attention_item(body: &Value, at: u128) -> Result<AttentionItemView
         launch_id: None,
         variant_id: None,
         message_id: None, answers: Vec::new(),
+        prompt_call: None,
         conversation: body["owner"]
             .as_str()
             .and_then(super::attention_snapshot::agent),

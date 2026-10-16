@@ -90,6 +90,8 @@ pub enum Hit {
     Menu(super::glass::MenuAction),
     /// Glasses: show a group's tab (Now opens from the top bar, not a fixed tab).
     GlassTab(usize, usize),
+    /// Glasses: the marker for tabs that do not fit the strip; shows the nearest hidden one.
+    GlassTabMore(usize, usize),
     /// Glasses: open the palette for a new tab in a group.
     GlassAdd(usize),
     /// Glasses: open a palette row.

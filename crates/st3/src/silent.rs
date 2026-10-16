@@ -46,6 +46,7 @@ pub fn reserved_event_tag(tag: &str) -> bool {
         || tag == "st3-provider-capacity-retry"
         || tag.starts_with("st3-product-wait:")
         || tag.starts_with(crate::handoff::SESSION_START_TAG_PREFIX)
+        || tag.starts_with(crate::handoff::PREPARE_TAG_PREFIX)
 }
 
 /// A person's message (including one an adapter imports, such as from a chat bridge), anything

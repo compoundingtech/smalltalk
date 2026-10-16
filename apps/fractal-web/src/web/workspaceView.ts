@@ -1,22 +1,31 @@
 /**
- * What the workspace body shows for the selected pane. The thread and terminal subjects have web surfaces; any
+ * What the workspace body shows for the selected pane. The thread, terminal and document subjects have web surfaces; any
  * other pane states its own unavailability instead of repeating the transcript under a different tab.
  */
 export type WorkspaceView =
   | { readonly _tag: 'Thread' }
   | { readonly _tag: 'Terminal'; readonly ref: TerminalRef }
+  | { readonly _tag: 'Missions' }
+  | { readonly _tag: 'Document'; readonly ref: `doc/${string}` }
   | { readonly _tag: 'ViewUnavailable'; readonly ref: string; readonly reason: string }
 
 /** A terminal subject address, as `terminalSubjectForAgent` and the fleet projection produce it. */
 export type TerminalRef = `terminal/${string}`
 const isTerminalRef = (ref: string): ref is TerminalRef => ref.startsWith('terminal/')
+/** The Missions screen's tab, opened from the sidebar. */
+export const MISSIONS_REF = 'missions'
+const isDocumentRef = (ref: string): ref is `doc/${string}` => ref.startsWith('doc/')
 
 export const workspaceView = (pane: { readonly ref: string } | undefined): WorkspaceView =>
   pane === undefined
     ? { _tag: 'Thread' }
     : isTerminalRef(pane.ref)
       ? { _tag: 'Terminal', ref: pane.ref }
-      : { _tag: 'ViewUnavailable', ref: pane.ref, reason: 'This web client does not render this view yet.' }
+      : pane.ref === MISSIONS_REF
+        ? { _tag: 'Missions' }
+        : isDocumentRef(pane.ref)
+          ? { _tag: 'Document', ref: pane.ref }
+        : { _tag: 'ViewUnavailable', ref: pane.ref, reason: 'This web client does not render this view yet.' }
 
 export const workspaceViewNotice = (view: Extract<WorkspaceView, { _tag: 'ViewUnavailable' }>): string =>
   `View unavailable. ${view.reason}`

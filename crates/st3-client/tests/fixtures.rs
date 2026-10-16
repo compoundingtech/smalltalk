@@ -501,7 +501,6 @@ fn generated_action_union_and_machine_manifest_stay_in_lockstep() {
         READ_OPERATIONS.len(),
         operations["reads"].as_array().unwrap().len()
     );
-    assert_eq!(CONTRACT_SHA256.len(), 64);
 }
 
 #[test]
@@ -596,4 +595,20 @@ fn relay_omission_fixture_round_trips_without_inventing_nonnullable_fields() {
         "items":raw["value"]["items"], "next_cursor":"conversation-cursor/relay/next"});
     let typed: ConversationChanges = serde_json::from_value(changes.clone()).unwrap();
     assert_eq!(serde_json::to_value(typed).unwrap(), changes);
+}
+
+#[test]
+fn queued_mission_deadlines_decode_for_stui() {
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&fixture("person-ask-mission.json")).unwrap();
+    wire["run_details"][0]["after"] = serde_json::json!("mission-run/predecessor");
+    wire["run_details"][0]["deadline"] = serde_json::Value::Null;
+    let queued: Mission = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(queued.run_details[0].deadline, None);
+    wire["run_details"][0]["deadline"] = serde_json::json!("2026-09-20T11:05:00Z");
+    let admitted: Mission = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        admitted.run_details[0].deadline.as_deref(),
+        Some("2026-09-20T11:05:00Z")
+    );
 }

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add scratch-only st3 scenario recording and development/test recording fixtures",
+  "replay": {"status": "none", "detail": "Test-only recorder and development/test package changes; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client protocol or deployed runtime compatibility change; recordings use the existing client-v0 schema."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; identity and state are unchanged."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

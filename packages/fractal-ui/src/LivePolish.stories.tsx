@@ -43,7 +43,7 @@ type Story = StoryObj<typeof meta>
 export const Dark1440: Story = { play: async ({ mount, args }) => {
   const canvas = await mount()
   const liveCanvas = within(canvas.getByRole('region', { name: 'Live activity example' }))
-  await expect(liveCanvas.getByTestId('live-work')).toHaveTextContent(args.state._tag === 'Working' ? 'Working for 12s' : 'Waiting for your answer · 4h 27m')
+  await expect(liveCanvas.getByTestId('live-work')).toHaveTextContent(args.state._tag === 'Working' ? 'Working · 12s' : 'Waiting for your answer · 4h 27m')
   const label = liveCanvas.getByTestId('live-activity-label')
   // The label has no animation, so its trough is its permanent alpha/opacity.
   await expect(label.getAnimations()).toHaveLength(0)
@@ -98,7 +98,7 @@ export const Dark1440: Story = { play: async ({ mount, args }) => {
   await expect(send.getBoundingClientRect().width).toBe(32)
   if (args.scheme === 'light') await expect(getComputedStyle(dock).backgroundColor).toBe('rgb(252, 252, 252)')
   const advanced = await mount(<meta.render {...args} now={args.now + 1000} />)
-  await expect(within(advanced.getByRole('region', { name: 'Live activity example' })).getByTestId('live-work')).toHaveTextContent(args.state._tag === 'Working' ? 'Working for 13s' : 'Waiting for your answer · 4h 27m')
+  await expect(within(advanced.getByRole('region', { name: 'Live activity example' })).getByTestId('live-work')).toHaveTextContent(args.state._tag === 'Working' ? 'Working · 13s' : 'Waiting for your answer · 4h 27m')
   const restoredDock = within(advanced.getByRole('region', { name: 'Composer dock example' })).getByTestId('workbench-composer-dock')
   await waitFor(() => {
     expect(within(restoredDock).getByTestId('composer-input')).toHaveValue('Keep the selected resource visible.')

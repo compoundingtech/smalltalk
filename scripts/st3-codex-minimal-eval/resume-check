@@ -85,7 +85,7 @@ turn() { # turn KEY BODY FILE: send, then wait for the seat to write FILE (or gi
 }
 wait_state running 120 || { echo "the seat did not start" >&2; exit 1; }
 turn first "Using a shell command, create a file named first.txt in your workspace that contains the word first. Then reply with the single word done and nothing else." first.txt
-"$st" agents restart "$seat" --as "$operator" >"$out/restart.txt" 2>&1 || true
+"$st" agents restart "$seat" --now --as "$operator" >"$out/restart.txt" 2>&1 || true
 wait_state running 180 || true
 turn second "Do these in order, once each, and then reply with the single word done. (1) Run: git ls-remote https://github.com/compoundingtech/smalltalk HEAD > network.txt (2) Run: \"\$ST3_BIN\" conversations ls --as \"\$ST_AGENT\" > st.txt (3) Run exactly this once and do not retry it: bash -c 'echo outside > \$HOME/st-resume-outside.txt' 2> outside.txt . Do not request an escalation for any of them and do not change any setting." outside.txt
 

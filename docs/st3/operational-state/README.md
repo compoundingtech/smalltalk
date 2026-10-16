@@ -1,7 +1,8 @@
 # st operational-state contract
 
-Status: contract and red-fixture baseline. This document defines selection semantics; it does not
-implement them.
+This page defines which facts each operational read selects. The tests in
+`crates/st3/tests/operational_state_contract.rs` check its fixtures and the two JSON inventories
+beside it.
 
 ## Three layers
 
@@ -23,9 +24,8 @@ Every operational read must name one of three layers. Mixing them is a correctne
 
 Default product commands and screens use the actionable view. Detail screens use current
 projection and link to bounded history. `--all` or an explicit `history` command is required for
-historical/stopped/superseded rows. The transition is intentionally compatibility-free: no legacy
-default, fallback union, spelling alias, or environment switch restores stale rows to default
-output.
+historical/stopped/superseded rows. No legacy default, fallback union, spelling alias, or environment switch restores stale rows
+to default output.
 
 ## Selection rules
 
@@ -115,7 +115,7 @@ snapshot/cursor, stable deterministic ordering, bounded pages, summary counts, f
 typed relationships and deep links, typed actions and preconditions, and explicit empty/error
 states. The required screens are:
 
-- Now/Home sitrep;
+- Now sitrep;
 - missions list/detail, visual graph, and live progress;
 - attention inbox/detail/actions;
 - launch conversation, questions, visualization, and approve-and-launch;
@@ -143,10 +143,10 @@ error envelopes, documented examples, bounded bodies, and human/JSON membership/
 Unexplained empty output is a failure.
 
 Root and nested help lead with the human job and why. Product workflows are `now`, `missions`,
-`attention`, `launch`, `machines`, `agents`, `conversations`, `activity`, and `devices`. Operator
+`alerts`, `launch`, `machines`, `agents`, `conversations`, `activity`, and `devices`. Operator
 workflows are `doctor`, `admission`, `repair`, `replication`, and `service`. `subject`, `claim`, `trace`, `schema`,
 and `documents` are explicitly expert/debug. Internal tables and endpoints are not commands merely
-because they exist. Commands with the same why are merged; legacy aliases are removed.
+because they exist. Commands with the same why are merged.
 
 Two CLI reproductions are release-blocking:
 
@@ -190,6 +190,4 @@ The fixtures under `crates/st3/tests/fixtures/operational-state` cover:
 - a live idle harness that accepts terminal input but does not start a turn until a full prompt is
   injected.
 
-The passing tests validate fixture completeness and deterministic contract rules. Ignored red tests
-exercise current projections and are expected to fail until behavior work lands. Implementations
-must turn them green without rewriting the expected fixture outcome or removing immutable history.
+The tests check fixture completeness and the contract rules against the current projections.

@@ -666,6 +666,31 @@ mod tests {
         assert_eq!(row("person-read")["windows"]["1m"]["over_target"], 1);
     }
 
+    /// A refresher's publication counts toward `projection-fresh`, and one past 1500 ms is over
+    /// it.
+    #[test]
+    fn publications_count_toward_projection_freshness() {
+        let mut meter = Meter::default();
+        let now = Instant::now();
+        for (collection, ms) in [("missions", 900), ("agents", 1200), ("attention", 1800)] {
+            meter.time(
+                now,
+                Timed::resolve(&format!("publish {collection}"), false, Wait::No),
+                Duration::from_millis(ms),
+            );
+        }
+        let report = meter.windows(now);
+        let fresh = report["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "projection-fresh")
+            .unwrap()
+            .clone();
+        assert_eq!(fresh["windows"]["1m"]["count"], 3);
+        assert_eq!(fresh["windows"]["1m"]["over_target"], 1);
+    }
+
     #[test]
     fn roster_stages_report_their_own_samples_beside_the_route() {
         let mut meter = Meter::default();

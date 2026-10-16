@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add a standalone evidence verifier script and register its tests",
+  "replay": {"status": "none", "detail": "No daemon replay change; the script reads Git notes only."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change; it reads the existing v1 tests record."},
+  "rules": {"status": "none", "detail": "No daemon rule, required check or main landing change. Nothing calls the script yet."},
+  "compatibility": {"status": "none", "detail": "A new script and a new test in the existing script-test step; no existing behavior changes."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "Nothing to do. A key list at .st/evidence-keys is only needed once a check calls the script."},
+  "recovery": {"status": "none", "detail": "Reverting removes the script and its test."}
+}

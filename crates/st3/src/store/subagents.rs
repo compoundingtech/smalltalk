@@ -83,8 +83,8 @@ enum Scope<'a> {
     All,
 }
 
-/// Open subagents in `scope`, oldest first in the canonical claim order.
-fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<SubagentView>> {
+/// SQL shared by the read and its query-plan/cost regression test.
+fn open_subagents_sql(scope: Scope<'_>) -> String {
     let (live, from, filter) = match scope {
         Scope::Seat(_) => ("", "FROM claims", "AND claims.subject=?1"),
         // The sweep's own bound on this node's claims, not an order.
@@ -93,40 +93,48 @@ fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<Su
             "FROM claims",
             "AND claims.origin=?1 AND claims.store_index>=?2",
         ),
-        // Only a lease that runs on finds a running subagent, so the read starts from the
-        // leases, through their indexes, and costs what runs rather than all history.
+        // Pin the expiry seeks: SQLite otherwise prefers its generic kind index without
+        // ANALYZE and scans historical JSON. Keep the live pairs outermost for the join.
         Scope::Running(_) => (
             "WITH live(subject, subagent_id) AS (
-                 SELECT subject, json_extract(body, '$.fields.subagent_id') FROM claims
+                 SELECT subject, json_extract(body, '$.fields.subagent_id')
+                 FROM claims INDEXED BY claims_subagent_appeared_lease_index
                  WHERE kind='subagent.appeared'
                    AND CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER)>?1
                  UNION
-                 SELECT subject, json_extract(body, '$.fields.subagent_id') FROM claims
+                 SELECT subject, json_extract(body, '$.fields.subagent_id')
+                 FROM claims INDEXED BY claims_subagent_renewed_lease_index
                  WHERE kind='subagent.renewed'
                    AND CAST(json_extract(body, '$.fields.lease_expires_at_unix_ms') AS INTEGER)>?1)",
-            "FROM live JOIN claims ON claims.subject=live.subject
+            "FROM live CROSS JOIN claims INDEXED BY claims_subagent_appeared_index
+               ON claims.subject=live.subject
                AND json_extract(claims.body, '$.fields.subagent_id')=live.subagent_id",
             "",
         ),
         Scope::All => ("", "FROM claims", ""),
     };
-    let mut statement = connection.prepare_cached(&canonical_sql(&format!(
+    canonical_sql(&format!(
         "{live} SELECT claims.subject, claims.id, claims.origin, claims.body, claims.store_index,
              (SELECT MAX(CAST(json_extract(renewed.body, '$.fields.lease_expires_at_unix_ms')
                   AS INTEGER))
-              FROM claims renewed
+              FROM claims renewed INDEXED BY claims_subagent_renewed_max_lease_index
               WHERE renewed.kind='subagent.renewed' AND renewed.subject=claims.subject
                 AND json_extract(renewed.body, '$.fields.subagent_id')
                     =json_extract(claims.body, '$.fields.subagent_id'))
          {from}
          WHERE claims.kind='subagent.appeared' {filter}
            AND NOT EXISTS (
-               SELECT 1 FROM claims ended
+               SELECT 1 FROM claims ended INDEXED BY claims_subagent_ended_index
                WHERE ended.kind='subagent.ended' AND ended.subject=claims.subject
                  AND json_extract(ended.body, '$.fields.subagent_id')
                      =json_extract(claims.body, '$.fields.subagent_id'))
          ORDER BY CANONICAL_ASC(claims)"
-    )))?;
+    ))
+}
+
+/// Open subagents in `scope`, oldest first in the canonical claim order.
+fn open_subagents_at(connection: &Connection, scope: Scope<'_>) -> Result<Vec<SubagentView>> {
+    let mut statement = connection.prepare_cached(&open_subagents_sql(scope))?;
     let read = |row: &rusqlite::Row<'_>| {
         Ok((
             row.get::<_, String>(0)?,
@@ -635,6 +643,114 @@ mod tests {
         assert!(running(30_000).is_empty());
         // The open ones still include the lapsed subagent until its node ends it.
         assert_eq!(ids(&store), ["lapsed", "renewed", "fresh"]);
+    }
+
+    #[test]
+    fn running_subagent_work_is_flat_when_expired_history_grows_tenfold() {
+        let store = Store::open_memory("node").unwrap();
+        let mut connection = store.connection.write();
+        let tx = connection.transaction().unwrap();
+        let append = |kind: &str, id: &str, lease: u64| {
+            append_claim_record_tx(
+                &tx,
+                "node",
+                SEAT,
+                kind,
+                None,
+                &json!({"fields":{"subagent_id":id,"lease_expires_at_unix_ms":lease}}),
+                &[],
+                None,
+            )
+            .unwrap();
+        };
+        append("subagent.appeared", "fresh", 30_000);
+        append("subagent.appeared", "renewed", 1);
+        append("subagent.renewed", "renewed", 40_000);
+        // An end wins even while its lease still runs.
+        append("subagent.appeared", "ended-live", 50_000);
+        append("subagent.ended", "ended-live", 0);
+        let sql = open_subagents_sql(Scope::Running(10_000));
+        let original = sql
+            .replace(" INDEXED BY claims_subagent_appeared_lease_index", "")
+            .replace("FROM live CROSS JOIN claims", "FROM live JOIN claims")
+            .replace(" INDEXED BY claims_subagent_renewed_lease_index", "")
+            .replace(" INDEXED BY claims_subagent_appeared_index", "")
+            .replace(" INDEXED BY claims_subagent_renewed_max_lease_index", "")
+            .replace(" INDEXED BY claims_subagent_ended_index", "");
+        let measure = |query: &str| {
+            let mut statement = tx.prepare(query).unwrap();
+            let mut timings = Vec::new();
+            let mut cost = 0;
+            for _ in 0..31 {
+                statement.reset_status(rusqlite::StatementStatus::VmStep);
+                let started = std::time::Instant::now();
+                let rows = statement
+                    .query_map([10_000], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                timings.push(started.elapsed());
+                assert_eq!(rows, [SEAT, SEAT]);
+                cost = statement.get_status(rusqlite::StatementStatus::VmStep);
+            }
+            timings.sort();
+            (cost, timings[15])
+        };
+        let explain = |query: &str| {
+            tx.prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map([10_000], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let mut costs = Vec::new();
+        for (start, end) in [(0, 1_000), (1_000, 10_000)] {
+            for number in start..end {
+                let id = format!("expired-{number}");
+                append("subagent.appeared", &id, 1);
+                append("subagent.renewed", &id, 2);
+                append("subagent.ended", &id, 0);
+                // Grow renewal history for a pair that still runs, too.
+                append("subagent.renewed", "renewed", 3);
+            }
+            // Measure the exact old query against the old schema as well.
+            tx.execute_batch(
+                "DROP INDEX claims_subagent_renewed_max_lease_index;
+                 CREATE INDEX claims_subagent_renewed_index
+                 ON claims(subject, json_extract(body, '$.fields.subagent_id'))
+                 WHERE kind='subagent.renewed';",
+            )
+            .unwrap();
+            let before = measure(&original);
+            let before_plan = explain(&original);
+            tx.execute_batch(SCHEMA).unwrap();
+            let after = measure(&sql);
+            let plan = explain(&sql);
+            println!("history={end} before={before:?} after={after:?}");
+            println!("before plan: {before_plan:#?}\nafter plan: {plan:#?}");
+            for index in [
+                "claims_subagent_appeared_lease_index (<expr>>?)",
+                "claims_subagent_renewed_lease_index (<expr>>?)",
+                "claims_subagent_appeared_index (subject=? AND <expr>=?)",
+                "claims_subagent_renewed_max_lease_index (subject=? AND <expr>=?)",
+                "claims_subagent_ended_index (subject=? AND <expr>=?)",
+            ] {
+                assert!(plan.iter().any(|line| line.contains(index)), "{plan:?}");
+            }
+            assert!(!plan.iter().any(|line| line.contains("claims_kind_index")));
+            let open = open_subagents_at(&tx, Scope::Running(10_000)).unwrap();
+            assert_eq!(
+                open.iter()
+                    .map(|subagent| (subagent.subagent_id.as_str(), subagent.lease_expires_at_unix_ms))
+                    .collect::<Vec<_>>(),
+                [("fresh", 30_000), ("renewed", 40_000)]
+            );
+            costs.push(after.0);
+        }
+        assert_eq!(costs[0], costs[1], "work follows live leases, not expired history");
+        assert!(costs[0] < 500, "fixed two-row overlay must stay bounded: {costs:?}");
+        tx.rollback().unwrap();
     }
 
     #[test]

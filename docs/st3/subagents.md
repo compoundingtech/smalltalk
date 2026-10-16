@@ -29,8 +29,11 @@ harness records:
 
 - `PreToolUse` for the Agent tool gives the launch's description and type.
 - `SubagentStart` starts the subagent.
-- `SubagentStop` ends it as `completed`. A stop for an agent that never started is Claude's trailing
-  phantom stop, and it changes nothing.
+- `SubagentStop` reads the child's last assistant transcript record: `isApiErrorMessage` ends it
+  as `failed`, `isAbortedMidStream` as `interrupted`, otherwise `completed`. Retry diagnostics
+  (`system/api_error`) do not count as a failed run. A missing or unreadable transcript retains
+  the stop's ordinary `completed` outcome. A stop for an agent that never started is Claude's
+  trailing phantom stop, and it changes nothing.
 - Each top-level `Stop` lists the background subagents still running. One missing from that list
   for ten seconds ends as `interrupted`.
 - A new session or `SessionEnd` ends the session's subagents.
@@ -42,6 +45,12 @@ The ledger trusts `SessionStart` as a boundary; its caller must admit that hook 
 current runtime. This guard does not authenticate a delayed predecessor `SessionStart`.
 
 A running seat keeps the settings it started with, so it records subagents from its next restart.
+
+The [SubagentStop hook contract](https://code.claude.com/docs/en/hooks#subagentstop) carries
+`agent_transcript_path` and final response text, but no outcome or error flag. The transcript's
+typed assistant flags, not that model-authored text, are the outcome evidence. These flags were
+checked in Claude Code 2.1.287: API errors create `isApiErrorMessage` assistant records, aborted
+streams create `isAbortedMidStream` records, and `system/api_error` records describe retries.
 
 **Codex.** The control connection reads the parent thread's `subAgentActivity` items and
 `collabAgentToolCall` results into the same ledger. A subagent thread can take a follow-up task
@@ -59,6 +68,13 @@ after its end; only a new `agent_start` does. That new run is `ID#2` and so on, 
 The type is omp's agent name. IDs longer than 256 UTF-8 bytes are rejected rather than truncated,
 and names longer than 128 UTF-8 bytes are omitted. Both the extension and channel enforce these
 bounds. omp reports no tokens for a subagent, so its end carries none.
+
+Child lifecycle is the start/end authority, not parent `task` tool results: one call can launch
+several children, and an asynchronous result can return while they still run. Each child reports
+its own terminal error or abort. Children never open a channel, consume seat mail, or emit seat
+state/context/timeline frames; only their lifecycle/progress frames use the parent's channel.
+Deploy the updated st3 extension and restart existing omp seats to load it; the legacy st2
+extension continues to suppress all child events.
 
 An omp subagent also reports `progress` at each `turn_end`, at most every ten seconds at its
 messages and tool calls, and every minute while omp says its session is busy, as in a long tool

@@ -427,11 +427,12 @@ impl PtyRuntime {
         const ATTEMPTS: u32 = 4;
         let mut last_error = String::new();
         for attempt in 0..ATTEMPTS {
-            let mut command =
-                crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
-            if let Some(environment) = &self.command_environment {
-                command.env_clear().envs(environment);
-            }
+            let mut command = crate::isolate::wrap_in(
+                &unit,
+                std::ffi::OsStr::new(&self.binary),
+                &argument_refs,
+                self.command_environment.as_ref(),
+            );
             command.env("PTY_ROOT", &self.root);
             // A later failed attempt cannot close a producer created by an earlier
             // attempt. Only failure to create the first launcher proves rejection.

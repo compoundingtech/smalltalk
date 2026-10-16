@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Pre-push: when the tree about to be tested has no signed evidence, produce it, then let the push go.
+
+When you push the branch you have checked out, `scripts/st-test --status` says whether its head tree is covered. If
+every check that has a local command is covered the push goes, silently. If not, `scripts/st-test --push REMOTE` runs the checks
+once on this machine, the host's signer records them, the notes are pushed, and then the push goes.
+
+The installed hook runs THIS file and scripts/st-test from the base branch of the remote (<remote>/main), copied to a
+temporary directory, never from the tree being pushed: the hook and the runner are not the pushed branch's. The checks
+are: st-test runs `nix develop`, `pnpm install` and the tests of the pushed commit in a clean worktree, so the pushed
+tree's code does run on this machine, as you, with your signing key within reach. That is what testing it means on a
+machine we trust (cooperative trust, known defect 22); it is not something the base-pinned hook protects against.
+
+  * It never blocks a push. Every failure path (an exception, a missing python3, a hung fetch, a signer that refuses,
+    a failing check, a timeout) is printed and the push goes. Ctrl-C stops the run and everything under it (its process
+    group) and the hook exits 0; `git push` itself gets the same Ctrl-C from the terminal, so the push ends there.
+  * ST_SKIP_EVIDENCE=1 skips all of it (work in progress); it says it did not sign and the PR simply runs in CI.
+  * ST_EVIDENCE_TIME_LIMIT=SECONDS bounds the signing run (default 1200, must be a positive integer); past it the run
+    is stopped (TERM, then KILL of the whole process group), that is printed, and the push goes. ST_EVIDENCE_STATUS_TIMEOUT
+    bounds the "is it covered" question (default 60 s).
+  * An agent (ST_AGENT set, or no terminal on stderr) runs `git push` inside a tool call with a short timeout, so there
+    the hook waits at most ST_EVIDENCE_AGENT_LIMIT seconds (default 120), prints that signing continues in the
+    background with its log path, and lets the push go; the notes are pushed when the run finishes. Agents should run
+    `scripts/st-test --push origin` before pushing so the first CI run already sees the notes.
+  * It signs only the checked-out branch's head commit and only when the work tree has no uncommitted changes to tracked
+    files; anything else (other refs, tags, deletes, the base branch, a remote given as a URL) is pushed untouched.
+    Pushing notes from inside the run does not run this hook again.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True
+LIMIT = 1200
+AGENT_LIMIT = 120
+STATUS_LIMIT = 60
+BASE = 'main'
+CHILD = None
+
+
+SELECTING = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR',
+                  'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_QUARANTINE_PATH', 'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_GRAFT_FILE',
+                  'GIT_SHALLOW_FILE', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
+                  'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE')
+
+
+def clean_environment(**extra):
+    """The environment for what this hook starts: without the variables that select a repository or an identity (git exports GIT_DIR
+    and friends to a hook; the checks make their own repositories and must not reach the caller's through them, st2#3014). Transport
+    and credential variables (GIT_SSH_COMMAND, GIT_ASKPASS, GIT_CONFIG_*, ...) stay: the notes push needs them."""
+    return dict({k: v for k, v in os.environ.items() if not (k in SELECTING or k.startswith('GIT_PUSH_OPTION'))}, **extra)
+
+
+def say(message):
+    print(f'evidence: {message}', file=sys.stderr)
+
+
+def say_once(name, message):
+    """Say `message` the first time on this machine and stay quiet after: the hook never blocks, and the same line on every
+    push of every branch only teaches people to stop reading what it prints."""
+    marker = Path.home() / '.local/state/st3/evidence-prepush' / f'noticed-{name}'
+    if marker.exists():
+        return
+    say(message)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(message + '\n')
+    except OSError:
+        pass  # cannot remember: it will say it again, which is harmless
+
+
+def git(*args):
+    return subprocess.run(['git', *args], capture_output=True, text=True)
+
+
+def positive(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if raw.isdecimal() and int(raw) > 0:
+        return int(raw)
+    say(f'{name}={raw!r} is not a positive integer; using {default}')
+    return default
+
+
+def stop(group, wait):
+    """TERM the process group (st-test cleans its worktree on TERM), then always KILL what is left of it: the leader
+    exiting does not mean its children did."""
+    try:
+        os.killpg(group.pid, signal.SIGTERM)
+        group.wait(timeout=wait)
+    except subprocess.TimeoutExpired:
+        pass
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(group.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    group.wait()
+
+
+def signer_listed(base):
+    """False only when this machine's signer principal is known and the base's key list has no line for it."""
+    if os.environ.get('EVIDENCE_SIGNER'):
+        return True
+    try:
+        principal = json.loads((Path.home() / '.config/st/evidence-sign.json').read_text())['signer']
+        keys = git('show', f'{base}:.st/evidence-keys')
+    except (OSError, ValueError, KeyError, TypeError):
+        return True  # cannot tell: let the run decide
+    return keys.returncode != 0 or any(line.split(' ', 1)[0] == principal for line in keys.stdout.splitlines())
+
+
+def hook(argv):
+    global CHILD
+    if os.environ.get('ST_EVIDENCE_IN_HOOK'):
+        return 0  # the notes push of our own run
+    remote = argv[0] if argv else 'origin'
+    if os.environ.get('ST_SKIP_EVIDENCE') == '1':
+        say('NOT signing (ST_SKIP_EVIDENCE=1); the pull request will run in CI')
+        return 0
+    head = git('rev-parse', 'HEAD').stdout.strip()
+    top = git('rev-parse', '--show-toplevel').stdout.strip() or os.getcwd()
+    pushed = []
+    for line in sys.stdin:
+        fields = line.split()
+        if len(fields) != 4:
+            continue
+        _, local_sha, remote_ref, _ = fields
+        if not remote_ref.startswith('refs/heads/') or re.fullmatch(r'0+', local_sha):
+            continue  # a tag, a note, a delete: untouched
+        if remote_ref != f'refs/heads/{BASE}' and local_sha == head:
+            pushed.append(remote_ref)
+    if not pushed:
+        return 0
+    script = Path(__file__).resolve().parent / 'st-test'
+    if not script.exists():
+        say('st-test is not next to the hook; not signing')
+        return 0
+    if remote not in git('remote').stdout.split():
+        say(f'{remote!r} is not a configured remote name (a URL?); not signing')
+        return 0
+    if git('status', '--porcelain', '--untracked-files=no').stdout.strip():
+        say('uncommitted changes to tracked files: not signing (the note is for the committed tree)')
+        return 0
+    if not os.environ.get('EVIDENCE_SIGNER') and not (Path.home() / '.config/st/evidence-sign.json').exists():
+        say_once('no-signer', 'no signing key is set up on this machine (run scripts/evidence-keygen --name ALIAS and list its line in '
+                 '.st/evidence-keys); not signing, the pull request will run in CI. On a machine that stays without a signer, hosted '
+                 'CI at the exact head is the proof: push with ST_SKIP_EVIDENCE=1 and say so in the pull request. This is said once '
+                 'per machine.')
+        return 0
+    base = f'{remote}/{BASE}'
+    if not signer_listed(base):
+        say('this machine\'s signer is not listed in .st/evidence-keys on main yet, so its notes would not count; not signing '
+            '(list the line scripts/evidence-keygen prints by pull request). The pull request will run in CI')
+        return 0
+    try:
+        status = subprocess.run([sys.executable, str(script), '--status', '--base', base], capture_output=True, text=True,
+                                cwd=top, env=clean_environment(), timeout=positive('ST_EVIDENCE_STATUS_TIMEOUT', STATUS_LIMIT))
+    except subprocess.TimeoutExpired:
+        say('could not tell whether the tree is covered in time (a slow fetch?); not signing, the pull request will run in CI')
+        return 0
+    if status.returncode == 0:
+        return 0  # already covered: nothing to say
+    if status.returncode != 3:
+        say(f'could not tell whether the tree is covered ({(status.stderr or status.stdout).strip()[-200:]}); '
+            'not signing, the pull request will run in CI')
+        return 0
+    limit = positive('ST_EVIDENCE_TIME_LIMIT', LIMIT)
+    agent = bool(os.environ.get('ST_AGENT')) or not sys.stderr.isatty()
+    wait = min(limit, positive('ST_EVIDENCE_AGENT_LIMIT', AGENT_LIMIT)) if agent else limit
+    log = None
+    if agent:
+        directory = Path.home() / '.local/state/st3/evidence-prepush'
+        directory.mkdir(parents=True, exist_ok=True)
+        log = directory / f'{time.strftime("%Y%m%dT%H%M%S")}-{os.getpid()}.log'
+    say(f'no signed evidence for this tree yet: running the checks here and signing them (this push waits at most '
+        f'{max(wait // 60, 1) if wait >= 60 else wait} {"min" if wait >= 60 else "s"}; ST_SKIP_EVIDENCE=1 skips this)')
+    # Its own process group, so stopping it stops the nix and pnpm processes under it too.
+    sink = open(log, 'ab') if log else sys.stderr
+    CHILD = subprocess.Popen([sys.executable, str(script), '--base', base, '--push', remote, '--time-limit', str(limit)],
+                             cwd=top, env=clean_environment(ST_EVIDENCE_IN_HOOK='1'), stdout=sink, stderr=sink if log else None,
+                             start_new_session=True)
+    try:
+        CHILD.wait(timeout=wait)
+    except subprocess.TimeoutExpired:
+        if agent:
+            say(f'still signing in the background (pid {CHILD.pid}, log {log}); the notes are pushed when it finishes. '
+                'Pushing now: the first CI run may not see them (run scripts/st-test --push before pushing to avoid that)')
+            CHILD = None
+            return 0
+        stop(CHILD, 15)
+        git('worktree', 'prune')
+        say(f'signing did not finish within {max(limit // 60, 1)} minute(s); stopped. Pushing anyway: the pull request will run in CI')
+        return 0
+    code = CHILD.returncode
+    CHILD = None
+    if code == 0:
+        say('signed; pushing')
+    elif code == 1:
+        say('a check failed or could not be signed (the reason is above); a failing run is recorded. Pushing anyway')
+    else:
+        say(f'signing could not run (exit {code}; the reason is above). Pushing anyway')
+    return 0
+
+
+def main(argv):
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        return hook(argv)
+    except KeyboardInterrupt:
+        if CHILD is not None:
+            stop(CHILD, 15)
+            git('worktree', 'prune')
+        say('interrupted; the signing run was stopped')
+        return 0
+    except Exception as error:  # nothing here may stop a push
+        say(f'{type(error).__name__}: {error}; not signing, pushing anyway')
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

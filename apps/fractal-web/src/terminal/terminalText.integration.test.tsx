@@ -9,7 +9,7 @@ import { makeScreen } from './fixtures.ts'
 import { defaultTerminalPalette } from './palette.ts'
 import { terminalMatches, terminalText } from './terminalText.ts'
 
-vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 let host: HTMLDivElement
 let root: Root

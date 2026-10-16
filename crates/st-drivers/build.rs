@@ -15,6 +15,44 @@ fn git(args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Tell Cargo which Git files can change the stamp. The directory `refs` is NOT one of them: in a linked worktree
+/// `git rev-parse --git-path refs` names the COMMON directory that every worktree of the repository shares, and Cargo
+/// rescans a watched directory recursively, so any ref updated by anyone (a fetch, a push, a branch in another worktree)
+/// re-ran this script and rebuilt everything that depends on this crate (a whole workspace, ~12 minutes) although this
+/// worktree's HEAD had not moved. HEAD, the index and the ONE ref HEAD names are the inputs. While that ref is a loose file
+/// only the file is watched; when it exists only in packed-refs (after `git gc` or `git pack-refs`) packed-refs is watched
+/// instead, and so is the directory the loose file will appear in, because a new commit creates it there. A path that does
+/// not exist is skipped: Cargo treats a missing watched file as always changed.
+fn watch_git_inputs() {
+    let path_of = |name: &str| git(&["rev-parse", "--git-path", name]);
+    let watch = |path: &str| {
+        if std::path::Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    };
+    for name in ["HEAD", "index"] {
+        if let Some(path) = path_of(name) {
+            watch(&path);
+        }
+    }
+    let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) else {
+        return;
+    };
+    let Some(loose) = path_of(&branch) else {
+        return;
+    };
+    if std::path::Path::new(&loose).exists() {
+        watch(&loose);
+        return;
+    }
+    if let Some(packed) = path_of("packed-refs") {
+        watch(&packed);
+    }
+    if let Some(directory) = std::path::Path::new(&loose).parent().and_then(|p| p.to_str()) {
+        watch(directory);
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=AGENT_SPEC_REVISION");
     let mut explicit_clean_source = false;
@@ -55,9 +93,5 @@ fn main() {
     // Rebuild the stamp when HEAD moves or the working tree changes (dirty flag).
     // This build script also stamps st-drivers from its crate directory. Git resolves the
     // same worktree metadata for both callers, including linked-worktree layouts.
-    for path in ["HEAD", "refs", "index"] {
-        if let Some(path) = git(&["rev-parse", "--git-path", path]) {
-            println!("cargo:rerun-if-changed={path}");
-        }
-    }
+    watch_git_inputs();
 }

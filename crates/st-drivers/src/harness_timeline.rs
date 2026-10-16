@@ -743,7 +743,13 @@ pub fn observe_claude_stop_transcript(
 }
 
 /// One Claude response's token buckets, as Claude reports them: already disjoint.
-fn claude_usage_body(value: &Value, turn_id: &str) -> Option<Value> {
+pub(crate) fn claude_usage_body(value: &Value, turn_id: &str) -> Option<Value> {
+    // Stop and the write observer share response IDs. An explicitly unfinished response
+    // must not reserve that ID with provisional counters before its completion is written.
+    // Older native records omit this field entirely; retain their existing Stop behavior.
+    if value.pointer("/message/stop_reason").is_some_and(Value::is_null) {
+        return None;
+    }
     let tokens = value.pointer("/message/usage")?;
     let bucket = |key| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
     let input = bucket("input_tokens");

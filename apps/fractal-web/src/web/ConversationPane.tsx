@@ -10,6 +10,8 @@ import { createConversationTranscript, openableImageUrl, transcriptObservedAt, t
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
+import { DOCUMENT_REF } from '../documents/document-port.ts'
+import { documentReferences } from '../documents/DocumentLink.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import type * as Atom from 'effect/reactivity/Atom'
@@ -22,6 +24,7 @@ export const ConversationPane = ({
   agentRef,
   agentName,
   onOpenTool,
+  onOpenDocument,
   ux,
   visible = true,
   interest: shellInterest,
@@ -31,6 +34,8 @@ export const ConversationPane = ({
   readonly agentName: string
   /** Host-owned detail surface for a tool call opened from the transcript. */
   readonly onOpenTool: (call: WorkLogCall) => void
+  /** Opens a `doc/…` named in the conversation; stable, so the memoized transcript keeps still. */
+  readonly onOpenDocument?: (ref: string) => void
   readonly ux?: UxTelemetry
   /** A retained hidden pane keeps its DOM but releases visible follow demand (setVisible false). */
   readonly visible?: boolean
@@ -84,14 +89,15 @@ export const ConversationPane = ({
     onFocusCapture={event => { if (!visible) event.target.blur() }}
     onKeyDownCapture={event => { if (!visible) { event.preventDefault(); event.stopPropagation() } }}
     onClickCapture={event => { if (!visible) { event.preventDefault(); event.stopPropagation() } }}>
-    <ConversationContent agentRef={agentRef} agentName={agentName} onOpenTool={onOpenTool} feed={feed} state={state} />
+    <ConversationContent agentRef={agentRef} agentName={agentName} onOpenTool={onOpenTool} onOpenDocument={onOpenDocument} feed={feed} state={state} />
   </div>
 }
 
-const ConversationContent = React.memo(function ConversationContent({ agentRef, agentName, onOpenTool, feed, state }: {
+const ConversationContent = React.memo(function ConversationContent({ agentRef, agentName, onOpenTool, onOpenDocument, feed, state }: {
   readonly agentRef: string
   readonly agentName: string
   readonly onOpenTool: (call: WorkLogCall) => void
+  readonly onOpenDocument?: (ref: string) => void
   readonly feed: Feed<ConversationPage>
   readonly state: ConversationTranscriptState
 }) {
@@ -107,9 +113,18 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     refusal, onRefused: setRefusal,
   })
   const retryConversation = source.retryConversation
+  const renderInlineReference = React.useMemo(() => onOpenDocument === undefined ? undefined : documentReferences(onOpenDocument), [onOpenDocument])
+  // A Markdown link to a `doc/…` opens it in a tab instead of following a relative URL.
+  const followDocumentLinks = (event: React.MouseEvent) => {
+    const href = event.target instanceof Element ? event.target.closest('a[href]')?.getAttribute('href') ?? '' : ''
+    if (onOpenDocument === undefined || !DOCUMENT_REF.test(href)) return
+    event.preventDefault()
+    event.stopPropagation()
+    onOpenDocument(href)
+  }
   return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
     {/* Bound the 100%-height kit frame to the space left above the composer. */}
-    <div data-testid="conversation-history-host" style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
+    <div data-testid="conversation-history-host" onClickCapture={followDocumentLinks} style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
     <Transcript
       viewportKey={agentRef}
       turns={state._tag === 'Observed' ? state.turns : []}
@@ -120,6 +135,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
       observedAt={transcriptObservedAt(observation, now)}
       onOpenTool={onOpenTool}
       onRetrySync={state._tag === 'Unavailable' || retryConversation === undefined ? undefined : () => retryConversation(agentRef)}
+      {...(renderInlineReference === undefined ? {} : { renderInlineReference })}
       onLoadImage={(src) => { const url = openableImageUrl(src); if (url !== undefined) window.open(url, '_blank', 'noopener,noreferrer') }}
       onRetrySend={grants.messageSend === 'granted' ? (id) => {
         if (feed._tag !== 'Observed') return

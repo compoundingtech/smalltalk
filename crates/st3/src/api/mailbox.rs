@@ -583,7 +583,7 @@ fn own_post_reactor(state: &AppState, fence: &Fence) -> tokio::sync::mpsc::Sende
         while let Some(subject) = pending.recv().await {
             let store = state.store.clone();
             let binding = fence.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = store.connection.write_workers().spawn_blocking(move || {
                 store.close_mailbox_own_post_wake(&binding, &subject)
             }).await;
             match result {
@@ -635,7 +635,7 @@ async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDe
         } => {},
     }
     if native {
-        let _ = crate::api::read_deadline::spawn_blocking(move || {
+        let _ = state.store.connection.write_workers().spawn_blocking(move || {
             authority::loss_if_current(&state, &fence, &peer)
         }).await;
     }
@@ -793,7 +793,7 @@ async fn stream_with_timers_inner<F, S, H>(
             let repaired = if let Some(peer) = peer.clone() {
                 let repair_state = state.clone();
                 let repair_fence = fence.clone();
-                match tokio::task::spawn_blocking(move || {
+                match state.store.connection.write_workers().spawn_blocking(move || {
                     if repair_state.store.check_mailbox(&repair_fence).is_ok() { return false; }
                     let _ = authority::loss_if_current(&repair_state, &repair_fence, &peer);
                     matches!(authority::with_authority(&repair_state, &repair_fence, &peer, |owner, validate| {
@@ -948,7 +948,7 @@ async fn stream_with_timers_inner<F, S, H>(
                             let checked_state = state.clone();
                             let binding = fence.clone();
                             let raw = report.to_string();
-                            matches!(crate::api::read_deadline::spawn_blocking(move || {
+                            matches!(state.store.connection.write_workers().spawn_blocking(move || {
                                 authority::admit_report(&checked_state, &binding, &peer, &raw)
                             }).await, Ok(Ok(())))
                         } else { true };
@@ -988,7 +988,7 @@ async fn stream_with_timers_inner<F, S, H>(
                             let repair_state = state.clone();
                             let binding = fence.clone();
                             let raw = report.to_string();
-                            replay_proven = crate::api::read_deadline::spawn_blocking(move || {
+                            replay_proven = state.store.connection.write_workers().spawn_blocking(move || {
                                 authority::repair_proven(&repair_state, &binding, &peer, &raw)
                             }).await.ok().and_then(Result::ok);
                         }
@@ -1255,20 +1255,29 @@ mod tests {
         }
     }
 
+    /// Backdate a send past the recovery window of the recipient's current boot. The
+    /// window is measured from the boot floor, so age from it (or from now, before any
+    /// boot): a slow runner between boot and this call must not make the mail recent.
     fn age_sent(store: &Store, database: &Path, subject: &str) {
         let claim = store
             .latest_claim(subject, Some("message.sent"))
             .unwrap()
             .unwrap();
+        let recipient = claim.body.get("fields").unwrap_or(&claim.body)["to"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let anchor = store
+            .native_mail_boot_floor(&recipient)
+            .unwrap()
+            .map_or(client_now_ms(), |(since, _)| since.min(client_now_ms()));
         let connection = rusqlite::Connection::open(database).unwrap();
         crate::store::configure_projection_writer(&connection).unwrap();
         connection
             .execute(
                 "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                 rusqlite::params![
-                    (client_now_ms()
-                        - u128::from(super::super::mail_backlog::THRESHOLD_MS)
-                        - 1_000)
+                    (anchor - u128::from(super::super::mail_backlog::THRESHOLD_MS) - 1_000)
                         .to_string(),
                     claim.id
                 ],
@@ -3069,12 +3078,13 @@ mod tests {
         source.bind_fleet(FLEET).unwrap();
         crate::mailbox::tests::ready(&source, "session-1");
         let request = || ReplicationReceiveRequest {
+            carrier: Default::default(),
             peer: "source".into(),
             fleet_id: FLEET.into(),
             exchange: source
                 .export_replication_exchange(FLEET, &state.store.replication_inventory().unwrap())
                 .unwrap(),
-            // The native replication worker supplies this; it enables the worker's heal path.
+            // The native replication worker supplies this for its own dials.
             round_trip_ms: Some(1),
         };
         // Establish the remote incarnation before binding the live stream.

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Rebase terminal agent retirement onto current main, preserving main's down agent state and adding retired alongside it in the generated client contract.",
+  "replay": {
+    "status": "none",
+    "detail": "No retirement admission, terminal precedence or replay implementation change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Retirement claim shape, retention and schema hooks unchanged. Resolve AgentState contract by retaining main's down state and description together with retirement's retired state; regenerate all clients and schema docs."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Retirement durable retention and checkpoint rules remain unchanged from the reviewed slice."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Preserve current main storage 19, setup/shared view models and ordinary down-agent delivery. Existing exact registry gate, never-reuse decision and sender-local admission policy remain."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Upgrade members together and prevent downgraded or old entrants as the retirement runbook requires."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing terminal-evidence roll-forward instructions remain; follow the storage 19 baseline upgrade requirements."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Retirement first-open claims index still scans populated claims; no new installation timing, and live-store downtime remains unknown."
+  }
+}

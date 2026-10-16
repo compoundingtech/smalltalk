@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep two mission_cancellation tests and one trim timing test out of the sandboxed st3 Nix check, by name, with reasons",
+  "replay": {"status": "none", "detail": "No graph, claim or storage change; a list of test names for the Nix check."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. The excluded tests still run in the linux-tests shards of central CI."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "none", "detail": "No operator action."},
+  "recovery": {"status": "none", "detail": "Remove an entry from nix/st3-check-exclusions.json once its test passes in the Nix sandbox."}
+}

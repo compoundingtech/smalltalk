@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Document the iPhone design direction, shared UI model boundaries and incremental screen order; documentation only.",
+  "replay": { "status": "none", "detail": "No runtime or stored-data change; no replay or backfill." },
+  "schema": { "status": "none", "detail": "No database, schema or operation change." },
+  "rules": { "status": "none", "detail": "No checkpoint, claim, authority or fleet coordination change." },
+  "compatibility": { "status": "none", "detail": "No client, protocol, pairing or harness change; screen implementation follows separately." },
+  "downtime": { "status": "none", "detail": "Documentation only; no deployment or service interruption." },
+  "manual": { "status": "none", "detail": "Existing installations require no action." },
+  "recovery": { "status": "none", "detail": "Documentation only; no state transition to recover." }
+}

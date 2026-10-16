@@ -16,7 +16,7 @@ fn sized_cache_kib(memory_bytes: u64, default_kib: usize, readers: usize) -> Opt
 }
 
 /// An operator's valid override takes precedence and survives service installation.
-pub(crate) fn override_kib() -> Option<usize> {
+pub fn override_kib() -> Option<usize> {
     if let Some(value) = configured_override_kib(std::env::var(CACHE_ENV).ok().as_deref()) {
         return Some(value);
     }

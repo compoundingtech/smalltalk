@@ -172,46 +172,55 @@ pub fn run_controlled_paths(
     ];
     env.extend(paths.environment(&identity));
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
-    run_provider_with_env_removals(
-        "Claude",
-        None,
-        &claude_argv,
-        &env,
-        &[
-            EXPECTED_NATIVE_SESSION_ENV,
-            RESUME_GENERATION_ENV,
-            "CATALOG",
-            "ST_ROOT",
-        ],
-        crate::provider_session::SESSION_REFRESH,
-        PROVIDER_POLL,
-        &STOP,
-        Some(&observer),
-    )
+    crate::claude_usage::supervise(paths, &identity, &runtime_id, observer.session(), || {
+        run_provider_with_env_removals(
+            "Claude",
+            None,
+            &claude_argv,
+            &env,
+            &[
+                EXPECTED_NATIVE_SESSION_ENV,
+                RESUME_GENERATION_ENV,
+                "CATALOG",
+                "ST_ROOT",
+            ],
+            crate::provider_session::SESSION_REFRESH,
+            PROVIDER_POLL,
+            &STOP,
+            Some(&observer),
+        )
+    })
     .with_context(|| format!("running interactive Claude driver '{runtime_id}'"))
 }
 
 /// Resume supervising an interactive Claude provider a predecessor driver image launched through
 /// [`run_controlled_paths`] and released with [`crate::provider_session::Detached`].
 pub fn adopt_controlled_paths(
-    agent_dir: &Path,
+    paths: &crate::driver_paths::Paths,
     identity: &str,
     runtime_id: &str,
     pid: u32,
     session: &str,
     seq: u64,
 ) -> Result<()> {
-    let observer = SessionObserver::adopt(agent_dir, identity, "claude", runtime_id, session, seq);
-    crate::provider_session::adopt_provider(
-        "Claude",
-        None,
-        pid,
-        crate::provider_session::SESSION_REFRESH,
-        PROVIDER_POLL,
-        &STOP,
-        Some(&observer),
-    )
+    let observer = SessionObserver::adopt(&paths.agent_dir, identity, "claude", runtime_id, session, seq);
+    crate::claude_usage::supervise(paths, identity, runtime_id, session, || {
+        crate::provider_session::adopt_provider(
+            "Claude",
+            None,
+            pid,
+            crate::provider_session::SESSION_REFRESH,
+            PROVIDER_POLL,
+            &STOP,
+            Some(&observer),
+        )
+    })
     .with_context(|| format!("supervising adopted interactive Claude driver '{runtime_id}'"))
+}
+
+/// A current native usage acquisition fault; Stop observations do not certify complete usage.
+pub fn usage_observation_warning(agent_dir: &Path, incarnation: &str) -> Option<String> {
+    crate::claude_usage::warning(agent_dir, incarnation)
 }
 
 fn requires_st2_channel(argv: &[String]) -> bool {
@@ -1573,10 +1582,9 @@ fn wrapperless_token(payload: &serde_json::Value) -> Option<String> {
 /// [`observe_writer`] selects: the wrapper's exported token when a wrapper launched this seat,
 /// otherwise Claude's own session id under the wrapperless prefix.
 ///
-/// The claim half of that selection is deliberately absent. `incarnation` on this record is
-/// PROVENANCE and is never consulted as a fence (HC-R15), so there is nothing here to claim —
-/// which is also why the status-line tee, which is not a hook and has no session boundary, can
-/// share the selection without sharing the takeover.
+/// This helper selects a token without claiming ownership. Native observation outboxes require
+/// it to match the current harness-state owner. Legacy context files retain provenance without
+/// fencing (HC-R15). The status-line tee shares this selection without taking over a session.
 fn context_writer(
     agent_dir: &Path,
     identity: &str,

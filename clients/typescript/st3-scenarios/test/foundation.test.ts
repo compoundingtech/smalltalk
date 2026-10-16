@@ -222,7 +222,9 @@ describe('foundation contracts', () => {
 
   it('keeps attach and subscribe working when only the advertised capability is omitted', async () => {
     const original = base()
-    const world = original.with({ sync: { ...original.slices.sync, state: { ...original.slices.sync.state, capabilities: { ...original.slices.sync.state.capabilities, capabilities: original.slices.sync.state.capabilities.capabilities.filter((entry) => entry.id !== 'terminal.attach') } } } })
+    const capabilities = original.slices.sync.state.capabilities
+    if (capabilities === undefined) throw new Error('Synthetic base must advertise capabilities')
+    const world = original.with({ sync: { ...original.slices.sync, state: { ...original.slices.sync.state, capabilities: { ...capabilities, capabilities: capabilities.capabilities.filter((entry) => entry.id !== 'terminal.attach') } } } })
     const clock = manualClock(world.now)
     const replay = createReplay(world, { clock })
     replays.push(replay)

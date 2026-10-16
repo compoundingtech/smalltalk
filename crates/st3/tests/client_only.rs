@@ -70,6 +70,8 @@ impl Tui {
         command.env("XDG_CACHE_HOME", root.join("cache"));
         command.env("XDG_STATE_HOME", root.join("state"));
         command.env("TERM", "xterm-256color");
+        // A real restart of st reads "connecting" for a minute; this test only waits 25 s for "offline".
+        command.env("STUI_OFFLINE_GRACE_MS", "0");
         // These deliberately unusable local settings must never select local authority.
         command.env("ST3_ENDPOINT", root.join("absent.sock"));
         command.env("ST3_PERSON", "person/wrong-local-actor");

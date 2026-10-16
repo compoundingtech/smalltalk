@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep native driver stop-ordering proofs in the current runtime integration suite.",
+  "replay": {
+    "status": "none",
+    "detail": "none"
+  },
+  "schema": {
+    "status": "none",
+    "detail": "none"
+  },
+  "rules": {
+    "status": "none",
+    "detail": "none"
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI disables retries only for the three named native stop-ordering tests; runtime and client behavior are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "none"
+  },
+  "manual": {
+    "status": "none",
+    "detail": "none"
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "none"
+  }
+}

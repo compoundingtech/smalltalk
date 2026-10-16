@@ -8,7 +8,7 @@ import { harnessColor, theme } from './theme';
 // st found running but did not start listed last.
 
 // Declaration order is the sort order, as in stui's AgentState.
-export const AGENT_STATES = ['needs-you', 'needs-login', 'fault', 'working', 'compacting', 'idle', 'starting', 'down', 'stopped', 'unknown'] as const;
+export const AGENT_STATES = ['needs-you', 'needs-login', 'fault', 'working', 'compacting', 'idle', 'starting', 'down', 'stopped', 'retired', 'unknown'] as const;
 export type AgentState = typeof AGENT_STATES[number];
 
 export type AgentRowView = {
@@ -19,6 +19,8 @@ export type AgentRowView = {
   name: string;
   harness: string;
   state: AgentState;
+  /** The state st reports, from an st too old to serve a presentation. */
+  reported?: string;
   unmanaged: boolean;
   /** How long since st last saw it change, e.g. `8h`. */
   activity: string;
@@ -61,29 +63,21 @@ export function harnessName(driver: string | null | undefined): string {
   return '?';
 }
 
-type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'> & { activity?: string | null } & { harness_error_state?: string | null; reason?: string | null; observation?: string | null; reachability?: string | null };
-export function agentState(agent: StateAgent): AgentState {
-  if (agent.fault) return 'fault';
-  // A seat whose message path runs a replaced binary or stopped polling takes no messages,
-  // however ready its harness looks.
-  if (agent.delivery?.state === 'stale') return 'fault';
-  switch (agent.state) {
-    case 'failed': return 'fault';
-    // st decides a seat with no session is down, since when; no app re-derives it.
-    case 'down': return 'down';
-    // A harness compacting its conversation is a status of the seat, never an alert.
-    case 'running': return agent.activity === 'compacting' ? 'compacting' : agent.harness_state === 'working' ? 'working' : 'idle';
-    // Signed out of its provider: a login on its host fixes it, without a restart (Nathan, 2026-10-04).
-    // st withdraws an idle claim it has not heard renewed lately: the harness reads "indeterminate"
-    // and the seat "waiting", though it is up and reachable. That is an idle seat nobody has
-    // spoken to, not one starting (Nathan, 2026-10-05).
-    case 'waiting': return agent.harness_error_state === 'needs-login' ? 'needs-login' : agent.harness_state === 'indeterminate' && agent.observation === 'stale' && (agent.reachability === 'reachable' || agent.reachability === 'local') ? 'idle' : agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
-    case 'starting':
-    case 'desired': return 'starting';
-    case 'stopped': return 'stopped';
-    default: return 'unknown';
-  }
+/** The state st serves for an agent (`presentation.state`, a words.json id). A daemon too old to
+ *  serve one leaves it unknown; the phone keeps no derivation of its own. */
+export function agentState(agent: Pick<Agent, 'presentation'>): AgentState {
+  const state = agent.presentation?.state.replace('_', '-');
+  return (AGENT_STATES as readonly string[]).includes(state ?? '') ? state as AgentState : 'unknown';
 }
+
+/** The word for an agent from an st too old to serve its presentation: the state st reports,
+ *  marked so. Undefined when st serves a presentation. */
+export function agentReported(agent: Pick<Agent, 'presentation' | 'state'>): string | undefined {
+  return agent.presentation ? undefined : `${agent.state} · older st`;
+}
+
+/** What the Agents list says when a row came from an older st. */
+export const OLDER_ST_NOTE = "This host's st is older: agent states show as st reports them.";
 
 export const SPINNER = '⠿';
 export function agentGlyph(state: AgentState, spinner = SPINNER): { glyph: string; color: string } {
@@ -96,7 +90,8 @@ export function agentGlyph(state: AgentState, spinner = SPINNER): { glyph: strin
     case 'idle': return { glyph: '●', color: theme.idle };
     case 'starting': return { glyph: '◌', color: theme.waiting };
     case 'down': return { glyph: '⊘', color: theme.fault };
-    case 'stopped': return { glyph: '○', color: theme.quiet };
+    case 'stopped':
+    case 'retired': return { glyph: '○', color: theme.quiet };
     case 'unknown': return { glyph: '?', color: theme.quiet };
   }
 }
@@ -112,6 +107,7 @@ export function agentWord(state: AgentState): string {
     case 'starting': return 'starting';
     case 'down': return 'down';
     case 'stopped': return 'stopped';
+    case 'retired': return 'retired';
     case 'unknown': return 'not managed';
   }
 }
@@ -130,6 +126,7 @@ export function agentGroup(row: Pick<AgentRowView, 'state' | 'unmanaged'>): stri
     case 'starting': return 'idle';
     case 'stopped':
     case 'unknown': return 'stopped';
+    case 'retired': return 'retired';
   }
 }
 
@@ -142,6 +139,7 @@ export const AGENT_LEGEND: ReadonlyArray<{ state: AgentState; word: string }> = 
   { state: 'fault', word: 'broken' },
   { state: 'down', word: 'down' },
   { state: 'stopped', word: 'stopped' },
+  { state: 'retired', word: 'retired' },
   { state: 'unknown', word: 'unmanaged' },
 ];
 
@@ -173,6 +171,7 @@ export function agentRows(agents: Agent[], sessions: SessionView[], gatewayHost:
     name: agentName(agent),
     harness: harnessName(agent.driver),
     state: agentState(agent),
+    reported: agentReported(agent),
     unmanaged: false,
     activity: ago(agent.updated_at, now),
     path: agent.id.replace(/^agent\//, ''),

@@ -1,4 +1,10 @@
-import { SIDEBAR_ARRANGEMENT_UUID, type Arrangement, type ArrangementOperation } from '../../clients/typescript/st3-client';
+import { ClientError, SIDEBAR_ARRANGEMENT_UUID, type Arrangement, type ArrangementOperation } from '../../clients/typescript/st3-client';
+
+/** What a person reads when their Sidebar was removed and no older one exists to edit. */
+export const SIDEBAR_RETIRED = 'This Sidebar was removed; restoring a removed Sidebar is not available yet.';
+/** Whether st refused to create the Sidebar because the person retired it. Retired arrangements
+ *  leave the window, so this refusal is how the phone learns it. */
+export function sidebarRetired(error: unknown): boolean { return error instanceof ClientError && error.response.code === 'arrangement-retired'; }
 
 /** The subject of a person's one Sidebar (#2043); concurrent creates converge on it. */
 export function sidebarSubject(person: string): string { return `arrangement/${person}/${SIDEBAR_ARRANGEMENT_UUID}`; }

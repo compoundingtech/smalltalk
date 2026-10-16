@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "When a Fabric tunnel closes, st asks `fabric probe --json` whether the member refused it, and puts only a refusal-class route to sleep.",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "After an exchange over a Fabric route fails at the connection, the replication worker runs `fabric probe PEER SERVICE --json` and reads its `code` and `class`. A Fabric older than 0.2.41 prints no `code` or `class`, so st reads the two old refusal phrases in its `error` text, in the same legacy fallback as the dial path. No wire change. Fabric exec of a program now retries a few times on `text file busy`."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover."}
+}

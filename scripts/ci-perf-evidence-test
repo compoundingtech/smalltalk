@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -12,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='perf evidence ') as scratch:
     tools = base / 'tools'
     tools.mkdir()
     cargo = tools / 'cargo'
-    cargo.write_text('''#!/usr/bin/env python3
+    cargo.write_text('#!' + sys.executable + '''
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ['RUNNER_TEMP'])
 with (root / 'calls.jsonl').open('a') as output:

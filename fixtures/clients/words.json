@@ -46,6 +46,11 @@
       "name": "stopped"
     },
     {
+      "glyph": "○",
+      "id": "retired",
+      "name": "retired"
+    },
+    {
       "glyph": "?",
       "id": "unknown",
       "name": "not managed"

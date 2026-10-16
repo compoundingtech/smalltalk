@@ -1,6 +1,7 @@
+import type { Capabilities } from '@smalltalk/st3-client'
 import type { FactoryContext } from '../context.ts'
 import * as resources from '../resources.ts'
-import type { Selector, Slice, SyncExpectation, SyncSurface } from '../slice.ts'
+import type { Selector, Slice, SyncExpectation, SyncState, SyncSurface } from '../slice.ts'
 import type { SyncStatus } from '../syncStatus.ts'
 import type { Slices, VariantTable } from '../world.ts'
 
@@ -14,7 +15,7 @@ const everySurface = (surfaces: SyncSurface[], at_ms: number, status: SyncStatus
   surfaces.map((surface) => ({ surface, at_ms, status, compare }))
 
 /** Healthy transport: every surface goes `Live` from its first snapshot or conversation frame. */
-export const liveSync = (ctx: FactoryContext, slices: Pick<Slices, 'conversation'>): Slice<'sync'> => ({
+export const liveSync = (ctx: FactoryContext, slices: Pick<Slices, 'conversation'>): Slice<'sync'> & { readonly state: SyncState & { readonly capabilities: Capabilities } } => ({
   kind: 'sync',
   variant: 'live',
   source: { _tag: 'synthetic', seed: 0 },

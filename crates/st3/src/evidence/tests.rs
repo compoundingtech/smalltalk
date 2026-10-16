@@ -363,6 +363,8 @@ fn simultaneous_writers_keep_every_record_and_same_import_is_idempotent() {
         }
     });
     assert_eq!(records(f.repo()).unwrap().len(), 6);
+    // Six concurrent first writers measured the process image once between them.
+    assert_eq!(MEASUREMENTS.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]

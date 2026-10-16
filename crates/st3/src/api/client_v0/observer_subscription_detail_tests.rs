@@ -843,7 +843,7 @@ async fn measured_detail(
     during: impl FnOnce() + Send + 'static,
 ) -> (ClientSnapshot, Value, smallclaims::sqlite::work::SqliteWork) {
     let state = state.clone();
-    super::super::read_deadline::spawn_handler(None, move || {
+    super::super::read_deadline::spawn_handler(None, None, move || {
         let store = state.store.clone();
         store
             .readers

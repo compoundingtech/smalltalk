@@ -194,6 +194,63 @@
       0,
       0,
       0
+    ],
+    "send_echo_ms": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "send_ack_ms": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "send_visible_ms": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
     ]
   },
   "targets": {
@@ -208,6 +265,8 @@
     "reconnect_p95_ms_lt": 10000.0,
     "direct_attach_success_percent_gte": 99.0,
     "terminal_open_p95_ms_lt": 1000.0,
-    "alert_landed_p95_ms_lt": 2000.0
+    "alert_landed_p95_ms_lt": 2000.0,
+    "send_echo_p99_ms_lt": 100.0,
+    "send_visible_p99_ms_lt": 200.0
   }
 }

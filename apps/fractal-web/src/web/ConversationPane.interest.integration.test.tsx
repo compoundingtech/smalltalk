@@ -13,13 +13,7 @@ import type { ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // The kit compiles StyleX at build time; node tests stub only the CSS runtime, never data hooks.
-vi.mock('@stylexjs/stylex', () => ({
-  create: (styles: unknown) => styles,
-  defineVars: (variables: unknown) => variables,
-  createTheme: () => ({}),
-  keyframes: () => 'test-animation',
-  props: () => ({}),
-}))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 import { liveSource, type LiveSource } from '../data/liveSource.ts'
 import { DataSourceProvider } from '../data/react.tsx'
 import { ConversationPane } from './ConversationPane.tsx'

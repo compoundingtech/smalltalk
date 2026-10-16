@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep native work lease polling independent of timing history and list presentation",
+  "replay": { "status": "none", "detail": "No claim or projection replay changes." },
+  "schema": { "status": "none", "detail": "Uses the existing held-step lease index; no persisted schema changes." },
+  "rules": { "status": "none", "detail": "Preserves current owner, generation, lease and harness-incarnation checks and writer-side renewal validation." },
+  "compatibility": { "status": "changed", "detail": "GET /v1/work accepts view=renewal with a required actor and returns only currently held claimed/working/verifying/blocked steps selected by the driver's shared held-claim predicate, without timing, queue, wake, summaries or hierarchy enrichment. Native renewal polling selects this view. The default full list is unchanged. Fixed performance labels distinguish work/renewal, work/list and named native diagnostic, timeline, wait and subagent callers." },
+  "downtime": { "status": "none", "detail": "Normal binary rollout; no backfill." },
+  "manual": { "status": "none", "detail": "No operator steps required." },
+  "recovery": { "status": "none", "detail": "Ordinary binary rollback restores full-list native polling without changing durable state." }
+}

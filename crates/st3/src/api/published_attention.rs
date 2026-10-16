@@ -274,6 +274,7 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
         let changed = previous
             .as_ref()
             .is_none_or(|previous| !Arc::ptr_eq(&previous.rows, &rows));
+        let published_at_unix_ms = client_now_ms();
         store.publish_attention_list(
             generation,
             AttentionPublication {
@@ -282,11 +283,25 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
                 evaluated_at_unix_ms,
                 due_at_unix_ms,
                 future_after,
-                published_at_unix_ms: client_now_ms(),
+                published_at_unix_ms,
                 rows,
             },
             changed,
         );
+        // While windows read attention it publishes at least once a clock period. A previous
+        // publication older than two was from before the refresher followed commits again: its
+        // commits waited for a reader, not for a fold, and are not a freshness sample.
+        if let Some(previous) = previous.as_ref().filter(|previous| {
+            published_at_unix_ms.saturating_sub(previous.published_at_unix_ms) <= 2 * clock
+        }) {
+            super::record_publish_latency(
+                store,
+                "attention",
+                previous.cut,
+                index,
+                published_at_unix_ms,
+            );
+        }
         Ok(())
     })
 }

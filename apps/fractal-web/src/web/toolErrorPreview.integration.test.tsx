@@ -6,11 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { EmbraceToolItem } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceToolCall.tsx'
 import { ToolDetailPreview } from '../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx'
 
-vi.mock('@stylexjs/stylex', () => ({
-  create: (styles: unknown) => styles,
-  defineVars: (variables: unknown) => variables,
-  createTheme: () => ({}), keyframes: () => 'test-animation', props: () => ({}),
-}))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 let root: Root
 let container: HTMLDivElement

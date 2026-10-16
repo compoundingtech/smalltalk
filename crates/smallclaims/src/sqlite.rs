@@ -20,6 +20,10 @@ mod transaction_finalizer;
 #[cfg(test)]
 mod managed_commit_counter_tests;
 mod writer_queue;
+mod writer_admission;
+pub use writer_admission::{MAX_WRITE_WORKERS, WritePermit, WriteWorkers, max_write_workers};
+#[cfg(any(test, feature = "test-support"))]
+pub use writer_admission::with_write_limit_for_test;
 
 #[cfg(test)]
 mod read_admission_tests;
@@ -329,6 +333,7 @@ pub struct WriterConnection {
     observers: Arc<CommitObservers>,
     finalizers: Arc<TransactionFinalizers>,
     background: Arc<writer_queue::BackgroundAdmission>,
+    workers: Arc<Semaphore>,
     handler_policy: Arc<Mutex<Option<Arc<writer_budget::OwnedHandlerPolicy>>>>,
     mutation_observer: Option<Arc<writer_observer::MutationState>>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
@@ -464,6 +469,7 @@ impl WriterConnection {
             observers,
             finalizers,
             background,
+            workers: Arc::new(Semaphore::new(writer_admission::constructor_write_limit())),
             handler_policy,
             mutation_observer,
             batches,
@@ -1275,7 +1281,7 @@ impl Drop for PinnedRead<'_> {
 
 impl ReadPool {
     pub fn new(path: &Path, shared_memory: bool) -> Result<Self> {
-        let pool = Self {
+        let mut pool = Self {
             idle: Arc::new(Mutex::new(Vec::new())),
             returned: Condvar::new(),
             path: path.to_path_buf(),
@@ -1286,6 +1292,7 @@ impl ReadPool {
         };
         // Open one now, so a store that cannot be read fails to open.
         let connection = pool.open_connection()?;
+        pool.path = opened_database_path(&connection, path)?;
         pool.release(connection);
         telemetry::register_pool(&pool);
         Ok(pool)
@@ -1936,6 +1943,32 @@ pub mod work {
         }
     }
 
+}
+
+/// Use the filename of the actual opened main database, as resolved by SQLite's VFS.
+/// Unlike canonicalizing the caller's spelling, this also handles a newly created file and
+/// SQLite URI filenames. Empty filenames denote memory/temporary databases: retain the
+/// original URI so named shared-memory readers still open the same database.
+pub(crate) fn opened_database_path(connection: &Connection, requested: &Path) -> Result<PathBuf> {
+    let filename: Vec<u8> = connection
+        .query_row("SELECT file FROM pragma_database_list WHERE name='main'", [], |row| {
+            Ok(row.get_ref(0)?.as_bytes()?.to_vec())
+        })
+        .with_context(|| format!("resolve opened st database {}", requested.display()))?;
+    if filename.is_empty() {
+        return Ok(requested.to_path_buf());
+    }
+    // SQLite accepts native filename bytes on Unix. Do not turn a valid non-UTF-8 target
+    // into another path through display/to_string_lossy while deriving readers or sidecars.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(filename)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(String::from_utf8(filename).context("opened st database filename is not UTF-8")?))
+    }
 }
 
 pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {

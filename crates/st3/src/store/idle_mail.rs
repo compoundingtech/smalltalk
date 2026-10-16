@@ -70,7 +70,7 @@ DROP TRIGGER IF EXISTS local_idle_messages_update;
            WHERE subject=NEW.subject AND (pending<>0 OR
              (delivered<>1 AND NEW.kind IN ('message.delivered','message.read'))); END;",
     )?;
-    // Claim bytes are immutable in normal admission; migration/heal can update them.
+    // Claim bytes are immutable in normal admission; a migration can update them.
     connection.execute_batch(&format!(
         "CREATE TRIGGER IF NOT EXISTS local_idle_messages_update_v1
          AFTER UPDATE OF subject,kind,body,accepted_at_unix_ms ON claims

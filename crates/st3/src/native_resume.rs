@@ -82,6 +82,61 @@ fn refuse_authored(argv: &[String], flags: &[&str]) -> Result<(), Refusal> {
     }
 }
 
+/// Session selectors shared by native resume and its request-time preflight.
+fn selection_flags(driver: &str) -> &'static [&'static str] {
+    match driver {
+        "claude" => &[
+            "-c",
+            "--continue",
+            "-r",
+            "--resume",
+            "--session-id",
+            "--fork-session",
+            "--from-pr",
+            "--teleport",
+        ],
+        "pi" | "omp" => &[
+            "-c",
+            "--continue",
+            "-r",
+            "--resume",
+            "--session",
+            "--session-id",
+            "--fork",
+            "--no-session",
+        ],
+        "opencode" => &["-c", "--continue", "-s", "--session", "--fork"],
+        "codex" => &["resume", "fork"],
+        _ => &[],
+    }
+}
+
+fn codex_selection(argv: &[String]) -> Option<String> {
+    argv.iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .find(|argument| matches!(argument.as_str(), "resume" | "fork"))
+        .cloned()
+}
+
+/// Check only the declared argv, without reading a native transcript or requiring rollout
+/// support. This uses the same selectors that strict native resume refuses.
+pub fn authored_session_selection(member: &crate::model::MemberSpec) -> Option<String> {
+    let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+        return None;
+    };
+    let provider = argv
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(argv.as_slice(), |index| &argv[index + 1..]);
+    let driver = member.driver.as_deref()?;
+    if driver == "codex" {
+        codex_selection(provider)
+    } else {
+        authors_selection(provider, selection_flags(driver))
+    }
+}
+
 /// The normalized authored selector, independent of unrelated launch arguments.
 pub fn selection_scope(member: &crate::model::MemberSpec) -> Option<String> {
     let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
@@ -94,13 +149,7 @@ pub fn selection_scope(member: &crate::model::MemberSpec) -> Option<String> {
 
 pub fn selector_scope(driver: &str, argv: &[String]) -> Option<String> {
     use sha2::{Digest as _, Sha256};
-    let flags: &[&str] = match driver {
-        "claude" => &["-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "--from-pr", "--teleport"],
-        "pi" | "omp" => &["-c", "--continue", "-r", "--resume", "--session", "--session-id", "--fork", "--no-session"],
-        "opencode" => &["-c", "--continue", "-s", "--session", "--fork"],
-        "codex" => &["resume", "fork"],
-        _ => return None,
-    };
+    let flags = selection_flags(driver);
     let mut selected = Vec::new();
     let mut args = argv.iter().skip(1).take_while(|arg| arg.as_str() != "--").peekable();
     while let Some(arg) = args.next() {
@@ -155,34 +204,10 @@ pub fn rollout_support(member: &crate::model::MemberSpec) -> Result<(), Refusal>
         .position(|argument| argument == "--")
         .map_or(argv.as_slice(), |index| &argv[index + 1..]);
     match member.driver.as_deref() {
-        Some("claude") => refuse_authored(
-            provider,
-            &[
-                "-c",
-                "--continue",
-                "-r",
-                "--resume",
-                "--session-id",
-                "--fork-session",
-                "--from-pr",
-                "--teleport",
-            ],
-        ),
-        Some("pi" | "omp") => refuse_authored(
-            provider,
-            &[
-                "-c",
-                "--continue",
-                "-r",
-                "--resume",
-                "--session",
-                "--session-id",
-                "--fork",
-                "--no-session",
-            ],
-        ),
+        Some("claude") => refuse_authored(provider, selection_flags("claude")),
+        Some("pi" | "omp") => refuse_authored(provider, selection_flags("pi")),
         Some("opencode") => {
-            refuse_authored(provider, &["-c", "--continue", "-s", "--session", "--fork"])
+            refuse_authored(provider, selection_flags("opencode"))
         }
         Some("codex") => codex_check(provider, "rollout-preflight"),
         _ => Err(Refusal::new(
@@ -262,19 +287,7 @@ pub fn claude_argv(
     home: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
-    refuse_authored(
-        &argv,
-        &[
-            "-c",
-            "--continue",
-            "-r",
-            "--resume",
-            "--session-id",
-            "--fork-session",
-            "--from-pr",
-            "--teleport",
-        ],
-    )?;
+    refuse_authored(&argv, selection_flags("claude"))?;
     let home =
         home.ok_or_else(|| Refusal::new("transcript-missing", "Claude has no config directory"))?;
     let transcript = claude_transcript(home, workspace, id);
@@ -501,8 +514,10 @@ fn exchange_transcript_inventory(prepared: &Path, sessions: &Path) -> std::io::R
     if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
-/// pi resumes by transcript path, omp by session ID. pi silently starts a new session at a
-/// path that does not exist, so both check the transcript first.
+/// Both pi and omp resume by the transcript path checked here. omp's own session-ID lookup does
+/// not follow symlinks, so it cannot find the individual-file link st stages in the inventory;
+/// the checked path is passed as is, without a second resolution. pi silently starts a new
+/// session at a path that does not exist, so both check the transcript first.
 pub fn pi_family_argv(
     driver: &str,
     argv: Vec<String>,
@@ -510,28 +525,17 @@ pub fn pi_family_argv(
     id: &str,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
-    refuse_authored(
-        &argv,
-        &[
-            "-c",
-            "--continue",
-            "-r",
-            "--resume",
-            "--session",
-            "--session-id",
-            "--fork",
-            "--no-session",
-        ],
-    )?;
+    refuse_authored(&argv, selection_flags("pi"))?;
     let transcript = pi_family_transcript(sessions, id).ok_or_else(|| {
         Refusal::new(
             "transcript-missing",
             format!("{driver} session {id} has no transcript in {}", sessions.display()),
         )
     })?;
+    let path = transcript.to_string_lossy();
     Ok(match driver {
-        "omp" => insert_after_program(argv, &["--resume", id]),
-        _ => insert_after_program(argv, &["--session", &transcript.to_string_lossy()]),
+        "omp" => insert_after_program(argv, &["--resume", &path]),
+        _ => insert_after_program(argv, &["--session", &path]),
     })
 }
 
@@ -552,7 +556,7 @@ pub fn opencode_argv(
     data_dir: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
-    refuse_authored(&argv, &["-c", "--continue", "-s", "--session", "--fork"])?;
+    refuse_authored(&argv, selection_flags("opencode"))?;
     if let Some(database) = data_dir
         .map(|dir| dir.join("opencode.db"))
         .filter(|path| path.is_file())
@@ -602,12 +606,7 @@ pub fn opencode_bound_session(agent_dir: &Path) -> Option<String> {
 /// rollouts, so it is not a precondition.
 pub fn codex_check(argv: &[String], id: &str) -> Result<(), Refusal> {
     valid_id(id)?;
-    if argv
-        .iter()
-        .skip(1)
-        .take_while(|argument| argument.as_str() != "--")
-        .any(|argument| matches!(argument.as_str(), "resume" | "fork"))
-    {
+    if codex_selection(argv).is_some() {
         return Err(Refusal::new(
             "authored-session-selection",
             "the seat declares its own Codex thread selection, so st cannot resume",
@@ -622,6 +621,46 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn suspend_preflight_names_selectors_in_typed_launches() {
+        for (driver, args, expected) in [
+            ("claude", "\"--continue\"", Some("--continue")),
+            (
+                "claude",
+                "\"--resume=native-copper\"",
+                Some("--resume=native-copper"),
+            ),
+            (
+                "pi",
+                "\"--session\" \"/missing-transcript\"",
+                Some("--session"),
+            ),
+            ("omp", "\"-c\"", Some("-c")),
+            ("omp", "\"--no-session\"", Some("--no-session")),
+            ("opencode", "\"-s\" \"native-copper\"", Some("-s")),
+            ("codex", "\"resume\" \"native-copper\"", Some("resume")),
+            ("codex", "\"fork\" \"native-copper\"", Some("fork")),
+            ("omp", "\"--model\" \"copper\"", None),
+            ("omp", "\"--\" \"--resume\"", None),
+            ("codex", "\"--\" \"resume\"", None),
+        ] {
+            let source = format!(
+                "version 2\nagent \"example\" {{ host \"amber\"; workspace \"/workspace\"; harness {driver:?} {{ args {args}; }} }}"
+            );
+            let member = crate::parse_intent(&source, "amber")
+                .unwrap()
+                .subjects
+                .into_values()
+                .find_map(|desired| desired.member)
+                .unwrap();
+            assert_eq!(
+                authored_session_selection(&member).as_deref(),
+                expected,
+                "{driver}: {args}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -998,13 +1037,103 @@ mod tests {
         );
         assert_eq!(
             pi_family_argv("omp", argv(&["omp"]), &sessions, "two").unwrap(),
-            argv(&["omp", "--resume", "two"])
+            argv(&["omp", "--resume", &path.to_string_lossy()])
         );
         assert_eq!(
             pi_family_argv("omp", argv(&["omp", "--no-session"]), &sessions, "two")
                 .unwrap_err()
                 .code,
             "authored-session-selection"
+        );
+    }
+
+    /// A stand-in for OMP 18.10.2's selector lookup: a path selector opens the file, and a bare
+    /// session ID is found only among regular files of `--session-dir` (its glob does not follow
+    /// symlinks). It prints the header's session ID, or exits 1 as OMP does before it binds.
+    #[cfg(unix)]
+    fn stub_omp(root: &Path, sessions: &Path, arguments: &[String]) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = root.join("omp");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+dir="$1"; shift
+[ "$1" = "--resume" ] || exit 2
+selector="$2"
+case "$selector" in
+  */*) file="$selector" ;;
+  *) file=""
+     for candidate in "$dir"/*_"$selector".jsonl; do
+       if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then file="$candidate"; fi
+     done ;;
+esac
+[ -n "$file" ] && [ -f "$file" ] || { echo "no session matches $selector" >&2; exit 1; }
+sed -n '1s/.*"id":"\([^"]*\)".*/\1/p' "$file"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        std::process::Command::new(&script)
+            .arg(sessions)
+            .args(&arguments[1..])
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_resumes_a_symlinked_inventory_transcript_by_its_checked_path() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let transcript = legacy.join(format!("2026-10-04_{id}.jsonl"));
+        fs::write(&transcript, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
+        // st stages the authored transcript as an individual-file symlink.
+        let sessions = root.path().join("provider-sessions");
+        assert!(
+            pi_family_link_transcript(
+                &argv(&["omp", "--resume", transcript.to_str().unwrap()]),
+                &sessions,
+            )
+            .unwrap()
+        );
+        let staged = sessions.join(transcript.file_name().unwrap());
+        assert!(fs::symlink_metadata(&staged).unwrap().file_type().is_symlink());
+
+        let resumed = pi_family_argv("omp", argv(&["omp", "--model", "m"]), &sessions, id).unwrap();
+        assert_eq!(resumed, argv(&["omp", "--resume", &staged.to_string_lossy(), "--model", "m"]));
+        let output = stub_omp(root.path(), &sessions, &resumed);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), id);
+
+        // Control: the session-ID selector st used before cannot see the same symlink.
+        let by_id = argv(&["omp", "--resume", id]);
+        assert_eq!(stub_omp(root.path(), &sessions, &by_id).status.code(), Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_refuses_a_missing_or_mismatched_symlinked_transcript() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("provider-sessions");
+        fs::create_dir(&sessions).unwrap();
+        let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let name = format!("2026-10-04_{id}.jsonl");
+        // A dangling link is not a transcript, and a header naming another session is not this one.
+        symlink(root.path().join("gone.jsonl"), sessions.join(&name)).unwrap();
+        assert_eq!(
+            pi_family_argv("omp", argv(&["omp"]), &sessions, id).unwrap_err().code,
+            "transcript-missing"
+        );
+        fs::remove_file(sessions.join(&name)).unwrap();
+        let target = root.path().join("other.jsonl");
+        fs::write(&target, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+        symlink(&target, sessions.join(&name)).unwrap();
+        assert_eq!(
+            pi_family_argv("omp", argv(&["omp"]), &sessions, id).unwrap_err().code,
+            "transcript-missing"
         );
     }
 

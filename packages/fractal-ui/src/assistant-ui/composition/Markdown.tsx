@@ -26,16 +26,25 @@ export type MarkdownImageResolution = { readonly _tag: 'Load'; readonly src: str
 export type MarkdownImageResolver = (src: string) => MarkdownImageResolution
 /** Host handoff for a deferred image. When set, the placeholder action calls it instead of loading the image inline. */
 export type MarkdownImageOpener = (src: string) => void
-export interface MarkdownImageOptions { readonly resolveImage?: MarkdownImageResolver; readonly onLoadImage?: MarkdownImageOpener }
+export interface MarkdownImageOptions {
+  readonly resolveImage?: MarkdownImageResolver
+  readonly onLoadImage?: MarkdownImageOpener
+  /** A host's own inline references (for example `doc/…` names), for every Markdown below it. */
+  readonly renderInlineReference?: InlineReferenceRenderer
+}
 const NO_IMAGE_OPTIONS: MarkdownImageOptions = {}
 export const MarkdownImagePolicy = React.createContext<MarkdownImageOptions>(NO_IMAGE_OPTIONS)
-export interface MarkdownProps { text: string; streaming?: boolean; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer; resolveImage?: MarkdownImageResolver; onLoadImage?: MarkdownImageOpener }
+/** `muted` sets reasoning-style prose in the themed muted ink; strong text then stays muted, as it does inside quotes. */
+export interface MarkdownProps { text: string; streaming?: boolean; tone?: 'default' | 'muted' | 'foreground'; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer; resolveImage?: MarkdownImageResolver; onLoadImage?: MarkdownImageOpener }
 const EMPTY_RESOURCES: readonly InlineResource[] = []
 const REMARK_PLUGINS = [remarkGfm]
 const STREAMING_PLUGINS = [markStreamingTail]
-type ReferenceOptions = Omit<MarkdownProps, 'text' | 'streaming'>
+type ReferenceOptions = Omit<MarkdownProps, 'text' | 'streaming' | 'tone'>
 const EMPTY_REFERENCES: ReferenceOptions = {}
 const ReferenceContext = React.createContext<ReferenceOptions>(EMPTY_REFERENCES)
+const MutedTone = React.createContext(false)
+/** True directly inside a list item, where blocks get the 8px sibling gap the root and quotes get from flex. */
+const InListItem = React.createContext(false)
 /** Paragraphs keep the caret on their final line; every other terminal block gets an inline fallback. */
 function markStreamingTail() {
   return (tree: Root) => {
@@ -52,11 +61,11 @@ function markStreamingTail() {
   }
 }
 
-export const Markdown = React.memo(function Markdown({ text, streaming = false, resources = EMPTY_RESOURCES, onOpenResource, renderInlineReference, resolveImage, onLoadImage }: MarkdownProps) {
+export const Markdown = React.memo(function Markdown({ text, streaming = false, tone = 'default', resources = EMPTY_RESOURCES, onOpenResource, renderInlineReference, resolveImage, onLoadImage }: MarkdownProps) {
   const inherited = React.useContext(MarkdownImagePolicy)
-  const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference, resolveImage: resolveImage ?? inherited.resolveImage, onLoadImage: onLoadImage ?? inherited.onLoadImage }), [resources, onOpenResource, renderInlineReference, resolveImage, onLoadImage, inherited])
+  const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference: renderInlineReference ?? inherited.renderInlineReference, resolveImage: resolveImage ?? inherited.resolveImage, onLoadImage: onLoadImage ?? inherited.onLoadImage }), [resources, onOpenResource, renderInlineReference, resolveImage, onLoadImage, inherited])
   const source = React.useMemo(() => streaming ? completeStreamingTail(text) : text, [text, streaming])
-  return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown skipHtml urlTransform={(url, key) => key === 'src' ? url : defaultUrlTransform(url)} remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
+  return <ReferenceContext.Provider value={references}><MutedTone.Provider value={tone === 'muted'}><div data-testid="markdown" data-tone={tone} {...stylex.props(styles.markdown, tone === 'muted' && styles.muted, tone === 'foreground' && styles.foreground)}><ReactMarkdown skipHtml urlTransform={(url, key) => key === 'src' ? url : defaultUrlTransform(url)} remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></MutedTone.Provider></ReferenceContext.Provider>
 })
 
 function DeferredImage({ src = '', alt = '' }: React.ComponentProps<'img'>) {
@@ -81,7 +90,7 @@ function MarkdownLink({ children, href, title, node }: React.ComponentProps<'a'>
 
 function Paragraph({ children, node }: React.ComponentProps<'p'> & ExtraProps) {
   const live = node?.properties['data-streaming-tail'] === true
-  return <p data-streaming-tail={live || undefined} {...stylex.props(styles.paragraph, styles.prose, live && styles.streamingTail)}><InlineText>{children}</InlineText></p>
+  return <p data-streaming-tail={live || undefined} {...stylex.props(styles.paragraph, styles.prose, React.useContext(InListItem) && styles.itemBlock, live && styles.streamingTail)}><InlineText>{children}</InlineText></p>
 }
 
 function renderReference(path: string, options: ReferenceOptions): React.ReactNode | undefined {
@@ -161,7 +170,7 @@ const CodeBlock = React.memo(function CodeBlock({ code, language }: { code: stri
   }
   const copiedCurrentCode = copy.tag === 'copied' && copy.code === code
   const copyLabel = copy.tag === 'copying' ? 'Copying…' : copiedCurrentCode ? 'Copied' : 'Copy'
-  return <div data-testid="markdown-code-block" data-language={language || 'text'} data-wrap={wrap} data-copy-state={copy.tag} {...stylex.props(styles.codeBlock)}>
+  return <div data-testid="markdown-code-block" data-language={language || 'text'} data-wrap={wrap} data-copy-state={copy.tag} {...stylex.props(styles.codeBlock, React.useContext(InListItem) && styles.itemBlock)}>
     <div {...stylex.props(styles.codeToolbar)}>
       <span data-testid="markdown-code-language" {...stylex.props(styles.codeLanguage)}>{language || 'text'}</span>
       <Button aria-label="Wrap code" aria-pressed={wrap} onPress={() => setWrap(value => !value)} {...stylex.props(styles.codeButton, wrap && styles.codeButtonSelected)}>Wrap</Button>
@@ -184,20 +193,33 @@ function CodeFence({ node }: React.ComponentProps<'pre'> & ExtraProps) {
 const heading = (Tag: 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6') => function Heading({ children }: React.ComponentProps<'h3'>) {
   return <Tag {...stylex.props(styles.heading, styles.prose)}><InlineText>{children}</InlineText></Tag>
 }
+/** Nesting depth, so a list inside a list item gets the indent, rail and open marker. */
+const ListDepth = React.createContext(0)
+function MarkdownStrong({ children }: React.ComponentProps<'strong'>) {
+  return <strong {...stylex.props(styles.strong, React.useContext(MutedTone) && styles.strongMuted)}><InlineText>{children}</InlineText></strong>
+}
+function MarkdownQuote({ children }: React.ComponentProps<'blockquote'>) {
+  return <blockquote {...stylex.props(styles.blockquote, React.useContext(InListItem) && styles.itemBlock)}><InListItem.Provider value={false}><MutedTone.Provider value>{children}</MutedTone.Provider></InListItem.Provider></blockquote>
+}
+function MarkdownList({ ordered, start, children }: { readonly ordered: boolean; readonly start?: number; readonly children?: React.ReactNode }) {
+  const depth = React.useContext(ListDepth)
+  const props = { 'data-list-depth': depth, ...stylex.props(styles.list, styles.prose, ordered ? styles.orderedList : styles.unorderedList, depth > 0 && styles.nestedList, depth > 0 && !ordered && styles.nestedUnordered) }
+  return <ListDepth.Provider value={depth + 1}>{ordered ? <ol start={start} {...props}>{children}</ol> : <ul {...props}>{children}</ul>}</ListDepth.Provider>
+}
 const MARKDOWN_COMPONENTS: Components = {
   h1: heading('h1'), h2: heading('h2'), h3: heading('h3'), h4: heading('h4'), h5: heading('h5'), h6: heading('h6'),
   p: Paragraph,
   span: ({ children, node }) => <span data-streaming-tail={node?.properties['data-streaming-tail'] || undefined} aria-hidden={node?.properties['aria-hidden'] === true || undefined} {...stylex.props(node?.properties['data-streaming-tail'] === true && styles.streamingTail)}>{children}</span>,
-  strong: ({ children }) => <strong {...stylex.props(styles.strong)}><InlineText>{children}</InlineText></strong>,
+  strong: MarkdownStrong,
   em: ({ children }) => <em {...stylex.props(styles.emphasis)}><InlineText>{children}</InlineText></em>,
-  ul: ({ children }) => <ul {...stylex.props(styles.list, styles.prose, styles.unorderedList)}>{children}</ul>,
-  ol: ({ children, start }) => <ol start={start} {...stylex.props(styles.list, styles.prose, styles.orderedList)}>{children}</ol>,
-  li: ({ children }) => <li {...stylex.props(styles.listItem)}><InlineText>{children}</InlineText></li>,
+  ul: ({ children }) => <MarkdownList ordered={false}>{children}</MarkdownList>,
+  ol: ({ children, start }) => <MarkdownList ordered start={start}>{children}</MarkdownList>,
+  li: ({ children }) => <li {...stylex.props(styles.listItem)}><InListItem.Provider value><InlineText>{children}</InlineText></InListItem.Provider></li>,
   a: MarkdownLink,
   code: InlineCode,
   img: DeferredImage,
   pre: CodeFence,
-  blockquote: ({ children }) => <blockquote {...stylex.props(styles.blockquote)}>{children}</blockquote>,
+  blockquote: MarkdownQuote,
   table: ({ children }) => <div role="region" aria-label="Markdown table" tabIndex={0} {...stylex.props(styles.tableScroll)}><table {...stylex.props(styles.table)}>{children}</table></div>,
   th: ({ children, style }) => <th {...stylex.props(styles.cell, styles.tableHeading, style?.textAlign === 'center' ? styles.alignCenter : style?.textAlign === 'right' ? styles.alignRight : styles.alignLeft)}><InlineText>{children}</InlineText></th>,
   td: ({ children, style }) => <td {...stylex.props(styles.cell, style?.textAlign === 'center' ? styles.alignCenter : style?.textAlign === 'right' ? styles.alignRight : styles.alignLeft)}><InlineText>{children}</InlineText></td>,
@@ -299,16 +321,24 @@ export function completeStreamingTail(source: string): string {
 }
 
 const styles = stylex.create({
-  markdown: { display: 'flow-root', minWidth: 0, maxWidth: '100%' },
+  // Blocks are separated by one 8px gap and carry no outer margin, so the last child ends flush.
+  // Prose blocks inherit ink from here (or a blockquote), so tone is one themed declaration rather than a var override.
+  markdown: { display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0, maxWidth: '100%', color: textColor.fgSoft },
+  muted: { color: textColor.fgMuted },
+  foreground: { color: textColor.fg },
   image: { maxWidth: '100%', height: 'auto' },
   imagePlaceholder: { display: 'inline-flex', alignItems: 'center', gap: s.sm, padding: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.sm, color: textColor.fgSoft, backgroundColor: surface.controlFill, fontSize: t.metaSize },
   imageAction: { borderWidth: 0, padding: s.xs, backgroundColor: surface.transparent, color: status.runningFg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   prose: { maxWidth: g.proseMax, fontSize: t.bodySize, lineHeight: t.bodyLeading },
-  heading: { margin: 0, marginBlockStart: s.xxl, marginBlockEnd: s.md, fontSize: t.headingSize, lineHeight: t.headingLeading, fontWeight: t.weightSemibold, color: textColor.fg },
-  list: { margin: 0, marginBlockEnd: s.proseGap, paddingInlineStart: s.xxl, listStylePosition: 'outside' },
+  heading: { margin: 0, fontSize: t.headingSize, lineHeight: t.headingLeading, fontWeight: t.weightSemibold, color: textColor.fg },
+  list: { margin: 0, paddingInlineStart: g.textColumn, listStylePosition: 'outside' },
   unorderedList: { listStyleType: 'disc' }, orderedList: { listStyleType: 'decimal' },
-  listItem: { display: 'list-item', fontSize: t.bodySize, lineHeight: t.bodyLeading, color: textColor.fgSoft },
-  strong: { fontWeight: t.weightBold, color: textColor.fg },
+  nestedList: { marginBlockStart: s.xs2, paddingInlineStart: s.xxl, borderInlineStartWidth: g.hairline, borderInlineStartStyle: 'solid', borderInlineStartColor: border.rail },
+  nestedUnordered: { listStyleType: 'circle' },
+  listItem: { display: 'list-item', marginBlockStart: { default: s.xs2, ':first-child': 0 }, fontSize: t.bodySize, lineHeight: t.bodyLeading, color: 'inherit', '::marker': { color: textColor.fgMuted } },
+  // Loose items hold sibling blocks: 8px between them, none before the first, so items keep their 2px pitch.
+  itemBlock: { marginBlockStart: { default: s.md, ':first-child': 0 } },
+  strong: { fontWeight: t.weightBold, color: textColor.fg }, strongMuted: { color: 'inherit' },
   emphasis: { fontStyle: 'italic' },
   syntaxComment: { color: textColor.fgMuted, fontStyle: 'italic' },
   syntaxKeyword: { color: status.runningFg },
@@ -316,9 +346,9 @@ const styles = stylex.create({
   syntaxLiteral: { color: status.attention },
   syntaxFunction: { color: textColor.fg, fontWeight: t.weightMedium },
   syntaxDeleted: { color: status.dangerFg },
-  blockquote: { margin: 0, marginBlockEnd: s.proseGap, paddingInlineStart: s.lg, borderInlineStartWidth: g.focusRing, borderInlineStartStyle: 'solid', borderInlineStartColor: border.borderStrong },
-  tableScroll: { maxWidth: '100%', overflowX: 'auto', marginBlockEnd: s.proseGap, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: g.focusOffset } },
-  table: { width: '100%', borderCollapse: 'collapse', fontSize: t.bodySize, lineHeight: t.bodyLeading, color: textColor.fgSoft },
+  blockquote: { display: 'flex', flexDirection: 'column', gap: s.md, margin: 0, paddingInlineStart: s.lg, borderInlineStartWidth: g.focusRing, borderInlineStartStyle: 'solid', borderInlineStartColor: border.railStrong, color: textColor.fgMuted },
+  tableScroll: { maxWidth: '100%', overflowX: 'auto', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: g.focusOffset } },
+  table: { width: '100%', borderCollapse: 'collapse', fontSize: t.bodySize, lineHeight: t.bodyLeading, color: 'inherit' },
   cell: { paddingInline: s.md, paddingBlock: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, verticalAlign: 'top' },
   tableHeading: { backgroundColor: surface.raised, fontWeight: t.weightSemibold, color: textColor.fg },
   alignLeft: { textAlign: 'left' }, alignCenter: { textAlign: 'center' }, alignRight: { textAlign: 'right' },
@@ -326,12 +356,12 @@ const styles = stylex.create({
   codeLanguage: { flexGrow: 1, minWidth: 0, overflowWrap: 'anywhere', fontFamily: t.fontMono, fontSize: t.metaSize, color: textColor.fgMuted },
   codeButton: { flexShrink: 0, minHeight: g.controlSm, paddingInline: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: surface.transparent, borderRadius: r.sm, backgroundColor: surface.transparent, color: textColor.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: g.focusOffset }, ':disabled': { cursor: 'default', color: textColor.fgMuted } },
   codeButtonSelected: { backgroundColor: surface.rowActive, borderColor: border.borderStrong, color: textColor.fg },
-  codePre: { margin: 0, padding: s.md, overflowX: 'auto', whiteSpace: 'pre', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: `calc(-1 * ${g.focusRing})` } },
+  codePre: { margin: 0, paddingBlock: s.md, paddingInline: s.lg, overflowX: 'auto', whiteSpace: 'pre', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: `calc(-1 * ${g.focusRing})` } },
   codeWrapped: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
   copyStatus: { display: 'block', paddingInline: s.md, paddingBlock: s.xs, color: status.dangerFg, fontSize: t.metaSize, lineHeight: t.metaLeading },
-  codeBlock: { minWidth: 0, maxWidth: '100%', margin: 0, marginBlockEnd: s.proseGap, backgroundColor: surface.codeBg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.md, overflow: 'hidden' },
-  codeText: { fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: t.uiLeading, color: textColor.fgSoft },
-  paragraph: { margin: 0, marginBlockEnd: s.proseGap, fontSize: t.bodySize, lineHeight: t.bodyLeading, color: textColor.fgSoft, overflowWrap: 'anywhere' },
+  codeBlock: { minWidth: 0, maxWidth: '100%', margin: 0, backgroundColor: surface.codeBg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.sm, overflow: 'hidden' },
+  codeText: { fontFamily: t.fontMono, fontSize: t.metaSize, lineHeight: t.codeLeading, color: textColor.fgSoft },
+  paragraph: { margin: 0, fontSize: t.bodySize, lineHeight: t.bodyLeading, color: 'inherit', overflowWrap: 'anywhere' },
   streamingTail: { '::after': { content: '""', display: 'inline-block', width: g.caret, height: t.bodySize, marginInlineStart: s.xs, verticalAlign: 'text-bottom', backgroundColor: textColor.fgMuted } },
   inlineCode: { fontFamily: t.fontMono, fontSize: t.metaSize, color: textColor.fg, backgroundColor: surface.codeBg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.sm, paddingInline: s.xs },
   link: { color: status.runningFg, textDecorationLine: 'none', ':hover': { textDecorationLine: 'underline' }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: g.focusOffset } },

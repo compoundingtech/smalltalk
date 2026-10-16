@@ -6,6 +6,7 @@ import type {
 
 import type { Clock } from '../clock.ts'
 import { generateConversationRange } from '../kit/conversationHistory.ts'
+import type { RecordedFrame, RecordedHttp } from '../kit/recording.ts'
 import type { FactoryContext } from '../kit/context.ts'
 import { rngFromSeed } from '../kit/rng.ts'
 import { timeContext } from '../kit/time.ts'
@@ -162,6 +163,16 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     if ([...held].some((key) => matches(sub, JSON.parse(key) as Selector))) return
     sub.ready = true
     if (kind !== undefined) consumed.add(kind)
+    if (world.recording !== undefined) {
+      if (sub.collection === 'terminal') {
+        const terminal = state('terminal').terminals.find((item) => item.terminal === sub.terminal)
+        if (terminal === undefined) return refuse(connection, sub, 'not-found', false)
+        if (sub.incarnation !== terminal.incarnation) return refuse(connection, sub, 'stale-fence', false)
+        const lease = leases.get(sub.capability ?? '')
+        if (lease === undefined || lease.terminal !== terminal.terminal || lease.incarnation !== terminal.incarnation || lease.expires <= clock.now()) return refuse(connection, sub, 'terminal-unavailable', true)
+      }
+      return
+    }
     switch (sub.collection) {
       case 'conversation': {
         const thread = state('conversation').threads.find((thread) => followsThread(sub, thread))
@@ -199,6 +210,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     connection.socket.onclose?.({ code, reason })
   }
   const dispatch = (kind: SliceKind, event: TimelineEvent) => {
+    if (world.recording !== undefined && kind !== 'sync') return
     switch (event._tag) {
       case 'thread-create': {
         const timeline = world.slices.conversation.timeline
@@ -337,6 +349,39 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     if (event.at_ms <= offset()) { if (kind === 'sync') dispatch(kind, event) }
     else schedule(world.now + event.at_ms, () => dispatch(kind, event))
   }
+  const recordedFrame = (metadata: RecordedFrame): void => {
+    for (const connection of connections) for (const sub of connection.subscriptions.values()) {
+      if (!sub.ready || !matches(sub, metadata.selector)) continue
+      const identity = { id: sub.id, collection: sub.collection }
+      if (metadata.kind === 'conversation') {
+        if (!('conversation' in metadata.selector)) throw new Error('Conversation frame requires a conversation selector')
+        const agent = metadata.selector.conversation
+        const thread = world.slices.conversation.state.threads.find((thread) => thread.agent === agent)
+        const event = metadata.event === undefined ? undefined : world.slices.conversation.timeline[metadata.event]
+        if (thread === undefined || event !== undefined && event._tag !== 'entries' && event._tag !== 'replace') throw new Error('Invalid recorded conversation boundary')
+        emit(connection, { kind: 'conversation', ...identity,
+          session_id: event?._tag === 'replace' ? event.session_id : thread.session_id,
+          replace: metadata.replace, items: event === undefined ? thread.items : event.items,
+          ...(metadata.has_more === undefined ? {} : { has_more: metadata.has_more }) })
+      } else if (metadata.kind === 'screen') {
+        if (!('terminal' in metadata.selector)) throw new Error('Screen frame requires a terminal selector')
+        const terminalId = metadata.selector.terminal
+        const terminal = world.slices.terminal.state.terminals.find((terminal) => terminal.terminal === terminalId)
+        const event = metadata.event === undefined ? undefined : world.slices.terminal.timeline[metadata.event]
+        if (event !== undefined && event._tag !== 'screen') throw new Error('Invalid recorded screen boundary')
+        const screen = event === undefined ? terminal?.screens.filter((item) => item.at_ms <= metadata.at_ms).at(-1)?.screen : event.screen
+        if (screen === undefined) throw new Error('Missing recorded screen')
+        emit(connection, { kind: 'screen', ...identity, snapshot: metadata.snapshot, value: screen })
+      } else {
+        emit(connection, { kind: 'error', ...identity, message: metadata.message,
+          ...(metadata.code === undefined ? {} : { code: metadata.code }),
+          ...(metadata.retryable === undefined ? {} : { retryable: metadata.retryable }) })
+      }
+    }
+  }
+  for (const metadata of [...(world.recording?.frames ?? [])].sort((a, b) => a.at_ms - b.at_ms || a.ordinal - b.ordinal)) {
+    if (metadata.at_ms >= offset()) schedule(world.now + metadata.at_ms, () => recordedFrame(metadata))
+  }
   const socket: CollectionSocketFactory = (address, protocols) => {
     const url = new URL(address)
     const connection: Connection = { socket: {
@@ -386,6 +431,45 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     return connection.socket
   }
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+  const recordedHttp = (metadata: RecordedHttp): Response => {
+    const source = metadata.value
+    let value: unknown
+    switch (source.kind) {
+      case 'screen': {
+        const terminal = state('terminal').terminals.find((terminal) => terminal.terminal === source.terminal)
+        value = terminal?.screens.filter((item) => item.at_ms <= offset()).at(-1)?.screen
+        if (value === undefined) throw new Error('Missing recorded HTTP screen')
+        consumed.add('terminal')
+        break
+      }
+      case 'timeline': {
+        const thread = state('conversation').threads.find((thread) => thread.agent === source.agent)
+        if (thread === undefined) throw new Error('Missing recorded HTTP conversation')
+        const items = source.items.map((selection) => {
+          const item = thread.items.find((item) => item.id === selection.id)
+          if (item === undefined) throw new Error(`Missing recorded HTTP item ${selection.id}`)
+          if (selection.blocks || !record(item.body)) return item
+          const { blocks: _blocks, ...body } = item.body
+          return { ...item, body }
+        })
+        value = { kind: 'timeline-page', session_id: thread.session_id, items, page: source.page }
+        consumed.add('conversation')
+        break
+      }
+      case 'agents':
+        value = { kind: 'page', collection: 'agents', filters: source.filters, items: rows('agents'), page: source.page }
+        consumed.add('roster')
+        break
+      case 'attach':
+        if (source.attachment.stream_capability !== null) leases.set(source.attachment.stream_capability, { terminal: source.attachment.terminal_id,
+          incarnation: source.attachment.runtime_incarnation, expires: Date.parse(source.attachment.expires_at) })
+        value = { kind: 'action-result', action_id: source.action_id, operation_id: source.operation_id, status: 'completed',
+          affected_ids: [source.attachment.attachment_id], terminal_attachment: source.attachment, snapshot_id: source.snapshot_id }
+        consumed.add('terminal')
+        break
+    }
+    return json({ api_version: 'st3.client.v0', request_id: metadata.request_id, snapshot: metadata.snapshot, value }, metadata.status)
+  }
   const fetchImpl: typeof fetch = async (input, init) => {
     if (closed) throw new DOMException('Replay closed', 'AbortError')
     const req = new Request(input, init)
@@ -393,6 +477,20 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
     const parts = url.pathname.replace(/^\/v1\/client\/?/, '').split('/').map(decodeURIComponent)
     const route = parts[0] ?? ''
     const family = parts.includes('timeline') ? 'timeline' : route
+    if (world.recording !== undefined) {
+      const metadata = world.recording.http.find((entry) => entry.at_ms === offset() && entry.method === req.method &&
+        entry.path === url.pathname && entry.query === url.searchParams.toString())
+      if (metadata === undefined) throw new Error(`No recorded HTTP transport for ${req.method} ${url.pathname} at ${offset()}`)
+      if (metadata.value.kind === 'attach') {
+        const action: unknown = await req.json()
+        if (!record(action) || action.type !== 'terminal.attach' || action.id !== metadata.value.action_id ||
+          !record(action.fence) || action.fence.runtime_incarnation !== metadata.value.attachment.runtime_incarnation ||
+          !record(action.parameters) || action.parameters.target_id !== metadata.value.attachment.terminal_id) {
+          return json(errorEnvelope('stale-fence', 'Recorded attach does not match terminal'), 409)
+        }
+      }
+      return recordedHttp(metadata)
+    }
     const routes = [url.pathname, family, ...(route !== 'capabilities' && route !== 'actions' && route !== 'events' && family !== 'timeline' ? ['resources'] : [])]
     const override = routes.flatMap((route) => [...overrides.values()].reverse().filter((event) => event.route === route && requestMatches(url, event.when)))[0]
     if (override?._tag === 'http-error') return json(override.envelope, override.status)
@@ -407,7 +505,9 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
       if (req.signal.aborted) abort()
     })
     for (const kind of sources) consumed.add(kind)
-    if (route === 'capabilities' && req.method === 'GET') return json(envelope(state('sync').capabilities))
+    const capabilities = state('sync').capabilities
+    if (capabilities === undefined) throw new Error('Unrecorded replay requires observed capabilities')
+    if (route === 'capabilities' && req.method === 'GET') return json(envelope(capabilities))
     if (route === 'actions' && req.method === 'POST') {
       const action = await req.json() as ActionRequest
       const snapshot = fence()
@@ -434,7 +534,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
       return json(envelope(result), result.status === 'accepted' ? 202 : 200)
     }
     if (req.method !== 'GET') return json(errorEnvelope('unsupported-capability', 'Route not supported by this world'), 405)
-    const max = state('sync').capabilities.limits.max_page_items
+    const max = capabilities.limits.max_page_items
     const limit = Number(url.searchParams.get('limit') ?? max)
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > max) return json(errorEnvelope('validation-failed', 'Invalid page limit'), 400)
     const cursor = url.searchParams.get('cursor')
@@ -463,7 +563,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
       return json(envelope(value))
     }
     if (route === 'events') return json(envelope({ kind: 'event-page', items: [], has_more: false,
-      oldest_cursor: state('sync').capabilities.oldest_event_cursor, resume_cursor: state('sync').capabilities.event_cursor }))
+      oldest_cursor: capabilities.oldest_event_cursor, resume_cursor: capabilities.event_cursor }))
     if (parts.length > 1) {
       if (route === 'terminals' && parts[2] === 'screen') {
         const terminal = state('terminal').terminals.find((terminal) => terminal.terminal === parts[1])

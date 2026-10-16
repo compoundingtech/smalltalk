@@ -88,7 +88,7 @@ test('hourly writer is bounded and content-free, and Fleet aggregates only the l
   const report = f.quality.report();
   assert.equal(report.last.window_start, Math.floor(f.wall() / 3600_000) * 3600 - 3600);
   assert.equal(report.day.counters.active_ms, 24 * 3600_000);
-  assert.equal(qualityRows(report.last, report.day).length, 12);
+  assert.equal(qualityRows(report.last, report.day).length, 14);
   f.advance(25 * 3600_000); assert.equal(f.quality.report().last, null); assert.equal(f.quality.report().day, null);
 });
 test('full numeric buffers report overflow; unavailable storage never rejects the app lifecycle', async () => {

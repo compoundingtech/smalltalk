@@ -19,7 +19,7 @@ export interface SubjectSummary {
   /** Icon name (see `ContainerIcon`). */
   readonly icon: string
   readonly status?: 'live' | 'unavailable'
-  /** The subject needs the user (attention open, agent waiting or faulted): the notification ring. */
+  /** The subject has an open native ask with a supported answer action: the notification ring. */
   readonly attention?: boolean
 }
 

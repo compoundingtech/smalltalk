@@ -90,6 +90,7 @@ impl Ui {
             Hit::Split(true) => "split right [Ctrl+V]".into(),
             Hit::Split(false) => "split below [Ctrl+X]".into(),
             Hit::GlassTab(..) => "show tab; drag to move/split; middle-click closes".into(),
+            Hit::GlassTabMore(..) => "more tabs: show the next hidden tab [Tab]".into(),
             Hit::GlassAdd(_) => "new tab [Ctrl+T]".into(),
             Hit::PaletteChoice(_) => format!("open {label}"),
         };

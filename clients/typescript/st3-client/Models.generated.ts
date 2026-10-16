@@ -14,7 +14,7 @@ export type ActionCommon = {
   parameters: {
 
 };
-  type: "arrangement.edit" | "custom.reply" | "prompt.respond" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
+  type: "arrangement.edit" | "custom.reply" | "prompt.respond" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.retire" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
 };
 
 export type ActionResult = {
@@ -57,6 +57,7 @@ export type Agent = ResourceHeader & {
   next_work_id?: (Id | null);
   observation?: "current" | "stale" | "missing";
   owner_run_id?: (MissionRunId | null);
+  presentation?: AgentPresentation;
   queued_work_count?: number;
   reachability: AgentReachability;
   reason?: string | null;
@@ -152,6 +153,29 @@ export type AgentMessageEstimate = {
   source: string;
 };
 
+export type AgentPresentation = {
+  because: string | null;
+  group: "needs_you" | "needs_login" | "fault" | "working" | "idle" | "stopped" | "retired";
+  next: Array<AgentPresentationWork>;
+  now: (AgentPresentationNow | null);
+  queued: number;
+  state: "needs_you" | "needs_login" | "fault" | "working" | "compacting" | "idle" | "starting" | "down" | "stopped" | "retired" | "unknown";
+};
+
+export type AgentPresentationNow = AgentPresentationWork & {
+  goal?: string | null;
+  holder_down_since?: (Timestamp | null);
+  since: Timestamp;
+};
+
+export type AgentPresentationWork = {
+  label: string;
+  mission: Id;
+  path: string;
+  step: StepRunId;
+  title?: string | null;
+};
+
 export type AgentQueue = {
   agent_id: Id;
   current_work_ids: Array<Id>;
@@ -202,11 +226,16 @@ export type AgentResumeParameters = {
   host?: string;
 };
 
+export type AgentRetireParameters = {
+  agent: Id;
+  reason: string;
+};
+
 export type AgentStartParameters = {
   agent: Id;
 };
 
-export type AgentState = ("desired" | "starting" | "running" | "waiting" | "down" | "stopped" | "failed" | "suspended" | string);
+export type AgentState = ("desired" | "starting" | "running" | "waiting" | "down" | "stopped" | "failed" | "suspended" | "retired" | string);
 
 export type AgentStopParameters = {
   agent: Id;
@@ -791,16 +820,19 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (DirectiveNotes | Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
+  value: (DirectiveNotes | Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog | SloList | SloHistory);
 };
 
-export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "message-too-large" | "message-store-full" | "long-message-signature-unsupported" | "internal" | string);
+export type ErrorCode = ("recipient-retired" | "lifecycle-unavailable" | "retirement-upgrade-required" | "attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "suspend-authored-session-selection" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "message-too-large" | "message-store-full" | "long-message-signature-unsupported" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
+  applied?: "none" | "unknown";
   code: ErrorCode;
   details: {
-
+  applied?: "none" | "unknown";
+  refusal?: MessageSendRefusal;
+  [key: string]: unknown;
 };
   error_version: "st3.client.error.v0";
   message: string;
@@ -815,6 +847,12 @@ export type EventPage = {
   kind: "event-page";
   oldest_cursor: Cursor;
   resume_cursor: Cursor;
+};
+
+export type ExchangeTransport = {
+  at: Timestamp;
+  carrier: string;
+  fabric_route?: string;
 };
 
 export type Fence = {
@@ -1116,6 +1154,17 @@ export type MessageProvenance = {
   signer?: ParticipantRef;
   verdict: "verified" | "unsigned" | "held" | "invalid";
 };
+
+export type MessageSendRefusal = ({
+  recipient: Id;
+  successor?: Id;
+  transfer?: string;
+  variant: "Retired";
+} | {
+  reason: "unavailable" | "conflict";
+  recipient: Id;
+  variant: "LifecycleUnavailable";
+});
 
 export type Mission = ResourceHeader & {
   active_runs?: number;
@@ -1525,7 +1574,7 @@ export type ProjectionEvent = Omit<{
 }, 'type' | 'body'> & ({ type: "timeline.delta"; body: TimelineDelta });
 
 export type PromptRespondParameters = {
-  answer: "allow" | "deny";
+  answer: string;
   episode: string;
   target_id: Id;
 };
@@ -1638,6 +1687,34 @@ export type Session = ResourceHeader & {
   state: "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled";
   timeline_cursor: Cursor;
   usage?: (UsageSummary | null);
+};
+
+export type SloHistory = {
+  id: string;
+  samples: number;
+  since_ms: number;
+  steps: Array<number | null>;
+  until_ms: number;
+};
+
+export type SloList = {
+  as_of_unix_ms: number;
+  rows: Array<SloRow>;
+};
+
+export type SloRow = {
+  about: string;
+  account?: string;
+  current: string;
+  explain: string;
+  id: string;
+  kind: "objective" | "budget";
+  measured_at_unix_ms?: number;
+  remaining_percent: number | null;
+  resets_at_unix_ms?: number | null;
+  status: "met" | "missed" | "no-data" | "stale";
+  target: string;
+  window: string;
 };
 
 export type Snapshot = {
@@ -1775,6 +1852,8 @@ export type SyncPeer = {
   estimated_catch_up_seconds?: number | null;
   host_id: Id;
   last_exchange_at?: (Timestamp | null);
+  last_failed_exchange?: ExchangeTransport;
+  last_successful_exchange?: ExchangeTransport;
   local_only_envelopes: number;
   peer_only_envelopes: number;
 };
@@ -2056,7 +2135,7 @@ export type TimelineUsageBody = {
   turn_id?: string;
 };
 
-export type TimelineView = (TimelineViewBash | TimelineViewEdit | TimelineViewWrite | TimelineViewRead | TimelineViewSearch | TimelineViewTodo | TimelineViewAsk | TimelineViewTask | TimelineViewHub | TimelineViewEval | TimelineViewGeneric | TimelineViewIrc | TimelineViewJob | TimelineViewSkill | TimelineViewCompaction | TimelineViewAssistantError | TimelineViewModelChange | TimelineViewThinkingLevel | TimelineViewTitle | TimelineViewSessionExit | TimelineViewToolStart | TimelineViewResetBoundary | TimelineViewCredentialPin | {
+export type TimelineView = (TimelineViewBash | TimelineViewEdit | TimelineViewWrite | TimelineViewRead | TimelineViewSearch | TimelineViewTodo | TimelineViewAsk | TimelineViewTask | TimelineViewHub | TimelineViewEval | TimelineViewGeneric | TimelineViewIrc | TimelineViewJob | TimelineViewSkill | TimelineViewCompaction | TimelineViewAssistantError | TimelineViewModelChange | TimelineViewThinkingLevel | TimelineViewTitle | TimelineViewSessionExit | TimelineViewToolStart | TimelineViewResetBoundary | TimelineViewCredentialPin | TimelineViewOmpEvent | {
   type: string;
 });
 
@@ -2077,6 +2156,9 @@ export type TimelineViewAssistantError = {
   label: string;
   message: string;
   model?: string;
+  native?: {
+  [key: string]: unknown;
+};
   presentation: "full" | "compact-recovered" | "none";
   provider?: string;
   retry?: {
@@ -2197,6 +2279,14 @@ export type TimelineViewModelChange = {
   model: string;
   role?: string;
   type: "model_change";
+};
+
+export type TimelineViewOmpEvent = {
+  attribution?: unknown;
+  content?: unknown;
+  details?: unknown;
+  kind: string;
+  type: "omp_event";
 };
 
 export type TimelineViewRead = {
@@ -2543,6 +2633,7 @@ export type ActionRequest =
   reason?: string;
 }; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.resume'; parameters: AgentResumeParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.retire'; parameters: AgentRetireParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.start'; parameters: AgentStartParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.stop'; parameters: AgentStopParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.suspend'; parameters: AgentSuspendParameters; fence: Fence & Required<Pick<Fence, 'runtime_incarnation' | 'runtime_desired_revision'>> }) |

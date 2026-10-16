@@ -639,6 +639,40 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn graph_delivery_watcher_ignores_runtime_and_status_but_wakes_on_inbox() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/h/worker");
+        std::fs::create_dir_all(agent_dir.join("resources/inbox")).unwrap();
+        let (tx, rx) = channel();
+        let _watcher = watch_delivery_inputs_with_status(&agent_dir, tx, false)
+            .expect("start graph delivery inotify watcher");
+
+        std::fs::write(agent_dir.join("harness-state"), "{}").unwrap();
+        std::fs::write(agent_dir.join(".harness-state.tmp-1-0"), "{}").unwrap();
+        std::fs::write(agent_dir.join("harness-context"), "{}").unwrap();
+        std::fs::write(agent_dir.join(".harness-context.lock"), "").unwrap();
+        st2_harness_context_write(&agent_dir);
+        std::fs::create_dir_all(agent_dir.join("resources/streams/s")).unwrap();
+        std::fs::write(agent_dir.join("resources/streams/s/state.json"), "{}").unwrap();
+        std::fs::write(agent_dir.join("status"), "available\n").unwrap();
+        std::fs::write(agent_dir.join(".status.tmp-1-0"), "held\n").unwrap();
+        std::fs::rename(agent_dir.join(".status.tmp-1-0"), agent_dir.join("status")).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(RecvTimeoutError::Timeout),
+            "graph delivery must ignore runtime records and both status write shapes"
+        );
+
+        std::fs::write(agent_dir.join("resources/inbox/0001-msg.md"), "hi").unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("graph inbox write must wake delivery");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn delivery_watch_is_bounded_by_inputs_not_payload_depth() {
         use std::sync::mpsc::channel;
 

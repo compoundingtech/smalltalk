@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Run the genie-freshness commands from one script and as a sandboxed Nix check",
+  "replay": {
+    "status": "none",
+    "detail": "Runtime claims and replay behavior are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, schema version or claim registration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint and admission rule versions are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Installed st and st2 binaries and release contracts are unchanged; only CI test stand-ins and a new flake check change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon interruption or restart is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator step. The required genie-freshness check keeps its name and outcome."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting the change restores the inline commands; stored runtime data needs no repair."
+  }
+}

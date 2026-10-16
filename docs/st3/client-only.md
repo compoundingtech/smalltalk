@@ -6,17 +6,17 @@ that member. It runs no st daemon or replication worker, holds no graph replica,
 fleet membership, member key, peer exposure, or fleet sync secret. Members continue to sync as
 described in [replication](replication.md) and [Fleet join](../fleet-join.md).
 
-The [iOS fabric transport proof](ios-fabric-protocol.md) documents a pinned,
-development-only direct iroh carrier and app-owned loopback adapter for the same
-paired gateway. It is a protocol specification; device interoperability is still
-to be proven.
+A phone can reach the same paired gateway over Fabric instead of a tailnet; see
+[the iOS app's Fabric carrier](../../apps/ios/README.md#fabric-an-opt-in-carrier) and
+[the member's inbound-only phone grant](ios-fabric-protocol.md#member-exposure-and-authorization).
 
 ## Pair once
 
 First publish the member's **paired-only** `st3-client.sock` through an existing LAN or tailnet
 carrier. Use the [client gateway setup](client-v0/README.md#tailnet-carrier), including the
-unauthenticated `403` check. Never forward the privileged `st3.sock`. Use HTTPS, or HTTP over an
-encrypted tailnet; HTTP on a shared LAN exposes the bearer credential to observers.
+check that an unauthenticated `GET /v1/client/agents` answers `403`. Never forward the
+privileged `st3.sock`. Use HTTPS, or HTTP over an encrypted tailnet; HTTP on a shared LAN
+exposes the bearer credential to observers.
 
 On the member, create a short-lived, single-use challenge for the intended person:
 
@@ -25,8 +25,8 @@ st devices --as person/avery pair --full-control "Demo laptop"
 ```
 
 This returns a `pairing_id`, a code, and its expiration time. `--full-control` grants the actions
-the terminal UI offers; omit it for the API's limited read/terminal/attention/launch scopes, or pass
-`--read-only` for a device that may only observe projections, glasses, and terminal output.
+the terminal UI offers; omit it for the limited default scopes: projection reads, glasses and
+arrangement reads and controls, terminal output, attention, and launches. Pass `--read-only` for a device that may only observe projections, glasses, and terminal output.
 The terminal UI cannot expand the member's grant.
 
 On the laptop, install Smalltalk and run one setup command:
@@ -62,8 +62,10 @@ does not replay it. An action whose response was lost is not automatically submi
 Connection attempts have a five-second deadline per route. Retries grow from one second to
 thirty seconds, with up to half a second of jitter, and reset when the member answers. Device
 gateways have no member-online announcement channel, so this bounded retry also discovers a
-member's return without requiring inbound connections to the laptop. A fifteen-second bounded
-capability probe detects an idle network blackhole. Press `r` while offline to retry immediately;
+member's return without requiring inbound connections to the laptop. After ten quiet seconds
+the terminal UI sends a WebSocket ping; if neither a frame nor its pong arrives within eight
+more seconds it drops the connection, so an idle network blackhole shows offline within about
+twenty seconds. Press `r` while offline to retry immediately;
 reconnecting normally requires no keys or commands. Opening a new connection resubscribes the
 live windows and open conversation and reattaches a terminal when its incarnation still matches.
 

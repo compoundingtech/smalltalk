@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add a runnable host for the Fractal web app on a tailnet, and serve the exact commit it was built from at /build-identity.json",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses st's paired client gateway socket unchanged. The bundle's build identity gains rev, buildTs, commitTs, dirty and displayVersion; existing fields are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing changes for existing installs. Hosting the web app is opt-in, and its steps are in docs/fractal-web.md."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or new swap-back restrictions."
+  }
+}

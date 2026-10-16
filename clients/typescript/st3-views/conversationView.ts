@@ -13,7 +13,7 @@ export type Body =
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; title: string; state: ToolState; output: string[] }
   /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
-  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; signed?: string; images?: MailImage[] }
+  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; signed?: string; images?: MailImage[]; whole?: WholeText }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
 export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body; content?: ConversationContentRef[]; contentSources?: Entry[] };
 
@@ -706,6 +706,9 @@ export function unreadableTranscript(timeline: Entry[]): string | null {
  * One conversation as st joined it: the harness's turns and the agent's Small Talk, in time
  * order. `names` maps graph ids to what a person calls them; the viewer is `you`.
  */
+/** A long message shows only its start; the whole text (`bytes` long, in UTF-8) is read from st by `message`. */
+export type WholeText = { message: string; bytes: number };
+
 /** An image a message carries; its bytes are read from st by `sha256`, naming `message`. */
 export type MailImage = { sha256: string; message: string; mediaType: string; name?: string; size: number };
 
@@ -795,6 +798,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
           ...(Array.isArray(message.tags) && message.tags.includes('dictated') ? { dictated: true } : {}),
           ...(signatureMark(message.provenance) ? { signed: signatureMark(message.provenance)! } : {}),
           ...(images.length ? { images } : {}),
+          ...(typeof message.body_bytes === 'number' && message.body_bytes > 0 ? { whole: { message: str(message.message_id)!, bytes: message.body_bytes } } : {}),
         });
       }
       const content = contentReferences(message);

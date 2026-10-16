@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Preserve unconfirmed message outcomes in the client error envelope and clarify retirement rollout.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No storage or claim registry change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No retention rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Client-v0 ErrorEnvelope accepts applied none and unknown; generated decoders preserve message-send-unconfirmed without turning transport uncertainty into a refusal."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Clarify exact registry digest matching after future upgrades and the operational requirement to prevent old downgraded or rejoining binaries, which this slice cannot block."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional restart or migration."
+  }
+}

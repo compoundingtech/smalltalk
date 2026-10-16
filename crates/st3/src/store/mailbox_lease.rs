@@ -709,6 +709,215 @@ mod tests {
         store.desired_subjects_named(&["agent/eval.worker".into()]).unwrap().remove(0).member.unwrap()
     }
 
+    // A typed Store fixture changes the captured member without a runtime
+    // reconciliation or process restart. This is not a physical argv witness.
+    fn update_argv_member(store: &Store, member: &MemberSpec) {
+        let mut intent = crate::graph::parse_intent(
+            "version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; argv \"python3\" \"probe\"; }",
+            "node",
+        ).unwrap();
+        intent.subjects.get_mut("agent/eval.worker").unwrap().member = Some(member.clone());
+        store
+            .apply_internal(&intent, "argv-member-edit-fixture")
+            .unwrap();
+        assert_eq!(
+            store
+                .desired_subjects_named(&["agent/eval.worker".into()])
+                .unwrap()[0]
+                .member
+                .as_ref(),
+            Some(member)
+        );
+    }
+
+    #[test]
+    fn argv_metadata_edits_preserve_capability_and_receipt_admission() {
+        for edit in ["tags", "display", "environment", "restart"] {
+            let store = fixture();
+            let captured = declare_argv(&store, "node");
+            let bound = store
+                .bind_argv_mailbox_checked(&request(), &captured, &|| Ok(()))
+                .unwrap();
+            let runtime = store
+                .latest_claim(&bound.subject, Some("runtime.observed"))
+                .unwrap()
+                .unwrap()
+                .id;
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/argv-metadata".into(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/fixture".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
+                        ("from".into(), json!("person/fixture")),
+                        ("to".into(), json!(bound.subject)),
+                        ("content".into(), json!("Original envelope")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let receipt = |phase: &str| ClaimInput {
+                subject: "message/argv-metadata".into(),
+                kind: format!("message.{phase}"),
+                actor: Some(bound.subject.clone()),
+                fields: BTreeMap::from([("status".into(), json!(phase))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some(format!("argv-metadata:{phase}")),
+            };
+            store
+                .append_mailbox_receipt_outcome(&receipt("staged"), &bound)
+                .unwrap();
+            let mut changed = captured.clone();
+            match edit {
+                "tags" => {
+                    changed.tags.insert("purpose".into(), "updated".into());
+                }
+                "display" => changed.display_name = Some("Updated display".into()),
+                "environment" => {
+                    changed
+                        .environment
+                        .insert("ARGV_FIXTURE".into(), "updated".into());
+                }
+                "restart" => {
+                    changed.restart = crate::model::RestartType::Never;
+                    changed.restart_intensity.attempts += 1;
+                    changed.shutdown_timeout_ms += 1;
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(changed, captured);
+            assert!(changed.launch_changes(&captured).is_empty());
+            update_argv_member(&store, &changed);
+            assert_eq!(
+                store
+                    .latest_claim(&bound.subject, Some("runtime.observed"))
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                runtime
+            );
+            store.check_mailbox(&bound).unwrap();
+            for phase in ["staged", "delivered", "read"] {
+                // Cached and fresh receipts must both keep the original current
+                // capability; metadata changes do not grant another owner.
+                store
+                    .append_mailbox_receipt_outcome(&receipt(phase), &bound)
+                    .unwrap();
+                store
+                    .append_mailbox_receipt_outcome(&receipt(phase), &bound)
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .claims_for("message/argv-metadata", Some(&format!("message.{phase}")))
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+            for member in [&captured, &changed] {
+                let reconnect = store
+                    .bind_argv_mailbox_checked(&bound, member, &|| Ok(()))
+                    .unwrap();
+                assert_eq!(
+                    (reconnect.token, reconnect.epoch),
+                    (bound.token.clone(), bound.epoch)
+                );
+            }
+            assert!(store.mailbox_lease_authority(&bound).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn argv_launch_edits_still_fence_the_unchanged_running_capability() {
+        for edit in ["workspace", "cwd", "terminal", "runtime", "raw-argv"] {
+            let store = fixture();
+            let mut captured = declare_argv(&store, "node");
+            if edit == "raw-argv" {
+                captured.launch = LaunchSpec::Argv(vec![
+                    "wrapper".into(),
+                    "--".into(),
+                    "program".into(),
+                    "--settings".into(),
+                    "old.json".into(),
+                    "argument".into(),
+                ]);
+                update_argv_member(&store, &captured);
+            }
+            let bound = store
+                .bind_argv_mailbox_checked(&request(), &captured, &|| Ok(()))
+                .unwrap();
+            let runtime = store
+                .latest_claim(&bound.subject, Some("runtime.observed"))
+                .unwrap()
+                .unwrap()
+                .id;
+            let mut changed = captured.clone();
+            match edit {
+                "workspace" => changed.workspace = "/different".into(),
+                "cwd" => changed.cwd = "/different".into(),
+                "terminal" => changed.terminal = !captured.terminal,
+                "runtime" => changed.runtime_id.push_str("-replacement"),
+                "raw-argv" => {
+                    let LaunchSpec::Argv(argv) = &mut changed.launch else {
+                        unreachable!()
+                    };
+                    argv[4] = "new.json".into();
+                    // Typed wrappers omit generated settings from their launch
+                    // comparison. An explicit argv transport must not do that.
+                    assert!(changed.launch_changes(&captured).is_empty());
+                }
+                _ => unreachable!(),
+            }
+            update_argv_member(&store, &changed);
+            assert_eq!(
+                store
+                    .latest_claim(&bound.subject, Some("runtime.observed"))
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                runtime
+            );
+            assert_eq!(
+                store.check_mailbox(&bound).unwrap_err().code,
+                "stale-mailbox-session"
+            );
+            let receipt = ClaimInput {
+                subject: "message/argv-launch-edit".into(),
+                kind: "message.read".into(),
+                actor: Some(bound.subject.clone()),
+                fields: BTreeMap::from([("status".into(), json!("read"))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some(format!("argv-launch-edit:{edit}")),
+            };
+            assert_eq!(
+                store
+                    .append_mailbox_receipt_outcome(&receipt, &bound)
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
+            assert!(
+                store
+                    .claims_for(&receipt.subject, Some("message.read"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .bind_argv_mailbox_checked(&bound, &changed, &|| Ok(()))
+                    .is_err()
+            );
+            // Restoring the exact declaration restores this same capability.
+            update_argv_member(&store, &captured);
+            store.check_mailbox(&bound).unwrap();
+        }
+    }
+
     #[test]
     fn argv_channel_binding_retains_runtime_declaration_and_receipt_fences() {
         let store = fixture();
@@ -1327,8 +1536,13 @@ pub(super) fn check_argv_declaration(
         || current.driver.is_some()
         || current.terminal_binding.is_some()
         || !matches!(&current.launch, LaunchSpec::Argv(argv) if !argv.is_empty())
-        || serde_json::to_value(&current).map_err(internal)?
-            != serde_json::to_value(captured).map_err(internal)?
+        || current.kind != captured.kind
+        || current.terminal_binding != captured.terminal_binding
+        || current.runtime_id != captured.runtime_id
+        || !current.launch_changes(captured).is_empty()
+        // This is an explicit argv transport, not a typed harness wrapper:
+        // every argument remains authoritative, including wrapper-like flags.
+        || current.launch != captured.launch
     {
         return Err(refused("the explicit argv seat declaration was stopped or replaced"));
     }

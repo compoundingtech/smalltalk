@@ -1307,27 +1307,14 @@ fn comparable_peers_name_differing_tables_and_legacy_peers_keep_their_digest() {
     let old: ReplicationExchange = serde_json::from_value(old).unwrap();
     assert!(old.projection_digests.is_empty());
     assert_eq!(old.graph_digest, legacy);
-    let receipt = target
+    target
         .receive_replication_exchange("alder", TEST_FLEET, &old)
         .unwrap();
-    assert!(!receipt.heal);
     let status = target
         .replication_status(true, Some(TEST_FLEET), &["alder".into()])
         .unwrap();
     assert!(status.peers[0].projection_digests.is_empty());
     assert!(status.peers[0].differing_tables.is_empty());
-    let mut answer = source
-        .heal_answer("birch", &ReplicationHealQuery::Ranges)
-        .unwrap();
-    if let ReplicationHealAnswer::Ranges {
-        projection_digests, ..
-    } = &mut answer
-    {
-        projection_digests.clear();
-    }
-    assert!(
-        matches!(target.heal_next("alder",answer).unwrap(),ReplicationHealStep::Done{report} if report.healed)
-    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Select Cargo targets before building; nextest's ci filter only selects tests after the build.
+# Compile the workspace and preserve the selected test binaries with nextest filters.
 set -euo pipefail
 action=${1:?usage: scripts/ci-nextest run|list [nextest options]}
 shift
@@ -23,21 +23,41 @@ if [[ "$action" == run && " $* " != *" --no-run "* && "${GITHUB_ACTIONS:-}" == t
   fi
 fi
 
-# Use the same selections for --no-run and execution, on Linux and macOS. Keep both groups
-# running after a test failure, as the ci profile does with fail-fast = false.
-status=0
+# Keep the former workspace and three legacy integration targets in one invocation.
+# Intersect caller filtersets with this binary selection, including when callers ignore
+# the profile's default test filter. Multiple caller filtersets retain nextest's union.
 if [[ -n "${CI_TEST_EXTRACTED:-}" ]]; then
-  [[ " $* " != *" --no-run "* ]] || { echo 'archive consumers must not rebuild' >&2; exit 2; }
-  for group in workspace st2; do
-    target="$CI_TEST_EXTRACTED/$group/target"
-    cargo nextest "$action" --binaries-metadata "$target/nextest/binaries-metadata.json" \
-      --cargo-metadata "$target/nextest/cargo-metadata.json" --target-dir-remap "$target" \
-      --workspace-remap "$CI_TEST_WORKSPACE" --profile ci "${partition[@]}" "$@" || status=$?
-  done
+  target="$CI_TEST_EXTRACTED/workspace/target"
+  selection=$(python3 scripts/ci-nextest-targets --metadata "$target/nextest/cargo-metadata.json")
 else
-  cargo nextest "$action" --workspace --exclude st2 --locked --profile ci "${partition[@]}" "$@" || status=$?
-  # Keep the original st2 target selection for local and macOS runs.
-  cargo nextest "$action" -p st2 --test integration --test agent_resource --test driver_expansion \
-    --locked --profile ci "${partition[@]}" "$@" || status=$?
+  selection=$(python3 scripts/ci-nextest-targets)
 fi
-exit "$status"
+arguments=()
+filters=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -E|--filterset|--filter-expr)
+      [[ $# -ge 2 && -n "$2" ]] || { echo 'missing nextest filterset' >&2; exit 2; }
+      filters+=("$2"); shift 2 ;;
+    --filterset=*|--filter-expr=*) filters+=("${1#*=}"); shift ;;
+    -E?*) filters+=("${1#-E}"); shift ;;
+    *) arguments+=("$1"); shift ;;
+  esac
+done
+if [[ ${#filters[@]} -gt 0 ]]; then
+  requested=""
+  for filter in "${filters[@]}"; do
+    if [[ -n "$requested" ]]; then requested+=" or "; fi
+    requested+="($filter)"
+  done
+  selection="($selection) and ($requested)"
+fi
+if [[ -n "${CI_TEST_EXTRACTED:-}" ]]; then
+  [[ " ${arguments[*]} " != *" --no-run "* ]] || { echo 'archive consumers must not rebuild' >&2; exit 2; }
+  target="$CI_TEST_EXTRACTED/workspace/target"
+  exec cargo nextest "$action" --binaries-metadata "$target/nextest/binaries-metadata.json" \
+    --cargo-metadata "$target/nextest/cargo-metadata.json" --target-dir-remap "$target" \
+    --workspace-remap "$CI_TEST_WORKSPACE" --profile ci -E "$selection" "${partition[@]}" "${arguments[@]}"
+else
+  exec cargo nextest "$action" --workspace --locked --profile ci -E "$selection" "${partition[@]}" "${arguments[@]}"
+fi

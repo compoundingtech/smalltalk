@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Preserve terminal retirement errors and action while integrating current upstream inventory, account and review-resource contracts.",
+  "replay": { "status": "none", "detail": "No additional replay behavior." },
+  "schema": { "status": "none", "detail": "Regenerated the combined registry documentation and clients, retaining retirement refusals and upstream connected-client and usage resources." },
+  "rules": { "status": "none", "detail": "No additional claim or retention rule." },
+  "compatibility": { "status": "none", "detail": "Preserves the open error details model and upstream additive client fields. The retirement rollout still requires exact registry digest agreement." },
+  "manual": { "status": "none", "detail": "No additional operator action beyond the terminal retirement rollout." },
+  "recovery": { "status": "none", "detail": "No additional recovery behavior." },
+  "downtime": { "status": "none", "detail": "No additional startup work." }
+}

@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Publish the signed notes that CI jobs wrote with `evidence-wrap --out`.
+
+  scripts/evidence-publish --notes DIR --keys ALLOWED_SIGNERS --checks a,b,c [--remote origin]
+
+Run in one job with a full-history checkout of the tested commit (the server refuses a push from a
+shallow repository). For every DIR/**/<record>.json it imports the pack, then accepts the record
+only if all of these hold, and otherwise skips it with the reason:
+  * the summary and the pack agree (record id, check, tree, commit);
+  * the note commit's SSH signature verifies against ALLOWED_SIGNERS (taken from the base commit)
+    and names the principal the statement claims;
+  * the statement is about THIS checkout's commit and tree, and about one of the allowed checks;
+  * the tier is full.
+It creates refs/notes/evidence/<record> (never replacing one) and pushes the accepted ones in one
+push. EVIDENCE_PUSH_TOKEN, if set, is sent as an authorization header and never printed. At most
+--limit (default 40) records are accepted in one run.
+
+  exit 0  every note was accepted and published, or there was nothing to publish
+  exit 1  a note was refused or the push failed (the others are still published)
+"""
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+
+OID = re.compile(r'^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
+NOTES = 'refs/notes/evidence/'
+INPUT_NOTES = 'refs/notes/evidence-input/'
+
+
+class Refused(Exception):
+    pass
+
+
+def git(*args, stdin=None, check=True, header=None):
+    clean = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    if header:
+        # In the environment, not an argument: a process listing must not show the token.
+        clean.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.extraheader', GIT_CONFIG_VALUE_0=header)
+    done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', *args], input=stdin, capture_output=True, timeout=600,
+                          env=dict(clean, GIT_NO_REPLACE_OBJECTS='1', GIT_TERMINAL_PROMPT='0', LC_ALL='C'))
+    if check and done.returncode != 0:
+        raise Refused(f'git {args[0]}: {done.stderr.decode(errors="replace").strip()[-400:]}')
+    return done
+
+
+def accept(summary_path, keys, allowed_checks, commit, tree):
+    summary = json.loads(summary_path.read_text())
+    record, check = summary.get('record', ''), summary.get('check', '')
+    if not OID.match(record) or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}', check):
+        raise Refused('malformed summary')
+    pack = summary_path.with_suffix('.pack')
+    if not pack.exists():
+        raise Refused('the pack is missing')
+    git('index-pack', '--stdin', stdin=pack.read_bytes())
+    if git('cat-file', '-t', record).stdout.decode().strip() != 'commit':
+        raise Refused('the pack does not contain the record commit')
+    entries = git('ls-tree', '-r', record).stdout.decode().split()
+    if len(entries) != 4 or entries[:2] != ['100644', 'blob']:
+        raise Refused('the record is not a single-note commit')
+    statement = json.loads(git('cat-file', 'blob', entries[2]).stdout)
+    predicate = statement['predicate']
+    if statement['subject'][0]['name'] != commit or statement['subject'][0]['digest'].get('gitTree') != tree or entries[3] != tree:
+        raise Refused('the note is about another commit or tree than this checkout')
+    if predicate['tier'] != 'full' or not predicate.get('signer'):
+        raise Refused('only signed full-tier notes are published')
+    if check not in allowed_checks or list(predicate['observed']['checks']) != [check]:
+        raise Refused(f'check {check!r} is not one of the allowed checks')
+    verified = git('-c', 'gpg.format=ssh', '-c', f'gpg.ssh.allowedSignersFile={keys}', '-c', 'gpg.ssh.program=ssh-keygen',
+                   'verify-commit', '--raw', record, check=False)
+    text = (verified.stdout + verified.stderr).decode(errors='replace')
+    if verified.returncode != 0 or f'signature for {predicate["signer"]} with' not in text:
+        raise Refused('the signature does not verify against the accepted key list for the claimed signer')
+    if git('show', '-s', '--format=%P', record).stdout.decode().strip() != commit:
+        raise Refused('the note must have the tested commit as its only parent')
+    inputs = predicate['observed'].get('inputs') or {}
+    key = inputs.get('source_inputs')
+    if key is not None and not (isinstance(key, str) and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', key)):
+        raise Refused('source_inputs must be a git tree id')
+    return record, check, key
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--notes', required=True, help='directory searched for *.json summaries')
+    parser.add_argument('--keys', required=True, help='allowed-signers file from the base commit')
+    parser.add_argument('--checks', required=True, help='comma-separated check names that may be published')
+    parser.add_argument('--remote', help='push the accepted refs here')
+    parser.add_argument('--limit', type=int, default=40)
+    args = parser.parse_args(argv)
+    allowed = set(filter(None, args.checks.split(',')))
+    commit = git('rev-parse', 'HEAD').stdout.decode().strip()
+    tree = git('rev-parse', 'HEAD^{tree}').stdout.decode().strip()
+    shallow = git('rev-parse', '--is-shallow-repository').stdout.decode().strip()
+    result = {'commit': commit, 'tree': tree, 'accepted': [], 'refused': [], 'pushed': False}
+    summaries = sorted(Path(args.notes).rglob('*.json'))
+    if shallow == 'true' and args.remote and summaries:
+        result['refused'].append({'record': None, 'reason': 'the checkout is shallow; fetch full history before publishing'})
+        summaries = []
+    for summary_path in summaries:
+        if len(result['accepted']) >= args.limit:
+            result['refused'].append({'record': summary_path.stem, 'reason': f'more than {args.limit} notes in one run'})
+            continue
+        try:
+            record, check, key = accept(summary_path, args.keys, allowed, commit, tree)
+            ref = NOTES + record
+            existing = git('for-each-ref', '--format=%(objectname)', ref).stdout.decode().strip()
+            if existing and existing != record:
+                raise Refused(f'{ref} already names {existing}; evidence refs are never replaced')
+            if not existing:
+                git('update-ref', ref, record, '0' * len(record))
+            entry = {'record': record, 'check': check}
+            if key:
+                # An index by input key, one ref per record: a newer record never replaces an older one, so a newer
+                # failure with the same key can be found next to an older pass. The ref name repeats the record.
+                entry['input_ref'] = f'{INPUT_NOTES}{check}/{key}/{record}'
+                if not git('for-each-ref', '--format=%(objectname)', entry['input_ref']).stdout.decode().strip():
+                    git('update-ref', entry['input_ref'], record, '0' * len(record))
+            result['accepted'].append(entry)
+        except (Refused, KeyError, ValueError, IndexError) as error:
+            result['refused'].append({'record': summary_path.stem, 'reason': str(error)})
+    if args.remote and result['accepted']:
+        token = os.environ.get('EVIDENCE_PUSH_TOKEN', '')
+        header = None
+        if token:
+            header = 'Authorization: Basic ' + base64.b64encode(f'x-access-token:{token}'.encode()).decode()
+        refspecs = [f'{NOTES}{a["record"]}:{NOTES}{a["record"]}' for a in result['accepted']]
+        refspecs += [f'{a["input_ref"]}:{a["input_ref"]}' for a in result['accepted'] if a.get('input_ref')]
+        pushed = git('push', '--quiet', args.remote, *refspecs,
+                     check=False, header=header)
+        if pushed.returncode != 0:
+            text = pushed.stderr.decode(errors='replace')
+            result['refused'].append({'record': None, 'reason': 'push failed: ' + (text.replace(token, '***') if token else text).strip()[-400:]})
+        else:
+            result['pushed'] = True
+    print(json.dumps(result, indent=2))
+    path = os.environ.get('GITHUB_STEP_SUMMARY')
+    if path:
+        with open(path, 'a') as stream:
+            stream.write(f'### Evidence notes for `{commit[:12]}` (tree `{tree[:12]}`)\n')
+            for a in result['accepted']:
+                stream.write(f'- accepted `{a["check"]}`: `{a["record"]}`' + (' (pushed)\n' if result['pushed'] else '\n'))
+            for r in result['refused']:
+                stream.write(f'- **refused** `{r["record"]}`: {r["reason"]}\n')
+    return 1 if result['refused'] else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

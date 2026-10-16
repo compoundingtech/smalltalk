@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""A ref updated elsewhere in the repository must not rebuild a crate that stamps itself from Git; a new commit must.
+
+crates/agent-spec/build.rs and crates/st-drivers/build.rs stamp the build with the Git revision. They used to tell Cargo to
+watch `git rev-parse --git-path refs`, which in a linked worktree is the COMMON directory of every worktree: any ref anyone
+updated re-ran the stamp scripts and rebuilt the whole workspace (about 12 minutes) with HEAD unmoved. This test builds each
+real build script in a linked worktree, moves unrelated refs in the common directory and in the main checkout, and asserts
+that the next build is a no-op; then it commits in the worktree and asserts a rebuild whose stamp names the new revision."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+GIT = ['git', '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', '-c', 'commit.gpgsign=false',
+       '-c', 'core.hooksPath=/dev/null']
+CASES = {
+    'agent-spec': ('crates/agent-spec/build.rs', 'env!("AGENT_SPEC_REVISION").to_owned()'),
+    'st-drivers': ('crates/st-drivers/build.rs', 'env!("ST_BUILD_STAMP_LOCAL").to_owned()'),
+}
+
+
+def run(*command, cwd, env=None):
+    done = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
+    assert done.returncode == 0, f'{command} failed: {done.stderr[-800:]}'
+    return done.stdout.strip(), done.stderr
+
+
+def head_of(directory):
+    return run('git', 'rev-parse', 'HEAD', cwd=directory)[0]
+
+
+def stamp(binary, name, expected):
+    printed = run(str(binary), cwd=binary.parent)[0]
+    if name == 'agent-spec':
+        assert printed == expected, (printed, expected)
+    else:
+        assert json.loads(printed)['fullRev'] == expected, (printed, expected)
+
+
+for name, (script, expression) in CASES.items():
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch = Path(scratch)
+        main, work, target = scratch / 'main', scratch / 'work', scratch / 'target'
+        main.mkdir()
+        run('git', 'init', '-q', '-b', 'trunk', cwd=main)
+        (main / 'README').write_text('fixture\n')
+        run('git', 'add', 'README', cwd=main)
+        run(*GIT, 'commit', '-qm', 'First', cwd=main)
+        run('git', 'worktree', 'add', '-q', '-b', 'fixture', str(work), cwd=main)
+        # The crate sits two levels below the workspace root, where agent-spec's script expects Cargo.lock (`../../Cargo.lock`).
+        crate = work / 'crates/stamp-fixture'
+        (crate / 'src').mkdir(parents=True)
+        (work / 'Cargo.toml').write_text('[workspace]\nmembers=["crates/stamp-fixture"]\nresolver="3"\n')
+        (crate / 'Cargo.toml').write_text('[package]\nname="stamp-fixture"\nversion="0.1.0"\nedition="2024"\nbuild="build.rs"\n')
+        (crate / 'build.rs').write_text((root / script).read_text())
+        (crate / 'src/main.rs').write_text('fn main() { println!("{}", %s); }\n' % expression)
+        env = {key: value for key, value in os.environ.items()
+               if key not in ('RUSTC_WRAPPER', 'RUSTFLAGS', 'AGENT_SPEC_REVISION', 'ST_BUILD_STAMP_LOCAL', 'CLI_BUILD_STAMP', 'CARGO_BUILD_TARGET')}
+        env.update(CARGO_TARGET_DIR=str(target), CARGO_INCREMENTAL='0', CARGO_ENCODED_RUSTFLAGS='')
+        run('cargo', 'generate-lockfile', '--offline', cwd=work, env=env)
+        run('git', 'add', '-A', cwd=work)
+        run(*GIT, 'commit', '-qm', 'Fixture crate', cwd=work)
+        # Git rewrites the index on every `git status` while entries are as new as the index itself (racily clean), which
+        # would make every build look stale through the watched index file. Let the files age past the index first.
+        time.sleep(1.2)
+        run('git', 'status', '--porcelain', cwd=work)
+        build = lambda: run('cargo', 'build', '--locked', '--offline', cwd=work, env=env)[1]
+        binary = target / 'debug/stamp-fixture'
+
+        assert 'Compiling stamp-fixture' in build(), name
+        stamp(binary, name, head_of(work))
+        # The stamp script runs `git status`, which may refresh (rewrite) this worktree's index while Cargo's timestamp for the
+        # build is already taken: one more build can be needed to settle. After that an unchanged tree must not rebuild.
+        build()
+        again = build()
+        assert 'Compiling' not in again, f'{name}: an unchanged tree rebuilt: {again[-1500:]}'
+
+        # Refs that are not this worktree's HEAD: a branch, a tag, a notes ref, and a commit on the main checkout's branch.
+        run('git', 'branch', 'unrelated', cwd=main)
+        run('git', 'tag', 'unrelated-tag', cwd=main)
+        run('git', 'update-ref', 'refs/notes/evidence/example', head_of(main), cwd=main)
+        (main / 'README').write_text('fixture, changed\n')
+        run(*GIT, 'commit', '-qam', 'Elsewhere', cwd=main)
+        assert 'Compiling' not in build(), f'{name}: a ref updated elsewhere in the repository rebuilt the crate'
+
+        # HEAD of this worktree moves: the stamp must be rebuilt and name the new revision.
+        run(*GIT, 'commit', '-q', '--allow-empty', '-m', 'Next', cwd=work)
+        assert 'Compiling stamp-fixture' in build(), f'{name}: a new commit did not rebuild the stamp'
+        stamp(binary, name, head_of(work))
+        assert 'Compiling' not in build(), name
+
+        # The branch ref moves into packed-refs (git gc / pack-refs): the loose file the build watched is gone, so one more build
+        # is allowed; then a commit creates the loose file again and must still be seen (the directory is watched meanwhile).
+        run('git', 'pack-refs', '--all', cwd=work)
+        build()
+        build()
+        assert 'Compiling' not in build(), f'{name}: an unchanged tree with a packed branch ref rebuilt'
+        run(*GIT, 'commit', '-q', '--allow-empty', '-m', 'After packing', cwd=work)
+        assert 'Compiling stamp-fixture' in build(), f'{name}: a commit on a packed branch did not rebuild the stamp'
+        stamp(binary, name, head_of(work))
+print('build-stamp-watch-test: ok')

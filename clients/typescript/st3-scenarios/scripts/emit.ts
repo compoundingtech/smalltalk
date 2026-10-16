@@ -10,9 +10,23 @@ import { fileURLToPath } from 'node:url'
 import { ANCHOR, ANCHOR_MS, catalog, loadWorld, SLICE_KINDS, wireValues, type AnySlice, type TimePointer, type World } from '../src/index.ts'
 import { loadDefinitions, makeInstantFinder } from './times.ts'
 import { rebaseVectors } from './vectors.ts'
+import { decodeRecording, decodeScript, normalizeRecording } from './recordings.ts'
 
 export const FIXTURES_DIR = fileURLToPath(new URL('../../../../fixtures/scenarios/', import.meta.url))
 export const SLICE_FORMAT = 'st3.scenario.slice.v1'
+export const RECORDINGS_DIR = fileURLToPath(new URL('../recordings/', import.meta.url))
+
+/** Recorder inputs are source files, not generated files; only normalized siblings are emitted. */
+export const generateRecordings = (root: string = RECORDINGS_DIR): Map<string, string> => {
+  const files = new Map<string, string>()
+  for (const name of readdirSync(root).filter((name) => name.endsWith('.script.json')).sort()) {
+    const stem = name.slice(0, -'.script.json'.length)
+    const script = decodeScript(JSON.parse(readFileSync(join(root, name), 'utf8')))
+    const rows = decodeRecording(readFileSync(join(root, `${stem}.recording.jsonl`), 'utf8'))
+    files.set(`${stem}.normalized.json`, canonicalJson(normalizeRecording(script, rows, ANCHOR_MS)))
+  }
+  return files
+}
 
 /** Sorted keys, two-space indentation, trailing newline. */
 export const canonicalJson = (value: unknown): string => {
@@ -139,18 +153,42 @@ export const checkTree = (root: string, files: Map<string, string> = generate())
   }
 }
 
+/** Compare only generated normalized outputs; script/raw inputs are deliberately not extras. */
+export const checkRecordings = (root: string = RECORDINGS_DIR): FreshnessProblem[] => {
+  const files = generateRecordings(root)
+  const actual = new Set(readdirSync(root).filter((name) => name.endsWith('.normalized.json')))
+  const problems: FreshnessProblem[] = []
+  for (const [path, bytes] of files) {
+    if (!actual.has(path)) problems.push({ path, problem: 'missing' })
+    else if (readFileSync(join(root, path), 'utf8') !== bytes) problems.push({ path, problem: 'stale' })
+    actual.delete(path)
+  }
+  for (const path of actual) problems.push({ path, problem: 'extra' })
+  return problems
+}
+
 if (import.meta.main) {
   if (process.argv.includes('--check')) {
     const problems = checkTree(FIXTURES_DIR)
+    const recordings = checkRecordings()
     for (const { path, problem } of problems) console.error(`${problem}: fixtures/scenarios/${path}`)
-    if (problems.length > 0) {
+    for (const { path, problem } of recordings) console.error(`${problem}: recordings/${path}`)
+    if (problems.length > 0 || recordings.length > 0) {
       console.error('fixtures/scenarios is out of date; run: pnpm --filter @smalltalk/st3-scenarios emit')
       process.exitCode = 1
     } else console.log('emit --check: fixtures/scenarios is up to date')
   } else {
-    rmSync(FIXTURES_DIR, { recursive: true, force: true })
-    const files = generate()
-    writeTree(FIXTURES_DIR, files)
-    console.log(`emit: wrote ${files.size} files to fixtures/scenarios`)
+    if (!process.argv.includes('--recordings-only')) rmSync(FIXTURES_DIR, { recursive: true, force: true })
+    if (!process.argv.includes('--recordings-only')) {
+      const files = generate()
+      writeTree(FIXTURES_DIR, files)
+      console.log(`emit: wrote ${files.size} files to fixtures/scenarios`)
+    }
+    const recordings = generateRecordings()
+    for (const name of readdirSync(RECORDINGS_DIR).filter((name) => name.endsWith('.normalized.json'))) {
+      if (!recordings.has(name)) rmSync(join(RECORDINGS_DIR, name))
+    }
+    writeTree(RECORDINGS_DIR, recordings)
+    console.log(`emit: wrote ${recordings.size} normalized recordings`)
   }
 }

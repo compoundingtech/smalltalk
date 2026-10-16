@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Create this host's evidence signing key and the signer configuration, and print the line to list the key.
+
+  scripts/evidence-keygen --name ALIAS [--home DIR]
+
+For a host we trust (our own machines). It makes, under $HOME/.config/st and owned by the running user:
+
+  evidence-sign-key          an ed25519 key, mode 0600, no passphrase
+  evidence-sign-scratch.git  the bare repository the signer builds notes in
+  evidence-sign.json         {"signer": "host/NAME", "ssh_key": ..., "scratch_repo": ...}
+
+and prints one line on stdout, the public key in the format of .st/evidence-keys:
+
+  host/NAME namespaces="git" ssh-ed25519 AAAA...
+
+Adding that line to .st/evidence-keys is a pull request like any other; the file is read from main, so a change
+cannot vouch for its own key. Anything that runs as this user can read the key and sign: this is cooperative
+trust in the host (docs/st3/gate-evidence.md, "Host keys"). Running it again prints the same line and changes
+nothing. It never overwrites a key or a configuration that differs from what it would write.
+
+The name is an alias, required and never taken from the machine: the printed line goes into a public file, which
+must not carry real host names. Keep the alias-to-machine mapping outside the repository (revocation needs it).
+
+Care it takes, because the key sits in an account whose other processes run code under test:
+  * it sets umask 077 before creating anything and creates the directory with mode 0700;
+  * a symlink where the directory, key, scratch repository or configuration should be is refused (lstat), so a
+    planted link cannot redirect a write or a chmod; the key must be a regular file of this user with mode 0600
+    and the directory must belong to this user;
+  * the configuration is created with O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600;
+  * the printed line is derived from the private key with `ssh-keygen -y`, never from a file next to it, so an
+    existing key is reused only as what it is;
+  * HOME must be an absolute path equal to this account's home directory (pass --home DIR to mean another), and
+    root is refused: run it as the user who will own the key.
+The root-owned hardening of scripts/evidence-sign (tool directories closed to the account) does not apply to a
+user-owned key; see docs/st3/gate-evidence.md, "Host keys".
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+NAME = re.compile(r'^[a-z0-9][a-z0-9-]{0,39}$')
+
+
+class Failure(Exception):
+    pass
+
+
+def run(*command):
+    done = subprocess.run(command, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise Failure(f'{command[0]} failed: {done.stderr.strip()}')
+    return done.stdout.strip()
+
+
+def lstat(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def require(path, kind, mode=None):
+    """The lstat of `path` if it exists (None if not); refuses a symlink, the wrong kind, another owner or a looser mode."""
+    info = lstat(path)
+    if info is None:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        raise Failure(f'{path} is a symlink; refusing to follow it')
+    if not kind(info.st_mode):
+        raise Failure(f'{path} is not the kind of file expected')
+    if info.st_uid != os.getuid():
+        raise Failure(f'{path} belongs to another user')
+    if mode is not None and stat.S_IMODE(info.st_mode) != mode:
+        raise Failure(f'{path} has mode {stat.S_IMODE(info.st_mode):o}, not {mode:o}; fix it yourself, this script will not chmod an existing key')
+    return info
+
+
+def account_home(explicit):
+    if explicit:
+        home = explicit
+    else:
+        home = os.environ.get('HOME', '')
+        if not home.startswith('/'):
+            raise Failure('HOME must be set to an absolute path')
+        recorded = pwd.getpwuid(os.getuid()).pw_dir
+        if os.path.realpath(home) != os.path.realpath(recorded):
+            raise Failure(f'HOME ({home}) is not this account\'s home ({recorded}); pass --home DIR to mean another')
+    if not home.startswith('/'):
+        raise Failure('--home must be an absolute path')
+    return Path(home)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('--name', required=True, help='an ALIAS for this host in the signer, host/ALIAS; the line is for a public file, so never the real host name')
+    parser.add_argument('--home', help='the home directory to use instead of this account\'s (for tests and special accounts)')
+    args = parser.parse_args(argv)
+    if not NAME.fullmatch(args.name):
+        raise Failure(f'--name {args.name!r} must be lowercase letters, digits and dashes, starting with one')
+    if os.geteuid() == 0:
+        raise Failure('refusing to run as root: run it as the user who will own the key')
+    os.umask(0o077)
+    home = account_home(args.home)
+    directory = home / '.config/st'
+    key, scratch, config = directory / 'evidence-sign-key', directory / 'evidence-sign-scratch.git', directory / 'evidence-sign.json'
+    wanted = {'signer': f'host/{args.name}', 'ssh_key': str(key), 'scratch_repo': str(scratch)}
+
+    require(directory, stat.S_ISDIR)
+    if lstat(config) is not None:
+        require(config, stat.S_ISREG, 0o600)
+        if json.loads(config.read_text()) != wanted:
+            raise Failure(f'{config} exists and differs from {wanted}; remove it first if you mean to replace it')
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    require(directory, stat.S_ISDIR)
+    if stat.S_IMODE(os.lstat(directory).st_mode) & 0o077:
+        raise Failure(f'{directory} is readable or writable by others; chmod 700 it yourself')
+    if require(key, stat.S_ISREG, 0o600) is None:
+        run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', wanted['signer'], '-f', str(key))
+        require(key, stat.S_ISREG, 0o600)
+    # The line comes from the private key itself, so a stale or planted .pub file cannot change what is listed.
+    fields = run('ssh-keygen', '-y', '-f', str(key)).split()
+    if len(fields) < 2 or fields[0] != 'ssh-ed25519':
+        raise Failure(f'{key} is not an ed25519 key')
+    if require(scratch, stat.S_ISDIR) is None:
+        run('git', 'init', '-q', '--bare', str(scratch))
+    if lstat(config) is None:
+        descriptor = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            handle.write(json.dumps(wanted, indent=2) + '\n')
+    print(f'{wanted["signer"]} namespaces="git" {fields[0]} {fields[1]}')
+    print(f'signer {wanted["signer"]}; key {key}; configuration {config}', file=sys.stderr)
+    print('List the printed line in .st/evidence-keys with a pull request.', file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Failure as error:
+        print(f'evidence-keygen: {error}', file=sys.stderr)
+        sys.exit(1)

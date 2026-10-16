@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { assertUniqueJsonMembers } from './unique-json.ts'
 
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url))
 const PACKAGE_ROOT = fileURLToPath(new URL('../', import.meta.url))
@@ -123,6 +124,37 @@ export const scanIdentities = (path: string, text: string): Finding[] =>
       .map((match) => ({ path, line: index + 1, rule: `identity outside the namespace: ${match[0]}` })),
   )
 
+/** Decode keys and values before checking capabilities, including nested fields and JSON escapes. */
+const scanRecordingCapabilities = (path: string, text: string): Finding[] => {
+  const scanDocument = (document: string, line: number): Finding[] => {
+    let liveCapability = false
+    try {
+      assertUniqueJsonMembers(document)
+      JSON.parse(document, (key: string, value: unknown) => {
+        if ((key === 'capability' || key === 'stream_capability') && (typeof value !== 'string' || !/^capability#[1-9]\d*$/u.test(value))) {
+          liveCapability = true
+        }
+        return value
+      })
+    } catch {
+      return [{ path, line, rule: 'invalid recording JSON' }]
+    }
+    return liveCapability ? [{ path, line, rule: 'live terminal capability' }] : []
+  }
+  // JSONL diagnostics identify the row; a multi-line JSON document is reported at its start.
+  return path.endsWith('.jsonl')
+    ? text.split('\n').flatMap((document, index) => document.trim() === '' ? [] : scanDocument(document, index + 1))
+    : scanDocument(text, 1)
+}
+
+/** Raw captures contain registered scratch identities; only nonfunctional capability tokens are public. */
+export const scanRecordingContent = (path: string, text: string): Finding[] => [
+  ...scanContent(path, text),
+  ...text.split('\n').flatMap((line, index) =>
+    /\/tmp\/|st3-scenario-|nix-shell\./u.test(line) ? [{ path, line: index + 1, rule: 'scratch path' }] : []),
+  ...scanRecordingCapabilities(path, text),
+]
+
 export const scanVocabulary = (path: string, text: string): Finding[] =>
   text.split('\n').flatMap((line, index) => {
     const code = line.replace(/\/\/.*$/, '').replace(/^\s*\*.*$/, '')
@@ -172,7 +204,8 @@ export const scanTree = ({ fixturesDir, packageRoot, vocabularyDir }: ScanRoots)
   const rel = (path: string) => relative(REPO_ROOT, path)
   return [
     ...filesUnder(fixturesDir).flatMap((path) => [...scanContent(rel(path), read(path)), ...scanIdentities(rel(path), read(path))]),
-    ...publishedFiles(packageRoot).flatMap((path) => scanContent(rel(path), read(path))),
+    ...publishedFiles(packageRoot).flatMap((path) => relative(packageRoot, path).startsWith('recordings/')
+      ? scanRecordingContent(rel(path), read(path)) : scanContent(rel(path), read(path))),
     ...filesUnder(vocabularyDir).flatMap((path) => scanVocabulary(rel(path), read(path))),
   ]
 }

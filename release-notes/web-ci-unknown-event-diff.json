@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Run every web CI lane when an event diff cannot be determined, while preserving input-scoped kit plays for known PR, merge-queue and push diffs.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "No application or API change. Unknown web CI diffs select all lanes rather than failing detection before execution. Known diffs retain PR merge-base, merge-group base-to-head and push before-to-after selection; existing check names and gate failure semantics are unchanged." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}

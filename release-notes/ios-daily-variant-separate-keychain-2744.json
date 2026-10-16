@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The optional iOS daily variant installs separately from the development app with its own bundle identifier and Keychain profile",
+  "replay": { "status": "none", "detail": "No replay changes." },
+  "schema": { "status": "none", "detail": "No schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "none", "detail": "The default dev variant keeps its existing identity; the optional daily variant installs as a separate app with its own bundle identifier and Keychain profile." },
+  "downtime": { "status": "none", "detail": "No downtime required." },
+  "manual": { "status": "none", "detail": "No manual migration required." },
+  "recovery": { "status": "none", "detail": "No recovery changes." }
+}

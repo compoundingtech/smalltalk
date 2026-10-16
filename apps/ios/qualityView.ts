@@ -6,6 +6,7 @@ const LABELS: Record<SloTarget, string> = {
   conversation_error_percent_lt: 'Open errors', key_to_redraw_p95_ms_lt: 'Typing p95',
   reconnect_p95_ms_lt: 'Reconnect p95', direct_attach_success_percent_gte: 'Direct attach',
   terminal_open_p95_ms_lt: 'Terminal p95', alert_landed_p95_ms_lt: 'Answer landed p95',
+  send_echo_p99_ms_lt: 'Send shown p99', send_visible_p99_ms_lt: 'Send sent p99',
 };
 function numberText(value: number, key: SloTarget): string {
   if (key.includes('_ms_')) return !Number.isFinite(value) ? '>32s' : value >= 1000 ? `${value / 1000}s` : `${value}ms`;

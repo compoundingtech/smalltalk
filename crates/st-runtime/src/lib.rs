@@ -16,8 +16,9 @@ pub use environment::{
     resolve_executable,
 };
 pub use isolate::{
-    Isolation, SCOPE_GRACE, end_scope, initialize_isolation, mode as isolation_mode, scope_unit,
-    signal_scope, systemd_user_available, warn_if_degraded, wrap as wrap_isolated,
+    CgroupEnding, Isolation, SCOPE_GRACE, ScopeRetirementProof, end_scope, end_scope_with_proof,
+    initialize_isolation, mode as isolation_mode, scope_unit, signal_scope, systemd_user_available,
+    warn_if_degraded, wrap as wrap_isolated,
 };
 pub use priority::{
     BACKGROUND_IO_LEVEL, BACKGROUND_NICE, LIVE_WEIGHT, PRIORITY_ENV, SeatPriority, ServerPlacement,

@@ -13,13 +13,7 @@ import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import { expect, it, vi } from 'vitest'
 // Node tests stub only the CSS runtime; render identity and feed equality are under test.
-vi.mock('@stylexjs/stylex', () => ({
-  create: (styles: unknown) => styles,
-  defineVars: (variables: unknown) => variables,
-  createTheme: () => ({}),
-  keyframes: () => 'test-animation',
-  props: () => ({}),
-}))
+vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 import { sameFolderFleet } from '../shell/AgentFolders.tsx'
 import { useAgentAttentionCounts } from '../shell/AgentAttention.tsx'
@@ -58,7 +52,7 @@ const card = decodeUnknownSync(Attention)({
   detail: 'Independent request',
   priority: 'normal',
   state: 'open',
-  actions: [],
+  actions: ['work.done'],
   revision: '1',
   requested_at: '2026-10-04T12:00:00.000Z',
   updated_at: '2026-10-04T12:00:00.000Z',

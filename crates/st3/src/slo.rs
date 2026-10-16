@@ -20,6 +20,7 @@ pub struct Targets {
     pub statement: Statement,
     pub transaction: Transaction,
     pub cpu: Cpu,
+    pub divergence: Divergence,
     pub database: Database,
 }
 
@@ -63,6 +64,15 @@ pub struct Transaction {
 pub struct Cpu {
     pub about: String,
     pub max_cores: f64,
+}
+
+/// Projection divergences, counted fleet-wide from their open faults. A projection is a pure
+/// function of the claims, so each one is a bug.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Divergence {
+    pub about: String,
+    pub max_open: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,11 +125,14 @@ pub fn parse(text: &str) -> Result<Targets> {
                 .split_once(' ')
                 .with_context(|| format!("path {path:?} names no method"))?;
             ensure!(
-                matches!(method, "GET" | "POST" | "PUT" | "DELETE" | "stream"),
+                matches!(
+                    method,
+                    "GET" | "POST" | "PUT" | "DELETE" | "stream" | "publish"
+                ),
                 "path {path:?} has an unknown method"
             );
             ensure!(
-                method == "stream" || route.starts_with("/v1/"),
+                matches!(method, "stream" | "publish") || route.starts_with("/v1/"),
                 "path {path:?} is not a daemon route"
             );
             ensure!(paths.insert(path.as_str()), "path {path:?} has two targets");
@@ -503,6 +516,20 @@ pub fn doctor_lines(report: &Value) -> Vec<(String, &'static str, String)> {
     lines
 }
 
+/// `st doctor`'s line for open projection divergences: met while there are no more open than the
+/// target allows, which is none. A miss is `info` like every other target's: the fault itself goes
+/// to the fleet's fault agent, and while a peer still differs the replication check fails.
+pub fn divergence_line(open: u64) -> (String, &'static str, String) {
+    let max_open = targets().divergence.max_open;
+    (
+        "slo/projection-divergence".into(),
+        if open <= max_open { "pass" } else { "info" },
+        format!(
+            "open P1 projection bugs ≤ {max_open}: {open} open; `st subject daemon/NODE` for the member that found one shows it with what a reproduction needs"
+        ),
+    )
+}
+
 /// `st doctor`'s line for the store's size: met when the pages in use and their daily growth are
 /// both within target. Growth needs an hour of samples; until then only the size is judged.
 fn database_line(target: &Value) -> (String, &'static str, String) {
@@ -565,6 +592,17 @@ mod tests {
         assert_eq!(fresh.remote_p99_ms, None);
         // A fresh list counts toward its own target only, never the first page's.
         assert_eq!(targets.for_path("GET /v1/client/agents").unwrap().name, "person-read");
+        for path in [
+            "GET /v1/client/missions",
+            "GET /v1/client/missions/{*id}",
+            "stream missions",
+        ] {
+            assert_eq!(targets.for_path(path).unwrap().name, "person-read", "{path}");
+        }
+        for path in ["publish missions", "publish agents", "publish attention"] {
+            let fresh = targets.for_path(path).unwrap();
+            assert_eq!((fresh.name.as_str(), fresh.p99_ms), ("projection-fresh", 1500), "{path}");
+        }
         let attach = targets.for_path("stream terminal").unwrap();
         assert_eq!(attach.p99_ms, 200);
         assert_eq!((targets.statement.p99_ms, targets.statement.max_ms), (10, 100));

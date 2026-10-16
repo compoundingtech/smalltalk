@@ -9,7 +9,7 @@
 //! systemd's default weight of 100. The daemon's unit carries [`LIVE_WEIGHT`] too.
 //!
 //! macOS has no cgroups. There the harness, and each exec task such as a gate's tests, starts
-//! under a utility QoS clamp that every child inherits, while the daemon and the PTY servers keep
+//! under `taskpolicy -b`, which throttles it and every child it starts, while the daemon and the PTY servers keep
 //! their launchd agent's default QoS.
 //!
 //! Linux scope weights only divide a resource between cgroups, and need the user manager to
@@ -74,7 +74,7 @@ pub const BACKGROUND_IO_LEVEL: u8 = 7;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeatPriority {
-    /// Below the daemon: nice 10 and best-effort IO level 7 on Linux, a utility QoS clamp on macOS.
+    /// Below the daemon: nice 10 and best-effort IO level 7 on Linux, `taskpolicy -b` on macOS.
     #[default]
     Background,
     /// The daemon's own priority.
@@ -138,7 +138,7 @@ fn work_prefix_for(
     }
     if macos {
         return if taskpolicy {
-            vec![MACOS_TASKPOLICY.into(), "-c".into(), "utility".into()]
+            vec![MACOS_TASKPOLICY.into(), "-b".into()]
         } else {
             Vec::new()
         };
@@ -397,7 +397,7 @@ fn placement_report(observations: &[PtyObservation]) -> (&'static str, String) {
             } else {
                 (
                     "pass",
-                    "the daemon and PTY servers keep the default QoS; a utility clamp applies to harnesses only in the background mode".into(),
+                    "the daemon and PTY servers keep the default QoS; background throttling applies to harnesses only in the background mode".into(),
                 )
             }
         }
@@ -507,7 +507,7 @@ mod tests {
     fn a_background_seat_on_macos_needs_taskpolicy() {
         assert_eq!(
             work_prefix_for(SeatPriority::Background, true, true, None, None),
-            ["/usr/sbin/taskpolicy", "-c", "utility"]
+            ["/usr/sbin/taskpolicy", "-b"]
         );
         assert!(
             work_prefix_for(

@@ -1,7 +1,7 @@
 /** Device-local summaries shared by stui and the phone. No resource identity or content. */
 export const SLO_BUCKET_UPPER_MS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, null] as const;
 export const SLO_COUNTERS = ['active_ms', 'panics', 'silent_exits', 'launches', 'first_screen_top_bar_flips', 'first_screen_placeholder_flips', 'conversation_opens', 'open_not_bound', 'open_remote_unavailable', 'open_cannot_load', 'drafts_restored_unclean', 'not_live_ms', 'direct_attach_attempts', 'direct_attach_success', 'gateway_attach', 'terminal_open_errors', 'dead_terminal_tabs', 'measurement_overflow'] as const;
-export const SLO_HISTOGRAMS = ['first_frame_ms', 'first_real_state_ms', 'conversation_open_ms', 'key_to_redraw_ms', 'freshness_ms', 'reconnect_ms', 'terminal_open_ms', 'alert_landed_ms'] as const;
+export const SLO_HISTOGRAMS = ['first_frame_ms', 'first_real_state_ms', 'conversation_open_ms', 'key_to_redraw_ms', 'freshness_ms', 'reconnect_ms', 'terminal_open_ms', 'alert_landed_ms', 'send_echo_ms', 'send_ack_ms', 'send_visible_ms'] as const;
 export type SloCounter = typeof SLO_COUNTERS[number];
 export type SloHistogram = typeof SLO_HISTOGRAMS[number];
 /** Initial guesses, to revisit after one week; the Rust reference fixture tests this table. */
@@ -18,6 +18,8 @@ export const SLO_TARGETS = {
   direct_attach_success_percent_gte: 99,
   terminal_open_p95_ms_lt: 1000,
   alert_landed_p95_ms_lt: 2000,
+  send_echo_p99_ms_lt: 100,
+  send_visible_p99_ms_lt: 200,
 } as const;
 export type SloTarget = keyof typeof SLO_TARGETS;
 export type QualityHour = {
@@ -116,6 +118,7 @@ export function judgeQuality(hour: QualityHour): QualityJudgment[] {
     key_to_redraw_p95_ms_lt: p('key_to_redraw_ms'), reconnect_p95_ms_lt: p('reconnect_ms'),
     direct_attach_success_percent_gte: c.direct_attach_attempts ? 100 * c.direct_attach_success / c.direct_attach_attempts : null,
     terminal_open_p95_ms_lt: p('terminal_open_ms'), alert_landed_p95_ms_lt: p('alert_landed_ms'),
+    send_echo_p99_ms_lt: p('send_echo_ms', 99), send_visible_p99_ms_lt: p('send_visible_ms', 99),
   };
   return (Object.keys(SLO_TARGETS) as SloTarget[]).map(target => {
     const value = values[target], limit = hour.targets[target];

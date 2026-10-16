@@ -152,7 +152,7 @@ fn submit(env: &dyn HookEnv, claim: &ClaimInput) -> anyhow::Result<()> {
     let endpoint = match env.var("ST3_ENDPOINT") {
         Some(endpoint) => crate::client::Endpoint::parse(endpoint),
         None => {
-            crate::client::Endpoint::Unix(crate::config::Config::load_unvalidated(None)?.socket)
+            crate::client::Endpoint::Unix(crate::config::Config::load_client_unvalidated(None)?.0.socket)
         }
     };
     let runtime = tokio::runtime::Builder::new_current_thread()

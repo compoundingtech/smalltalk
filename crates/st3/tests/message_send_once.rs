@@ -318,12 +318,32 @@ async fn a_send_whose_answer_was_lost_is_found_and_never_sent_twice() {
     let front = root.path().join("front.sock");
     let losses = Arc::new(Losses::default());
     let proxy = lossy_proxy(front.clone(), back, losses.clone()).await;
+    let intent = st3::parse_intent(
+        "version 2\nagent \"example/worker\" { command \"true\"; workspace \"/tmp\"; }\n",
+        "message-send-once",
+    )
+    .unwrap();
+    store
+        .apply_internal(&intent, "lost-reply-declaration")
+        .unwrap();
     // The daemon applies the send and its in-process retry, and neither answer arrives.
     losses.sends.store(2, Ordering::SeqCst);
 
     let lost = st(&front, &[], SEND).await;
     assert!(!lost.status.success());
     assert_eq!(message_count(&store), 1);
+    let token = store.selected_desired_token(WORKER).unwrap().unwrap();
+    store
+        .retire_agent(
+            WORKER,
+            PERSON,
+            "Work finished",
+            &token,
+            None,
+            "lost-reply-retirement",
+            &[],
+        )
+        .unwrap();
     let rerun = st(&front, &[], SEND).await;
     assert_eq!(
         message_count(&store),

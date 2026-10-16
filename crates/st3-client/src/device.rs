@@ -21,6 +21,23 @@ use std::{
     sync::Arc,
 };
 
+/// The longest message, in UTF-8 bytes, whose text stays whole in the claim. A longer one keeps a
+/// preview there, and a device signs the preview with the whole text's hash and length.
+pub const INLINE_MAX_BYTES: usize = 8192;
+const PREVIEW_BYTES: usize = 1024;
+
+/// The start of a long message as the daemon keeps it in the claim: the first 1,024 bytes cut at a
+/// character, trailing whitespace trimmed, then `…`. A device signs exactly this.
+pub fn long_message_preview(text: &str) -> String {
+    let mut end = PREVIEW_BYTES.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut preview = text[..end].trim_end().to_owned();
+    preview.push('…');
+    preview
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyAlgorithm {
@@ -182,9 +199,11 @@ impl Device {
         Ok(client)
     }
 
-    /// Sign the seven fields in device-signing-v1, including the canonical message subject.
-    /// These fields contain only strings, nulls and arrays of strings, so serde_json's compact
-    /// encoding is their JCS encoding (no floating point or object ordering to normalize).
+    /// Sign the seven fields in device-signing-v1 (nine for a message past `INLINE_MAX_BYTES`),
+    /// including the canonical message subject.
+    /// These fields contain only strings, nulls, arrays of strings and one whole number, so
+    /// serde_json's compact encoding is their JCS encoding (no floating point or object ordering
+    /// to normalize).
     pub fn sign_message(
         &self,
         idempotency_key: &str,
@@ -225,8 +244,34 @@ impl Device {
             "message/{:016x}",
             u64::from_be_bytes(subject_hash[..8].try_into()?)
         );
-        let fields = [
-            ("content", serde_json::to_value(&parameters.content)?),
+        // Past `INLINE_MAX_BYTES` the daemon keeps only a preview in the claim and names the
+        // whole text by its hash and length, so that is what is signed (docs/st3/long-messages.md).
+        let long = parameters.content.len() > INLINE_MAX_BYTES;
+        let mut fields = Vec::with_capacity(9);
+        if long {
+            fields.push((
+                "body_bytes",
+                serde_json::to_value(parameters.content.len() as u64)?,
+            ));
+            fields.push((
+                "body_sha256",
+                serde_json::to_value(
+                    Sha256::digest(parameters.content.as_bytes())
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                )?,
+            ));
+        }
+        fields.extend([
+            (
+                "content",
+                if long {
+                    serde_json::to_value(long_message_preview(&parameters.content))?
+                } else {
+                    serde_json::to_value(&parameters.content)?
+                },
+            ),
             ("from", serde_json::to_value(&self.session.person_id)?),
             (
                 "in_reply_to",
@@ -236,7 +281,7 @@ impl Device {
             ("tags", serde_json::to_value(&parameters.tags)?),
             ("title", serde_json::to_value(&parameters.title)?),
             ("to", serde_json::to_value(&parameters.to)?),
-        ];
+        ]);
         let mut lines = vec![
             "smallclaims-claim-fields-v1".to_owned(),
             subject,
@@ -828,9 +873,18 @@ mod tests {
                 signing_key: Some(key.clone()),
             };
             let fields = &case["fields"];
+            // A long case carries what the person sent as a unit and a count; its `content`
+            // field is only the preview that is signed.
+            let content = match case.get("body") {
+                Some(body) => body["unit"]
+                    .as_str()
+                    .unwrap()
+                    .repeat(body["repeat"].as_u64().unwrap() as usize),
+                None => fields["content"].as_str().unwrap().to_owned(),
+            };
             let parameters = MessageSendParameters {
                 to: fields["to"].as_str().unwrap().into(),
-                content: fields["content"].as_str().unwrap().into(),
+                content,
                 title: serde_json::from_value(fields["title"].clone()).unwrap(),
                 in_reply_to: serde_json::from_value(fields["in_reply_to"].clone()).unwrap(),
                 session_id: serde_json::from_value(fields["session_id"].clone()).unwrap(),
@@ -849,6 +903,12 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(signed.key, case["key"]);
+            assert_eq!(
+                signed.signed_fields,
+                serde_json::from_value::<Vec<String>>(case["signed_fields"].clone()).unwrap(),
+                "{}",
+                case["name"]
+            );
             let raw = URL_SAFE_NO_PAD
                 .decode(signed.key.strip_prefix("p256:").unwrap())
                 .unwrap();

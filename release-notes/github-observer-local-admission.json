@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Persist local GitHub request reservations before sending and slow the shared repository observer minimum to five minutes.",
+  "replay": {
+    "status": "none",
+    "detail": "No graph replay trigger or recovery wait is introduced. Request counters load from a separate local JSON journal at daemon configuration."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, migrations or schema version change. The daemon adds STATE/github-admission.json for local request reservations."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordinated member upgrade change. Admission state belongs to one local daemon."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The shared repository GraphQL observer minimum changes from 60 seconds to five minutes, affecting observer-backed watch and UI freshness; settled polling remains 15 minutes. Configured daemon HTTP sends gain durable metering, defaulting to meter-only. An optional github.observer_requests_per_hour value from 1 through 1000 enforces a local observer request ceiling per resource; unscoped merge/write requests remain uncapped. This does not reserve shared-token quota or count GraphQL points. No wire contract or mixed-version pairing change is introduced."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "No extra restart is requested, but per-request journal fsync latency and deployed freshness have not been measured. Qualify request latency and affected observer consumers before relying on enforcement."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Leave github.observer_requests_per_hour unset for meter-only operation until the owner measures request rates, pagination, quota and freshness headroom. Doctor reports durable reservations and meter gaps. Existing installations gain the local journal on use; no live configuration is changed by this source patch. See docs/st3/github-observer-admission.md."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Unset the optional observer ceiling to return to meter-only operation. Preserve the request journal across restarts and rollback; corrupt state is reported rather than silently reset. An older binary does not account for these reservations, so it cannot supply durable admission guarantees; remove the new optional config field before using an older parser. No database migration is undone or required."
+  }
+}

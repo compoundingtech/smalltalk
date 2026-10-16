@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Retain phase, process and daemon evidence when the fleet-leave fixture stalls",
+  "replay": {"status": "none", "detail": "Only the fleet-leave test fixture changes."},
+  "schema": {"status": "none", "detail": "No claim, registry or storage schema change."},
+  "rules": {"status": "none", "detail": "The fixture keeps its existing assertions and operations; a stalled run fails after an external ten-minute diagnostic deadline."},
+  "compatibility": {"status": "none", "detail": "No production behavior, admission or client contract change."},
+  "downtime": {"status": "none", "detail": "Test diagnostics require no deployment or restart."},
+  "manual": {"status": "none", "detail": "No user configuration or setup change."},
+  "recovery": {"status": "none", "detail": "The existing test guardian still owns and reaps fixture processes; no product recovery change."}
+}

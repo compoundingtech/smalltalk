@@ -76,6 +76,51 @@
       "signed_at_unix_ms": 1791000000000,
       "signed_bytes": "smallclaims-claim-fields-v1\nmessage/09b8b915950a8a24\nmessage.sent\nperson/avery\ncontent=\"a/b \\\"quoted\\\"\\nnext line 🎉 naïve Ωmega\\ttab \\\\ back\"\nfrom=\"person/avery\"\nin_reply_to=null\nsession_id=\"session/phone-1\"\ntags=[\"dictated\",\"zeta\",\"alpha\"]\ntitle=\"Ünïcödé title\"\nto=\"person/robin\"\nperson/avery\n\np256:BFVCcYh9tmkW27mKjxyYQaBBihkCu_hNxEIzH51YFtnoBAL7PdQc1DdFNe-zyl8CL7RU1x49bJTwHbFeY1TyMC8\n4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a,9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d\nvector-nonce-escapes-00\n1791000000000",
       "signature": "G6HsJ5N57Lham3RfFdDvnybUwys3do7EkP_P8EjhVD0PDbY8ogkdpSdDcrVWLf8IBcl0nf2Dl0tvpOQWNMGjMg"
+    },
+    {
+      "name": "long",
+      "idempotency_key": "vector-message-long",
+      "subject": "message/69fa02fea670731a",
+      "kind": "message.sent",
+      "actor": "person/avery",
+      "fields": {
+        "content": "Harbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\nHarbor notes: the tide table,…",
+        "from": "person/avery",
+        "in_reply_to": null,
+        "session_id": null,
+        "tags": [
+          "dictated"
+        ],
+        "title": "Harbor notes",
+        "to": "agent/alder",
+        "body_sha256": "c58b65413676fa08e37d021d6996d9f15af2ef39ac5bfa5174bd4295cd723e34",
+        "body_bytes": 14200
+      },
+      "signed_fields": [
+        "body_bytes",
+        "body_sha256",
+        "content",
+        "from",
+        "in_reply_to",
+        "session_id",
+        "tags",
+        "title",
+        "to"
+      ],
+      "signer": "person/avery",
+      "key": "p256:BFVCcYh9tmkW27mKjxyYQaBBihkCu_hNxEIzH51YFtnoBAL7PdQc1DdFNe-zyl8CL7RU1x49bJTwHbFeY1TyMC8",
+      "chain": [
+        "4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a",
+        "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d"
+      ],
+      "nonce": "vector-nonce-long-00",
+      "signed_at_unix_ms": 1791000000000,
+      "signed_bytes": "smallclaims-claim-fields-v1\nmessage/69fa02fea670731a\nmessage.sent\nperson/avery\nbody_bytes=14200\nbody_sha256=\"c58b65413676fa08e37d021d6996d9f15af2ef39ac5bfa5174bd4295cd723e34\"\ncontent=\"Harbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table, the ferry list and Ωmega's café order.\\nHarbor notes: the tide table,…\"\nfrom=\"person/avery\"\nin_reply_to=null\nsession_id=null\ntags=[\"dictated\"]\ntitle=\"Harbor notes\"\nto=\"agent/alder\"\nperson/avery\n\np256:BFVCcYh9tmkW27mKjxyYQaBBihkCu_hNxEIzH51YFtnoBAL7PdQc1DdFNe-zyl8CL7RU1x49bJTwHbFeY1TyMC8\n4f6b8a0d2c1e3f5a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a,9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d\nvector-nonce-long-00\n1791000000000",
+      "signature": "xFuyagH8CpotwxAggtiCcwlNfEY5e4x9E3pKpxkrON6XnF_ySmIKrutzcMm60K3A0CjdaDd0BvbTMslfyBO2eg",
+      "body": {
+        "unit": "Harbor notes: the tide table, the ferry list and Ωmega's café order.\n",
+        "repeat": 200
+      }
     }
   ]
 }

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Preserve step progress and completion notes across mission revisions",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or backfill is required. Summary reads follow existing step-run.carried links, including revisions written by older builds."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, generated client schema, public command or claim field changes. The reader uses existing carry references and work claims."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint retention rule, digest or version changes. Revision compatibility, authority and attempt boundaries remain in force."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Carried steps expose their prior progress timestamps and completion summaries through the revision cutover. Successor reports supersede inherited notes; a new attempt starts without them. Existing work action eligibility, live-lease requirements and terminal-step refusals are unchanged. Older servers keep their previous summary behavior."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "The server change needs the usual daemon upgrade/restart. Upgrade interruption has not been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator repair or repeated note entry is needed for steps with existing carry links. Changed steps and new attempts do not inherit incompatible progress."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Rollback needs no data migration. Existing claims remain readable; an older server again omits carried summaries."
+  }
+}

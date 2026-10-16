@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add a manual-dispatch macOS run of the seat-priority hog load test to the Performance workflow, and keep its test binary.",
+  "replay": {
+    "status": "none",
+    "detail": "Performance test addition only; no projection or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, migration or stored-data changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No writer, checkpoint, retention or authority changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Existing jobs are unchanged; the new job runs only on manual dispatch and continues on error."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service or runner deployment is introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing manual is required; the job runs only when someone dispatches the workflow."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting removes the perf-load-hog-macos job; nothing stored changes."
+  }
+}

@@ -431,13 +431,23 @@ pub fn record_degraded(repo: &Path, statement: &Statement) -> Result<String> {
 
 /// The running process has one producer identity. Measure it once, from the actual
 /// executable image on Linux; trust-list and evidence verification are never cached.
+/// Concurrent first callers wait for the one measurement instead of each hashing the image.
 fn producer_digest() -> Result<&'static str> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if let Some(value) = DIGEST.get() {
         return Ok(value);
     }
+    let _measuring = MEASURING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(value) = DIGEST.get() {
+        return Ok(value);
+    }
+    #[cfg(test)]
+    MEASUREMENTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     #[cfg(target_os = "linux")]
     let path = PathBuf::from("/proc/self/exe");
     #[cfg(not(target_os = "linux"))]
@@ -458,6 +468,10 @@ fn producer_digest() -> Result<&'static str> {
         .map(String::as_str)
         .context("measured observer digest")
 }
+
+/// How many times this process hashed its own image; the single-flight test pins it at one.
+#[cfg(test)]
+static MEASUREMENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn write_observation(repo: &Path, statement: &Statement, ssh_key: Option<&Path>) -> Result<String> {
     let mut statement = statement.clone();

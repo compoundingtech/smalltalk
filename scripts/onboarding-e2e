@@ -658,7 +658,7 @@ class Run:
         self.check("pre-channel-inline-route",read and any("server:st3" in json.dumps(a) and "plugin:st-channel@st" not in json.dumps(a) for a in argv),"original incarnation reads through inline fallback with no installed plugin")
         r=self.cli("User installs Claude channel without policy","claude-channel","install","--no-policy")
         if not self.check("pre-channel-user-install",r["exit"]==0,"ordinary user installs channel without sudo policy"): return
-        r=self.cli("Restart existing Claude assistant","agents","restart",subject,"--as","person/ada",timeout=45)
+        r=self.cli("Restart existing Claude assistant","agents","restart",subject,"--now","--as","person/ada",timeout=45)
         current,ready=self.wait_seat(subject,previous=previous)
         if not self.check("pre-channel-new-incarnation",restart_requested(r,subject) and ready,"restart produces a different current reachable incarnation without a fault; interactive waiting exit is followed by exact read proof"): return
         incarnation=seat_incarnation(current)

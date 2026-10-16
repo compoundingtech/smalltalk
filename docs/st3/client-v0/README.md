@@ -14,7 +14,8 @@ local Unix socket and authenticated paired HTTP over Tailscale or optional Fabri
 [`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
-The contract digest is written once, in `crates/st3-client/src/contract.rs`. When generated
+No digest of the contract is committed: a line every schema change rewrites made any two of them
+conflict, and `--check` already fails when any generated file differs from its source. When generated
 client files conflict in a merge, resolve the schema and template files, take either side of every
 generated file (`git checkout --theirs -- clients crates/st3-client/src/contract.rs
 crates/st3-client/src/generated.rs`), and run the generator again; never edit generated files by
@@ -556,6 +557,41 @@ retention decision for native per-request records remain later work.
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 
+### Objectives and budgets
+
+`GET /v1/client/slo` lists every objective and budget, the rows `st slo ls` prints. It requires
+`read.projections`. The value is `SloList { as_of_unix_ms, rows }`. An objective is a target with
+windows and an error budget (the daemon's latency, store, CPU and database targets and a paired
+phone's live-share target); a budget is an allowance that resets (each account's weekly and 5-hour
+limit, from the readings `usage.period` reports in `limits`). Every `SloRow` has `id`, `kind`
+(`objective` or `budget`), `about`, `target`, `current`, `window`, `remaining_percent` (what is
+left of the error budget or allowance; null when nothing was measured), `status` (`met`, `missed`,
+`no-data` or `stale`, the last meaning the newest reading is not recent) and `explain`, the row in
+plain words. A budget adds `account`, `resets_at_unix_ms` and `measured_at_unix_ms`. The list is
+computed on each read from live windows and readings; it writes nothing.
+
+`GET /v1/client/slo/history?id=…&since_ms=…&until_ms=…&steps=…` reads what was left of one row
+across a period, from the daemon's local observation log (one reading a minute, kept seven days;
+it is not in the graph and does not replicate). The period defaults to the 24 hours ending now,
+spans at most seven days and answers in `steps` equal steps (default 120, 1 to 1000); a period
+that ends before it starts, is longer than seven days or asks for another number of steps is
+`validation-failed` (HTTP 422). The value is `SloHistory { id, since_ms, until_ms, samples, steps }`: each
+step holds its lowest reading, and a step with no reading is null, so a gap means "not measured",
+never "spent". A daemon that has run for less than the period has fewer readings than steps. An
+id the daemon has no rows for answers with no readings (`samples` 0 and every step null), not an
+error: a client that remembers an id should check it against the list.
+
+The objectives are this daemon's own: each member reports the targets and limits it measures, and
+nothing replicates between members. The wording in `about`, `target`, `current`, `window` and
+`explain` is display text built by the daemon for a person to read; it may change between builds,
+so a client shows it and does not parse it. The pair of reads is experimental while the TUI,
+the phone and the web app settle on what they need. The `slo` capability (version 1) is granted to
+a session with `read.projections`; an older daemon does not list it and answers both paths with 404.
+
+The Rust methods are `Client::slo_list()` and `Client::slo_history(id, since_ms, until_ms, steps)`;
+Swift has `sloList()` and `sloHistory(id:sinceMS:untilMS:steps:)`, and TypeScript `sloList()` and
+`sloHistory(id, { since_ms, until_ms, steps })`.
+
 ### Clients connected now
 
 A client may name itself and its build in an `x-st3-client` header on every request and stream,
@@ -667,24 +703,39 @@ a permission, a question or a review. Its `source_id` and `conversation_id` are 
 `episode` is the harness observation that opened the prompt, and its detail carries the prompt
 text the harness reported. It clears when the harness reports the prompt gone, however it was
 answered, when Claude's terminal shows it was refused (Claude reports no event for that), or
-when the seat's runtime incarnation changes. It offers no typed action yet: its action attaches
-to the seat's terminal to answer there.
+when the seat's runtime incarnation changes. Its action attaches to the seat's terminal to answer
+there.
 
-A Claude permission prompt or a Codex approval request can also be answered from a client: its
-alert lists `answers` (`allow`, `deny`) under `action_parameters["prompt.respond"]` with its
-`target_id` and `episode`, and offers the typed action `prompt.respond`. The alert names only
-Claude's tool (a Codex alert names none); the call it would make (its command, path or other
-input) is conversation content, read from the seat's conversation, where the harness records the
-pending call before it asks. A client shows that pending call in full beside the answers and
-offers `allow` only when it can show it. Only the seat's person answers, only the prompt still
-waiting, and only once; the answer is recorded as a replicated `harness.diagnostic`
-(`native-prompt-answered`, naming the seat's driver). On the seat's host, Claude's prompt hook,
-which waits while Claude shows its own dialog, returns it to Claude; the Codex driver's control
-connection to the app-server sends it as the request's response (`accept`/`decline` for a
-command or file change; the requested permissions, or none, for a permissions request), which
-closes the TUI's prompt. Each waits on the exact observation its prompt wrote, so an answer to an
-earlier prompt never answers a later one. An answer in the terminal still wins at once. A
-question prompt, and prompts of other harnesses, are answered in the terminal.
+A prompt st can deliver an answer to lists its `answers` under `action_parameters["prompt.respond"]`
+with its `target_id` and `episode`, and offers the typed action `prompt.respond`:
+
+| Prompt | `answers` | What is sent as `answer` |
+|---|---|---|
+| Claude permission (its own or a subagent's), Codex command, file change or permissions approval | `allow`, `deny` | the answer |
+| Claude plan approval (`ExitPlanMode`) | `approve`, `deny` | the answer |
+| Claude question (`AskUserQuestion`, single or multi-select) | `answer`, `deny` | `deny`, or the choices: a JSON object of each question's text to its chosen label, several comma-separated |
+| Claude's new-MCP-server dialog | `use`, `use-all`, `skip` | the answer |
+| Claude's or Codex's workspace trust dialog | `trust`, and `exit` or `quit` | the answer |
+
+The alert names only Claude's tool, or what a Codex request asks to do; the call it would make
+(its command, path, plan, questions or other input) is conversation content, read from the seat's
+conversation, where the harness records the pending call before it asks. A client shows that
+pending call in full beside the answers, and offers `allow` or `approve` only when it can show it,
+and `answer` only when it can show the call's questions to choose from. A screen prompt (the MCP
+and trust dialogs) has no pending call: its detail says what it asks. Only the seat's person
+answers, only the prompt still waiting, and only once; the answer is recorded as a replicated
+`harness.diagnostic` (`native-prompt-answered`, naming the seat's driver). On the seat's host,
+Claude's prompt hook, which waits while Claude shows its own dialog, returns it to Claude (a
+question's choices as the tool's answers); the Codex driver's control connection to the app-server
+sends it as the request's response (`accept`/`decline` for a command or file change; the requested
+permissions, or none, for a permissions request); a plan's approval and a screen prompt's answer
+are pressed into the dialog with its own keys by the reconciler, only while the screen still shows
+that dialog. Each waits on the exact observation its prompt wrote, so an answer to an earlier
+prompt never answers a later one. An answer in the terminal still wins at once. A Claude prompt is
+answered from a client only while its hook still waits (a day); a Codex approval only when the
+driver saw its request. Other prompts are answered in the terminal. A refusal because the prompt
+is gone or terminal-only is `stale-fence` with a message beginning `that prompt `, written for the
+person; sending it again never helps.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`
@@ -759,6 +810,38 @@ the normalized `tool_output` block's optional open `metadata`, preserving `wallT
 `source_record` block. Legacy tool-result blocks inside message content remain supported and
 use the same block metadata shape.
 
+When a native user turn retains an exact delivery identity, the graph message and its content
+remain the canonical timeline entries; the native echo and its parts are suppressed. The graph
+entries keep their IDs, sequences, and `message_id` across pages, stream updates, and reconnects.
+The conversation cursor still advances past suppressed native entries. Correlation uses the
+existing delivery marker at the beginning of a user prompt, or a persisted native client ID
+bound to the exact thread and recipient. No content-text, adjacency, or queue-order matching is
+used. Extension-based harnesses retain both entries: exact correlation requires their delivery
+API to propagate a delivery token to the native user-message event.
+
+A transcript without a supported delivery identity retains both entries. This does not alter
+timeline ordering or sequence allocation, and no client idempotency-key field is exposed. If
+the native read sees a send beyond its graph snapshot, its echo is withheld until the next graph
+delta supplies the canonical rows. Post-snapshot client-ID reconciliation reads at most 256
+indexed conversation rows; if that window is exhausted without establishing correlation, the
+torn read requests a full conversation resync rather than guessing.
+Native keyset pages refill bounded batches after suppressing exact echoes, retaining their
+authenticated ordering boundary and source-generation fence. OPEN and change replay carry
+the suppressed native high-water without exposing the private correlation hint.
+A page examines at most 4096 native entries (the scan budget) while omitting echoes. Past the
+budget with visible entries it is a short page: fewer than `limit` items with `has_more: true`
+and its last visible entry as the boundary, so the next page reads on with a fresh budget. When
+that many consecutive entries are all suppressed echoes and none is visible, the read answers
+`page-cursor-expired` (HTTP 410, no `full_resync`) on a continuation, on the header's head read
+and on change replay; it is not `cursor-gap`, because reloading the newest page would meet the
+same prefix. OPEN keeps its established stored-timeline fallback in that case, and a following
+stream waits 1.5 s before it re-opens after such a refusal. While 4096 or more echoes sit at the head, each
+change to the conversation therefore costs one refused replay and one stored-timeline re-OPEN per
+1.5 s at most, until a visible entry is appended. A transcript with
+more than 4096 consecutive correlated delivery echoes therefore cannot be paged past by cursor,
+and while its newest 4096 entries are all echoes its native entries cannot be shown; this is an
+accepted, known limit.
+
 Native block `view` and `metadata` (including assistant text/reasoning metadata) use
 the same bounded open-value display convention on full reads and native keyset pages:
 the outer object and its keys survive, oversized strings gain the visible
@@ -772,6 +855,16 @@ is the only remainder; if the payload or another open field also needs a continu
 the same ref fetches the complete original `/body`, including its unbounded blocks.
 The final per-entry size guard remains authoritative and can replace an entry with a
 `native-entry-too-large` error whose continuation fetches its original body.
+
+A timeline page is also bounded after preparation. An entry that alone still exceeds the response
+ceiling (the 1 MiB response cap minus 128,000 reserved bytes) does not fail the page: it is
+replaced in place by an `error` entry that keeps its `id` and `sequence`, with body
+`{code: "timeline-entry-too-large", message, retryable: false, details: {size}}`, and the page
+cursor continues after it. This applies to native keyset pages and cached offset pages alike. The
+code is an entry-level string in the open `error` body, not an HTTP error code. Native entries
+normally reach this limit through the `native-entry-too-large` guard above, so they keep its
+continuation; the `timeline-entry-too-large` entry carries only the entry's size and has no
+continuation.
 
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
@@ -1843,12 +1936,12 @@ projection time of its cut.
 
 Before the missions list's first publication, and while its refresher fails three folds in a
 row or after it stops, missions windows fold on read and follow commits as before, until a fold
-publishes again. When projections are replaced without a claim (a replay, trim or heal), they
+publishes again. When projections are replaced without a claim (a replay or trim), they
 keep the newest rows, under their own cut, until the list's fold from nothing publishes.
 
 The work list is never folded on read while its refresher runs. Until it has a current
 publication (at startup, after its refresher withdrew it on three failed folds in a row, and
-after a replay, trim or heal until its fold from nothing publishes), a work window receives one
+after a replay or trim until its fold from nothing publishes), a work window receives one
 retryable `resync`, then waits for the list's next publication; neither commits, the reread
 interval nor a repeat of that answer sends it anything more. A paired session's clock still
 rechecks its grant meanwhile, and an expired or revoked grant ends the window. If the work
@@ -1858,7 +1951,7 @@ list's refresher stops for good, a work window receives one `error` frame and en
 `GET /v1/client/work` (the current list, not `history=true`) answers the same way. A first
 page is a slice of the newest publication, under that publication's snapshot. A continuation
 is a slice of the same publication, even after a newer one, a withdrawal or the refresher's end
-(new first pages then refuse), until its cursor expires or a replay, trim or heal replaced the
+(new first pages then refuse), until its cursor expires or a replay or trim replaced the
 projections behind it (`page-cursor-expired`). Asking for the same first page again reuses its
 cursor and its original expiry: a cursor close to expiring can still expire before its next page
 is read, and the client restarts from a first page. The daemon keeps at most 32 cached first pages,
@@ -1875,7 +1968,7 @@ comes, it answers HTTP 503, retryable, with `details.reason: "work-list-not-fres
 asks again on a not-ready or not-fresh answer within `--daemon-wait`, measured once across every
 attempt. A client that does not retry, such as the TypeScript and Swift `workList` or a feed's
 model, gets that retryable 503 until the work list's first fold after the daemon starts, and again
-after each replay, trim or heal and each withdrawal until the next publication. HTTP pages of `/v1/client/missions` are unchanged.
+after each replay or trim and each withdrawal until the next publication. HTTP pages of `/v1/client/missions` are unchanged.
 
 A daemon started with `ST3_PUBLISHED_LISTS=off` folds each window and page on read instead.
 
@@ -1941,6 +2034,21 @@ has it, and `working` comes only from the register. The full mapping tables live
 clients model `view` and `header` as optional loose JSON; `timeline-views.json` is the
 wire fixture.
 
+Schema-integer typed duration projections round native fractional values to the nearest
+whole contract unit: milliseconds for `wall_ms`, `total_ms` and `duration_ms`, seconds
+for `timeout_s`. Open assistant metadata, including `ttft_ms` and `duration_ms`, and
+native payloads and tool-result detail metadata preserve their original number precision.
+Integer counts are projected only from nonnegative integers; signed exit codes remain signed.
+Job summaries require a native identity and use `unknown` when no state was supplied;
+jobs without an identity remain in the native payload rather than receiving invented IDs.
+Tool-start views use the record timestamp when `startedAt` is absent or invalid. If neither
+instant is available, the native record remains readable without a typed tool-start view.
+The optional thinking-level `configured` field is projected only from native boolean
+evidence. A native string such as `"high"` stays in the payload but is omitted from the
+typed view; its presence does not imply an explicit-configuration fact.
+Non-fetchable prefix notices express that fact in `reason` and omit a continuation cursor,
+without adding undeclared fields to the closed truncation body.
+
 The pre-approval parity audit adds these parsed contract fields explicitly:
 `TimelineViewTask.context`, `SubagentSummary.name` (OMP name, distinct from agent
 type), `TimelineViewWrite.content` and `line_count`, search flags `case`, `hidden`,
@@ -1955,6 +2063,9 @@ Assistant session errors add `TimelineViewAssistantError` with `status`,
 `superseded_by` with epoch-ms `timestamp`, `response_id`, `provider`, `model`).
 Recovery markers do not invent live retry state. Recovered errors start compact,
 retain original errors on expansion, and superseded errors are not drawn.
+The optional open `native` object preserves exact `stopReason`, `errorMessage`,
+`errorStatus`, `errorId` and `retryRecovery` values, including structured/null
+diagnostics and future fields, without changing the presentation projection.
 
 
 `read.projections` authorizes **raw native conversation content**, including full
@@ -2070,3 +2181,23 @@ matching, even when the expected incarnation is also missing. A summary is not r
 
 The optional claim field changes the registry digest. Older members keep new-field submissions
 as waiting records until upgrade; see [rolling upgrades](../replication.md#rolling-upgrades-and-waiting-claims).
+
+`agent.retire` permanently retires the identity at its declaring host. It requires `{ "agent": "agent/example/worker", "reason": "Work finished" }`, a selected desired claim ID in `fence.runtime_desired_revision`, and a stable idempotency key. Optional `runtime_incarnation` fences a selected process. Rust provides `agent_retire`; Swift and TypeScript provide `agentRetire`. See [terminal retirement](../agent-retirement.md) for the coordinated registry rollout and locally known retirement rule. Fresh sends to a known retired agent return 409 `recipient-retired` with `applied: "none"` and a typed `details.refusal.variant: "Retired"`. Exact accepted retries return their receipt; a lost reply remains unconfirmed. `lifecycle-unavailable` concerns incomplete/conflicting local evidence, never an offline owner alone.
+
+### Exchange carrier observations
+
+`SyncPeer` may include `last_successful_exchange` and `last_failed_exchange`, each
+an `ExchangeTransport` with `at` (ISO timestamp), `carrier` (an open string:
+`tailscale`, `fabric`, `loopback`, or `unknown` today), and optional `fabric_route`
+(`unknown` for Fabric today). They describe this serving host's last **locally initiated** exchange or attempt of
+each outcome, with its original timestamp, not replicated reachability or advertised
+endpoints. Success and failure records
+are independent: a successful fallback preserves the failed attempt's carrier.
+Incoming exchanges advance ordinary last-seen status and preserve the original
+outbound carrier record and timestamp; an inbound-only peer has no carrier record,
+which means evidence is unknown/unavailable. Fabric's loopback tunnel address cannot
+establish an incoming carrier. Restart clears these records, and probes never change
+them. Idle receipts outside the sync notice set do not notify client streams;
+repeated same-carrier failures likewise stay quiet when the graph is unchanged. Existing sync notice conditions
+remain the same. Older servers omit these optional fields; older clients ignore
+the additions. No API version, scope, operation or claim shape changes.

@@ -903,6 +903,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         | ErrorCode::ProjectionDetailInvalidSource
         | ErrorCode::AttentionMigrated
         | ErrorCode::IssuerRequired
+        | ErrorCode::SuspendAuthoredSessionSelection
         | ErrorCode::RuntimeNotLocal
         | ErrorCode::ArrangementExists
         | ErrorCode::ArrangementFolderExists
@@ -919,6 +920,9 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         | ErrorCode::InvalidArrangementName
         | ErrorCode::InvalidArrangementKey
         | ErrorCode::InvalidSubjectReference
+        | ErrorCode::RecipientRetired
+        | ErrorCode::LifecycleUnavailable
+        | ErrorCode::RetirementUpgradeRequired
         | ErrorCode::Unknown => message.to_owned(),
     }
 }
@@ -1714,6 +1718,28 @@ impl Client {
     pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {
         self.get("/v1/client/mail-backlog").await
     }
+    pub async fn slo_list(&self) -> Result<Envelope<SloList>, ClientError> {
+        self.get("/v1/client/slo").await
+    }
+    pub async fn slo_history(
+        &self,
+        id: &str,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+        steps: Option<usize>,
+    ) -> Result<Envelope<SloHistory>, ClientError> {
+        let mut path = format!("/v1/client/slo/history?id={}", percent_encode(id));
+        if let Some(since_ms) = since_ms {
+            path.push_str(&format!("&since_ms={since_ms}"));
+        }
+        if let Some(until_ms) = until_ms {
+            path.push_str(&format!("&until_ms={until_ms}"));
+        }
+        if let Some(steps) = steps {
+            path.push_str(&format!("&steps={steps}"));
+        }
+        self.get(&path).await
+    }
     pub async fn usage_period(
         &self,
         since_ms: Option<u64>,
@@ -2141,6 +2167,17 @@ impl Client {
         parameters: AgentResumeParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::agent_resume(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn agent_retire(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentRetireParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::agent_retire(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
@@ -4141,6 +4178,47 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_older_error_decoder_preserves_terminal_refusal_as_a_generic_error() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(rename_all = "kebab-case")]
+        enum PreviousCode {
+            NotFound,
+            #[serde(other)]
+            Unknown,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousEnvelope {
+            code: PreviousCode,
+            message: String,
+            retryable: bool,
+            details: serde_json::Value,
+        }
+        for (code, variant) in [
+            ("recipient-retired", "Retired"),
+            ("lifecycle-unavailable", "LifecycleUnavailable"),
+        ] {
+            let wire = serde_json::json!({"api_version":API_VERSION,"error_version":ERROR_VERSION,
+                "request_id":"request/example","code":code,"message":format!("{variant}: recipient agent/example/worker refuses this first send"),
+                "retryable":false,"applied":"none","details":{"applied":"none","refusal":{"variant":variant,"recipient":"agent/example/worker"}}});
+            let previous: PreviousEnvelope = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(previous.code, PreviousCode::Unknown);
+            assert!(!previous.retryable);
+            assert!(previous.message.contains(variant));
+            assert_eq!(previous.details["applied"], "none");
+            let current: ErrorEnvelope = serde_json::from_value(wire).unwrap();
+            let error = ClientError::Api(
+                current.code.clone(),
+                current.message.clone(),
+                Box::new(current),
+            );
+            assert_eq!(error.applied(), Some("none"));
+            assert!(!error.outcome_unknown());
+            assert!(!error.is_transient());
+            assert!(error.plain().contains(variant));
+        }
+    }
 
     #[test]
     fn every_schema_error_code_is_typed_and_round_trips() {

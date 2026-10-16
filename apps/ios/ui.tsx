@@ -1,19 +1,59 @@
-import { useCallback, useRef, type ReactNode, type Ref } from 'react';
+import { createContext, useContext, useCallback, useRef, type ReactNode, type Ref } from 'react';
 import { quality } from './qualityNative';
 import * as Clipboard from 'expo-clipboard';
-import { ActionSheetIOS, Linking, Pressable, StyleSheet, Text, TextInput, View, type StyleProp, type TextInputProps, type TextStyle, type ViewStyle } from 'react-native';
-import { fonts, theme } from './theme';
+import { ActionSheetIOS, Linking, Pressable, StyleSheet, Text, TextInput, View, useColorScheme, type StyleProp, type TextInputProps, type TextStyle, type ViewStyle } from 'react-native';
+import { fonts, systemColors, theme } from './theme';
 import type { Run } from './markdown';
 import { markdown } from './markdown';
 
-// The pieces every screen draws with, so the app reads like stui: one monospace face, the
-// Mocha palette, dense rows, dim section rules with counts, and glyphs for state.
+// Shared renderers retain the legacy stui presentation by default. SystemScreen scopes
+// system text, semantic appearance and grouped rows to the migrated native surfaces.
 
 export const SIZE = 14;
 export const LINE = 20;
 
+const SystemAppearance = createContext(false);
+export function useSystemColors() {
+  return systemColors[useColorScheme() === 'dark' ? 'dark' : 'light'];
+}
+export function useTextAppearance() {
+  const system = useContext(SystemAppearance);
+  const colors = useSystemColors();
+  const color = (value?: string) => {
+    if (!system) return value;
+    if (!value || value === theme.text) return colors.text;
+    if (value === theme.person || value === theme.waiting || value === theme.working || value === theme.yellow || value === theme.peach) return colors.attention;
+    if (value === theme.red) return colors.fault;
+    if (value === theme.green || value === theme.teal) return colors.success;
+    if (value === theme.blue || value === theme.lavender || value === theme.sapphire) return colors.action;
+    return colors.secondary;
+  };
+  return { system, colors, color };
+}
+
+/** Opt-in system typography and appearance, scoped to one migrated screen. */
+export function SystemScreen({ children }: { children: ReactNode }) {
+  const colors = useSystemColors();
+  return <SystemAppearance.Provider value={true}><View style={{ flex: 1, backgroundColor: colors.background }}>{children}</View></SystemAppearance.Provider>;
+}
+
+/** Wrapping, inset grouped row. The label carries meaning without a glyph legend. */
+export function GroupedRow({ title, context, onPress, onLongPress }: { title: string; context: string; onPress: () => void; onLongPress?: () => void }) {
+  const colors = useSystemColors();
+  return <Pressable accessibilityRole="button" accessibilityLabel={`${title}. ${context}`} accessibilityHint="Opens alert details" onPress={onPress} onLongPress={onLongPress}
+    style={({ pressed }) => ({ marginHorizontal: 16, padding: 16, minHeight: 60, borderRadius: 10, backgroundColor: pressed ? colors.separator : colors.grouped, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.separator, flexDirection: 'row', alignItems: 'center', gap: 12 })}>
+    <View style={{ flex: 1, gap: 6 }}><T bold>{title}</T><T dim>{context}</T></View>
+    <Text accessible={false} style={{ color: colors.secondary, fontSize: 22 }}>›</Text>
+  </Pressable>;
+}
+
+export function GroupedHeader({ title, count }: { title: string; count?: number }) {
+  return <View style={{ paddingHorizontal: 32, paddingTop: 24, paddingBottom: 8 }} accessibilityRole="header"><T bold>{title}{count === undefined ? '' : ` · ${count}`}</T></View>;
+}
+
 export function T({ children, style, color, dim, bold, soft, numberOfLines, selectable }: { children: ReactNode; style?: StyleProp<TextStyle>; color?: string; dim?: boolean; bold?: boolean; soft?: boolean; numberOfLines?: number; selectable?: boolean }) {
-  return <Text numberOfLines={numberOfLines} selectable={selectable} style={[styles.text, dim && { color: theme.overlay0 }, soft && { color: theme.subtext0 }, bold && styles.bold, color ? { color } : null, style]}>{children}</Text>;
+  const appearance = useTextAppearance();
+  return <Text allowFontScaling numberOfLines={numberOfLines} selectable={selectable} style={[styles.text, dim && { color: theme.overlay0 }, soft && { color: theme.subtext0 }, bold && styles.bold, color ? { color } : null, appearance.system && { fontFamily: 'System', fontSize: 17, lineHeight: undefined, fontWeight: bold ? '600' : '400', color: appearance.color(color ?? (dim || soft ? theme.subtext0 : theme.text)) }, style]}>{children}</Text>;
 }
 
 /** A section rule: `idle ────── 19`, mauve when a person is needed. */
@@ -47,7 +87,8 @@ export function Note({ children, tone = 'dim' }: { children: ReactNode; tone?: '
 }
 
 export function Button({ label, onPress, disabled = false, color = theme.accent, style }: { label: string; onPress: () => void; disabled?: boolean; color?: string; style?: StyleProp<ViewStyle> }) {
-  return <Pressable accessibilityRole="button" accessibilityLabel={label} disabled={disabled} onPress={onPress} style={({ pressed }) => [styles.button, pressed && { backgroundColor: theme.surface1 }, disabled && styles.disabled, style]}>
+  const appearance = useTextAppearance();
+  return <Pressable accessibilityRole="button" accessibilityLabel={label} accessibilityState={{ disabled }} disabled={disabled} onPress={onPress} style={({ pressed }) => [styles.button, appearance.system && { minHeight: 44, justifyContent: 'center', backgroundColor: appearance.colors.grouped, paddingHorizontal: 16, paddingVertical: 12, borderRadius: 10 }, pressed && (appearance.system ? { opacity: 0.7 } : { backgroundColor: theme.surface1 }), disabled && styles.disabled, style]}>
     <T bold color={color}>{label}</T>
   </Pressable>;
 }
@@ -62,8 +103,9 @@ export function Field(props: TextInputProps & { ref?: Ref<TextInput> }) {
 
 /** A banner under the header: a problem to read, tap to dismiss when it can be. */
 export function Banner({ text, tone = 'fault', onPress }: { text: string; tone?: 'fault' | 'warning' | 'quiet'; onPress?: () => void }) {
+  const appearance = useTextAppearance();
   const color = tone === 'fault' ? theme.fault : tone === 'warning' ? theme.waiting : theme.subtext0;
-  return <Pressable disabled={!onPress} onPress={onPress} style={[styles.banner, { borderLeftColor: color }]}><T color={color}>{text}</T></Pressable>;
+  return <Pressable accessibilityRole={onPress ? 'button' : undefined} disabled={!onPress} onPress={onPress} style={[styles.banner, { borderLeftColor: appearance.color(color), backgroundColor: appearance.system ? appearance.colors.grouped : theme.mantle }]}><T color={color}>{text}</T></Pressable>;
 }
 
 export function Screen({ children, style }: { children: ReactNode; style?: StyleProp<ViewStyle> }) {
@@ -86,22 +128,24 @@ function showPath(path: string) {
   );
 }
 function Runs({ runs, base }: { runs: Run[]; base: TextStyle }) {
-  return <>{runs.map((run, index) => <Text key={index} style={runStyle(run, base)} onPress={run.url ? () => void Linking.openURL(run.url!) : run.path ? () => showPath(run.path!) : undefined}>{run.text}</Text>)}</>;
+  const appearance = useTextAppearance();
+  return <>{runs.map((run, index) => <Text key={index} style={appearance.system ? [base, run.style === 'bold' && { fontWeight: '600' }, run.style === 'code' && { fontFamily: fonts.regular }, run.style === 'link' && { color: appearance.colors.action, textDecorationLine: 'underline' }] : runStyle(run, base)} onPress={run.url ? () => void Linking.openURL(run.url!) : run.path ? () => showPath(run.path!) : undefined}>{run.text}</Text>)}</>;
 }
 
 /** Markdown as stui renders a reply: peach headings, lavender bullets, code in a gutter. */
 export function Markdown({ text, color = theme.text, selectable = true }: { text: string; color?: string; selectable?: boolean }) {
-  const base: TextStyle = { ...styles.text, color };
+  const appearance = useTextAppearance();
+  const base: TextStyle = appearance.system ? { fontFamily: 'System', fontSize: 17, color: appearance.color(color) } : { ...styles.text, color };
   return <View>{markdown(text).map((block, index) => {
     switch (block.kind) {
       case 'blank': return <View key={index} style={{ height: LINE / 2 }} />;
-      case 'heading': return <Text key={index} style={[base, styles.bold, { color: theme.peach }, block.level === 1 && { textDecorationLine: 'underline' }]}><Runs runs={block.runs} base={{ ...base, ...styles.bold, color: theme.peach }} /></Text>;
+      case 'heading': return <Text key={index} style={[base, appearance.system ? { fontWeight: '600', color: appearance.color(theme.peach) } : [styles.bold, { color: theme.peach }, block.level === 1 && { textDecorationLine: 'underline' }]]}><Runs runs={block.runs} base={appearance.system ? { ...base, fontWeight: '600' } : { ...base, ...styles.bold, color: theme.peach }} /></Text>;
       case 'rule': return <View key={index} style={[styles.mdRule, { backgroundColor: theme.surface2 }]} />;
-      case 'quote': return <View key={index} style={styles.quote}><Text style={[base, { color: theme.subtext0, fontFamily: fonts.italic }]}><Runs runs={block.runs} base={{ ...base, color: theme.subtext0, fontFamily: fonts.italic }} /></Text></View>;
-      case 'item': return <View key={index} style={[styles.item, { paddingLeft: block.indent * 7 }]}><Text style={[base, { color: theme.lavender }]}>{block.marker}</Text><Text style={[base, styles.itemText]}><Runs runs={block.runs} base={base} /></Text></View>;
+      case 'quote': return <View style={styles.quote}><Text style={[base, appearance.system ? { color: appearance.colors.secondary, fontStyle: 'italic' } : { color: theme.subtext0, fontFamily: fonts.italic }]}><Runs runs={block.runs} base={appearance.system ? base : { ...base, color: theme.subtext0, fontFamily: fonts.italic }} /></Text></View>;
+      case 'item': return <View style={[styles.item, { paddingLeft: block.indent * 7 }]}><Text style={[base, { color: appearance.color(theme.lavender) }]}>{block.marker}</Text><Text style={[base, styles.itemText]}><Runs runs={block.runs} base={base} /></Text></View>;
       case 'fence': return <Text key={index} style={[base, { color: theme.overlay0 }]}>{block.text}</Text>;
-      case 'code': return <Text key={index} selectable={selectable} style={[base, { color: theme.subtext1, paddingLeft: 14 }]}>{block.text || ' '}</Text>;
-      case 'table': return <Text key={index} style={[base, { color: theme.subtext0 }]}>{block.text}</Text>;
+      case 'code': return <Text key={index} selectable={selectable} style={[base, { fontFamily: fonts.regular, color: appearance.color(theme.subtext1), paddingLeft: 14 }]}>{block.text || ' '}</Text>;
+      case 'table': return <Text key={index} style={[base, !appearance.system && { color: theme.subtext0 }]}>{block.text}</Text>;
       case 'text': return <Text key={index} selectable={selectable} style={base}><Runs runs={block.runs} base={base} /></Text>;
     }
   })}</View>;

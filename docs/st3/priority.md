@@ -16,7 +16,7 @@ changes it for a seat.
 
 | Setting | Linux | macOS |
 | --- | --- | --- |
-| `background` (default) | `nice -n 10` and IO class best-effort, level 7 | `taskpolicy -c utility` |
+| `background` (default) | `nice -n 10` and IO class best-effort, level 7 | `taskpolicy -b` |
 | `normal` | the daemon's own priority | the daemon's own priority |
 
 Only agent seats and what they start go to background: their harnesses, helpers, shells an agent
@@ -122,10 +122,12 @@ their harnesses.
 
 macOS has no cgroups. The daemon runs as a launchd agent with `ProcessType` `Interactive`, and the
 PTY servers it starts keep that agent's default QoS. st starts each harness, and each exec task,
-under `/usr/sbin/taskpolicy -c utility`. That clamps the program and every child it starts to the
-utility QoS class, which schedules below the default class and throttles its disk IO. The
-`background` clamp would confine builds to efficiency cores, so st does not use it. A seat at
-`normal` priority starts without the clamp.
+under `/usr/sbin/taskpolicy -b`. That runs the program and every child it starts with its resources
+throttled, below the daemon's default QoS. `nice` alone is not enough on macOS: on a
+10-core Mac, a test run at `nice 20` (13 processes, 226% CPU) took the load average to 54 and made
+the daemon answer slowly, and `taskpolicy -b` on the same processes brought it to 23 within a minute
+and 16 within five. The cost is that throttled builds can be confined to efficiency cores; set
+`normal` for a seat that needs more. A seat at `normal` priority starts without the policy.
 
 ## Stopping a session
 

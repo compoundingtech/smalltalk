@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Let the evidence verifier read the central observer's CI records and report unsigned degraded records distinctly",
+  "replay": {"status": "none", "detail": "No daemon replay change; the script reads Git notes only."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change."},
+  "rules": {"status": "none", "detail": "No daemon rule, required check or main landing change. Nothing calls the script yet."},
+  "compatibility": {"status": "none", "detail": "A new accepted record kind and result reason on a script nothing calls; existing behavior is unchanged."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "Nothing to do."},
+  "recovery": {"status": "none", "detail": "Reverting removes the observed kind."}
+}

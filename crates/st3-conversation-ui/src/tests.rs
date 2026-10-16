@@ -1071,6 +1071,31 @@ fn attachment_only_mail_and_non_image_refs_remain_visible() {
 }
 
 #[test]
+fn a_long_message_shows_its_start_and_says_where_the_rest_is_read() {
+    let long: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+        "id":"mail","sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"user","final":true,"type":"message",
+        "body":{"message_id":"message/harbor","role":"user","from":"person/ada","to":"agent/a",
+            "body_bytes":12800}
+    }))
+    .unwrap();
+    let start = item("content", 2, 1, "Harbor notes: the tide table…");
+    let rendered = adapt::conversation(&[long, start.clone()], &Default::default());
+    let Body::Mail { body, .. } = &rendered[0].body else { panic!("{rendered:?}") };
+    assert!(body.starts_with("Harbor notes: the tide table…"), "{body}");
+    assert!(body.contains("12.5 KiB") && body.contains("st conversations read message/harbor"), "{body}");
+    // A message with no body size reads exactly as before.
+    let short: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+        "id":"mail","sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"user","final":true,"type":"message",
+        "body":{"message_id":"message/short","role":"user","from":"person/ada","to":"agent/a"}
+    }))
+    .unwrap();
+    let rendered = adapt::conversation(&[short, start], &Default::default());
+    assert!(matches!(&rendered[0].body, Body::Mail { body, .. } if body == "Harbor notes: the tide table…"));
+}
+
+#[test]
 fn pending_binding_preserves_authorized_activity_without_claiming_an_empty_harness() {
     let activity = item("activity", 1, 1, "Captured activity");
     let mail = serde_json::from_value(serde_json::json!({

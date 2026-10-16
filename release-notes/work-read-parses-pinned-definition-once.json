@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The per-step work reads parse a run's pinned mission definition once per read, not once per step, so reading the work of a 4,200-step mission no longer costs the square of its size",
+  "replay": {"status": "none", "detail": "Reads only; no claim or replay change."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "Same rows and fields; a read now reuses the definition it parsed for an earlier step of the same read."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "none", "detail": "No operator step."},
+  "recovery": {"status": "none", "detail": "Revert the commit."}
+}

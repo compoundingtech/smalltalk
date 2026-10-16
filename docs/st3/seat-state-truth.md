@@ -9,9 +9,9 @@ fields, so they cannot disagree.
 
 | Card | Rule |
 | --- | --- |
-| `state: running` | The harness reported `ready`, `idle` or `working` inside the freshness window (90 s), even when the runtime row still says `pending`. A seat can outlive its row. |
+| `state: running` | The harness reported `ready`, `idle` or `working` inside the freshness window (90 s), even when the runtime row still says `pending`. A seat can outlive its row. A seat whose runtime row is stuck and whose last report is an idle one older than 90 s but newer than a heartbeat (11 minutes) reads `waiting`, like any other live idle seat; it is never `down`. |
 | `state: desired` / `starting` | A declared seat inside its launch window (two minutes from its last runtime claim, or from its declaration if it never reported). |
-| `state: down`, `down_since` | A declared seat with no running session and no fresh harness report once the launch window has passed. `down_since` is when it began waiting. Never shown as starting, working or idle. |
+| `state: down`, `down_since` | A declared seat with no running session and no harness report within a heartbeat (11 minutes; a driver at an empty prompt reports every five minutes) once the launch window has passed. `down_since` is when it last reported after its launch, or when it began waiting if it never has; the report time is the driver's own clock value, so a driver with a skewed clock moves `down_since` by the same amount. Never shown as starting, working or idle. |
 | `current_work[].holder_down_since` | Set on every step a `down` seat holds: the step's progress and activity were written by a holder that has no session. |
 | `harness_state: working`, `observation: stale` | A turn can run for hours without a new harness claim, so a `working` report is kept until the harness says otherwise. `silent_since` already says how long the seat has been quiet. |
 | `harness_state: indeterminate`, `observation: stale` | Only a `ready` or `idle` report lapses after the window: st has not heard from the harness. stui and the phone app show this as idle for a reachable seat; the card does not claim it. |
@@ -24,6 +24,16 @@ and its driver can outlive a runtime row stuck at `pending`; while such a seat r
 says `running`; when it stops reporting, the card says `down` and `st terminals screen` finds no
 session for it too. Finding the process and relaunching a seat that declares `restart always` belong to
 the launch and reconcile path, not to the label.
+
+## A seat st cannot place on a host
+
+When two hosts both claim a seat's runtime, st cannot say which one runs it, and `st terminals`
+refuses with `runtime-authority-indeterminate`. The card keeps `state: waiting` and
+`reachability: indeterminate`, and its `reason` reads "st cannot tell which host runs this agent; its
+processes may be running" unless the harness gave a reason of its own. The card does not call the
+seat running, stopped or down, and the conflicting claims stay as they are. `st agents show` prints
+the same sentence in place of "Still starting". The apps keep their present word for the state until
+they learn to print the reason.
 
 ## A seat that dies mid-turn
 

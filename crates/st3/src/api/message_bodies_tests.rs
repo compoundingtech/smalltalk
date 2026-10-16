@@ -19,12 +19,16 @@ fn text(bytes: usize) -> String {
 }
 
 fn send(state: &AppState, key: &str, content: &str) -> Result<MessageSendReceipt, ApiError> {
+    send_to(state, "agent/worker", key, content)
+}
+
+fn send_to(state: &AppState, to: &str, key: &str, content: &str) -> Result<MessageSendReceipt, ApiError> {
     accept_message_receipt(
         state,
         MessageSendRequest {
             idempotency_key: key.into(),
             from: "person/alex".into(),
-            to: "agent/worker".into(),
+            to: to.into(),
             content: content.into(),
             title: Some("notes".into()),
             in_reply_to: None,
@@ -126,6 +130,44 @@ async fn a_repeated_send_of_a_long_body_sends_once() {
     assert_eq!(first.message.subject, again.message.subject);
     assert_eq!(again.message.body_ref, first.message.body_ref);
     assert_eq!(state.store.messages(Some("agent/worker"), true).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retirement_keeps_accepted_long_body_retries_and_discards_refused_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::state(root.path());
+    let intent = crate::parse_intent(
+        "version 2\nagent \"example/worker\" { command \"true\"; workspace \".\"; restart \"never\"; }\n",
+        state.store.origin(),
+    ).unwrap();
+    state.store.apply_internal(&intent, "long-body-retirement-declare").unwrap();
+    let token = state.store.selected_desired_token("agent/example/worker").unwrap().unwrap();
+    let body = text(50 * 1024);
+    let first = send_to(&state, "agent/example/worker", "accepted-before-retirement", &body).unwrap();
+    state.store.retire_agent(
+        "agent/example/worker", "agent/example/worker", "Work finished", &token, None,
+        "long-body-retirement", &[],
+    ).unwrap();
+
+    let again = send_to(&state, "agent/example/worker", "accepted-before-retirement", &body).unwrap();
+    assert!(again.already_sent);
+    assert_eq!(again.message.subject, first.message.subject);
+    assert_eq!(again.message.body_ref, first.message.body_ref);
+    assert_eq!(full_text(&state, &first.message.subject).await, body);
+    let changed = send_to(&state, "agent/example/worker", "accepted-before-retirement", &(body.clone() + " changed")).unwrap_err();
+    assert_eq!(changed.code, "idempotency-mismatch");
+
+    let before = state.store.index().unwrap();
+    let refused = send_to(&state, "agent/example/worker", "fresh-after-retirement", &body).unwrap_err();
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.code, "recipient-retired");
+    assert_eq!(refused.details["applied"], "none");
+    assert_eq!(state.store.index().unwrap(), before);
+    assert!(state.store.operation_claim("fresh-after-retirement").unwrap().is_none());
+    assert_eq!(state.store.messages(Some("agent/example/worker"), true).unwrap().len(), 1);
+    let files = message_body::bodies(&state.state_dir).files();
+    assert_eq!(files.len(), 1, "refused sends must leave no extra body file");
+    assert!(files.iter().all(|file| !file.temporary));
 }
 
 #[tokio::test]

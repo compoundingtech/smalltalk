@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Rebase terminal agent retirement onto current main, regenerating shared client contracts and preserving fresh-store schema installation.",
+  "replay": {
+    "status": "none",
+    "detail": "No retirement admission, precedence or replay contract change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No additional claim or index beyond the existing retirement slice. Preserve main client/schema additions and regenerate combined contracts."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing durable agent.retired retention and checkpoint policies unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Retain exact registry-digest upgrade gate, terminal never-reuse policy approved by Nathan, and relaxed cross-peer admission."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Upgrade members together; prevent downgrades and upgrade entrants before admission as the retirement runbook requires."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing roll-forward and checkpoint recovery instructions remain applicable."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Retirement indexes install within main fresh-schema transaction; existing-store per-statement schema path and common selection-trigger installation retained. No new timing measurements; live-store downtime remains unknown."
+  }
+}

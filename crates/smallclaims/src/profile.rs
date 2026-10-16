@@ -1447,9 +1447,9 @@ mod tests {
             acquired.send(()).unwrap();
             released.recv().unwrap();
             {
-                let _replay = span("projection/heal-replay");
+                let _replay = span("projection/full-replay");
                 sql("SELECT invented", Duration::from_millis(3));
-                note("projection: full replay for a heal");
+                note("projection: full replay");
             }
             writer_released(writer);
             // The entered guard must account for CPU/I/O before the worker's last Op drops.
@@ -1480,8 +1480,8 @@ mod tests {
             assert_eq!(recorded.count, 1);
             assert_eq!(recorded.acc.writer_hold.count, 1);
             assert_eq!(recorded.acc.sql.count, 1);
-            assert_eq!(recorded.acc.spans["projection/heal-replay"].count, 1);
-            assert_eq!(recorded.acc.spans["projection/heal-replay"].sql_count, 1);
+            assert_eq!(recorded.acc.spans["projection/full-replay"].count, 1);
+            assert_eq!(recorded.acc.spans["projection/full-replay"].sql_count, 1);
             assert!(recorded.acc.cpu_ns > 0);
         }
         let lines = fs::read_to_string(state.dir.join("slow.jsonl")).unwrap();
@@ -1495,7 +1495,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|span| span["name"] == "projection/heal-replay")
+            .find(|span| span["name"] == "projection/full-replay")
             .unwrap();
         assert_eq!(replay["sql_count"], 1);
 

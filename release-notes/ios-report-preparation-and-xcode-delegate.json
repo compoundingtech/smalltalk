@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Prevent recursive iOS observation reporting and fix the Xcode 27 collections delegate build",
+  "replay": {"status": "none", "detail": "No runtime replay changes."},
+  "schema": {"status": "none", "detail": "No database schema changes."},
+  "rules": {"status": "none", "detail": "No checkpoint or fleet coordination changes."},
+  "compatibility": {"status": "none", "detail": "The SocketRocket ping delegate retains its Objective-C selector; only the Swift requirement name changes. Observation report bytes and protocol contracts are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional service interruption introduced."},
+  "manual": {"status": "none", "detail": "No manual upgrade or state migration required."},
+  "recovery": {"status": "none", "detail": "No recovery procedure changes."}
+}

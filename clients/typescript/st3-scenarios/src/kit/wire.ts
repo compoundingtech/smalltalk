@@ -61,7 +61,7 @@ export const wireValues = (slice: AnySlice): WireValue[] => {
       })
       break
     case 'sync':
-      out.push({ pointer: '/state/capabilities', definition: 'Capabilities', value: slice.state.capabilities })
+      if (slice.state.capabilities !== undefined) out.push({ pointer: '/state/capabilities', definition: 'Capabilities', value: slice.state.capabilities })
       break
   }
   slice.timeline.forEach((event, index) => {

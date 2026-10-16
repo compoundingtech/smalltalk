@@ -416,7 +416,13 @@ fn apply_claude(ledger: &mut Ledger, event: &str, payload: &Value, now: u64) {
             {
                 subagent.transcript = Some(PathBuf::from(path));
             }
-            ledger.end(&id, "completed", None, now);
+            let outcome = ledger
+                .running
+                .get(&id)
+                .and_then(|subagent| subagent.transcript.as_deref())
+                .and_then(claude_subagent_outcome)
+                .unwrap_or("completed");
+            ledger.end(&id, outcome, None, now);
         }
         "Stop" => {
             // A subagent's own events carry its ID; only the parent's Stop lists its tasks.
@@ -445,6 +451,33 @@ fn apply_claude(ledger: &mut Ledger, event: &str, payload: &Value, now: u64) {
         }
         _ => {}
     }
+}
+
+/// SubagentStop carries final response text, not an outcome. Claude's last assistant record
+/// carries typed API-error and mid-stream-abort flags. Ignore diagnostic/progress records:
+/// `system/api_error` describes a retry and is not evidence that the run failed.
+fn claude_subagent_outcome(transcript: &Path) -> Option<&'static str> {
+    let file = fs::File::open(transcript).ok()?;
+    let mut outcome = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        outcome = Some(
+            if record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
+                "failed"
+            } else if record.get("isAbortedMidStream").and_then(Value::as_bool) == Some(true) {
+                "interrupted"
+            } else {
+                "completed"
+            },
+        );
+    }
+    outcome
 }
 
 /// Claude writes a subagent's transcript at `SESSION/subagents/agent-ID.jsonl` beside the
@@ -920,6 +953,54 @@ mod tests {
         // A repeated start of an ended subagent does not reopen it.
         started(&mut ledger, "a1", "p-1", "general-purpose", 14);
         assert!(ledger.running.is_empty());
+    }
+
+    #[test]
+    fn claude_stop_uses_the_last_assistant_outcome_not_retry_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("agent-tester.jsonl");
+        for (tail, expected) in [
+            (
+                json!({"type": "assistant", "isApiErrorMessage": true,
+                "message": {"content": [{"type": "text", "text": "usage limit"}]}}),
+                "failed",
+            ),
+            (
+                json!({"type": "assistant", "isAbortedMidStream": true}),
+                "interrupted",
+            ),
+            (
+                json!({"type": "assistant", "message": {"stop_reason": "end_turn"}}),
+                "completed",
+            ),
+        ] {
+            fs::write(
+                &transcript,
+                format!(
+                    "{}\n{}\n{}\n{}\n",
+                    json!({"type": "assistant", "isApiErrorMessage": true}),
+                    json!({"type": "system", "subtype": "api_error", "retryAttempt": 1}),
+                    tail,
+                    json!({"type": "progress"}),
+                ),
+            )
+            .unwrap();
+            let mut ledger = Ledger::default();
+            started(&mut ledger, "tester", "p-1", "general-purpose", 11);
+            apply_claude(
+                &mut ledger,
+                "SubagentStop",
+                &json!({
+                    "session_id": "s-1", "agent_id": "tester",
+                    "agent_transcript_path": transcript,
+                    // Text is not an outcome: a successful response may discuss failure.
+                    "last_assistant_message": "failed",
+                }),
+                12,
+            );
+            assert!(ledger.running.is_empty());
+            assert_eq!(ledger.ended[0].outcome, expected);
+        }
     }
 
     #[test]

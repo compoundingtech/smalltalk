@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Install the pre-push hook that signs evidence. Idempotent; never replaces a hook it did not write.
+#   scripts/install-git-hooks [--uninstall]
+#
+# The hook is a small stub. At push time it does NOT run anything from the tree being pushed: it takes
+# scripts/evidence-prepush and scripts/st-test from the base branch of the remote (<remote>/main) into a temporary
+# directory and runs those copies, so the hook and the runner are never the pushed branch's. (The checks the runner then
+# runs, nix develop, pnpm install and the tests, are the tree's code, on this machine as this user with the key within
+# reach: cooperative trust, known defect 22.) When the base has no such files the stub does nothing.
+# It does nothing in CI (GITHUB_ACTIONS or CI set).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[ -z "${GITHUB_ACTIONS:-}" ] && [ -z "${CI:-}" ] || exit 0
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0   # not a checkout (a source export): nothing to install into
+hooks=$(git rev-parse --git-path hooks)
+mark='# st-evidence-prepush: written by scripts/install-git-hooks'
+hook="$hooks/pre-push"
+if [ "${1:-}" = --uninstall ]; then
+  if [ -f "$hook" ] && grep -qF "$mark" "$hook"; then rm -f "$hook"; echo "removed $hook"; fi
+  exit 0
+fi
+if [ "$(git config --get core.hooksPath || true)" != "" ]; then
+  echo "install-git-hooks: core.hooksPath is set; add the stub from scripts/install-git-hooks to that directory yourself" >&2
+  exit 0
+fi
+if [ -e "$hook" ] && ! grep -qF "$mark" "$hook"; then
+  echo "install-git-hooks: $hook exists and is not ours; not replacing it" >&2
+  exit 0
+fi
+mkdir -p "$hooks"
+cat > "$hook.tmp" <<'STUB'
+#!/usr/bin/env bash
+# st-evidence-prepush: written by scripts/install-git-hooks
+# Never blocks a push. Runs the base branch's copy of scripts/evidence-prepush, never the pushed tree's.
+remote=${1:-origin}
+# git exports GIT_DIR and friends to a hook: note where we are, drop the variables that select a repository or an identity, and let git
+# find the repository from the working directory again, so nothing started below can reach the caller's repository through them
+# (st2#3014). Only `export -p` is used (no compgen: missing from the non-interactive bash of a nix shell), and a scrub that did not work
+# skips the hook rather than carry on with GIT_DIR set.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+selecting=' GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE GIT_SHALLOW_FILE GIT_INTERNAL_SUPER_PREFIX GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE '
+remaining() {
+  for name in $(export -p | sed -n -e 's/^declare -x \(GIT_[A-Za-z0-9_]*\)[= ].*/\1/p' -e 's/^export \(GIT_[A-Za-z0-9_]*\)[= ].*/\1/p'); do
+    case "$selecting" in *" $name "*) echo "$name" ;; *) case "$name" in GIT_PUSH_OPTION*) echo "$name" ;; esac ;; esac
+  done
+}
+for name in $(remaining); do unset "$name" 2>/dev/null || true; done
+if [ -n "$(remaining)" ]; then
+  echo "evidence: could not drop the git environment of the hook; not signing" >&2
+  exit 0
+fi
+cd "$top" || exit 0
+git rev-parse -q --verify "refs/remotes/$remote/main" >/dev/null 2>&1 || exit 0
+work=$(mktemp -d 2>/dev/null) || exit 0
+trap 'rm -rf "$work"' EXIT
+git archive "refs/remotes/$remote/main" scripts/evidence-prepush scripts/st-test 2>/dev/null | tar -x -C "$work" 2>/dev/null || exit 0
+[ -f "$work/scripts/evidence-prepush" ] || exit 0
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$work/scripts/evidence-prepush" "$@"
+else
+  echo "evidence: python3 is not on PATH; not signing" >&2
+fi
+exit 0
+STUB
+chmod +x "$hook.tmp"
+changed=1
+[ -f "$hook" ] && cmp -s "$hook.tmp" "$hook" && changed=0
+mv -f "$hook.tmp" "$hook"
+[ "$changed" -eq 0 ] || echo "evidence pre-push hook installed (ST_SKIP_EVIDENCE=1 skips)"

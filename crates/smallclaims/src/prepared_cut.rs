@@ -266,8 +266,8 @@ pub enum ComparisonDecision {
 }
 
 impl ComparisonDecision {
-    /// The same gate applies to projection equality, projection first-sync observation,
-    /// compare_graphs, and heal_due. Log-only authority sync has a separate contract.
+    /// The same gate applies to projection equality, first-sync observation and
+    /// compare_graphs. Log-only authority sync has a separate contract.
     pub fn permits_projection_actions(self) -> bool {
         self == Self::Eligible
     }
@@ -645,7 +645,7 @@ mod tests {
             decision(&cut(), &prepared(), &capability, &changed_proof),
             ComparisonDecision::PendingPeerProof
         );
-        // An unequal, but complete, remote graph is eligible for comparison and healing.
+        // An unequal, but complete, remote graph is eligible for comparison.
         changed_proof = completeness.clone();
         changed_proof.transmitted.legacy = digest('f');
         changed_proof.asserted.legacy = digest('f');

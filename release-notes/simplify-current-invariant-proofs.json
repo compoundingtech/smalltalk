@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep native invariant references and prove graph delivery wakeups in the current runtime tests.",
+  "schema": {
+    "status": "none",
+    "detail": "Documentation and native proof tests only; existing root proofs remain."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation and native proof tests only; existing root proofs remain."
+  },
+  "replay": {
+    "status": "none",
+    "detail": "Documentation and native proof tests only; existing root proofs remain."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation and native proof tests only; existing root proofs remain."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation and native proof tests only; existing root proofs remain."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation and native proof tests only; existing root proofs remain."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation and native proof tests only; existing root proofs remain."
+  }
+}

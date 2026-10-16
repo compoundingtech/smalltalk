@@ -192,11 +192,32 @@ escaped, non-ASCII not escaped. The values are the ones the daemon stores:
 - A missing `title`, `in_reply_to` or `session_id` is `null`.
 - `tags` is the array in the client's order, and `[]` when there are none.
 
+### A message longer than 8 KiB
+
+Past 8,192 bytes of UTF-8 the daemon keeps only a preview in the claim
+([long messages](long-messages.md)), so the device signs the preview, with the hash and length of
+the whole text. Two fields are added, and the names are sorted as always:
+
+```json
+"signed_fields": ["body_bytes", "body_sha256", "content", "from", "in_reply_to", "session_id", "tags", "title", "to"]
+```
+
+- `content` is the preview: the first 1,024 bytes of the text, cut at a character boundary,
+  trailing whitespace removed, then `…` (U+2026).
+- `body_sha256` is the lowercase hex SHA-256 of the whole text's UTF-8 bytes, a JSON string.
+- `body_bytes` is the whole text's length in UTF-8 bytes, a JSON number with no fraction.
+
+`content` in the `message.send` request is still the whole text. The `long` case in the shared
+vectors builds its text from a unit and a count and signs it this way. A device that signs the
+whole text of a message past 8 KiB is refused with `long-message-signature-unsupported` and
+nothing is written; a device whose signer cannot do this must refuse the send in words and keep
+the person's text.
+
 ## What the daemon checks before it writes the message
 
 | Refusal | When |
 | --- | --- |
-| `device-signature-format` | The format is not `fields-v1`, or the signed fields differ from the list above. |
+| `device-signature-format` | The format is not `fields-v1`, or the signed fields differ from the list above (or, past 8 KiB, from the long list). |
 | `device-signature-signer` | The signer is not the paired person, or the signature names someone it acts on behalf of. |
 | `device-signature-noncanonical` | `to` is not a canonical subject. |
 | `device-signature-stale` | `signed_at_unix_ms` is more than 15 minutes from the accepting daemon's clock. |

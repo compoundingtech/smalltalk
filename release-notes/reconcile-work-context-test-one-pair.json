@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The batched work-metadata scale test runs the quadratic per-step oracle once per step count instead of three times",
+  "replay": {"status": "none", "detail": "Test-only change."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "No product behaviour change."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "none", "detail": "No operator step."},
+  "recovery": {"status": "none", "detail": "Revert the commit."}
+}

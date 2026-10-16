@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Name the runtime readiness waiter for current pending work",
+  "replay": {
+    "status": "none",
+    "detail": "No claims or projections change; this is a read-only annotation of existing owner and work state."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table or index changes. Single and batched owner hydration also reads the existing run phase without extra queries."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Readiness evaluation and priority are unchanged. Partially progressed runs now expose the same runtime owner through operational reasons."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Current pending work includes waiting for daemon/runtime to evaluate readiness in the existing string reasons list. It does not promise eligibility or predicate evaluation. Ready, terminal, superseded and cleanup-owned work does not carry this waiter; existing blockers remain visible."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup migration or replay is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "The runtime owner appears in normal CLI and client work reads without a repair or person action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Promotion removes the waiter automatically. No new durable state needs recovery."
+  }
+}

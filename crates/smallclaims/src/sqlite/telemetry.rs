@@ -713,6 +713,57 @@ mod tests {
         provider.shutdown().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wal_gauge_uses_the_opened_target_not_a_file_alias_sidecar() {
+        if isolated("wal_gauge_uses_the_opened_target_not_a_file_alias_sidecar") {
+            return;
+        }
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.sqlite3");
+        let writer = rusqlite::Connection::open(&target).unwrap();
+        writer.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE wal_path_fixture(value INTEGER);
+             INSERT INTO wal_path_fixture VALUES(1);",
+        ).unwrap();
+        let alias = root.path().join("alias.sqlite3");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let mut alias_wal = alias.as_os_str().to_os_string();
+        alias_wal.push("-wal");
+        std::fs::write(&alias_wal, b"alias decoy").unwrap();
+        let mut target_wal = target.as_os_str().to_os_string();
+        target_wal.push("-wal");
+        let expected = std::fs::metadata(&target_wal).unwrap().len();
+        assert!(expected > 11);
+        let pool = super::super::ReadPool::new(&alias, false).unwrap();
+        assert_eq!(pool.path, std::fs::canonicalize(&target).unwrap());
+        let value: i64 = pool.get().query_row("SELECT value FROM wal_path_fixture", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, 1);
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        let gauge = finished.iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "st.db.wal.size")
+            .expect("the WAL gauge exports");
+        let AggregatedMetrics::U64(MetricData::Gauge(gauge)) = gauge.data() else {
+            panic!("the WAL gauge is a u64 gauge");
+        };
+        let points: Vec<_> = gauge.data_points().collect();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value(), expected);
+        assert_eq!(std::fs::read(alias_wal).unwrap(), b"alias decoy");
+        drop(pool);
+        drop(writer);
+        provider.shutdown().unwrap();
+    }
+
     #[test]
     fn write_without_provider_works() {
         if isolated("write_without_provider_works") {

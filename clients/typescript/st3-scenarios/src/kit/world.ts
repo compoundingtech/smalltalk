@@ -1,6 +1,7 @@
 import { drawCast, type Cast, type CastSpec } from './cast.ts'
 import { type FactoryContext } from './context.ts'
 import { fork, rngFromSeed } from './rng.ts'
+import type { RecordedTransport } from './recording.ts'
 import { SLICE_KINDS, type AnySlice, type Slice, type SliceKind, type TimelineEvent } from './slice.ts'
 import { timeContext } from './time.ts'
 
@@ -24,6 +25,7 @@ export interface WorldDefinition {
   readonly scope?: string
   /** Variants that replace the world's own slices (worlds derived from another world). */
   readonly selected?: Partial<Record<SliceKind, string>>
+  readonly recording?: RecordedTransport
 }
 
 export type SliceOverride<K extends SliceKind> = string | Slice<K>
@@ -38,6 +40,7 @@ export interface World {
   readonly now: number
   readonly cast: Cast
   readonly slices: Slices
+  readonly recording?: RecordedTransport
   /** The variant name of each slice (`custom` for a slice value passed to `with`). */
   readonly variants: Readonly<Record<SliceKind, string>>
   /** Variant names available per slice. */
@@ -70,18 +73,22 @@ const changesState = (event: TimelineEvent): boolean => {
 }
 
 const assignStores = (slices: Slices): Slices => {
+  // A recording's ordinals describe shared daemon versions, not event counts.
+  // In particular published HTTP snapshots may lag newer stream fences.
+  if (SLICE_KINDS.every((kind) => slices[kind].source._tag === 'recorded')) return slices
   const events = SLICE_KINDS.flatMap((kind) => slices[kind].timeline.map((event, index) => ({ kind, index, event: event as TimelineEvent })))
   events.sort((a, b) => a.event.at_ms - b.event.at_ms || SLICE_KINDS.indexOf(a.kind) - SLICE_KINDS.indexOf(b.kind) || a.index - b.index)
   let store = 1
   const stores = new Map<string, number>()
   for (const { kind, index, event } of events) {
-    if (changesState(event)) store += 1
+    if (slices[kind].source._tag === 'recorded') store = Math.max(store, event.store)
+    else if (changesState(event)) store += 1
     stores.set(`${kind}/${index}`, store)
   }
   const out = {} as Record<SliceKind, AnySlice>
   for (const kind of SLICE_KINDS) {
     const slice = slices[kind] as AnySlice
-    out[kind] = { ...slice, timeline: slice.timeline.map((event, index) => ({ ...event, store: stores.get(`${kind}/${index}`)! })) } as AnySlice
+    out[kind] = slice.source._tag === 'recorded' ? slice : { ...slice, timeline: slice.timeline.map((event, index) => ({ ...event, store: stores.get(`${kind}/${index}`)! })) } as AnySlice
   }
   return out as unknown as Slices
 }
@@ -126,6 +133,7 @@ export const buildWorld = (definition: WorldDefinition, generic: VariantTable, n
     now,
     cast,
     slices: assignStores(slices as unknown as Slices),
+    ...(definition.recording === undefined ? {} : { recording: definition.recording }),
     variants,
     available,
     with: (next) => buildWorld(definition, generic, now, { ...overrides, ...next }),

@@ -2,9 +2,9 @@
 """Decide whether a Workspace CI event must run the fractal-web execution lane.
 
 Pull requests diff the immutable base and head SHAs from their merge base; merge groups diff the
-queued group's base and head. Both commits are fetched explicitly. Renames are split into a
-deletion and an addition, so both paths are matched. Any missing or malformed SHA, failed fetch or
-failed diff exits nonzero: it never means "no web changes". Manual runs always execute.
+queued group's base_sha..head_sha and pushes diff before..after, including every pushed commit.
+Both commits are fetched explicitly. Renames are split into a deletion and an addition, so both
+paths are matched. If the diff cannot be determined, all web lanes run. Manual runs always execute.
 """
 
 import os
@@ -40,6 +40,7 @@ PATTERNS = (
     "flake.lock",
     "pnpm-install-contract.json*",
     ".npmrc",
+    "flake.nix",
     "tsconfig*.json*",
     ".buckroot*",
     ".buckconfig*",
@@ -56,6 +57,22 @@ PATTERNS = (
     ".github/workflows/cache-audit.ts",
     ".github/repo-settings.json*",
 )
+# Keep workspace dependency coverage in sync with the guarded package graph in ci-fractal-web-test.
+KIT_PATTERNS = (
+    "packages/fractal-ui/**",
+    "clients/typescript/st3-scenarios/**",
+    "clients/typescript/st3-client/**",
+    "package.json*",
+    "pnpm-workspace.yaml*",
+    "pnpm-lock.yaml",
+    "pnpm-install-contract.json*",
+    ".npmrc",
+    "flake.nix",
+    "flake.lock",
+    "scripts/ci-fractal-web*",
+    ".github/workflows/fleet.yml*",
+    ".github/workflows/workspace-ci.ts",
+)
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -67,10 +84,15 @@ def pattern_regex(pattern):
 
 
 MATCHERS = tuple(pattern_regex(pattern) for pattern in PATTERNS)
+KIT_MATCHERS = tuple(pattern_regex(pattern) for pattern in KIT_PATTERNS)
+
+
+def kit_paths(paths):
+    return [path for path in paths if any(matcher.match(path) for matcher in KIT_MATCHERS)]
 
 
 def relevant_paths(paths):
-    return [path for path in paths if any(matcher.match(path) for matcher in MATCHERS)]
+    return [path for path in paths if any(matcher.match(path) for matcher in (*MATCHERS, *KIT_MATCHERS))]
 
 
 def git(directory, *args):
@@ -96,19 +118,29 @@ def main():
     event = os.environ.get("EVENT", "")
     summary = []
     if event == "workflow_dispatch":
-        relevant, summary = True, ["Manual run: web execution is forced."]
-    elif event in ("pull_request", "merge_group"):
-        paths = changed_paths(os.environ["REMOTE"], event, os.environ.get("BASE_SHA", ""), os.environ.get("HEAD_SHA", ""))
-        matched = relevant_paths(paths)
-        relevant = bool(matched)
-        summary = [f"{len(paths)} changed path(s), {len(matched)} web-relevant."] + [f"- `{path}`" for path in matched[:50]]
+        relevant, kit_inputs, summary = True, True, ["Manual run: web execution and kit plays are forced."]
+    elif event in ("pull_request", "merge_group", "push"):
+        try:
+            paths = changed_paths(os.environ["REMOTE"], event, os.environ.get("BASE_SHA", ""), os.environ.get("HEAD_SHA", ""))
+        except (ValueError, subprocess.SubprocessError, OSError) as error:
+            detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+            print(f"::warning::fractal-web diff unknown; running all lanes: {detail}", file=sys.stderr)
+            relevant, kit_inputs = True, True
+            summary = ["Diff unavailable: all web lanes, including kit plays, are required."]
+        else:
+            matched = relevant_paths(paths)
+            relevant = bool(matched)
+            kit_inputs = bool(kit_paths(paths))
+            summary = [f"{len(paths)} changed path(s), {len(matched)} web-relevant."] + [f"- `{path}`" for path in matched[:50]]
     else:
         raise ValueError(f"unsupported event {event!r}")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"relevant={'true' if relevant else 'false'}\n")
+        output.write(f"kit-inputs={'true' if kit_inputs else 'false'}\n")
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as step_summary:
         step_summary.write("\n".join([f"fractal-web execution: **{'required' if relevant else 'not required'}**", *summary]) + "\n")
     print(f"relevant={'true' if relevant else 'false'}")
+    print(f"kit-inputs={'true' if kit_inputs else 'false'}")
     return 0
 
 

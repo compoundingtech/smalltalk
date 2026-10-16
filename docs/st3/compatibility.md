@@ -31,7 +31,7 @@ fresh writer; it is not a downgrade or permission to overwrite a running member.
 | --- | --- |
 | SQLite schema and startup DDL | Read all transitions in the source interval. A numeric schema identity alone does not describe every startup index or projection change. |
 | Checkpoint rules | All participating members must agree on rules before new sealing. Mixed builds can replicate signed history while sealing stalls or projections differ. A rules bump alone does not establish a full-replay trigger. See [checkpoints](checkpoints.md). |
-| Claim registry and replication | Admitted history, known claim vocabulary, projection digests and signature verification are separate checks. Equal replication digests alone do not establish claim-signature validity. See [replication](replication.md). |
+| Claim registry and replication | Admitted history, known claim vocabulary, projection digests and signature verification are separate checks. Equal replication digests alone do not establish claim-signature validity. An exchange's optional `build` names the sender's build for divergence faults; older peers omit it and ignore it. See [replication](replication.md). |
 | Client API | `st3.client.v0`, projection versions and capability versions are distinct from release tags and database schema. Discover capabilities first; unknown required capability versions stop the client, while unknown optional capabilities may be ignored. See the [client contract](client-v0/README.md#discovery-lists-and-details). |
 | Native harness and driver resume | Provider APIs, managed extensions and saved resume state have their own contracts. See [seats across deploys](seat-deploys.md); rolling back across the push-delivery boundary can require coordinated seat restarts. |
 

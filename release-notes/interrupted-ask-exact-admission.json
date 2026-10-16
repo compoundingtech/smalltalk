@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Admit the exact OMP producer and shipped extension before interrupted-ask repair",
+  "replay": {"status": "none", "detail": "No graph replay or persisted claim changes."},
+  "schema": {"status": "none", "detail": "No database schema or migration changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rule or coordinated member upgrade changes."},
+  "compatibility": {"status": "changed", "detail": "Interrupted-ask repair uses the same exact producer and shipped-extension admission as interactive launch. It may run isolated admission probes before repair; a failed admission cannot touch the selected transcript. Minor-version admission is not retained. Reopened asks name their tool call in the existing reason field, and malformed transcript rows no longer hide later valid rows."},
+  "downtime": {"status": "changed", "detail": "An uncached exact producer/extension identity can add bounded isolated admission probes before repair. Unchanged exact identities reuse measured results; no additional daemon restart is required."},
+  "manual": {"status": "none", "detail": "No new manual step is required. Existing exact-build admission and override controls apply."},
+  "recovery": {"status": "none", "detail": "Repair refusal leaves the selected transcript unchanged; interactive launch still applies its own admission gate."}
+}

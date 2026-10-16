@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Integrate the current main reconciliation revert and onboarding changes with terminal retirement, preserving retirement dependency keys and action coverage.",
+  "replay": {
+    "status": "none",
+    "detail": "No retirement-specific replay change; the integrated checkpoint fragment describes its bounded recovery."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Regenerate combined clients without adding a retirement claim field or changing its registry contract."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No additional retirement retention or checkpoint rule."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Preserve terminal retirement precedence and upstream suspension and stopped-seat controls. Retirement creation still requires exact registry digest agreement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "The coordinated terminal retirement rollout and the integrated checkpoint recovery instructions remain applicable."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional retirement recovery beyond the integrated checkpoint fix."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional startup work beyond the existing retirement indexes and integrated checkpoint recovery."
+  }
+}

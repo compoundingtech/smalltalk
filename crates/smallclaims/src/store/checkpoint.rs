@@ -1638,8 +1638,12 @@ impl Store {
     /// snapshot or a later commit. The `-shm` index is not copied: opening the copy rebuilds it
     /// from the WAL. False, with nothing left at `copy`, where the filesystem cannot clone.
     fn clone_store_to(&self, copy: &Path) -> Result<bool> {
-        let wal = PathBuf::from(format!("{}-wal", self.path.display()));
-        let copy_wal = PathBuf::from(format!("{}-wal", copy.display()));
+        let mut wal = self.path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let mut copy_wal = copy.as_os_str().to_os_string();
+        copy_wal.push("-wal");
+        let copy_wal = PathBuf::from(copy_wal);
         let connection = self.readers.get();
         let snapshot = connection.unchecked_transaction()?;
         snapshot.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
@@ -1737,6 +1741,21 @@ impl Store {
         self.runtime.checkpoint_preflight()?;
         // A directory of its own, so a dry run never replaces the scheduler's resumable capture.
         let staged = self.checkpoint_staged_set(cut_unix_ms, None, &scratch.join("plan"))?;
+        self.checkpoint_plan_view_from_staged(cut_unix_ms, staged, scratch)
+    }
+
+    /// Plan and prove an already staged set without borrowing the live writer in production.
+    /// Capture can release writer admission before this scratch-file phase runs.
+    /// Keep the staging connection and planning inputs inside the completion boundary.
+    /// Test support's optional in-memory reference comparison can recapture the live set.
+    pub fn checkpoint_plan_view_from_staged(
+        &self,
+        cut_unix_ms: u128,
+        captured: super::checkpoint_staging::StagedSet,
+        scratch: &Path,
+    ) -> Result<CheckpointPlanView> {
+        let _completion = super::checkpoint_completion::Completion::outer();
+        let staged = captured;
         let plan = self.plan_staged_checkpoint(&staged)?;
         let proof = self.prove_staged_checkpoint_plan(&staged, &plan, scratch);
         staged.remove()?;

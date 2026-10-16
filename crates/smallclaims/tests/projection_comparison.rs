@@ -167,3 +167,50 @@ fn an_equal_comparison_stays_equal_while_the_inventory_moves_on() {
     assert!(after.differing_tables.is_empty());
     assert!(after.projection_compared_at_unix_ms.is_some());
 }
+
+#[test]
+fn aligned_comparison_excludes_different_definitions_and_expires_when_the_definition_changes() {
+    let source = node("alder");
+    let target = node("birch");
+    let mut summary = source.export_replication_summary(FLEET).unwrap();
+    summary.projection_registry_digest = Some(summary.schema_digest.clone());
+    summary.schema_digest = "versioned-layout".into();
+    summary.projection_versions.insert("documents".into(), 2);
+    summary
+        .projection_digests
+        .insert("documents".into(), "different definition".into());
+    let aligned = summary.inventory.digest.clone();
+    target
+        .receive_replication_exchange("alder", FLEET, &summary)
+        .unwrap();
+    let view = status(&target);
+    assert!(!view.peers[0].projection_comparison_waiting);
+    assert!(view.peers[0].differing_tables.is_empty());
+    assert_eq!(
+        view.peers[0].incompatible_projection_tables,
+        vec!["documents"]
+    );
+    summary.inventory.digest = "older inventory".into();
+    target
+        .receive_replication_exchange("alder", FLEET, &summary)
+        .unwrap();
+    let view = status(&target);
+    assert!(!view.peers[0].projection_comparison_waiting);
+    assert_eq!(view.peers[0].projection_graphs_equal, Some(true));
+    assert!(view.peers[0].differing_tables.is_empty());
+    // An older aligned comparison cannot certify a newly advertised definition.
+    summary.projection_versions.insert("documents".into(), 3);
+    target
+        .receive_replication_exchange("alder", FLEET, &summary)
+        .unwrap();
+    let view = status(&target);
+    assert!(view.peers[0].projection_comparison_waiting);
+    assert_eq!(view.peers[0].projection_graphs_equal, None);
+    summary.inventory.digest = aligned;
+    target
+        .receive_replication_exchange("alder", FLEET, &summary)
+        .unwrap();
+    let view = status(&target);
+    assert!(!view.peers[0].projection_comparison_waiting);
+    assert!(view.peers[0].differing_tables.is_empty());
+}

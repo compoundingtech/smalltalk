@@ -7,7 +7,7 @@
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
     # The runtime, Rust crates and native terminal library share one producer revision.
-    pty.url = "github:compoundingtech/pty/1ae8c187301034d2b343b6ec638f2b74c009f92e";
+    pty.url = "github:compoundingtech/pty/f8388fe7a8617d973e720e29107e68ac5ea95987";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared CI generators and the `otelite` collector used by release-integration.
     # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
@@ -372,6 +372,26 @@
           };
         };
 
+        # Tests that checks.st3 leaves out because the Nix build sandbox cannot give them what they
+        # need. One named list, a reason and an owner per entry; central CI and the wrapper path
+        # still run every one of them. The check fails if an entry no longer names exactly one
+        # test, and any test not listed here must pass.
+        st3Exclusions =
+          let
+            list = (builtins.fromJSON (builtins.readFile ./nix/st3-check-exclusions.json)).exclusions;
+            key = e: "${e.package}/${e.binary}/${e.test}";
+          in
+          assert pkgs.lib.assertMsg (list != [ ]) "nix/st3-check-exclusions.json lists no exclusion";
+          assert pkgs.lib.assertMsg (builtins.all (e: e.reason != "" && e.owner != "") list)
+            "every st3 check exclusion needs a reason and an owner";
+          assert pkgs.lib.assertMsg (
+            builtins.length (pkgs.lib.unique (map key list)) == builtins.length list
+          ) "st3 check exclusions must be unique";
+          list;
+        st3ExcludedFilter = pkgs.lib.concatMapStringsSep " | " (
+          e: "(package(=${e.package}) & binary(=${e.binary}) & test(=${e.test}))"
+        ) st3Exclusions;
+
         st3Check = pkgs.rustPlatform.buildRustPackage {
           pname = "st3";
           inherit version;
@@ -430,8 +450,19 @@
           # pollute CPU measurements and outlive the daemon delivery-presence startup grace.
           checkPhase = ''
             runHook preCheck
+            # Every exclusion must still name exactly one test, or the list has gone stale.
+            cargo nextest list --release --offline --target ${rustHostTarget} \
+              --build-jobs "$NIX_BUILD_CORES" \
+              ${pkgs.lib.escapeShellArgs (pkgs.lib.remove "--no-fail-fast" st3Check.cargoTestFlags)} \
+              --message-format json -E ${pkgs.lib.escapeShellArg st3ExcludedFilter} > excluded-tests.json
+            matched=$(jq '[.["rust-suites"][].testcases | to_entries[] | select(.value["filter-match"].status == "matches")] | length' excluded-tests.json)
+            if [ "$matched" -ne ${toString (builtins.length st3Exclusions)} ]; then
+              echo "nix/st3-check-exclusions.json lists ${toString (builtins.length st3Exclusions)} tests but $matched match; remove or fix the stale entries" >&2
+              exit 1
+            fi
             cargo nextest run --release --offline --target ${rustHostTarget} \
               --build-jobs "$NIX_BUILD_CORES" --test-threads "$NIX_BUILD_CORES" --retries 0 \
+              -E ${pkgs.lib.escapeShellArg "not (${st3ExcludedFilter})"} \
               ${pkgs.lib.escapeShellArgs st3Check.cargoTestFlags} \
               -- ${pkgs.lib.escapeShellArgs st3Check.checkFlags}
             cargo test --doc --release --offline --target ${rustHostTarget} \
@@ -482,6 +513,9 @@
             pkgs.which
             pkgs.cargo-nextest
             pkgs.python3
+            # Evidence fixtures make throwaway SSH signing keys and let Git verify the signed
+            # notes; git itself comes from nativeBuildInputs above.
+            pkgs.openssh
             # Boot cleanup fixtures query their isolated daemon with curl.
             pkgs.curl
             pkgs.nodejs
@@ -1128,6 +1162,34 @@
           touch "$out"
         '';
 
+        # The `genie-freshness` required check as a sandboxed derivation: the CI scripts' own tests
+        # and `genie --check` over the exact flake source. It has no network and no `.git`, so
+        # the one test that needs a repository gets a throwaway one (its commit ID is an opaque
+        # value there) and `tar` is declared for the cache test.
+        checks.genie-freshness = pkgs.runCommand "genie-freshness-${version}" {
+          nativeBuildInputs = [
+            effect-utils.packages.${system}.genie
+            pkgs.git
+            pkgs.gnutar
+            pkgs.jq
+            pkgs.openssh
+            pkgs.python3
+            pkgs.zstd
+          ];
+        } ''
+          export HOME=$(mktemp -d)
+          cp -r ${self} source
+          chmod -R u+w source
+          cd source
+          mkdir -p repos
+          ln -sfn ${effect-utils} repos/effect-utils
+          git init --quiet
+          git add -A
+          git -c user.name=nix -c user.email=nix@localhost commit --quiet -m source
+          bash scripts/ci-genie-freshness
+          touch "$out"
+        '';
+
         # Smoke test that the built binary actually runs and its command tree is
         # wired, independent of the in-tree `cargo test`.
         checks.help = pkgs.runCommand "st2-help-${version}" { } ''
@@ -1250,6 +1312,10 @@
             if [ "''${GITHUB_ACTIONS:-}" = true ]; then
               source ${./scripts/ci-cargo-tools-env} || exit $?
               export RUSTC_WRAPPER=${ciRustcWrapper}/bin/ci-rustc-wrapper
+            fi
+            # Pushing a branch signs its checks first when they have no evidence yet (scripts/evidence-prepush).
+            if [ -z "''${GITHUB_ACTIONS:-}" ] && [ -z "''${CI:-}" ] && [ -x ./scripts/install-git-hooks ]; then
+              ./scripts/install-git-hooks || echo "scripts/install-git-hooks failed: pushes will not sign evidence" >&2
             fi
           '';
         };

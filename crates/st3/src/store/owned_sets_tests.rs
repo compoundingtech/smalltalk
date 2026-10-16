@@ -1065,7 +1065,7 @@ fn signed_share(from: &Store, to: &Store) {
 }
 
 #[test]
-fn signed_replication_heal_replay_and_checkpoint_keep_source_winner() {
+fn signed_replication_replay_and_checkpoint_keep_source_winner() {
     let stores = signed_fleet();
     let (amber, cobalt, ivory) = (&stores[0], &stores[1], &stores[2]);
     apply(amber, &bundle("initial", true), 10);

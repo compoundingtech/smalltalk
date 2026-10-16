@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Use synthetic host examples in fractal-web sidebar search hints and tests so the public fixture privacy gate passes without weakening its rules.",
+  "replay": { "status": "none", "detail": "No claims or replay behavior change." },
+  "schema": { "status": "none", "detail": "No database, index, trigger, or schema-version changes." },
+  "rules": { "status": "none", "detail": "No checkpoint, retention, authority, admission, or rules-version changes." },
+  "compatibility": { "status": "none", "detail": "Only accessible search examples and test data change; host-filter semantics and protocols are unchanged." },
+  "downtime": { "status": "none", "detail": "No startup work or interruption is required." },
+  "manual": { "status": "none", "detail": "No operator actions or configuration changes are required." },
+  "recovery": { "status": "none", "detail": "No persistent state changes; rollback restores the previous search examples and tests." }
+}

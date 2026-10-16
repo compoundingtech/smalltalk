@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep live argv mailbox capabilities through metadata-only declaration edits",
+  "replay": {
+    "status": "none",
+    "detail": "No graph or projection replay, backfill or receipt rewrite. Existing local argv designation is checked in place against the current declaration."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, trigger, version or persistent row layout change. Existing owner, binding, lease and argv designation tables are retained."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, digest or replicated rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Explicit argv channels retain their capability after tags, display name, environment and restart-policy changes that leave their launch unchanged. Host, runtime identity, workspace/cwd, terminal, exact raw argv, stop, native-provider and custody fences remain. No client protocol extension or mixed-version guarantee is introduced."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon deployment only; no new startup work. Source-specific restart-to-API or restart-to-health timing has not been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual SQL, token replacement or seat restart is required by this change. Existing designation is revalidated through ordinary reads, reconnects and receipt commits."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A downgrade restores the former metadata-edit refusal. Persistent mailbox custody from1894 remains; an older binary ignoring that custody is still not a qualified rollback. Same-provider native recovery and truthful-status production acceptance remain unverified."
+  }
+}

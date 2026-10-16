@@ -120,8 +120,8 @@ export interface SyncExpectation {
 }
 
 export interface SyncState {
-  /** The `GET capabilities` envelope's value. */
-  readonly capabilities: Capabilities
+  /** The observed `GET capabilities` value; absent when a recording never probed it. */
+  readonly capabilities?: Capabilities
   /** A local condition the consumer test must create; replay cannot. */
   readonly local?: { readonly _tag: 'visible-follows'; readonly count: number } | { readonly _tag: 'hidden-follow'; readonly hidden: string; readonly visible: string[] }
   readonly expected: SyncExpectation[]
@@ -146,7 +146,7 @@ export type HttpRoute = 'capabilities' | 'resources' | 'events' | 'timeline' | '
 
 interface At {
   readonly at_ms: number
-  /** Store version after this event. */
+  /** Store version after this event. Recorded versions are shared daemon ordinals and are never reassigned. */
   readonly store: number
 }
 

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Raise a denied-call alert only while the call waits on its person",
+  "replay": {
+    "status": "none",
+    "detail": "Reads existing harness.diagnostic and harness.observed claims; no claim is rewritten."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, index or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No rule or limit changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A Claude seat's Stop hook raises a call auto mode's classifier denied only from the turn that just ended, and only while the transcript records the session in auto mode, so a bypass seat or an old turn raises nothing. The denial alert leaves the person's home once the seat begins another turn or its session ends, and an answer to it is then refused as stale. Alerts already raised for old denials clear once their seat has moved on."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment or startup behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration or configuration change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted production state changes beyond a seat's denial ledger gaining its last permission mode; reverting restores the earlier alerts."
+  }
+}

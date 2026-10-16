@@ -44,7 +44,9 @@ record('started', { argv: process.argv.slice(2), harness });
 
 // The session, kept as pi and omp keep it: `<time>_<id>.jsonl` in `--session-dir`, whose first line
 // names the session. pi resumes `--session PATH` (and starts a new session at a path that does not
-// exist); omp resumes `--resume ID` and refuses an ID it has no transcript for.
+// exist); omp resumes `--resume PATH` by opening the file, or `--resume ID` by looking the ID up
+// among the regular files of `--session-dir` (its glob does not follow symlinks), and refuses an
+// ID it has no transcript for.
 const option = (name) => {
   const index = process.argv.indexOf(name);
   return index > 0 ? process.argv[index + 1] : undefined;
@@ -54,14 +56,27 @@ const headerId = (file) => JSON.parse(fs.readFileSync(file, 'utf8').split('\n')[
 let sessionFile;
 let sessionId;
 if (harness === 'omp' && option('--resume')) {
-  sessionId = option('--resume');
-  const name = fs.readdirSync(sessionDir).find((entry) => entry.endsWith(`_${sessionId}.jsonl`));
-  if (!name) {
-    console.error(`Session ${sessionId} not found`);
-    record('session-missing', { sessionId });
-    process.exit(1);
+  const selector = option('--resume');
+  if (selector.includes('/')) {
+    if (!fs.existsSync(selector)) {
+      console.error(`Session file ${selector} not found`);
+      record('session-missing', { sessionId: selector });
+      process.exit(1);
+    }
+    sessionFile = selector;
+    sessionId = headerId(sessionFile);
+  } else {
+    sessionId = selector;
+    const name = fs
+      .readdirSync(sessionDir, { withFileTypes: true })
+      .find((entry) => entry.isFile() && entry.name.endsWith(`_${sessionId}.jsonl`))?.name;
+    if (!name) {
+      console.error(`Session ${sessionId} not found`);
+      record('session-missing', { sessionId });
+      process.exit(1);
+    }
+    sessionFile = path.join(sessionDir, name);
   }
-  sessionFile = path.join(sessionDir, name);
 } else if (harness === 'pi' && option('--session') && fs.existsSync(option('--session'))) {
   sessionFile = option('--session');
   sessionId = headerId(sessionFile);

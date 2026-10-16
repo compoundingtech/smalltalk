@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A planned restart first asks the seat for its handoff, then stops it at the acknowledgement or a two-minute deadline",
+  "replay": {
+    "status": "none",
+    "detail": "No claim kind or field changes. The daemon appends ordinary message.sent and runtime.reconcile-decision claims; a seat acknowledges with a custom.agent.restart-ready claim, a kind the store already accepts."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes or triggers change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission and authority are unchanged. The reserved message tag prefix st3-restart-prepare: joins the daemon-only tags, so a seat cannot send one."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "An explicit restart, a pool switch at a limit and a declaration change applied to a running, ready seat now wait up to two minutes for the seat to write its handoff or run st agents handoff ready before the seat is stopped. A seat that is not up and ready is restarted at once, as before. New command st agents handoff ready."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "A restart of a ready seat takes up to two minutes longer when the seat does not answer. st agents restart waits ten minutes by default, so it still succeeds."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Rolling back removes the wait; restarts go ahead at once as before."
+  }
+}

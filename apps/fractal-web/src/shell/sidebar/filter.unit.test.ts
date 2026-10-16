@@ -100,42 +100,42 @@ describe('sidebar machine query', () => {
   it.each([
     ['', '', []],
     ['  compiler  sidebar ', 'compiler sidebar', []],
-    ['machine:dev3', '', [['dev3']]],
-    ['machine:dev3,,dev5,', '', [['dev3', 'dev5']]],
-    ['HOST:DEV machine:dev3', '', [['dev'], ['dev3']]],
+    ['machine:synthetic-138/1', '', [['synthetic-138/1']]],
+    ['machine:synthetic-138/1,,synthetic-138/2,', '', [['synthetic-138/1', 'synthetic-138/2']]],
+    ['HOST:SYNTHETIC-138 machine:synthetic-138/1', '', [['synthetic-138'], ['synthetic-138/1']]],
     ['machine: host:,, compiler', 'compiler', []],
-    ['compiler machine:dev3 sidebar host:DEV', 'compiler sidebar', [['dev3'], ['dev']]],
-    ['other:dev3 compiler-machine:dev3', 'other:dev3 compiler-machine:dev3', []],
+    ['compiler machine:synthetic-138/1 sidebar host:SYNTHETIC-138', 'compiler sidebar', [['synthetic-138/1'], ['synthetic-138']]],
+    ['other:synthetic-138/1 compiler-machine:synthetic-138/1', 'other:synthetic-138/1 compiler-machine:synthetic-138/1', []],
   ] as const)('parses %j without highlighting facets', (input, query, machines) => {
     expect(parseSidebarQuery(input)).toEqual({ query, machines })
   })
 
   it('shares row host namespace stripping without rewriting query values', () => {
-    expect(matchesSidebarHost('HOST/DEV3', parseSidebarQuery('machine:dev').machines)).toBe(true)
-    expect(matchesSidebarHost('host/dev3', parseSidebarQuery('machine:host/dev3').machines)).toBe(false)
-    expect(parseSidebarQuery('machine:HOST/DEV3').machines).toEqual([['host/dev3']])
+    expect(matchesSidebarHost('HOST/SYNTHETIC-138/1', parseSidebarQuery('machine:synthetic-138').machines)).toBe(true)
+    expect(matchesSidebarHost('host/synthetic-138/1', parseSidebarQuery('machine:host/synthetic-138/1').machines)).toBe(false)
+    expect(parseSidebarQuery('machine:HOST/SYNTHETIC-138/1').machines).toEqual([['host/synthetic-138/1']])
   })
 
   const machineRows = [
-    row('dev3', 'Compiler', 'idle', 'host/dev3', 0),
-    row('dev5', 'Sidebar', 'idle', 'DEV5', 0),
+    row('synthetic-138/1', 'Compiler', 'idle', 'host/synthetic-138/1', 0),
+    row('synthetic-138/2', 'Sidebar', 'idle', 'SYNTHETIC-138/2', 0),
     row('other', 'Compiler', 'idle', 'host/laptop24', 0),
   ]
   it.each([
-    ['machine:dev3', '', ['dev3']],
-    ['machine:dev3,dev5', '', ['dev3', 'dev5']],
-    ['HOST:DEV', '', ['dev3', 'dev5']],
-    ['machine:dev machine:dev3', '', ['dev3']],
-    ['machine:dev3 host:dev5', '', []],
-    ['machine:dev9', '', []],
-    ['machine:', '', ['dev3', 'dev5', 'other']],
-    ['machine:,,', '', ['dev3', 'dev5', 'other']],
-    ['machine:dev3,,', '', ['dev3']],
-    ['compiler machine:dev', '', ['dev3']],
-    ['laptop machine:dev', '', []],
-    ['machine:dev', 'host/dev3', ['dev3']],
-    ['machine:dev3', 'DEV5', []],
-    ['machine:dev', 'dev3', []],
+    ['machine:synthetic-138/1', '', ['synthetic-138/1']],
+    ['machine:synthetic-138/1,synthetic-138/2', '', ['synthetic-138/1', 'synthetic-138/2']],
+    ['HOST:SYNTHETIC-138', '', ['synthetic-138/1', 'synthetic-138/2']],
+    ['machine:synthetic-138 machine:synthetic-138/1', '', ['synthetic-138/1']],
+    ['machine:synthetic-138/1 host:synthetic-138/2', '', []],
+    ['machine:synthetic-138/9', '', []],
+    ['machine:', '', ['synthetic-138/1', 'synthetic-138/2', 'other']],
+    ['machine:,,', '', ['synthetic-138/1', 'synthetic-138/2', 'other']],
+    ['machine:synthetic-138/1,,', '', ['synthetic-138/1']],
+    ['compiler machine:synthetic-138', '', ['synthetic-138/1']],
+    ['laptop machine:synthetic-138', '', []],
+    ['machine:synthetic-138', 'host/synthetic-138/1', ['synthetic-138/1']],
+    ['machine:synthetic-138/1', 'SYNTHETIC-138/2', []],
+    ['machine:synthetic-138', 'synthetic-138/1', []],
   ] as const)('matches %j AND the exact menu host %j', (query, host, expected) => {
     expect(machineRows.filter((candidate) =>
       matchesRow({ row: candidate, filters: { ...defaultFilters, query, host }, context: '' }),

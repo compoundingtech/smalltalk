@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The terminal UI and the phone stop recreating a Sidebar the person removed",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Client-only. When st refuses the reserved Sidebar's create with arrangement-retired, the terminal UI and the phone say that restoring a removed Sidebar is not available yet and send no further creates, as Fractal already does."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or swap-back restrictions."}
+}

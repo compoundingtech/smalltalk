@@ -100,6 +100,10 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// Routes the check does not measure, and why. Keep this list short: a route here can grow with
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
+    (
+        "GET /v1/internal/fleet/admission-residue",
+        "the scan doctor's fleet-admission check runs inside GET /v1/doctor, which is measured; st fleet wait reads it once as it ends",
+    ),
     ("POST /v1/client/observations", "requires a current paired session; bounded diagnostic memory and blocking JSONL, no Store mutation; real paired transport/unchanged-index controls in api/client_observations.rs"),
     // A Claude permission hook's or Codex driver's approval poll: one indexed newest-claim read
     // and one operation lookup.
@@ -232,14 +236,6 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     (
         "POST /v1/internal/replication/checkpoint-adopt",
         "adopts a peer's checkpoint",
-    ),
-    (
-        "POST /v1/internal/replication/heal/answer",
-        "a heal walks the store's differences",
-    ),
-    (
-        "POST /v1/internal/replication/heal/next",
-        "a heal walks the store's differences",
     ),
     // Planning sessions and evals start harnesses.
     ("POST /v1/launches", "starts a planning harness"),
@@ -622,7 +618,7 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/documents/content",
         "/v1/client/documents/content?name={document_reference}",
     ),
-    get("GET /v1/client/usage", "/v1/client/usage"),
+    get("GET /v1/client/usage", "/v1/client/usage?since_ms={usage_since}&until_ms={usage_until}"),
     get("GET /v1/client/clients", "/v1/client/clients"),
     get(
         "GET /v1/client/subject-definition",
@@ -642,6 +638,8 @@ const PROBES: &[Probe] = &[
         "/v1/client/attention/{attention}",
     ),
     get("GET /v1/client/mail-backlog", "/v1/client/mail-backlog"),
+    get("GET /v1/client/slo", "/v1/client/slo"),
+    get("GET /v1/client/slo/history", "/v1/client/slo/history?id=cpu"),
     post("POST /v1/messages/cleanup", "/v1/messages/cleanup", |_, _| {
         json!({ "all": true, "older_than_ms": 1, "dry_run": true })
     }),
@@ -768,7 +766,12 @@ const PROBES: &[Probe] = &[
     get("GET /v1/delivery/hold", "/v1/delivery/hold?subject={seat}"),
     get("GET /v1/claims", "/v1/claims?limit=100"),
     get("GET /v1/claims/by-id/{id}", "/v1/claims/by-id/{claim}"),
-    get("GET /v1/usage", "/v1/usage"),
+    // A Claude hook's poll for the answer to the prompt or denial it raised.
+    get(
+        "GET /v1/harness-prompts/answer",
+        "/v1/harness-prompts/answer?agent={seat}&episode={seat_claim}",
+    ),
+    get("GET /v1/usage", "/v1/usage?since_ms={usage_since}&until_ms={usage_until}"),
     get("GET /v1/usage/messages", "/v1/usage/messages"),
     get("GET /v1/slo", "/v1/slo"),
     get("GET /v1/slo/history", "/v1/slo/history?id=cpu"),
@@ -1469,9 +1472,13 @@ async fn no_request_does_work_that_grows_with_the_store() {
         "generated or found in {:.0}s",
         started.elapsed().as_secs_f64()
     );
+    // An empty reporting day after both templates' usage history has a fixed answer even
+    // when a cached template ages. The default last-day window let answer growth hide the
+    // same series work in one run and expose it in another (#2733).
+    let usage_window = usage_window_after_history(&[stores.0.0.as_path(), stores.1.0.as_path()]);
     let mut measured = Vec::new();
     for (scale, (store, peer)) in scales.iter().zip([stores.0, stores.1]) {
-        measured.push(measure(*scale, &store, &peer).await);
+        measured.push(measure(*scale, &store, &peer, usage_window).await);
         println!(
             "scale {scale}: measured at {:.0}s",
             started.elapsed().as_secs_f64()
@@ -1556,6 +1563,7 @@ async fn no_request_does_work_that_grows_with_the_store() {
     if let Some(path) = std::env::var_os("ST_COST_REPORT") {
         let report = json!({
             "scales": scales,
+            "usage_window": {"since_ms": usage_window.0, "until_ms": usage_window.1},
             "claims": [small.claims, large.claims],
             "growth_limit": GROWTH,
             "slack": SLACK,
@@ -1573,6 +1581,96 @@ async fn no_request_does_work_that_grows_with_the_store() {
         large.claims,
         failures.join("\n")
     );
+}
+
+/// Fixture preparation only: never change a template or use the measuring host's clock.
+fn usage_window_after_history(sources: &[&Path]) -> (u64, u64) {
+    const DAY_MS: u64 = 86_400_000;
+    let latest = sources
+        .iter()
+        .map(|source| {
+            let connection = rusqlite::Connection::open_with_flags(
+                source,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("read the generated usage fixture");
+            connection
+                .query_row(
+                    "SELECT MAX(json_extract(body,'$.fields.observed_at_unix_ms')) FROM claims
+                     WHERE kind='harness.usage'
+                       AND json_extract(body,'$.fields.semantics')='response_rollup'
+                       AND json_type(body,'$.fields.observed_at_unix_ms')='integer'",
+                    [],
+                    |row| row.get::<_, Option<u64>>(0),
+                )
+                .expect("read generated usage timestamps")
+                .expect("the generated fixture must contain cumulative usage readings")
+        })
+        .max()
+        .expect("usage needs generated fixtures");
+    let since = latest.checked_add(DAY_MS).expect("fixture window overflow");
+    let until = since.checked_add(DAY_MS).expect("fixture window overflow");
+    (since, until)
+}
+
+#[test]
+fn usage_cost_window_is_shared_and_stays_after_cached_history() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = [
+        root.path().join("small.sqlite3"),
+        root.path().join("large.sqlite3"),
+    ];
+    for (path, readings) in paths.iter().zip([vec![100, 200], vec![150, 300]]) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute("CREATE TABLE claims(kind TEXT,body TEXT)", [])
+            .unwrap();
+        for at in readings {
+            connection
+                .execute(
+                    "INSERT INTO claims VALUES ('harness.usage',?1)",
+                    [
+                        json!({"fields":{"semantics":"response_rollup","observed_at_unix_ms":at}})
+                            .to_string(),
+                    ],
+                )
+                .unwrap();
+        }
+        // A later observation of another semantics cannot move the usage period.
+        connection
+            .execute(
+                "INSERT INTO claims VALUES ('harness.usage',?1)",
+                [
+                    json!({"fields":{"semantics":"context_occupancy","observed_at_unix_ms":9999}})
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+    }
+    let sources = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let window = usage_window_after_history(&sources);
+    assert_eq!(window, (86_400_300, 172_800_300));
+    assert_eq!(usage_window_after_history(&sources), window);
+    for path in &paths {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let inside: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE kind='harness.usage'
+             AND json_extract(body,'$.fields.semantics')='response_rollup'
+             AND json_extract(body,'$.fields.observed_at_unix_ms') BETWEEN ?1 AND ?2",
+                [window.0, window.1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inside, 0, "the fixed answer must be empty at both sizes");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM claims", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            3
+        );
+    }
 }
 
 /// Every route `api.rs` declares is measured or listed in `NOT_MEASURED`, and nothing is both.
@@ -1888,7 +1986,7 @@ fn seed_git_change_reads(store: &Store, scale: f64) {
     }
 }
 
-async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
+async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u64, u64)) -> Measured {
     let work_directory = tempfile::tempdir().unwrap();
     let root = work_directory.path();
     let database = root.join("state/claims.sqlite3");
@@ -2026,6 +2124,8 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    fixture.items.insert("usage_since", usage_window.0.to_string());
+    fixture.items.insert("usage_until", usage_window.1.to_string());
     fixture.items.insert(
         "event_after",
         store.event_bounds().unwrap().0.saturating_sub(1).to_string(),
@@ -2172,6 +2272,24 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         "measure a populated event page, not a refused or empty traversal"
     );
 
+    // Keep populated semantic coverage as well as the stable empty-period cost probe.
+    // Both windows come from the same templates, even after a long cache residence.
+    let populated_until = usage_window.0 - 86_400_000;
+    let populated_since = populated_until.saturating_sub(86_400_000);
+    for (reader, path) in [(&person, "/v1/client/usage"), (&client, "/v1/usage")] {
+        let answer: Value = reader
+            .get(&format!("{path}?since_ms={populated_since}&until_ms={populated_until}"))
+            .await
+            .expect("the generated usage fixture must be readable");
+        let period = answer.get("value").unwrap_or(&answer);
+        assert!(
+            period["rows"].as_array().is_some_and(|rows| rows.iter().any(|row| {
+                row["total_tokens"].as_u64().unwrap_or(0) > 0
+            })),
+            "{path} must preserve populated usage coverage: {answer}",
+        );
+    }
+
     let mut costs = BTreeMap::new();
     for probe in PROBES {
         // Prepare immediately before the work writes so the extra person steps do not change
@@ -2221,6 +2339,15 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                     }
                     answer
                         .and_then(|value| {
+                            if matches!(probe.route, "GET /v1/client/usage" | "GET /v1/usage") {
+                                let period = value.get("value").unwrap_or(&value);
+                                anyhow::ensure!(
+                                    period["since_ms"].as_u64() == Some(usage_window.0)
+                                        && period["until_ms"].as_u64() == Some(usage_window.1)
+                                        && period["rows"].as_array().is_some_and(Vec::is_empty),
+                                    "the usage cost probe must answer its exact empty fixture period",
+                                );
+                            }
                             if probe.route == "POST /v1/internal/client-read/forward"
                                 && (serde_json::from_value::<st3::model::ClientResourcePage>(
                                     value.clone(),
@@ -2450,6 +2577,18 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
         .and_then(|page| first_string(&page, "id"))
         .unwrap_or_else(|| "bench-missing-claim".into());
     items.insert("claim", claim);
+    // A claim of the probed seat, so the prompt-answer poll reads past its subject check to the
+    // answer lookup, as a hook's poll for its own prompt does.
+    let seat_claim = client
+        .get::<Value>(&format!(
+            "/v1/claims?subject={}&limit=1",
+            urlencoding::encode(&subjects.seats[0])
+        ))
+        .await
+        .ok()
+        .and_then(|page| first_string(&page, "id"))
+        .expect("the probed seat has a claim");
+    items.insert("seat_claim", urlencoding::encode(&seat_claim).into_owned());
     let record = client
         .get::<Value>("/v1/replication/records")
         .await

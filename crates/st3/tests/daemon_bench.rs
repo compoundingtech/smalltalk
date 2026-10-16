@@ -1664,7 +1664,59 @@ fn synthetic_fields(spec: &st3_schema::ClaimSpec, index: usize) -> BTreeMap<Stri
         };
         fields.insert(name.clone(), value);
     }
+    if spec.kind == "gate.requested" {
+        // Preserve the original every-third reviewer density: reviews and attention must
+        // traverse real candidates without adding unrelated work to mission-detail probes.
+        // Alternate legacy and structured review requests within that population.
+        for name in st3_schema::review::REQUEST_FIELDS {
+            fields.remove(name);
+        }
+        if index.is_multiple_of(3) {
+            fields.insert("reviewer".into(), json!("person/reviewer"));
+        }
+        if index.is_multiple_of(6) {
+            fields.extend(BTreeMap::from([
+                ("gate_subject".into(), json!("gate-operation/reviewer")),
+                ("generation".into(), json!("run-generation/tester")),
+                ("episode".into(), json!(index as u64)),
+                ("change".into(), json!({"kind":"github.pull-request","subject":"resource/tester/change"})),
+                ("head".into(), json!({"kind":"git.commit","sha":"a".repeat(40)})),
+                ("scope".into(), json!({"coverage":["implementation"]})),
+                ("author".into(), json!("agent/alex")),
+                ("binding_claim".into(), json!("binding")),
+                ("delta_ref".into(), json!("doc/tester/delta")),
+            ]));
+        }
+    }
     fields
+}
+
+#[test]
+fn synthetic_review_requests_admit_legacy_and_structured_fields() {
+    let store = Store::open_memory("ada").unwrap();
+    let registry = st3_schema::registry();
+    let spec = &registry.claims["gate.requested"];
+    for index in 0..6 {
+        let fields = synthetic_fields(spec, index);
+        assert_eq!(fields.contains_key("reviewer"), index.is_multiple_of(3));
+        if index.is_multiple_of(3) {
+            assert_eq!(fields["reviewer"], json!("person/reviewer"));
+        }
+        for name in st3_schema::review::REQUEST_FIELDS {
+            assert_eq!(fields.contains_key(name), index.is_multiple_of(6), "{name}");
+        }
+        store
+            .append_claim(&ClaimInput {
+                subject: format!("gate-operation/tester/{index}"),
+                kind: spec.kind.clone(),
+                actor: None,
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("reviewer-{index}")),
+            })
+            .unwrap();
+    }
 }
 
 pub(crate) fn claim_input(kind: &str, key: &str, index: usize, run: &str) -> ClaimInput {

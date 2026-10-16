@@ -210,6 +210,16 @@ async fn workers_done<R: RuntimeControl>(reconciler: &Arc<Reconciler<R>>) {
     .unwrap();
 }
 
+/// `sleep` as a program path. The Nix build sandbox has no `/bin/sleep`, so look it up on PATH
+/// and fall back to the usual location.
+fn sleep_program() -> String {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("sleep"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.display().to_string())
+        .unwrap_or_else(|| "/bin/sleep".into())
+}
+
 fn fixture(
     publish_early: bool,
     honor_guard: bool,
@@ -1299,7 +1309,7 @@ fn native_rejected_starts_prove_closure_and_allow_a_later_start_for_the_same_sea
         let program = if failure == "missing-program" {
             format!("missing-native-program-{}", uuid::Uuid::new_v4())
         } else {
-            "/bin/sleep".into()
+            sleep_program()
         };
         apply_source(
             &store,
@@ -1349,8 +1359,9 @@ fn native_rejected_starts_prove_closure_and_allow_a_later_start_for_the_same_sea
         apply_source(
             &store,
             &format!(
-                "version 2\nexec \"example/rejected\" {{ workspace {:?}; argv \"/bin/sleep\" \"1000\"; }}",
-                root.path().display().to_string()
+                "version 2\nexec \"example/rejected\" {{ workspace {:?}; argv {:?} \"1000\"; }}",
+                root.path().display().to_string(),
+                sleep_program()
             ),
             "valid-native",
         );
@@ -1411,7 +1422,7 @@ fn native_rollout_guard_rejection_proves_no_producer_was_created() {
     )
     .unwrap();
     std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let intent = parse_intent(&format!("version 2\nagent \"example/guard\" {{ workspace {:?}; argv \"/bin/sleep\" \"1000\"; }}", root.path().display().to_string()), "node").unwrap();
+    let intent = parse_intent(&format!("version 2\nagent \"example/guard\" {{ workspace {:?}; argv {:?} \"1000\"; }}", root.path().display().to_string(), sleep_program()), "node").unwrap();
     let mut member = intent
         .subjects
         .values()
@@ -1476,7 +1487,7 @@ fn native_pty_publication_guard_after_a_launcher_does_not_prove_producer_closure
     )
     .unwrap();
     std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let intent = parse_intent(&format!("version 2\nagent \"example/late-guard\" {{ workspace {:?}; argv \"/bin/sleep\" \"1000\"; }}", root.path().display().to_string()), "node").unwrap();
+    let intent = parse_intent(&format!("version 2\nagent \"example/late-guard\" {{ workspace {:?}; argv {:?} \"1000\"; }}", root.path().display().to_string(), sleep_program()), "node").unwrap();
     let mut member = intent
         .subjects
         .values()
@@ -1538,7 +1549,7 @@ fn native_pty_launcher_rejection_is_distinct_from_a_returned_producer_error() {
         let pty = root.path().join("pty");
         std::fs::write(&pty, binary).unwrap();
         std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let intent = parse_intent(&format!("version 2\nagent \"example/rejected-pty\" {{ workspace {:?}; argv \"/bin/sleep\" \"1000\"; }}", root.path().display().to_string()), "node").unwrap();
+        let intent = parse_intent(&format!("version 2\nagent \"example/rejected-pty\" {{ workspace {:?}; argv {:?} \"1000\"; }}", root.path().display().to_string(), sleep_program()), "node").unwrap();
         let mut member = intent
             .subjects
             .values()
@@ -1630,8 +1641,9 @@ exit 1
         apply_source(
             &store,
             &format!(
-                "version 2\nagent \"example/late\" {{ workspace {:?}; argv \"/bin/sleep\" \"1000\"; }}",
-                root.path().display().to_string()
+                "version 2\nagent \"example/late\" {{ workspace {:?}; argv {:?} \"1000\"; }}",
+                root.path().display().to_string(),
+                sleep_program()
             ),
             "late-native",
         );

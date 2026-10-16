@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Optimize hot dependencies in development and test profiles while preserving assertions.",
+  "replay": {
+    "status": "none",
+    "detail": "Development/test code-generation profile only; no runtime schema, API, fixture, test selection, workflow routing or release-profile change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Development/test code-generation profile only; no runtime schema, API, fixture, test selection, workflow routing or release-profile change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Development/test code-generation profile only; no runtime schema, API, fixture, test selection, workflow routing or release-profile change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Development/test code-generation profile only; no runtime schema, API, fixture, test selection, workflow routing or release-profile change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Development/test code-generation profile only; no runtime schema, API, fixture, test selection, workflow routing or release-profile change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Development/test code-generation profile only; no runtime schema, API, fixture, test selection, workflow routing or release-profile change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Dev/test builds optimize libsqlite3-sys, sha2, ring and serde_json at level 3. Dependency debug info remains disabled; debug assertions and overflow checks remain enabled. The first build recompiles affected units; later unchanged builds reuse them. Workspace package optimization defaults are unchanged."
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Invalidate sealed fleet membership using the fold's batch signer identity",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "changed", "detail": "Replace legacy fleet-generation signature triggers with batch-identity predicates matching the membership fold, including when envelope identity differs from its batch."},
+  "rules": {"status": "none", "detail": "Membership and checkpoint authority rules are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client or wire changes."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "None."},
+  "recovery": {"status": "none", "detail": "Replacement triggers are installed idempotently when the store opens. The cache remains process-local."}
+}

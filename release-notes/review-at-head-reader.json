@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Register provider-independent review-at-head claim readers and preserve their audit references before gate activation.",
+  "replay": {"status": "none", "detail": "No projection or mission replay is introduced. Unknown authenticated records can be retried unchanged after upgrading readers."},
+  "schema": {"status": "changed", "detail": "Add four gate-operation append kinds and nine gate.requested extension fields. Nested change/head identities are validated explicitly. Change kinds are open namespaced identifiers; tagged head formats and existing subject families remain checked. No local table or client contract changes."},
+  "rules": {"status": "changed", "transitions": [[15, 16]], "detail": "Checkpoint rules version advances from 15 to 16 to preserve review binding, withdrawal, verdict, evidence and exact author-attempt references. All four kinds and existing gate/document claims remain durable. The reader release must precede activation; activation itself must not introduce a rules-digest change."},
+  "compatibility": {"status": "changed", "detail": "Older peers quarantine the new kinds or request fields as unknown, retaining authenticated original bytes for upgrade retry. This release does not publish review-at-head declarations, advertise readiness or activate review gates. Existing human gate mode and verdict enums are unchanged."},
+  "manual": {"status": "changed", "detail": "Deploy upgraded readers before any later review-at-head activation. Mixed rules versions cannot agree on a new checkpoint; no authoritative evidence is trimmed to reconcile them."},
+  "recovery": {"status": "none", "detail": "Existing unknown-record retry and checkpoint agreement mechanisms remain in use. No record replacement or cache authority is introduced."},
+  "downtime": {"status": "unknown", "detail": "Ordinary binary restart; no measured downtime claim."}
+}

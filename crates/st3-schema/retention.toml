@@ -28,6 +28,7 @@
 "agent.placement.source-offline" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "agent.presence" = { class = "current", pending = "no reader audit yet" }
 "agent.queue.moved" = { class = "durable" }
+"agent.retired" = { class = "durable" }
 "arrangement.edited" = { class = "durable" }
 "attention.requested" = { class = "durable" }
 "attention.resolved" = { class = "durable" }
@@ -47,8 +48,12 @@
 "fleet.member-endpoints" = { class = "current", pending = "the membership fold reads every endpoint claim" }
 "fleet.member-left" = { class = "durable" }
 "fleet.member-removed" = { class = "durable" }
+"gate.head-bound" = { class = "durable" }
+"gate.remediation-attached" = { class = "durable" }
 "gate.requested" = { class = "durable" }
 "gate.result" = { class = "durable" }
+"gate.review-verdict" = { class = "durable" }
+"gate.review-withdrawn" = { class = "durable" }
 "github.posted" = { class = "durable" }
 "glass.deleted" = { class = "durable" }
 "glass.upserted" = { class = "durable" }

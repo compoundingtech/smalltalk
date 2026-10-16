@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep summary startup pending only for the initial roster dependency",
+  "replay": {"status": "none", "detail": "No claim or replay changes."},
+  "schema": {"status": "none", "detail": "Summary publication state remains process-local. No storage schema changes."},
+  "rules": {"status": "none", "detail": "No rule changes."},
+  "compatibility": {"status": "changed", "detail": "Before the first shared summary succeeds, only the typed roster-not-published condition keeps selections pending. Other computation errors preserve native fallback. The old stderr text st3: the summary's shared counts failed is replaced by the structured summary.shared_counts_failed event with outcome, reason and selection count. Expected initial roster waits are debug events; real failures are warning events. summary.startup records the first shared publication at debug level, so healthy startup exports no routine OTel log stream."},
+  "downtime": {"status": "none", "detail": "No extra downtime beyond the normal binary restart."},
+  "manual": {"status": "none", "detail": "No additional setup. Log queries should use the structured event field rather than the old stderr text."},
+  "recovery": {"status": "none", "detail": "Binary swap-back requires no data migration."}
+}

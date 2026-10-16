@@ -3,13 +3,13 @@ import { Alert, Linking, Pressable, ScrollView, useWindowDimensions, View } from
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
-import { ANSWERS, alertsIn, cleanMessageText, isRequest, offeredAnswers, pendingCalls, promptAnswers, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
+import { ANSWERS, alertsIn, answerLabel, cleanMessageText, isRequest, offeredAnswers, pendingCalls, pendingQuestions, promptAnswers, questionAnswer, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
 import { agentName } from '../agentsView';
 import type { RootParams } from '../navigation';
 import { attentionKindLabel } from '../presentation';
 import { useStore } from '../store';
 import { theme } from '../theme';
-import { Button, Markdown, Note, T } from '../ui';
+import { Button, Markdown, Note, T, useTextAppearance } from '../ui';
 
 // Alerts in an agent's conversation: everything that waits on the person and belongs to this
 // agent, above the conversation, answerable there. Each is a line that opens to its question and
@@ -57,7 +57,7 @@ function AlertCard({ item, agentId, open, onToggle, calls }: { item: KeptAttenti
   </View>;
 }
 
-export function AlertBody({ item, from, calls, seats }: { item: KeptAttention; from: string; calls: PendingCall[]; seats: string[] }) {
+export function AlertBody({ item, from, calls, seats }: { item: KeptAttention; from: string; calls: PendingCall[] | null; seats: string[] }) {
   const prompt = promptAnswers(item);
   if (prompt) return <PromptAnswerView item={item} calls={calls} />;
   if (item.attention_kind === 'harness-prompt') return <View style={{ gap: 6 }}>
@@ -79,34 +79,59 @@ export function AlertBody({ item, from, calls, seats }: { item: KeptAttention; f
   </View>;
 }
 
-// A Claude permission prompt: the call it would allow, in full, beside the answers. The prompt
-// names no call, so Allow is offered only when exactly one call is unanswered; with several, all
-// are listed and only Deny is offered, and the terminal shows which one Claude asks about.
-function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: PendingCall[] }) {
+// A native prompt: what it would let through, in full, beside the answers it offers. `allow` and
+// `approve` are offered only beside the one call shown in full (the prompt names no call); a
+// question's options are chosen here and sent together; a screen prompt's own answers and deny are
+// one tap. `calls` is null where the conversation is not loaded: the call cannot be shown there.
+function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: PendingCall[] | null }) {
   const { busy, status, actions } = useStore();
+  const appearance = useTextAppearance();
   const prompt = promptAnswers(item)!;
   const disabled = busy || status !== 'online';
-  const offered = offeredAnswers(prompt, calls);
-  const call = calls.length === 1 ? calls[0] : null;
-  const send = (answer: 'allow' | 'deny') => {
-    const shown = call ? `${call.tool}${call.lines[0] ? `\n${call.lines[0]}` : ''}` : undefined;
-    Alert.alert(answer === 'allow' ? 'Allow this call?' : calls.length > 1 ? 'Deny the prompt?' : 'Deny this call?', shown, [
+  const shown = calls ?? [];
+  const offered = offeredAnswers(prompt, shown);
+  const questions = pendingQuestions(shown);
+  const [chosen, setChosen] = useState<number[][]>([]);
+  const call = shown.length === 1 ? shown[0] : null;
+  const gated = prompt.answers.find(answer => answer === 'allow' || answer === 'approve' || answer === 'answer');
+  const choose = (question: number, option: number, multi: boolean) => setChosen(previous => {
+    const next = [...previous];
+    const picked = next[question] ?? [];
+    next[question] = multi ? (picked.includes(option) ? picked.filter(each => each !== option) : [...picked, option].sort()) : [option];
+    return next;
+  });
+  const sendable = questions ? questionAnswer(questions, chosen) : null;
+  const send = (answer: string) => {
+    const sent = answer === 'answer' ? sendable : answer;
+    if (!sent) return;
+    const what = call ? `${call.tool}${call.lines[0] ? `\n${call.lines[0]}` : ''}` : undefined;
+    Alert.alert(`${answerLabel(answer)}?`, answer === 'answer' ? undefined : what, [
       { text: 'Cancel', style: 'cancel' },
-      { text: answer === 'allow' ? 'Allow' : 'Deny', style: answer === 'deny' ? 'destructive' : 'default', onPress: () => void actions.respondPrompt(item, answer) },
+      { text: answerLabel(answer), style: answer === 'deny' ? 'destructive' : 'default', onPress: () => void actions.respondPrompt(item, answer, sent) },
     ]);
   };
   return <View style={{ gap: 8 }}>
     {item.detail ? <T selectable>{cleanMessageText(item.detail)}</T> : null}
-    {calls.map(each => <View key={each.id} style={{ backgroundColor: theme.crust, borderRadius: 4, padding: 8, gap: 2 }}>
+    {questions ? questions.map((question, index) => <View key={index} style={{ gap: 4 }}>
+      <T bold>{question.header ? `${question.header} · ` : ''}{question.question}{question.multiSelect ? '  (choose any)' : ''}</T>
+      <View style={{ flexDirection: 'row', gap: 8, flexWrap: 'wrap' }}>
+        {question.options.map((option, choice) => {
+          const on = (chosen[index] ?? []).includes(choice);
+          return <Button key={choice} label={`${on ? '✓ ' : ''}${option.label}`} color={on ? theme.green : theme.text} disabled={disabled} onPress={() => choose(index, choice, question.multiSelect)} />;
+        })}
+      </View>
+    </View>) : shown.map(each => <View key={each.id} style={{ backgroundColor: appearance.system ? appearance.colors.grouped : theme.crust, borderRadius: 4, padding: 8, gap: 2 }}>
       <T bold color={theme.person}>{each.tool}</T>
       {each.lines.map((line, index) => <T key={index} selectable>{line}</T>)}
     </View>)}
-    {calls.length === 0 ? <Note tone="warning">The call it would allow is not in the conversation yet, so only deny is offered. Allow it in the terminal.</Note> : null}
-    {calls.length > 1 ? <Note tone="warning">{calls.length} calls are waiting and the prompt does not say which one it is asking about, so only deny is offered. Allow it in the terminal, where Claude shows it.</Note> : null}
-    {calls.length === 1 && !offered.includes('allow') ? <Note tone="warning">The call cannot be shown in full, so only deny is offered. Allow it in the terminal.</Note> : null}
+    {gated && calls === null ? <Note>Open the agent's conversation to see what it would {gated === 'answer' ? 'be asked' : 'let through'} and answer it there, or answer it in the terminal.</Note> : null}
+    {gated && calls !== null && shown.length === 0 ? <Note tone="warning">It is not in the conversation yet, so it cannot be {gated === 'answer' ? 'answered' : gated === 'approve' ? 'approved' : 'allowed'} here. Answer it in the terminal.</Note> : null}
+    {gated && shown.length > 1 ? <Note tone="warning">{shown.length} calls are waiting and the prompt does not say which one it is asking about. Answer it in the terminal, where the harness shows it.</Note> : null}
+    {gated && shown.length === 1 && !offered.includes(gated) ? <Note tone="warning">It cannot be shown in full, so it is answered in the terminal.</Note> : null}
     <View style={{ flexDirection: 'row', gap: 8, flexWrap: 'wrap' }}>
-      {offered.includes('allow') ? <Button label="Allow" color={theme.green} disabled={disabled} onPress={() => send('allow')} /> : null}
-      {offered.includes('deny') ? <Button label="Deny" color={theme.red} disabled={disabled} onPress={() => send('deny')} /> : null}
+      {offered.map(answer => <Button key={answer} label={answer === 'deny' && gated === 'answer' ? 'Decline' : answerLabel(answer)}
+        color={answer === 'deny' ? theme.red : answer === gated ? theme.green : theme.accent}
+        disabled={disabled || (answer === 'answer' && !sendable)} onPress={() => send(answer)} />)}
     </View>
     <Note>Only this prompt, once. An answer in the terminal wins.</Note>
   </View>;
@@ -118,6 +143,7 @@ function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: Pending
 type Structured = NonNullable<Parameters<ReturnType<typeof useStore>['actions']['done']>[0]['request']>;
 export function StructuredRequestView({ item, request, from, onAnswered }: { item: Parameters<ReturnType<typeof useStore>['actions']['done']>[0]; request: Structured; from: string; onAnswered: () => void }) {
   const { busy, status, actions } = useStore();
+  const appearance = useTextAppearance();
   const disabled = busy || status !== 'online';
   const label = (id: string) => request.answers?.find(answer => answer.id === id)?.label ?? id;
   const send = (answer: { id: string; label: string; outcome?: string | null }) => answer.outcome === 'request_changes'
@@ -137,8 +163,8 @@ export function StructuredRequestView({ item, request, from, onAnswered }: { ite
       ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
       : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
     <T bold color={theme.person}>{from} is waiting on you.</T>
-    {request.answers?.map(answer => <Pressable key={answer.id} disabled={disabled} onPress={() => send(answer)}
-      style={{ borderLeftWidth: 2, borderLeftColor: request.recommendation?.answer === answer.id ? theme.green : theme.surface1, paddingLeft: 8, paddingVertical: 4, opacity: disabled ? 0.5 : 1 }}>
+    {request.answers?.map(answer => <Pressable key={answer.id} accessibilityRole="button" accessibilityLabel={`${answer.label}. ${answer.consequence ?? ''}`} accessibilityState={{ disabled }} disabled={disabled} onPress={() => send(answer)}
+      style={{ borderLeftWidth: 2, borderLeftColor: appearance.color(request.recommendation?.answer === answer.id ? theme.green : theme.surface1), paddingLeft: appearance.system ? 12 : 8, paddingVertical: appearance.system ? 12 : 4, minHeight: appearance.system ? 44 : undefined, opacity: disabled ? 0.5 : 1 }}>
       <T bold color={theme.accent}>{answer.label}{request.recommendation?.answer === answer.id ? <T color={theme.green}>  recommended</T> : null}{answer.outcome === 'request_changes' ? <T color={theme.yellow}>  needs your words</T> : null}</T>
       <T dim>{answer.consequence}</T>
     </Pressable>)}
@@ -149,12 +175,13 @@ export function StructuredRequestView({ item, request, from, onAnswered }: { ite
 
 // A request's question: a JSON report as its telling fields, anything else as Markdown.
 export function RequestQuestion({ text }: { text: string }) {
+  const appearance = useTextAppearance();
   const shown = report(text);
   if (!shown) return <Markdown text={spaced(text)} color={theme.text} />;
   const tone = { fault: theme.red, text: theme.text, soft: theme.subtext0 } as const;
   return <View style={{ gap: 2 }}>
     {shown.before ? <Markdown text={shown.before} color={theme.text} /> : null}
-    {shown.rows.map(row => <T key={row.key} numberOfLines={1}><T dim>{row.key}  </T><T color={tone[row.tone]}>{row.value}</T></T>)}
+    {shown.rows.map(row => <T key={row.key} numberOfLines={appearance.system ? undefined : 1}><T dim>{row.key}  </T><T color={tone[row.tone]}>{row.value}</T></T>)}
     {shown.more ? <T dim>… {shown.more} more fields</T> : null}
   </View>;
 }
