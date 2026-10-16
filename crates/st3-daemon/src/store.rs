@@ -61382,7 +61382,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
 
 
     /// Run against a reflink-copied live store only:
-    /// `CLAIM_SUMMARY_BENCH=/path/to/copy.sqlite3 cargo test -p st3 --lib claim_summary -- --ignored --nocapture`.
+    /// `CLAIM_SUMMARY_BENCH=/path/to/copy.sqlite3 cargo test -p st3-daemon --lib claim_summary -- --ignored --nocapture`.
     /// Alternates full and summary reductions of the same subject at the same cut so both
     /// answers measure one store, one index and one page cache.
     #[test]

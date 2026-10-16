@@ -2084,7 +2084,7 @@ fn peak_use_while<T>(path: &Path, work: impl FnOnce() -> T) -> (T, u64) {
 /// Plans a checkpoint over a copy of a real store and prints the dry run, with the most disk
 /// space opening the store (its schema upgrade) and the proof each took at once:
 /// `ST3_CHECKPOINT_STORE=/var/tmp/copy.sqlite3 ST3_CHECKPOINT_ORIGIN=example-linux
-/// ST3_CHECKPOINT_DAY=2026-09-27 cargo test -p st3 --lib plan_a_copy_of_a_real_store --
+/// ST3_CHECKPOINT_DAY=2026-09-27 cargo test -p st3-daemon --lib plan_a_copy_of_a_real_store --
 /// --ignored --nocapture`. Without `ST3_CHECKPOINT_DAY` it plans the newest due checkpoint.
 /// The copy is changed; the store it came from is not read.
 #[test]
