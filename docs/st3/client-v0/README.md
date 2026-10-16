@@ -713,7 +713,7 @@ with its `target_id` and `episode`, and offers the typed action `prompt.respond`
 |---|---|---|
 | Claude permission (its own or a subagent's), Codex command, file change or permissions approval | `allow`, `deny` | the answer |
 | Claude plan approval (`ExitPlanMode`) | `approve`, `deny` | the answer |
-| Claude question (`AskUserQuestion`, single or multi-select) | `answer`, `deny` | `deny`, or the choices: a JSON object of each question's text to its chosen label, several comma-separated |
+| Claude question (`AskUserQuestion`, single or multi-select) | `answer`, `deny` | `deny`, or the choices as positions: a JSON object of each question's position in the pending call to the positions of the options chosen, such as `{"0":[1],"1":[0,2]}`; the questions and labels stay in the conversation, and the seat's hook turns positions into labels |
 | Claude's new-MCP-server dialog | `use`, `use-all`, `skip` | the answer |
 | Claude's or Codex's workspace trust dialog | `trust`, and `exit` or `quit` | the answer |
 

@@ -171,16 +171,36 @@ export function alertsIn(items: readonly KeptAttention[], agentId: string, actor
  * `questionAnswer`) or `deny` a question, and a screen prompt's own answers (`use`, `use-all`,
  * `skip`, `trust`, `exit`, `quit`).
  */
-export type PromptAnswers = { target_id: string; episode: string; answers: string[] };
-export function promptAnswers(item: Pick<Attention, 'actions' | 'source_id'> & { episode?: string; action_parameters?: unknown }): PromptAnswers | null {
-  if (!(item.actions as readonly string[]).includes('prompt.respond')) return null;
-  const parameters = (item.action_parameters as Record<string, unknown> | undefined)?.['prompt.respond'] as { target_id?: unknown; episode?: unknown; answers?: unknown } | undefined;
+export type PromptAnswers = {
+  target_id: string; episode: string; answers: string[];
+  /**
+   * The exact call the prompt asks about (a tool use or Codex item id), or null when its harness
+   * named none; undefined from a daemon that predates it.
+   */
+  call_id?: string | null;
+};
+export function promptAnswers(item: { readonly actions: readonly string[]; readonly source_id: string; readonly episode?: string; readonly action_parameters?: unknown }): PromptAnswers | null {
+  if (!item.actions.includes('prompt.respond')) return null;
+  const parameters = (item.action_parameters as Record<string, unknown> | undefined)?.['prompt.respond'] as { target_id?: unknown; episode?: unknown; answers?: unknown; call_id?: unknown } | undefined;
   if (!parameters) return null;
   const answers = (Array.isArray(parameters.answers) ? parameters.answers : []).filter((answer): answer is string => typeof answer === 'string' && /^[a-z][a-z-]*$/.test(answer));
   if (!answers.length) return null;
   const target_id = typeof parameters.target_id === 'string' ? parameters.target_id : item.source_id;
   const episode = typeof parameters.episode === 'string' ? parameters.episode : item.episode ?? '';
-  return episode ? { target_id, episode, answers } : null;
+  if (!episode) return null;
+  const prompt: PromptAnswers = { target_id, episode, answers };
+  if ('call_id' in parameters) prompt.call_id = typeof parameters.call_id === 'string' ? parameters.call_id : null;
+  return prompt;
+}
+
+/**
+ * Which prompt an alert's answer controls belong to: the alert, the episode it asks about and its
+ * revision. A client keys the person's choices on it, so a new prompt behind the same alert, or a
+ * new revision of it, starts with nothing chosen: positions chosen for one question never answer
+ * another.
+ */
+export function promptAlertKey(item: { readonly id: string; readonly revision: string; readonly actions: readonly string[]; readonly source_id: string; readonly episode?: string; readonly action_parameters?: unknown }): string {
+  return [item.id, promptAnswers(item)?.episode ?? item.episode ?? '', item.revision].join('\n');
 }
 
 /** The call a harness recorded before it asked, in full: its tool and each input, lines intact. */
@@ -230,8 +250,9 @@ export type PendingQuestion = { question: string; header: string; options: Array
 
 /** The questions of the one pending call, when it is an `AskUserQuestion` whose questions can be read. */
 export function pendingQuestions(calls: readonly PendingCall[]): PendingQuestion[] | null {
-  if (calls.length !== 1 || calls[0].tool !== 'AskUserQuestion') return null;
-  const asked = (calls[0].input as { questions?: unknown } | undefined)?.questions;
+  const [call] = calls;
+  if (calls.length !== 1 || call?.tool !== 'AskUserQuestion') return null;
+  const asked = (call.input as { questions?: unknown } | undefined)?.questions;
   if (!Array.isArray(asked) || !asked.length) return null;
   const questions: PendingQuestion[] = [];
   for (const each of asked) {
@@ -250,16 +271,17 @@ export function pendingQuestions(calls: readonly PendingCall[]): PendingQuestion
 }
 
 /**
- * The answer a question alert sends once every question has a choice: each question's text with
- * its chosen labels, several joined with a comma, as Claude's `AskUserQuestion` takes them. Null
- * while a question has none.
+ * The answer a question alert sends once every question has a choice: positions only, each
+ * question's position to the positions of the options chosen, such as {"0":[1],"1":[0,2]}. The
+ * questions and labels stay in the conversation; the seat's hook turns positions into labels.
+ * Null while a question has none.
  */
 export function questionAnswer(questions: readonly PendingQuestion[], chosen: ReadonlyArray<ReadonlyArray<number>>): string | null {
-  const answers: Record<string, string> = {};
+  const answers: Record<string, number[]> = {};
   for (const [index, question] of questions.entries()) {
-    const labels = (chosen[index] ?? []).map(option => question.options[option]?.label).filter((label): label is string => !!label);
-    if (!labels.length) return null;
-    answers[question.question] = labels.join(', ');
+    const options = [...new Set(chosen[index] ?? [])].filter(option => option >= 0 && option < question.options.length).sort((a, b) => a - b);
+    if (!options.length) return null;
+    answers[String(index)] = options;
   }
   return JSON.stringify(answers);
 }
@@ -277,21 +299,35 @@ export function answerLabel(answer: string): string {
     case 'trust': return 'Trust';
     case 'exit': return 'Exit';
     case 'quit': return 'Quit';
+    case 'approve-once': return 'Allow once';
+    case 'approve-kind': return 'Allow this kind';
+    case 'dismiss': return 'Dismiss';
     default: return answer;
   }
 }
 
 /**
- * The answers a client may offer. `allow` and `approve` only when exactly one call is unanswered
- * and it is shown in full, since only then is it certain what they let through; `answer` only
- * when that call's questions can be shown and chosen from; every other answer (deny, and a
- * screen prompt's own answers) always.
+ * The answers a client may offer. `allow` and `approve` only beside the exact call the prompt asks
+ * about, shown in full (from an older daemon: the one call unanswered); `answer` only when that
+ * call's questions can be shown and chosen from; every other answer (deny, and a screen prompt's
+ * or denial's own answers) always.
  */
 export function offeredAnswers(prompt: PromptAnswers, calls: readonly PendingCall[]): string[] {
-  const certain = calls.length === 1 && calls[0].lines.length > 0;
+  const shown = promptCalls(prompt, calls);
+  const certain = shown.length === 1 && (shown[0]?.lines.length ?? 0) > 0;
   return prompt.answers.filter(answer => {
     if (answer === 'allow' || answer === 'approve') return certain;
-    if (answer === 'answer') return pendingQuestions(calls) !== null;
+    if (answer === 'answer') return pendingQuestions(shown) !== null;
     return true;
   });
+}
+
+/**
+ * The calls to show beside a prompt's answers: the exact call it asks about, when its daemon names
+ * it (none when it named none); from a daemon that predates that, every unanswered call, of which
+ * only a lone one is certain.
+ */
+export function promptCalls(prompt: PromptAnswers, calls: readonly PendingCall[]): PendingCall[] {
+  if (prompt.call_id === undefined) return [...calls];
+  return calls.filter(call => call.id === prompt.call_id);
 }

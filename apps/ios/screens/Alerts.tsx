@@ -3,7 +3,7 @@ import { Alert, Linking, Pressable, ScrollView, useWindowDimensions, View } from
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
-import { ANSWERS, alertsIn, answerLabel, cleanMessageText, isRequest, offeredAnswers, pendingCalls, pendingQuestions, promptAnswers, questionAnswer, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
+import { ANSWERS, alertsIn, answerLabel, cleanMessageText, isRequest, offeredAnswers, pendingCalls, pendingQuestions, promptAlertKey, promptAnswers, promptCalls, questionAnswer, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
 import { agentName } from '../agentsView';
 import type { RootParams } from '../navigation';
 import { attentionKindLabel } from '../presentation';
@@ -59,7 +59,8 @@ function AlertCard({ item, agentId, open, onToggle, calls }: { item: KeptAttenti
 
 export function AlertBody({ item, from, calls, seats }: { item: KeptAttention; from: string; calls: PendingCall[] | null; seats: string[] }) {
   const prompt = promptAnswers(item);
-  if (prompt) return <PromptAnswerView item={item} calls={calls} />;
+  // A new prompt or revision behind the same alert starts with nothing chosen.
+  if (prompt) return <PromptAnswerView key={promptAlertKey(item)} item={item} calls={calls} />;
   if (item.attention_kind === 'harness-prompt') return <View style={{ gap: 6 }}>
     {item.detail ? <Markdown text={spaced(cleanMessageText(item.detail))} color={theme.text} /> : null}
     <Note>This prompt is answered in the agent's terminal.</Note>
@@ -88,7 +89,8 @@ function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: Pending
   const appearance = useTextAppearance();
   const prompt = promptAnswers(item)!;
   const disabled = busy || status !== 'online';
-  const shown = calls ?? [];
+  // Only the exact call the prompt asks about, when the daemon names it.
+  const shown = promptCalls(prompt, calls ?? []);
   const offered = offeredAnswers(prompt, shown);
   const questions = pendingQuestions(shown);
   const [chosen, setChosen] = useState<number[][]>([]);
