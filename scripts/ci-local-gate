@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Run the members of the Linux gate on this machine, in the commands CI runs, and write the aggregate facts.
+
+  scripts/ci-local-gate [--stage NAME]... [--base REF] [--external NAME=exit]... [--facts FILE] [--dry-run]
+
+CI runs these as separate jobs; here they run one after another in the checkout you are in (scripts/st-test
+gives it a clean worktree of the merge tree). Each stage is the command its CI job runs, with the environment its
+job prepares (an isolated HOME, RUNNER_TEMP, the historical messaging channel and the provider components). The one
+deliberate difference: CI builds the test archive in one job and the shard jobs extract it; here nextest builds in
+place (`ci-nextest run --no-run`, then the four partitions of the merge-queue run), so no GitHub artifact is needed.
+A test proves every command below appears in the generated workflow, so the two cannot drift apart.
+On a host whose cargo shim lives at $HOME/.local/bin/cargo (build admission, a builds slice) the dev shell's cargo is run through
+that shim, so the compile is queued and sliced like any other, and each step that builds runs inside ONE ticket of the shim's
+stage slot (`cargo --stage-slot LABEL -- ...`, one at a time, stopped after the host's stage limit): the same compile, only
+queued once per stage instead of once per cargo command. A step the host stops (40 minutes today, exit 124) is reported as a failure;
+a step that needs longer must be split (each step has its own ticket and its own limit). A shim without the stage form is detected (its file names `--stage-slot`) and the stage runs the
+old way, in this process. Done at run time; not a CI command.
+
+Every stage runs even after a failure (a failing record is information); --fail-fast stops at the first and writes
+no facts. --external NAME=EXIT passes the exit code of a member this script does not run (genie-freshness and
+typescript-client are run by scripts/st-test): with them, --facts writes the same facts the CI aggregate job
+records, for `scripts/evidence-wrap --aggregate`: the command is the aggregate's, the output names every member's
+result. Without every member present no facts are written, because a note that leaves one out would claim more than
+was tested. Exit 0 only if every stage passed.
+
+Trust: the facts and the --external exit codes are written by whoever runs this script. Run by hand from a checkout, that is the tree
+under test itself; a signed note must come only from the copy of this script taken from the accepted base, with the external members run by
+the signer's own caller (scripts/st-test, once it is wired to call this; not yet). Nothing here signs.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+NIX = ['nix', 'develop', '-c']
+SHARDS = {'linux-tests': 'hash:1/4', 'linux-tests-shard-2': 'hash:2/4', 'linux-tests-shard-3': 'hash:3/4', 'linux-tests-shard-4': 'hash:4/4'}
+EXTERNAL = ('genie-freshness', 'typescript-client')
+GATE = 'linux-gate'
+MERGE = '@MERGE@'  # replaced by the merge commit of HEAD into the base: what CI's effective merge source is
+
+KVM_PROBE = r'''if [ ! -e /dev/kvm ]; then echo "/dev/kvm is missing: this machine offers no nested virtualization" >&2; exit 1; fi
+if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then echo "/dev/kvm is not readable and writable by this user" >&2; exit 1; fi'''
+VM_TESTS = r'''set -euo pipefail
+nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackages.x86_64-linux.transport-isolation-vm.driver
+mkdir -p "$RUNNER_TEMP/vm-out"
+"$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
+nix build --print-build-logs --out-link "$RUNNER_TEMP/sekrets-vm-driver" .#legacyPackages.x86_64-linux.sekrets-vm.driver
+mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
+"$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"'''
+
+
+def stages(base):
+    """name -> list of (argv, extra environment). The argv strings are the ones the CI jobs run."""
+    hooks = (NIX + ['bash', 'scripts/ci-install-built-hooks'], {})
+    proof = lambda name: (NIX + ['python3', 'scripts/ci-test-partitions'], {'CI_TEST_PARTITION': SHARDS[name]})
+    run = lambda name: (NIX + ['bash', 'scripts/ci-linux', 'tests'], {'CI_TEST_PARTITION': SHARDS[name]})
+    # Only the first shard proves that the shards form the complete inventory (CI runs that step in linux-tests alone).
+    tests = lambda name: [hooks, proof(name), run(name)] if name == 'linux-tests' else [hooks, run(name)]
+    return {
+        'upgrade-impact': [(['python3', 'scripts/release_notes_test.py'], {}),
+                           (['python3', 'scripts/check-release-impact', '--base', base, '--source', MERGE], {})],
+        'linux-test-build': [(NIX + ['bash', 'scripts/ci-nextest', 'run', '--no-run'], {})],
+        'linux-tests': tests('linux-tests'),
+        'linux-tests-shard-2': tests('linux-tests-shard-2'),
+        'linux-tests-shard-3': tests('linux-tests-shard-3'),
+        'linux-tests-shard-4': tests('linux-tests-shard-4'),
+        'linux-clippy': [(NIX + ['bash', 'scripts/ci-linux', 'clippy'], {'CLIPPY_BASE_SHA': base})],
+        'linux-fleet-compat': [(NIX + ['bash', 'scripts/ci-linux', 'fleet-compat'], {})],
+        'mail-redelivery-canaries': [hooks, (NIX + ['bash', 'scripts/ci-linux', 'mail-redelivery-canaries'], {})],
+        'isolation-vm': [hooks, (['bash', '-c', KVM_PROBE], {}), (['bash', '-c', VM_TESTS], {})],
+    }
+
+
+def admitted(command, shim_dir):
+    """Run a dev-shell command with cargo going through the host's cargo shim, when this host has one.
+
+    Inside `nix develop` the dev shell's own cargo comes first on PATH, so a host that queues builds in its cargo shim
+    (build admission, a builds slice) never sees them. The shim is put first, with the dev shell's cargo as the real
+    one, so the compile is the same and only its queueing and slice change. Not a CI command: applied at run time only."""
+    if not shim_dir or command[:3] != NIX:
+        return command
+    return NIX + ['bash', '-c', 'export CARGO_REAL=$(command -v cargo); export PATH="$1:$PATH"; shift; exec "$@"', '_', shim_dir, *command[3:]]
+
+
+LIGHT = ('upgrade-impact',)  # no cargo, no nix build: no slot
+STAGE_LIMIT_EXIT = 124  # the shim stops a stage after the host's limit (2400 s today) and exits 124: reported as a failure
+
+
+def has_stage_slot(shim_dir):
+    """True when the shim at shim_dir really has the stage form (st3-network #383). An older shim hands `--stage-slot` to the real
+    cargo, which fails: every building stage would report a false red. The shim must be a regular file of this user that nobody
+    else can write, and it must answer `cargo --stage-slot` (no label) the way the stage form does: usage on stderr and exit 2
+    (the host's own smoke test). That asks for no ticket and runs no build."""
+    path = Path(shim_dir) / 'cargo'
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            return False
+        answer = subprocess.run([str(path), '--stage-slot'], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return answer.returncode == 2 and 'stage-slot' in answer.stderr
+
+
+def slot_command(name, shim_dir, base, step=0):
+    """Run one step of a stage inside ONE host build-queue ticket: `cargo --stage-slot LABEL -- COMMAND` queues once, and the cargo
+    commands inside run without queueing again (each in its own builds.slice scope); the host stops a slot after its limit (40
+    minutes today, exit 124). One ticket per STEP, not per cargo command (a stage that ran several re-queued, at the back, for
+    each) and not per stage (the test partition's inventory proof alone takes about 30 minutes locally and would leave the
+    tests no time). The command is this script, running that step directly."""
+    return [str(Path(shim_dir) / 'cargo'), '--stage-slot', f'ci-local-gate-{name}-{step}', '--',
+            sys.executable, str(Path(__file__).resolve()), '--direct', '--stage', name, '--step', str(step), '--base', base]
+
+
+def heavy_step(command):
+    """False for a step that builds nothing (the KVM probe): it needs no ticket."""
+    return not (command[:2] == ['bash', '-c'] and 'nix build' not in command[2])
+
+
+def slot_environment(environment, real_home):
+    """The environment of the process that takes the host ticket: the seat's name stays, because the host ranks tickets by it
+    (the stage itself then drops it for what it runs)."""
+    kept = {k: os.environ[k] for k in ('ST_AGENT',) if k in os.environ}
+    return dict(environment, HOME=real_home, **kept)
+
+
+def merge_commit(base, env):
+    """CI classifies the merge of the pull request into its base, not the branch's own commits; so do we."""
+    def git(*args, **kw):
+        done = subprocess.run(['git', *args], capture_output=True, text=True, env=dict(env, GIT_AUTHOR_NAME='ci-local-gate',
+                              GIT_AUTHOR_EMAIL='ci-local-gate@example.invalid', GIT_COMMITTER_NAME='ci-local-gate',
+                              GIT_COMMITTER_EMAIL='ci-local-gate@example.invalid'))
+        if done.returncode != 0:
+            raise RuntimeError(f'git {args[0]} failed: {done.stderr.strip()[-300:]}')
+        return done.stdout.strip()
+    if subprocess.run(['git', 'merge-base', '--is-ancestor', base, 'HEAD']).returncode != 0:
+        raise RuntimeError(f'HEAD does not hold {base}; merge it first')
+    tree = git('rev-parse', 'HEAD^{tree}')
+    return git('commit-tree', tree, '-p', base, '-p', 'HEAD', '-m', 'ci-local-gate: effective merge source')
+
+
+SEAT_PREFIXES = ('ST_', 'ST2_', 'ST3_', 'CLAUDE', 'ANTHROPIC_')
+KEPT_SEAT = ('ST_EVIDENCE', 'ST_SKIP_EVIDENCE')
+
+
+def without_seat_variables(env):
+    """A CI runner has none of the variables an agent seat carries (its identity, mission, session, daemon endpoint, hook and
+    messaging settings). Tests that read them fail or behave differently under a seat: the first drill's four claude hook
+    tests failed that way. Drop them, except the evidence hook's own switches."""
+    return {k: v for k, v in env.items() if not (k.startswith(SEAT_PREFIXES) and not k.startswith(KEPT_SEAT))}
+
+
+def cargo_home():
+    """A cargo home that outlives the run but is NOT the user's own ~/.cargo (credentials, config, installed tools).
+
+    CI's per-job cargo home is thrown away with its runner; a temporary one here made every stage download and recompile every
+    registry dependency (cargo's fingerprints include the registry path). It is a dedicated directory under the real cache
+    directory, shared by the stages of every tree this script runs: downloads are verified against Cargo.lock's checksums, and a
+    tree's own build scripts run as this user anyway (cooperative trust, docs/st3/gate-evidence.md)."""
+    if os.environ.get('CARGO_HOME'):
+        return os.environ['CARGO_HOME']
+    cache = os.environ.get('XDG_CACHE_HOME') or str(Path(os.environ['HOME']) / '.cache')
+    return str(Path(cache) / 'ci-local-gate/cargo-home')
+
+
+def prepare(work):
+    """The environment the CI jobs prepare: RUNNER_TEMP, an isolated HOME and XDG state, the cache directory."""
+    temp = Path(work) / 'runner-temp'
+    home = temp / 'test-home'
+    for directory in (home / '.config', home / '.cache', home / '.local/state'):
+        directory.mkdir(parents=True, exist_ok=True)
+    return {'RUNNER_TEMP': str(temp), 'GITHUB_STEP_SUMMARY': str(temp / 'summary.md'),
+            'HOME': str(home), 'XDG_CONFIG_HOME': str(home / '.config'), 'XDG_CACHE_HOME': str(home / '.cache'),
+            'XDG_STATE_HOME': str(home / '.local/state'),
+            # The stages emulate CI: the default dev shell installs the pre-push hook unless CI is set, and a drill must not install hooks
+            # in the shared repository of every seat on the host (st2#3014 happened that way).
+            'CI': 'true',
+            'CARGO_HOME': cargo_home(), 'CI_CACHE_DIR': str(Path(os.environ.get('XDG_CACHE_HOME') or Path(os.environ['HOME']) / '.cache') / 'ci-local-gate/st-ci-cache')}
+
+
+def shared_environment(env):
+    """The historical messaging channel and the provider components, built once for the stages that use them."""
+    done = subprocess.run(['timeout', '10m', 'bash', 'scripts/messaging-compat-binary'], capture_output=True, text=True, env=env)
+    if done.returncode != 0:
+        raise RuntimeError('messaging-compat-binary failed: ' + done.stderr.strip()[-300:])
+    found = {'ST3_MESSAGING_COMPAT_BIN': done.stdout.strip().splitlines()[-1]}
+    system = subprocess.run(['nix', 'eval', '--impure', '--raw', '--expr', 'builtins.currentSystem'], capture_output=True, text=True, env=env).stdout.strip()
+    built = subprocess.run(['nix', 'build', f'.#checks.{system}.provider-components', '--no-link', '--print-out-paths', '--print-build-logs'],
+                           capture_output=True, text=True, env=env)
+    if built.returncode != 0:
+        raise RuntimeError('provider-components failed: ' + built.stderr.strip()[-300:])
+    components = built.stdout.strip().splitlines()[-1]
+    for provider in ('GITHUB_ISSUE', 'GITHUB_PR', 'PTY_STATS', 'VISTA'):
+        found[f'ST2_{provider}_COMPONENT'] = f'{components}/share/st2/providers/st2_{provider.lower()}_component.component.wasm'
+    return found
+
+
+def facts(results, gate=GATE):
+    """What the CI aggregate job records (scripts/ci-evidence-signing aggregate), for the same member set."""
+    names = sorted(set(results) | {gate})
+    verdict = 'success' if all(results[n] == 'success' for n in results) else 'failure'
+    needs = dict(sorted({**results, gate: verdict}.items()))
+    return {'command': [gate, 'aggregate', *names], 'exit_code': 0 if verdict == 'success' else 1,
+            'output': {'gate': verdict, 'needs': needs},
+            'inputs': {'event_name': 'local', 'needed_jobs': ','.join(names),
+                       'stage_results': ','.join(f'{n}={r}' for n, r in needs.items())}}
+
+
+def main(argv, table=None, setup=None, shim=None):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('--stage', action='append', default=[], metavar='NAME', help='only this stage (repeatable)')
+    parser.add_argument('--base', default='origin/main', help='the accepted base (default origin/main)')
+    parser.add_argument('--external', action='append', default=[], metavar='NAME=EXIT')
+    parser.add_argument('--facts', metavar='FILE', help='write the aggregate facts here')
+    parser.add_argument('--fail-fast', action='store_true')
+    parser.add_argument('--direct', action='store_true', help='run the chosen stages in this process, without the host stage slot (what the slot itself runs)')
+    parser.add_argument('--step', type=int, help='with --direct: only this step (0-based) of the one chosen stage')
+    parser.add_argument('--dry-run', action='store_true', help='print the plan and stop')
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9._/-]*', args.base):
+        print(f'ci-local-gate: --base {args.base!r} must be a ref name (it may not start with "-")', file=sys.stderr)
+        return 2
+    plan = table if table is not None else stages(args.base)
+    unknown = [name for name in args.stage if name not in plan]
+    if unknown:
+        print(f'ci-local-gate: unknown stage {", ".join(unknown)}; known: {", ".join(plan)}', file=sys.stderr)
+        return 2
+    chosen = args.stage or list(plan)
+    if args.dry_run:
+        for name in chosen:
+            for command, extra in plan[name]:
+                shown = ['bash', '-c', '<script>'] if command[:2] == ['bash', '-c'] else command
+                print(' '.join(filter(None, [f'{name}:', *[f'{k}={v}' for k, v in extra.items()], *shown])))
+        return 0
+    external = {}
+    for item in args.external:
+        name, _, code = item.partition('=')
+        if name not in EXTERNAL or not code.isdecimal():
+            print(f'ci-local-gate: --external {item!r} must be NAME=EXIT for one of {", ".join(EXTERNAL)}', file=sys.stderr)
+            return 2
+        external[name] = 'success' if int(code) == 0 else 'failure'
+    if args.direct and args.facts:
+        print('ci-local-gate: --direct runs stages for the stage slot and writes no facts', file=sys.stderr)
+        return 2
+    results, failed = {}, False
+    real_home = os.environ.get('HOME', '')
+    shim_dir = shim or (str(Path(real_home) / '.local/bin') if real_home and os.access(Path(real_home) / '.local/bin/cargo', os.X_OK) else None)
+    slotted = bool(shim_dir) and has_stage_slot(shim_dir)  # an older shim: the stage runs the old way, in this process
+    with tempfile.TemporaryDirectory(prefix='ci-local-gate-') as work:
+        environment = dict(without_seat_variables(os.environ), **(setup or prepare)(work))
+        if shim_dir and os.access(Path(shim_dir) / 'build-admission', os.X_OK):
+            environment.setdefault('BUILD_ADMISSION_BIN', str(Path(shim_dir) / 'build-admission'))  # HOME is isolated below
+        shared = []  # built lazily, by the process that runs the steps (inside the stage slot when there is one)
+        for name in chosen:
+            started = time.monotonic()
+            code = 0
+            if slotted and (table is None or shim) and not args.direct and name not in LIGHT:
+                # One ticket per step; the step runs this script again, directly, inside it. A light step takes none.
+                for index, (command, extra) in enumerate(plan[name]):
+                    if heavy_step(command):
+                        code = subprocess.run(slot_command(name, shim_dir, args.base, index), env=slot_environment(environment, real_home)).returncode
+                    else:
+                        code = subprocess.run(command, env=dict(environment, **extra)).returncode
+                    if code != 0:
+                        break
+                results[name] = 'success' if code == 0 else 'failure'
+                failed = failed or code != 0
+                print(f'ci-local-gate: {name} {results[name]} in {round(time.monotonic() - started)}s', file=sys.stderr)
+                if code != 0 and args.fail_fast:
+                    return 1
+                continue
+            if table is None and name not in LIGHT and not shared:
+                environment.update(shared_environment(environment))
+                shared.append(True)
+            steps = list(enumerate(plan[name]))
+            if args.direct and args.step is not None:
+                steps = [pair for pair in steps if pair[0] == args.step]
+            for _, (command, extra) in steps:
+                if MERGE in command:
+                    command = [merge_commit(args.base, environment) if part == MERGE else part for part in command]
+                code = subprocess.run(admitted(command, shim_dir if table is None else None), env=dict(environment, **extra)).returncode
+                if code != 0:
+                    break
+            results[name] = 'success' if code == 0 else 'failure'
+            failed = failed or code != 0
+            print(f'ci-local-gate: {name} {results[name]} in {round(time.monotonic() - started)}s', file=sys.stderr)
+            if code != 0 and args.fail_fast:
+                return 1
+    if args.facts:
+        members = {**results, **external}
+        missing = sorted((set(stages(args.base)) | set(EXTERNAL)) - set(members))
+        if missing:
+            print(f'ci-local-gate: no facts written: {", ".join(missing)} not run or not given with --external', file=sys.stderr)
+            return 1
+        Path(args.facts).write_text(json.dumps(facts(members), sort_keys=True))
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

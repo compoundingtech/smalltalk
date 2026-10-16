@@ -749,6 +749,24 @@ record too, the latest record decides, the merge queue still tests the integrate
 covers it), and sampled real runs compare a note with the job. The root-installed, hash-pinned signer
 (`scripts/evidence-sign` behind a `sekrets` grant) stays supported for a host that wants it.
 
+### The Linux gate's members, locally (`scripts/ci-local-gate`)
+
+`scripts/ci-local-gate` runs the members of `linux-gate` that CI runs as separate jobs (`upgrade-impact`, `linux-test-build`, the
+four test partitions, `linux-clippy`, `linux-fleet-compat`, `mail-redelivery-canaries`, `isolation-vm`) one after another in the
+checkout it is in, with the environment their jobs prepare (an isolated `HOME`, `RUNNER_TEMP`, the historical messaging channel,
+the provider components). The one difference from CI is that nextest builds in place instead of extracting a test archive that
+another job built, so no GitHub artifact is needed. A test checks every command it runs against the generated workflow, so the
+two cannot drift apart. Every stage runs even after a failure; with `--external genie-freshness=EXIT --external
+typescript-client=EXIT` and `--facts FILE` it writes the facts the CI aggregate job records (the command the policy pins, every
+member's result), for `scripts/evidence-wrap --aggregate`. `isolation-vm` needs `/dev/kvm`. Run it only on a build host (hetz2), never on the production host: it starts the full Rust
+test partitions, clippy and VM tests, and it relies on the host's cargo shim and `build-admission` (it puts the shim in front of the
+dev shell's cargo when `~/.local/bin/cargo` exists, because the dev shell's own cargo would bypass it; run one stage at a time under
+`build-admission run heavy`). The facts it writes say `event_name: local`, where CI records `pull_request` or `merge_group`: the
+policy does not require that input, and a policy that did would reject these notes, which is the safe direction. **Until the drill
+has run every stage end to end, a note made from this runner must not be treated as covering a CI job, and no policy may pin it.**
+Drill so far on a build host: `upgrade-impact` 13 s, `linux-test-build` 693 s; the rest are unproven. This change does not sign
+anything; the `st-test` wiring comes next.
+
 ### Running the checks locally (`scripts/st-test`)
 
 `scripts/st-test` runs each required check that has a local command (today `genie-freshness` and
