@@ -432,6 +432,8 @@
             "-p"
             "st3"
             "-p"
+            "st-drivers"
+            "-p"
             "st3-client"
             "-p"
             "st3-client-codegen"

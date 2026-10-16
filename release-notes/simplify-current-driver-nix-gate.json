@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep shared native driver proofs in the current-runtime Nix check before retiring the legacy check",
+  "replay": {
+    "status": "none",
+    "detail": "none"
+  },
+  "schema": {
+    "status": "none",
+    "detail": "none"
+  },
+  "rules": {
+    "status": "none",
+    "detail": "none"
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "none"
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "none"
+  },
+  "manual": {
+    "status": "none",
+    "detail": "none"
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "none"
+  }
+}
