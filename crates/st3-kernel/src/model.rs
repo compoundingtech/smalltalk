@@ -7,8 +7,6 @@ pub use smallclaims::claim::{
     ClaimInput, ClaimRecord, ClaimsPage, DocumentVersion, ReplicaBatch, ReplicaEnvelope,
     ReplicaEnvelopeId, ReplicaEnvelopeSignature,
 };
-#[cfg(test)]
-pub use smallclaims::replication::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 pub use smallclaims::replication::{
     InventoryCheckpoint, ReplicaRecordView, ReplicationExchange, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationFirstSync, ReplicationInventory,
@@ -212,7 +210,7 @@ impl MemberSpec {
 
 /// A launch without the arguments st puts right after a typed harness's program, past the
 /// wrapper's `--`: its channel and its hook settings, which follow st's build, not the author.
-pub(crate) fn authored_launch(launch: &LaunchSpec) -> Vec<&str> {
+pub fn authored_launch(launch: &LaunchSpec) -> Vec<&str> {
     let argv = match launch {
         LaunchSpec::Shell(source) => return vec![source.as_str()],
         LaunchSpec::Argv(argv) => argv,
@@ -584,7 +582,7 @@ pub struct StepSpec {
     #[serde(default, skip_serializing_if = "is_false")]
     pub fresh_context: bool,
     /// st's own step that holds its run open while the mission watches: not work. Read it with
-    /// [`crate::mission::step_keeps_open`], which covers revisions published before the flag.
+    /// `mission::step_keeps_open` (st3-daemon), which covers revisions published before the flag.
     #[serde(default, skip_serializing_if = "is_false")]
     pub keep_open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -639,7 +637,7 @@ pub struct MissionSpec {
     pub state: MissionState,
     pub revision: String,
     /// st's own plumbing or a standing observer, which clients fold away until asked. Read it
-    /// with [`crate::mission::is_system`], which covers revisions published before the flag.
+    /// with `mission::is_system` (st3-daemon), which covers revisions published before the flag.
     #[serde(default, skip_serializing_if = "is_false")]
     pub system: bool,
     #[serde(default)]
@@ -886,7 +884,7 @@ pub struct NormalizedIntent {
     /// Local parser provenance for the public existing-observer registration route.
     /// Never trusted from a serialized client intent; APIs reparse authored KDL.
     #[serde(skip)]
-    pub(crate) direct_message_registrations: BTreeSet<String>,
+    pub direct_message_registrations: BTreeSet<String>,
     pub schema: String,
     pub source_hash: String,
     pub subjects: BTreeMap<String, DesiredSubject>,
@@ -3135,61 +3133,6 @@ pub struct MissionOutputView {
     pub mission: String,
     pub revision: String,
     pub claim_id: String,
-}
-
-#[cfg(test)]
-mod launch_change_tests {
-    use super::{LaunchSpec, MemberSpec};
-
-    fn claude(settings: &str, model: &str) -> MemberSpec {
-        let intent = crate::graph::parse_intent(
-            &format!(
-                "version 2\nagent \"example/worker\" {{ workspace \"/work\"; harness \"claude\" {{ model {model:?}; }} }}"
-            ),
-            "example-host",
-        )
-        .unwrap();
-        let mut member = intent.subjects["agent/example/worker"]
-            .member
-            .clone()
-            .unwrap();
-        // Stand in for another st build's hook registration.
-        if let LaunchSpec::Argv(argv) = &mut member.launch {
-            let at = argv.iter().position(|item| item == "--settings").unwrap();
-            argv[at + 1] = settings.into();
-        }
-        member
-    }
-
-    #[test]
-    fn only_what_the_author_declares_changes_a_launch() {
-        let launched = claude("{\"hooks\":{}}", "example-model");
-        // Another st build's hook settings, a new run generation's environment and a new
-        // restart policy launch the same harness.
-        let mut same = claude("{\"hooks\":{\"Stop\":[]}}", "example-model");
-        same.environment
-            .insert("ST_RUN_GENERATION".into(), "next".into());
-        same.restart = super::RestartType::Never;
-        same.one_shot = true;
-        assert!(same.launch_changes(&launched).is_empty());
-
-        assert_eq!(
-            claude("{\"hooks\":{}}", "another-model").launch_changes(&launched),
-            ["launch"]
-        );
-        let mut moved = launched.clone();
-        moved.workspace = "/elsewhere".into();
-        moved.cwd = "/elsewhere".into();
-        assert_eq!(moved.launch_changes(&launched), ["workspace"]);
-        let mut switched = launched.clone();
-        switched.driver = Some("codex".into());
-        assert_eq!(switched.launch_changes(&launched), ["harness"]);
-        let mut command = launched.clone();
-        command.launch = LaunchSpec::Shell("sleep 1".into());
-        let mut other = command.clone();
-        other.launch = LaunchSpec::Shell("sleep 2".into());
-        assert_eq!(other.launch_changes(&command), ["launch"]);
-    }
 }
 
 #[cfg(test)]

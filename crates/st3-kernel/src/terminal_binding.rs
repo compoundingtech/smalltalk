@@ -30,7 +30,7 @@ pub fn from_desired(desired: &Value) -> Result<Option<TerminalBinding>, St3Error
     }))
 }
 
-pub(crate) fn validate_declaration(
+pub fn validate_declaration(
     desired: &DesiredSubject,
     actor: Option<&str>,
 ) -> Result<(), St3Error> {
@@ -80,7 +80,7 @@ pub(crate) fn validate_declaration(
     Ok(())
 }
 
-pub(crate) fn validate_claim(
+pub fn validate_claim(
     kind: &str,
     body: &Value,
     actor: Option<&str>,
@@ -99,34 +99,3 @@ pub(crate) fn validate_claim(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durable_binding_claims_require_the_terminal_owners_actor_on_every_admission_path() {
-        let intent = crate::parse_intent(
-            "version 2\nagent \"example/bound\" { harness \"claude\" {}; bind-terminal \"pty/person/avery/019a0000-0000-7000-8000-000000000001\" incarnation=\"shell:created\" id=\"019a0000-0000-7000-8000-000000000002\"; }",
-            "orchid",
-        ).unwrap();
-        let body = serde_json::to_value(&intent.subjects["agent/example/bound"]).unwrap();
-        validate_claim("intent.desired", &body, Some("person/avery")).unwrap();
-        for actor in [None, Some("person/intruder"), Some("agent/example/worker")] {
-            assert_eq!(
-                validate_claim("intent.desired", &body, actor)
-                    .unwrap_err()
-                    .code,
-                "terminal-owner-forbidden"
-            );
-        }
-        let mut forged = body.clone();
-        forged["member"]["terminal_binding"]["subject"] =
-            Value::String("pty/person/intruder/019a0000-0000-7000-8000-000000000001".into());
-        assert_eq!(
-            validate_claim("intent.desired", &forged, Some("person/avery"))
-                .unwrap_err()
-                .code,
-            "invalid-terminal-binding"
-        );
-    }
-}

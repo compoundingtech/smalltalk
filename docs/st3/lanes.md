@@ -134,7 +134,7 @@ observers and schedules.
 
 ## Tests
 
-- `crates/st3-daemon/src/lane.rs` unit tests cover the replay: join order, rejoin, moves in every
+- `crates/st3-kernel/src/lane.rs` unit tests cover the replay: join order, rejoin, moves in every
   placement, and marks and approvals that belong to one membership.
 - `crates/st3/tests/client_v0_cli.rs` declares a lane, lets the reconciler write it for a run, and
   drives it through the CLI: join by prefix, a harness joining as its own seat, show, move, mark,

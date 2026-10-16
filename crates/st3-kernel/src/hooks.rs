@@ -17,10 +17,10 @@ use sha2::{Digest as _, Sha256};
 /// Each file in the set, by name. The pi and omp extensions belong to st's
 /// daemon channel; historical seats retain the shared driver's original assets.
 pub const FILES: [(&str, &[u8]); 4] = [
-    ("claude-observe.sh", include_bytes!("../hooks/claude-observe.sh")),
-    ("claude-statusline.sh", include_bytes!("../hooks/claude-statusline.sh")),
-    ("pi-channel.ts", include_bytes!("../hooks/pi-channel.ts")),
-    ("omp-channel.ts", include_bytes!("../hooks/omp-channel.ts")),
+    ("claude-observe.sh", include_bytes!("../../st3-daemon/hooks/claude-observe.sh")),
+    ("claude-statusline.sh", include_bytes!("../../st3-daemon/hooks/claude-statusline.sh")),
+    ("pi-channel.ts", include_bytes!("../../st3-daemon/hooks/pi-channel.ts")),
+    ("omp-channel.ts", include_bytes!("../../st3-daemon/hooks/omp-channel.ts")),
 ];
 
 /// The file that makes a directory an st3 hook set. st2 skips an `$ST_HOOKS` that holds it.
@@ -63,7 +63,7 @@ pub fn set_dir(root: &Path) -> PathBuf {
 
 /// Whether an older immutable set contains this hook. Running harnesses retain `ST_HOOKS`
 /// across binary replacement; only their already-published scripts may use retired aliases.
-pub(crate) fn older_set_contains_hook(dir: &Path, name: &str) -> bool {
+pub fn older_set_contains_hook(dir: &Path, name: &str) -> bool {
     let Ok(bytes) = fs::read(dir.join(MANIFEST)) else {
         return false;
     };
@@ -295,18 +295,6 @@ mod tests {
         assert!(verify(&first).is_err());
         assert_eq!(ensure_installed(root.path()).unwrap(), first);
         verify(&first).unwrap();
-    }
-
-    /// Claude ends a hook at its timeout, so the permission hook's timeout outlasts the wait for a
-    /// person's answer: an answer st accepts from a client always finds its hook.
-    #[test]
-    fn the_permission_hook_outlasts_the_wait_for_an_answer() {
-        let settings = claude_settings_registration();
-        let timeout_ms = settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"]
-            .as_u64()
-            .unwrap() as u128
-            * 1000;
-        assert!(timeout_ms > crate::store::CLAUDE_PROMPT_ANSWER_WAIT_MS);
     }
 
     #[test]

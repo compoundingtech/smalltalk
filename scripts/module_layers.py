@@ -16,7 +16,7 @@ import os
 import re
 import tomllib
 
-SOURCE_DIRS = ("crates/st3-core/src", "crates/st3-daemon/src", "crates/st3/src")
+SOURCE_DIRS = ("crates/st3-core/src", "crates/st3-kernel/src", "crates/st3-daemon/src", "crates/st3/src")
 ENTRY_FILES = {"lib", "main", "fixture"}
 TEST_ONLY_MODULES = {"test_support"}
 REEXPORTS = {

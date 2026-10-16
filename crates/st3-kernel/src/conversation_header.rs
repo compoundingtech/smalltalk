@@ -22,7 +22,7 @@ const TERMINAL_STATES: &[&str] = &[
 /// Derive the header fields the transcript window holds. Items may arrive in any order: "last"
 /// is by `(timestamp, sequence)`, so both a chronological page and the paged cache agree. A
 /// field is absent when the window holds nothing for it.
-pub(crate) fn derive(items: &[Value], window_truncated: bool) -> Value {
+pub fn derive(items: &[Value], window_truncated: bool) -> Value {
     let mut order = (0..items.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| {
         (
@@ -196,7 +196,7 @@ pub(crate) fn derive(items: &[Value], window_truncated: bool) -> Value {
 
 /// Overlay the live register: its fields win, with source `register`, over the derived ones.
 /// Omit the header entirely when neither source supplies a field.
-pub(crate) fn merge_register(mut derived: Value, register: Option<&Value>) -> Option<Value> {
+pub fn merge_register(mut derived: Value, register: Option<&Value>) -> Option<Value> {
     let target = derived.as_object_mut()?;
     if let Some(register) = register.and_then(Value::as_object) {
         for (name, entry) in register {
@@ -215,7 +215,7 @@ pub(crate) fn merge_register(mut derived: Value, register: Option<&Value>) -> Op
 
 /// Whether the window the items came from lost its prefix: the native fold's truncation entry,
 /// or the bounded-query notices the projected timeline adds.
-pub(crate) fn window_truncated(items: &[Value]) -> bool {
+pub fn window_truncated(items: &[Value]) -> bool {
     items.iter().any(|item| {
         item["type"] == "truncation"
             || matches!(

@@ -9,14 +9,14 @@ use anyhow::Result;
 use anyhow::{Context, anyhow, ensure};
 
 #[derive(Debug)]
-pub(crate) struct GroupMemory {
+pub struct GroupMemory {
     pub path: PathBuf,
     pub max_bytes: Option<u64>,
     pub max_events: u64,
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn service_memory() -> Result<Option<Vec<GroupMemory>>> {
+pub fn service_memory() -> Result<Option<Vec<GroupMemory>>> {
     groups(
         &std::fs::read_to_string("/proc/self/cgroup")?,
         &std::fs::read_to_string("/proc/self/mountinfo")?,
@@ -25,7 +25,7 @@ pub(crate) fn service_memory() -> Result<Option<Vec<GroupMemory>>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn service_memory() -> Result<Option<Vec<GroupMemory>>> {
+pub fn service_memory() -> Result<Option<Vec<GroupMemory>>> {
     Ok(None)
 }
 

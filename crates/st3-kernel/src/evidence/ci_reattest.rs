@@ -5,9 +5,9 @@ use sha2::{Digest, Sha256};
 
 /// Opaque links: only construction against authenticated old/new job observations is allowed.
 #[derive(Default)]
-pub(crate) struct Links(BTreeMap<String, String>);
+pub struct Links(BTreeMap<String, String>);
 
-pub(crate) fn identity(repository: &str, runner: &str) -> Result<(u64, u64, u64)> {
+pub fn identity(repository: &str, runner: &str) -> Result<(u64, u64, u64)> {
     let prefix = format!("github:{repository}/actions/runs/");
     let pieces = runner
         .strip_prefix(&prefix)
@@ -29,7 +29,7 @@ pub(crate) fn identity(repository: &str, runner: &str) -> Result<(u64, u64, u64)
     Ok((number(pieces[0])?, number(pieces[2])?, number(pieces[4])?))
 }
 
-pub(crate) fn prior(repo: &Path, repository: &str, id: &str) -> Result<Statement> {
+pub fn prior(repo: &Path, repository: &str, id: &str) -> Result<Statement> {
     let statement = show(repo, id)?;
     ensure!(
         statement.predicate.tier == TrustTier::Degraded,
@@ -50,7 +50,7 @@ pub(crate) fn prior(repo: &Path, repository: &str, id: &str) -> Result<Statement
 
 /// The transport supplies old job objects fetched through the same attempt-specific
 /// endpoint as the original observer. No old output or timestamp is accepted on faith.
-pub(crate) fn prepare(
+pub fn prepare(
     repo: &Path,
     repository: &str,
     current: &[Statement],
@@ -161,14 +161,14 @@ pub(crate) fn prepare(
 }
 
 impl Links {
-    pub(crate) fn for_runner(&self, runner: &str) -> Option<&String> {
+    pub fn for_runner(&self, runner: &str) -> Option<&String> {
         self.0.get(runner)
     }
 }
 
 /// Count only new full records. The signed note's issuance time includes observer
 /// scheduling delay, unlike the rerun's earlier CI completion timestamp.
-pub(crate) fn measurements(repo: &Path, produced: &[Produced]) -> Result<Vec<Value>> {
+pub fn measurements(repo: &Path, produced: &[Produced]) -> Result<Vec<Value>> {
     let mut samples = Vec::new();
     for result in produced
         .iter()

@@ -5,6 +5,7 @@ use super::client_blobs::{blob_error, person_reads_message, read_error};
 use super::client_v0::{ClientSession, require_scope};
 use super::*;
 use crate::peer::{ClientReadOperation, ClientReadRequest};
+use crate::message_body::BodyAttachment as _;
 
 /// The whole text of a message: its own content when it has no separate body, else the body
 /// read from its owner. This member's own file is read directly; another member's is asked for

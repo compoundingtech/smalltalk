@@ -65,7 +65,7 @@ fn state() -> &'static Mutex<State> {
 /// Load durable counters at daemon configuration, so doctor does not wait for a
 /// new request to show prior-hour reservations. A corrupt ledger stays a visible
 /// gap and refuses observer sends; startup does not erase it or stop merge paths.
-pub(crate) fn configure(path: std::path::PathBuf, limit: Option<usize>) {
+pub fn configure(path: std::path::PathBuf, limit: Option<usize>) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|time| time.as_millis())
@@ -250,7 +250,7 @@ fn admit(
 /// the shell's ST_AGENT. Unscoped calls are visible but not capped here: comments
 /// and live merge gates need their own authenticated caller enrollment before
 /// their write path may be throttled. They must not inherit an observer identity.
-pub(crate) async fn before_send(
+pub async fn before_send(
     path: std::path::PathBuf,
     caller: Option<String>,
     resource: String,
@@ -310,7 +310,7 @@ pub(crate) async fn before_send(
     result
 }
 
-pub(crate) fn doctor_lines(now: u128) -> Vec<crate::model::DoctorCheck> {
+pub fn doctor_lines(now: u128) -> Vec<crate::model::DoctorCheck> {
     // Doctor must not wait for the journal writer's disk sync.
     let Ok(held) = state().try_lock() else {
         return vec![crate::model::DoctorCheck {
