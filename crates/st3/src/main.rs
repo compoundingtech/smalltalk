@@ -1,3 +1,8 @@
+#[cfg(test)]
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use st3::cli_output;
 use st3::{cli_print as print, cli_println as println};
 
@@ -68,6 +73,7 @@ mod doctor_cli;
 #[cfg(test)]
 mod follow_tests;
 mod presentation;
+mod actor_contract;
 
 use presentation::{
     OutputStyle, follow_snapshot, glance, mission_run_signature, relative_time,
@@ -117,6 +123,12 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print the generated, versioned CLI actor contract without contacting a daemon.
+    ActorContract {
+        /// Also print the effective instance, config path and state directory.
+        #[arg(long)]
+        effective: bool,
+    },
     /// Configure this machine and start st, with flags for unattended setup.
     Setup(crate::setup::SetupArgs),
     /// Open the terminal interface: spaces, conversations, Home and agent terminals.
@@ -5375,6 +5387,15 @@ fn cli_main() -> ExitCode {
         Err(error) => exit_usage_error(error),
     };
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
+    if let Command::ActorContract { effective } = &cli.command {
+        return match actor_contract::print(*effective) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("st actor-contract: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // Root runs tiles. Entering one makes namespaces, which needs this process single-threaded,
     // so it runs before any runtime or thread starts.
     if let Command::Tiles(args) = cli.command {
@@ -5856,6 +5877,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
+        Command::ActorContract { .. } => unreachable!("the actor contract runs before the CLI runtime"),
         Command::Setup(_) => unreachable!(),
         Command::Apply(args) => run_apply(&client, args, cli.json).await,
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,

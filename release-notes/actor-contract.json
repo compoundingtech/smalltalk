@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Publish the CLI actor syntax as a generated, versioned contract and report effective instance and state directory on request.",
+  "replay": {"status": "none", "detail": "No claim replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No authority rule or command behavior change."},
+  "compatibility": {"status": "changed", "detail": "Adds st actor-contract --json and optional --effective output. Static mode reads no config and contacts no daemon. Effective output exposes only selected instance, default config_path and resolved state_dir metadata, not config values; config_path is always Config::default_path(), not evidence of an actual custom config file loaded. Existing CLI commands, config resolution, wire APIs and actor defaults are unchanged. The new syntax contract does not grant person authority. Version-policy proposal, pending Intake/Nathan approval in PR #3061 comment 6207525882: additive optional metadata and additional command/alias entries retain kind st3.actor-contract.v1 and numeric version 1; classification changes alter content and its digest, not automatically the format version. Removed/renamed required fields, changed types, or reader-breaking field/enum interpretation changes bump kind suffix and numeric version together. Classification-value and enum additions remain an open compatibility question; no approved guarantee or unsupported-version rejection behavior is claimed."},
+  "downtime": {"status": "none", "detail": "No service interruption required."},
+  "manual": {"status": "none", "detail": "Operators may read the new contract instead of maintaining a command list. Operator policy and authority checks remain in place."},
+  "recovery": {"status": "none", "detail": "No runtime recovery change."}
+}

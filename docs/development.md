@@ -10,6 +10,73 @@ For st3 claims, missions, replication, runtime ownership, or recovery, start wit
 [documentation index](st3/README.md). For st2 lifecycle, messaging, teardown, or presence,
 read and preserve the proofs in [st2 invariants](st2/invariants.md).
 
+## CLI actor contract
+
+`st actor-contract --json` prints the actor syntax of the binary that runs it. It
+does not read config or call a daemon. The versioned `contract` has one entry for
+each callable clap command path, including hidden commands and optional parent
+commands. `aliases` lists other names under each canonical command. `contract_sha256` is
+the SHA-256 of compact JSON for `contract`, not of the formatted output. The
+printer computes this digest; the checked-in snapshot omits it and the equality
+test compares the contract body. The printed `actor_semantics` reminder comes
+first: actor: none means no --as syntax.
+
+Version-policy proposal (pending Intake/Nathan approval in
+[#3061 comment 6207525882](https://github.com/compoundingtech/smalltalk/pull/3061#issuecomment-6207525882)):
+retain `kind: st3.actor-contract.v1` and numeric `version: 1` for additive optional
+metadata and additional command/alias entries. The digest identifies exact
+per-binary content; a command's classification changing is a content change,
+not automatically a format-version change. Bump the kind suffix and numeric
+version together for removed or renamed required fields, changed field types,
+or changed field/enum interpretation that breaks readers. Compatibility of
+classification-value and enum additions is still an explicit open question.
+This proposal is not an approved compatibility guarantee and does not claim
+that readers implement unsupported-version rejection.
+
+`actor` means whether argv accepts `--as`: `none`, `optional`, or `required`.
+`actor_environment` names an environment default, if one exists. `accepts_person`
+means the real argument value parser accepts `person/NAME`; it does not grant
+person authority. An optional flag can still need an actor from config or the
+environment at run time. A command with no flag can still use a configured
+identity. `can_carry_person` records whether a command can carry a person actor,
+including configured-person fallbacks and the separate `note --actor` option.
+This does not mean an agent may use that person: identity guards and daemon
+authorization still apply. `as_role` distinguishes an actor from the document
+name in `documents put --as` and the ignored compatibility flags on reads.
+`ignores_actor` identifies those ignored flags. Do not use this contract as an
+authorization decision.
+
+Add `--effective` to include only the selected `instance`, `config_path` and
+`state_dir` metadata; no config values are printed. Instance activation and the
+existing config loader determine the state directory. **`config_path` always
+reports `Config::default_path()` for the selected instance, not the actual path
+of a custom config file.** Do not use it as evidence of which file was loaded.
+These fields are outside the hashed contract and can differ between calls.
+Without `--effective`, static mode reads no config (even an invalid config is
+irrelevant) and does not contact a daemon.
+
+After a deliberate CLI change, review the changed actor entries and regenerate
+the checked-in contract:
+
+```sh
+st actor-contract --json | jq 'del(.contract_sha256)' > docs/st3/actor-contract.json
+cargo nextest run -p st3 -E 'test(actor_contract)'
+```
+
+Use the binary built from the changed source. Resolve any rebase conflict in
+`docs/st3/actor-contract.json` by running that regeneration command, never by
+hand-merging the JSON. The snapshot test fails if a
+command is added or removed, if its actor parser changes the published fields, or
+if an alias changes. Supplement coverage also compares the reviewed setup/UI,
+note and changes paths, including every descendant, against the real clap
+inventory. Additions or removals require reviewing the identity handlers named
+beside `implicit_person`; mutation tests exercise added setup/UI descendants and
+a removed UI descendant. `st ui open` resolves the configured person before
+queueing a request in that person's terminal UI request directory.
+This is freshness coverage, not proof of live runtime fallback or authority.
+Host, account, repository and harness policy remains in the
+operator layer. Person-authority enforcement is a separate daemon change.
+
 ## Build from source
 
 From a checkout, install with Nix:
