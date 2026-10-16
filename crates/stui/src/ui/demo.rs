@@ -884,6 +884,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: Some(s(ATLAS_KDL)),
             outcome: None,
             updated_at: String::new(),
+            state: String::new(),
             step_metadata: Default::default(),
         },
         Mission {
@@ -919,6 +920,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            state: String::new(),
             step_metadata: Default::default(),
         },
         Mission {
@@ -962,6 +964,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            state: String::new(),
             step_metadata: Default::default(),
         },
         Mission {
@@ -997,6 +1000,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            state: String::new(),
             step_metadata: Default::default(),
         },
         Mission {
@@ -1042,6 +1046,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            state: String::new(),
             step_metadata: Default::default(),
         },
         Mission {
@@ -1069,6 +1074,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            state: String::new(),
             step_metadata: Default::default(),
         },
         Mission {
@@ -1104,6 +1110,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            state: String::new(),
             step_metadata: Default::default(),
         },
     ]

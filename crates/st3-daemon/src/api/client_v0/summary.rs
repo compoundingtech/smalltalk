@@ -2,7 +2,6 @@
 //! one snapshot; the contract stays the same when the shared IVM source takes over.
 use super::*;
 use crate::store::summary_list::{SummaryInputs, SummaryMachines, SummaryShared};
-use st3_ui_model::missions::Display;
 
 #[derive(Debug)]
 struct RosterNotPublished;
@@ -23,8 +22,8 @@ pub(super) fn working(agent: &Value) -> bool {
 }
 /// A mission that is really running or about to: stuck, paused and finished runs, and ones that
 /// only wait on a person, are counted elsewhere.
-pub(super) fn active(mission: &st3_ui_model::missions::Mission) -> bool {
-    !mission.system && mission.word.is_active()
+pub(super) fn active(mission: &st3_client::Mission) -> bool {
+    !mission.system && st3_ui_model::missions::row_word(mission, &[]).is_active()
 }
 
 pub(super) fn native(
@@ -62,23 +61,11 @@ fn shared(
     let store = &state.store;
     let compute = || {
         let (missions, deadline) = store.client_summary_missions(now)?;
-        let semantics = st3_ui_model::missions::adapt(
-            missions.iter(),
-            std::iter::empty(),
-            std::iter::empty(),
-            "",
-            &Display {
-                mission_label: &|m| m.header.id.clone(),
-                agent_label: &|a| a.name.clone(),
-                age_label: &|_, _| String::new(),
-                clean_text: &str::to_owned,
-            },
-        );
         Ok((
             vec![
-                json!({"evaluated_at":now.to_string(),"valid_until":deadline.map(|d| d.to_string()),"missions":semantics
-                .into_iter()
-                .map(|m| json!({"id":m.id,"system":m.system,"active":active(&m)}))
+                json!({"evaluated_at":now.to_string(),"valid_until":deadline.map(|d| d.to_string()),"missions":missions
+                .iter()
+                .map(|m| json!({"id":m.header.id,"system":m.system,"active":active(m)}))
                 .collect::<Vec<_>>()}),
             ],
             false,
