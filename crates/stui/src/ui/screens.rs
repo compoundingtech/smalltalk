@@ -169,7 +169,16 @@ pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
         AttentionKind::Fault { .. } => ("✕", theme::FAULT),
         AttentionKind::Message { .. } => ("✉", theme::SAPPHIRE),
         AttentionKind::Update { .. } => ("✦", theme::GREEN),
+        AttentionKind::Unplaced { .. } => ("?", theme::OVERLAY1),
     }
+}
+
+/// The answer an unplaced card offers: the one st lists for the row (a custom reply, else a
+/// request's), or none.
+pub(super) fn unplaced_answer(actions: &[String]) -> Option<&'static str> {
+    ["custom.reply", "work.done"]
+        .into_iter()
+        .find(|answer| actions.iter().any(|action| action == answer))
 }
 
 fn harness_color(harness: Harness) -> Color {
@@ -1363,6 +1372,30 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 ),
                 inner,
             );
+        }
+        AttentionKind::Unplaced { text: body, why, .. } => {
+            card.lines(text::markdown(body, inner, theme::text()));
+            card.blank();
+            card.wrap(&text::inline(why, theme::dim()), inner);
+            // Only the answers st lists for the row: a request's answer, never one guessed from
+            // its kind, so a gate here is answered with st.
+            if let Some(answer) = unplaced_answer(&item.actions) {
+                card.blank();
+                if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
+                    text_box(&mut card, "answer", drafts, "", inner);
+                    card.buttons(&[
+                        ("enter", "Send the answer", Hit::Enter, theme::ACCENT),
+                        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+                    ]);
+                } else {
+                    let label = if answer == "custom.reply" {
+                        "Reply with fields"
+                    } else {
+                        "Answer"
+                    };
+                    card.buttons(&[("c", label, Hit::Key('c'), theme::ACCENT)]);
+                }
+            }
         }
         AttentionKind::Message { from, body } => {
             card.line(Line::from(vec![

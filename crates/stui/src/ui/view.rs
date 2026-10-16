@@ -262,6 +262,14 @@ pub enum AttentionKind {
         /// a recommendation. Absent on a free-text ask.
         structured: Option<Box<st3_client::StructuredRequest>>,
     },
+    /// A row st did not place in a way this client knows: an older st presents nothing, and a
+    /// newer one may name a group or card this client does not know. It shows st's text and
+    /// why, keeps st's alert flag, and offers no answer of its own.
+    Unplaced {
+        text: String,
+        why: String,
+        alert: bool,
+    },
     /// Information the person asked an agent for (`st work update`): it asks nothing, and it
     /// clears once they read it.
     Update {
@@ -277,7 +285,11 @@ pub enum AttentionKind {
 impl AttentionKind {
     /// Whether a card of this kind blocks or waits on the person.
     pub fn is_alert(&self) -> bool {
-        !matches!(self, AttentionKind::Update { .. } | AttentionKind::Message { .. })
+        match self {
+            AttentionKind::Update { .. } | AttentionKind::Message { .. } => false,
+            AttentionKind::Unplaced { alert, .. } => *alert,
+            _ => true,
+        }
     }
 
     pub fn word(&self) -> &'static str {
@@ -292,6 +304,7 @@ impl AttentionKind {
             AttentionKind::Login { .. } => "login",
             AttentionKind::Request { .. } => "request",
             AttentionKind::Update { .. } => "update",
+            AttentionKind::Unplaced { .. } => "unplaced",
         }
     }
 }

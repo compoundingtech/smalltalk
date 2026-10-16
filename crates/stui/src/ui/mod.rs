@@ -4951,6 +4951,19 @@ impl Ui {
                         "review" | "feedback" | "launch" | "message" | "revision" | "request",
                         'c',
                     ) => self.editing = true,
+                    // An unplaced row answers only as st lists for it.
+                    ("unplaced", 'c') => {
+                        if self
+                            .current_item()
+                            .is_some_and(|item| screens::unplaced_answer(&item.actions).is_some())
+                        {
+                            self.editing = true;
+                        } else {
+                            self.flash(
+                                "st does not say how to answer this here: answer it with st alerts",
+                            );
+                        }
+                    }
                     ("review" | "feedback" | "launch" | "revision", 'a') => {
                         self.confirm = Some('a')
                     }
@@ -5528,6 +5541,16 @@ impl Ui {
                         to: from,
                         text: draft,
                     }),
+                    // An unplaced card answers only as st lists for the row.
+                    Some(AttentionKind::Unplaced { .. }) => self
+                        .current_item()
+                        .and_then(|item| screens::unplaced_answer(&item.actions))
+                        .map(|answer| Effect::Attention {
+                            id: id.clone(),
+                            action: answer.into(),
+                            reason: Some(draft),
+                            answer: None,
+                        }),
                     Some(AttentionKind::Revision { .. }) => self
                         .current_item()
                         .and_then(|item| {
@@ -7486,6 +7509,8 @@ mod tests {
                 "review_mode": mode, "title": "Review the draft", "detail": "Ready to ship?",
                 "priority": "normal", "state": "open", "requested_at": "2026-10-03T08:00:00Z",
                 "actions": ["review.approve", back],
+                "presentation": {"tier": "stopped", "kind": if mode == "feedback" { "feedback" } else { "review" },
+                    "agent": null, "raised_by": null, "waiting": null},
             }))
             .unwrap()
         };
@@ -7537,6 +7562,69 @@ mod tests {
             );
             ui.effects.clear();
         }
+    }
+
+    /// On an st that presents nothing, an ask still answers from its card with the answer st
+    /// lists for it, and a gate offers none of a request's: it is answered with st.
+    #[test]
+    fn an_unplaced_row_answers_only_as_st_lists_for_it() {
+        let row = |id: &str, kind: &str, actions: serde_json::Value| {
+            serde_json::from_value(serde_json::json!({
+                "kind": "attention", "id": id, "revision": "one",
+                "updated_at": "2026-10-16T08:00:00Z", "attention_kind": kind,
+                "source_id": format!("step-run/example/{kind}"), "person_id": "person/avery",
+                "title": "Online proof", "detail": "Reply when done.", "priority": "normal",
+                "state": "open", "requested_at": "2026-10-16T08:00:00Z", "actions": actions,
+                "alert": true,
+            }))
+            .unwrap()
+        };
+        let mut model = crate::model::Model::default();
+        model.actor = "person/avery".into();
+        model.now = crate::model::Collection {
+            items: vec![
+                row("attention/ask", "person-step", serde_json::json!(["work.done"])),
+                row(
+                    "attention/gate",
+                    "human-gate",
+                    serde_json::json!(["review.approve", "review.reject"]),
+                ),
+            ],
+            snapshot: Some(st3_client::Snapshot {
+                id: "snapshot/example-host/1/0".into(),
+                host_id: "host/example-host".into(),
+                store_index: 1,
+                projection_version: "1".into(),
+                created_at: "2026-10-16T08:00:00Z".into(),
+            }),
+            truncated: false,
+            sync: None,
+        };
+        let mut ui = Ui::new(adapt::world(&model, "person/avery", &adapt::Extras::default()));
+        ui.live = true;
+        ui.tab = 0;
+        let select = |ui: &mut Ui, id: &str| {
+            let at = ui.listing(60).ids.iter().position(|listed| listed == id).expect("listed");
+            ui.selected[0] = at;
+        };
+        select(&mut ui, "attention/ask");
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        for letter in "Done.".chars() {
+            ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+        }
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, reason: Some(reason), .. }]
+                if id == "attention/ask" && action == "work.done" && reason == "Done."),
+            "{:?}",
+            ui.effects
+        );
+        ui.effects.clear();
+        ui.editing = false;
+        select(&mut ui, "attention/gate");
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!ui.editing, "a gate offers no request's answer");
+        assert!(ui.effects.is_empty());
     }
 
     #[test]
