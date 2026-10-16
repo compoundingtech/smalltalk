@@ -10,7 +10,6 @@
 pub mod cli;
 #[cfg(target_os = "linux")]
 pub mod launch;
-pub mod registry;
 #[cfg(target_os = "linux")]
 pub mod seccomp;
 #[cfg(target_os = "linux")]

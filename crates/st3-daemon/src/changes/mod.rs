@@ -2,7 +2,7 @@
 //! cooperative scheduling data, not signed gate evidence or permission to move main.
 
 pub mod transport;
-pub mod config;
+pub use crate::config::changes as config;
 pub mod service;
 pub mod discovery;
 pub mod view;

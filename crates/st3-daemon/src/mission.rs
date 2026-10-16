@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use crate::declaration_syntax::*;
 use crate::model::{
     BaselineSpec, CompletionSpec, DependencySpec, GateSpec, LoopAttentionSpec, LoopExhaustionSpec,
     LoopSpec, LoopStopSpec, MetricSource, MetricSpec, MissionInputKind, MissionInputSpec,
@@ -12,41 +13,10 @@ use crate::model::{
     UsedMissionSpec, WorkSelector,
 };
 
-const VARIABLES: &[&str] = &[
-    "ST_MISSION",
-    "ST_MISSION_REVISION",
-    "ST_MISSION_RUN",
-    "ST_RUN_GENERATION",
-    "ST_ROOT_MISSION_RUN",
-    "ST_ROOT_MISSION_RUN_ID",
-    "ST_WORKSPACE",
-    "ST_REQUESTER",
-    "ST_STEP",
-    "ST_STEP_RUN",
-    "ST_ATTEMPT",
-    "ST_ASSIGNEE",
-    "ST_PARENT_STEP_RUN",
-    "ST_GATE",
-    "ST_AGENT",
-    "ST_LOOP_ROUND",
-    "ST_LOOP_FEEDBACK",
-    "ST_LOOP_ITEM_ID",
-    "ST_CANDIDATE_INDEX",
-    "loop.round",
-    "loop.feedback",
-    "loop.item.id",
-    "candidate.index",
-    "PATH",
-];
-
 pub(crate) const LOOP_ROUND_INPUT: &str = "__st3_loop_round";
 pub(crate) const LOOP_FEEDBACK_INPUT: &str = "__st3_loop_feedback";
 pub(crate) const LOOP_ITEM_INPUT: &str = "__st3_loop_item";
 pub(crate) const CANDIDATE_INDEX_INPUT: &str = "__st3_candidate_index";
-
-pub(crate) fn is_reserved_context_name(name: &str) -> bool {
-    (VARIABLES.contains(&name) && name != "PATH") || name == "ST3_SUBJECT"
-}
 
 pub(crate) fn validate_mission_id(value: &str) -> Result<(), St3Error> {
     validate_id(value, "mission")
@@ -410,14 +380,14 @@ fn parse_mission(
                 ));
             }
             "gate" => {
-                let gate = crate::graph::parse_gate(child, default_host)?;
+                let gate = crate::gate_parse::parse_gate(child, default_host)?;
                 require_approve_mode_outside_step(&gate)?;
-                if !gate_names.insert(crate::graph::gate_name(&gate).to_owned()) {
+                if !gate_names.insert(crate::gate_parse::gate_name(&gate).to_owned()) {
                     return Err(St3Error::new(
                         "duplicate-gate",
                         format!(
                             "mission `{id}` repeats gate `{}`",
-                            crate::graph::gate_name(&gate)
+                            crate::gate_parse::gate_name(&gate)
                         ),
                     ));
                 }
@@ -510,8 +480,8 @@ fn parse_mission(
                     format!("mission `{id}` cannot own an account"),
                 ));
             }
-            name if crate::graph::is_mission_declaration(name) => {
-                crate::graph::validate_deferred_declaration(child)?;
+            name if is_mission_declaration(name) => {
+                validate_deferred_declaration(child)?;
                 let child = take_agent_constraints(child, default_host, &mut agent_constraints)?;
                 let mut declaration = KdlDocument::new();
                 declaration.nodes_mut().push(child.clone());
@@ -675,7 +645,7 @@ fn parse_loop_group(
         if let MetricSource::Gate { gate } = &metric.source
             && !until
                 .iter()
-                .any(|candidate| crate::graph::gate_name(candidate) == gate)
+                .any(|candidate| crate::gate_parse::gate_name(candidate) == gate)
         {
             return Err(St3Error::new(
                 "unknown-metric-gate",
@@ -960,9 +930,9 @@ fn parse_until(node: &KdlNode, default_host: &str) -> Result<Vec<GateSpec>, St3E
                     "until accepts only gate blocks",
                 ));
             }
-            let gate = crate::graph::parse_gate(child, default_host)?;
+            let gate = crate::gate_parse::parse_gate(child, default_host)?;
             require_approve_mode_outside_step(&gate)?;
-            if !names.insert(crate::graph::gate_name(&gate).to_owned()) {
+            if !names.insert(crate::gate_parse::gate_name(&gate).to_owned()) {
                 return Err(St3Error::new("duplicate-gate", "an until gate repeats"));
             }
             Ok(gate)
@@ -1169,7 +1139,7 @@ fn parse_loop_exhaustion(
             ensure_bare(child)?;
             LoopExhaustionSpec::Succeed
         }
-        "gate" => match crate::graph::parse_gate(child, default_host)? {
+        "gate" => match crate::gate_parse::parse_gate(child, default_host)? {
             gate @ GateSpec::Human { .. } => {
                 require_approve_mode_outside_step(&gate)?;
                 LoopExhaustionSpec::Human { gate }
@@ -1337,7 +1307,7 @@ fn parse_step(
                     | "depends-on"
                     | "document"
                     | "available-to"
-            ) && !crate::graph::is_mission_declaration(name)
+            ) && !is_mission_declaration(name)
                 && !names.insert(name.to_owned())
             {
                 return Err(St3Error::new(
@@ -1400,8 +1370,8 @@ fn parse_step(
                         format!("step `{path}` cannot declare a lane; declare it on the mission"),
                     ));
                 }
-                name if crate::graph::is_mission_declaration(name) => {
-                    crate::graph::validate_deferred_declaration(child)?;
+                name if is_mission_declaration(name) => {
+                    validate_deferred_declaration(child)?;
                     let child =
                         take_agent_constraints(child, default_host, &mut agent_constraints)?;
                     let mut declaration = KdlDocument::new();
@@ -1416,19 +1386,19 @@ fn parse_step(
                 "uses-mission" => uses_mission = Some(parse_used_mission(child)?),
                 "after-run" => after_run = Some(parse_after_run(child)?),
                 "gate" => {
-                    let gate = crate::graph::parse_gate(child, default_host)?;
+                    let gate = crate::gate_parse::parse_gate(child, default_host)?;
                     if matches!(gate, GateSpec::Deadline { .. }) {
                         return Err(St3Error::new(
                             "invalid-mission-deadline",
                             format!("step `{path}` must use its timeout property"),
                         ));
                     }
-                    if !gate_names.insert(crate::graph::gate_name(&gate).to_owned()) {
+                    if !gate_names.insert(crate::gate_parse::gate_name(&gate).to_owned()) {
                         return Err(St3Error::new(
                             "duplicate-gate",
                             format!(
                                 "step `{path}` repeats gate `{}`",
-                                crate::graph::gate_name(&gate)
+                                crate::gate_parse::gate_name(&gate)
                             ),
                         ));
                     }
@@ -1951,7 +1921,7 @@ fn parse_baseline(node: &KdlNode) -> Result<BaselineSpec, St3Error> {
         } else {
             format!("{name}/{}", index + 1)
         };
-        let gate = crate::graph::parse_baseline_gate(predicate, gate_name)?;
+        let gate = crate::gate_parse::parse_baseline_gate(predicate, gate_name)?;
         if matches!(
             gate,
             GateSpec::Deadline { .. }
@@ -2051,7 +2021,7 @@ fn parse_dependencies(
                     state,
                 });
             } else {
-                let parsed = crate::graph::parse_baseline_gate(
+                let parsed = crate::gate_parse::parse_baseline_gate(
                     child,
                     format!("dependency/{}", output.len() + 1),
                 )?;
@@ -2978,6 +2948,54 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
             .ok_or_else(|| St3Error::new("invalid-number", "a float must be finite")),
         KdlValue::Null => Ok(Value::Null),
     }
+}
+
+pub(crate) fn is_mission_declaration(name: &str) -> bool {
+    matches!(
+        name,
+        "agent"
+            | "exec"
+            | "pty"
+            | "host"
+            | "doc"
+            | "resource"
+            | "lane"
+            | "observer"
+            | "subscription"
+            | "person"
+            | "message"
+            | "schedule"
+            | "stop"
+    )
+}
+
+pub(crate) fn validate_deferred_declaration(node: &KdlNode) -> Result<(), St3Error> {
+    validate_deferred_declaration_in(node, None)
+}
+
+/// `parent` is the enclosing node's name. An `account "NAME"` inside a harness block names an
+/// account a root declaration owns, the same reference a top-level seat makes, so a mission's agent
+/// may carry it; an `account` that declares one must stay at the root.
+fn validate_deferred_declaration_in(node: &KdlNode, parent: Option<&str>) -> Result<(), St3Error> {
+    if node.name().value() == "account" && parent != Some("harness") {
+        return Err(St3Error::new(
+            "account-inside-mission",
+            "an account declaration must be at the root",
+        ));
+    }
+    if node.name().value() == "env" {
+        validate_string_map(node, true)?;
+    }
+    // A lane has no run-time values, so a bad prefix or approver fails at publish, not at start.
+    if node.name().value() == "lane" {
+        return validate_lane(node);
+    }
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            validate_deferred_declaration_in(child, Some(node.name().value()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

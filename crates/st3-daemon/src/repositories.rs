@@ -2,7 +2,6 @@
 use anyhow::Result;
 use st3_client::{AgentRepository, HostRepositories};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 
 /// A graph-only read: paths belong to the selected host, even through another member.
 pub fn host_repositories(store: &crate::store::Store, host: &str) -> Result<HostRepositories> {
@@ -46,32 +45,7 @@ pub fn host_repositories(store: &crate::store::Store, host: &str) -> Result<Host
     })
 }
 
-/// Read Git's directory pointers on the owning host during reconciliation. Checks only the
-/// declared workspace and its ancestors, with no search through other host directories.
-pub(crate) fn workspace_repository(workspace: &Path) -> Option<PathBuf> {
-    let workspace = std::fs::canonicalize(workspace).ok()?;
-    for root in workspace.ancestors() {
-        let dot_git = root.join(".git");
-        if dot_git.is_dir() {
-            return Some(root.to_path_buf());
-        }
-        if dot_git.is_file() {
-            let pointer = std::fs::read_to_string(dot_git).ok()?;
-            let git_dir = root.join(pointer.strip_prefix("gitdir:")?.trim());
-            if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
-                let common = std::fs::canonicalize(git_dir.join(common.trim())).ok()?;
-                return Some(if common.file_name().is_some_and(|name| name == ".git") {
-                    common.parent()?.to_path_buf()
-                } else {
-                    // Bare repositories keep their shared Git directory at the repository root.
-                    common
-                });
-            }
-            return Some(root.to_path_buf());
-        }
-    }
-    None
-}
+pub(crate) use crate::checkout::workspace_repository;
 
 #[cfg(test)]
 mod tests {

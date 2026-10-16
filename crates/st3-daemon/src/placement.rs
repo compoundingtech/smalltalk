@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-pub const SOURCE_OFFLINE_KIND: &str = "agent.placement.source-offline";
+pub use crate::model::{PLACEMENT_SOURCE_OFFLINE_KIND as SOURCE_OFFLINE_KIND, PlacementFence as Fence};
 
 #[derive(Deserialize)]
 pub struct SourceOfflineRequest {
@@ -140,13 +140,6 @@ pub fn acknowledges(store: &Store, claim: &ClaimRecord, tokens: &BTreeSet<String
     Ok(false)
 }
 
-/// The former owners and declarations which can acknowledge their latest departure.
-/// Walk causal predecessors, never receiver-local indexes or receipt timestamps.
-pub struct Fence {
-    pub token: String,
-    pub destination: String,
-    pub sources: BTreeMap<String, BTreeSet<String>>,
-}
 pub fn fence(store: &Store, subject: &str, token: &str) -> Result<Option<Arc<Fence>>> {
     smallclaims::touched::note_read(|| subject.to_owned());
     store.cached_placement_fence(token, || build_fence(store, subject, token))

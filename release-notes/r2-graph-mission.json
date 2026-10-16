@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Split declaration KDL parsing so mission no longer names graph: the shared argument and validation helpers move to declaration_syntax and gate parsing to gate_parse; the module layer check now skips string literals and nested comments when it drops test code; the module allowlist shrinks from 6 to 5 pairs",
+  "replay": {"status": "none", "detail": "Parsing functions move between modules with the same bodies. Intents and missions parse to the same values, with the same errors."},
+  "schema": {"status": "none", "detail": "No database schema, schema version or migration changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and fleet coordination are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, protocol, route, CLI output or exit code changes; graph::parse_duration stays at its path through a re-export."},
+  "downtime": {"status": "none", "detail": "Nothing to restart beyond a normal upgrade."},
+  "manual": {"status": "none", "detail": "No operator steps."},
+  "recovery": {"status": "none", "detail": "Revert the pull request."}
+}
