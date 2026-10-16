@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Compose driver backoff with the landed native renewal work view.",
+  "replay": {
+    "status": "none",
+    "detail": "Integration preserves main\u2019s landed renewal-view request and StepRunView held-claim predicate. The backoff lease selector uses that same predicate; no additional schema, index, authority, lease, request deadline or recovery policy change is introduced by this composition."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Integration preserves main\u2019s landed renewal-view request and StepRunView held-claim predicate. The backoff lease selector uses that same predicate; no additional schema, index, authority, lease, request deadline or recovery policy change is introduced by this composition."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Integration preserves main\u2019s landed renewal-view request and StepRunView held-claim predicate. The backoff lease selector uses that same predicate; no additional schema, index, authority, lease, request deadline or recovery policy change is introduced by this composition."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Integration preserves main\u2019s landed renewal-view request and StepRunView held-claim predicate. The backoff lease selector uses that same predicate; no additional schema, index, authority, lease, request deadline or recovery policy change is introduced by this composition."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Integration preserves main\u2019s landed renewal-view request and StepRunView held-claim predicate. The backoff lease selector uses that same predicate; no additional schema, index, authority, lease, request deadline or recovery policy change is introduced by this composition."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Integration preserves main\u2019s landed renewal-view request and StepRunView held-claim predicate. The backoff lease selector uses that same predicate; no additional schema, index, authority, lease, request deadline or recovery policy change is introduced by this composition."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Integration preserves main\u2019s landed renewal-view request and StepRunView held-claim predicate. The backoff lease selector uses that same predicate; no additional schema, index, authority, lease, request deadline or recovery policy change is introduced by this composition."
+  }
+}

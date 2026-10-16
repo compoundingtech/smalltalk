@@ -84,6 +84,49 @@ each incarnation once and writes only when it sends, so a settled fleet costs no
 A session that continues the earlier conversation receives the message too. It says so: such a
 session already knows what it describes.
 
+## Driver retries during a daemon outage
+
+The native driver keeps the provider alive when the daemon cannot answer. Mailbox binding,
+mailbox opening, startup calls, periodic control reports and work renewal keep separate retry
+state. Repeated failures use base waits of 1, 2, 4, 8, 16 and then 30 seconds. The random share
+is between half and one and a half of the base, with a hard 30-second cap. The first successful
+operation clears its failure count. A valid mailbox frame counts as a successful reconnect,
+not just opening a socket.
+
+Mailbox transport establishment means `Client::open_mailbox` returned after the WebSocket HTTP 101
+upgrade, before any application frame. Open and handshake failures use the exponential curve;
+after an accepted upgrade, report-write errors, EOF and stream errors retain the original fixed
+one-second base with 0.5–1.5-second jitter. The upgrade does not reset the open-failure count:
+after two open failures, an upgraded stream that fails before a decoded frame leaves the next
+open failure at base four seconds. Reading a decoded application frame resets it, making the
+next open failure start at base one. A server that accepts the upgrade and then drops every
+connection is therefore retried at the fixed jittered one-second cadence forever, as before
+this change. The exponential policy does not protect or repair that case.
+
+A refused connection or a missing socket stays at the one-second restart base instead of
+growing. Its random wait is 0.5 to 1 second, so the retry wait itself does not delay discovery
+of a restarted daemon by more than one second. Request execution time is separate from this wait.
+The native session report, binding watch and harness publications inside the gated control tick
+back off together. After repeated failures, the whole block can wait up to 30 seconds plus request
+time. Delivery-control work and Claude attachment checks outside that block keep their cadence,
+as does provider-completion handling. This is deliberate degradation while the daemon is slow;
+settle gating of these ticks is a separate change. A fast typed API refusal from a live daemon
+also grows that operation's failure count, just as a timeout does; it is not a refused socket.
+A caller's existing terminal-refusal handling still applies before another attempt is scheduled.
+Work renewal has its own retry state; control-report success cannot clear a failed renewal's
+backoff. Renewal writes keep their
+existing per-step, per-actor, per-minute idempotency keys. Warning logs remain rate limited.
+Each known held-work lease also caps the retry wait at half of its remaining margin. A retry
+keeps the last known expiry if the next work read fails; an expired lease gets no 30-second wait.
+An authoritative read with no held work clears that old lease bound, so an idle driver's later
+timeout retries can grow again. A held claim with an unknown expiry does not clear it.
+The normal lease is ten minutes and renewal starts once a minute. No retry policy can preserve
+a claim through an outage longer than its lease.
+
+This reduces repeated requests when the daemon is slow; it does not fix the cause of a slow
+request. A failure may now delay an update by up to 30 seconds, plus request time. List reads,
+stream events, stored records and the provider's own retry policy do not change.
+
 ## Tests
 
 - `crates/st3/src/handoff.rs`: naming, write authority, and what the message renders.
