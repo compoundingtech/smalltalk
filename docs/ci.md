@@ -410,6 +410,19 @@ while st2 remains a member; the filters preserve execution coverage rather than 
 Matching rendered hooks are installed by a CI binary that calls the driver
 library directly, rather than by the legacy runner CLI.
 
+Outside GitHub Actions on Linux, `scripts/ci-nextest run` keeps the tests' temporary files in a
+per-run directory `/dev/shm/st-nextest.XXXXXX` (removed when the run ends) when `TMPDIR` is unset,
+`/tmp` or `/var/tmp` and `/dev/shm` has 4 GiB free. The file-backed SQLite stores sync every WAL
+commit, and that wait is most of the wall time of the tests that use them (the st3 library set
+measured 251 s on tmpfs against 407 s on disk with the same CPU, about 0.5 GiB of scratch either
+way). The 4 GiB check is made at start and reserves nothing: concurrent local runs share that RAM. A run
+killed with SIGKILL leaves its directory in RAM until reboot; sweep with
+`find /dev/shm -maxdepth 1 -name 'st-nextest.*' -mmin +1440 -exec rm -rf {} +`. Set
+`ST_NEXTEST_TMPDIR=disk` to keep the disk. CI never takes this branch, so the hosted runs keep real
+disks and every test that syncs to one; a local tmpfs pass does not exercise fsync or disk behavior
+and is not evidence for those tests, and nothing a local run produces stands in for the hosted
+required checks.
+
 The old trusted fleet runner and st merge train are retired; there is no operations installation
 handoff. Namespace workflows use this script from the checkout and land through GitHub's merge
 queue. Provider fixtures, rendered hooks, workspace Clippy and the isolation archive keep their
