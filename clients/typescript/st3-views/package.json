@@ -10,6 +10,7 @@
     "./sessionView": "./sessionView.ts",
     "./homeView": "./homeView.ts",
     "./requestView": "./requestView.ts",
+    "./sidebarView": "./sidebarView.ts",
     "./deviceSigning": "./deviceSigning.ts",
     "./clientName": "./clientName.ts",
     "./time": "./time.ts",

@@ -19,6 +19,7 @@ package_view(
         "package.json": "package.json",
         "requestView.ts": "requestView.ts",
         "sessionView.ts": "sessionView.ts",
+        "sidebarView.ts": "sidebarView.ts",
         "slo.ts": "slo.ts",
         "syncNotice.ts": "syncNotice.ts",
         "time.ts": "time.ts",
