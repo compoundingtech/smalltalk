@@ -675,7 +675,7 @@ wording) gets a new card, so an action through the old one returns `stale-fence`
 nothing. A client then re-reads attention and, if a card of the same `attention_kind` for the
 same `source_id` is open, acts once more through it; it does not retry the old card. A review st
 no longer asks returns `validation-failed`, and its message says why: who already answered it
-and how, or what moved on since it was asked. The terminal UI does both on its live and classic screens.
+and how, or what moved on since it was asked. The terminal UI does both.
 
 Clients must evict removed source cards and replace their window from fresh snapshots on
 reconnect. The iOS cache version is 4 and the terminal UI's is 3; older cached cards are discarded. Offline

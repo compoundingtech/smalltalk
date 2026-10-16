@@ -71,8 +71,8 @@ pub enum Answer {
     Opened { focused: bool },
     /// st has no such agent, mission or machine.
     NotFound,
-    /// st knows it, but this layout cannot show it without moving the person's focus: the classic
-    /// layout has no tabs or splits, and the person is typing or asked to keep their focus.
+    /// st knows it, but this interface cannot show it without moving the person's focus. Older
+    /// interfaces, which had a classic layout without tabs or splits, answer this.
     NotShown,
 }
 
