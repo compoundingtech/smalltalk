@@ -1,5 +1,0 @@
-agent "agent" {
-  host "cr"
-  role "worker"
-  command "exec sleep 300"
-}
