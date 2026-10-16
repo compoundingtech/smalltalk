@@ -611,7 +611,7 @@ pub async fn transfer(
         }
     }
     payload.flush()?;
-    store.connection.write_workers().spawn_blocking(move || -> Result<()> {
+    store.connection.write_workers().spawn_blocking(move || crate::task_cpu::blocking("seat.snapshot_transfer", || -> Result<()> {
         anyhow::ensure!(
             hex::encode(Sha256::digest(fs::read(payload.path())?)) == expected.unwrap().1,
             "snapshot digest differs"
@@ -660,7 +660,7 @@ pub async fn transfer(
             "restoring",
         )?;
         Ok(())
-    })
+    }))
     .await??;
     Ok(())
 }

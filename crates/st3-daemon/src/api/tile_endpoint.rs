@@ -257,7 +257,7 @@ fn spawn_with(
     kernel: Arc<dyn Kernel>,
     supervisor: u32,
 ) {
-    tokio::spawn(async move {
+    tokio::spawn(crate::task_cpu::account("tile.endpoints", async move {
         // Each served tile with the user ID it was served for: a tile the launcher gives a new
         // ID is served afresh, never under the ID it had.
         type Served = (Tile, Option<u32>);
@@ -314,12 +314,12 @@ fn spawn_with(
                     if serving.contains_key(&name) {
                         continue;
                     }
-                    let task = tokio::spawn(serve_tile(
+                    let task = tokio::spawn(crate::task_cpu::account("tile.endpoint", serve_tile(
                         state.clone(),
                         Arc::clone(registry),
                         name.clone(),
                         Arc::clone(&kernel),
-                    ));
+                    )));
                     serving.insert(name, (served, task));
                 }
             }
@@ -333,7 +333,7 @@ fn spawn_with(
                 None => changed.await,
             }
         }
-    });
+    }));
 }
 
 /// Serve one tile's endpoint once root has made its directory for this Unix user.

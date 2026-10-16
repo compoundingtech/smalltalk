@@ -73,11 +73,11 @@ impl OtlpExporter {
     pub async fn export_once(&self, store: &Arc<Store>) -> Result<ExportOutcome> {
         let cursor = {
             let store = store.clone();
-            tokio::task::spawn_blocking(move || store.otlp_export_cursor()).await??
+            tokio::task::spawn_blocking(move || crate::task_cpu::blocking("observations.export", || store.otlp_export_cursor())).await??
         };
         let batch = {
             let store = store.clone();
-            tokio::task::spawn_blocking(move || store.local_observations_after(cursor, OTLP_BATCH))
+            tokio::task::spawn_blocking(move || crate::task_cpu::blocking("observations.export", || store.local_observations_after(cursor, OTLP_BATCH)))
                 .await??
         };
         let Some(last) = batch.last().and_then(local_observation_position) else {
@@ -99,7 +99,7 @@ impl OtlpExporter {
             self.send(&self.traces_url, &traces).await?;
         }
         let store = store.clone();
-        store.connection.write_workers().spawn_blocking(move || store.set_otlp_export_cursor(last)).await??;
+        store.connection.write_workers().spawn_blocking(move || crate::task_cpu::blocking("observations.export", || store.set_otlp_export_cursor(last))).await??;
         Ok(ExportOutcome {
             exported: batch.len(),
             skipped,

@@ -493,18 +493,18 @@ pub async fn run<B: Backend>(
         activity_changed: watch::channel(0).0,
         exchange_jobs: Arc::default(),
     };
-    tokio::spawn(keep_connectivity_current(fleet.clone()));
+    tokio::spawn(crate::task_cpu::account("replication.connectivity", keep_connectivity_current(fleet.clone())));
     if let Some(fabric) = fabric.clone() {
-        tokio::spawn(keep_fabric_presence_current(fabric, fleet.clone()));
+        tokio::spawn(crate::task_cpu::account("replication.fabric_presence", keep_fabric_presence_current(fabric, fleet.clone())));
     }
     backend.ready().await;
     let notify = wake;
     refresh_fleet_view(&backend, &fleet).await;
-    tokio::spawn(keep_fleet_view_current(
+    tokio::spawn(crate::task_cpu::account("replication.fleet_view", keep_fleet_view_current(
         backend.clone(),
         fleet.clone(),
         notify.subscribe(),
-    ));
+    )));
     let state = PeerState {
         backend: backend.clone(),
         node: config.node.clone(),
@@ -517,7 +517,7 @@ pub async fn run<B: Backend>(
     for peer in config.peers.iter().filter(|peer| peer.url.is_empty()) {
         let backend = backend.clone();
         let name = peer.name.clone();
-        tokio::spawn(async move {
+        tokio::spawn(crate::task_cpu::account("replication.peer_failure", async move {
             loop {
                 tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
                 super::telemetry::record_error(&name, super::telemetry::ErrorReason::Down);
@@ -525,7 +525,7 @@ pub async fn run<B: Backend>(
                     .record_failure(&name, "down", "no recent inbound exchange", None)
                     .await;
             }
-        });
+        }));
     }
     start_outbound(
         backend.clone(),
@@ -562,7 +562,7 @@ pub async fn run<B: Backend>(
             endpoints.update(|set| set.tailscale = vec![address]);
         }
         if let Some(tailscale) = tailscale {
-            tokio::spawn(keep_tailnet_current(
+            tokio::spawn(crate::task_cpu::account("replication.tailnet", keep_tailnet_current(
                 tailscale,
                 bound_address.map(|address| (address.port(), app.clone())),
                 tailnet.map(|address| address.ip()),
@@ -570,14 +570,14 @@ pub async fn run<B: Backend>(
                 fleet_transports,
                 notify_for_transports,
                 fleet.connectivity_changed.subscribe(),
-            ));
+            )));
         }
         if let (Some(fabric), Some(address)) = (fabric, loopback) {
             let protocol = file
                 .fabric_protocol
                 .clone()
                 .unwrap_or_else(|| default_fabric_protocol(&file.fleet_id));
-            settings_tasks.spawn(keep_fabric_exposed(
+            settings_tasks.spawn(crate::task_cpu::account("replication.fabric_exposure", keep_fabric_exposed(
                 fabric,
                 protocol,
                 address,
@@ -585,15 +585,15 @@ pub async fn run<B: Backend>(
                 fleet.connectivity_changed.subscribe(),
                 config.state_dir.clone(),
                 file.clone(),
-            ));
+            )));
         }
-        settings_tasks.spawn(keep_endpoints_published(
+        settings_tasks.spawn(crate::task_cpu::account("replication.publish_endpoints", keep_endpoints_published(
             backend,
             file.mode.as_str(),
             endpoints.clone(),
             config.state_dir.clone(),
             file.clone(),
-        ));
+        )));
     }
     let serving = async move {
         // A dial-out member accepts no connections, but still supervises publication.
@@ -909,10 +909,10 @@ async fn lock_current_settings(
 ) -> Result<Option<std::fs::File>> {
     let state_dir = state_dir.to_path_buf();
     let settings = settings.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || crate::task_cpu::blocking("replication.settings", || {
         let lock = FleetFile::lock_settings(&state_dir)?;
         Ok((FleetFile::load(&state_dir)?.as_ref() == Some(&settings)).then_some(lock))
-    })
+    }))
     .await?
 }
 
@@ -1004,7 +1004,7 @@ fn start_outbound<B: Backend>(
 ) {
     // One dialer per target. Targets follow membership: a new listening member gets a dialer,
     // and a member that ends or turns dial-out loses its dialer.
-    tokio::spawn(async move {
+    tokio::spawn(crate::task_cpu::account("replication.outbound", async move {
         let mut view_changes = fleet.view_changed.subscribe();
         let mut dialers: BTreeMap<String, Dialer> = BTreeMap::new();
         let mut transport_changes = notify.subscribe();
@@ -1038,7 +1038,7 @@ fn start_outbound<B: Backend>(
                     continue;
                 }
                 let (routes, route_changes) = watch::channel(routes);
-                let task = tokio::spawn(dial_peer(
+                let task = tokio::spawn(crate::task_cpu::account("replication.dial_peer", dial_peer(
                     backend.clone(),
                     node.clone(),
                     name.clone(),
@@ -1046,7 +1046,7 @@ fn start_outbound<B: Backend>(
                     auth.clone(),
                     fleet.clone(),
                     notify.subscribe(),
-                ));
+                )));
                 dialers.insert(name, (routes, task));
             }
             tokio::select! {
@@ -1059,7 +1059,7 @@ fn start_outbound<B: Backend>(
                 _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
             }
         }
-    });
+    }));
 }
 
 /// Exchange with one peer for as long as it stays a target, trying its routes in order.
@@ -1698,7 +1698,7 @@ async fn receive_exchange<B: Backend>(
             );
             let state = state.clone();
             let relay = relay.clone();
-            tokio::spawn(async move {
+            tokio::spawn(crate::task_cpu::account("replication.exchange", async move {
                 let _permit = permit;
                 let result = async {
                     let received = state
@@ -1735,7 +1735,7 @@ async fn receive_exchange<B: Backend>(
                 .await
                 .map_err(|error| format!("replication request failed: {error:#}"));
                 done.send_replace(Some(result));
-            });
+            }));
         }
         jobs.get(&relay).unwrap().answer.clone()
     };

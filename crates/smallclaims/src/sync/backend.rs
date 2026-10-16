@@ -164,7 +164,7 @@ where
         let fleet_id = fleet_id.to_owned();
         let inventory = inventory.clone();
         let signature_requests = signature_requests.to_vec();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || crate::task_cpu::blocking("replication.export", || {
             let store = backend.store();
             let exchange = if summary_only {
                 store.export_replication_summary(&fleet_id)?
@@ -179,7 +179,7 @@ where
                 exchange,
                 store_index: store.index()?,
             })
-        })
+        }))
         .await?
     }
 
@@ -195,7 +195,7 @@ where
         let peer = peer.to_owned();
         let fleet_id = fleet_id.to_owned();
         let exchange = exchange.clone();
-        self.store().connection.spawn_blocking(move || {
+        self.store().connection.spawn_blocking(move || crate::task_cpu::blocking("replication.receive", || {
             let store = backend.store();
             if let Some(round_trip) = round_trip {
                 store.record_replication_round_trip(round_trip);
@@ -218,7 +218,7 @@ where
                 changed: projected && (admission.changed || repairs != 0),
                 store_index: store.index()?,
             })
-        })
+        }))
         .await?
     }
 

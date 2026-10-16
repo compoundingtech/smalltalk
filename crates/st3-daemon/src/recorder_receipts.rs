@@ -30,7 +30,7 @@ pub async fn run(
     loop {
         let receipt_store = store.clone();
         let receipts = directory.clone();
-        match store.connection.write_workers().spawn_blocking(move || ingest_once(&receipt_store, &receipts)).await {
+        match store.connection.write_workers().spawn_blocking(move || crate::task_cpu::blocking("recorder.receipts", || ingest_once(&receipt_store, &receipts))).await {
             Ok(Ok(0)) => delay = (delay * 2).min(Duration::from_secs(60)),
             Ok(Ok(_)) => {
                 delay = Duration::from_secs(1);
