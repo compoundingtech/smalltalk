@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Limit Namespace test-producer compilation to four Cargo jobs to reduce concurrent compiler memory pressure.",
+  "replay": {
+    "status": "none",
+    "detail": "CI compile concurrency only; no deployed state, protocol, test selection or assertion change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI compile concurrency only; no deployed state, protocol, test selection or assertion change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI compile concurrency only; no deployed state, protocol, test selection or assertion change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI compile concurrency only; no deployed state, protocol, test selection or assertion change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI compile concurrency only; no deployed state, protocol, test selection or assertion change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI compile concurrency only; no deployed state, protocol, test selection or assertion change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI compile concurrency only; no deployed state, protocol, test selection or assertion change."
+  }
+}
