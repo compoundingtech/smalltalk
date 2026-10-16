@@ -152,6 +152,14 @@ runs. A stop ends that scope.
    incarnation. An exec task's record names its scope, and the same three moments end it. Each
    launch has a scope of its own, so ending an old one never reaches the next incarnation.
 
+A stop or a retirement of an agent root also stops every exec and PTY task declared under it
+(`exec/ROOT/TASK`), each through its own stop above, whether or not the root has a process of its
+own. Those tasks are not started or restarted while the root is stopped, whatever their restart
+policy, and the root is not recorded as stopped while one of them still runs on this host; a task
+whose stop fails keeps its own fault, and the root stays unsettled until it ends. A task of an
+earlier release could outlive a stop of its root; it no longer does. A task is stopped by the
+host it runs on. Starting the root again declares them again.
+
 A unit that is no longer loaded has ended: systemd collects a work scope once its last process
 exits. st never ends a PTY server's own scope, a service, or the unit it runs in.
 
