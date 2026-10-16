@@ -21,7 +21,7 @@ Opening an agent attaches its live terminal; **Ctrl+\\** shows its conversation,
 
 ### Connect from another machine
 
-Install Smalltalk on the client machine. Publish the daemon's **paired-only gateway** with the [gateway setup](st3/client-v0/README.md#tailnet-carrier), using HTTPS or an encrypted tailnet route. On the daemon machine, make a pairing challenge:
+Install Fractal on the client machine. Publish the daemon's **paired-only gateway** with the [gateway setup](st3/client-v0/README.md#tailnet-carrier), using HTTPS or an encrypted tailnet route. On the daemon machine, make a pairing challenge:
 
 ```sh
 st devices --as person/ada pair --full-control 'Garden laptop'

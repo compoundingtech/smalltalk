@@ -1,6 +1,6 @@
 # GitHub integration
 
-Smalltalk can observe a repository and start finite review and triage missions for new pull requests and issues. A durable seat serves those runs; a curator groups what needs a person before it reaches Now.
+Fractal can observe a repository and start finite review and triage missions for new pull requests and issues. A durable seat serves those runs; a curator groups what needs a person before it reaches Now.
 
 Use the worker and workspace from [missions in practice](missions-in-practice.md#declare-a-worker-seat), and a repository you are allowed to inspect. Install [GitHub CLI](https://cli.github.com/), then log in as the OS user who runs the daemon:
 

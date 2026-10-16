@@ -1,4 +1,4 @@
-# Smalltalk with Home Manager
+# Fractal with Home Manager
 
 Import `inputs.smalltalk.homeManagerModules.default` and configure the user service:
 
@@ -54,7 +54,7 @@ When a path is set, Home Manager does not install `package`, copy an executable
 to `stateDir/bin`, or create the `st` alias there. The daemon and declaration
 commands execute `binary.path`, and their PATH starts with its containing
 directory. The daemon's `--pty-binary` also selects `pty` in that directory.
-The systemd units and launchd agents omit the Smalltalk and PTY package store
+The systemd units and launchd agents omit the Fractal and PTY package store
 paths and the package restart trigger. Changing only `package` or `ptyPackage`
 therefore does not restart the daemon on a Home Manager switch.
 

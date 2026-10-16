@@ -94,7 +94,7 @@ Provider scenarios use `scripts/st3-boot-canaries` and the Claude adapter in
 runner asserts the exact Selected harness output once, creates its own disposable
 native-driver seat, sends a graph message,
 requires a successful read of that exact message plus route/consent or app-server
-receipts, and stops the seat. It does not depend on the built-in Smalltalk Assistant or publish
+receipts, and stops the seat. It does not depend on the built-in Fractal Assistant or publish
 onboarding. The default provider scenarios retain the assistant and one-run checks.
 The policy-present fixture runs the candidate's `claude-channel install-policy`
 helper as root inside the disposable guest and verifies ordinary-user readability.
@@ -190,14 +190,14 @@ The full assistant phase adds two focused scenarios:
 
 - `assistant-lifecycle`: a fresh Codex first-run waits for the focused `Message Smalltalk Assistant`
   composer hint with `type or click` before navigating Home. It requires a reachable
-  built-in Smalltalk Assistant and the exact graph wake read, stops the assistant, explicitly
+  built-in Fractal Assistant and the exact graph wake read, stops the assistant, explicitly
   cancels `mission-run/st/onboarding`, and repeats ordinary setup twice. The assistant
   must stay stopped and non-actionable in history with one historical run. `setup --onboarding` must
   then restore it with a different observed incarnation and add exactly one UUID
   run alongside cancelled history; the restored assistant must read a new exact wake.
 - `claude-pre-channel`: `setup --harness claude --claude-channel false` must preserve
   the selected Claude harness, print its inline development route and start the
-  built-in Smalltalk Assistant without the user plugin. The original incarnation must read a
+  built-in Fractal Assistant without the user plugin. The original incarnation must read a
   wake through `server:st3`; user `claude-channel install --no-policy` followed by
   `agents restart` must produce a different reachable incarnation using the
   installed development plugin, accept its consent, and read a new exact wake.

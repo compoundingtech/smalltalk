@@ -617,7 +617,7 @@ successfully sent envelopes. Neither counts signatures or claims.
 `peer` is bounded by fleet members plus explicitly
 configured/bootstrap peers; it is a node name, never a URL, route, session,
 agent, or message id. Outcomes, directions, and reasons are closed
-lowercase registries owned by Smalltalk. No other identities become metric
+lowercase registries owned by Fractal. No other identities become metric
 attributes.
 
 Error reasons preserve worker failure classification: typed `PeerOverloaded`
@@ -714,7 +714,7 @@ the global text-map propagator. This makes the daemon's SERVER span a child of t
 `st3.cli.command` span (or its current child); hook requests use their current span in the
 same way. No SDK/OTel layer or an invalid context produces no trace headers.
 
-The wire-only tracestate entry `st=c` is owned by Smalltalk and means sampling is decided
+The wire-only tracestate entry `st=c` is owned by Fractal and means sampling is decided
 by the collector. Injection replaces an existing `st` entry without growing the list.
 When adding `st` to a full 32-entry list, it first drops the rightmost entry; all other
 entries retain their order. It does not mutate the current span's context. The daemon

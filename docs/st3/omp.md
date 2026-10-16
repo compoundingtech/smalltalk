@@ -344,7 +344,7 @@ OMP executable (not a fleet launcher); `--omp` overrides that variable. Optional
 **1** means the original picker reopened natively (contract this migration);
 **2** means probe error, not evidence either way.
 
-Smalltalk does not provide OMP in its checks: the native Rust test runs this probe only with
+Fractal does not provide OMP in its checks: the native Rust test runs this probe only with
 `OMP_BIN` set and otherwise prints an explicit skip. The hermetic gate belongs to the dotfiles
 OMP pin, `flakes/external/omp`: run the same script and fixture verbatim as a flake check on
 **every** OMP bump, including patches. That is where native reopening must fail the bridge-retaining

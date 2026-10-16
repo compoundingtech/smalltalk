@@ -1,7 +1,7 @@
-# Get started with Smalltalk
+# Get started with Fractal
 
-Download Smalltalk and run `st`. The first run sets up your machine and opens a
-conversation with the built-in Smalltalk Assistant, when a coding harness is available. The Assistant
+Download Fractal and run `st`. The first run sets up your machine and opens a
+conversation with the built-in Fractal Assistant, when a coding harness is available. The Assistant
 helps you give agents a mission and follow its progress in the terminal interface.
 
 Start with one machine. Each person currently runs their own fleet; a phone, another
@@ -23,7 +23,7 @@ it checks the downloaded bytes, rather than supplying an independent signature.
 Linux x86_64 needs glibc 2.35+ (Ubuntu 22.04+), `curl`, `tar` and `sha256sum` or
 `shasum`. Apple Silicon macOS needs macOS 15+, those download tools and Python 3.
 If a required tool is missing, install it with your operating system's package
-manager before downloading Smalltalk. Neither Rust, Nix nor the GitHub CLI is needed.
+manager before downloading Fractal. Neither Rust, Nix nor the GitHub CLI is needed.
 
 For an existing installation, read [upgrading st](upgrading-st.md) and the selected
 release's Upgrade impact before replacing binaries or restarting a populated store.
@@ -41,7 +41,7 @@ and TCC permission setup remain a separate manual rehearsal.
 ## 2. Answer the first-run screen
 
 In a terminal, `st setup` (and the first plain `st`) shows one screen instead of asking
-questions one at a time. It says in a few lines what Smalltalk is and that your first
+questions one at a time. It says in a few lines what Fractal is and that your first
 agent runs on your own Claude or Codex account and uses its usage. Then it lists
 everything to choose:
 
@@ -89,10 +89,10 @@ export PATH="$HOME/.local/bin:$PATH"
 st setup
 ```
 
-For Claude, setup offers the user-owned Smalltalk message channel without needing
+For Claude, setup offers the user-owned Fractal message channel without needing
 administrator rights. A machine approval policy is optional: without it, seats use
 the development-channel flag and st handles its admission dialog. Provider or
-organization restrictions can still block the channel. Smalltalk never asks for or
+organization restrictions can still block the channel. Fractal never asks for or
 types a password; optional machine policy, GitHub login and `gh` do not block setup.
 
 Before expecting a Claude Assistant to be ready, run `claude` in a normal terminal as
@@ -122,10 +122,10 @@ waits for you. The setting is `access_mode` in `~/.config/st3/config.toml`. An e
 without the key stays on `bypass` until you ask for a change. See
 [Managed harness access](st3/harness-access.md) for what each mode does.
 
-## 3. Work with the Smalltalk Assistant
+## 3. Work with the Fractal Assistant
 
 When a usable harness is available, the first run, the one that creates your configuration,
-asks before it starts anything. It says that the built-in Smalltalk Assistant is an agent that runs on your
+asks before it starts anything. It says that the built-in Fractal Assistant is an agent that runs on your
 own harness account, so it uses that harness's usage and quota, and which access mode it
 runs in, then asks `Start the built-in Smalltalk Assistant now?` (default yes). `--yes` answers yes and
 `--assistant false` declines; a decline prints `Not started. Run st setup --onboarding when you
@@ -215,7 +215,7 @@ st service permissions
 ```
 
 Follow the instructions for the OS permissions you must grant, including Full Disk
-Access and Developer Tools. Smalltalk does not automate those approval prompts.
+Access and Developer Tools. Fractal does not automate those approval prompts.
 
 For an upgrade, `st service install` refreshes definitions and restarts services;
 `st service restart` suffices when definitions already point at the intended binaries.

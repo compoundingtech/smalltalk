@@ -1,4 +1,4 @@
-# Smalltalk binary releases
+# Fractal binary releases
 
 Every pushed Git tag runs **Smalltalk tag release**. Both native builds must pass before a
 GitHub release is published. A release is also published once a day when `main` changed since the

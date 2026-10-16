@@ -1,14 +1,14 @@
 # TUI and Expo iOS design-session brief
 
 This brief prepares the product design session that follows the CLI walkthrough. It does not start
-UI implementation. The goal is one Smalltalk product on two surfaces: a Rust TUI and an Expo iOS
+UI implementation. The goal is one Fractal product on two surfaces: a Rust TUI and an Expo iOS
 app, both acting as online thin clients of the same `st3.client.v0` API.
 
 ## Product promise
 
 From either app Alex can:
 
-1. understand what work is happening across the Smalltalk network;
+1. understand what work is happening across the Fractal network;
 2. see and resolve what needs his attention;
 3. have a native back-and-forth conversation with Codex to shape a launch;
 4. approve and launch durable missions onto eligible machines;
@@ -190,7 +190,7 @@ There are two deployment classes:
 EAS Workflows can be triggered from GitHub or its API and can build, test, submit, and publish
 updates. We should still model each release as an st operation with exact commit/artifact evidence,
 idempotency, progress, terminal outcome, and rollback target. EAS is an executor, not the source of
-Smalltalk's operational truth.
+Fractal's operational truth.
 
 For the first iteration, agents may autonomously publish preview TUI artifacts and preview EAS
 updates after tests. Production promotion should be one explicit typed policy decision in the design
@@ -214,7 +214,7 @@ each with an optional explanation:
    first connected release?
 7. What notification events deserve APNs rather than appearing only when the online app opens?
 8. What telemetry, crash reporting, privacy, and redaction policy is acceptable for both apps?
-9. What is the friend onboarding path for Smalltalk, Fabric/Tailscale, device pairing, TestFlight,
+9. What is the friend onboarding path for Fractal, Fabric/Tailscale, device pairing, TestFlight,
    and recovery?
 
 ## Recommended first three missions

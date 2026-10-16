@@ -1,4 +1,4 @@
-# Smalltalk feed
+# Fractal feed
 
 `st3-feed` owns the live collection subscriptions, member reconnects, snapshot model and private
 display cache used by stui. It depends on the generated `st3-client` and the conversation model;

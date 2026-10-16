@@ -1,4 +1,4 @@
-# Upgrade Smalltalk safely
+# Upgrade Fractal safely
 
 Upgrade each machine in your own fleet to the **same release**. Keep the old archive and read the new release's **Upgrade impact** section before starting it against your state. Patch tags do not promise rollback or mixed-build compatibility; see the [0.x compatibility policy](st3/compatibility.md). For an initial installation, use [getting started](getting-started.md).
 

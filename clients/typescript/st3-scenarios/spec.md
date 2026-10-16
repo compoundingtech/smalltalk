@@ -2,7 +2,7 @@
 
 This document specifies `@smalltalk/st3-scenarios`: one package that holds the scenario kit
 (seeded factories, slices, worlds, replay, React and Storybook bindings) and the world catalog.
-Every Smalltalk client uses it for realistic, coherent, privacy-safe demo and test data.
+Every Fractal client uses it for realistic, coherent, privacy-safe demo and test data.
 
 ## Status
 

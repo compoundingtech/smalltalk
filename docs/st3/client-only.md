@@ -29,7 +29,7 @@ the terminal UI offers; omit it for the limited default scopes: projection reads
 arrangement reads and controls, terminal output, attention, and launches. Pass `--read-only` for a device that may only observe projections, glasses, and terminal output.
 The terminal UI cannot expand the member's grant.
 
-On the laptop, install Smalltalk and run one setup command:
+On the laptop, install Fractal and run one setup command:
 
 ```sh
 st devices complete https://member.example pairing/CHALLENGE_ID --fingerprint sha256:FINGERPRINT

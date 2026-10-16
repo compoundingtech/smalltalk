@@ -1,4 +1,4 @@
-# Smalltalk terminal client
+# Fractal terminal client
 
 `st` in a terminal opens spaces on the live graph: splits with their own tabs, each showing a conversation,
 a mission, a terminal, Now or usage. `st ui --space NAME` opens a named space. `st ui --demo`

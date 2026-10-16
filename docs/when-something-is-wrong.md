@@ -205,9 +205,9 @@ keys/database is not a normal troubleshooting step.
 
 ## Report an install or upgrade problem
 
-Use [Smalltalk GitHub issues](https://github.com/compoundingtech/smalltalk/issues/new/choose)
+Use [Fractal GitHub issues](https://github.com/compoundingtech/smalltalk/issues/new/choose)
 with the **Install or upgrade problem** template as the single support path. Initial triage is
-owned by the Smalltalk distribution agent, which routes
+owned by the Fractal distribution agent, which routes
 runtime, signing and replication failures to the relevant maintainer. No separate support
 account or chat channel is required.
 

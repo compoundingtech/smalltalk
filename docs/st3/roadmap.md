@@ -9,7 +9,7 @@ This file records accepted future work that is not built yet. Active fleet work 
 
 ## User interfaces
 
-- [ ] Hold a product design session for `st` and the Smalltalk mobile application.
+- [ ] Hold a product design session for `st` and the Fractal mobile application.
 
 ## Runtime containment
 

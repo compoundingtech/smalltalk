@@ -1,6 +1,6 @@
 # @smalltalk/st3-scenarios
 
-Seeded, privacy-safe scenario worlds for every Smalltalk client, and the kit that builds and
+Seeded, privacy-safe scenario worlds for every Fractal client, and the kit that builds and
 replays them. [spec.md](spec.md) is the contract.
 
 The registered catalog contains 24 worlds: seven narratives, empty/loading/forward-compatibility

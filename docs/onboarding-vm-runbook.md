@@ -3,7 +3,7 @@
 `scripts/onboarding-vm-test` uses the same runner as `scripts/onboarding-e2e`.
 It supports baseline and setup, with Incus or an existing command transport.
 Real-machine backends refuse CI environments. Nothing schedules them in CI.
-An agent invokes them on a disposable machine with no real Smalltalk state for ada.
+An agent invokes them on a disposable machine with no real Fractal state for ada.
 
 ## Agent host preparation
 
@@ -35,7 +35,7 @@ candidate bytes to hetz2 through an authorized transport or download its pinned
 URL; paths under another host's /var/tmp are not shared. Use the same archive
 for both releases. Native Ubuntu22 requires an archive built for its libc
 baseline; the host-linked Ubuntu24-only assistant/cache proof archives do not
-establish that compatibility. Neither provider credentials nor a host Smalltalk
+establish that compatibility. Neither provider credentials nor a host Fractal
 store are needed for the setup/service/UI pass.
 
 ## Managed disposable guest

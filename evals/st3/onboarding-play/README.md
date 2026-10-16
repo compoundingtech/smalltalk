@@ -1,6 +1,6 @@
 # Onboarding play
 
-This eval measures the first-run play with real harnesses: the Smalltalk Assistant greets a person,
+This eval measures the first-run play with real harnesses: the Fractal Assistant greets a person,
 shows two agents messaging each other, runs a small mission, raises an alert that appears above the
 message input, and interviews the person about what they want to do. It checks what the person experiences and what the graph recorded, never only what
 the Assistant claims.

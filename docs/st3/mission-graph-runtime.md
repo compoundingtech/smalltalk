@@ -1757,7 +1757,7 @@ The default `work show` and `work claim` output gives a human-readable step view
 
 A worker completion report is not a correctness result. Products and gates still control final completion.
 
-The native driver renews active claims and transports messages. The reconciler creates one durable Smalltalk message for each readiness epoch and runtime incarnation.
+The native driver renews active claims and transports messages. The reconciler creates one durable Fractal message for each readiness epoch and runtime incarnation.
 
 A pool message closes when another agent wins the claim. Release or expiry creates a new readiness epoch and a new message.
 
@@ -2163,7 +2163,7 @@ The planner uses this command:
 st launch submit SESSION --variant compact --markdown MISSION.md --kdl mission.kdl
 ```
 
-The session stores the request, feedback, Markdown, and KDL as immutable documents. Smalltalk carries document references, not mutable file paths.
+The session stores the request, feedback, Markdown, and KDL as immutable documents. Fractal carries document references, not mutable file paths.
 
 Each named candidate must contain exactly one ready mission with the requested ID.
 

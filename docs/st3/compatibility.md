@@ -1,4 +1,4 @@
-# Smalltalk 0.x compatibility
+# Fractal 0.x compatibility
 
 For your own fleet, install the **same verified release source on every member** and read the
 release's **Upgrade impact** before restart. A patch tag is a publication label, not a promise
@@ -52,7 +52,7 @@ shape. Consult the release notes before using new client features.
 ## Harness support and test coverage
 
 Install and log in to the harness as the OS user who runs the daemon. Record its actual version
-when diagnosing an issue; Smalltalk does not publish a universal minimum-version promise for
+when diagnosing an issue; Fractal does not publish a universal minimum-version promise for
 all future vendor releases. No exhaustive real-provider version matrix is established for
 v0.3.17. The rows below describe tested native contracts, not acceptance of every vendor version.
 
@@ -63,7 +63,7 @@ v0.3.17. The rows below describe tested native contracts, not acceptance of ever
 | pi and omp | Managed extension, mailbox and resume contracts have boot/delivery regressions. An unseen omp build is measured in a disposable native admission probe before launch; a failed probe refuses launch and reports the boundary. |
 | OpenCode | Loopback API, mailbox and resume contracts have boot/delivery regressions. An unseen build is measured before launch; a failed native contract disables delivery and retains queued mail. |
 
-The [boot canaries](../../scripts/st3-boot-canaries/README.md) use real Smalltalk processes with
+The [boot canaries](../../scripts/st3-boot-canaries/README.md) use real Fractal processes with
 stand-in providers; they do not prove real vendor login, model turns or every installed vendor
 version. Native admission probes identify the exact installed build, and their exceptions expire
 when the build identity changes. Follow [admission diagnosis](seat-deploys.md#harness-admission-at-the-next-launch)

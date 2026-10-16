@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Documentation calls the product Fractal; commands, paths and identifiers are unchanged.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or claim schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or replication rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only documentation product prose changes. Commands, paths, durable identifiers, repository references and release identities remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon or seat restart is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is needed."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No store migration or recovery procedure changes."
+  }
+}

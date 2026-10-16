@@ -4,7 +4,7 @@ Messages are durable conversation. Missions track work and its result; [human re
 
 ## From the terminal UI or phone
 
-Run `st`, open **Agents**, and select `garden/worker`. Click the conversation composer, type, and press **Enter** to send. In v0.3.4, **c** opens the composer from the conversation. **Ctrl+K** finds an agent or mission; **Ctrl+H** opens Home, and **Ctrl+Q** quits. The conversation shows your Smalltalk messages alongside the harness's transcript and tool calls.
+Run `st`, open **Agents**, and select `garden/worker`. Click the conversation composer, type, and press **Enter** to send. In v0.3.4, **c** opens the composer from the conversation. **Ctrl+K** finds an agent or mission; **Ctrl+H** opens Home, and **Ctrl+Q** quits. The conversation shows your Fractal messages alongside the harness's transcript and tool calls.
 
 If a conversation fails to open, its error card offers **Ctrl+R** to retry opening it
 without closing the tab. Leave the message box with **Esc** first. On a failed-open
@@ -73,7 +73,7 @@ st conversations ls person/ada
 
 `send` and `reply` safely recognize a retry with the same content. If a send times out, check its status or retry it; do not assume it failed. An agent's answer belongs in the conversation where you asked it.
 
-Claude's native permission, question and review dialogs hold new Smalltalk channel
+Claude's native permission, question and review dialogs hold new Fractal channel
 notifications outside the harness. Mail remains durable and releases in mailbox
 order once Claude applies the native answer or the dialog is dismissed; a later session cannot inherit
 the previous session's hold or answer. Native transcript receipt recovery still
@@ -83,7 +83,7 @@ held until current evidence returns.
 
 A permission hook's answer-poll timeout does **not** mean the dialog timed out:
 Claude can still be waiting for a terminal answer after that hook stops polling.
-The hold remains while that dialog is open. Merely recording an answer in Smalltalk
+The hold remains while that dialog is open. Merely recording an answer in Fractal
 cannot release mail: an expired hook no longer receives that answer. Claude must
 apply the decision or its terminal must show the dialog has closed. A native timeout
 that closes the prompt releases it on that same positive evidence; an ended session
@@ -246,7 +246,7 @@ message may have landed: the error prints its key and the command that tells whe
 `st conversations status --idempotency-key KEY`. Running the same command again is safe.
 
 `st conversations sessions` lists harness sessions and `st conversations timeline SESSION`
-shows one conversation as the terminal UI shows it: messages, Smalltalk, and tool calls folded to a line
+shows one conversation as the terminal UI shows it: messages, Fractal, and tool calls folded to a line
 or two. `--raw` prints every stored entry instead (message boundaries, tool input and output in
 full), and `--json` prints the page.
 

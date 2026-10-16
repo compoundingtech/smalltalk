@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Rename the product in tracked Markdown; durable identifiers are not migrated.
+
+Only tracked Markdown is read. Content rules remain valid after crate moves.
+On a conflict, run `scripts/fractal-rename brand-docs --apply` on your branch, then merge main.
+"""
+import argparse
+import difflib
+import fnmatch
+import pathlib
+import re
+import subprocess
+import sys
+
+NAME = re.compile(r"Smalltalk|SmallTalk")
+ALLOW = ("*.md",)
+SKIP_FILES = (
+    ".changelog/*", "release-notes/*", ".experiments/*", "*/.experiments/*", "crates/st3/*",
+    "CHANGELOG*", "*/CHANGELOG*", "snapshots/*", "*/snapshots/*", "*.snap",
+    "fixtures/*", "*/fixtures/*", "onboarding-fixtures/*", "*/onboarding-fixtures/*", "*fixture*.json",
+    "*.lock", "pnpm-lock.yaml", "*.svg", "*.png", "*.ico",
+    "scripts/fractal-rename", "docs/fractal-rename-inventory.md",
+)
+# Protect exact spans, not whole lines: a label next to a bundle ID may change.
+SKIP_CONTEXT = (
+    (r"compoundingtech/smalltalk", "d", "repository URL/reference; redirect transition"),
+    (r"(?:https?://|github:)[^\s`<>\"']+", "c", "URL identity/path (including signed evidence predicate)"),
+    (r"(?:Smalltalk (?:tag|daily) release|smalltalk-(?:release|daily-release|edge-publish)|(?:scripts/)?release-smalltalk[\w.*-]*)", "e", "release script, workflow name or concurrency/artifact identity"),
+    (r"smalltalk-(?:\$\{?[\w.]+|<target>|aarch64|x86_64|linux|darwin)[^\s`\"']*", "e", "release archive/target artifact name"),
+    (r"(?:com(?:\[\.\]|\.)compoundingtech(?:\[\.\]|\.)smalltalk[\w.:-]*|smalltalk\.dev[^\s`\"'<>]*)", "c", "Apple bundle/keychain or evidence identity"),
+    (r"[\w@~./:$<>-]*(?:smalltalk|Smalltalk|SmallTalk|SMALLTALK)[\w@/:-]*(?:\.[\w*-]+)+(?:/[\w./*-]*)?", "c", "file/service/domain path or dotted identifier"),
+    (r"[\w@~./:$<>-]*(?:smalltalk|Smalltalk|SmallTalk|SMALLTALK)[\w@/:<>-]+", "c", "package, subject, path, hash domain or compound identifier"),
+    (r"[\w@~./:$<>-]+(?:smalltalk|Smalltalk|SmallTalk|SMALLTALK)[\w@/:<>-]*", "c", "identifier, environment variable, path or namespace"),
+    (r"smalltalk\s*(?:#\d+|issue\s+#\d+)", "c", "historical repository issue reference"),
+    (r"(?:\.join|Path::new)\(\s*[\"'](?:Smalltalk|SmallTalk|smalltalk)[\"']", "c", "filesystem path component in code/test"),
+    (r"agentName\(.*Smalltalk Ci", "c", "derived title-case expectation of unchanged stored agent ID"),
+    (r"\*\*smalltalk\*\*\s+scheme", "c", "Xcode scheme name"),
+    (r'\"[^\"\n]*\"|“[^”\n]*”', "c", "quoted literal UI text or example"),
+    (r"\| (?:Smalltalk Dev, amber DEV-badged icon|Smalltalk, ordinary icon) \|", "c", "installed app display identity still emitted by app config"),
+    (r"prompt names Smalltalk", "c", "macOS permission prompt still uses the app display identity"),
+    (r"Smalltalk references were inspected at commit", "d", "historical repository inspection reference"),
+    (r"accomplish in Smalltalk today", "c", "onboarding question still quoted by the bundled guide"),
+)
+COMPILED_SKIP = [(re.compile(p), cls, why) for p, cls, why in SKIP_CONTEXT]
+CAPITAL = re.compile(r"(?<![\w])(?:Smalltalk|SmallTalk)(?![\w])")
+
+
+def matches(path, globs):
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in globs)
+
+
+def protected(path, line):
+    spans = []
+    if matches(path, SKIP_FILES):
+        spans.append((0, len(line), "c", "excluded history, crate, fixture, generated asset, or migration audit"))
+    for pattern, cls, why in COMPILED_SKIP:
+        for match in pattern.finditer(line):
+            spans.append((*match.span(), cls, why))
+    for match in re.finditer(r"(`+).*?\1", line):
+        if NAME.search(match.group()):
+            spans.append((*match.span(), "c", "backticked command/identifier"))
+    return spans
+
+
+def classify(path, line, match, fenced=False):
+    start, end = match.span()
+    spans = protected(path, line)
+    # Repository references are reported separately even inside preserved fixtures.
+    for cls in ("d", "e", "c"):
+        for lo, hi, kind, why in spans:
+            if kind == cls and lo <= start and end <= hi:
+                return cls, why
+    if not matches(path, ALLOW):
+        return "c", "outside tracked Markdown scope"
+    if fenced:
+        return "c", "literal fenced code or output"
+    if CAPITAL.fullmatch(match.group()):
+        return "a", "product prose"
+    return "c", "identifier, not product prose"
+
+
+def scan(path, text):
+    fenced = False
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        if path.endswith('.md') and re.match(r"\s*(```|~~~)", line):
+            fenced = not fenced
+        for match in NAME.finditer(line):
+            cls, why = classify(path, line, match, fenced)
+            yield number, line, match, cls, why
+
+
+def rewrite(path, text):
+    edits = {}
+    for number, line, match, cls, why in scan(path, text):
+        if cls in ('a', 'b'):
+            # Independent last-line-of-defense guard: fail before any file writes.
+            if any(lo <= match.start() and match.end() <= hi for lo, hi, _, _ in protected(path, line)):
+                raise ValueError(f'{path}:{number}: would replace protected context: {why}')
+            edits.setdefault(number, []).append(match.span())
+    result = []
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        for start, end in reversed(edits.get(number, [])):
+            line = line[:start] + 'Fractal' + line[end:]
+        result.append(line)
+    return ''.join(result), sum(map(len, edits.values()))
+
+
+def tracked_brand_files(root):
+    result = subprocess.run(['git', 'grep', '-I', '-l', '-z', '-E', NAME.pattern], cwd=root, capture_output=True, check=False)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(result.stderr.decode())
+    return sorted(p.decode() for p in result.stdout.split(b'\0') if p)
+
+
+def plan(root):
+    changes = []
+    for path in tracked_brand_files(root):
+        if not matches(path, ALLOW) or matches(path, SKIP_FILES):
+            continue
+        file = root / path
+        if file.is_symlink():
+            continue
+        old = file.read_bytes().decode('utf-8')
+        new, count = rewrite(path, old)
+        if count:
+            changes.append((path, old, new, count))
+    return changes
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    brand = commands.add_parser('brand-docs', aliases=['brand'], help='rename capitalized product prose in Markdown only')
+    mode = brand.add_mutually_exclusive_group()
+    mode.add_argument('--dry-run', action='store_true', help='print unified diff without writing (default)')
+    mode.add_argument('--apply', action='store_true', help='write the preflighted changes')
+    args = parser.parse_args()
+    root = pathlib.Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip())
+    try:
+        changes = plan(root)
+    except (ValueError, RuntimeError, UnicodeError) as error:
+        print(f'fractal-rename: {error}', file=sys.stderr)
+        return 1
+    for path, old, new, count in changes:
+        print(f'{path}: {count} replacements')
+        sys.stdout.writelines(difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True), fromfile='a/' + path, tofile='b/' + path))
+    if args.apply:
+        for path, _, new, _ in changes:
+            (root / path).write_bytes(new.encode('utf-8'))
+    print(f'{"Applied" if args.apply else "Dry run"}: {len(changes)} files changed, {sum(c[3] for c in changes)} replacements')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
