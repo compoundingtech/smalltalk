@@ -534,6 +534,18 @@ workflow-level path filters. `linux-gate` does not depend on them.
 `scripts/ci-fractal-web-test`, run by `genie-freshness`, covers detection, fail-closed
 paths, the gate truth table and generated job shape.
 
+`scripts/web-skip-proof` prints the signed-skip decision for the web checks in the
+selection design's format (`check=… decision=skip|run key=… proof=… inputs_sha256=…
+reason=…`): `fractal-web` (the lane, the detector's relevant paths) and `fractal-web-kit`
+(the kit plays, its kit paths). The key is `evidence-verify --project` over the check's
+inputs; a skip is only a trusted signed passing record with the same key, found by
+`evidence-verify` under the base skip policy. Inputs, detector, verifier and keys come
+from the base. Until the base policy declares a web check (and something signs it with
+input keys), every web decision is `run` with `reason=no-record`. `claims PATH…` and
+`inputs CHECK` print the plugin's path ownership and declared inputs.
+`scripts/web-skip-proof-test` (in `genie-freshness`) covers key stability, the app/kit
+split, base-pinned rules and the policy path.
+
 The strict kit play lane runs every indexed story at both 440/1440 widths and
 dark/light schemes, with up to six workers bounded by available CPUs. Each worker
 reuses a Chromium context and its HTTP asset cache for the job's immutable build;
