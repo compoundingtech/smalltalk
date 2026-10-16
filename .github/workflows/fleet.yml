@@ -1261,7 +1261,7 @@ jobs:
           done
       - name: Compile and archive each selected target group once
         shell: bash
-        run: 'nix develop -c bash -c ''python3 scripts/ci-build-memory before || echo "::warning::build memory baseline unavailable"; exec python3 scripts/ci-test-archive build'''
+        run: 'nix develop -c bash -c ''if [[ "${RUNNER_NAME:-}" == nsc-* ]]; then export CARGO_BUILD_JOBS=4; fi; python3 scripts/ci-build-memory before || echo "::warning::build memory baseline unavailable"; exec python3 scripts/ci-test-archive build'''
         id: archive
       - name: Publish this run attempt’s exact-source test archives
         id: upload

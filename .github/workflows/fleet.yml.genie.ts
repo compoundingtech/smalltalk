@@ -479,7 +479,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
                 'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
             : step),
         { ...nixDevelopStep({ name: 'Compile and archive each selected target group once',
-          command: ['bash', '-c', 'python3 scripts/ci-build-memory before || echo "::warning::build memory baseline unavailable"; exec python3 scripts/ci-test-archive build'] }), id: 'archive' },
+          command: ['bash', '-c', 'if [[ "${RUNNER_NAME:-}" == nsc-* ]]; then export CARGO_BUILD_JOBS=4; fi; python3 scripts/ci-build-memory before || echo "::warning::build memory baseline unavailable"; exec python3 scripts/ci-test-archive build'] }), id: 'archive' },
         {
           name: 'Publish this run attempt’s exact-source test archives', id: 'upload',
           uses: 'actions/upload-artifact@v4',
