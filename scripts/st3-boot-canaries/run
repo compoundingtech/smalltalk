@@ -54,6 +54,12 @@ MISSION = "canary/boot"
 RUN_ID = f"{MISSION}/c1"
 LETTERS = "abcde"
 IMPORTED_SUBJECT = None
+# Production waits 20 s for the channel to attach and then backs off 10/20/40 s between recovery
+# restarts. The channel scenarios shorten the window, and channel-parked also the backoff, through
+# the shorten-only overrides so the schedule is exercised, not waited out. The window stays well
+# above a healthy stand-in's attach time.
+CHANNEL_ATTACH_WINDOW_MS = 6000
+CHANNEL_BACKOFF_MS = 1000
 
 
 class Failure(Exception):
@@ -808,7 +814,9 @@ def claude_channel_parked(node, seats):
           20, "parked channel did not stop its provider")
     node.kill_daemon()
     node.start()
-    time.sleep(30)
+    # A lost budget would charge a fourth attempt after one detection window and the largest
+    # backoff of the schedule; wait out both with margin.
+    time.sleep((CHANNEL_ATTACH_WINDOW_MS + 4 * CHANNEL_BACKOFF_MS) / 1000 + 2)
     if len(attempts()) != 3 or len([row for row in receipts(node, "a") if row.get("event") == "started"]) != starts:
         fail("parked channel restarted after the daemon lost its in-memory budget")
     if native_mention_count(node, early) != 0:
@@ -1093,6 +1101,20 @@ def prove_claim_socket_denied(node, seats, evidence):
 def run(args, root, evidence):
     register(root, evidence)
     node = Node(root, args.binary, args.harness)
+    if args.scenario.startswith("channel-"):
+        shorten = {"ST3_CLAUDE_ATTACH_WINDOW_MS": str(CHANNEL_ATTACH_WINDOW_MS)}
+        # channel-missing and channel-uninitialized wait for the transient blocked state, which
+        # lasts from detection to the first recovery restart: that is the backoff. Shortening it
+        # there would make a snapshot poll miss the state, so only channel-parked, which counts
+        # attempts, takes the short backoff.
+        if args.scenario == "channel-parked":
+            shorten["ST3_CLAUDE_CHANNEL_BACKOFF_MS"] = str(CHANNEL_BACKOFF_MS)
+        node.env.update(shorten)
+        # Seats take their environment from the daemon's login shell, so export it there too.
+        for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
+            with (root / "home" / name).open("a") as profile:
+                for key, value in shorten.items():
+                    profile.write(f"export {key}={value}\n")
     if args.scenario == "access-auto":
         with (root / "config.toml").open("a") as config:
             config.write('access_mode = "auto"\n')

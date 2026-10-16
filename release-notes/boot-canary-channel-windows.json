@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The Claude channel boot canaries can run with a shorter attach window and recovery backoff; production values are unchanged unless the new ST3_CLAUDE_ATTACH_WINDOW_MS or ST3_CLAUDE_CHANNEL_BACKOFF_MS is set to a smaller value",
+  "replay": {
+    "status": "none",
+    "detail": "No stored history or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, claim or configuration schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination version change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Both variables can only shorten the defaults (20 s window, 10 s base backoff); unset, behavior is identical."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration and no restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting removes the two variables; nothing stored depends on them."
+  }
+}

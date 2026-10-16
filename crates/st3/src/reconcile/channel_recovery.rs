@@ -6,6 +6,16 @@ use serde_json::json;
 
 const MAX_ATTEMPTS: usize = 3;
 const RECHECK_BACKOFF_MS: u128 = 10_000;
+
+/// The first recheck backoff; later ones double it. `ST3_CLAUDE_CHANNEL_BACKOFF_MS` can only
+/// shorten it, so the boot canaries need not wait out the production schedule.
+fn recheck_backoff_ms() -> u128 {
+    std::env::var("ST3_CLAUDE_CHANNEL_BACKOFF_MS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|cap| *cap > 0)
+        .map_or(RECHECK_BACKOFF_MS, |cap| cap.min(RECHECK_BACKOFF_MS))
+}
 const RECOVERY: &str = "claude-channel-recovery";
 
 impl<R: RuntimeControl> Reconciler<R> {
@@ -167,7 +177,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .saturating_add(if attempts.len() >= MAX_ATTEMPTS {
                 0
             } else {
-                RECHECK_BACKOFF_MS * (1_u128 << attempts.len())
+                recheck_backoff_ms() * (1_u128 << attempts.len())
             });
         if now < due {
             self.arm_restart(&format!("channel-recovery:{}", subject.subject), due);
