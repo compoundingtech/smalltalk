@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add an optional named claim-store container for future shard bindings, with no shard enabled by default.",
+  "replay": {"status": "none", "detail": "No existing claims move or replay differently. The default store and historical claims are unchanged."},
+  "schema": {"status": "changed", "detail": "An explicitly requested shard opens the existing claim-store schema in STATE/shards/<id>/claims.sqlite3. Empty configuration creates no shard database; this change adds no tables to the default database."},
+  "rules": {"status": "none", "detail": "Existing checkpoint and retention rules are unchanged; each optional store has independent checkpoint records and trim state."},
+  "compatibility": {"status": "none", "detail": "No daemon routing, wire protocol, client API, or mixed-version activation is introduced."},
+  "downtime": {"status": "none", "detail": "No deployed store is opened or migrated by this change."},
+  "manual": {"status": "none", "detail": "No operator action enables a shard in this change. A later reviewed Ops binding is required before any trial."},
+  "recovery": {"status": "changed", "detail": "A future explicitly opened shard file needs its own backup and restore coverage. This change does not route writes to it or alter rollback of the current default store."}
+}
