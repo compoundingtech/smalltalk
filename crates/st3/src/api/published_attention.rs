@@ -3,8 +3,9 @@
 //! and never fold attention while it runs. See `store::attention_list`.
 
 use super::*;
-use crate::store::attention_list::{AttentionDelta, AttentionPublication};
+use crate::store::attention_list::{AttentionDelta, AttentionFleet, AttentionPublication};
 use crate::store::owner_lists::OwnerView;
+use std::collections::HashMap;
 
 /// The shortest pause between two refreshes. A refresh also pauses as long as it took, so the
 /// refresher never takes more than about half a core. Windows never wait for it: a summary
@@ -221,9 +222,28 @@ fn refresh_waiting_summary(state: &AppState, starting: bool) -> Option<anyhow::R
 /// attention reads changed since the newest publication, else a fold of every person's rows.
 /// A fold that comes out equal keeps the published rows, so windows have nothing to reread.
 /// The clock is read inside the snapshot: every local claim in it was accepted before then.
+/// Each row carries its presentation, presented again when the agents it reads change.
 pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
+    refresh_attention_list_with(store, |previous| attention_fleet(store, previous))
+}
+
+/// `refresh_attention_list`, presenting with the fleet `fleet` gives for the previous
+/// publication's fleet.
+pub(crate) fn refresh_attention_list_with(
+    store: &Store,
+    fleet: impl FnOnce(Option<&Arc<AttentionFleet>>) -> Option<Arc<AttentionFleet>>,
+) -> anyhow::Result<()> {
     let (generation, previous) = store.newest_attention_list();
     let clock = ATTENTION_LIST_CLOCK.as_millis();
+    // Read before the snapshot: a roster published in between presents again at the next wake.
+    let fleet = fleet(
+        previous
+            .as_ref()
+            .and_then(|previous| previous.fleet.as_ref()),
+    );
+    let fleet_changed = previous
+        .as_ref()
+        .is_none_or(|previous| previous.fleet.as_deref() != fleet.as_deref());
     store.read_snapshot(|index| {
         let now = client_now_ms();
         let (cause, due) = match &previous {
@@ -238,7 +258,9 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
                 (Some("due".to_owned()), None)
             }
             Some(previous) => match store.attention_list_delta(previous, index, now)? {
-                AttentionDelta::Unchanged(None) if previous.cut == index => return Ok(()),
+                AttentionDelta::Unchanged(None) if previous.cut == index && !fleet_changed => {
+                    return Ok(());
+                }
                 AttentionDelta::Unchanged(due) => (None, due),
                 AttentionDelta::Refold(cause) => (Some(cause), None),
             },
@@ -249,11 +271,23 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
                 // Still pending future acceptance times stand beside the new ones.
                 let due = [previous.due_at_unix_ms, due].into_iter().flatten().min();
                 let future_after = due.and(previous.future_after.or(Some(previous.cut)));
-                (Arc::clone(&previous.rows), previous.evaluated_at_unix_ms, due, future_after)
+                let rows = if fleet_changed {
+                    let mut rows = (*previous.rows).clone();
+                    present_attention(store, &mut rows, fleet.as_deref())?;
+                    if rows == *previous.rows {
+                        Arc::clone(&previous.rows)
+                    } else {
+                        Arc::new(rows)
+                    }
+                } else {
+                    Arc::clone(&previous.rows)
+                };
+                (rows, previous.evaluated_at_unix_ms, due, future_after)
             }
             (cause, _) => {
                 store.note_attention_list_fold(cause.as_deref().unwrap_or("first"));
-                let rows = client_attention_resources_at(store, None, false, now)?;
+                let mut rows = client_attention_resources_at(store, None, false, now)?;
+                present_attention(store, &mut rows, fleet.as_deref())?;
                 let rows = match &previous {
                     Some(previous) if *previous.rows == rows => Arc::clone(&previous.rows),
                     _ => Arc::new(rows),
@@ -285,6 +319,7 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
                 future_after,
                 published_at_unix_ms,
                 rows,
+                fleet,
             },
             changed,
         );
@@ -304,6 +339,116 @@ pub(crate) fn refresh_attention_list(store: &Store) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// The newest published agents roster as the attention presentation reads it, reusing
+/// `previous` while no roster has been published since, and while none is available (its cache
+/// cleared, or no roster refresher), so rows keep their agents until the next roster. None
+/// until a roster is published.
+pub(crate) fn attention_fleet(
+    store: &Store,
+    previous: Option<&Arc<AttentionFleet>>,
+) -> Option<Arc<AttentionFleet>> {
+    let revision = store.agent_roster_revision();
+    if let Some(previous) = previous.filter(|previous| previous.revision == revision) {
+        return Some(Arc::clone(previous));
+    }
+    let Some((_, cards, _)) = store.published_agent_roster(u64::MAX, false) else {
+        return previous.cloned();
+    };
+    Some(Arc::new(AttentionFleet::from_cards(revision, &cards)))
+}
+
+/// What the attention presentation reads beside a row: the fleet, and the paths of the steps
+/// the rows hold.
+struct Known<'a> {
+    fleet: &'a AttentionFleet,
+    paths: &'a HashMap<String, String>,
+}
+
+impl st3_ui_model::attention::Fleet for Known<'_> {
+    fn agent_label(&self, agent: &str) -> Option<String> {
+        self.fleet.agent_label(agent)
+    }
+    fn claimant(&self, step: &str) -> Option<String> {
+        self.fleet.claimant(step)
+    }
+    fn working_in(&self, mission: &str) -> Option<String> {
+        self.fleet.working_in(mission)
+    }
+    fn step_path(&self, step: &str) -> Option<String> {
+        self.paths.get(step).cloned()
+    }
+}
+
+/// Give each row the presentation st serves for it (docs/clients/ui-contract.md, Attention
+/// row), reading `fleet`, or no agents before the first roster. A row it cannot read goes
+/// without one, and a step whose path it cannot read is named on no card; neither fails the
+/// list for every client.
+pub(crate) fn present_attention(
+    store: &Store,
+    rows: &mut [Value],
+    fleet: Option<&AttentionFleet>,
+) -> anyhow::Result<()> {
+    crate::performance::task("attention/present", || present_rows(store, rows, fleet))
+}
+
+fn present_rows(
+    store: &Store,
+    rows: &mut [Value],
+    fleet: Option<&AttentionFleet>,
+) -> anyhow::Result<()> {
+    let none = AttentionFleet::default();
+    let mut paths = HashMap::new();
+    for step in rows.iter().filter_map(|row| row["step_run_id"].as_str()) {
+        if paths.contains_key(step) {
+            continue;
+        }
+        match store.step_path(step) {
+            Ok(Some(path)) => {
+                paths.insert(step.to_owned(), path);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("st3: WARN attention cannot read the path of {step}: {error:#}")
+            }
+        }
+    }
+    let known = Known {
+        fleet: fleet.unwrap_or(&none),
+        paths: &paths,
+    };
+    for row in rows {
+        match st3_ui_model::attention::Facts::deserialize(&*row) {
+            Ok(facts) => {
+                row["presentation"] =
+                    serde_json::to_value(st3_ui_model::attention::present(&facts, &known))?;
+            }
+            Err(error) => eprintln!(
+                "st3: WARN attention {} has no presentation: {error}",
+                row["id"]
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Copy each item's presentation from the newest published list, which presents every row;
+/// a read computes none. An item the list has not published yet goes without one until it is.
+pub(crate) fn published_attention_presentations(store: &Store, items: &mut [Value]) {
+    let Some(publication) = store.published_attention_list() else {
+        return;
+    };
+    let presentations = publication
+        .rows
+        .iter()
+        .filter_map(|row| Some((row["id"].as_str()?, row.get("presentation")?)))
+        .collect::<HashMap<_, _>>();
+    for item in items {
+        if let Some(presentation) = item["id"].as_str().and_then(|id| presentations.get(id)) {
+            item["presentation"] = (*presentation).clone();
+        }
+    }
 }
 
 /// Publish every person's rows of `view` (glasses or arrangements) at the current cut in one

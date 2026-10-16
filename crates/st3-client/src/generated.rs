@@ -383,6 +383,9 @@ pub struct Attention {
     /// The mission step waiting on this ask, on an ask a mission step made.
     #[serde(default)]
     pub blocked: Option<AttentionBlocked>,
+    /// st's presentation of this row; absent from older daemons.
+    #[serde(default)]
+    pub presentation: Option<AttentionPresentation>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -394,6 +397,37 @@ pub struct Attention {
     pub target_states: Vec<AttentionTargetState>,
     #[serde(default)]
     pub actions: Vec<String>,
+}
+/// st's presentation of an attention row (docs/clients/ui-contract.md, Attention row). Words
+/// are fixtures/clients/words.json ids.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AttentionPresentation {
+    /// The Now group; `None` for a row that is not a Now card.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// The card; `None` for a row that is no card.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Who Chat about this reaches; `None` means the chief of staff.
+    #[serde(default)]
+    pub agent: Option<AttentionActor>,
+    #[serde(default)]
+    pub raised_by: Option<AttentionActor>,
+    #[serde(default)]
+    pub waiting: Option<AttentionWaiting>,
+}
+/// An agent or other actor, with the name a person reads.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AttentionActor {
+    pub id: String,
+    pub label: String,
+}
+/// The step an attention row holds.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AttentionWaiting {
+    pub step: String,
+    /// The step's name within its mission.
+    pub path: String,
 }
 /// The mission step that asked and waits for the answer.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

@@ -1113,6 +1113,37 @@ export const AttentionBlocked = /*#__PURE__*/ (() => Schema.Struct({
 export type AttentionBlocked = typeof AttentionBlocked.Type
 export type AttentionBlockedEncoded = typeof AttentionBlocked.Encoded
 
+export const AttentionActor = /*#__PURE__*/ (() => Schema.Struct({
+  "id": Id,
+  /** The name a person reads. */
+  "label": Schema.String.annotate({ description: "The name a person reads." })
+}).annotate({ identifier: "AttentionActor" }))()
+export type AttentionActor = typeof AttentionActor.Type
+export type AttentionActorEncoded = typeof AttentionActor.Encoded
+
+export const AttentionWaiting = /*#__PURE__*/ (() => Schema.Struct({
+  /** The step's name within its mission. */
+  "path": Schema.String.annotate({ description: "The step's name within its mission." }),
+  "step": StepRunId
+}).annotate({ identifier: "AttentionWaiting" }))()
+export type AttentionWaiting = typeof AttentionWaiting.Type
+export type AttentionWaitingEncoded = typeof AttentionWaiting.Encoded
+
+export const AttentionPresentation = /*#__PURE__*/ (() => Schema.Struct({
+  /** Who Chat about this reaches: the conversation, else the step's claimant, else an agent working in the mission, else the agent that asked. null means the chief of staff. */
+  "agent": Schema.OptionFromNullOr(AttentionActor).annotate({ description: "Who Chat about this reaches: the conversation, else the step's claimant, else an agent working in the mission, else the agent that asked. null means the chief of staff." }),
+  /** The card; null for a row that is no card (an unread message stays in its conversation). */
+  "kind": Schema.OptionFromNullOr(Schema.Literals(["review","feedback","request","update","launch","revision","prompt","login","fault"])).annotate({ description: "The card; null for a row that is no card (an unread message stays in its conversation)." }),
+  /** Who raised it: the requester, else the agent behind it, with st's own actors labeled st; else its mission. */
+  "raised_by": Schema.OptionFromNullOr(AttentionActor).annotate({ description: "Who raised it: the requester, else the agent behind it, with st's own actors labeled st; else its mission." }),
+  /** The Now group, by its fixtures/clients/words.json tier id; null for a row that is not a Now card. */
+  "tier": Schema.OptionFromNullOr(Schema.Literals(["stopped","alert","today","later"])).annotate({ description: "The Now group, by its fixtures/clients/words.json tier id; null for a row that is not a Now card." }),
+  /** The step it holds. */
+  "waiting": Schema.OptionFromNullOr(AttentionWaiting).annotate({ description: "The step it holds." })
+}).annotate({ identifier: "AttentionPresentation" }))()
+export type AttentionPresentation = typeof AttentionPresentation.Type
+export type AttentionPresentationEncoded = typeof AttentionPresentation.Encoded
+
 export const AttentionTargetState = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "since": optionalKey(Timestamp),
@@ -1170,6 +1201,8 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "mission_run_id": optionalKey(Id),
   "operational": optionalKey(Operational),
   "person_id": Id,
+  /** st's presentation of this row: its Now group and card, who Chat about this reaches, who raised it, and the step it holds. Clients read it instead of deriving their own (docs/clients/ui-contract.md, Attention row). Absent on older daemons. */
+  "presentation": optionalKey(AttentionPresentation),
   "preview": Schema.OptionFromOptionalNullOr(LaunchPreview, NULL_NONE),
   "preview_token": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "priority": Schema.Literals(["critical","high","normal","low"]),

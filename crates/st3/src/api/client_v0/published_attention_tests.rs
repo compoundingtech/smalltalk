@@ -70,6 +70,8 @@ async fn attention_windows_serve_the_published_list_to_each_session_and_never_fo
             publication.evaluated_at_unix_ms,
         )
         .unwrap();
+        crate::api::present_attention(&state.store, &mut rows, publication.fleet.as_deref())
+            .unwrap();
         client_attention_compatibility(&mut rows, false);
         rows
     };
@@ -121,6 +123,35 @@ async fn attention_windows_serve_the_published_list_to_each_session_and_never_fo
     assert_eq!(own.store_index, state.store.index().unwrap());
     assert!(own.published_at.is_none());
     assert_eq!(items.len(), 4);
+}
+
+/// Every published row carries the presentation the refresher computed, and every attention
+/// route copies it from the published list: a read computes none.
+#[test]
+fn attention_rows_carry_the_published_presentation_on_every_route() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "attention-presentation");
+    custom(&state, "custom/garden/review/v1/ada-one", "person/ada");
+    state.store.start_attention_list_refresher().unwrap();
+    // Before the first publication a read has nothing to copy.
+    let read =
+        crate::api::client_attention_resources_with_previews(&state, Some("person/ada"), false)
+            .unwrap();
+    assert!(read[0].get("presentation").is_none());
+    crate::api::refresh_attention_list(&state.store).unwrap();
+    let publication = state.store.newest_attention_list().1.unwrap();
+    let row = &publication.rows[0];
+    assert_eq!(
+        row["presentation"]["tier"], "today",
+        "a custom kind is a Today request"
+    );
+    assert_eq!(row["presentation"]["kind"], "request");
+    assert!(row["presentation"]["waiting"].is_null());
+    let read =
+        crate::api::client_attention_resources_with_previews(&state, Some("person/ada"), false)
+            .unwrap();
+    assert_eq!(read[0]["id"], row["id"]);
+    assert_eq!(read[0]["presentation"], row["presentation"]);
 }
 
 async fn summary_window(

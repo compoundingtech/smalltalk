@@ -169,3 +169,26 @@ fn presentation_names_why_now_and_next() {
     );
     assert!(present(&agent(json!({}))).now.is_none());
 }
+
+#[test]
+fn a_label_is_the_last_segment_in_title_case_without_its_host() {
+    assert_eq!(
+        super::label("fleet/example/image-sorter", None),
+        "Image Sorter"
+    );
+    assert_eq!(
+        super::label("harbor.image-sorter", Some("host/harbor")),
+        "Image Sorter"
+    );
+    // Another host's prefix stays: it is part of the name.
+    assert_eq!(
+        super::label("harbor.image-sorter", Some("host/dock")),
+        "Harbor.image Sorter"
+    );
+    assert_eq!(super::label("fleet/st3-cos-ios", None), "ST COS iOS");
+    assert_eq!(
+        super::label("fleet/release-captain/omp", None),
+        "Release Captain · OMP"
+    );
+    assert_eq!(super::label("Initial seat", None), "Initial seat");
+}
