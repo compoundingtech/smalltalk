@@ -325,8 +325,45 @@ pub async fn attach_with_io(
     name: &str,
     io: ClientIo,
 ) -> Result<i32> {
+    attach_expected_with_io(client, terminal_id, name, io, None).await
+}
+
+/// Creation waits attach only to the requested incarnation, even through the gateway fallback.
+pub async fn attach_expected(
+    client: &Client,
+    terminal_id: &str,
+    name: &str,
+    expected: &str,
+) -> Result<i32> {
+    attach_expected_with_io(
+        client,
+        terminal_id,
+        name,
+        ClientIo::default(),
+        Some(expected),
+    )
+    .await
+}
+
+async fn attach_expected_with_io(
+    client: &Client,
+    terminal_id: &str,
+    name: &str,
+    io: ClientIo,
+    expected: Option<&str>,
+) -> Result<i32> {
     let terminal_id = format!("terminal/{}", terminal_id.trim_start_matches("terminal/"));
-    let (attachment, first, stream) = open(client, &terminal_id).await?;
+    let (attachment, first, stream) = open(client, &terminal_id, expected).await?;
+    if expected.is_some_and(|expected| first.runtime_incarnation != expected) {
+        detach(
+            client,
+            &terminal_id,
+            &attachment,
+            &first.runtime_incarnation,
+        )
+        .await;
+        anyhow::bail!("the requested launch changed incarnation before attaching");
+    }
     let incarnation = first.runtime_incarnation.clone();
     let (screens_sender, screens) = mpsc::channel(4);
     let follower = tokio::spawn(follow(stream, screens_sender));
@@ -363,11 +400,16 @@ pub async fn attach_with_io(
 async fn open(
     client: &Client,
     terminal_id: &str,
+    expected: Option<&str>,
 ) -> Result<(String, TerminalScreen, TerminalStream)> {
     let mut attempt = 0;
     let attachment = loop {
         attempt += 1;
         let screen = client.terminal_screen(terminal_id).await?;
+        anyhow::ensure!(
+            expected.is_none_or(|expected| screen.value.runtime_incarnation == expected),
+            "the requested launch changed incarnation before attaching"
+        );
         let capabilities = client.capabilities().await?;
         let fence = Fence {
             snapshot_id: capabilities.snapshot.id,

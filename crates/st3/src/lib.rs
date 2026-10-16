@@ -8,6 +8,7 @@ pub mod cli_output;
 mod ci_test_paths;
 
 pub mod accounts;
+pub mod agent_launch;
 pub mod api;
 pub mod archive;
 pub mod attach_image;

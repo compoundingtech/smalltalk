@@ -62963,3 +62963,113 @@ mod harness_event_tests {
         assert!(store.append_harness_event(&input).is_err());
     }
 }
+
+impl Store {
+    /// Resolve the immutable requested declaration through presentation-only predecessors.
+    /// This has the reconciler's launch-token comparator, but never follows a later head.
+    /// Both fork probing and payload copying are budgeted; excessive lineage is unavailable.
+    pub(crate) fn launch_request_source(
+        &self,
+        subject: &str,
+        token: &str,
+    ) -> Result<Option<(ClaimRecord, String)>> {
+        anyhow::ensure!(subject.len() <= 512 && token.len() <= 1024,
+            "launch source identity exceeds the read budget");
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        let mut reads = 0usize;
+        let mut bytes = 0usize;
+        let mut fetch = |id: &str| -> Result<Option<ClaimRecord>> {
+            anyhow::ensure!(reads < 64 && id.len() <= 1024,
+                "requested launch lineage exceeds the read budget");
+            reads += 1;
+            // Bound all copied columns before fetching any body or predecessor strings.
+            let lengths: Option<(i64, i64)> = connection.query_row(
+                "SELECT octet_length(body) + octet_length(predecessors),
+                        octet_length(id) + octet_length(subject) + octet_length(kind) +
+                        octet_length(origin) + coalesce(octet_length(actor),0) +
+                        coalesce(octet_length(batch_id),0)
+                 FROM claims WHERE id=?1",
+                [id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let Some((payload, identity)) = lengths else { return Ok(None); };
+            anyhow::ensure!(payload >= 0 && (0..=8192).contains(&identity),
+                "requested launch source exceeds the read budget");
+            let copied = payload.checked_add(identity)
+                .context("launch source byte budget overflow")?;
+            bytes = bytes.checked_add(usize::try_from(copied)?)
+                .context("launch source byte budget overflow")?;
+            anyhow::ensure!(bytes <= 256 * 1024,
+                "requested launch lineage exceeds the byte budget");
+            claim_by_id_tx(&connection, id)
+        };
+        let Some(mut current) = fetch(token)? else { return Ok(None); };
+        anyhow::ensure!(current.kind == "intent.desired" && current.subject == subject,
+            "requested launch token does not name this agent declaration");
+        let mut seen = BTreeSet::from([current.id.clone()]);
+        loop {
+            let mut next = None;
+            for predecessor in &current.predecessors {
+                if seen.contains(predecessor) { continue; }
+                if let Some(previous) = fetch(predecessor)?
+                    && previous.kind == "intent.desired" && previous.subject == current.subject
+                    && presentation_only_change(&previous.body, &current.body)
+                {
+                    next = Some(previous);
+                    break;
+                }
+            }
+            let Some(previous) = next else { break; };
+            seen.insert(previous.id.clone());
+            current = previous;
+        }
+        let token = current.id.clone();
+        Ok(Some((current, token)))
+    }
+
+    /// Read an owner-local idempotent observation without entering the writer queue.
+    pub(crate) fn local_observation_for_key(
+        &self,
+        subject: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                &format!(
+                    "{LOCAL_OBSERVATION_COLUMNS} WHERE dedupe_key=?1 AND subject=?2 AND kind=?3"
+                ),
+                params![local_observation_dedupe_key(kind, key), subject, kind],
+                |row| local_observation_from_row(&self.origin, row),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Bounded recent evidence for launch waits, merging owner-local receipts and claims.
+    pub fn launch_observations(
+        &self,
+        subject: &str,
+        kind: &str,
+    ) -> Result<(Vec<ClaimRecord>, bool)> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let page = self.claims_for_subject_kind_at(subject, kind, None, true, 64)?;
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 65"
+        ))?;
+        let rows = statement.query_map(params![subject, kind], |row| {
+            local_observation_from_row(&self.origin, row)
+        })?;
+        let mut records = page.claims;
+        records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        let truncated = page.next_cursor.is_some() || records.len() > 64;
+        records.sort_by_key(claim_log_order);
+        if records.len() > 64 {
+            records.drain(..records.len() - 64);
+        }
+        Ok((records, truncated))
+    }
+}

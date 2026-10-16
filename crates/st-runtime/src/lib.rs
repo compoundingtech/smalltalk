@@ -31,3 +31,5 @@ pub use process::{
 pub use pty::{
     Launch, PtyObservation, PtyRuntime, PtySpawnTimeout, PtySpawnTimeoutPhase, TerminalSize,
 };
+
+pub mod launch_diagnostic;

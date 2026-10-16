@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Report the requested harness launch exit promptly and pace short-lived automatic restarts",
+  "replay": {
+    "status": "none",
+    "detail": "No canonical replay change or new replay trigger. Existing durable runtime.observed claims retain declaration evidence, and harness.diagnostic claims add fixed early-exit diagnostics. Launch waits read runtime-host-local receipts and those durable observations."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, migrations or schema version changes. Existing observation kinds and fields carry launch diagnostics, readiness receipts and retry deadlines."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes. Existing guarded effects and clock/due dependencies remain in use."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The updated agents new CLI uses a new agent-launch read route and authenticated host-relay operation for pinned early-exit evidence. Upgrade local and destination daemons for that evidence. If a daemon or relay returns 404/503, creation uses the prior readiness/event wait within the same timeout, retaining the selected declaration and first observed incarnation; this compatibility path cannot recover an unobserved early-exit code or output. It never claims remote replication from the local card. Older CLIs keep working with updated daemons. JSON creation results add stages and error fields; upgraded early-exit evidence fails creation with a nonzero CLI status (the child\u2019s nonzero code, or 1 after a zero child exit), preserving the child\u2019s own optional code in the message and JSON error.exit_code. Older peers reject the new peer operation. The agent-launch route is an internal CLI/peer read outside the generated client contract. Both local and relayed reads require a concrete person or agent actor, preserved at the destination. The harness-ready stage means the requested incarnation reached readiness, not that it is ready now; attachment retains its fresh runtime/incarnation checks. A seat without a readiness receipt stays launched. The background reconciler writes the idempotent owner-local receipt only while that incarnation satisfies harness.is_ready(); after a daemon crash it records the receipt on the next still-ready pass, or reports the incarnation\u2019s exit instead. The first attempt for the pinned launch lineage decides the result, so a retry success cannot erase its failure. Label-only changes share that lineage; changed launch revisions do not. Evidence windows or declaration lineage exceeding the bounded read budget refuse the read instead of guessing readiness. Conditional launch reads carry a bounded wait and response marker across the peer relay, use the existing change notification feed, and close every database snapshot before awaiting. Unrelated events are coalesced: after the initial capture, a waiting request captures at most once per 500 ms, including one final dirty partial interval, and unchanged events do not end the request. Coalescing adds up to 500 ms before capturing a notified launch change. A quiet feed performs no extra capture. A newly committed local readiness receipt wakes launch readers once; quiet ready passes neither append it again nor wake readers again. The CLI no longer repeats the launch read on a fixed polling timer."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond the normal binary deployment. No live daemon restart or fleet seat stimulus was used for validation."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Automatic short-lived agent retries wait from 5 seconds up to 120 seconds including deterministic jitter, using existing scheduler state. A stable 60-second lifetime, changed launch revision or explicit person retry resets the consecutive delay. Existing restart-intensity parking still applies. Use agents show for faults and retry explicitly after correcting setup; creation never attaches to a replacement incarnation."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No forward-only migration. Binary swap-back remains supported with existing graph state; older binaries reject the added peer operation, while unknown JSON CLI fields are additive. Startup output uses bounded runtime-host-local SystemLocal receipts, served to a concrete actor over the trusted Unix boundary or signed fleet-peer transport, without a separate per-agent ownership check. Actor preservation is not per-agent authorization. Replicated diagnostics, step failures and crash-loop faults contain fixed failure text; OTLP logs omit local startup detail. Credential and transcript markers withhold the captured local output window."
+  }
+}

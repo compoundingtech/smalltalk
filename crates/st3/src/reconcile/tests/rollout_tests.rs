@@ -1114,6 +1114,29 @@ fn manual_rollout_without_set_policy_survives_receipts_reopens_and_idle_passes()
 }
 
 #[test]
+fn a_pending_manual_replacement_does_not_borrow_the_incumbents_launch_readiness() {
+    let seat = Seat::new();
+    let old = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    seat.store.append_claim(&ClaimInput {
+        subject: SUBJECT.into(), kind: "runtime.action.succeeded".into(), actor: None,
+        fields: serde_json::from_value(json!({
+            "action":"harness-ready", "incarnation_id":"original-1"
+        })).unwrap(), evidence: vec![], expected_subject: None,
+        idempotency_key: Some(format!("launch-ready:{SUBJECT}:original-1")),
+    }).unwrap();
+    seat.publish_mode(2, "second", None, false, true);
+    let pending = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    assert_ne!(old, pending);
+    assert_eq!(rollout::pending_manual_launch(&seat.store, SUBJECT).unwrap().unwrap().0, old);
+    let status = crate::agent_launch::read(&seat.store, SUBJECT, &pending).unwrap();
+    assert_eq!(status.stage, "replicated");
+    assert_eq!(status.incarnation_id, None);
+    assert_eq!(crate::agent_launch::read(&seat.store, SUBJECT, &old).unwrap().stage, "superseded");
+    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+    assert!(seat.runtime.stops.lock().unwrap().is_empty());
+}
+
+#[test]
 fn removing_manual_policy_releases_pending_cutover_to_automatic_rollout() {
     let seat = Seat::new();
     let policy = Some(Policy::when_idle(1_800_000, false));

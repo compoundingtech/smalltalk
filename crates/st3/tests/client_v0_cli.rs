@@ -3636,18 +3636,33 @@ async fn serve_creation_api(
     root: &Path,
     harness_state: Option<&'static str>,
 ) -> (PathBuf, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+    serve_creation_api_with_launch_status(root, harness_state, None).await
+}
+
+async fn serve_creation_api_with_launch_status(
+    root: &Path,
+    harness_state: Option<&'static str>,
+    launch_status: Option<axum::http::StatusCode>,
+) -> (PathBuf, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
     let socket = root.join("st3.sock");
     let state = test_state(root);
     let store = state.store.clone();
+    let launch_events = state.event_notify.clone();
     let router = st3::api::router(state).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let store = store.clone();
+            let launch_events = launch_events.clone();
             async move {
                 // This fixture supplies provider observations without launching a binary.
                 if request.uri().path() == "/v1/harnesses" {
                     return axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
                         "api_version": "st3.v1", "value": ["omp"]
                     })));
+                }
+                if request.uri().path().ends_with("/agent-launch")
+                    && let Some(status) = launch_status
+                {
+                    return axum::response::IntoResponse::into_response(status);
                 }
                 let applied = matches!(
                     request.uri().path(),
@@ -3659,7 +3674,20 @@ async fn serve_creation_api(
                     && response.status().is_success()
                     && let Some(harness_state) = harness_state
                 {
+                    let reached_ready = matches!(harness_state, "ready" | "idle" | "working" | "blocked-after-ready");
+                    let blocked_after_ready = harness_state == "blocked-after-ready";
+                    let harness_state = if blocked_after_ready { "blocked" } else { harness_state };
+                    let token = store
+                        .selected_desired_token("agent/client-v0-cli.demo")
+                        .unwrap()
+                        .expect("the fake launch must follow its accepted declaration");
                     for (kind, fields) in [
+                        (
+                            "runtime.action.succeeded",
+                            serde_json::json!({
+                                "action":"start", "desired_token":token, "incarnation_id":"demo:1"
+                            }),
+                        ),
                         (
                             "runtime.observed",
                             serde_json::json!({
@@ -3674,6 +3702,18 @@ async fn serve_creation_api(
                             }),
                         ),
                     ] {
+                        if launch_status.is_some() && kind == "runtime.action.succeeded" {
+                            continue;
+                        }
+                        if blocked_after_ready && kind == "harness.observed" {
+                            store.append_claim(&ClaimInput {
+                                subject: "agent/client-v0-cli.demo".into(), kind:kind.into(),
+                                actor:Some("agent/client-v0-cli.demo".into()),
+                                fields:serde_json::from_value(serde_json::json!({
+                                    "driver":"omp", "incarnation_id":"demo:1", "state":"ready",
+                                })).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
+                            }).unwrap();
+                        }
                         store
                             .append_claim(&ClaimInput {
                                 subject: "agent/client-v0-cli.demo".into(),
@@ -3686,6 +3726,17 @@ async fn serve_creation_api(
                             })
                             .unwrap();
                     }
+                    if launch_status.is_none() && reached_ready {
+                        store.append_claim(&ClaimInput {
+                            subject: "agent/client-v0-cli.demo".into(),
+                            kind: "runtime.action.succeeded".into(), actor: None,
+                            fields: serde_json::from_value(serde_json::json!({
+                                "action":"harness-ready", "incarnation_id":"demo:1"
+                            })).unwrap(), evidence: vec![], expected_subject: None,
+                            idempotency_key: Some("launch-ready:agent/client-v0-cli.demo:demo:1".into()),
+                        }).unwrap();
+                    }
+                    launch_events.send_modify(|generation| *generation = generation.saturating_add(1));
                 }
                 response
             }
@@ -3989,6 +4040,7 @@ async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json
         (None, false),
         (Some("ready"), false),
         (Some("blocked"), false),
+        (Some("blocked-after-ready"), false),
         (Some("ready"), true),
     ] {
         let root = tempfile::tempdir().unwrap();
@@ -4015,7 +4067,22 @@ async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json
         )
         .await;
         if json {
-            let response = value(&output);
+            let mut response = value(&output);
+            let stages = response.as_object_mut().unwrap().remove("stages").unwrap();
+            assert!(
+                stages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|stage| stage["stage"] == "replicated" && stage["state"] == "skipped")
+            );
+            assert!(
+                stages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|stage| stage["stage"] == "harness-ready")
+            );
             assert_eq!(
                 response,
                 serde_json::json!({
@@ -4024,8 +4091,12 @@ async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json
                 })
             );
         } else {
-            let rendered = String::from_utf8(output.stdout).unwrap();
             let progress = String::from_utf8(output.stderr).unwrap();
+            let rendered = if output.status.success() {
+                String::from_utf8(output.stdout).unwrap()
+            } else {
+                progress.clone()
+            };
             assert!(!progress.contains("unobserved"), "{progress}");
             let expected = match harness {
                 None => "Still starting — waiting for the agent process to appear.",
@@ -4048,6 +4119,49 @@ async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json
                 assert!(rendered.contains(action), "{rendered}");
             }
         }
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_agent_uses_compatibility_readiness_when_launch_route_is_missing_or_unavailable() {
+    for status in [
+        axum::http::StatusCode::NOT_FOUND,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (socket, server) =
+            serve_creation_api_with_launch_status(root.path(), Some("ready"), Some(status)).await;
+        let output = run_cli_mode(
+            &socket,
+            true,
+            &[
+                "agents",
+                "new",
+                "demo",
+                "--harness",
+                "omp",
+                "--model",
+                "example-model",
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--as",
+                "person/avery",
+                "--timeout",
+                "3s",
+            ],
+        )
+        .await;
+        let result = value(&output);
+        assert_eq!(result["state"], "running");
+        let stages = result["stages"].as_array().unwrap();
+        assert!(stages.iter().any(|stage| stage["state"] == "unavailable"));
+        assert!(stages.iter().any(|stage| stage["stage"] == "harness-ready" && stage["state"] == "compatibility"));
+        assert!(
+            !stages
+                .iter()
+                .any(|stage| stage["stage"] == "replicated" && stage["state"] != "skipped")
+        );
         server.abort();
     }
 }

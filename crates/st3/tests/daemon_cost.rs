@@ -882,6 +882,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/hosts/{host}/agent-workspace",
         "/v1/hosts/bench-host/agent-workspace?identity=bench/seat-0",
     ),
+    get(
+        "GET /v1/hosts/{host}/agent-launch",
+        "/v1/hosts/bench-host/agent-launch?subject={launch_subject}&token={launch_token}",
+    ),
     // Writes, each with a new idempotency key.
     post("POST /v1/claims", "/v1/claims", |fixture, attempt| {
         let seat = &fixture.subjects.seats[0];
@@ -1364,6 +1368,122 @@ impl Fixture {
     }
 }
 
+/// Launch waits must not turn unrelated daemon traffic into repeated captures.
+/// Run this control alone: these counters include every statement in the process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launch_waiters_coalesce_unrelated_event_storms() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    const WAITERS: u64 = 4;
+    const WAIT_MS: u64 = 1_200;
+    // Initial capture plus at most ceil(1200/500) event-driven captures, including
+    // a dirty final partial interval. This bounds work, not just response frequency.
+    const MAX_CAPTURES: u64 = 4;
+    let root = tempfile::tempdir().unwrap();
+    let (store, token, subject) = super::agent_launch::requested_launch();
+    let store = Arc::new(store);
+    // This harness measures warm request work. Warm all four simultaneous reader
+    // loans, rather than comparing a single warm reader with cold pool expansion.
+    // The barrier is fixture-local; no request snapshot or network wait is involved.
+    let barrier = Arc::new(std::sync::Barrier::new(WAITERS as usize));
+    let mut warm_readers = Vec::new();
+    for _ in 0..WAITERS {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        warm_readers.push(tokio::task::spawn_blocking(move || {
+            store
+                .read_snapshot(|_| {
+                    barrier.wait();
+                    Ok(())
+                })
+                .unwrap();
+        }));
+    }
+    for reader in warm_readers {
+        reader.await.unwrap();
+    }
+    let state = super::agent_launch::state(root.path(), store);
+    let events = state.event_notify.clone();
+    let app = st3::api::router(state);
+    let path = format!("/v1/hosts/studio/agent-launch?subject={subject}&token={token}");
+    let request = |path: String| {
+        Request::get(path)
+            .header("x-st3-person", "agent/bench/cost/launch")
+            .body(Body::empty())
+            .unwrap()
+    };
+    // Warm the private router before measuring the one-capture reference.
+    let warm = app.clone().oneshot(request(path.clone())).await.unwrap();
+    assert!(warm.status().is_success());
+    to_bytes(warm.into_body(), 32_768).await.unwrap();
+    let before = work::total();
+    let response = app.clone().oneshot(request(path.clone())).await.unwrap();
+    assert!(response.status().is_success());
+    let bytes = to_bytes(response.into_body(), 32_768).await.unwrap();
+    let one = work::total() - before;
+    assert!(one.statements > 0);
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let status = serde_json::from_value(body["value"].clone()).unwrap();
+    let marker = st3::agent_launch::wait_marker(&status).unwrap();
+    for event_ms in [100, 1] {
+        let before = work::total();
+        let started = Instant::now();
+        let mut waiting = Vec::new();
+        for _ in 0..WAITERS {
+            let app = app.clone();
+            let request = request(format!("{path}&after={marker}&wait_ms={WAIT_MS}"));
+            waiting.push(tokio::spawn(
+                async move { app.oneshot(request).await.unwrap() },
+            ));
+        }
+        let feed = events.clone();
+        let storm = tokio::spawn(async move {
+            let mut sent = 0;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(WAIT_MS);
+            while tokio::time::Instant::now() < deadline {
+                feed.send_modify(|generation| *generation += 1);
+                sent += 1;
+                tokio::time::sleep(Duration::from_millis(event_ms)).await;
+            }
+            sent
+        });
+        for waiter in waiting {
+            let response = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.status().is_success());
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 32_768).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["value"], serde_json::to_value(&status).unwrap());
+        }
+        let elapsed = started.elapsed();
+        let sent = storm.await.unwrap();
+        let spent = work::total() - before;
+        assert!(elapsed >= Duration::from_millis(WAIT_MS), "{elapsed:?}");
+        assert!(sent >= if event_ms == 1 { 100 } else { 5 });
+        assert!(
+            spent.statements <= one.statements * WAITERS * MAX_CAPTURES,
+            "{spent:?}, single capture {one:?}"
+        );
+        assert!(
+            spent.vm_steps <= one.vm_steps * WAITERS * MAX_CAPTURES,
+            "{spent:?}, single capture {one:?}"
+        );
+        assert_eq!(spent.fullscan_steps, 0);
+        assert_eq!(spent.sorts, 0);
+        assert_eq!(spent.autoindex_rows, 0);
+        println!(
+            "launch-wait cost: event_ms={event_ms}, events={sent}, waiters={WAITERS}, single={one:?}, total={spent:?}, elapsed={elapsed:?}, captures_per_waiter_max={MAX_CAPTURES}, inclusive_reads_per_second_per_waiter={}, steady_limit_per_second=2 (initial and dirty final partial capture included in measured rate)",
+            spent.statements as f64 / (one.statements as f64 * WAITERS as f64 * elapsed.as_secs_f64())
+        );
+    }
+}
 /// Historical runs may grow the answer, but must not repeat the assignee's message scan.
 #[tokio::test]
 async fn mission_detail_many_finished_runs_do_not_repeat_step_history() {
@@ -2126,6 +2246,37 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
     let mut fixture = fixture(&person, &client, subjects).await;
     fixture.items.insert("usage_since", usage_window.0.to_string());
     fixture.items.insert("usage_until", usage_window.1.to_string());
+    let launch_subject = "agent/bench/cost/launch";
+    let launch_intent = st3::parse_intent(
+        "version 2\nagent \"bench/cost/launch\" { workspace \"/tmp\"; argv \"/usr/bin/true\"; restart \"never\" }\n",
+        NODE,
+    ).unwrap();
+    store
+        .apply_internal(&launch_intent, "cost-launch-source")
+        .unwrap();
+    let launch_token = store
+        .selected_desired_token(launch_subject)
+        .unwrap()
+        .expect("the launch probe must name the seat's selected declaration");
+    let mut launched = claim_input("runtime.action.succeeded", "cost-seat-0-launch", 0, "");
+    launched.subject = launch_subject.into();
+    launched.fields = serde_json::from_value(json!({
+        "action":"start", "desired_token":launch_token, "incarnation_id":SEAT_RUNTIME,
+    }))
+    .unwrap();
+    store.append_claim(&launched).unwrap();
+    let mut ready = claim_input("runtime.action.succeeded", "cost-launch-ready", 0, "");
+    ready.subject = launch_subject.into();
+    ready.actor = None;
+    ready.idempotency_key = Some(format!("launch-ready:{launch_subject}:{SEAT_RUNTIME}"));
+    ready.fields = serde_json::from_value(json!({
+        "action":"harness-ready", "incarnation_id":SEAT_RUNTIME,
+    })).unwrap();
+    store.append_claim(&ready).unwrap();
+    fixture
+        .items
+        .insert("launch_subject", launch_subject.into());
+    fixture.items.insert("launch_token", launch_token);
     fixture.items.insert(
         "event_after",
         store.event_bounds().unwrap().0.saturating_sub(1).to_string(),
@@ -2271,6 +2422,16 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
         !event_page["items"].as_array().unwrap().is_empty(),
         "measure a populated event page, not a refused or empty traversal"
     );
+    let launch: Value = person
+        .get(&fixture.fill(
+            "/v1/hosts/bench-host/agent-launch?subject={launch_subject}&token={launch_token}",
+            0,
+        ))
+        .await
+        .expect("the launch cost probe must read a successful owned launch");
+    assert_eq!(launch["incarnation_id"], SEAT_RUNTIME);
+    assert_eq!(launch["desired_token"], fixture.items["launch_token"]);
+    assert_eq!(launch["stage"], "harness-ready");
 
     // Keep populated semantic coverage as well as the stable empty-period cost probe.
     // Both windows come from the same templates, even after a long cache residence.
@@ -2316,7 +2477,8 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
                     arrangement_person.clone()
                 } else if path.starts_with("/v1/client/adapter/") {
                     adapter.clone()
-                } else if path.starts_with("/v1/client/") || path == "/v1/notes" {
+                } else if path.starts_with("/v1/client/") || path == "/v1/notes"
+                    || path.ends_with("/agent-launch") || path.contains("/agent-launch?") {
                     person.clone()
                 } else {
                     client.clone()
