@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The store's claim fold reaches each domain projection through an ordered projector registry (store/projectors.rs) instead of naming it, with a test that pins the order per phase and per claim kind",
+  "replay": {"status": "none", "detail": "Every phase calls the same projections in the same order as before; the registry only lists them. Replay, append and incremental projection derive the same rows."},
+  "schema": {"status": "none", "detail": "No database schema, schema version or migration changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and fleet coordination are unchanged; the checkpoint proof's replay runs the same rebuild list."},
+  "compatibility": {"status": "none", "detail": "No client, protocol, harness, route, CLI output or exit code changes."},
+  "downtime": {"status": "none", "detail": "Nothing to restart beyond a normal upgrade."},
+  "manual": {"status": "none", "detail": "No operator steps."},
+  "recovery": {"status": "none", "detail": "Revert the pull request."}
+}
