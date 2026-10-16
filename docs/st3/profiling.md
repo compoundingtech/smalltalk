@@ -77,7 +77,15 @@ oldest first, with its holder, start (`started_unix_ms`) and `held_ms`, so a stu
 before it ends. `holders` ranks up to 16 holders by writer time over the last hour (count, over
 target, total and max). `long_holds` and `long_reads` keep the last 64 writer holds and read
 transactions over the target in that hour, newest first; a long hold also gives its `kind`
-(`batch` or `lend`), `writes` and `longest_write_ms`. `open_reads` lists up to eight read
+(`batch` or `lend`), `writes` and `longest_write_ms`. The replication projection chunk's loan
+also says where its hold went: `stages` gives the time in each of `begin` (BEGIN IMMEDIATE),
+`chunk-read` (the frontier and chunk bounds), `incremental`, `replay`, `after-projection`,
+`health` (the projection_health write), `commit`, `rollback`, `callbacks` (the caller's progress
+and log sinks, which run under the writer) and `release` (giving the connection back, with the
+commit observers it runs). `unattributed_ms` is the rest: the handoff between the writer thread
+and the borrower. Its hold in progress names the `stage` it is in. Other holds carry no stages.
+`begin` and `chunk-read` are marked but no control slows them, so a small `unattributed_ms` does
+not by itself show that their marks are placed right. `open_reads` lists up to eight read
 snapshots open past the target now. `waiting` counts callers waiting for the writer and reads
 waiting for admission, and `threads` counts this process's threads, in all and by name. `st
 doctor` prints it as `slo/writer-hold`.
