@@ -51,6 +51,8 @@ struct Pending {
     /// When it was last sent (or sent again): one st has not answered for a while is said to be
     /// unconfirmed, so it can be sent again or cleared rather than wait forever.
     since: Instant,
+    /// How many times it was sent again without the person asking, once st had not confirmed it.
+    resent: usize,
 }
 
 /// How often st is asked how long a message it takes, and how soon again after it did not answer.
@@ -1656,6 +1658,13 @@ pub fn run(context: Context) -> Result<()> {
                 });
             });
         }
+        // A send st did not confirm goes again by itself, as the same request, while the link is
+        // live; what it cannot settle that way waits for the person.
+        if matches!(ui.world.link, super::view::Link::Live) {
+            effects.extend(due_for_resend(&mut pending).into_iter().map(|token| Effect::Resend {
+                entry: format!("pending:{token}"),
+            }));
+        }
         for effect in effects {
             let (effect, token, sent) = match effect {
                 Effect::Resend { entry } => {
@@ -1720,6 +1729,7 @@ pub fn run(context: Context) -> Result<()> {
                         sent: sent.clone(),
                         echoed: false,
                         since: Instant::now(),
+                        resent: 0,
                     });
                     changed = true;
                     (effect, Some(token), Some(sent))
@@ -2187,6 +2197,33 @@ async fn older_page(
         cursor = page.cursor;
     }
     Err("this session is too long to read further back here; st conversations timeline reads it all".into())
+}
+
+/// How long a message st did not confirm waits before it is sent again by itself, for each time.
+/// A repeat is the exact first request, so st answers it with the first result and never takes
+/// the message twice (Nathan, 2026-10-16: "I hate when it thinks it failed but it didn't"); after
+/// the last one the person decides.
+const AUTO_RESEND_AFTER: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+];
+
+/// The unconfirmed messages whose turn to be sent again has come. Only one st took no answer for;
+/// a message st refused is never sent again here.
+fn due_for_resend(pending: &mut [Pending]) -> Vec<String> {
+    let mut due = Vec::new();
+    for entry in pending {
+        if entry.unconfirmed
+            && entry.message_id.is_none()
+            && let Some(wait) = AUTO_RESEND_AFTER.get(entry.resent)
+            && entry.since.elapsed() >= *wait
+        {
+            entry.resent += 1;
+            due.push(entry.token.clone());
+        }
+    }
+    due
 }
 
 /// Say of each message st has not answered for a while that it is unconfirmed, so the person
@@ -4220,6 +4257,7 @@ mod tests {
             sent: Arc::new(Mutex::new(None)),
             echoed: false,
             since,
+            resent: 0,
         };
         let mut fresh = [pending(Instant::now())];
         assert!(!mark_unanswered(&mut fresh));
@@ -4229,6 +4267,45 @@ mod tests {
         assert!(waiting[0].unconfirmed && waiting[0].failed.is_some());
         // Said once.
         assert!(!mark_unanswered(&mut waiting));
+    }
+
+    #[test]
+    fn a_send_st_did_not_confirm_goes_again_by_itself_a_few_times_and_then_waits_for_the_person() {
+        let pending = |unconfirmed: bool, message_id: Option<&str>| Pending {
+            token: "t".into(),
+            agent: "agent/example/cos".into(),
+            text: "hello".into(),
+            at: "10:17".into(),
+            message_id: message_id.map(str::to_owned),
+            failed: unconfirmed.then(|| "st did not answer".into()),
+            unconfirmed,
+            effect: Effect::Send {
+                in_reply_to: None,
+                agent: "agent/example/cos".into(),
+                text: "hello".into(),
+                tags: Vec::new(),
+                images: Vec::new(),
+            },
+            sent: Arc::new(Mutex::new(None)),
+            echoed: false,
+            since: Instant::now() - Duration::from_secs(600),
+            resent: 0,
+        };
+        // Due three times in a row (each resend restarts the clock in the loop), then never.
+        let mut waiting = [pending(true, None)];
+        for turn in 1..=3 {
+            assert_eq!(due_for_resend(&mut waiting), ["t"], "turn {turn}");
+            assert_eq!(waiting[0].resent, turn);
+            waiting[0].since = Instant::now() - Duration::from_secs(600);
+        }
+        assert!(due_for_resend(&mut waiting).is_empty(), "then the person decides");
+        // Not yet: the first wait is five seconds.
+        let mut fresh = [pending(true, None)];
+        fresh[0].since = Instant::now();
+        assert!(due_for_resend(&mut fresh).is_empty());
+        // A send st refused or answered, or one still waiting for its answer, is left alone.
+        let mut refused = [pending(false, None), pending(true, Some("message/one"))];
+        assert!(due_for_resend(&mut refused).is_empty());
     }
 
     fn fixture_screen() -> st3_client::TerminalScreen {
