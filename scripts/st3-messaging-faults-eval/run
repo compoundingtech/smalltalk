@@ -11,6 +11,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sys
 import secrets
 import tempfile
 import time
@@ -294,6 +295,12 @@ class Node:
                     env={**self.env, "PTY_ROOT": str(self.root / "pty")})
         except (ValueError, KeyError):
             pass
+        except asyncio.TimeoutError:
+            # Closing the registry is a courtesy ahead of the sweep below, which kills every
+            # process with this eval's endpoint, and the guardian removes the roots. A slow
+            # `pty` call (it waits for the seat's process tree to exit) is not the property
+            # under test and must not fail a case whose verdict is already decided.
+            print(f"{self.name}: pty cleanup exceeded its 5 s bound; sweeping the node's processes instead", file=sys.stderr, flush=True)
         finally:
             for process in reversed(self.processes):
                 await stop(process)

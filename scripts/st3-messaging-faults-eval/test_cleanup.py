@@ -68,6 +68,20 @@ class CleanupTests(unittest.TestCase):
                 node.cleanup.assert_awaited_once()
             self.assertEqual(list(parent.iterdir()), [])
 
+    def test_a_slow_pty_registry_does_not_fail_cleanup_and_the_sweep_still_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stopped = []
+            process = SimpleNamespace(pid=0)
+            node = SimpleNamespace(name='amber', root=Path(directory), env={}, logs=[], processes=[process],
+                                   down=AsyncMock(), seats=lambda: [])
+            async def stop(target):
+                stopped.append(target)
+            with patch.object(runner, 'capture', new=AsyncMock(side_effect=asyncio.TimeoutError)), \
+                 patch.object(runner, 'stop', new=stop):
+                asyncio.run(runner.Node.cleanup(node))
+            node.down.assert_awaited_once()
+            self.assertEqual(stopped, [process])
+
     def test_provider_shutdown_bounds_a_stuck_extension_and_kills_its_channel(self):
         with tempfile.TemporaryDirectory(prefix='mfe-provider-proof-') as directory:
             root = Path(directory)
