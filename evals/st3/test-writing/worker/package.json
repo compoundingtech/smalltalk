@@ -1,9 +1,0 @@
-{
-  "name": "grades",
-  "version": "0.2.0",
-  "private": true,
-  "type": "module",
-  "description": "Letter grades, GPA points, and score summaries.",
-  "main": "src/grades.js",
-  "scripts": { "test": "node --test" }
-}
