@@ -207,6 +207,32 @@ word, list group, why the agent needs someone, and what it holds and has queued 
 [the UI contract](../../clients/ui-contract.md#agent)). Older daemons omit both. A row that
 lacks it shows the state st reports, marked as coming from an older st; clients derive nothing.
 
+## Sync on the stream
+
+A window frame of the `attention` collection may carry `sync` (`StreamSync`): this host's
+replication, taken when the frame was built. It is `{state: "level"}` while this host is current,
+or `{state: "catching-up" | "diverged", peers}` naming the peers it lacks envelopes from or
+projects a different graph than, with the same `SyncPeer` a page's `sync` carries. Unlike a page's
+`SyncNotice`, which is absent while level, it says `level` explicitly: on the stream an absent
+`sync` means unknown, as from a daemon that does not send it, never level.
+
+A daemon that sends it puts it on every `snapshot` frame of the collection, and on a `changes`
+frame only when it changed since the subscription's previous frame: its state, or which peers
+(by `host_id`) are named, including the change back to `level`. A peer's counts moving is not a
+change. A client that missed a changes frame learns the current value from the next snapshot,
+which every resubscribe gets. A client on a daemon that sends none keeps reading a page's `sync`
+(`GET /v1/client/attention?limit=1`).
+
+A state this client does not know, or a shape the schema forbids (`level` with peers, or another
+state without them), reads as unknown, never level, and the frame is kept: the Rust client reads
+such a `sync` as none, and the TypeScript transport parses frames without validating them, so a
+reader there must apply the same rule (only `level` without peers is level; only `catching-up` or
+`diverged` with peers is behind; anything else is unknown). Decoding a frame with the generated
+TypeScript schema is stricter: it rejects a forbidden shape as it rejects any malformed field,
+and a state it does not know decodes as unknown. A daemon sends neither. Older clients ignore the
+field: the generated Rust and Swift decoders read frames by named field (fixtures:
+`fixtures/clients/stream-sync/frames.json`).
+
 ## Screen inventories
 
 Optional capability `inventory-collections` version 1 advertises six additional

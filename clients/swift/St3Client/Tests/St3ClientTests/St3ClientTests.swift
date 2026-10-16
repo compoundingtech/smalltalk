@@ -6,6 +6,33 @@ import FoundationNetworking
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    /// The stream sync notice frames (fixtures/clients/stream-sync/frames.json): each sync decodes as StreamSync and a
+    /// malformed one never reads as level; a glasses frame carrying a sync key a glasses stream never sends still
+    /// decodes, since synthesized Codable ignores undeclared keys.
+    func testStreamSyncFramesDecodeAndNoBadNoticeReadsAsLevel() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("fixtures/clients/stream-sync/frames.json"))
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        for group in ["valid", "invalid"] {
+            let cases = try XCTUnwrap(fixture[group] as? [String: [String: Any]])
+            for (name, testCase) in cases {
+                let frame = try XCTUnwrap(testCase["frame"] as? [String: Any])
+                let expected = try XCTUnwrap(testCase["expect"] as? String)
+                var read = "unknown"
+                if let sync = frame["sync"], JSONSerialization.isValidJSONObject(["sync": sync]),
+                   let notice = try? JSONDecoder().decode(StreamSync.self, from: JSONSerialization.data(withJSONObject: sync, options: [.fragmentsAllowed])) {
+                    switch notice.level { case true?: read = "level"; case false?: read = notice.state; case nil: read = "unknown" }
+                }
+                XCTAssertEqual(read, expected, "\(group) \(name)")
+                var glasses = frame
+                glasses["collection"] = "glasses"
+                let decoded = try JSONDecoder().decode(GlassCollectionFrame.self, from: JSONSerialization.data(withJSONObject: glasses))
+                XCTAssertEqual(decoded.kind, frame["kind"] as? String, "\(group) \(name)")
+            }
+        }
+    }
+
     func testQueuedMissionDeadlineAcceptsNullAndAdmissionTimestamp() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

@@ -233,6 +233,29 @@ impl SyncNotice {
     }
 }
 
+/// This host's replication as a stream frame states it (`sync` on a collection frame): `level`,
+/// or `catching-up` or `diverged` with the peers ahead. Unlike a page's [`SyncNotice`] it is
+/// explicit when level, so a frame without one is unknown, never level.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StreamSync {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<SyncPeer>,
+}
+
+impl StreamSync {
+    /// `Some(true)` when level, `Some(false)` when catching up or diverged with the peers named,
+    /// and `None` for a state this client does not know or a shape the contract forbids (level
+    /// with peers, or not level without them): unknown, never level.
+    pub fn level(&self) -> Option<bool> {
+        match (self.state.as_str(), self.peers.is_empty()) {
+            ("level", true) => Some(true),
+            ("catching-up" | "diverged", false) => Some(false),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ExchangeTransport {
     pub at: String,

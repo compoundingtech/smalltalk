@@ -2185,6 +2185,19 @@ export const Snapshot = /*#__PURE__*/ (() => Schema.Struct({
 export type Snapshot = typeof Snapshot.Type
 export type SnapshotEncoded = typeof Snapshot.Encoded
 
+/** This host's replication as a stream frame states it: level, or catching up with or diverged from the peers named. Unlike a page's SyncNotice it is explicit when level, so that its absence on a stream means unknown. A state this client does not know reads as unknown, never level. */
+export const StreamSync = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "peers": optionalKey(Schema.Array(Schema.Unknown).check(Schema.isMaxLength(0))), "state": Schema.Literal("level") }),
+  Schema.Struct({ /** The peers this host is behind or diverged from: present exactly when the state is not level. */
+"peers": Schema.Array(SyncPeer).check(Schema.isMinLength(1)).annotate({ description: "The peers this host is behind or diverged from: present exactly when the state is not level." }), "state": Schema.Literal("catching-up") }),
+  Schema.Struct({ /** The peers this host is behind or diverged from: present exactly when the state is not level. */
+"peers": Schema.Array(SyncPeer).check(Schema.isMinLength(1)).annotate({ description: "The peers this host is behind or diverged from: present exactly when the state is not level." }), "state": Schema.Literal("diverged") }),
+  Schema.Struct({ /** The peers this host is behind or diverged from: present exactly when the state is not level. */
+"peers": optionalKey(Schema.Array(SyncPeer).check(Schema.isMinLength(1))).annotate({ description: "The peers this host is behind or diverged from: present exactly when the state is not level." }), "state": unknownCase(["level","catching-up","diverged"]) })
+], { mode: "oneOf" }).annotate({ identifier: "StreamSync", description: "This host's replication as a stream frame states it: level, or catching up with or diverged from the peers named. Unlike a page's SyncNotice it is explicit when level, so that its absence on a stream means unknown. A state this client does not know reads as unknown, never level." }))()
+export type StreamSync = typeof StreamSync.Type
+export type StreamSyncEncoded = typeof StreamSync.Encoded
+
 export const TerminalFacts = /*#__PURE__*/ (() => Schema.Struct({
   "clients": optionalKey(Schema.Struct({ "attached": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "read_only": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "total": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })),
   "columns": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
@@ -2836,8 +2849,10 @@ export type TimelineEntry = typeof TimelineEntry.Type
 export type TimelineEntryEncoded = typeof TimelineEntry.Encoded
 
 export const CollectionFrame = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(Resource), "kind": Schema.Literal("snapshot"), "order": Schema.Array(Id), "snapshot": Snapshot }),
-  Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(Resource) }),
+  Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(Resource), "kind": Schema.Literal("snapshot"), "order": Schema.Array(Id), "snapshot": Snapshot, /** This host's replication, taken when this frame was built. A daemon that sends it sends it on every snapshot of the collections that carry it (attention). Absent means unknown (an older daemon), never level. */
+"sync": optionalKey(StreamSync) }),
+  Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, /** Present only when this host's replication changed since the last frame of this subscription (its state, or which peers are ahead), including back to level. Absent means it did not change. */
+"sync": optionalKey(StreamSync), "upserts": Schema.Array(Resource) }),
   Schema.Struct({ "collection": Schema.Literal("terminal"), "id": Schema.String, "kind": Schema.Literal("screen"), "snapshot": Snapshot, "value": TerminalScreen }),
   Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), /** Present when conversation-blocks.v1 is negotiated and at least one header field is available */
 "header": optionalKey(ConversationHeader), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "replace": Schema.Boolean, "session_id": Id }),

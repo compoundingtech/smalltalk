@@ -617,6 +617,9 @@ pub enum CollectionEvent {
         items: Vec<Resource>,
         order: Vec<String>,
         has_more: bool,
+        /// This host's replication when the frame was built, on the collections that carry it.
+        /// `None` when the frame has none (an older daemon) or it could not be read: unknown.
+        sync: Option<StreamSync>,
     },
     /// What changed in the window since the last frame, with its complete new order.
     Changes {
@@ -626,6 +629,8 @@ pub enum CollectionEvent {
         removes: Vec<String>,
         order: Vec<String>,
         has_more: bool,
+        /// This host's replication, only when it changed since the subscription's last frame.
+        sync: Option<StreamSync>,
     },
     /// A terminal subscription's whole current screen; it replaces every earlier one.
     Screen {
@@ -660,6 +665,12 @@ pub enum CollectionEvent {
     },
 }
 
+/// A frame's `sync`, when it has one this client can read. A malformed one is no reason to drop
+/// the frame: it reads as none, unknown, like a frame from a daemon that sends none.
+fn stream_sync(frame: &serde_json::Value) -> Option<StreamSync> {
+    serde_json::from_value(frame.get("sync")?.clone()).ok()
+}
+
 impl CollectionEvent {
     fn from_frame(frame: serde_json::Value) -> Result<Self, ClientError> {
         fn field<T: DeserializeOwned>(
@@ -678,6 +689,7 @@ impl CollectionEvent {
                 items: field(&frame, "items")?,
                 order: field(&frame, "order")?,
                 has_more: field(&frame, "has_more")?,
+                sync: stream_sync(&frame),
                 id,
             }),
             Some("changes") => Ok(Self::Changes {
@@ -686,6 +698,7 @@ impl CollectionEvent {
                 removes: field(&frame, "removes")?,
                 order: field(&frame, "order")?,
                 has_more: field(&frame, "has_more")?,
+                sync: stream_sync(&frame),
                 id,
             }),
             Some("screen") => Ok(Self::Screen {
@@ -4022,6 +4035,39 @@ fn percent_encode_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The stream sync notice frames (`fixtures/clients/stream-sync/frames.json`) all decode: a
+    /// frame without `sync`, and every malformed one, reads as unknown, never level, and a key
+    /// this client does not know is ignored.
+    #[test]
+    fn stream_sync_frames_decode_and_no_bad_notice_reads_as_level() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/clients/stream-sync/frames.json"
+        ))
+        .unwrap();
+        for group in ["valid", "invalid"] {
+            for (name, case) in fixture[group].as_object().unwrap() {
+                let mut frame = case["frame"].clone();
+                frame["a_key_from_a_newer_daemon"] = serde_json::json!({"any": "value"});
+                let event = CollectionEvent::from_frame(frame)
+                    .unwrap_or_else(|error| panic!("{name} does not decode: {error}"));
+                let (CollectionEvent::Snapshot { sync, .. }
+                | CollectionEvent::Changes { sync, .. }) = event
+                else {
+                    panic!("{name} is not a window frame");
+                };
+                let read = match sync
+                    .as_ref()
+                    .map(|sync| (sync.level(), sync.state.as_str()))
+                {
+                    Some((Some(true), _)) => "level",
+                    Some((Some(false), state)) => state,
+                    _ => "unknown",
+                };
+                assert_eq!(read, case["expect"], "{group} {name}");
+            }
+        }
+    }
+
     fn api(code: ErrorCode, message: &str) -> ClientError {
         ClientError::Api(
             code.clone(),
