@@ -3660,12 +3660,16 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reason", string()),
         ],
         "schedule.occurrence-scheduled" => &[
+            ("standby", object()),
+            ("reason", string()),
             ("occurrence", integer()),
             ("revision", string()),
             ("at_unix_ms", integer()),
             ("scheduled_at_unix_ms", string()),
         ],
         "schedule.occurrence-reached" => &[
+            ("standby", object()),
+            ("reason", string()),
             ("occurrence", integer()),
             ("revision", string()),
             ("at_unix_ms", integer()),

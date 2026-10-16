@@ -4913,3 +4913,6 @@ mission "orchard/release" state="ready" {
     let shown = older.st_json(&["missions", "show", run["subject"].as_str().unwrap()]);
     assert_eq!(shown["provenance"]["reason"], "Approved release source.");
 }
+
+#[path = "fleet/schedule_standby.rs"]
+mod schedule_standby;

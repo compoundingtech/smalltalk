@@ -1955,6 +1955,15 @@ schedule again never starts work from before the stop.
 
 The schedule does not assign work. The referenced mission defines its work selectors.
 
+### Optional automatic standby
+
+See [Automatic schedule standby](schedule-standby.md) for the `standby { host
+"archive"; after "5m" }` declaration and all-member adoption requirement.
+Jobs must be safe to run twice: while hosts cannot hear each other a job may run
+on both; write jobs so a second run is harmless.
+
+If the standby restarts while the primary is down, the standby cannot take over until it has heard the primary once; a run in that window may be skipped (catch-up policy applies when the primary returns).
+
 ## Mission revisions
 
 In [free mode](kdl-lifecycle.md#free-mode), any person or agent may revise any part of a run, as
