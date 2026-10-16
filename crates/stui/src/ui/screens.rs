@@ -390,6 +390,7 @@ fn structured_request(
     card: &mut Doc,
     from: &str,
     request: &st3_client::StructuredRequest,
+    images: &[st3_conversation_ui::MailImage],
     drafts: &Drafts<'_>,
     inner: usize,
 ) {
@@ -465,6 +466,31 @@ fn structured_request(
                 &[text::run("   ", theme::dim())],
                 None,
             ));
+        }
+    }
+    // The images it carries: a line each that opens it; where stui keeps image state, the line
+    // also loads it inline (`Content::expand_requests`).
+    if !images.is_empty() {
+        card.blank();
+        for image in images {
+            card.targets.push(super::doc::Target {
+                line: card.lines.len(),
+                column: 0,
+                width: inner as u16,
+                hit: Hit::Pane(st3_conversation_ui::PaneIntent::Image(image.clone())),
+            });
+            card.line(Line::from(vec![
+                span(
+                    format!(
+                        "   ▣ {} · {} · {} KB  ",
+                        super::content::image_name(image),
+                        image.media_type,
+                        image.size.div_ceil(1024)
+                    ),
+                    theme::text(),
+                ),
+                span("open", theme::fg(theme::LAVENDER)),
+            ]));
         }
     }
     card.blank();
@@ -1204,8 +1230,9 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
         AttentionKind::Request {
             from,
             structured: Some(request),
+            images,
             ..
-        } => structured_request(&mut card, from, request, drafts, inner),
+        } => structured_request(&mut card, from, request, images, drafts, inner),
         AttentionKind::Request { from, question, .. } => {
             let custom = item.actions.iter().any(|action| action == "custom.reply");
             card.line(Line::from(vec![

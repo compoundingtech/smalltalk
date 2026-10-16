@@ -43,6 +43,7 @@ fn ask(agent: &str) -> Attention {
             from_id: agent.into(),
             question: "Ship the release?".into(),
             structured: None,
+            images: Vec::new(),
         },
         actions: vec!["work.done".into()],
         related: vec![],

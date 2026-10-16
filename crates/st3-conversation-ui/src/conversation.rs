@@ -120,16 +120,18 @@ impl Cache {
                 .count();
             if run == 0 {
                 let entry = &entries[index];
-                doc.entries.push((entry.id.clone(), doc.lines.len()));
                 // Mail between others is two lines until opened (Nathan, 2026-10-02).
                 if matches!(&entry.body, Body::Mail { .. })
                     && folds(&entry.body)
                     && !expanded.contains(&entry.id)
                 {
+                    doc.entries.push((entry.id.clone(), doc.lines.len()));
                     doc.append(mail_lines(entry, width, theme), 0);
                     index += 1;
                     continue;
                 }
+                // Drawn in full, the entry records its own start, once: content
+                // decorators add their lines after each start they find.
                 let one = self.render_as(
                     std::slice::from_ref(entry),
                     width,
@@ -819,6 +821,33 @@ mod tests {
         entries.push(entry("3", Body::Event("step ready".into())));
         let grown = cache.render(&entries, 40, &HashSet::new(), "⠋", &crate::tests::theme());
         assert_eq!(&grown.lines[..first.lines.len()], &first.lines[..]);
+    }
+
+    #[test]
+    fn simplified_records_each_entry_once() {
+        // A decorator adds its lines after every start it finds; twice would draw them twice.
+        let entries = vec![
+            entry("1", Body::User("what is growing here?".into())),
+            entry(
+                "2#images",
+                Body::Tool {
+                    title: "image · Ctrl+Enter details · Ctrl+U load inline".into(),
+                    state: ToolState::Ok,
+                    output: Vec::new(),
+                },
+            ),
+            entry("3", Body::Assistant("Rings of clover.".into())),
+        ];
+        let doc = Cache::default().render_as(
+            &entries,
+            60,
+            &HashSet::new(),
+            "⠋",
+            &crate::tests::theme(),
+            Density::Simple,
+        );
+        let ids: Vec<_> = doc.entries.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["1", "2#images", "3"]);
     }
 
     #[test]

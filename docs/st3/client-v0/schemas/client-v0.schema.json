@@ -2079,7 +2079,8 @@
         "recommendation": {"type": "object", "additionalProperties": false, "required": ["answer", "reason"], "properties": {"answer": {"type": "string"}, "reason": {"type": "string"}}, "description": "Absent means no recommendation."},
         "subjects": {"type": "array", "maxItems": 12, "items": {"$ref": "#/$defs/RequestSubject"}},
         "answers": {"type": "array", "maxItems": 5, "items": {"$ref": "#/$defs/RequestAnswerOption"}},
-        "custom": {"type": "boolean", "description": "A choice also takes an answer in the person's own words."}
+        "custom": {"type": "boolean", "description": "A choice also takes an answer in the person's own words."},
+        "attachments": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/Attachment"}, "description": "Images to look at, read with the blob route and the ask's step as the carrier (message=step-run/…)."}
       }
     },
     "PersonUpdate": {

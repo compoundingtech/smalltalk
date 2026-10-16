@@ -1,7 +1,7 @@
 //! Person asks are runtime steps. The immutable asking claim supplies their ownership fence;
 //! step_runs supplies their state. No separate attention record is created.
 use super::*;
-use crate::model::{PersonAskRequest, PersonStepResponse};
+use crate::model::{MessageAttachment, PersonAskRequest, PersonStepResponse};
 use crate::person_request::{StructuredRequest, answer_summary};
 
 #[cfg(test)]
@@ -25,6 +25,14 @@ const PERSON_ASKS_FOR_RECONCILE: &str =
        AND step_runs.status IN ('ready','pending')
        AND claims.subject=step_runs.subject AND claims.kind='work.person-asked'
      ORDER BY CANONICAL_ASC(claims)";
+
+/// The images an ask carries and the two parties to it (`Store::ask_images`).
+#[derive(Clone, Debug)]
+pub struct AskImages {
+    pub asker: String,
+    pub person: Option<String>,
+    pub attachments: Vec<MessageAttachment>,
+}
 
 fn person_asks_for_reconcile(connection: &Connection) -> Result<Vec<ClaimRecord>> {
     connection
@@ -685,6 +693,26 @@ impl Store {
             }
             step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the person step disappeared"))
         }).map_err(internal)?
+    }
+
+    /// The images an ask's request carries, found by the ask's person step, with who asked and
+    /// whom it asks: what a blob read needs to authorize the person looking at them.
+    pub fn ask_images(&self, step_subject: &str) -> Result<Option<AskImages>> {
+        let connection = self.readers.get();
+        let Some(ask) = request(&connection, step_subject)? else {
+            return Ok(None);
+        };
+        let attachments = ask.body["fields"]
+            .pointer("/request/attachments")
+            .cloned()
+            .map(serde_json::from_value::<Vec<MessageAttachment>>)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(AskImages {
+            asker: ask.actor.unwrap_or_default(),
+            person: step(&connection, step_subject)?.and_then(|view| view.assigned_to),
+            attachments,
+        }))
     }
 
     pub(crate) fn reconcile_person_asks(&self) -> Result<bool> {

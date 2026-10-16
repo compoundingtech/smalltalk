@@ -1039,6 +1039,56 @@ fn attribute(head: &str, name: &str) -> Option<String> {
     Some(unescape(&head[start..end]))
 }
 
+/// The images a delivery names, `<attachment path="…/<sha256>.png" media_type="image/png"
+/// bytes="…" name="…"/>`, as the message's own images: read from st by the message, never by
+/// the seat's path, which stays private. What is left is the delivery's text; an image past its
+/// retention (`unavailable="expired"`) says so in it.
+fn delivered_images(block: &str, message: &str) -> (String, Vec<MailImage>) {
+    let mut text = String::with_capacity(block.len());
+    let mut images = Vec::new();
+    let mut rest = block;
+    while let Some(start) = rest.find("<attachment ") {
+        let Some(length) = rest[start..].find("/>") else {
+            break;
+        };
+        let element = &rest[start..start + length + 2];
+        text.push_str(&rest[..start]);
+        rest = &rest[start + length + 2..];
+        let name = attribute(element, "name");
+        let media_type = attribute(element, "media_type").unwrap_or_default();
+        let sha256 = attribute(element, "path").and_then(|path| {
+            let leaf = path.rsplit(['/', '\\']).next()?.split('.').next()?.to_owned();
+            (leaf.len() == 64 && leaf.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(leaf)
+        });
+        match sha256 {
+            Some(sha256) if media_type.starts_with("image/") && message.starts_with("message/") => {
+                images.push(MailImage {
+                    sha256,
+                    message: message.to_owned(),
+                    media_type,
+                    name,
+                    size: attribute(element, "bytes")
+                        .and_then(|bytes| bytes.parse().ok())
+                        .unwrap_or_default(),
+                });
+            }
+            _ => text.push_str(&format!(
+                "[{} · {}]",
+                name.as_deref().unwrap_or("attachment"),
+                if attribute(element, "unavailable").as_deref() == Some("expired") {
+                    "expired".to_owned()
+                } else if media_type.is_empty() {
+                    "not available here".to_owned()
+                } else {
+                    media_type
+                }
+            )),
+        }
+    }
+    text.push_str(rest);
+    (text.trim_end().to_owned(), images)
+}
+
 /// Undo the XML escaping st applies to a delivery's attributes and body.
 fn unescape(text: &str) -> String {
     text.replace("&lt;", "<")
@@ -1222,6 +1272,7 @@ fn harness_bodies(
             delivered.insert(graph);
             continue;
         }
+        let (block, images) = delivered_images(&block, &graph);
         bodies.push(Body::Mail {
             from,
             to: attribute(&head, "to").unwrap_or_default(),
@@ -1230,7 +1281,7 @@ fn harness_bodies(
             delivered: false,
             dictated: false,
             signed: None,
-            images: Vec::new(),
+            images,
         });
     }
     // A `<channel>` delivery announces mail that is already in the stream, so it becomes one line.
