@@ -157,8 +157,8 @@ pub(crate) struct SealedBatch {
     /// Each blob hash the claims name, and whether `blobs` held it. A named blob that is not
     /// stored is left out of the payload.
     named_blobs: Vec<(String, bool)>,
-    /// Each claim's `claim_signatures` text, in claim order.
-    stored_signatures: Vec<Option<String>>,
+    /// Each claim's stored signature under the serving authorization model, in claim order.
+    stored_signatures: Vec<Option<ClaimSignature>>,
     /// The signature each signed claim carries, stored before or made now.
     signatures: Vec<(String, ClaimSignature)>,
     pub(crate) payload: Vec<u8>,
@@ -216,14 +216,8 @@ pub(crate) fn seal_batch(
     let mut claim_signatures = BTreeMap::new();
     let mut fresh = Vec::new();
     for claim in &claims {
-        let stored = connection
-            .prepare_cached("SELECT signature FROM claim_signatures WHERE claim_id=?1")?
-            .query_row([&claim.id], |row| row.get::<_, String>(0))
-            .optional()?;
-        let existing = stored
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<ClaimSignature>(text).ok());
-        let signature = match (existing, sign) {
+        let stored = principals::envelope_signature(connection, &claim.id)?;
+        let signature = match (stored.clone(), sign) {
             (Some(signature), _) => Some(signature),
             (None, Some(sign)) => {
                 let unsealed = principals::Unsealed {
@@ -376,10 +370,7 @@ fn sealed_batch_current(connection: &Connection, sealed: &SealedBatch) -> Result
         }
     }
     for ((claim_id, _), stored) in claims.iter().zip(&sealed.stored_signatures) {
-        let now = connection
-            .prepare_cached("SELECT signature FROM claim_signatures WHERE claim_id=?1")?
-            .query_row([claim_id], |row| row.get::<_, String>(0))
-            .optional()?;
+        let now = principals::envelope_signature(connection, claim_id)?;
         if now != *stored {
             return Ok(false);
         }

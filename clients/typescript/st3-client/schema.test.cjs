@@ -502,3 +502,18 @@ test('exchange carrier additions preserve legacy absence and future carrier valu
     assert.deepEqual(Schema.encodeSync(Rich.SyncPeer)(decode(future)), future);
     assert.throws(() => decode({ ...observed, last_failed_exchange: { carrier: 'fabric' } }));
 });
+
+
+test('message provenance retains its serving model and reads historical absence strictly', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const decode = Rich.decodeUnknownSync(Rich.MessageProvenance, 'strict');
+    for (const authorization_model of ['legacy', 'candidate']) {
+        const wire = { verdict: 'unsigned', authorization_model };
+        assert.deepEqual(Schema.encodeSync(Rich.MessageProvenance)(decode(wire)), wire);
+    }
+    const historical = { verdict: 'unsigned' };
+    assert.deepEqual(Schema.encodeSync(Rich.MessageProvenance)(decode(historical)), historical);
+    assert.throws(() => decode({ ...historical, authorization_model: 'unqualified-model' }));
+    assert.throws(() => decode({ ...historical, authorization_model: null }));
+    assert.throws(() => decode({ ...historical, undeclared_authority: true }));
+});

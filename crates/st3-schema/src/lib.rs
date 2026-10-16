@@ -23,7 +23,7 @@ pub const SCHEMA_NAME: &str = "st3.v1";
 pub use st_storage_version::STORAGE_VERSION;
 pub const LOCAL_STORAGE_SCHEMA: &str = r#"## Local checkpoint capture storage
 
-SQLite `user_version` is 19. The local checkpoint guard uses trigger version 3, independently of the unchanged claim/wire registry digest. Initialization adds the singleton, any missing guard columns, and its mutation triggers; it does not scan history, rewrite claim bodies, rebuild projections, or force replay.
+SQLite `user_version` is 20. The local checkpoint guard uses trigger version 3, independently of the unchanged claim/wire registry digest. Initialization adds the singleton, any missing guard columns, and its mutation triggers; it does not scan history, rewrite claim bodies, rebuild projections, or force replay.
 
 ```sql
 CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
@@ -57,7 +57,7 @@ Capture does not read envelope signatures/holds, projection-health rows, peer/cu
 
 Triggers persist and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. A trigger-version migration atomically drops/recreates the old predicates, increments `value`, and stores `trigger_version=3`; captures using the old guard must restart. Earlier version-18 PR-head stores receive `cut_unix_ms` and `trigger_version` columns with default zero while preserving their epoch and frontier. Version-2 stores retain their active cut/frontier through the version-3 predicate migration. Ordinary reopens preserve all bounds and do not repeat the migration.
 
-Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Stable older binaries reject storage version 18. Earlier version-18 PR-head binaries are not rollback targets: guard version 1 cannot safely operate the cut-aware schema, and guard version 2 rejects trigger version 3 on open. Their copied stores can migrate forward only. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.
+The checkpoint guard requires the normal process restart. Storage version 20 atomically renames and preserves the complete pre-candidate signature projection and its indexes, then inventories candidates online in bounded loans while the whole legacy authorization model serves. One atomic control-row update activates the candidate model; the version marker commits with the rename, so older builds refuse the store before creating empty signature state. The restart duration has not been measured. Builds limited to storage version 19 or earlier reject version 20; in-place rollback below 20 is unsupported. Earlier version-18 PR-head binaries are not rollback targets: guard version 1 cannot safely operate the cut-aware schema, and guard version 2 rejects trigger version 3 on open. Their copied stores can migrate forward only. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, or wire protocol changes. Local signature provenance and grant proof responses label the serving authorization model.
 
 ## Local runtime start operations
 

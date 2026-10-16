@@ -2213,6 +2213,9 @@ pub struct TimelineMessageBody {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MessageProvenance {
     pub verdict: String,
+    /// The complete local authorization model supplying this judgment; absent on older producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

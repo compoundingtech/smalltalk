@@ -398,9 +398,9 @@ pub fn admit_prepared_envelope_tx(
             Ok(ReplicatedClaimAdmission::Valid) => {
                 // A checkpoint dropped this claim here, and another envelope carries it again.
                 // A node that still held it would ignore the copy as already stored.
-                let inserted = if checkpoint::claim_tombstoned(transaction, &claim.id)
-                    .map_err(internal)?
-                {
+                let tombstoned = checkpoint::claim_tombstoned(transaction, &claim.id)
+                    .map_err(internal)?;
+                let inserted = if tombstoned {
                     0
                 } else {
                     transaction
@@ -422,9 +422,14 @@ pub fn admit_prepared_envelope_tx(
                     ])
                     .map_err(internal)?
                 };
-                if let Some(signature) = payload.claim_signatures.get(&claim.id) {
-                    principals::store_claim_signature_tx(transaction, &claim.id, signature)
-                        .map_err(internal)?;
+                if !tombstoned && let Some(signature) = payload.claim_signatures.get(&claim.id) {
+                    principals::store_carried_signature_tx(
+                        transaction,
+                        &claim.id,
+                        signature,
+                        &envelope.writer,
+                    )
+                    .map_err(internal)?;
                 }
                 transaction
                     .prepare_cached(
