@@ -82,7 +82,13 @@ also says where its hold went: `stages` gives the time in each of `begin` (BEGIN
 `chunk-read` (the frontier and chunk bounds), `incremental`, `replay`, `after-projection`,
 `health` (the projection_health write), `commit`, `rollback`, `callbacks` (the caller's progress
 and log sinks, which run under the writer) and `release` (giving the connection back, with the
-commit observers it runs). `unattributed_ms` is the rest: the handoff between the writer thread
+commit observers it runs). Inside `incremental`, rebuilding an aggregate a late claim reached is
+its own stage: `rebuild-base` (a desired subject, document or mission), `rebuild-tree` (a whole
+run tree), `rebuild-part` (one part of a tree) or `rebuild-planning` (every planning session).
+Stages never overlap: a rebuild's time is not also in `incremental`, so the stages and
+`unattributed_ms` add up to `held_ms`. `rebuilt` counts, by the stage that ran them, the
+aggregates rebuilt and the claims they replayed. A full replay's own rebuilds count under
+`replay`. `unattributed_ms` is the rest: the handoff between the writer thread
 and the borrower. Its hold in progress names the `stage` it is in. Other holds carry no stages.
 `begin` and `chunk-read` are marked but no control slows them, so a small `unattributed_ms` does
 not by itself show that their marks are placed right. `open_reads` lists up to eight read

@@ -10,7 +10,10 @@
 //!
 //! A lend asked for inside `Stages::begin` also says where its hold went: each stage its borrower
 //! entered, and what no stage covers, which is the handoff between the writer thread and the
-//! borrower. Other holds carry no stages.
+//! borrower. Other holds carry no stages. Stages never overlap: entering one, including through
+//! `stage` from code the borrower calls, pauses the one it interrupts, so the stages and the
+//! unattributed rest add up to the hold. A staged lend also counts the aggregates it rebuilt and
+//! their claims, by the stage that rebuilt them.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -140,6 +143,8 @@ struct Long {
     longest_write: Duration,
     /// A staged lend's time by stage, in the order first entered.
     stages: Option<Vec<(&'static str, Duration)>>,
+    /// A staged lend's rebuilt aggregates and their claims, by stage.
+    rebuilt: Vec<(&'static str, Rebuilt)>,
 }
 
 #[derive(Default)]
@@ -206,6 +211,7 @@ impl Record {
                 writes: hold.writes,
                 longest_write: hold.longest.as_ref().map_or(Duration::ZERO, |(_, took)| *took),
                 stages: hold.stages.take(),
+                rebuilt: std::mem::take(&mut hold.rebuilt),
             });
         }
     }
@@ -220,6 +226,7 @@ impl Record {
             writes: 0,
             longest_write: Duration::ZERO,
             stages: None,
+            rebuilt: Vec::new(),
         });
     }
 
@@ -272,6 +279,13 @@ impl Record {
                         row["stages"] = stages.iter().map(|(stage, spent)| ((*stage).to_owned(), json!(ms(*spent)))).collect::<Value>();
                         row["unattributed_ms"] = json!(ms(long.held.saturating_sub(staged)));
                     }
+                    if !long.rebuilt.is_empty() {
+                        row["rebuilt"] = long
+                            .rebuilt
+                            .iter()
+                            .map(|(stage, rebuilt)| ((*stage).to_owned(), rebuilt.json()))
+                            .collect::<Value>();
+                    }
                     row
                 })
                 .collect::<Vec<_>>()
@@ -323,6 +337,8 @@ pub struct WriterHold {
     writes: usize,
     /// A staged lend's stages, closed when the hold ends.
     stages: Option<Vec<(&'static str, Duration)>>,
+    /// A staged lend's rebuilt aggregates, taken when the hold ends.
+    rebuilt: Vec<(&'static str, Rebuilt)>,
 }
 
 impl WriterHold {
@@ -343,6 +359,7 @@ impl WriterHold {
             longest: None,
             writes: 0,
             stages: None,
+            rebuilt: Vec::new(),
         }
     }
 
@@ -378,7 +395,20 @@ impl Drop for WriterHold {
         if self.kind == HoldKind::Lend
             && let Some(clock) = &self.first.0.stages
         {
-            self.stages = Some(clock.lock().unwrap_or_else(PoisonError::into_inner).close(ended));
+            let mut clock = clock.lock().unwrap_or_else(PoisonError::into_inner);
+            self.stages = Some(clock.close(ended));
+            self.rebuilt = clock.rebuilt.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let mut recent = RECENT_STAGED.lock().unwrap_or_else(PoisonError::into_inner);
+                if recent.len() == LONG {
+                    recent.pop_front();
+                }
+                recent.push_back((
+                    self.stages.clone().unwrap_or_default(),
+                    self.rebuilt.clone(),
+                ));
+            }
         }
         if let Some(observer) = &self.holder().0.observer {
             observer.fetch_max(us(held), Ordering::Relaxed);
@@ -442,13 +472,27 @@ pub fn longest_during<T>(work: impl FnOnce() -> T) -> (T, Duration) {
 }
 
 /// Stages a lend keeps; a later stage adds to `other`, the last.
-const STAGES_KEPT: usize = 12;
+const STAGES_KEPT: usize = 16;
+
+/// The aggregates one stage of a staged lend rebuilt, and the claims they replayed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rebuilt {
+    pub aggregates: u64,
+    pub claims: u64,
+}
+
+impl Rebuilt {
+    fn json(&self) -> Value {
+        json!({"aggregates": self.aggregates, "claims": self.claims})
+    }
+}
 
 /// Where one staged lend's borrower spent its hold so far.
 #[derive(Debug, Default)]
 struct StageClock {
     open: Option<(&'static str, Instant)>,
     spent: Vec<(&'static str, Duration)>,
+    rebuilt: Vec<(&'static str, Rebuilt)>,
     closed: bool,
 }
 
@@ -463,6 +507,28 @@ impl StageClock {
         } else {
             self.spent.push(("other", spent));
         }
+    }
+
+    /// Count one aggregate rebuilt with `claims` claims against the open stage, or `other`.
+    fn rebuilt(&mut self, claims: u64) {
+        let open = self.open.map_or("other", |(stage, _)| stage);
+        let stage = if self.rebuilt.len() < STAGES_KEPT - 1
+            || self.rebuilt.iter().any(|(kept, _)| *kept == open)
+        {
+            open
+        } else {
+            "other"
+        };
+        let index = match self.rebuilt.iter().position(|(kept, _)| *kept == stage) {
+            Some(index) => index,
+            None => {
+                self.rebuilt.push((stage, Rebuilt::default()));
+                self.rebuilt.len() - 1
+            }
+        };
+        let entry = &mut self.rebuilt[index].1;
+        entry.aggregates += 1;
+        entry.claims = entry.claims.saturating_add(claims);
     }
 
     /// End the open stage at `at` and stop. A stage entered after this is not counted.
@@ -520,27 +586,76 @@ impl Stages {
     /// End the open stage and begin `stage`, returning the stage it ended, so a callback can be
     /// charged to its own stage and the caller's resumed after it.
     pub fn enter(&self, stage: &'static str) -> Option<&'static str> {
-        let now = Instant::now();
-        let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
-        if clock.closed {
-            return None;
-        }
-        let ended = clock.open.replace((stage, now));
-        if let Some((ended, since)) = ended {
-            clock.add(ended, now.saturating_duration_since(since));
-        }
-        ended.map(|(stage, _)| stage)
+        enter(&self.clock, stage)
     }
 
     /// Run `work` as `stage`, then resume the stage it interrupted.
     pub fn during<T>(&self, stage: &'static str, work: impl FnOnce() -> T) -> T {
-        let resumed = self.enter(stage);
-        let result = work();
-        if let Some(resumed) = resumed {
-            self.enter(resumed);
-        }
-        result
+        during(&self.clock, stage, work)
     }
+}
+
+fn enter(clock: &Mutex<StageClock>, stage: &'static str) -> Option<&'static str> {
+    let now = Instant::now();
+    let mut clock = clock.lock().unwrap_or_else(PoisonError::into_inner);
+    if clock.closed {
+        return None;
+    }
+    let ended = clock.open.replace((stage, now));
+    if let Some((ended, since)) = ended {
+        clock.add(ended, now.saturating_duration_since(since));
+    }
+    ended.map(|(stage, _)| stage)
+}
+
+fn during<T>(clock: &Mutex<StageClock>, stage: &'static str, work: impl FnOnce() -> T) -> T {
+    let resumed = enter(clock, stage);
+    let result = work();
+    if let Some(resumed) = resumed {
+        enter(clock, resumed);
+    }
+    result
+}
+
+/// Run `work` as `stage` of the staged lend this thread is in, then resume the stage it
+/// interrupted, whose time excludes `work`'s. Outside a `Stages` scope it only runs `work`, so
+/// code that both a staged lend and other callers reach can mark its parts. If `work` panics, the
+/// stage stays open until the writer closes the lend at the end of its hold, which charges it the
+/// rest, as for any stage a borrower leaves open.
+pub fn stage<T>(stage: &'static str, work: impl FnOnce() -> T) -> T {
+    match STAGES.with(|stages| stages.borrow().clone()) {
+        Some(clock) => during(&clock, stage, work),
+        None => work(),
+    }
+}
+
+/// Count one rebuilt aggregate and the claims it replayed against the staged lend's open stage.
+/// Outside a `Stages` scope, or once the writer has closed the lend, it does nothing.
+pub fn rebuilt(claims: usize) {
+    if let Some(clock) = STAGES.with(|stages| stages.borrow().clone()) {
+        let mut clock = clock.lock().unwrap_or_else(PoisonError::into_inner);
+        if !clock.closed {
+            clock.rebuilt(claims as u64);
+        }
+    }
+}
+
+/// A staged lend's stages and rebuilt aggregates, as the writer closed them.
+#[cfg(any(test, feature = "test-support"))]
+pub type StagedLend = (Vec<(&'static str, Duration)>, Vec<(&'static str, Rebuilt)>);
+
+#[cfg(any(test, feature = "test-support"))]
+static RECENT_STAGED: Mutex<VecDeque<StagedLend>> = Mutex::new(VecDeque::new());
+
+/// The last staged lends this process closed, oldest first, whether or not they were long.
+#[cfg(any(test, feature = "test-support"))]
+pub fn recent_staged() -> Vec<StagedLend> {
+    RECENT_STAGED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
 }
 
 impl Drop for Stages {
@@ -607,6 +722,7 @@ mod tests {
             longest: None,
             writes: 0,
             stages: None,
+            rebuilt: Vec::new(),
         }
     }
 
@@ -787,7 +903,11 @@ mod tests {
             clock.add(name, Duration::from_millis(1));
         }
         assert_eq!(clock.spent.len(), STAGES_KEPT);
-        assert_eq!(clock.spent[STAGES_KEPT - 1], ("other", Duration::from_millis(9)));
+        let folded = (NAMES.len() - (STAGES_KEPT - 1)) as u64;
+        assert_eq!(
+            clock.spent[STAGES_KEPT - 1],
+            ("other", Duration::from_millis(folded))
+        );
         let total = clock.spent.iter().map(|(_, spent)| *spent).sum::<Duration>();
         assert_eq!(total, Duration::from_millis(20));
         // A stage entered after the writer closed the clock is not counted.
@@ -816,17 +936,74 @@ mod tests {
             longest: None,
             writes: 0,
             stages: Some(clock.lock().unwrap().spent.clone()),
+            rebuilt: vec![(
+                "rebuild-tree",
+                Rebuilt {
+                    aggregates: 2,
+                    claims: 40,
+                },
+            )],
         };
         record.held(now, 1_000_000, &mut lend, Duration::from_millis(200), true);
         std::mem::forget(lend);
         let long = &record.report(now, 1_000_000)["long_holds"][0];
         assert_eq!(long["stages"], json!({"incremental": 150.0, "commit": 30.0}));
         assert_eq!(long["unattributed_ms"], 20.0);
+        assert_eq!(
+            long["rebuilt"],
+            json!({"rebuild-tree": {"aggregates": 2, "claims": 40}})
+        );
         // A batch inside a scope is charged as before, with no stages.
         let mut batch = hold(HoldKind::Batch, "/v1/messages");
         record.held(now, 1_000_000, &mut batch, Duration::from_millis(200), true);
         std::mem::forget(batch);
         let batch = &record.report(now, 1_000_000)["long_holds"][0];
         assert!(batch.get("stages").is_none() && batch.get("unattributed_ms").is_none(), "{batch}");
+    }
+
+    #[test]
+    fn a_stage_entered_by_called_code_pauses_the_stage_it_interrupts_and_counts_rebuilds() {
+        // Outside a scope, a stage only runs its work and a rebuild counts nothing.
+        assert_eq!(stage("rebuild-tree", || 7), 7);
+        rebuilt(5);
+        let stages = Stages::begin();
+        stages.enter("incremental");
+        stage("rebuild-tree", || {
+            rebuilt(40);
+            rebuilt(2);
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        rebuilt(3);
+        let mut clock = stages.clock.lock().unwrap();
+        let spent = clock.close(Instant::now());
+        let of = |name: &str| spent.iter().find(|(stage, _)| *stage == name).unwrap().1;
+        assert!(of("rebuild-tree") >= Duration::from_millis(300));
+        assert!(
+            of("incremental") < Duration::from_millis(100),
+            "the stage a rebuild interrupts does not also count its time: {spent:?}"
+        );
+        assert_eq!(
+            clock.rebuilt,
+            [
+                (
+                    "rebuild-tree",
+                    Rebuilt {
+                        aggregates: 2,
+                        claims: 42
+                    }
+                ),
+                (
+                    "incremental",
+                    Rebuilt {
+                        aggregates: 1,
+                        claims: 3
+                    }
+                ),
+            ]
+        );
+        drop(clock);
+        // Once the writer has closed the lend, a late rebuild is not counted.
+        rebuilt(9);
+        assert_eq!(stages.clock.lock().unwrap().rebuilt.len(), 2);
     }
 }

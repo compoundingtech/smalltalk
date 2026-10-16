@@ -134,6 +134,7 @@ pub use smallclaims::store::{
     configure_projection_writer, drop_digest, excused_writers, first_verifications, newest_due_cut,
     newest_seals, stable_checkpoints, valid_fleet_node_name, verify_checkpoint_manifest,
 };
+use smallclaims::windows::holds;
 
 
 mod accounts;
@@ -22375,6 +22376,7 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
+    holds::rebuilt(claim_ids.len());
     clear_quarantined_claims_tx(transaction, "projection:planning")?;
     for id in claim_ids {
         let claim = claim_by_id_tx(transaction, &id)?
@@ -30363,6 +30365,7 @@ fn rebuild_runs_tx(transaction: &Transaction<'_>, runs: &BTreeSet<String>) -> Re
         )
         .collect::<BTreeSet<_>>();
     let claims = claims_in_replay_order_tx(transaction, &subjects, &generations, None)?;
+    holds::rebuilt(claims.len());
     for run in runs {
         for table in [
             "step_runs",
@@ -30477,6 +30480,7 @@ fn rebuild_base_aggregate_tx(
         &BTreeSet::new(),
         Some(&[kind]),
     )?;
+    holds::rebuilt(claims.len());
     for claim in &claims {
         project_claim_isolated_tx(transaction, "projection:base", claim, || {
             match claim.kind.as_str() {
@@ -31035,12 +31039,16 @@ fn try_project_simple_replication_tx(
         reconcile_carried_step_tx(transaction, claim)
             .map_err(|error| incremental_claim_error(error, claim, "claim-project"))?;
     }
-    // Missions first, since a rebuilt run reads the revision it runs.
+    // Missions first, since a rebuilt run reads the revision it runs. Each rebuild is a stage of
+    // a staged projection lend, so its hold says which kind of rebuild took its time.
     let (trees, bases): (Vec<_>, Vec<_>) = dirty
         .iter()
         .partition(|aggregate| matches!(aggregate, Aggregate::RunTree(_) | Aggregate::RunPart(_)));
     for aggregate in bases {
-        rebuild_base_aggregate_tx(transaction, aggregate).map_err(|error| {
+        holds::stage("rebuild-base", || {
+            rebuild_base_aggregate_tx(transaction, aggregate)
+        })
+        .map_err(|error| {
             let subject = match aggregate {
                 Aggregate::Desired(subject)
                 | Aggregate::Document(subject)
@@ -31054,8 +31062,14 @@ fn try_project_simple_replication_tx(
     }
     for aggregate in trees {
         let (rebuilt, root) = match aggregate {
-            Aggregate::RunTree(root) => (rebuild_run_tree_tx(transaction, root), root),
-            Aggregate::RunPart(top) => (rebuild_run_part_tx(transaction, top), top),
+            Aggregate::RunTree(root) => (
+                holds::stage("rebuild-tree", || rebuild_run_tree_tx(transaction, root)),
+                root,
+            ),
+            Aggregate::RunPart(top) => (
+                holds::stage("rebuild-part", || rebuild_run_part_tx(transaction, top)),
+                top,
+            ),
             _ => continue,
         };
         rebuilt.map_err(|error| {
@@ -31065,7 +31079,7 @@ fn try_project_simple_replication_tx(
         })?;
     }
     if rebuild_planning {
-        rebuild_planning_tx(transaction)
+        holds::stage("rebuild-planning", || rebuild_planning_tx(transaction))
             .map_err(|error| internal(error).with_detail("projection_stage", "planning-rebuild"))?;
     }
     owned_sets::project_tx(transaction)
@@ -44897,6 +44911,50 @@ version 2
         assert_eq!(
             (&projected.status, &projected.blocked_reason),
             (&replayed.status, &replayed.blocked_reason)
+        );
+    }
+
+    /// The projection lend that rebuilds a late claim's part names the rebuild as its own stage,
+    /// apart from `incremental`, and counts the part and the claims it replayed. The staged
+    /// lends are kept process-wide; CI runs each test in its own process (nextest).
+    #[test]
+    fn a_late_claim_rebuild_is_its_own_stage_of_the_projection_lend() {
+        let (controller, worker, _root, children) = replicated_run_tree(8);
+        let late = children[3].steps[0].subject.clone();
+        let earlier = worker
+            .claims_for(&children[0].subject, None)
+            .unwrap()
+            .iter()
+            .map(|claim| claim.accepted_at_unix_ms)
+            .min()
+            .unwrap();
+        worker
+            .set_step_state(
+                &children[7].steps[0].subject,
+                "blocked",
+                Some("waits on a person"),
+            )
+            .unwrap();
+        controller.set_write_clock_at(earlier).unwrap();
+        controller
+            .set_step_state(&late, "blocked", Some("the controller blocks it early"))
+            .unwrap();
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let staged = holds::recent_staged();
+        let rebuild = staged.iter().rev().find_map(|(stages, rebuilt)| {
+            let named = |label: &str| stages.iter().any(|(stage, _)| *stage == label);
+            let counted = rebuilt
+                .iter()
+                .find(|(stage, _)| *stage == "rebuild-part")
+                .map(|(_, rebuilt)| *rebuilt)?;
+            (named("incremental") && named("rebuild-part")).then_some(counted)
+        });
+        let rebuild =
+            rebuild.unwrap_or_else(|| panic!("no staged lend rebuilt a part: {staged:?}"));
+        assert!(rebuild.aggregates >= 1, "{rebuild:?}");
+        assert!(
+            rebuild.claims >= 1,
+            "the part's claims are counted: {rebuild:?}"
         );
     }
 
