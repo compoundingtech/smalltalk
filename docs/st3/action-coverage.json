@@ -2182,7 +2182,7 @@
       "command": "st ui",
       "description": "Open the terminal interface with spaces or classic layout; plain st opens it for humans on two terminals",
       "tests": [
-        "crates/st3/src/main.rs::terminal_ui_arguments_and_help_match_the_documented_surface",
+        "crates/st3/src/terminal_ui_tests.rs::terminal_ui_arguments_and_help_match_the_documented_surface",
         "crates/st3/tests/typed_keys.rs::shifted_keys_are_typed_as_a_keyboard_protocol_terminal_sends_them",
         "crates/st3/tests/client_only.rs::daemon_less_stui_pairs_controls_loses_recovers_and_uses_another_member"
       ],
