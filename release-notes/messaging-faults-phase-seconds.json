@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Test tooling only: the messaging fault eval records wall seconds per phase for every case",
+  "replay": {"status": "none", "detail": "No graph replay; the change is in scripts/st3-messaging-faults-eval and touches no daemon or stored data."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change; the shipped binaries are unchanged. result.json gains phase_seconds per case and inputs_seconds in the report."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to roll back; reverting the commit removes the extra fields."}
+}

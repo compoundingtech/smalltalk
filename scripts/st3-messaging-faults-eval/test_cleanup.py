@@ -24,14 +24,14 @@ runner = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.
 loader.exec_module(runner)
 
 
-def wait_for(predicate, timeout=30):
+def wait_for(predicate, timeout=30, describe=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
         if value:
             return value
         time.sleep(0.05)
-    raise AssertionError('cleanup fixture deadline expired')
+    raise AssertionError('cleanup fixture deadline expired' + (f': {describe()}' if describe else ''))
 
 
 def descendants(pid):
@@ -162,7 +162,14 @@ export default api => {
                                     return int(proc.name), guardian, root, Path(os.fsdecode(values[b'ST3_MESSAGING_SCRATCH'])), pids
                                 except (OSError, ValueError, KeyError):
                                     continue
-                        controller, guardian, root, binary_root, pids = wait_for(ready, 90)
+                        def where():
+                            # Which phase the fixture was in, and the eval's own last words.
+                            phases = list(evidence.glob('*/phases.json'))
+                            tail = (parent / 'eval.log').read_text(errors='replace')[-2000:]
+                            return f"phases {phases[0].read_text() if phases else 'none yet'}; eval.log tail: {tail}"
+                        began = time.monotonic()
+                        controller, guardian, root, binary_root, pids = wait_for(ready, 90, where)
+                        print(f'cleanup fixture ready after {time.monotonic() - began:.1f}s ({target}, {sig.name}, keep={keep}); {where()}', file=sys.stderr, flush=True)
                         roots = [root, binary_root]
                         for pid in pids:
                             try:
