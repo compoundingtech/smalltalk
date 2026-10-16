@@ -219,6 +219,8 @@ export const DensitiesAndChildren: Story = { name: 'Names and descriptions · SR
   await userEvent.click(within(canvasElement).getByRole('button', { name: 'Collapse 2 subagents' }))
   await waitFor(() => expect(within(canvasElement).queryByRole('button', { name: 'Subagent two' })).toBeNull())
   await assertRowNames(canvasElement)
+  // The pointer rests on the row, so its hover card opens; the a11y check must see it open, not race its delay.
+  await waitFor(() => expect(document.querySelectorAll('[role="tooltip"] [data-testid="agent-hover-card"]')).toHaveLength(1), { timeout: hoverSettleTimeout })
 } }
 
 const styles = stylex.create({

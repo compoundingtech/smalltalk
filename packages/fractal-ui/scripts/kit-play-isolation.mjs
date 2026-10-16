@@ -1,9 +1,26 @@
 import { performance } from 'node:perf_hooks'
 
+// Storybook's preview treats a "StorybookTestRunner" user agent as a test
+// environment: after the play it pauses animations at their end state for the
+// a11y check instead of sleeping a fixed 100 ms first (waitForAnimations).
+// Storybook's own test runner identifies itself the same way.
+const testRunnerUserAgents = new WeakMap()
+export function testRunnerUserAgent(browser) {
+  if (!testRunnerUserAgents.has(browser)) testRunnerUserAgents.set(browser, (async () => {
+    const probe = await browser.newContext()
+    try {
+      return `${await (await probe.newPage()).evaluate(() => navigator.userAgent)} StorybookTestRunner`
+    } finally {
+      await probe.close()
+    }
+  })())
+  return testRunnerUserAgents.get(browser)
+}
+
 // Chromium's HTTP resource cache is intentionally retained: the job's server and
 // bundle are immutable. Cache Storage and every other origin storage type are not.
 export async function createIsolatedKitWorker(browser, base) {
-  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, userAgent: await testRunnerUserAgent(browser) })
   const origins = new Set()
   const trackOrigin = url => {
     const parsed = new URL(url)

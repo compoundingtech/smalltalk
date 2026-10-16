@@ -542,6 +542,11 @@ pages/popups, clears cookies and permissions, and clears every origin-storage ty
 for all observed HTTP(S) origins. Cookie/quota audits and a first-document
 local/session-storage audit reject residual state. Case-internal navigation may
 retain its own state; it is never inherited by another case.
+Worker contexts identify as Storybook's test runner (`StorybookTestRunner` in the
+user agent), as Storybook's own runner does: after each play the preview pauses
+animations at their end state for the a11y check instead of a fixed 100 ms sleep
+before waiting for them. A play that leaves UI opening after it returns (a hover
+card under the pointer) waits for that state itself rather than relying on the sleep.
 
 `kit-play-isolation.browser-test.mjs` runs in the same kit-input-gated CI lane before
 the full play matrix. It exercises storage/service-worker/popup isolation, concurrent

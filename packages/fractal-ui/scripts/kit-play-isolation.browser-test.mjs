@@ -179,6 +179,7 @@ test('reused Chromium worker isolates cases and rejects contamination and broken
   assert.notEqual(next, previous)
   await next.goto(base)
   assert.deepEqual(await readState(next), emptyState)
+  assert.match(await next.evaluate(() => navigator.userAgent), / StorybookTestRunner$/)
   assert.equal(await next.evaluate(() => navigator.serviceWorker.controller === null), true)
   assert.equal(await next.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).length), 0)
   assert.notEqual(await next.evaluate(() => fetch('/sw-proof').then(response => response.text())), 'controlled by previous case')
