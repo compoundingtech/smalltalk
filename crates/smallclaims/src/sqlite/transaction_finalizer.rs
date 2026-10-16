@@ -19,6 +19,7 @@ struct TransactionHooks {
 #[derive(Default)]
 pub(super) struct TransactionFinalizers {
     hooks: OnceLock<TransactionHooks>,
+    runtime: OnceLock<TransactionCallback>,
     maintenance: OnceLock<TransactionCallback>,
 }
 
@@ -51,6 +52,17 @@ impl TransactionFinalizers {
         Ok(())
     }
 
+    pub(super) fn install_runtime(
+        &self,
+        callback: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        ensure!(
+            self.runtime.set(Arc::new(callback)).is_ok(),
+            "runtime transaction finalizer is already installed"
+        );
+        Ok(())
+    }
+
     pub(super) fn prepare(&self, transaction: &Transaction<'_>) -> Result<()> {
         if let Some(hooks) = self.hooks.get() {
             Self::invoke(&hooks.prepare, transaction, "prepare")?;
@@ -59,6 +71,15 @@ impl TransactionFinalizers {
     }
 
     pub(super) fn run(&self, transaction: &Transaction<'_>) -> Result<()> {
+        // Runtime projections precede the optional source adapter, so its finalizer
+        // observes all surviving source and projection mutations in this transaction.
+        if let Some(runtime) = self.runtime.get() {
+            Self::invoke(runtime, transaction, "runtime finalizer")?;
+        }
+        self.run_source_finalizers(transaction)
+    }
+
+    fn run_source_finalizers(&self, transaction: &Transaction<'_>) -> Result<()> {
         if let Some(maintenance) = self.maintenance.get() {
             Self::invoke(maintenance, transaction, "maintenance")?;
         }
@@ -117,14 +138,32 @@ impl<'connection> WriterTransaction<'connection> {
         self.commit_checked(|| Ok(()))
     }
 
+    /// Deferred replication projection leaves bounded runtime maintenance to its worker.
+    /// Source maintenance and the adapter still finalize atomically with this commit.
+    pub(crate) fn commit_with_deferred_runtime(self) -> Result<()> {
+        self.commit_finalized(false, || Ok(()))
+    }
+
     /// A writer-owned scope may refuse immediately before COMMIT, after managed finalizers.
     /// A check error drops/rolls back the transaction. It cannot cancel a completed COMMIT.
     pub(super) fn commit_checked(self, check: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.commit_finalized(true, check)
+    }
+
+    fn commit_finalized(
+        self,
+        run_runtime: bool,
+        check: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         ensure!(
             !self.transaction.is_autocommit(),
             "writer transaction was ended through raw SQL"
         );
-        self.finalizers.run(&self.transaction)?;
+        if run_runtime {
+            self.finalizers.run(&self.transaction)?;
+        } else {
+            self.finalizers.run_source_finalizers(&self.transaction)?;
+        }
         check()?;
         self.transaction.commit()?;
         crate::profile::managed_commit_succeeded();
@@ -195,6 +234,113 @@ mod tests {
         }
         tx.execute("DELETE FROM delta", [])?;
         Ok(())
+    }
+
+    #[test]
+    fn runtime_finalizer_composes_with_adapter_once_per_outer_transaction() {
+        let writer = writer();
+        let calls = Arc::new(AtomicU64::new(0));
+        let called = calls.clone();
+        writer.install_runtime_finalizer(move |tx| {
+            called.fetch_add(1, Ordering::Relaxed);
+            drain(tx)
+        }).unwrap();
+        writer.install_transaction_hooks(
+            |_| Ok(()),
+            |tx| {
+                ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM delta)", [], |row| row.get::<_, bool>(0))?,
+                    "runtime projection must precede adapter finalization");
+                Ok(())
+            },
+        ).unwrap();
+        writer.batched(|tx| {
+            free_write(tx, 1, "first")?;
+            free_write(tx, 2, "second")
+        }).unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 3, "lent first").unwrap();
+            free_write(&tx, 4, "lent second").unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 5, "rolled back").unwrap();
+            tx.rollback().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let guard = writer.write();
+        assert_eq!(guard.query_row("SELECT COUNT(*) FROM output", [], |row| row.get::<_, usize>(0)).unwrap(), 4);
+    }
+
+    #[test]
+    fn deferred_projection_commit_preserves_capture_and_source_finalizers() {
+        for failure in [None, Some("maintenance"), Some("adapter")] {
+            let writer = writer();
+            let runtime_calls = Arc::new(AtomicU64::new(0));
+            let called = runtime_calls.clone();
+            writer.install_runtime_finalizer(move |tx| {
+                called.fetch_add(1, Ordering::Relaxed);
+                drain(tx)
+            }).unwrap();
+            let maintenance_calls = Arc::new(AtomicU64::new(0));
+            let called = maintenance_calls.clone();
+            writer.install_transaction_maintenance(move |_| {
+                called.fetch_add(1, Ordering::Relaxed);
+                ensure!(failure != Some("maintenance"), "maintenance refused");
+                Ok(())
+            }).unwrap();
+            let adapter_calls = Arc::new(AtomicU64::new(0));
+            let called = adapter_calls.clone();
+            writer.install_transaction_finalizer(move |_| {
+                called.fetch_add(1, Ordering::Relaxed);
+                ensure!(failure != Some("adapter"), "adapter refused");
+                Ok(())
+            }).unwrap();
+            let (observed, observations) = mpsc::channel();
+            let _observer = writer.observe_commits(move |connection| {
+                let pending: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM delta", [], |row| row.get(0),
+                ).unwrap();
+                let output: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM output", [], |row| row.get(0),
+                ).unwrap();
+                observed.send((pending, output)).unwrap();
+            });
+            {
+                let mut guard = writer.write();
+                let tx = guard.transaction().unwrap();
+                free_write(&tx, 1, "projected").unwrap();
+                assert_eq!(tx.commit_with_deferred_runtime().is_ok(), failure.is_none());
+            }
+            assert_eq!(runtime_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(maintenance_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(adapter_calls.load(Ordering::Relaxed), u64::from(failure != Some("maintenance")));
+            assert_eq!(
+                observations.try_recv().unwrap(),
+                (i64::from(failure.is_none()), 0),
+            );
+            if failure.is_none() {
+                // A later worker loan retains the ordinary managed finalization path.
+                {
+                    let mut guard = writer.write();
+                    guard.transaction().unwrap().commit().unwrap();
+                }
+                assert_eq!(runtime_calls.load(Ordering::Relaxed), 1);
+                assert_eq!(maintenance_calls.load(Ordering::Relaxed), 2);
+                assert_eq!(adapter_calls.load(Ordering::Relaxed), 2);
+                assert_eq!(observations.try_recv().unwrap(), (0, 1));
+            }
+            assert!(observations.try_recv().is_err());
+            drop(_observer);
+            assert_eq!(count(&writer, "source"), i64::from(failure.is_none()));
+            assert_eq!(count(&writer, "delta"), 0);
+            assert_eq!(count(&writer, "output"), i64::from(failure.is_none()));
+        }
     }
 
     // A free transaction helper knows no runtime, writer or view registry.

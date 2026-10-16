@@ -128,6 +128,8 @@ pub enum ClientReadOperation {
         history: bool,
         limit: Option<usize>,
         cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        messages_paging: bool,
     },
 }
 
@@ -685,6 +687,24 @@ impl ClientRelay {
         peer: &PeerConfig,
         request: &ClientReadRequest,
     ) -> Result<serde_json::Value> {
+        if matches!(request.request, ClientReadOperation::Messages { messages_paging: true, .. }) {
+            let capabilities = self.send_http(peer, request, true).await?;
+            if !capabilities["capabilities"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["id"] == "messages-paging"
+                    && item["version"] == 2 && item["state"] == "granted")
+            }) {
+                return Err(messages_paging_unsupported().into());
+            }
+        }
+        self.send_http(peer, request, false).await
+    }
+
+    async fn send_http(
+        &self,
+        peer: &PeerConfig,
+        request: &ClientReadRequest,
+        inspect_capabilities: bool,
+    ) -> Result<serde_json::Value> {
         let name = peer.name.as_str();
         let url = match parse_route(&peer.url).context("invalid peer client route")? {
             Route::Http(url) => url,
@@ -712,7 +732,7 @@ impl ClientRelay {
             + request.relay.as_ref().map_or(Duration::ZERO, |relay| {
                 CLIENT_READ_HOP_MARGIN * (u32::from(relay.hops_left) + 1)
             });
-        let body = serde_json::to_vec(request)?;
+        let body = if inspect_capabilities { Vec::new() } else { serde_json::to_vec(request)? };
         anyhow::ensure!(
             body.len() <= 16_384,
             "the client read request exceeds its bound"
@@ -723,11 +743,17 @@ impl ClientRelay {
         }
         let headers = self
             .auth
-            .request_headers_for(CLIENT_READ_PATH, &self.node, &body)?;
+            .request_headers_method(
+                if inspect_capabilities { "GET" } else { "POST" },
+                CLIENT_READ_PATH, &self.node, &body,
+            )?;
         let mut headers_span = relay_trace::span(Phase::Headers);
         let response = self
             .http
-            .post(format!("{}{}", url.trim_end_matches('/'), CLIENT_READ_PATH))
+            .request(
+                if inspect_capabilities { reqwest::Method::GET } else { reqwest::Method::POST },
+                format!("{}{}", url.trim_end_matches('/'), CLIENT_READ_PATH),
+            )
             .headers(headers)
             .header("content-type", "application/json")
             .timeout(timeout)
@@ -752,6 +778,10 @@ impl ClientRelay {
         let status = response.status();
         if let Some(trace) = relay_trace::current() {
             trace.http_status(status.as_u16());
+        }
+        // Old workers expose only POST here. Never probe them with a new operation or flag.
+        if inspect_capabilities && matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED) {
+            return Err(messages_paging_unsupported().into());
         }
         if status == StatusCode::UNAUTHORIZED {
             return Err(ClientReadRejected::unreachable(
@@ -1119,6 +1149,30 @@ async fn forward_client_read(
         })
 }
 
+fn messages_paging_unsupported() -> ClientReadRejected {
+    ClientReadRejected::new(
+        "unsupported-capability",
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the owner route does not advertise messages-paging version 2",
+    )
+}
+
+/// Inspect the relay protocol without sending a new operation to POST-only older workers.
+/// Each forwarding hop gates the next hop independently; the owner also gates its daemon token.
+async fn client_read_capabilities(
+    State(state): State<PeerState>,
+    headers: HeaderMap,
+) -> Response {
+    match state.auth().verify_sender(&headers, "GET", CLIENT_READ_PATH, &[], None, None) {
+        Ok(sender) if state.accept(&sender).is_ok() => state.note_activity(&sender.name),
+        _ => return (StatusCode::UNAUTHORIZED, "untrusted fleet client read").into_response(),
+    };
+    signed_response_for(
+        &state, CLIENT_READ_PATH, &FleetAuth::body_digest(&[]), 0,
+        serde_json::json!({"capabilities":[{"id":"messages-paging","version":2,"state":"granted"}]}),
+    ).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 async fn receive_client_read(
     State(state): State<PeerState>,
     headers: HeaderMap,
@@ -1305,12 +1359,25 @@ async fn receive_client_read(
                 history,
                 limit,
                 cursor,
+                messages_paging,
             } => {
                 anyhow::ensure!(
                     limit.is_none_or(|limit| (1..=200).contains(&limit)),
                     "the messages limit is invalid"
                 );
+                let client = client.with_messages_paging(false);
+                if messages_paging {
+                    let advertised = client.capabilities().await?;
+                    if !advertised.value.capabilities.iter().any(|capability| {
+                        capability.id == "messages-paging"
+                            && capability.version == 2
+                            && capability.state == st3_client::CapabilityState::Granted
+                    }) {
+                        return Err(messages_paging_unsupported().into());
+                    }
+                }
                 let page = client
+                    .with_messages_paging(messages_paging)
                     .messages_list_for_peer(&actor, cursor.as_deref(), limit, history)
                     .await?
                     .value;
@@ -1657,7 +1724,7 @@ fn smalltalk_routes() -> Router<PeerState> {
     Router::new()
         .route(
             CLIENT_READ_PATH,
-            post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
+            post(receive_client_read).get(client_read_capabilities).layer(DefaultBodyLimit::max(16_384)),
         )
         .route(RAW_TERMINAL_PATH, get(receive_raw_terminal))
 }
@@ -1706,6 +1773,27 @@ pub async fn run_worker(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_paging_relay_preserves_explicit_negotiation_and_legacy_wire_shape() {
+        let legacy = serde_json::json!({
+            "authority_actor":"person/alex",
+            "request":{
+                "operation":"messages", "actor":"agent/owner",
+                "limit":1, "cursor":null
+            }
+        });
+        let mut request: ClientReadRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(&request.request, ClientReadOperation::Messages { messages_paging: false, .. }));
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
+        if let ClientReadOperation::Messages { messages_paging, .. } = &mut request.request {
+            *messages_paging = true;
+        }
+        let negotiated = serde_json::to_value(&request).unwrap();
+        assert_eq!(negotiated["request"]["messages_paging"], true);
+        let restored: ClientReadRequest = serde_json::from_value(negotiated).unwrap();
+        assert!(matches!(restored.request, ClientReadOperation::Messages { messages_paging: true, .. }));
+    }
 
     #[tokio::test]
     async fn a_read_through_the_relay_marks_its_request_as_a_remote_read() {
@@ -3074,6 +3162,7 @@ mod tests {
                         history: false,
                         limit: Some(20),
                         cursor: None,
+                        messages_paging: false,
                     },
                     relay: Some(ClientReadRoute {
                         target: "host/lag-owner".into(),
@@ -4553,3 +4642,6 @@ mod tests {
 
 #[cfg(test)]
 mod timeline_relay_tests;
+
+#[cfg(test)]
+mod messages_paging_relay_tests;

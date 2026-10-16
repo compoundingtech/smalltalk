@@ -61,6 +61,9 @@ mod resource_preparation_fence_tests;
 mod github_workflow_failures;
 pub mod git_changes;
 pub(crate) mod message_subscriptions;
+mod client_messages;
+#[cfg(test)]
+mod client_messages_version_benchmark;
 mod rollouts;
 pub(crate) mod publication;
 mod publication_facts;
@@ -7945,10 +7948,26 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
-    if owned_sets::owner(connection, subject, Some(at_index))
-        .map_err(anyhow::Error::new)?
-        .is_some()
-    {
+    // Owned sets admit only top-level agents, missions and schedules, never messages.
+    // Keep the hot message-page path on the desired primary key only when the
+    // projection covers its admitted declarations. Replication can project later
+    // at the same store index; absence of a later declaration alone is insufficient.
+    if subject.starts_with("message/") {
+        if let Some(row) = current_desired_row(connection, subject)? {
+            let unchanged: bool = connection.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_kind_index
+                 WHERE subject=?1 AND kind='intent.desired' AND store_index>?2)
+                 AND NOT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_kind_index
+                   WHERE subject=?1 AND kind='intent.desired'
+                     AND store_index>COALESCE((SELECT last_good_store_index FROM projection_health
+                       WHERE aggregate='graph' AND status='healthy'),0)
+                     AND EXISTS(SELECT 1 FROM replica_records
+                       WHERE claim_id=claims.id AND state='valid'))",
+                params![subject,at_index], |row| row.get(0),
+            )?;
+            if unchanged { return Ok(Some(row)); }
+        }
+    } else if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
         return retirements::overlay_row(
             connection,
             subject,
@@ -7956,16 +7975,26 @@ fn desired_row_at(
             owned_sets::desired_at(connection, subject, at_index)?,
         );
     }
-    let mut statement = connection.prepare_cached(&canonical_sql(
+    canonical_desired_row_at(connection, subject, at_index)
+}
+
+/// The canonical declaration fold shared by historical fallback and parity controls.
+fn canonical_desired_row_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: u64,
+) -> Result<Option<DesiredRow>> {
+    let mut statement = connection.prepare_cached(&canonical_sql(&format!(
         "SELECT id, body, predecessors FROM claims
          WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
+           AND {UNREPAIRED_CLAIM}
            AND NOT EXISTS (
                SELECT 1 FROM replica_records
                WHERE replica_records.claim_id=claims.id
                  AND replica_records.state='repaired'
            )
          ORDER BY CANONICAL_ASC(claims)",
-    ))?;
+    )))?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
             Ok((
@@ -10478,9 +10507,37 @@ fn message_view_tx(
     subject: &str,
     created_index: u64,
 ) -> Result<MessageView> {
-    let actual = latest_actual(connection, subject)?.unwrap_or(Value::Null);
-    let desired = current_desired_row(connection, subject)?
-        .and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
+    message_view_at(connection, subject, created_index, None)
+}
+
+fn message_view_at(
+    connection: &Connection,
+    subject: &str,
+    created_index: u64,
+    through: Option<u64>,
+) -> Result<MessageView> {
+    message_view_at_with_desired(connection, subject, created_index, through, || {
+        desired_row_at(connection, subject, through)
+    })
+}
+
+fn message_view_at_with_desired(
+    connection: &Connection,
+    subject: &str,
+    created_index: u64,
+    through: Option<u64>,
+    desired_row: impl FnOnce() -> Result<Option<DesiredRow>>,
+) -> Result<MessageView> {
+    let actual = latest_actual_at(connection, subject, through)?.unwrap_or(Value::Null);
+    // Deletion of the current projection retires the declaration. A retained
+    // intent.desired claim is not permission to resurrect it in a fresh page.
+    let desired = if through.is_some() && !connection.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM desired WHERE subject=?1)",
+    )?.query_row([subject], |row|row.get::<_,bool>(0))? {
+        None
+    } else {
+        desired_row()?
+    }.and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
     let field = |name: &str| actual.get(name).and_then(Value::as_str).map(str::to_owned);
     let child = |name: &str| {
         desired

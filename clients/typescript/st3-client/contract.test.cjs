@@ -23,6 +23,29 @@ const capabilityFixture = require('../../../docs/st3/client-v0/fixtures/capabili
 const cursorGapFixture = require('../../../docs/st3/client-v0/fixtures/cursor-gap-error.json');
 const capabilities = { ...capabilityFixture.value, limits: { ...capabilityFixture.value.limits, max_page_items: 2, max_event_items: 3, max_wait_ms: 10 } };
 
+for (const messagesPaging of [undefined, false, true]) {
+    test(`messages paging option ${messagesPaging} governs HTTP, WebSockets and trace-context views`, async () => {
+        const headers = [];
+        const client = new St3Client({
+            baseUrl: 'https://example.test',
+            ...(messagesPaging === undefined ? {} : { messagesPaging }),
+            fetchImpl: async (_url, init) => { headers.push(init.headers); return response(capabilityFixture); },
+        });
+        for (const view of [client, client.withTraceContext(() => undefined)]) {
+            await view.capabilities();
+            const socket = (_url, _protocols, values) => { headers.push(values); return collectionSocket(); };
+            (await view.terminalStream('terminal/example', { streamCapability: 'proof', onScreen() {}, socket })).close();
+            (await view.conversationStream('session/example', { onChange() {}, socket })).close();
+            (await view.collectionStream({ onFrame() {}, socket })).close();
+        }
+        assert.equal(headers.length, 8);
+        const expected = messagesPaging === true
+            ? 'custom-subjects.v1, conversation-blocks.v1, messages-paging.v2'
+            : 'custom-subjects.v1, conversation-blocks.v1';
+        for (const values of headers) assert.equal(values['x-st3-features'], expected);
+    });
+}
+
 test('notesList reads the typed advisory current notes endpoint', async () => {
     const wire = require('../../../docs/st3/client-v0/fixtures/directive-notes.json');
     const calls = [];

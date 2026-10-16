@@ -1870,7 +1870,7 @@ async fn invented_client_read_owner(
         "direct owner delivery has no relay fence"
     );
     assert!(
-        matches!(request.request, ClientReadOperation::Messages { actor, history: false, limit: Some(20), cursor: None } if actor == "agent/bench/cost/reader")
+        matches!(request.request, ClientReadOperation::Messages { actor, history: false, limit: Some(20), cursor: None, messages_paging: false } if actor == "agent/bench/cost/reader")
     );
     let envelope = PeerResponse::new(
         "cost-owner",

@@ -493,6 +493,43 @@ fn empty_wal_checkpoint_needs_no_writer_loan() {
 }
 
 #[test]
+fn healthy_empty_source_skips_runtime_writes_but_not_ahead_frontiers_or_verdicts() {
+    let store = Store::open_memory("node", Arc::new(FaultRuntime::new())).unwrap();
+    assert!(store.project_replication_backlog().unwrap());
+    let writes = store.connection.write().total_changes();
+    let mut phases = Vec::new();
+    assert!(store.project_replication_backlog_with_progress("test", |progress| {
+        phases.push(progress.phase);
+    }).unwrap());
+    assert_eq!(store.connection.write().total_changes(), writes,
+        "a healthy empty source must not execute runtime writes, even rolled-back ones");
+    assert!(phases.contains(&"projection-current"));
+    assert!(!phases.contains(&"projection-committed"));
+
+    store.connection.write().execute(
+        "UPDATE projection_health SET last_good_store_index=999999 WHERE aggregate='graph'", [],
+    ).unwrap();
+    phases.clear();
+    assert!(store.project_replication_backlog_with_progress("test", |progress| {
+        phases.push(progress.phase);
+    }).unwrap());
+    assert!(phases.contains(&"projection-committed"),
+        "an ahead frontier must reach the runtime's projection guard");
+
+    store.connection.write().execute(
+        "UPDATE projection_health SET last_good_store_index=0 WHERE aggregate='graph'", [],
+    ).unwrap();
+    store.verdicts_due.store(true, Ordering::Release);
+    phases.clear();
+    assert!(store.project_replication_backlog_with_progress("test", |progress| {
+        phases.push(progress.phase);
+    }).unwrap());
+    assert!(phases.contains(&"projection-committed"),
+        "pending verdicts must retain the projection commit boundary");
+    assert!(!store.verdicts_due.load(Ordering::Acquire));
+}
+
+#[test]
 fn tail_verdict_busy_remains_typed_and_pending_after_projection_commit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("claims.sqlite3");

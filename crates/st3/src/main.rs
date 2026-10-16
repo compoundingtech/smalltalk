@@ -7170,6 +7170,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
                 ready_at.duration_since(started_at).as_secs_f64() * 1_000.0,
             );
             startup.serving();
+            // Index population must not compete with either API's first bind.
+            tokio::spawn(st3::maintenance::run_client_message_selectors(
+                Arc::downgrade(&store), notify.clone(), event_notify.clone(),
+            ));
             eprintln!("st: local API listening at {}", config.socket.display());
             eprintln!(
                 "st: paired client gateway listening at {}",

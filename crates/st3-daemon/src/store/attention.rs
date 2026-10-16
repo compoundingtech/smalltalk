@@ -156,10 +156,11 @@ impl Store {
     }
 
     pub fn discard_desired_owned_by(&self, owner_run: &str) -> Result<usize> {
-        let connection = self.connection.write();
-        connection
-            .execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])
-            .map_err(Into::into)
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        let removed = transaction.execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     pub fn pending_human_reviews(&self, reviewer: Option<&str>) -> Result<Vec<HumanReviewView>> {

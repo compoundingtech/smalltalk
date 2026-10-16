@@ -1402,6 +1402,58 @@ fleet, see `sync`) or `unverified`, and the `reason` the owner was not asked, su
 `timed-out`. A client renders that as waiting, not as no messages. A list that names no remote
 agent has no `replicated`. Page cursors of a relayed list belong to the owner.
 
+The bounded message paging contract below is capability **`messages-paging` version 2**.
+Clients opt in on each request with `X-St3-Features: messages-paging.v2` (comma-separated
+with any other feature tokens in the first header value; repeated header values are ignored).
+Capability discovery advertises support but does not opt
+a client in. Requests without that exact token retain the legacy message-list response
+shape and paging behavior, including legacy cursors; they do not receive the new retained
+SQL cuts or byte-bounded paging behavior. Gateways preserve the negotiation when relaying
+message lists. Generated Rust, Swift and TypeScript clients default to the legacy contract:
+regenerating a client alone does not opt in. Enable the per-client option explicitly with
+Rust `.with_messages_paging(true)`, Swift `St3Client(..., messagesPaging: true)`, or
+TypeScript `new St3Client({ ..., messagesPaging: true })`. This choice applies to HTTP
+and every WebSocket transport; the default (`false`) omits only the messages-paging token
+while preserving existing feature tokens. Clients without the token keep the old contract unchanged.
+
+Message list pages select the recipient and actor, newest `sent_at` first with ascending message
+ID ties, before loading message bodies. A cursor retains the first page's server-issued cut
+and request time: later writes cannot change the traversal's message fields, current/history
+classification, or delivery age. Current lists omit closed and superseded reminder messages;
+history lists retain them with the same operational reasons. Reminder winners are selected in
+the recipient scope before the actor filter. Cursors remain opaque and expire after five minutes.
+The server retains only bounded cursor metadata, not message bodies; the cut, expiry, filters,
+snapshot and keyset must exactly match an issued cursor. Tampering, metadata eviction or restart,
+and repair/checkpoint deletion that makes the cut unavailable return `page-cursor-expired`
+(HTTP 410), never a successful incomplete page. A web client restarts pagination on that error.
+Fresh pages also respect current desired-projection availability: removing a desired-only
+declaration does not restore its recipient or content from retained `intent.desired` history.
+The local body-free selector projection maintains ordered recipient/actor ranges and current
+eligibility before the page limit. Opening an older store installs body-free tables, indexes
+and source capture without populating the headers. Once both APIs serve, a background worker
+builds the first cut in resumable, independently admitted writer chunks. Until publication,
+negotiated v2 message pages return HTTP 503 `message-selectors-not-ready`; legacy message
+reads and unrelated endpoints remain available. Changed ordering or eligibility creates a
+temporal header, but body-only writes do not copy bodies or churn header versions.
+While later selector maintenance lags, pages and issued cursors pin the last fully
+published frontier; pending rows are invisible rather than making message lists fail.
+Admitted remote declarations do not advance that frontier until the durable graph projection
+covers them. An interrupted initial backfill retains its resume state and exposes no initial
+message-page cut until projection and bounded backfill complete.
+Selector maintenance wakes from committed source-writer notifications, including projection-only
+changes, rather than polling while idle. It drains independently bounded background writer loans;
+its own maintenance commits do not schedule another idle pass.
+Recipient delivery presence is live process evidence, not graph state: each page reassesses
+`recipient_delivery`, including its observation age, rather than retaining a stale report.
+
+Successful message-list responses fit the advertised `max_bytes` ceiling (1,048,576 bytes),
+including JSON escaping, attachments, the response envelope and any continuation cursor.
+The byte ceiling can return fewer resources than the requested count; the continuation starts
+after the last resource actually returned, so the remaining resources are not skipped.
+A single resource that cannot fit returns HTTP 422 with `response-too-large`, rather than an
+empty page or a silently omitted resource. A relayed response whose final local envelope cannot
+fit is refused with the same error.
+
 A read that no peer can carry fails with `remote-unavailable`, and its `details` say why, so a
 client can tell a host nobody reaches from a slow or refusing one: `reason` is `no-route` (this node
 cannot dial the owner and no peer reaches it), `dial-failed`, `timed-out`, `refused` (a peer does

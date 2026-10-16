@@ -162,7 +162,8 @@ mod tests {
             inject_headers(&mut headers);
             assert!(headers.is_empty());
             let websocket =
-                crate::websocket_request("ws://localhost/v1/client/terminal", None, None, None)
+                crate::websocket_request("ws://localhost/v1/client/terminal", None, None, None,
+                    "custom-subjects.v1, conversation-blocks.v1")
                     .unwrap();
             assert!(!websocket.headers().contains_key("traceparent"));
             assert!(!websocket.headers().contains_key("tracestate"));
@@ -202,7 +203,8 @@ mod tests {
                 .unwrap();
             inject_headers(unix.headers_mut());
             let websocket =
-                crate::websocket_request("ws://localhost/v1/client/terminal", None, None, None)
+                crate::websocket_request("ws://localhost/v1/client/terminal", None, None, None,
+                    "custom-subjects.v1, conversation-blocks.v1")
                     .unwrap();
             for headers in [http.headers(), unix.headers(), websocket.headers()] {
                 assert_eq!(headers["traceparent"], expected);

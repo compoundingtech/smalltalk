@@ -395,6 +395,8 @@ final class St3ClientTests: XCTestCase {
         defer { session.invalidateAndCancel() }
         let client = St3Client(fabricLoopbackURL: URL(string: "https://trace.example/")!, session: session)
         _ = await client.conversationStream(sessionID: "session/example")
+        XCTAssertEqual(try XCTUnwrap(session.capture.requests.first).value(forHTTPHeaderField: "x-st3-features"),
+            "custom-subjects.v1, conversation-blocks.v1")
         assertNoTraceHeaders(try XCTUnwrap(session.capture.requests.first))
     }
 
@@ -416,8 +418,33 @@ final class St3ClientTests: XCTestCase {
     }
 
     @MainActor
+    func testMessagesPagingDefaultsOffAndExplicitOptionCoversEveryTransport() async throws {
+        let defaults = try await captureHTTPRequests()
+        XCTAssertEqual(try XCTUnwrap(defaults.first).value(forHTTPHeaderField: "x-st3-features"),
+            "custom-subjects.v1, conversation-blocks.v1")
+        for enabled in [false, true] {
+            let expected = enabled
+                ? "custom-subjects.v1, conversation-blocks.v1, messages-paging.v2"
+                : "custom-subjects.v1, conversation-blocks.v1"
+            let http = try await captureHTTPRequests(messagesPaging: enabled)
+            XCTAssertEqual(try XCTUnwrap(http.first).value(forHTTPHeaderField: "x-st3-features"), expected)
+            let session = WebSocketCaptureSession()
+            defer { session.invalidateAndCancel() }
+            let client = St3Client(fabricLoopbackURL: URL(string: "https://features.example/")!,
+                session: session, messagesPaging: enabled)
+            _ = await client.conversationStream(sessionID: "session/example")
+            _ = await client.glassesStream()
+            _ = await client.terminalStream("terminal/example", streamCapability: "proof")
+            XCTAssertEqual(session.capture.requests.count, 3)
+            for request in session.capture.requests {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "x-st3-features"), expected)
+            }
+        }
+    }
+
+    @MainActor
     private func captureHTTPRequests(traceContext: (@Sendable () -> TraceContext?)? = nil,
-        count: Int = 1) async throws -> [URLRequest] {
+        count: Int = 1, messagesPaging: Bool = false) async throws -> [URLRequest] {
         let url = URL(string: "https://trace-\(UUID().uuidString.lowercased()).example/")!
         let capture = TraceRequestCapture()
         TraceHTTPRegistry.shared.register(capture, host: url.host!)
@@ -429,7 +456,7 @@ final class St3ClientTests: XCTestCase {
             TraceHTTPRegistry.shared.remove(host: url.host!)
         }
         let client = St3Client(fabricLoopbackURL: url, credential: "test-credential",
-            session: session, client: "test-app 1", traceContext: traceContext)
+            session: session, client: "test-app 1", traceContext: traceContext, messagesPaging: messagesPaging)
         for _ in 0..<count { _ = try await client.capabilities() }
         return capture.requests
     }

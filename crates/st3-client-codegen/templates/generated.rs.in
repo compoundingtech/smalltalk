@@ -90,6 +90,7 @@ pub enum ErrorCode {
     StaleFence,
     CursorGap,
     PageCursorExpired,
+    MessageSelectorsNotReady,
     ProjectionDetailTooLarge,
     ProjectionDetailInvalidSource,
     RateLimited,

@@ -542,6 +542,16 @@ impl WriterConnection {
         self.finalizers.install(prepare, finalize)
     }
 
+    /// Graph-owned maintenance shares the managed outer boundary without consuming
+    /// the independently installed source adapter's prepare/finalize slot.
+    pub(crate) fn install_runtime_finalizer(
+        &self,
+        callback: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        let _writer = self.write_fence();
+        self.finalizers.install_runtime(callback)
+    }
+
     pub fn send(&self, mut job: WriterJob) {
         if let (Some(writer), WriterJob::Batched { wait, .. }) = (&self.telemetry, &mut job) {
             *wait = Some(crate::profile::writer_waiting_for(wait.take(), writer.holder(),

@@ -62,6 +62,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case invalidArrangementSubject, invalidArrangementAction, invalidArrangementOperations
     case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
     case staleFence, cursorGap, pageCursorExpired, rateLimited
+    case messageSelectorsNotReady
     case projectionDetailTooLarge, projectionDetailInvalidSource
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
@@ -87,6 +88,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "invalid-arrangement-name": .invalidArrangementName; case "invalid-arrangement-key": .invalidArrangementKey
         case "invalid-subject-reference": .invalidSubjectReference
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
+        case "message-selectors-not-ready": .messageSelectorsNotReady
         case "projection-detail-too-large": .projectionDetailTooLarge; case "projection-detail-invalid-source": .projectionDetailInvalidSource
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
@@ -117,6 +119,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .invalidArrangementName: "invalid-arrangement-name"; case .invalidArrangementKey: "invalid-arrangement-key"
         case .invalidSubjectReference: "invalid-subject-reference"
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
+        case .messageSelectorsNotReady: "message-selectors-not-ready"
         case .projectionDetailTooLarge: "projection-detail-too-large"; case .projectionDetailInvalidSource: "projection-detail-invalid-source"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
