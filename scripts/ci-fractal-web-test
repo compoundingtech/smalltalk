@@ -247,8 +247,10 @@ for pattern in detector_contract["PATTERNS"]:
     assert f'"{pattern}"' in changes, f"generated detector omits {pattern}"
 for pattern in ("crates/st3-client*/**", "crates/st3-schema/**", "docs/st3/client-v0/**"):
     assert f'"{pattern}"' not in changes, f"generated detector retains broad input {pattern}"
-for block in (changes, execution, gate_job):
+for block in (changes, gate_job):
     assert "runs-on: ubuntu-latest" in block
+assert "nscloud-ubuntu-24.04-amd64-8x16-with-features" in execution, "kit plays run on the 8 vCPU stage shape"
+assert "namespace-features:github.run-id=${{ github.run_id }}" in execution
 assert "timeout-minutes: 1" in changes and "timeout-minutes: 1" in gate_job and "timeout-minutes: 25" in execution
 assert "github.event.pull_request.base.sha || github.event.merge_group.base_sha" in changes
 assert "github.event.pull_request.head.sha || github.event.merge_group.head_sha" in changes
