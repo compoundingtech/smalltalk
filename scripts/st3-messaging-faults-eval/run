@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -68,6 +69,25 @@ async def stop(process):
                 except asyncio.TimeoutError:
                     pass
         await process.wait()
+
+
+def give_bytes(source, destination):
+    """Make `destination` a file with `source`'s bytes without writing them again.
+
+    The executables here are debug builds of about a gigabyte and a case used to write 5 to 6 of
+    them (5.4 GB), which stalls on writeback when the build host is busy: 40 s of a 85 s baseline
+    case at load 31, and the 90 s readiness deadline of controller_death_cleanup. Nothing here ever
+    writes through a path in place (a swap is os.replace of a new file over the path), so a hard
+    link is a private file as far as the eval can tell. Only a copy that is appended to must stay a
+    copy. Across filesystems, or where the kernel refuses links to files the user does not own
+    (a Nix store path), copy: those are the real reasons a link is impossible.
+    """
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES):
+            raise
+        shutil.copy2(source, destination)
 
 
 async def capture(*command, env):
@@ -170,7 +190,7 @@ class Node:
         # a small per-user quota). Socket, state and provider-fixture paths stay short.
         self.binary = binary_root / name / "bin/st3"
         self.binary.parent.mkdir(parents=True)
-        shutil.copy2(binary, self.binary)
+        give_bytes(binary, self.binary)
         self.endpoint = self.root / "run/st3.sock"
         self.env = {**env, "HOME": str(self.root / "home"),
                     "XDG_STATE_HOME": str(self.root / "home/state"),
@@ -525,7 +545,7 @@ url = "http://127.0.0.1:{proxies[1 - i]}"
         legacy_env = ""
         if case == "old-channel":
             legacy = target.binary.with_name("legacy-st3")
-            shutil.copy2(old, legacy)
+            give_bytes(old, legacy)
             legacy_env = f'  env {{ FAULT_OLD_CHANNEL_BIN "{legacy}"; }}\n'
         seats = target.root / "seats.kdl"
         seats.write_text(f'''version 2
@@ -582,7 +602,7 @@ agent "fault-probe" {{
             subject = await send(source, case)
             # Atomic install at the exact path watched by the existing driver/channel.
             next_binary = target.binary.with_suffix(".next")
-            shutil.copy2(candidate if case == "old-channel" else replacement, next_binary)
+            give_bytes(candidate if case == "old-channel" else replacement, next_binary)
             os.replace(next_binary, target.binary)
             await target.down()
             if case == "old-channel":
@@ -599,7 +619,7 @@ agent "fault-probe" {{
             # path the seat started from keeps its old executable, unchanged.
             deployed = binary_root / "cobalt/next-store/bin/st3"
             deployed.parent.mkdir(parents=True)
-            shutil.copy2(replacement, deployed)
+            give_bytes(replacement, deployed)
             await target.down()
             target.binary = deployed
             await target.start()
@@ -825,9 +845,13 @@ async def main(args):
     inputs = Path(tempfile.mkdtemp(prefix="mfi-", dir=args.scratch))
     try:
         candidate, old, replacement = [inputs / name for name in ("candidate", "old", "replacement")]
-        shutil.copy2(args.binary, candidate)
-        shutil.copy2(args.old_binary, old)
-        shutil.copy2(args.swap_binary or args.binary, replacement)
+        give_bytes(args.binary, candidate)
+        give_bytes(args.old_binary, old)
+        if args.swap_binary:
+            give_bytes(args.swap_binary, replacement)
+        else:
+            # Appended to below, so it must be its own file.
+            shutil.copy2(args.binary, replacement)
         probe = await asyncio.create_subprocess_exec(str(old), "resume-probe",
             env={"PATH": os.environ["PATH"]}, start_new_session=True, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:

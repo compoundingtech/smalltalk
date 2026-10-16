@@ -60,6 +60,41 @@ class RuntimeTests(unittest.TestCase):
                         self.assertNotIn("XDG_RUNTIME_DIR", node.env)
 
 
+class GiveBytesTests(unittest.TestCase):
+    def test_a_link_shares_the_bytes_and_a_replace_does_not_touch_the_others(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.write_bytes(b"executable")
+            first, second = root / "first", root / "second"
+            runner.give_bytes(source, first)
+            runner.give_bytes(source, second)
+            self.assertEqual(first.stat().st_ino, source.stat().st_ino)
+            # The swaps the cases perform: a new file renamed over a node's path.
+            swap = root / "swap.next"
+            swap.write_bytes(b"replacement")
+            os.replace(swap, first)
+            self.assertEqual(first.read_bytes(), b"replacement")
+            self.assertEqual(second.read_bytes(), b"executable")
+            self.assertEqual(source.read_bytes(), b"executable")
+
+    def test_it_copies_only_where_a_link_is_impossible(self):
+        import errno
+        for number in (errno.EXDEV, errno.EPERM, errno.EACCES):
+            with self.subTest(errno=errno.errorcode[number]), tempfile.TemporaryDirectory() as directory:
+                source, copy = Path(directory, "source"), Path(directory, "copy")
+                source.write_bytes(b"executable")
+                with patch.object(runner.os, "link", side_effect=OSError(number, "no link")):
+                    runner.give_bytes(source, copy)
+                self.assertEqual(copy.read_bytes(), b"executable")
+                self.assertNotEqual(copy.stat().st_ino, source.stat().st_ino)
+
+    def test_any_other_error_is_not_hidden(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(FileNotFoundError):
+                runner.give_bytes(Path(directory, "missing"), Path(directory, "target"))
+
+
 class ChannelReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def test_current_channel_waits_for_a_current_delivery_report(self):
         for card in ({}, {"delivery": None}, {"delivery": {"state": "legacy"}},
