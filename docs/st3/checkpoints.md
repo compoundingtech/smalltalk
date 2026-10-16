@@ -404,7 +404,7 @@ A trim shares the store with live writes. Recording tombstones and deleting rows
 to a transaction after 20 ms (`TRIM_CHUNK_BUDGET`); the commit then writes and syncs the changed pages.
 Cursors carry each tombstone scan across chunks. Every foreign key column leads an index, because
 deleting a claim looks up every row that references it. `every_foreign_key_column_leads_an_index` in
-`crates/st3-daemon/src/store.rs` fails otherwise, so add the index in the same change as the foreign key.
+`crates/st3-daemon/src/store/tests.rs` fails otherwise, so add the index in the same change as the foreign key.
 
 `a_trim_never_makes_a_write_wait_long` in `crates/st3-daemon/src/store/tombstones_tests.rs` trims a production-sized
 history (150,000 claims and operations) with every row made slow and fails without the budget;

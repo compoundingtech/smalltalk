@@ -87,9 +87,9 @@
     {
       "action": "prompt.respond",
       "tests": [
-        "crates/st3-daemon/src/store.rs::a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits",
+        "crates/st3-daemon/src/store/tests.rs::a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits",
         "crates/st3-daemon/src/driver_hook.rs::a_permission_hook_returns_the_persons_answer_and_nothing_else",
-        "crates/st3-daemon/src/store.rs::a_codex_permission_prompt_is_answered_and_records_its_driver",
+        "crates/st3-daemon/src/store/tests.rs::a_codex_permission_prompt_is_answered_and_records_its_driver",
         "crates/st-drivers/src/codex_app_server/tests.rs::an_approval_answered_in_st_is_sent_once_and_only_for_this_thread",
         "crates/st-drivers/src/codex_app_server/tests.rs::a_persons_answer_takes_each_approval_methods_own_decision_words"
       ],
