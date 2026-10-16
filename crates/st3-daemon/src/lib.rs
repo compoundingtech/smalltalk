@@ -10,6 +10,7 @@ mod ci_test_paths;
 pub mod accounts;
 pub mod api;
 pub mod archive;
+pub(crate) mod client_values;
 pub mod attach_image;
 pub mod backup;
 pub mod blobs;
@@ -26,6 +27,7 @@ pub mod repositories;
 pub(crate) mod disk;
 /// Answers the hooks an st3 seat's harness runs: `st driver-hook NAME`.
 pub mod delivery_hold;
+pub(crate) mod delivery_presence;
 pub mod driver_hook;
 pub mod environment;
 /// Offline signed gate observations in immutable git notes refs.
@@ -102,6 +104,7 @@ pub mod rollout;
 pub mod seat_queue;
 /// Runs any CLI with credentials no seat can read, through a gateway the sekrets user owns.
 pub mod sekrets;
+pub mod sekrets_daemon;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
@@ -122,6 +125,7 @@ pub mod test_support;
 pub mod terminal_fabric;
 pub mod terminal_binding;
 /// Runs each agent as its own Unix user, in its own namespaces and root-owned cgroup.
+pub mod tile_registry;
 pub mod tiles;
 
 pub use graph::{parse_intent, validate_mission_runtimes};

@@ -460,12 +460,12 @@ fn history_at_inner(connection: &Connection, subject: &str, now: u128, index: u6
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         json!({
             "seat": subject, "runtime_incarnation": fields["incarnation_id"],
-            "state": entry.1, "observed_at": crate::api::client_timestamp(observation_time(claim)), "reset": entry.2,
+            "state": entry.1, "observed_at": crate::client_values::client_timestamp(observation_time(claim)), "reset": entry.2,
         })
     }).collect::<Vec<_>>();
     Ok(json!({
         "kind": "status-history", "seat": subject, "items": items,
-        "retained_from": items.first().map(|item| item["observed_at"].clone()).unwrap_or_else(|| json!(crate::api::client_timestamp(cutoff))),
+        "retained_from": items.first().map(|item| item["observed_at"].clone()).unwrap_or_else(|| json!(crate::client_values::client_timestamp(cutoff))),
         "complete": !trimmed,
     }))
 }

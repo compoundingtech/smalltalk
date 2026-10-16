@@ -112,7 +112,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             && (self
                 .store
                 .claude_channel_attached(&subject.subject, incarnation)?
-                || crate::api::claude_channel_attached(&self.store, &subject.subject, incarnation))
+                || crate::delivery_presence::claude_channel_attached(&self.store, &subject.subject, incarnation))
             && !self
                 .store
                 .observations_for(&subject.subject, "runtime.action.requested")?
@@ -155,7 +155,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         // The attachment report may be newer than the driver's diagnostic. Recheck the live
         // current delivery fence directly before charging a retry or parking the seat.
-        if crate::api::claude_channel_attached(&self.store, &subject.subject, incarnation) {
+        if crate::delivery_presence::claude_channel_attached(&self.store, &subject.subject, incarnation) {
             self.arm_restart(
                 &format!("channel-recovery:{}", subject.subject),
                 now + 1_000,

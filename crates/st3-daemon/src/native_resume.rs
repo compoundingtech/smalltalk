@@ -1,7 +1,7 @@
 //! A driver's half of resuming a suspended seat: relaunch the harness on exactly the native
 //! session the seat suspended on, or refuse with a typed reason.
 //!
-//! The daemon names the session in [`crate::suspension::RESUME_ENV`]. Each harness has its own
+//! The daemon names the session in [`RESUME_ENV`]. Each harness has its own
 //! selector, and each refuses rather than letting the harness pick another session: a missing
 //! transcript, or a selector the declaration already authored, ends the launch before the harness
 //! starts. The driver then reports the session the harness actually bound, and the daemon compares
@@ -10,6 +10,14 @@
 use std::fs;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
+
+/// The environment variable that names the native session a resumed driver must relaunch.
+pub const RESUME_ENV: &str = "ST3_NATIVE_RESUME_SESSION";
+/// The environment variable that names the native session a relaunched driver continues when
+/// it can. Unlike [`RESUME_ENV`], a driver that cannot continue it starts a new session.
+pub const CONTINUE_ENV: &str = "ST3_NATIVE_CONTINUE_SESSION";
+/// Where the harness kept that session, when its driver reported a path.
+pub const CONTINUE_PATH_ENV: &str = "ST3_NATIVE_CONTINUE_PATH";
 
 /// Why a driver cannot relaunch the named session. `code` is stable; `reason` is for people.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +37,7 @@ impl Refusal {
 
 /// The native session this launch must resume, if the daemon named one.
 pub fn requested() -> Option<String> {
-    std::env::var(crate::suspension::RESUME_ENV)
+    std::env::var(RESUME_ENV)
         .ok()
         .filter(|id| !id.trim().is_empty())
 }
@@ -40,10 +48,10 @@ pub fn continued() -> Option<(String, Option<PathBuf>)> {
     if requested().is_some() {
         return None;
     }
-    let session = std::env::var(crate::suspension::CONTINUE_ENV)
+    let session = std::env::var(CONTINUE_ENV)
         .ok()
         .filter(|id| !id.trim().is_empty())?;
-    let path = std::env::var_os(crate::suspension::CONTINUE_PATH_ENV)
+    let path = std::env::var_os(CONTINUE_PATH_ENV)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
     Some((session, path))
