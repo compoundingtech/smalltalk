@@ -100,15 +100,15 @@ impl Store {
                 let subject = format!("mission-run/{id}");
                 let (_, _, steps) = self.mission_step_preview_at(&subject, at)?;
                 if self
-                    .reconcile_fault(&subject, crate::reconcile::FIRST_READINESS_FAULT_SCOPE)?
+                    .reconcile_fault(&subject, crate::model::FIRST_READINESS_FAULT_SCOPE)?
                     .is_some()
                 {
                     state = "blocked".into();
                 }
-                let steps=steps.iter().map(|step|json!({"id":step.subject,"path":step.step,"state":crate::api::client_work_state(&step.status),"attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,"agentless":step.agentless,"keep_open":crate::mission::step_keeps_open(definition, &step.step),"since":crate::api::client_timestamp(step.updated_at_unix_ms),"goals":[],"constraints":[],"blockers":[]})).collect::<Vec<_>>();
-                details.push(json!({"id":subject,"generation_id":format!("run-generation/{generation}"),"requester":requester,"status":status,"phase":phase,"progress":{"done":0,"total":0},"current_steps":[],"must_act":"nobody","state_since":crate::api::client_timestamp(0),"steps":steps}));
+                let steps=steps.iter().map(|step|json!({"id":step.subject,"path":step.step,"state":crate::client_values::client_work_state(&step.status),"attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,"agentless":step.agentless,"keep_open":crate::mission::step_keeps_open(definition, &step.step),"since":crate::client_values::client_timestamp(step.updated_at_unix_ms),"goals":[],"constraints":[],"blockers":[]})).collect::<Vec<_>>();
+                details.push(json!({"id":subject,"generation_id":format!("run-generation/{generation}"),"requester":requester,"status":status,"phase":phase,"progress":{"done":0,"total":0},"current_steps":[],"must_act":"nobody","state_since":crate::client_values::client_timestamp(0),"steps":steps}));
             }
-            result.push(serde_json::from_value(json!({"id":mission_subject,"system":crate::mission::is_system(&mission_subject, definition),"kind":"mission","revision":"summary-input","updated_at":crate::api::client_timestamp(0),"title":mission,"state":state,"mission_revision":"summary-input","runs":details.iter().map(|r|r["id"].clone()).collect::<Vec<_>>(),"run_details":details}))?);
+            result.push(serde_json::from_value(json!({"id":mission_subject,"system":crate::mission::is_system(&mission_subject, definition),"kind":"mission","revision":"summary-input","updated_at":crate::client_values::client_timestamp(0),"title":mission,"state":state,"mission_revision":"summary-input","runs":details.iter().map(|r|r["id"].clone()).collect::<Vec<_>>(),"run_details":details}))?);
         }
         Ok((result, deadline))
     }

@@ -142,10 +142,7 @@ pub fn standing_observer(locator: &str) -> String {
     format!("observer/github/{}", locator.to_ascii_lowercase())
 }
 
-/// `resource/github/OWNER/REPO`.
-pub fn default_resource(locator: &str) -> String {
-    format!("resource/github/{}", locator.to_ascii_lowercase())
-}
+pub use crate::resource::default_resource;
 
 /// The repository a standing observer's subject names, as `owner/repo`.
 pub fn standing_locator(subject: &str) -> Option<String> {
