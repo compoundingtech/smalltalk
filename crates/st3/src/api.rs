@@ -116,6 +116,16 @@ pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation:
         .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
 }
 
+pub fn configure_claude_ownership_observation(root: &Path, enabled: bool) {
+    delivery_presence::configure_observation(root, enabled);
+}
+
+/// Unknown proof of an already admitted CURRENT stream is not proof of channel loss.
+pub(crate) fn claude_channel_proof_pending(store: &Store, subject: &str, incarnation: &str) -> bool {
+    delivery_presence::pending_proof(subject, incarnation)
+        .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -9307,6 +9317,9 @@ fn doctor_report_with_operation_drift(
                 .iter()
                 .filter(|agent| {
                     agent.pointer("/delivery/state").and_then(Value::as_str) == Some("stale")
+                        || agent.pointer("/delivery/reason").and_then(Value::as_str)
+                            .is_some_and(|reason| delivery_presence::unprotected_reason(reason)
+                                || reason.starts_with("ownership proof unavailable"))
                 })
                 .map(|agent| {
                     format!(

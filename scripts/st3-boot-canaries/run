@@ -712,7 +712,7 @@ def claude_attachment(node, seats, mode):
     recovered_incarnation = seats.view("a")[0].get("incarnation_id")
     recovery_claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=100") or {}).get("claims", [])
     automatic = [row for row in recovery_claims if row.get("kind") == "runtime.action.requested"
-                 and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+                 and row.get("body", {}).get("fields", {}).get("operation") in ("claude-channel-recovery", "claude-channel-recovery-window-v1")]
     if mode == "missing":
         if recovered_incarnation == blocked_incarnation or len(automatic) != 1:
             fail(f"the missing channel did not recover with one automatic restart: {automatic}")
@@ -762,7 +762,7 @@ def claude_channel_parked(node, seats):
     def attempts():
         claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=500") or {}).get("claims", [])
         return [row for row in claims if row.get("kind") == "runtime.action.requested"
-                and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+                and row.get("body", {}).get("fields", {}).get("operation") in ("claude-channel-recovery", "claude-channel-recovery-window-v1")]
 
     # Each incarnation needs the driver's 20 s detection window, then the reconciler's
     # 10/20/40 s backoff, then a restart: about 170 s in all before any load. Bound each

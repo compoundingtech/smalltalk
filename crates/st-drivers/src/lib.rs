@@ -27,6 +27,7 @@ pub mod claude_channel;
 pub mod claude_denials;
 pub mod claude_mcp;
 pub mod claude_prompts;
+pub mod claude_process;
 pub mod claude_session;
 mod claude_usage;
 pub mod codex_app_server;

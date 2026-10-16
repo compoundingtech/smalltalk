@@ -4,6 +4,8 @@ use super::*;
 use crate::mailbox::{Fence, Frame, Receipt};
 
 mod authority;
+#[cfg(all(test, target_os = "linux"))]
+mod ownership_process_tests;
 
 pub(super) async fn subscribe(
     State(state): State<AppState>,
@@ -16,7 +18,7 @@ pub(super) async fn subscribe(
     let binding = fence.clone();
     let peer = peer.expect("authorize checked the native peer").0;
     let checked_peer = peer.clone();
-    let native = blocking_action(move || {
+    let (native, primary_wrapper) = blocking_action(move || authority::with_claude_primary(&checked_state, &binding, &checked_peer, None, || {
         if !cfg!(target_os = "linux") { return checked_state.store.check_mailbox(&binding).map(|_| false); }
         if authority::with_argv_channel(&checked_state, &binding, &checked_peer, |member, validate| {
             if binding.epoch == 0 {
@@ -32,10 +34,10 @@ pub(super) async fn subscribe(
             checked_state.store.repair_mailbox_checked(&binding, owner, validate).map(|_| ())
         }
         }).map(|_| true)
-    }).await?;
+    })).await?;
     // Wake the predecessor immediately, even when no graph content changed.
     signal_local_change(&state);
-    Ok(websocket.on_upgrade(move |socket| stream(state, fence, socket, peer, native)))
+    Ok(websocket.on_upgrade(move |socket| stream(state, fence, socket, peer, native, primary_wrapper)))
 }
 
 pub(super) async fn bind(
@@ -46,7 +48,7 @@ pub(super) async fn bind(
     authorize(&request, peer.as_ref().map(|p| &p.0))?;
     let bind_state = state.clone();
     let peer = peer.expect("authorize checked the native peer").0;
-    let bound = blocking_action(move || {
+    let bound = blocking_action(move || authority::with_claude_primary(&bind_state, &request, &peer, None, || {
         if !cfg!(target_os = "linux") { return bind_state.store.bind_mailbox(&request); }
         if let Some(bound) = authority::with_argv_channel(&bind_state, &request, &peer, |member, validate| {
             bind_state.store.bind_argv_mailbox_checked(&request, member, validate)
@@ -54,9 +56,9 @@ pub(super) async fn bind(
         authority::with_authority(&bind_state, &request, &peer, |owner, validate| {
             bind_state.store.bind_mailbox_with_lease_checked(&request, Some(owner), validate)
         })
-    }).await?;
+    })).await?;
     signal_local_change(&state);
-    Ok(Json(bound))
+    Ok(Json(bound.0))
 }
 
 // Explicit already-admitted protocol fixtures lack a physical PTY/provider lease.
@@ -94,7 +96,7 @@ pub(super) async fn attachment(
     let store = state.store.clone();
     let checked_state = state.clone();
     let peer = peer.expect("authorize checked the native peer").0;
-    let attached = blocking_action(move || {
+    let attached = blocking_action(move || authority::with_claude_primary(&checked_state, &fence, &peer, None, || {
         if store.has_mailbox_lease(&fence)? {
             authority::with_authority(&checked_state, &fence, &peer, |owner, validate| {
                 validate()?;
@@ -110,9 +112,9 @@ pub(super) async fn attachment(
             &fence.subject,
             &fence.incarnation,
         ))
-    })
+    }))
     .await?;
-    Ok(Json(crate::mailbox::Attachment { attached }))
+    Ok(Json(crate::mailbox::Attachment { attached: attached.0 }))
 }
 
 fn authorize(fence: &Fence, peer: Option<&NativeDeliveryPeer>) -> Result<(), ApiError> {
@@ -173,7 +175,7 @@ pub(super) async fn receipt(
     let checked_state = state.clone();
     let checked_peer = peer.expect("authorize checked the native peer").0;
     let kind = input.kind.clone();
-    let (record, appended, work_wake) = blocking_action(move || {
+    let ((record, appended, work_wake), _) = blocking_action(move || authority::with_claude_primary(&checked_state, &request.fence, &checked_peer, None, || {
         let (record, appended) = if store.has_mailbox_lease(&request.fence)? {
             authority::with_authority(&checked_state, &request.fence, &checked_peer, |owner, validate| {
                 validate()?;
@@ -190,7 +192,7 @@ pub(super) async fn receipt(
             .flatten()
             .is_none_or(|message| super::is_work_wake(&message.tags));
         Ok((record, appended, work_wake))
-    })
+    }))
     .await?;
     // A repeated or already-settled receipt changes nothing; only a new claim wakes readers.
     if appended {
@@ -603,7 +605,8 @@ fn own_post_reactor(state: &AppState, fence: &Fence) -> tokio::sync::mpsc::Sende
 /// Maximum gap between durable change checks, including when a notification is missed.
 const MAILBOX_RECHECK: Duration = Duration::from_secs(30);
 
-async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDeliveryPeer, native: bool) {
+async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDeliveryPeer, native: bool,
+    primary_wrapper: Option<st_drivers::claude_process::Process>) {
     #[cfg(feature = "test-support")]
     let mut control = crate::test_support::fixture_mailbox_transport(&state.store, &fence.subject);
     #[cfg(feature = "test-support")]
@@ -620,7 +623,9 @@ async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDe
         timer.tick().await;
         Some(((), timer))
     });
-    let stream = stream_with_timers_inner(state.clone(), fence.clone(), socket, raw_snapshot, safety, heartbeat, StreamControl::new(native.then(|| peer.clone())));
+    let mut stream_control = StreamControl::new(native.then(|| peer.clone()));
+    stream_control.primary_peer = (peer.transport == "claude-channel").then(|| (peer.clone(), primary_wrapper));
+    let stream = stream_with_timers_inner(state.clone(), fence.clone(), socket, raw_snapshot, safety, heartbeat, stream_control);
     #[cfg(not(feature = "test-support"))]
     stream.await;
     #[cfg(feature = "test-support")]
@@ -711,14 +716,63 @@ async fn stream_with_timers<F, S, H>(
     stream_with_timers_inner(state, fence, socket, read, safety, heartbeat, StreamControl::new(None)).await;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProofDecision {
+    Valid,
+    Unavailable,
+    Refused,
+}
+struct StreamProof {
+    fence: Fence,
+    failures: u8,
+    owner: u64,
+}
+impl StreamProof {
+    fn new(fence: Fence) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            fence,
+            failures: 0,
+            owner: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+    fn observe<T, E>(&mut self, result: Result<Result<T, St3Error>, E>) -> ProofDecision {
+        match result {
+            Ok(Ok(_)) => {
+                self.failures = 0;
+                delivery_presence::clear_proof_pending(&self.fence, self.owner, true);
+                ProofDecision::Valid
+            }
+            Ok(Err(error)) if error.code == "stale-mailbox-session" => ProofDecision::Refused,
+            _ => {
+                let before = self.failures;
+                self.failures = self.failures.saturating_add(1).min(3);
+                delivery_presence::proof_pending(&self.fence, self.owner, self.failures);
+                if before == 0 || (before < 3 && self.failures == 3) {
+                    // Only two bounded diagnostics per episode: the first and the cap crossing.
+                    tracing::warn!(subject = %self.fence.subject, checks = self.failures,
+                        "Claude ownership proof unavailable; established stream retained; new effects held");
+                }
+                ProofDecision::Unavailable
+            }
+        }
+    }
+}
+impl Drop for StreamProof {
+    fn drop(&mut self) {
+        delivery_presence::clear_proof_pending(&self.fence, self.owner, false);
+    }
+}
+
 struct StreamControl {
     peer: Option<NativeDeliveryPeer>,
+    primary_peer: Option<(NativeDeliveryPeer, Option<st_drivers::claude_process::Process>)>,
     #[cfg(test)]
     dirty_gate: Option<Arc<FixtureDirtyGate>>,
 }
 impl StreamControl {
     fn new(peer: Option<NativeDeliveryPeer>) -> Self {
-        Self { peer, #[cfg(test)] dirty_gate: None }
+        Self { peer, primary_peer: None, #[cfg(test)] dirty_gate: None }
     }
 }
 
@@ -740,6 +794,7 @@ async fn stream_with_timers_inner<F, S, H>(
     H: futures_util::Stream<Item = ()> + Send + 'static,
 {
     let peer = control.peer;
+    let primary_peer = control.primary_peer;
     futures_util::pin_mut!(safety, heartbeat);
     let since = client_now_ms();
     let through = match state.store.index() {
@@ -761,6 +816,7 @@ async fn stream_with_timers_inner<F, S, H>(
     let mut order = MailboxOrder::new();
     let own_posts = own_post_reactor(&state, &fence);
     let mut dirty = true;
+    let mut proof = StreamProof::new(fence.clone());
     let mut last: Option<(crate::store::MailboxWatermark, Snapshot)> = None;
     loop {
         #[cfg(test)]
@@ -769,6 +825,17 @@ async fn stream_with_timers_inner<F, S, H>(
         #[cfg(not(test))]
         let process_dirty = true;
         if dirty && process_dirty {
+            if let Some((primary, wrapper)) = primary_peer.clone() {
+                let state = state.clone();
+                let fence = fence.clone();
+                let admitted = crate::api::read_deadline::spawn_blocking(move ||
+                    authority::with_claude_primary(&state, &fence, &primary, wrapper, || Ok(()))).await;
+                match proof.observe(admitted) {
+                    ProofDecision::Valid => {},
+                    ProofDecision::Refused => return,
+                    ProofDecision::Unavailable => { dirty = false; continue; },
+                }
+            }
             // Retain consumed replay across ordinary wakes. A new unresolved loss
             // or changed authority input requires a fresh proof of the same nonce.
             if let (Some(proof), Some(peer)) = (replay_proven.take(), peer.as_ref()) {
@@ -944,6 +1011,17 @@ async fn stream_with_timers_inner<F, S, H>(
             incoming = socket.recv() => match incoming {
                 Some(Ok(WsMessage::Text(report))) => {
                     if state.store.check_mailbox(&fence).is_ok() {
+                        if let Some((primary, wrapper)) = primary_peer.clone() {
+                            let state = state.clone();
+                            let fence = fence.clone();
+                            let checked = crate::api::read_deadline::spawn_blocking(move ||
+                                authority::with_claude_primary(&state, &fence, &primary, wrapper, || Ok(()))).await;
+                            match proof.observe(checked) {
+                                ProofDecision::Valid => {},
+                                ProofDecision::Refused => return,
+                                ProofDecision::Unavailable => { dirty = false; continue; },
+                            }
+                        }
                         let authenticated = if let Some(peer) = peer.clone() {
                             let checked_state = state.clone();
                             let binding = fence.clone();
@@ -1205,6 +1283,53 @@ mod tests {
         let mut title = current;
         title.component = "title".into();
         assert!(admitted_report(&title, &report).is_none());
+    }
+
+    #[test]
+    fn established_stream_unavailable_is_unknown_not_loss_and_refusal_is_distinct() {
+        let fence = Fence::new("agent/stream-proof-unit", "fixture", "delivery");
+        let mut old = StreamProof::new(fence.clone());
+        for _ in 0..4 {
+            assert_eq!(old.observe::<(), ()>(Ok(Err(St3Error::new("mailbox-authority-unavailable", "fixture")))), ProofDecision::Unavailable);
+        }
+        assert_eq!(old.failures, 3);
+        let assessment = delivery_presence::assess_current(&fence.subject, "claude", Some(&fence.incarnation));
+        assert_eq!(assessment.state, "unknown");
+        assert!(assessment.reason.unwrap().contains("suspect after three checks"));
+        let mut next = StreamProof::new(fence.clone());
+        assert_eq!(next.observe::<(), ()>(Ok(Ok(()))), ProofDecision::Valid);
+        assert!(delivery_presence::pending_proof(&fence.subject, &fence.incarnation).is_none());
+        assert_eq!(next.observe::<(), ()>(Err(())), ProofDecision::Unavailable);
+        drop(old);
+        assert!(delivery_presence::pending_proof(&fence.subject, &fence.incarnation).is_some(), "old stream drop cannot clear the replacement's uncertainty");
+        assert_eq!(next.observe::<(), ()>(Ok(Err(St3Error::new("stale-mailbox-session", "proven mismatch")))), ProofDecision::Refused);
+        drop(next);
+        assert!(delivery_presence::pending_proof(&fence.subject, &fence.incarnation).is_none());
+    }
+
+    #[test]
+    fn protected_claude_admission_cannot_downgrade_or_rotate_the_primary_epoch() {
+        let root=tempfile::tempdir().unwrap();
+        let state=super::super::tests::state(root.path());
+        crate::mailbox::tests::ready(&state.store,"current");
+        let subject="agent/eval.worker";
+        let current=state.store.bind_mailbox(&Fence::new(subject,"current","delivery")).unwrap();
+        let candidate=Fence::new(subject,"current","delivery");
+        let peer=NativeDeliveryPeer { agent:subject.into(),transport:"claude-channel",
+            pid:std::process::id(),archives_inbox:false };
+        let physical=st_drivers::claude_process::process(std::process::id()).unwrap();
+        // This gate is outside the platform switch: Darwin cannot fall through to its old
+        // unfenced bind when a previously admitted protected generation loses its witness.
+        let rejected=authority::with_claude_primary(&state,&candidate,&peer,Some(physical),||
+            state.store.bind_mailbox(&candidate));
+        assert!(rejected.is_err());
+        state.store.check_mailbox(&current).unwrap();
+        // Explicit legacy admission is a separate compatibility branch, not primary proof.
+        let legacy=authority::with_claude_primary(&state,&candidate,&peer,None,||
+            state.store.bind_mailbox(&candidate)).unwrap();
+        assert!(legacy.1.is_none());
+        state.store.check_mailbox(&legacy.0).unwrap();
+        assert!(state.store.check_mailbox(&current).is_err());
     }
 
     #[tokio::test]
@@ -2810,7 +2935,7 @@ mod tests {
                                             receiver.recv().await.map(|()| ((), receiver))
                                         },
                                     ),
-                                    StreamControl { peer, dirty_gate: Some(fixture_gate) },
+                                    StreamControl { peer, primary_peer: None, dirty_gate: Some(fixture_gate) },
                                 )
                             })
                         }

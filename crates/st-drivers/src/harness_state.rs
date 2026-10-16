@@ -861,6 +861,29 @@ pub fn with_current_ownership<T>(
     action()
 }
 
+/// Nonblocking ownership capture for the Claude process gate. It never creates a lock or
+/// record. None is contention; false is a proven generation mismatch; read errors propagate.
+/// The process-owner lock serializes protected wrapper claims while the caller uses this cut.
+pub(crate) fn try_current_ownership(
+    agent_dir: &Path,
+    incarnation: &str,
+    seq: u64,
+) -> anyhow::Result<Option<bool>> {
+    let file = crate::flock::open(&agent_dir.join(LOCK_NAME), crate::flock::Open::Existing)?;
+    let Some(_lock) =
+        crate::flock::FileLock::hold(file, crate::flock::Mode::Exclusive, crate::flock::Wait::Now)?
+    else {
+        return Ok(None);
+    };
+    let raw = crate::harness_events::read_record(&harness_state_path(agent_dir))?;
+    let current: Record = serde_json::from_slice(&raw)?;
+    Ok(Some(
+        crate::contracts::schema_matches(&current.schema, SCHEMA)
+            && current.incarnation == incarnation
+            && current.seq == seq,
+    ))
+}
+
 /// The claim's body, under an already-held record lock.
 fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     // Unreadable bytes are superseded like anything else — that is exactly what the claim is

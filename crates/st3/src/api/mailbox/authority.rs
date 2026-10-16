@@ -17,6 +17,250 @@ fn source_agent_dir(state: &AppState, fence: &Fence) -> PathBuf {
     )
 }
 
+// An admitted physical generation is retained for the existing mailbox lifetime. This is
+// custody, not readiness: every use still proves live kernel ancestry and current ownership.
+// Replacing the incarnation replaces its entry; report ticks never rescan the PTY registry.
+pub(super) type PrimaryBindings =
+    BTreeMap<(PathBuf, String), (String, st_drivers::claude_process::Process)>;
+pub(super) fn primary_bindings() -> &'static std::sync::Mutex<PrimaryBindings> {
+    static BINDINGS: std::sync::OnceLock<std::sync::Mutex<PrimaryBindings>> =
+        std::sync::OnceLock::new();
+    BINDINGS.get_or_init(Default::default)
+}
+
+/// The physical PTY generation, not a mutable helper witness, chooses the wrapper.
+/// This gate applies on Darwin too; the existing Linux lease protocol remains unchanged.
+pub(super) fn with_claude_primary<T>(
+    state: &AppState,
+    fence: &Fence,
+    peer: &NativeDeliveryPeer,
+    captured: Option<st_drivers::claude_process::Process>,
+    action: impl FnOnce() -> Result<T, St3Error>,
+) -> Result<(T, Option<st_drivers::claude_process::Process>), St3Error> {
+    use st_drivers::claude_process::{self, Caller};
+    if peer.transport != "claude-channel" {
+        return action().map(|v| (v, None));
+    }
+    let known = primary_bindings()
+        .lock()
+        .map_err(|_| internal("Claude binding lock poisoned"))?
+        .get(&(state.state_dir.clone(), fence.subject.clone()))
+        .filter(|(incarnation, _)| incarnation == &fence.incarnation)
+        .map(|(_, wrapper)| *wrapper);
+    let captured = captured.or(known);
+    let dir = source_agent_dir(state, fence);
+    if !claude_process::recorded(&dir).map_err(internal)? {
+        // Legacy generation: no new witness can be minted by a helper or daemon. The old
+        // admission remains in force until the wrapper's next natural, authorized launch.
+        if captured.is_some() {
+            return Err(refused("admitted Claude ownership disappeared"));
+        }
+        let value = action()?;
+        delivery_presence::record_ownership(fence, true);
+        // Best-effort diagnostic runs AFTER old admission, without delaying its response.
+        // It cannot fail that action, change an epoch or become a recovery input.
+        queue_legacy_shape(state, fence, peer);
+        return Ok((value, None));
+    }
+    let wrapper = if let Some(wrapper) = captured {
+        wrapper
+    } else {
+        physical_wrapper(state, fence, None)?
+    };
+    if peer.archives_inbox && fence.component == "title" && peer.pid == wrapper.pid {
+        // The exact physical wrapper opens its title stream concurrently with provider startup.
+        // This grants no delivery readiness or mailbox delivery epoch.
+        if claude_process::process(wrapper.pid).map_err(internal)? != wrapper {
+            return Err(refused("physical wrapper generation changed"));
+        }
+        let value = action()?;
+        primary_bindings()
+            .lock()
+            .map_err(|_| internal("Claude binding lock poisoned"))?
+            .insert(
+                (state.state_dir.clone(), fence.subject.clone()),
+                (fence.incarnation.clone(), wrapper),
+            );
+        return Ok((value, Some(wrapper)));
+    }
+    let raw = st_drivers::harness_events::read_bound_provider_state(&dir)
+        .map_err(internal)?
+        .filter(|(runtime, _)| runtime == &fence.incarnation)
+        .map(|(_, raw)| raw)
+        .ok_or_else(|| refused("Claude provider source unavailable"))?;
+    let owner = provider_authority(&raw)?;
+    let session = owner
+        .evidence_incarnation
+        .ok_or_else(|| refused("Claude session unavailable"))?;
+    let seq = owner
+        .ownership_sequence
+        .ok_or_else(|| refused("Claude ownership unavailable"))?;
+    let role = if peer.archives_inbox {
+        Caller::Wrapper
+    } else {
+        Caller::Channel
+    };
+    claude_process::with_caller(&dir, &session, seq, peer.pid, Some(wrapper), role, |_| {
+        let value = action().map_err(anyhow::Error::new)?;
+        delivery_presence::record_ownership(fence, false);
+        primary_bindings()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Claude binding lock poisoned"))?
+            .insert(
+                (state.state_dir.clone(), fence.subject.clone()),
+                (fence.incarnation.clone(), wrapper),
+            );
+        Ok((value, Some(wrapper)))
+    })
+    .map_err(|e| {
+        e.downcast::<St3Error>().unwrap_or_else(|e| {
+            if claude_process::failure_kind(&e) == Some(claude_process::FailureKind::Unavailable) {
+                unavailable(claude_process::diagnostic(&e))
+            } else {
+                refused(claude_process::diagnostic(&e))
+            }
+        })
+    })
+}
+
+/// Physical source selection shared by enforcement and legacy shape observation. A legacy
+/// candidate for a bound terminal is observational only; it never grants mailbox authority.
+fn physical_wrapper(
+    state: &AppState,
+    fence: &Fence,
+    legacy_peer: Option<&NativeDeliveryPeer>,
+) -> Result<st_drivers::claude_process::Process, St3Error> {
+    use st_drivers::claude_process;
+    let dir = source_agent_dir(state, fence);
+    let desired = state
+        .store
+        .desired_subjects_named(std::slice::from_ref(&fence.subject))
+        .map_err(internal)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| refused("seat no longer declared"))?;
+    let member = desired
+        .member
+        .ok_or_else(|| refused("seat intentionally stopped"))?;
+    if desired.kind == "stop"
+        || member.host != state.node
+        || member.driver.as_deref() != Some("claude")
+    {
+        return Err(refused("Claude primary belongs to another live seat"));
+    }
+    let incarnation = member
+        .terminal_binding
+        .as_ref()
+        .map(|b| b.incarnation.as_str())
+        .unwrap_or(&fence.incarnation);
+    if member
+        .terminal_binding
+        .as_ref()
+        .is_some_and(|b| b.agent_incarnation() != fence.incarnation)
+    {
+        return Err(refused("terminal invocation was superseded"));
+    }
+    let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy())
+        .snapshot()
+        .map_err(internal)?
+        .into_iter()
+        .find(|r| {
+            r.pid
+                .zip(r.created_at.as_deref())
+                .is_some_and(|(p, t)| format!("{p}:{t}") == incarnation)
+                && r.name == member.runtime_id
+        })
+        .ok_or_else(|| refused("exact Claude runtime unavailable"))?;
+    let daemon = runtime.pid.ok_or_else(|| refused("runtime has no PID"))?;
+    let captured_daemon = claude_process::process(daemon).map_err(internal)?;
+    let stats = terminal_stats(state, &runtime.name)?;
+    let terminal_pid = terminal_identity(
+        &runtime.name,
+        runtime.created_at.as_deref().unwrap_or_default(),
+        daemon,
+        &stats,
+    )?;
+    let terminal = claude_process::process(terminal_pid).map_err(internal)?;
+    if terminal.parent != daemon {
+        return Err(refused(
+            "terminal no longer belongs to the physical runtime",
+        ));
+    }
+    let wrapper = if member.terminal_binding.is_some() {
+        let expected = if let Some(peer) = legacy_peer {
+            // OBSERVATION ONLY: a legacy wrapper has no recorded provider generation. The
+            // candidate is labelled as such and cannot enter an admission decision.
+            if peer.archives_inbox {
+                claude_process::process(peer.pid).map_err(internal)?
+            } else {
+                let caller = claude_process::process(peer.pid).map_err(internal)?;
+                let provider = claude_process::process(caller.parent).map_err(internal)?;
+                claude_process::process(provider.parent).map_err(internal)?
+            }
+        } else {
+            claude_process::wrapper(&dir).map_err(internal)?
+        };
+        let captured = claude_process::process(expected.pid).map_err(internal)?;
+        if captured != expected || captured.parent != terminal_pid {
+            return Err(refused("bound Claude wrapper generation changed"));
+        }
+        captured
+    } else {
+        terminal
+    };
+    if claude_process::process(daemon).map_err(internal)? != captured_daemon {
+        return Err(refused("physical runtime generation changed"));
+    }
+    Ok(wrapper)
+}
+
+fn queue_legacy_shape(state: &AppState, fence: &Fence, peer: &NativeDeliveryPeer) {
+    if !delivery_presence::observation_enabled(&state.state_dir) { return; }
+    if !delivery_presence::begin_legacy_shape(fence, peer.pid) {
+        return;
+    }
+    // One active capture globally; no queue and no retries. Repeated ticks and a peer flood
+    // cannot schedule unbounded work. A stuck filesystem can occupy only this diagnostic slot.
+    static SLOT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let slot = SLOT
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    let (Ok(permit), Ok(runtime)) = (
+        slot.try_acquire_owned(),
+        tokio::runtime::Handle::try_current(),
+    ) else {
+        delivery_presence::finish_legacy_shape(
+            fence,
+            peer.pid,
+            Err(anyhow::anyhow!("legacy capture unavailable")),
+        );
+        return;
+    };
+    let state = state.clone();
+    let fence = fence.clone();
+    let peer = peer.clone();
+    runtime.spawn_blocking(move || {
+        let _permit = permit;
+        capture_legacy_shape(&state, &fence, &peer);
+    });
+}
+
+pub(super) fn capture_legacy_shape(state: &AppState, fence: &Fence, peer: &NativeDeliveryPeer) {
+    // Exactly one selected physical inventory/stats capture, then at most three kernel nodes
+    // recaptured twice. Inventory filesystem cost is UNMEASURED and not bounded by peer count.
+    let shape = (|| {
+        let wrapper = physical_wrapper(state, fence, Some(peer)).map_err(anyhow::Error::new)?;
+        let role = if peer.archives_inbox {
+            st_drivers::claude_process::Caller::Wrapper
+        } else {
+            st_drivers::claude_process::Caller::Channel
+        };
+        st_drivers::claude_process::physical_chain(wrapper, peer.pid, role)
+    })();
+    delivery_presence::finish_legacy_shape(fence, peer.pid, shape);
+}
+
 pub(super) fn episode(fence: &Fence) -> String {
     let key = format!(
         "mailbox:{}:{}:{}",
@@ -1119,5 +1363,35 @@ mod tests {
             assert!(decode_provider_authority(&raw).is_err());
         }
         assert!(decode_provider_authority(b"{broken").is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod observation_setting_controls {
+    use super::*;
+    #[test]
+    fn absent_observation_setting_never_reserves_or_schedules_a_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        let fence = Fence::new("agent/observation-default-off", "fixture", "delivery");
+        let peer = NativeDeliveryPeer {
+            agent: fence.subject.clone(),
+            transport: "claude-channel",
+            pid: 0,
+            archives_inbox: false,
+        };
+        assert!(!delivery_presence::observation_enabled(&state.state_dir));
+        queue_legacy_shape(&state, &fence, &peer);
+        assert_eq!(
+            delivery_presence::legacy_capture_count(&fence.subject),
+            0,
+            "off must return BEFORE reservation, semaphore, runtime handle, pool task or physical inventory"
+        );
+        delivery_presence::configure_observation(&state.state_dir, true);
+        assert!(delivery_presence::observation_enabled(&state.state_dir));
+        delivery_presence::configure_observation(&state.state_dir, false);
+        queue_legacy_shape(&state, &fence, &peer);
+        assert_eq!(delivery_presence::legacy_capture_count(&fence.subject), 0);
     }
 }

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Disable the retired st2 Claude channel alongside the other retired st channel plugins in each managed Claude launch's settings override.",
+  "replay": {"status": "none", "detail": "No graph replay or projection change."},
+  "schema": {"status": "none", "detail": "No storage, local ownership-record or replicated schema change."},
+  "rules": {"status": "none", "detail": "No claim vocabulary or admission-rule change."},
+  "compatibility": {"status": "changed", "detail": "Managed st3 Claude launches explicitly set st2-channel@st2=false as well as disabling the retired st3 plugin spellings. Unrelated plugins, hooks, permission settings and the existing packaged/development channel policy are preserved. No global or shared project settings are rewritten or retired. Current embedded unscoped plugins remain idle without a selected subject; a subject or settings string is routing data, never independent kernel process-generation proof. Installed legacy plugin cache/executable identity remains unknown, so this is not an established cause or cure of a running seat's restart. Existing legacy generations remain unprotected under default-off ownership; both ownership settings stay off unless separately enabled."},
+  "manual": {"status": "none", "detail": "No agent conduct rule, environment-stripping instruction, installer action or live settings edit."},
+  "recovery": {"status": "none", "detail": "This delta changes no recovery counters, ownership enforcement or existing automatic and explicit restart guards."},
+  "downtime": {"status": "unknown", "detail": "Source preparation does not qualify installed providers or authorize a rollout, live attach or restart."}
+}

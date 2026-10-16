@@ -561,3 +561,62 @@ fn a_recording_render_is_also_free_of_the_collector() {
 
     drop(collector);
 }
+
+#[test]
+fn protected_statusline_lock_contention_keeps_the_renderer_budget_and_reports_unknown() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    use std::os::fd::AsRawFd as _;
+    let seat = Seat::new();
+    let renderer = seat.renderer("LOCKMARK");
+    // A recorded generation cannot downgrade to legacy. Holding the gate lock forces its
+    // unavailable path before any ancestry/read/observation work; the body is never decoded.
+    fs::write(
+        seat.paths.agent_dir.join("claude-primary-process.json"),
+        b"{}",
+    )
+    .unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(seat.paths.agent_dir.join("claude-primary-process.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let before = seat.record();
+    let started = std::time::Instant::now();
+    let output = seat.tee(&[
+        ("ST3_MAILBOX_TRANSPORT", "push"),
+        ("ST_CLAUDE_STATUSLINE_RENDERER", renderer.to_str().unwrap()),
+    ]);
+    assert!(
+        started.elapsed() < TEE_BUDGET,
+        "an ownership lock cannot stall a render"
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("LOCKMARK {}", payload_len())
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("Claude ownership unavailable after a bounded recheck; publication withheld"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.len() < 1024,
+        "bounded refusal diagnostic without payload"
+    );
+    assert_eq!(
+        seat.record(),
+        before,
+        "no false observation under unavailable ownership"
+    );
+    drop(lock);
+}

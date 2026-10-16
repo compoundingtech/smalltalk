@@ -144,6 +144,15 @@ pub fn run_controlled_paths(
     runtime_id: String,
     claude_argv: Vec<String>,
 ) -> Result<()> {
+    run_controlled_paths_with_primary_ownership(paths, identity, runtime_id, claude_argv, false)
+}
+
+/// A native control plane supplies its explicit install choice, sampled once at fresh claim.
+/// Existing callers remain default-off; adopting a driver never reclaims or changes its choice.
+pub fn run_controlled_paths_with_primary_ownership(
+    paths: &crate::driver_paths::Paths, identity: String, runtime_id: String,
+    claude_argv: Vec<String>, primary_ownership: bool,
+) -> Result<()> {
     anyhow::ensure!(
         !claude_argv.is_empty(),
         "Claude driver '{runtime_id}' has no provider argv"
@@ -162,7 +171,7 @@ pub fn run_controlled_paths(
     crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
         .with_context(|| format!("admitting Claude driver workspace {}", workspace.display()))?;
     install_signal_handler();
-    let observer = SessionObserver::new(&paths.agent_dir, &identity, "claude", &runtime_id)?;
+    let observer = SessionObserver::new_claude_with_primary_ownership(&paths.agent_dir, &identity, &runtime_id, primary_ownership)?;
     let mut env = vec![
         ("DISABLE_AUTOUPDATER".into(), "1".into()),
         (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
@@ -282,7 +291,8 @@ fn select_st3_channel_plugin(mut argv: Vec<String>, packaged: bool) -> Result<Ve
         serde_json::json!({"enabledPlugins": {
             "st-channel@st": packaged,
             "st3-channel@st3": false,
-            "st3-channel@st2": false
+            "st3-channel@st2": false,
+            "st2-channel@st2": false
         }})
         .to_string(),
     ]);
@@ -1332,6 +1342,29 @@ fn observe_payload(
     raw: &str,
     var: &dyn Fn(&str) -> Option<String>,
 ) -> Result<()> {
+    if native || crate::claude_process::recorded(agent_dir)? {
+        let session = var(SESSION_ENV).unwrap_or_default();
+        let sequence = var(SESSION_SEQ_ENV).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let command = format!("\"$ST_HOOKS/claude-observe.sh\" {event}");
+        return crate::claude_process::with_caller(agent_dir, &session, sequence,
+            std::process::id(), None, crate::claude_process::Caller::Hook { trampoline: &command }, |_| {
+                observe_payload_owned(session_dir, agent_dir, native, identity, runtime_id, event, raw, var)
+            });
+    }
+    observe_payload_owned(session_dir, agent_dir, native, identity, runtime_id, event, raw, var)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_payload_owned(
+    session_dir: &Path,
+    agent_dir: &Path,
+    native: bool,
+    identity: &str,
+    runtime_id: Option<&str>,
+    event: &str,
+    raw: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
     // Counted only once the invocation has its application target: a hook for an undeclared
     // agent errors out before any state is applied and must not inflate `hook_invocations_total`.
     crate::metrics::record_hook_invocation("claude-observe", event);
@@ -1788,7 +1821,11 @@ pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
     let mut raw = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut raw);
     if let Err(error) = record_statusline(catalog_root, identity, &raw) {
-        tracing::warn!("st claude-statusline: recording failed; chaining anyway: {error:#}");
+        if crate::claude_process::failure_kind(&error).is_some() {
+            eprintln!("st: {}", crate::claude_process::diagnostic(&error));
+        } else {
+            tracing::warn!("st claude-statusline: recording failed; chaining anyway: {error:#}");
+        }
     }
     chain_statusline(&raw)
 }
@@ -1804,7 +1841,11 @@ pub fn run_statusline_paths(agent_dir: &Path, identity: &str) -> Result<()> {
     let mut raw = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut raw);
     if let Err(error) = record_statusline_paths(agent_dir, identity, &raw, true) {
-        tracing::warn!("st claude-statusline: recording failed; chaining anyway: {error:#}");
+        if crate::claude_process::failure_kind(&error).is_some() {
+            eprintln!("st: {}", crate::claude_process::diagnostic(&error));
+        } else {
+            tracing::warn!("st claude-statusline: recording failed; chaining anyway: {error:#}");
+        }
     }
     chain_statusline(&raw)
 }
@@ -1815,6 +1856,18 @@ fn record_statusline_paths(
     raw: &[u8],
     native: bool,
 ) -> Result<()> {
+    if native || crate::claude_process::recorded(agent_dir)? {
+        let session = crate::contracts::env(SESSION_ENV).unwrap_or_default();
+        let sequence = crate::contracts::env(SESSION_SEQ_ENV).and_then(|v| v.parse().ok()).unwrap_or(0);
+        return crate::claude_process::with_caller(agent_dir, &session, sequence,
+            std::process::id(), None, crate::claude_process::Caller::Hook {
+                trampoline: "\"$ST_HOOKS/claude-statusline.sh\"",
+            }, |_| record_statusline_owned(agent_dir, identity, raw, native));
+    }
+    record_statusline_owned(agent_dir, identity, raw, native)
+}
+
+fn record_statusline_owned(agent_dir: &Path, identity: &str, raw: &[u8], native: bool) -> Result<()> {
     let payload: serde_json::Value = serde_json::from_slice(raw).unwrap_or(serde_json::Value::Null);
     // Deliberately uncounted. The tee builds no telemetry pipeline at all (`DQ-C13`, see
     // `main`), so a `record_hook_invocation` here could never reach a collector — and a metric
@@ -2196,7 +2249,8 @@ mod tests {
                 "st2-channel@st2": true,
                 "bridge@tools": true
             },
-            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "observe"}]}]}
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "observe"}]}]},
+            "permissions": {"allow": ["Read(./notes/**)"], "deny": ["Read(./private/**)"]}
         });
         let argv = vec![
             "claude".into(),
@@ -2215,9 +2269,10 @@ mod tests {
             assert_eq!(settings["enabledPlugins"]["st-channel@st"], packaged);
             assert_eq!(settings["enabledPlugins"]["st3-channel@st3"], false);
             assert_eq!(settings["enabledPlugins"]["st3-channel@st2"], false);
-            assert_eq!(settings["enabledPlugins"]["st2-channel@st2"], true);
+            assert_eq!(settings["enabledPlugins"]["st2-channel@st2"], false);
             assert_eq!(settings["enabledPlugins"]["bridge@tools"], true);
             assert_eq!(settings["hooks"], authored["hooks"]);
+            assert_eq!(settings["permissions"], authored["permissions"]);
             assert_eq!(select_st3_channel_plugin(selected.clone(), packaged).unwrap(), selected);
         }
     }
@@ -2230,6 +2285,7 @@ mod tests {
         assert_eq!(settings["enabledPlugins"]["st-channel@st"], true);
         assert_eq!(settings["enabledPlugins"]["st3-channel@st3"], false);
         assert_eq!(settings["enabledPlugins"]["st3-channel@st2"], false);
+        assert_eq!(settings["enabledPlugins"]["st2-channel@st2"], false);
     }
 
     #[test]
