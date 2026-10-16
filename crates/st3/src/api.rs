@@ -93,6 +93,8 @@ mod request_latency;
 mod client_observations;
 mod terminal_view;
 mod work;
+// client_v0 retries through the same handler as the route.
+use work::retry_work;
 mod work_response;
 mod published_lists;
 #[cfg(target_os = "linux")]
@@ -771,7 +773,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews", get(list_reviews))
         .route("/v1/reviews/{*subject}", post(post_review))
-        .route("/v1/work/delegation", post(set_delegation_policy))
+        .route("/v1/work/delegation", post(work::set_delegation_policy))
         .route("/v1/attention", get(list_attention).post(request_attention))
         .route("/v1/attention/resolve/{*subject}", post(resolve_attention))
         .route("/v1/subscription-requests", get(list_subscription_requests))
@@ -909,26 +911,26 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/revision-proposals/{proposal}/cancel",
             post(cancel_revision_proposal),
         )
-        .route("/v1/work/ask", post(ask_person))
-        .route("/v1/work/start", post(start_work))
-        .route("/v1/work/handoff/{*subject}", post(handoff_work))
-        .route("/v1/work/acknowledge/{*subject}", post(acknowledge_work))
+        .route("/v1/work/ask", post(work::ask_person))
+        .route("/v1/work/start", post(work::start_work))
+        .route("/v1/work/handoff/{*subject}", post(work::handoff_work))
+        .route("/v1/work/acknowledge/{*subject}", post(work::acknowledge_work))
         .route("/v1/github/watch", post(github_watch::watch))
         .route("/v1/github/unwatch", post(github_watch::unwatch))
         .route("/v1/github/watches", get(github_watch::watches))
         .route("/v1/github/comment", post(github_watch::comment))
         .route("/v1/github/own", post(github_watch::own))
-        .route("/v1/work/done", post(done_person_step))
-        .route("/v1/work/cancel-ask", post(cancel_person_ask))
-        .route("/v1/work", get(list_work))
-        .route("/v1/work-items/{*subject}", get(get_work))
-        .route("/v1/work/mission/{*subject}", post(publish_work_mission))
-        .route("/v1/work/wake/{*subject}", post(wake_work))
-        .route("/v1/work/retry/{*subject}", post(retry_work))
-        .route("/v1/work/extend/{*subject}", post(extend_work))
-        .route("/v1/work/{action}/{*subject}", post(post_work_action))
-        .route("/v1/gate-results", post(post_gate_result))
-        .route("/v1/agent-queue-moves", post(move_agent_queue))
+        .route("/v1/work/done", post(work::done_person_step))
+        .route("/v1/work/cancel-ask", post(work::cancel_person_ask))
+        .route("/v1/work", get(work::list_work))
+        .route("/v1/work-items/{*subject}", get(work::get_work))
+        .route("/v1/work/mission/{*subject}", post(work::publish_work_mission))
+        .route("/v1/work/wake/{*subject}", post(work::wake_work))
+        .route("/v1/work/retry/{*subject}", post(work::retry_work))
+        .route("/v1/work/extend/{*subject}", post(work::extend_work))
+        .route("/v1/work/{action}/{*subject}", post(work::post_work_action))
+        .route("/v1/gate-results", post(work::post_gate_result))
+        .route("/v1/agent-queue-moves", post(work::move_agent_queue))
         .route("/v1/sekrets/node", get(sekrets_node))
         .route("/v1/sekrets/attest", post(sekrets_attest))
         .route("/v1/lanes", get(list_lanes))

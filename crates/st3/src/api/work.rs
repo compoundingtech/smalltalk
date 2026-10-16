@@ -35,7 +35,7 @@ fn bind_work_incarnation(
     Ok(current)
 }
 
-async fn ask_person(
+pub(super) async fn ask_person(
     State(state): State<AppState>,
     bound: Option<Extension<BoundAgent>>,
     Json(mut request): Json<PersonAskRequest>,
@@ -65,7 +65,7 @@ async fn ask_person(
     Ok(Json(result))
 }
 
-async fn done_person_step(
+pub(super) async fn done_person_step(
     State(state): State<AppState>,
     Json(request): Json<PersonStepResponse>,
 ) -> Result<Json<StepRunView>, ApiError> {
@@ -77,7 +77,7 @@ async fn done_person_step(
     Ok(Json(result))
 }
 
-async fn set_delegation_policy(
+pub(super) async fn set_delegation_policy(
     State(state): State<AppState>,
     Json(request): Json<crate::model::DelegationPolicyRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
@@ -89,7 +89,7 @@ async fn set_delegation_policy(
     Ok(Json(result))
 }
 
-async fn cancel_person_ask(
+pub(super) async fn cancel_person_ask(
     State(state): State<AppState>,
     Json(request): Json<PersonStepResponse>,
 ) -> Result<Json<StepRunView>, ApiError> {
@@ -101,7 +101,7 @@ async fn cancel_person_ask(
     Ok(Json(result))
 }
 
-async fn list_work(
+pub(super) async fn list_work(
     State(state): State<AppState>,
     Query(query): Query<WorkQuery>,
 ) -> Result<Json<Vec<StepRunView>>, ApiError> {
@@ -153,7 +153,7 @@ async fn list_work(
     Ok(Json(work))
 }
 
-async fn get_work(
+pub(super) async fn get_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
 ) -> Result<Json<StepRunView>, ApiError> {
@@ -170,7 +170,7 @@ async fn get_work(
         .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))
 }
 
-async fn wake_work(
+pub(super) async fn wake_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<WorkWakeRequest>,
@@ -271,7 +271,7 @@ async fn wake_work(
 }
 
 /// Retry one failed step as a person or an agent.
-async fn retry_work(
+pub(super) async fn retry_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<WorkRetryRequest>,
@@ -312,7 +312,7 @@ async fn retry_work(
     Ok(Json(retried))
 }
 
-async fn publish_work_mission(
+pub(super) async fn publish_work_mission(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
     bound: Option<Extension<BoundAgent>>,
@@ -457,7 +457,7 @@ async fn publish_work_mission(
 }
 
 /// Move one run in a seat's queue as a person or an agent.
-async fn move_agent_queue(
+pub(super) async fn move_agent_queue(
     State(state): State<AppState>,
     Json(mut request): Json<crate::model::SeatQueueMoveRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
@@ -481,7 +481,7 @@ async fn move_agent_queue(
     Ok(Json(claim))
 }
 
-async fn start_work(
+pub(super) async fn start_work(
     State(state): State<AppState>,
     Json(request): Json<crate::model::WorkStartRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
@@ -491,7 +491,7 @@ async fn start_work(
     Ok(Json(result))
 }
 
-async fn handoff_work(
+pub(super) async fn handoff_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
     bound: Option<Extension<BoundAgent>>,
@@ -515,7 +515,7 @@ async fn handoff_work(
     work_action_response(state, "release".into(), subject, request, None, Some(input)).await
 }
 
-async fn acknowledge_work(
+pub(super) async fn acknowledge_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<crate::model::WorkAcknowledgeRequest>,
@@ -526,7 +526,7 @@ async fn acknowledge_work(
     Ok(Json(result))
 }
 
-async fn post_work_action(
+pub(super) async fn post_work_action(
     State(state): State<AppState>,
     AxumPath((action, subject)): AxumPath<(String, String)>,
     bound: Option<Extension<BoundAgent>>,
@@ -542,7 +542,7 @@ async fn post_work_action(
 }
 
 /// Add time to the execution budget of the step attempt this seat holds.
-async fn extend_work(
+pub(super) async fn extend_work(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
     bound: Option<Extension<BoundAgent>>,
@@ -567,7 +567,7 @@ async fn extend_work(
     work_action_response(state, "extend".into(), subject, request, Some(extend_ms), None).await
 }
 
-async fn post_gate_result(
+pub(super) async fn post_gate_result(
     State(state): State<AppState>,
     Json(request): Json<GateResultRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
