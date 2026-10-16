@@ -477,7 +477,19 @@ async def run_case(args, case, directory, candidate, old, replacement):
     nodes = []
     link = Link()
     result = {"case": case, "verdict": "error", "failures": []}
-    phase = "setup"
+    # Wall seconds spent in each named phase, so a slow case says which wait it was in.
+    marks = []
+
+    def enter(name):
+        marks.append((name, time.monotonic()))
+        # Flushed at every phase so a case that is killed or never finishes still says where it was.
+        # A sidecar only: failing to write it must not fail the case or skip its cleanup.
+        try:
+            write_json(directory / "phases.json", [[mark, round(at - marks[0][1], 2)] for mark, at in marks])
+        except OSError:
+            pass
+        return name
+    phase = enter("setup")
     try:
         env = {"PATH": os.environ["PATH"], "USER": os.environ.get("USER", "eval"),
                "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
@@ -517,6 +529,7 @@ url = "http://127.0.0.1:{proxies[1 - i]}"
                 f'  exec {provider} "$@"\nfi\nexec setsid {provider} "$@"\n'
             )
             wrapper.chmod(0o755)
+        enter("nodes-start")
         # The nodes are independent until both serve; neither startup waits behind the other.
         # Let both starts settle before raising, so cleanup never races a start still spawning.
         for outcome in await asyncio.gather(*(node.start() for node in nodes), return_exceptions=True):
@@ -537,15 +550,16 @@ agent "fault-probe" {{
   harness "omp" {{}}
 }}
 ''')
+        enter("seat-apply")
         await target.cli("apply", str(seats), "--no-gate-check", "--as", "person/eval")
 
         async def ready():
             value = await agent(target)
             return value if value.get("harness_state") == "idle" and provider_pids(target.seats()) else None
-        phase = "provider-readiness"
+        phase = enter("provider-readiness")
         await until(ready, args.ready_seconds)
         # A cross-node warmup proves the fixture before injecting any fault.
-        phase = "cross-node-warmup"
+        phase = enter("cross-node-warmup")
         warmup = await send(source, "warmup")
         async def warm():
             return any(row.get("event") == "read" and row.get("subject") == warmup for row in receipts(target))
@@ -560,7 +574,7 @@ agent "fault-probe" {{
         subject = None
         recovery_started = None
         channel_ready_at = channel_incarnation = None
-        phase = "fault-injection"
+        phase = enter("fault-injection")
         if case == "daemon-restart":
             # Queue before shutting down, without racing a successful handoff.
             # The temporary link gate is removed while the daemon is still down.
@@ -663,7 +677,7 @@ agent "fault-probe" {{
             subject = await send(source, case)
         if case in RECOVERY_CASES and not link.enabled:
             if case == "channel-killed":
-                phase = "replacement-channel-readiness"
+                phase = enter("replacement-channel-readiness")
                 replacement_ready_receipt = await until(lambda: current_replacement_channel(
                     target, baseline_report, old_channel, before_card.get("incarnation_id")), args.ready_seconds)
                 channel = replacement_ready_receipt["card"]
@@ -681,7 +695,7 @@ agent "fault-probe" {{
                 })
         else:
             cleared = recovery_started if recovery_started is not None else now_ms()
-        phase = "fault-observation"
+        phase = enter("fault-observation")
         result.update(message=subject, fault_started_at_unix_ms=fault_started,
                       fault_cleared_at_unix_ms=cleared,
                       fault_duration_ms=round((time.monotonic() - fault_monotonic) * 1000))
@@ -775,6 +789,7 @@ agent "fault-probe" {{
             trace = await node.cli("trace", "show", "agent/eval/fault-probe", "--json", "--limit", "100", check=False)
             (directory / f"{node.name}-error-trace.jsonl").write_text(trace)
     finally:
+        marks.append(("cleanup", time.monotonic()))
         cleaned = set()
         try:
             write_json(directory / "link-events.json", link.events)
@@ -814,6 +829,11 @@ agent "fault-probe" {{
             if not args.keep:
                 shutil.rmtree(root)
                 shutil.rmtree(binary_root)
+    marks.append(("end", time.monotonic()))
+    seconds = {}
+    for (name, began), (_, ended) in zip(marks, marks[1:]):
+        seconds[name] = round(seconds.get(name, 0) + ended - began, 2)
+    result["phase_seconds"] = seconds
     return result
 
 
@@ -821,6 +841,7 @@ async def main(args):
     args.out.mkdir(parents=True, exist_ok=False)
     args.scratch.mkdir(parents=True, exist_ok=True)
     started = datetime.datetime.now(datetime.timezone.utc)
+    began = time.monotonic()
     # Pin binaries once: a shared deploy during the eval cannot change its input.
     inputs = Path(tempfile.mkdtemp(prefix="mfi-", dir=args.scratch))
     try:
@@ -846,6 +867,8 @@ async def main(args):
                   "read_deadline_ms": 10000, "observe_seconds": args.observe_seconds,
                   "short_seconds": args.short_seconds, "long_seconds": args.long_seconds,
                   "agent_tokens": 0, "judge_tokens": 0, "cases": []}
+        # Copies, resume probe and digests of the three pinned executables, before any case.
+        report["inputs_seconds"] = round(time.monotonic() - began, 2)
         for case in args.cases:
             directory = args.out / case
             directory.mkdir()
