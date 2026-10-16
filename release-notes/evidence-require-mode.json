@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Evidence verifier: a per-check require switch (off, shadow, reject) and a require-all report; nothing uses it yet",
+  "replay": {"status": "none", "detail": "No daemon replay change."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change."},
+  "rules": {"status": "changed", "detail": "The skip policy accepts an optional per-check require key (off by default; shadow reports what would be rejected; reject fails). scripts/evidence-verify gains --require-all, which judges each check that requires a note and names the reason per check. No committed check sets require, no workflow calls it, and every enforce stays false, so no job is skipped or rejected by this change."},
+  "compatibility": {"status": "none", "detail": "A policy without require behaves exactly as before; the new flag is opt-in."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Reverting restores the previous verifier and docs; no state is written."}
+}

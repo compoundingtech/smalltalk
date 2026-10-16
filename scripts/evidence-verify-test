@@ -692,12 +692,190 @@ class SkipPolicy(unittest.TestCase):
                                     '--repository', 'org/repo')[0], 2)  # only with --policy-from
 
 
+def two_check_policy(unit_require=None, other_require=None):
+    """Two checks, `unit` and `other`, each accepting only the observed kind, with their own `require` mode."""
+    doc = json.loads(policy_text())
+    unit = doc['checks']['unit']
+    del unit['kinds']['wrapper']
+    other = json.loads(json.dumps(unit))
+    other['kinds']['observed']['command'] = ['github-actions', '{repository}', '.github/workflows/fleet.yml', '{check}']
+    doc['checks']['other'] = other
+    if unit_require is not None:
+        unit['require'] = unit_require
+    if other_require is not None:
+        other['require'] = other_require
+    return json.dumps(doc)
+
+
+class RequireAll(unittest.TestCase):
+    """`require` is the mode for rejecting an unsigned change at queue entry: off / shadow / reject, judged per check."""
+
+    def setUp(self):
+        self.f = Fixture()
+        self.addCleanup(self.f.tmp.cleanup)
+        self.ci = self.f.key('ci', 'machine/ci1')
+        self.commit, self.tree = self.f.commit('one')
+
+    def note(self, check, **kwargs):
+        defaults = dict(runner=OBSERVED, command=('github-actions', 'org/repo', '.github/workflows/fleet.yml', check), check=check)
+        defaults.update(kwargs)
+        key = defaults.pop('key', self.ci)
+        signer = defaults.pop('signer', 'machine/ci1')
+        return self.f.note(self.commit, self.tree, key, signer, **defaults)
+
+    def judge(self, text):
+        return evidence_verify.require_all(str(self.f.repo), self.tree, str(self.f.keys), text, 'org/repo')
+
+    def test_require_defaults_to_off_and_is_validated_strictly(self):
+        self.assertEqual(evidence_verify.policy_rules(policy_text(), 'unit', 'org/repo')['require'], 'off')
+        for mode in ('off', 'shadow', 'reject'):
+            self.assertEqual(evidence_verify.policy_rules(two_check_policy(mode), 'unit', 'org/repo')['require'], mode)
+        for bad in ('yes', True, False, 1, None, 'Reject', ['reject'], ''):
+            doc = json.loads(two_check_policy())
+            doc['checks']['unit']['require'] = bad
+            with self.assertRaises(evidence_verify.Failure) as caught:
+                evidence_verify.policy_rules(json.dumps(doc), 'unit', 'org/repo')
+            self.assertEqual(caught.exception.reason, 'error', repr(bad))
+
+    def test_a_check_with_require_off_is_not_judged_and_nothing_required_is_ok(self):
+        result = self.judge(two_check_policy())
+        self.assertEqual((result['decision'], result['satisfied'], result['lanes']), ('ok', True, {}))
+
+    def test_shadow_reports_would_reject_and_reject_rejects_and_each_lane_names_its_own_reason(self):
+        result = self.judge(two_check_policy('shadow', 'reject'))
+        self.assertEqual(result['decision'], 'reject')
+        self.assertFalse(result['satisfied'])
+        self.assertEqual({k: (v['decision'], v['reason']) for k, v in result['lanes'].items()},
+                         {'other': ('reject', 'no_record'), 'unit': ('would-reject', 'no_record')})
+        self.note('other')
+        result = self.judge(two_check_policy('shadow', 'reject'))
+        self.assertEqual(result['decision'], 'would-reject')  # only the shadow lane is missing now
+        self.assertEqual(result['lanes']['other']['decision'], 'ok')
+        self.assertEqual(result['lanes']['other']['signer'], 'machine/ci1')
+        self.note('unit')
+        result = self.judge(two_check_policy('shadow', 'reject'))
+        self.assertEqual((result['decision'], result['satisfied']), ('ok', True))
+
+    def test_every_refusal_reason_reaches_the_lane_it_belongs_to(self):
+        self.f.key('stranger')  # a key that is not on the list
+        stranger = self.f.root / 'stranger'
+        old_tree = self.tree
+        later, _ = self.f.commit('two')  # the tree under test moves on: notes for the first one are now for another tree
+        self.tree = self.f.git('rev-parse', 'HEAD^{tree}')
+        command = ('github-actions', 'org/repo', '.github/workflows/fleet.yml', 'unit')
+        def good(key=None, **kwargs):
+            options = dict(runner=OBSERVED, command=command)
+            options.update(kwargs)
+            return lambda: self.f.note(later, self.tree, key or self.ci, 'machine/ci1', **options)
+        cases = {
+            'no_record': (None, lambda: None),
+            'stale_tree': (None, lambda: self.f.note(self.commit, old_tree, self.ci, 'machine/ci1', runner=OBSERVED, command=command)),
+            'bad_signature': (None, good(sign=False)),
+            'untrusted_signer': (None, good(key=stranger)),
+            'untrusted_level': (['fleet'], good()),
+            'wrong_command': (None, good(command=('make', 'less'))),
+            'check_failed': (None, good(exit_code=1)),
+            'wrong_runner': (None, good(runner='github:other/repo/actions/runs/7/attempts/1/jobs/9')),
+        }
+        for reason, (levels, make) in cases.items():
+            with self.subTest(reason=reason):
+                for ref in self.f.git('for-each-ref', '--format=%(refname)', 'refs/notes/evidence/').split():
+                    self.f.git('update-ref', '-d', ref)
+                doc = json.loads(two_check_policy('reject'))
+                if levels:
+                    doc['checks']['unit']['trust_levels'] = levels
+                make()
+                lane = self.judge(json.dumps(doc))['lanes']['unit']
+                self.assertEqual((lane['satisfied'], lane['decision'], lane['reason']), (False, 'reject', reason), lane)
+
+    def test_a_forged_note_under_a_valid_looking_ref_from_an_untrusted_key_is_refused(self):
+        self.f.key('forger')
+        record = self.note('unit', key=self.f.root / 'forger', signer='machine/ci1')
+        self.assertEqual(self.f.git('for-each-ref', '--format=%(refname)', 'refs/notes/evidence/'), f'refs/notes/evidence/{record}')
+        lane = self.judge(two_check_policy('reject'))['lanes']['unit']
+        self.assertEqual((lane['satisfied'], lane['reason']), (False, 'untrusted_signer'))
+
+    def test_the_cli_exit_code_is_one_only_when_a_reject_lane_fails_and_it_reads_the_base_policy(self):
+        (self.f.repo / '.st').mkdir(exist_ok=True)
+        (self.f.repo / '.st/evidence-keys').write_text(self.f.keys.read_text())
+        for mode, expected in (('off', (0, 'ok')), ('shadow', (0, 'would-reject')), ('reject', (1, 'reject'))):
+            base = self._base(two_check_policy(mode, 'off'))
+            code, out, _ = self.f.cli('--tree', self.tree, '--require-all', '--keys-from', base, '--policy-from', base, '--repository', 'org/repo')
+            self.assertEqual((code, json.loads(out)['decision']), (expected[0], expected[1]), (mode, out))
+        # a pull request's own copy of the policy is not read: asking for the commit without a policy is an error, never a reject
+        code, out, _ = self.f.cli('--tree', self.tree, '--require-all', '--keys-from', base, '--policy-from', self.commit, '--repository', 'org/repo')
+        self.assertEqual((code, json.loads(out)['decision'], json.loads(out)['reason']), (2, 'error', 'no_policy'))
+        for bad in (['--check', 'unit'], ['--project'], ['--command', '["x"]'], ['--kinds', 'observed'], ['--max-age', '60']):
+            self.assertEqual(self.f.cli('--tree', self.tree, '--require-all', '--keys-from', base, '--policy-from', base,
+                                        '--repository', 'org/repo', *bad)[0], 2, bad)
+        self.assertEqual(self.f.cli('--tree', self.tree, '--require-all', '--keys-from', base)[0], 2)  # needs the policy and repository
+        self.assertEqual(self.f.cli('--tree', self.tree, '--keys-from', base)[0], 2)  # without --require-all, --check is still required
+
+    def test_a_verifier_that_cannot_decide_exits_two_with_decision_error_never_zero_or_one(self):
+        def run_cli(text):
+            base = self._base(text)
+            return self.f.cli('--tree', self.tree, '--require-all', '--keys-from', base, '--policy-from', base, '--repository', 'org/repo')
+        broken = json.loads(two_check_policy('reject'))
+        broken['checks']['unit']['require'] = 'sometimes'
+        no_command = json.loads(two_check_policy('reject'))
+        del no_command['checks']['unit']['kinds']['observed']['command']  # a kind rule without a command is a policy error
+        no_level_command = json.loads(two_check_policy('reject'))
+        no_level_command['checks']['unit']['kinds']['observed']['by_level'] = {'machine': {'events': ['pull_request']}}
+        for name, text in (('invalid json', 'not json'), ('unknown top-level key', json.dumps({'version': 1, 'checks': {}, 'x': 1})),
+                           ('invalid require', json.dumps(broken)), ('kind without a command', json.dumps(no_command)),
+                           ('by_level without a command', json.dumps(no_level_command))):
+            code, out, _ = run_cli(text)
+            document = json.loads(out)
+            self.assertEqual((code, document['decision'], document['satisfied'], document['reason']), (2, 'error', False, 'error'), (name, out))
+        # a base commit that has no policy file at all
+        base = self._base('{}')
+        self.f.git('rm', '-q', '.st/evidence-skip-policy.json')
+        self.f.git('commit', '-q', '-m', 'no policy')
+        base = self.f.git('rev-parse', 'HEAD')
+        code, out, _ = self.f.cli('--tree', self.tree, '--require-all', '--keys-from', base, '--policy-from', base, '--repository', 'org/repo')
+        self.assertEqual((code, json.loads(out)['decision'], json.loads(out)['reason']), (2, 'error', 'no_policy'))
+        # an unreadable key list and an unexpected exception inside the judging both end as errors too
+        base = self._base(two_check_policy('reject'))
+        code, out, _ = self.f.cli('--tree', self.tree, '--require-all', '--keys', str(self.f.root / 'missing-keys'), '--policy-from', base, '--repository', 'org/repo')
+        self.assertEqual((code, json.loads(out)['decision']), (2, 'error'))
+        import contextlib, io
+        original = evidence_verify.require_all
+        evidence_verify.require_all = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = evidence_verify.main(['--repo', str(self.f.repo), '--tree', self.tree, '--require-all', '--keys-from', base,
+                                             '--policy-from', base, '--repository', 'org/repo'])
+        finally:
+            evidence_verify.require_all = original
+        self.assertEqual((code, json.loads(out.getvalue())['decision'], json.loads(out.getvalue())['detail']), (2, 'error', 'RuntimeError: boom'))
+
+    def test_a_lane_is_always_held_to_the_recorded_argv_of_its_kind_because_a_kind_cannot_omit_one(self):
+        # (intake-b) require_all passes no command of its own; the kind's rule always supplies one, so a note that ran anything else fails
+        self.note('unit', command=('make', 'less'))
+        lane = self.judge(two_check_policy('reject'))['lanes']['unit']
+        self.assertEqual((lane['satisfied'], lane['reason']), (False, 'wrong_command'))
+
+    def _base(self, text):
+        (self.f.repo / '.st').mkdir(exist_ok=True)
+        (self.f.repo / '.st/evidence-keys').write_text(self.f.keys.read_text())
+        (self.f.repo / '.st/evidence-skip-policy.json').write_text(text)
+        self.f.git('add', '-A')
+        self.f.git('commit', '-q', '-m', 'policy')
+        return self.f.git('rev-parse', 'HEAD')
+
+
 class CommittedPolicy(unittest.TestCase):
     """The policy file in this repository, parsed by the same code the gate runs."""
 
     def rules(self, check):
         text = (ROOT / '.st/evidence-skip-policy.json').read_text()
         return evidence_verify.policy_rules(text, check, 'compoundingtech/smalltalk')
+
+    def test_no_committed_check_requires_a_signed_note_yet(self):
+        text = (ROOT / '.st/evidence-skip-policy.json').read_text()
+        for check in json.loads(text)['checks']:
+            self.assertEqual(evidence_verify.policy_rules(text, check, 'compoundingtech/smalltalk')['require'], 'off', check)
 
     def test_declared_inputs_are_exactly_the_reviewed_list_and_all_exist(self):
         # Written out here: changing what a check depends on is a reviewed change to the policy AND to this list.

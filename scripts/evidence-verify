@@ -62,7 +62,8 @@ def git(repo, *args, stdin=None, config=(), env=None):
 
 
 POLICY_KEYS = {'version', 'checks'}
-CHECK_KEYS = {'kinds', 'trust_levels', 'max_age_s', 'enforce', 'inputs', 'sample_one_in'}
+CHECK_KEYS = {'kinds', 'trust_levels', 'max_age_s', 'enforce', 'inputs', 'sample_one_in', 'require'}
+REQUIRE_MODES = ('off', 'shadow', 'reject')
 CHECK_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 PATH_PART = re.compile(r'[A-Za-z0-9._@+=,~#-]+')
 MAX_INPUTS = 300
@@ -109,6 +110,11 @@ def policy_rules(text, check, repository):
     enforce = entry.get('enforce', False)
     if not isinstance(enforce, bool):
         raise Failure('error', f'skip policy for {check}: enforce must be true or false')
+    # `require` is the separate switch for rejecting an unsigned change at queue entry: off (default) / shadow (report what would be
+    # rejected, reject nothing) / reject. It never turns on skipping; `enforce` does that.
+    require = entry.get('require', 'off')
+    if not isinstance(require, str) or require not in REQUIRE_MODES:
+        raise Failure('error', f'skip policy for {check}: require must be one of {", ".join(REQUIRE_MODES)}')
     inputs = entry.get('inputs')
     if inputs is not None:
         inputs = declared_paths(inputs, f'skip policy for {check}')
@@ -159,7 +165,7 @@ def policy_rules(text, check, repository):
                        # may cover pull requests only), whatever the rest of the kind says.
                        'by_level': by_level}
     return {'kinds': kinds, 'trust_levels': tuple(levels), 'max_age_s': max_age, 'enforce': enforce,
-            'inputs': inputs, 'sample_one_in': sample}
+            'inputs': inputs, 'sample_one_in': sample, 'require': require}
 
 
 def declared_paths(value, where):
@@ -459,6 +465,46 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
     }
 
 
+def read_policy(repo, commit):
+    try:
+        return git(repo, 'show', '--end-of-options', f'{commit}:{POLICY_PATH}').decode()
+    except (Failure, UnicodeDecodeError):
+        raise Failure('no_policy', f'no readable skip policy at {commit}:{POLICY_PATH}')
+
+
+def require_all(repo, tree, keys, policy_text, repository):
+    """Every check whose policy says `require` (shadow or reject), judged by the same rules as a single check.
+
+    One entry per such check with its own reason, so a missing lane is named, not folded into one boolean. The overall
+    `decision` is `reject` when a check in mode reject is not satisfied, `would-reject` when only shadow checks are not,
+    and `ok` otherwise (also when no check requires anything). Nothing here reads the pull request's own copy of the
+    policy: the caller passes the text of the accepted base."""
+    try:
+        doc = json.loads(policy_text)
+    except ValueError as error:
+        raise Failure('error', f'skip policy is not valid JSON: {error}')
+    if not isinstance(doc, dict) or set(doc) != POLICY_KEYS or doc['version'] != 1 or not isinstance(doc['checks'], dict):
+        raise Failure('error', 'skip policy must be {"version": 1, "checks": {...}}')
+    lanes = {}
+    for check in sorted(doc['checks']):
+        rules = policy_rules(policy_text, check, repository)  # validates the whole entry, `require` included
+        mode = rules['require']
+        if mode == 'off':
+            continue
+        try:
+            result = verify(repo, tree, check, keys, None, rules=rules)
+            lane = {'require': mode, 'satisfied': True, 'decision': 'ok', 'record': result.get('record'),
+                    'signer': result.get('signer'), 'tier': result.get('tier')}
+        except Failure as failure:
+            lane = {'require': mode, 'satisfied': False, 'reason': failure.reason, 'detail': failure.detail,
+                    'decision': 'reject' if mode == 'reject' else 'would-reject'}
+        lanes[check] = lane
+    decisions = {lane['decision'] for lane in lanes.values()}
+    decision = 'reject' if 'reject' in decisions else 'would-reject' if 'would-reject' in decisions else 'ok'
+    return {'mode': 'require-all', 'tree': tree, 'satisfied': all(lane['satisfied'] for lane in lanes.values()),
+            'decision': decision, 'lanes': lanes}
+
+
 def blob_sha256(repo, tree, path):
     """sha256 of a file as it is in the tree being verified, or None if the tree lacks it."""
     try:
@@ -515,7 +561,10 @@ def main(argv):
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument('--tree')
     target.add_argument('--revision')
-    parser.add_argument('--check', required=True)
+    parser.add_argument('--check')
+    parser.add_argument('--require-all', action='store_true',
+                        help='judge every check whose policy says `require` (needs --policy-from, --repository and keys); '
+                             'exit 1 only when a check in mode reject is not satisfied, exit 2 (decision error) when it could not decide')
     parser.add_argument('--project', action='store_true',
                         help='print the input key of the tree for the check\'s declared paths and exit (needs no keys)')
     parser.add_argument('--paths', metavar='PATH[,PATH...]', help='with --project: declared paths instead of the policy\'s')
@@ -537,6 +586,16 @@ def main(argv):
         args = parser.parse_args(argv)
     except SystemExit as error:
         return 2 if error.code else 0
+    if args.require_all:
+        loose = [args.check, args.command, args.kinds, args.runner_prefix, args.trust_levels, args.max_age, args.paths,
+                 args.bind_input or None, args.project or None]
+        if args.policy_from is None or args.repository is None or any(v is not None for v in loose):
+            print('--require-all needs --policy-from and --repository and replaces --check, --project, --paths, --command, --kinds, '
+                  '--runner-prefix, --trust-levels, --max-age and --bind-input', file=sys.stderr)
+            return 2
+    elif args.check is None:
+        print('--check is required', file=sys.stderr)
+        return 2
     if not args.project and not (args.keys or args.keys_from):
         print('one of --keys or --keys-from is required', file=sys.stderr)
         return 2
@@ -615,6 +674,10 @@ def main(argv):
             keys = os.path.abspath(args.keys)
             if not os.path.isfile(keys):
                 raise Failure('error', f'key list {args.keys} not found')
+        if args.require_all:
+            result = require_all(args.repo, tree, keys, read_policy(args.repo, args.policy_from), args.repository)
+            print(json.dumps(result, indent=2))
+            return 1 if result['decision'] == 'reject' else 0
         rules = None
         if args.policy_from:
             try:
@@ -627,10 +690,19 @@ def main(argv):
         print(json.dumps(result, indent=2))
         return 0
     except Failure as failure:
+        if args.require_all:
+            # Exit 1 means exactly "a reject lane is not satisfied"; a verifier that could not decide exits 2.
+            print(json.dumps({'mode': 'require-all', 'decision': 'error', 'satisfied': False, 'reason': failure.reason,
+                              'detail': failure.detail}, indent=2))
+            return 2
         print(json.dumps({'satisfied': False, 'reason': failure.reason, 'check': args.check,
                           'detail': failure.detail, **failure.extra}, indent=2))
         return 1
     except Exception as error:  # any surprise is a refusal with a reason, never a traceback or a pass
+        if args.require_all:
+            print(json.dumps({'mode': 'require-all', 'decision': 'error', 'satisfied': False, 'reason': 'error',
+                              'detail': f'{type(error).__name__}: {error}'}, indent=2))
+            return 2
         print(json.dumps({'satisfied': False, 'reason': 'error', 'check': args.check,
                           'detail': f'{type(error).__name__}: {error}'}, indent=2))
         return 1
