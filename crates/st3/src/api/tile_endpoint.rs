@@ -302,13 +302,7 @@ fn spawn_with(
                         .collect::<BTreeMap<_, _>>()
                 })
                 .unwrap_or_default();
-            serving.retain(|name, (served, task)| {
-                let keep = wanted.get(name) == Some(served);
-                if !keep {
-                    task.abort();
-                }
-                keep
-            });
+            withdraw_changed(&mut serving, &wanted).await;
             if let Some(registry) = &registry {
                 for (name, served) in wanted {
                     if serving.contains_key(&name) {
@@ -334,6 +328,29 @@ fn spawn_with(
             }
         }
     });
+}
+
+/// Stop every served tile that `wanted` no longer names as it was served, and return only once
+/// each one's task is gone. Its listener closes when the task is dropped, which `abort` alone
+/// leaves for later: the replacement would then bind while the old listener still answers,
+/// take it for another process, give up, and leave a dead socket behind with nothing to
+/// retry on.
+async fn withdraw_changed<S: PartialEq, K: Ord + Clone>(
+    serving: &mut BTreeMap<K, (S, tokio::task::JoinHandle<()>)>,
+    wanted: &BTreeMap<K, S>,
+) {
+    let changed: Vec<K> = serving
+        .iter()
+        .filter(|(name, (served, _))| wanted.get(*name) != Some(served))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in changed {
+        if let Some((_, task)) = serving.remove(&name) {
+            task.abort();
+            // Cancelled is the expected outcome; a task that had already ended is the same.
+            let _ = task.await;
+        }
+    }
 }
 
 /// Serve one tile's endpoint once root has made its directory for this Unix user.
@@ -496,6 +513,45 @@ mod tests {
 
     fn message(from: &str, to: &str, key: &str) -> Value {
         json!({"idempotency_key": key, "from": from, "to": to, "content": "hello"})
+    }
+
+    /// Sets its flag when dropped, as a listener closes when its task is.
+    struct Closes(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for Closes {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_tile_is_gone_before_its_replacement_may_bind() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let hold = |closed: &Arc<AtomicBool>| {
+            let guard = Closes(Arc::clone(closed));
+            tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+        };
+        let (changed, kept) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut serving = BTreeMap::from([
+            ("atlas", (1, hold(&changed))),
+            ("birch", (1, hold(&kept))),
+        ]);
+        // Let both tasks start, so abort has a running listener to cancel.
+        tokio::task::yield_now().await;
+        withdraw_changed(&mut serving, &BTreeMap::from([("atlas", 2), ("birch", 1)])).await;
+        assert!(
+            changed.load(Ordering::SeqCst),
+            "the changed tile's listener must be closed when the withdrawal returns"
+        );
+        assert!(!kept.load(Ordering::SeqCst), "an unchanged tile keeps serving");
+        assert_eq!(serving.keys().copied().collect::<Vec<_>>(), ["birch"]);
+        // A tile the registry dropped is withdrawn the same way.
+        withdraw_changed(&mut serving, &BTreeMap::new()).await;
+        assert!(kept.load(Ordering::SeqCst));
+        assert!(serving.is_empty());
     }
 
     #[tokio::test]
