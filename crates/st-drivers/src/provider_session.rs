@@ -665,6 +665,11 @@ fn apply_provider_environment(
     }
     for key in removed_env {
         command.env_remove(key);
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+        if let Some(new) = crate::contracts::fractal_env_name(key) {
+            command.env_remove(new);
+        }
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
         if let Some(legacy) = crate::contracts::legacy_env_name(key) {
             command.env_remove(legacy);
         }
@@ -674,6 +679,11 @@ fn apply_provider_environment(
             command.env_remove(legacy);
         }
         command.env(key, value);
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+        if let Some(new) = crate::contracts::fractal_env_name(key) {
+            command.env(new, value);
+        }
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
     }
 }
 
@@ -1009,10 +1019,14 @@ mod tests {
         let mut command = Command::new("true");
         apply_provider_environment(
             &mut command,
-            &[("ST_CLAUDE_SESSION".into(), "fresh".into())],
+            &[
+                ("ST_CLAUDE_SESSION".into(), "fresh".into()),
+                ("ST_AGENT".into(), "agent/fixture".into()),
+            ],
             &[
                 "ST_CLAUDE_EXPECTED_NATIVE_SESSION",
                 "ST_CLAUDE_RESUME_GENERATION",
+                "ST_SUPERVISOR",
             ],
         );
         let vars = command
@@ -1025,8 +1039,15 @@ mod tests {
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(vars["ST_CLAUDE_SESSION"].as_deref(), Some("fresh"));
+        assert_eq!(vars["FRACTAL_CLAUDE_SESSION"].as_deref(), Some("fresh"));
+        assert_eq!(vars["ST_AGENT"].as_deref(), Some("agent/fixture"));
+        assert_eq!(vars["FRACTAL_AGENT"].as_deref(), Some("agent/fixture"));
         for key in [
             "ST2_CLAUDE_SESSION",
+            "FRACTAL_CLAUDE_EXPECTED_NATIVE_SESSION",
+            "FRACTAL_CLAUDE_RESUME_GENERATION",
+            "ST_SUPERVISOR",
+            "FRACTAL_SUPERVISOR",
             "ST_CLAUDE_EXPECTED_NATIVE_SESSION",
             "ST2_CLAUDE_EXPECTED_NATIVE_SESSION",
             "ST_CLAUDE_RESUME_GENERATION",

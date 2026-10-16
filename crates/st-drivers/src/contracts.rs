@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-/// The retired spelling of a harness variable. New launchers export only the current name.
+/// The retired ST2 spelling, retained for already-running providers.
 pub fn legacy_env_name(name: &str) -> Option<String> {
     (name.starts_with("ST_CLAUDE_")
         || name.starts_with("ST_PI_CHANNEL_")
@@ -10,17 +10,66 @@ pub fn legacy_env_name(name: &str) -> Option<String> {
     .then(|| format!("ST2_{}", name.strip_prefix("ST_").unwrap()))
 }
 
-/// Read a current spelling first, then the spelling retained by an older running provider.
-/// An explicitly empty current value masks an inherited legacy value rather than reviving it.
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+/// Fractal spelling of an ST/ST3 environment variable.
+pub fn fractal_env_name(name: &str) -> Option<String> {
+    name.strip_prefix("ST_")
+        .or_else(|| name.strip_prefix("ST3_"))
+        .map(|suffix| format!("FRACTAL_{suffix}"))
+}
+
+fn identity_env(name: &str) -> bool {
+    matches!(
+        name,
+        "ST_AGENT" | "ST_SUPERVISOR" | "ST3_SUBJECT" | "ST3_INCARNATION"
+            | "ST_GATE_CAPABILITY" | "ST3_TERMINAL_CAPABILITY"
+    ) || name.starts_with("ST_DRIVER_")
+        || ((name.starts_with("ST_CLAUDE_")
+            || name.starts_with("ST_PI_CHANNEL_")
+            || name.starts_with("ST_OMP_CHANNEL_"))
+            && (name.ends_with("_IDENTITY")
+                || name.ends_with("_SESSION")
+                || name.ends_with("_SESSION_SEQ")
+                || name.ends_with("_SEQ")
+                || name.ends_with("_RUNTIME_ID")
+                || name.ends_with("_RESUME_GENERATION")))
+}
+
+/// Prefer Fractal, then ST/ST3, then the existing ST2 harness alias.
+/// An explicitly empty value masks every older spelling.
 pub fn env_with(name: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    get(name)
-        .or_else(|| legacy_env_name(name).and_then(|legacy| get(&legacy)))
-        .filter(|value| !value.is_empty())
+    env_with_warning(name, get, &mut |message| eprintln!("{message}"))
+}
+
+fn env_with_warning(
+    name: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+    warn: &mut dyn FnMut(String),
+) -> Option<String> {
+    let old = get(name).or_else(|| legacy_env_name(name).and_then(|legacy| get(&legacy)));
+    let Some(new_name) = fractal_env_name(name) else {
+        return old.filter(|value| !value.is_empty());
+    };
+    let Some(new) = get(&new_name) else {
+        return old.filter(|value| !value.is_empty());
+    };
+    if old.as_ref().is_some_and(|old| old != &new) {
+        let identity = identity_env(name);
+        warn(format!(
+            "st: conflicting environment variables {new_name} and {name}; {}",
+            if identity { "ignoring both identity values" } else { "using the Fractal value" }
+        ));
+        if identity {
+            return None;
+        }
+    }
+    Some(new).filter(|value| !value.is_empty())
 }
 
 pub fn env(name: &str) -> Option<String> {
     env_with(name, &|key| std::env::var(key).ok())
 }
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
 
 /// Admit only the exact old spelling of this version; future or foreign schemas stay rejected.
 pub(crate) fn schema_matches(actual: &str, current: &str) -> bool {
@@ -96,6 +145,49 @@ mod tests {
         }
         assert_eq!(legacy_env_name("ST_AGENT"), None);
         assert_eq!(legacy_env_name("HOME"), None);
+    }
+
+    #[test]
+    fn fractal_names_prefer_new_values_without_disclosing_conflicting_values() {
+        for name in ["ST_AGENT", "ST_SUPERVISOR", "ST_CLAUDE_SESSION", "ST3_SUBJECT", "ST3_BIN"] {
+            let new = fractal_env_name(name).unwrap();
+            for (old_value, new_value, expected, warning) in [
+                (None, None, None, false),
+                (Some("seat"), None, Some("seat"), false),
+                (None, Some("seat"), Some("seat"), false),
+                (Some("seat"), Some("seat"), Some("seat"), false),
+                (Some("old-secret"), Some("new-secret"),
+                    if identity_env(name) { None } else { Some("new-secret") }, true),
+                (Some("seat"), Some(""), None, true),
+                (Some(""), None, None, false),
+            ] {
+                let vars: BTreeMap<_, _> = [(name, old_value), (new.as_str(), new_value)]
+                    .into_iter()
+                    .filter_map(|(key, value)| value.map(|value| (key, value.to_owned())))
+                    .collect();
+                let mut warnings = Vec::new();
+                let actual = env_with_warning(name, &|key| vars.get(key).cloned(),
+                    &mut |message| warnings.push(message));
+                assert_eq!(actual.as_deref(), expected, "{name}: {vars:?}");
+                assert_eq!(!warnings.is_empty(), warning);
+                for message in warnings {
+                    assert!(message.contains(name) && message.contains(&new));
+                    assert!(!message.contains("old-secret") && !message.contains("new-secret"));
+                }
+            }
+        }
+        assert_eq!(fractal_env_name("HOME"), None);
+    }
+
+    #[test]
+    fn fractal_empty_masks_st2_and_conflicting_st2_identity_is_rejected() {
+        let mut vars = BTreeMap::from([
+            ("ST2_OMP_CHANNEL_SESSION", "old".to_owned()),
+            ("FRACTAL_OMP_CHANNEL_SESSION", String::new()),
+        ]);
+        assert_eq!(env_with("ST_OMP_CHANNEL_SESSION", &|key| vars.get(key).cloned()), None);
+        vars.insert("FRACTAL_OMP_CHANNEL_SESSION", "new".into());
+        assert_eq!(env_with("ST_OMP_CHANNEL_SESSION", &|key| vars.get(key).cloned()), None);
     }
 
     #[test]

@@ -34,6 +34,12 @@ The in-process OMP extension starts `driver omp-channel` on the executable named
 configuration; `ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION` and
 `ST_OMP_CHANNEL_RESUME_GENERATION` fence a cold residency resume.
 
+<!-- LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032 -->
+The provider wrapper also sets matching `FRACTAL_OMP_CHANNEL_*` names. Shared Rust
+channel readers prefer those names, retain the `ST_*` fallback, and reject conflicting
+ownership values. The existing `ST_*` names remain available to hooks and agent policy.
+<!-- LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read -->
+
 `session_start` sends the native OMP session ID before accepting Rust's hello.
 A matching ready frame completes the two-way exchange. A cold resume must prove the
 expected native ID, wrapper incarnation and residency generation before its candidate

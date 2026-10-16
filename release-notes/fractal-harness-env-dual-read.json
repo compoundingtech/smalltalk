@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Provider wrappers also export FRACTAL harness environment names; shared Rust readers reject conflicting ownership aliases",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No storage schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Shared provider wrappers retain ST harness environment names and additionally set matching FRACTAL names. Shared Rust environment readers prefer FRACTAL, retain ST and existing ST2 fallback, and warn on conflicts without exposing values. Conflicting ownership aliases are rejected. This is the shared-helper/provider-boundary part of the environment migration, not the CLI, daemon, shell or TypeScript consumer cutover."},
+  "downtime": {"status": "none", "detail": "No service replacement or seat restart required."},
+  "manual": {"status": "none", "detail": "Existing ST names remain supported; no consumer change required."},
+  "recovery": {"status": "none", "detail": "No durable state changes. Remove conflicting environment aliases before relaunching a manually configured provider."}
+}
