@@ -366,11 +366,10 @@ fi`,
       ],
     },
     // Watch queue refs on GitHub-hosted capacity, even when both workload pools are occupied.
-    // Manual runs retain the existing Namespace capacity report.
     'namespace-capacity': {
       name: 'namespace-capacity',
-      if: "github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'",
-      'runs-on': `\${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}').replaceAll("${{ github.event_name == 'merge_group' && 1 || 3 }}", '{1}')}', github.run_id, github.event_name == 'merge_group' && 1 || 3)) }}`,
+      if: "github.event_name == 'merge_group'",
+      'runs-on': 'ubuntu-latest',
       'timeout-minutes': 120,
       permissions: { contents: 'read', actions: 'write' },
       defaults: { run: { shell: 'bash' } },
@@ -387,26 +386,6 @@ fi`,
           },
           // Embed trusted workflow source: this job never checks out or executes queued PR code.
           run: `python3 - <<'QUEUE_WATCH_PY'\n${readFileSync(new URL('../../scripts/ci-queue-watch', import.meta.url), 'utf8')}\nQUEUE_WATCH_PY`,
-        },
-        {
-          name: 'Record Namespace platform capacity',
-          if: "github.event_name == 'workflow_dispatch'",
-          run: `nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
-cat "$RUNNER_TEMP/namespace-capacity.json"
-printf 'Measured at %s\\n\\n' "$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
-printf '\\x60\\x60\\x60json\\n' >> "$GITHUB_STEP_SUMMARY"
-cat "$RUNNER_TEMP/namespace-capacity.json" >> "$GITHUB_STEP_SUMMARY"
-printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
-        },
-        {
-          name: 'Retain Namespace capacity evidence',
-          if: "github.event_name == 'workflow_dispatch'",
-          uses: 'actions/upload-artifact@v4',
-          with: {
-            name: 'namespace-capacity',
-            path: '${{ runner.temp }}/namespace-capacity.json',
-            'if-no-files-found': 'error',
-          },
         },
       ],
     },

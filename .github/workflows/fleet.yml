@@ -787,8 +787,8 @@ jobs:
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (success()) }}
   namespace-capacity:
     name: namespace-capacity
-    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') }}
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 3)) }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name == 'merge_group') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: read
@@ -947,22 +947,6 @@ jobs:
               main()
 
           QUEUE_WATCH_PY
-      - name: Record Namespace platform capacity
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
-          cat "$RUNNER_TEMP/namespace-capacity.json"
-          printf 'Measured at %s\n\n' "$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
-          printf '\x60\x60\x60json\n' >> "$GITHUB_STEP_SUMMARY"
-          cat "$RUNNER_TEMP/namespace-capacity.json" >> "$GITHUB_STEP_SUMMARY"
-          printf '\n\x60\x60\x60\n' >> "$GITHUB_STEP_SUMMARY"
-      - name: Retain Namespace capacity evidence
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: namespace-capacity
-          path: "${{ runner.temp }}/namespace-capacity.json"
-          if-no-files-found: error
       - name: Report job cache coverage
         if: always()
         shell: bash

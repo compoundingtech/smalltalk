@@ -1129,9 +1129,14 @@ skipped jobs and jobs without a Namespace runner are excluded. Each active job's
 from its first step to job completion, with unfinished jobs counted through the observation.
 The observation is repository-scoped; the workspace can also have jobs from other repositories.
 
-To refresh the capacity measurement, dispatch Workspace CI on `main`. Its `namespace-capacity`
-job publishes platform limits and current usage for `workflow_dispatch` to the job
-summary and retains the `namespace-capacity` artifact. It reports no workspace or account identity.
+To refresh the capacity measurement, dispatch `namespace-capacity.yml` on `main`:
+`gh workflow run namespace-capacity.yml --ref main`. The same workflow runs hourly at minute 17 UTC.
+Its only job uses one Namespace runner to publish platform limits, current usage and an observation
+timestamp to the job summary and the `namespace-capacity` artifact (retained for 30 days).
+The newest request replaces an older pending or running reading instead of accumulating a backlog.
+It performs no checkout, build or cache setup and reports no workspace or account identity.
+The read retains priority 3 and can wait for the same Namespace capacity it measures; a queued
+reading is not current quota evidence. Dispatching Workspace CI is no longer a capacity read.
 See Namespace's [resource limits](https://namespace.so/docs/architecture/compute/resource-limits)
 and [profile concurrency controls](https://namespace.so/docs/solutions/github-actions/runner-controls/concurrent-runners)
 for the scheduler's limits, and GitHub's [merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
@@ -1153,7 +1158,8 @@ every 15 seconds. A missing ref or a changed SHA on two consecutive successful l
 its own workflow, including queued Linux jobs and always-run summaries. Lookup failures retain work.
 Once all five required checks finish, the watcher exits normally; a ref removed by a successful
 merge therefore retains the completed workflow result used by main upkeep. It executes embedded
-workflow code without checking out queued PR code. Manual capacity reports still use Namespace.
+workflow code without checking out queued PR code. Capacity reports run separately in
+`namespace-capacity.yml` on Namespace.
 
 ## Namespace jobs that never start
 
