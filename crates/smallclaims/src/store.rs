@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
@@ -748,6 +748,8 @@ pub type MemberRoots = BTreeSet<(String, String)>;
 pub struct Store {
     pub connection: WriterConnection,
     pub readers: ReadPool,
+    /// Physical store health. A named shard never contributes to another store's series.
+    pub health: Arc<crate::windows::StoreHealth>,
     pub committed_index: Arc<AtomicU64>,
     pub seeded_batch_rowid: AtomicI64,
     /// Check older writers' skipped batches once per open, before the first sealing pass.
@@ -1022,9 +1024,11 @@ impl Store {
             [index.to_string()],
         )?;
         let committed_index = Arc::new(AtomicU64::new(index));
+        let health = Arc::new(crate::windows::StoreHealth::default());
         Ok(Self {
-            connection: WriterConnection::new(connection, committed_index.clone()),
+            connection: WriterConnection::new_with_health(connection, committed_index.clone(), health.clone()),
             readers,
+            health,
             committed_index,
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             sealing_recovery: tokio::sync::Mutex::new(true),
@@ -4934,7 +4938,7 @@ impl Store {
                 Some(connection) => Rc::new(connection),
                 None => guard.pinned.take().expect("a request loan holds its connection"),
             }),
-            transaction: Some(crate::windows::holds::ReadHold::start()),
+            transaction: Some(crate::windows::holds::ReadHold::start_in(self.health.clone())),
         };
         drop(guard);
         let connection = pinned
@@ -5415,6 +5419,22 @@ impl Store {
     /// None names the legacy/default store and never means an absent named shard.
     pub fn bound_shard(&self) -> Result<Option<String>> {
         fleet_meta(&self.readers.get(), "shard_id")
+    }
+
+    /// Physical diagnostics for this database only. The shard ID comes from the durable
+    /// marker; an absent ID explicitly means the default store.
+    pub fn physical_health_report(&self, snapshot_age: Duration, snapshot_limit: usize) -> Result<serde_json::Value> {
+        use crate::windows::StoreWork;
+        let now = std::time::Instant::now();
+        let series = |kind| self.health.series_snapshot(kind).snapshot(now);
+        Ok(serde_json::json!({
+            "shard_id": self.bound_shard()?,
+            "writer_hold": series(StoreWork::WriterHold),
+            "write_transaction": series(StoreWork::WriteTransaction),
+            "read_transaction": series(StoreWork::ReadTransaction),
+            "holds": self.health.holds_report(),
+            "open_snapshots": self.readers.open_snapshots_over(snapshot_age, snapshot_limit),
+        }))
     }
 
     pub fn replication_inventory(&self) -> Result<ReplicationInventory> {

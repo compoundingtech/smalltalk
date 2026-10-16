@@ -342,6 +342,7 @@ pub struct WriterConnection {
     pub batches: Arc<(AtomicU64, AtomicU64)>,
     fifo: Arc<crate::fifo::Queue>,
     telemetry: Option<Arc<telemetry::Writer>>,
+    health: Option<Arc<crate::windows::StoreHealth>>,
 }
 
 pub enum WriterJob {
@@ -396,6 +397,7 @@ pub struct WriterGuard<'a> {
     finalizers: &'a Arc<TransactionFinalizers>,
     handler_policy: &'a Mutex<Option<Arc<writer_budget::OwnedHandlerPolicy>>>,
     mutation_observer: Option<&'a Arc<writer_observer::MutationState>>,
+    health: Option<&'a Arc<crate::windows::StoreHealth>>,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
     /// The connection's changed-row count when it was lent, so the rows this thread changed are
@@ -405,7 +407,16 @@ pub struct WriterGuard<'a> {
 
 impl WriterConnection {
     pub fn new(connection: Connection, committed_index: Arc<AtomicU64>) -> Self {
-        Self::new_inner(connection, committed_index, None, None)
+        Self::new_inner(connection, committed_index, None, None, None)
+            .expect("writer without an observer needs no schema check")
+    }
+
+    pub fn new_with_health(
+        connection: Connection,
+        committed_index: Arc<AtomicU64>,
+        health: Arc<crate::windows::StoreHealth>,
+    ) -> Self {
+        Self::new_inner(connection, committed_index, None, None, Some(health))
             .expect("writer without an observer needs no schema check")
     }
 
@@ -417,7 +428,7 @@ impl WriterConnection {
         committed_index: Arc<AtomicU64>,
         observer: Arc<dyn WriterObserver>,
     ) -> Result<Self> {
-        Self::new_inner(connection, committed_index, Some(observer), None)
+        Self::new_inner(connection, committed_index, Some(observer), None, None)
     }
 
     fn new_inner(
@@ -425,6 +436,7 @@ impl WriterConnection {
         committed_index: Arc<AtomicU64>,
         observer: Option<Arc<dyn WriterObserver>>,
         policy: Option<writer_budget::OwnedHandlerPolicy>,
+        health: Option<Arc<crate::windows::StoreHealth>>,
     ) -> Result<Self> {
         if let Some(policy) = &policy {
             policy.install(&connection)?;
@@ -448,6 +460,7 @@ impl WriterConnection {
         let observed_fifo = fifo.clone();
         let telemetry = telemetry::Writer::new(&connection);
         let writer_telemetry = telemetry.clone();
+        let writer_health = health.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
             .spawn(move || {
@@ -456,7 +469,7 @@ impl WriterConnection {
                     queue,
                     &index,
                     &counted,
-                    (&observed, &finalized, mutations.as_ref(), writer_telemetry.as_deref()),
+                    (&observed, &finalized, mutations.as_ref(), writer_telemetry.as_deref(), writer_health.as_ref()),
                     background_queue,
                     &observed_fifo,
                 )
@@ -475,6 +488,7 @@ impl WriterConnection {
             batches,
             fifo,
             telemetry,
+            health,
         })
     }
 
@@ -640,6 +654,7 @@ impl WriterConnection {
             finalizers: &self.finalizers,
             handler_policy: &self.handler_policy,
             mutation_observer: self.mutation_observer.as_ref(),
+            health: self.health.as_ref(),
             acquired: crate::profile::writer_acquired(wait),
         }
     }
@@ -775,6 +790,14 @@ impl Drop for WriterConnection {
     }
 }
 
+type WriterCallbacks<'a> = (
+    &'a CommitObservers,
+    &'a TransactionFinalizers,
+    Option<&'a Arc<writer_observer::MutationState>>,
+    Option<&'a telemetry::Writer>,
+    Option<&'a Arc<crate::windows::StoreHealth>>,
+);
+
 /// The writer thread: run each batched write with the others queued behind it in one
 /// transaction, and lend the connection to each lending write in its turn.
 fn write_queue(
@@ -782,7 +805,7 @@ fn write_queue(
     queue: std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    callbacks: (&CommitObservers, &TransactionFinalizers, Option<&Arc<writer_observer::MutationState>>, Option<&telemetry::Writer>),
+    callbacks: WriterCallbacks<'_>,
     background: Arc<writer_queue::BackgroundAdmission>,
     fifo: &Arc<crate::fifo::Queue>,
 ) {
@@ -793,7 +816,10 @@ fn write_queue(
             | WriterJob::FenceLend { lent, returned, holder, enqueued, origin, .. } => {
                 fifo.dequeued_at(enqueued);
                 telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
-                let _hold = crate::windows::holds::WriterHold::start(crate::windows::holds::HoldKind::Lend, &holder);
+                let _hold = match callbacks.4 {
+                    Some(health) => crate::windows::holds::WriterHold::start_in(crate::windows::holds::HoldKind::Lend, &holder, Arc::clone(health)),
+                    None => crate::windows::holds::WriterHold::start(crate::windows::holds::HoldKind::Lend, &holder),
+                };
                 let _holder = callbacks.3.map(|writer| writer.holding(origin));
                 if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
                     connection = back;
@@ -831,15 +857,10 @@ fn run_write_batch(
     queue: &std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    callbacks: (
-        &CommitObservers,
-        &TransactionFinalizers,
-        Option<&Arc<writer_observer::MutationState>>,
-        Option<&telemetry::Writer>,
-    ),
+    callbacks: WriterCallbacks<'_>,
     fifo: &crate::fifo::Queue,
 ) -> Option<WriterJob> {
-    let (observers, finalizers, mutation_observer, writer_telemetry) = callbacks;
+    let (observers, finalizers, mutation_observer, writer_telemetry, health) = callbacks;
     let first_origin = match &first {
         WriterJob::Batched { wait, .. } => wait.as_ref().and_then(crate::profile::WriterWait::trace_origin),
         _ => None,
@@ -856,8 +877,14 @@ fn run_write_batch(
         WriterJob::Batched { holder, .. } => holder.clone(),
         _ => crate::windows::holds::Holder::current(),
     };
-    let mut hold = crate::windows::holds::WriterHold::start(crate::windows::holds::HoldKind::Batch, &first_holder);
-    let transaction_timer = crate::windows::Timer::start(crate::windows::StoreWork::WriteTransaction);
+    let mut hold = match health {
+        Some(health) => crate::windows::holds::WriterHold::start_in(crate::windows::holds::HoldKind::Batch, &first_holder, Arc::clone(health)),
+        None => crate::windows::holds::WriterHold::start(crate::windows::holds::HoldKind::Batch, &first_holder),
+    };
+    let transaction_timer = match health {
+        Some(health) => crate::windows::Timer::start_in(crate::windows::StoreWork::WriteTransaction, Arc::clone(health)),
+        None => crate::windows::Timer::start(crate::windows::StoreWork::WriteTransaction),
+    };
     let mut answers = Vec::new();
     let mut lend = None;
     let (transaction, mut failure) =
@@ -1006,9 +1033,10 @@ impl WriterGuard<'_> {
     /// before COMMIT. Prepare failure rolls back and retains its original error cause.
     pub fn transaction(&mut self) -> Result<WriterTransaction<'_>> {
         let finalizers = self.finalizers.clone();
+        let health = self.health.cloned();
         let transaction = self.deref_mut().transaction()?;
         finalizers.prepare(&transaction)?;
-        Ok(WriterTransaction::new(transaction, finalizers))
+        Ok(WriterTransaction::new(transaction, finalizers, health))
     }
 
     pub fn transaction_with_behavior(
@@ -1016,9 +1044,10 @@ impl WriterGuard<'_> {
         behavior: rusqlite::TransactionBehavior,
     ) -> Result<WriterTransaction<'_>> {
         let finalizers = self.finalizers.clone();
+        let health = self.health.cloned();
         let transaction = self.deref_mut().transaction_with_behavior(behavior)?;
         finalizers.prepare(&transaction)?;
-        Ok(WriterTransaction::new(transaction, finalizers))
+        Ok(WriterTransaction::new(transaction, finalizers, health))
     }
 }
 
@@ -1306,6 +1335,11 @@ impl ReadPool {
     /// identity. Neither group proves who holds a WAL frame.
     pub fn live_read_report(&self) -> ReadLifetimeReport {
         read_lifetime::report(self.diagnostic_id)
+    }
+
+    /// Open snapshots from this database only, excluding every other shard and the default.
+    pub fn open_snapshots_over(&self, age: std::time::Duration, limit: usize) -> Vec<read_lifetime::ReadLifetime> {
+        read_lifetime::open_snapshots_over_in(Some(self.diagnostic_id), age, limit)
     }
 
     #[track_caller]
@@ -2248,7 +2282,7 @@ mod tests {
         let thread = std::thread::spawn(move || {
             write_queue(writer, receiver, &AtomicU64::new(0),
                 &(AtomicU64::new(0), AtomicU64::new(0)),
-                (&CommitObservers::default(), &TransactionFinalizers::default(), None, None),
+                (&CommitObservers::default(), &TransactionFinalizers::default(), None, None, None),
                 Arc::new(writer_queue::BackgroundAdmission::default()), &observed);
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

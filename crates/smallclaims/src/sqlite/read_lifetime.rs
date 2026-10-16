@@ -110,10 +110,15 @@ pub fn oldest_live_read() -> Option<OldestLiveRead> {
 
 /// Read snapshots open longer than `age`, oldest first, at most `limit`, in every pool.
 pub fn open_snapshots_over(age: std::time::Duration, limit: usize) -> Vec<ReadLifetime> {
+    open_snapshots_over_in(None, age, limit)
+}
+
+/// One store's snapshots; an absent pool selects the process aggregate above.
+pub(super) fn open_snapshots_over_in(pool: Option<u64>, age: std::time::Duration, limit: usize) -> Vec<ReadLifetime> {
     let reads = LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner);
     let mut open = reads
         .iter()
-        .filter(|(_, read)| read.snapshot && read.started.elapsed() > age)
+        .filter(|(_, read)| pool.is_none_or(|pool| read.pool == Some(pool)) && read.snapshot && read.started.elapsed() > age)
         .collect::<Vec<_>>();
     open.sort_by_key(|(_, read)| read.started);
     open.into_iter().take(limit).map(|(&id, read)| describe(id, read)).collect()

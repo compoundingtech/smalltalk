@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep writer, transaction, hold, and open-snapshot health separate for each optional named claim store.",
+  "replay": {"status": "none", "detail": "Health windows are in memory and do not change claim replay, checkpoint progress, or trim."},
+  "schema": {"status": "none", "detail": "No table, claim kind, or persisted health record is added."},
+  "rules": {"status": "none", "detail": "No authority or projection rule changes."},
+  "compatibility": {"status": "none", "detail": "No wire or client API changes. A store can report its own physical windows and snapshots; process aggregate diagnostics remain available for existing callers."},
+  "downtime": {"status": "none", "detail": "The optional stores remain default off; there is no live router or shard transport."},
+  "manual": {"status": "none", "detail": "No operator action enables a shard; activation and the one-member trial remain gated by the topology decision and Ops binding."},
+  "recovery": {"status": "none", "detail": "Health windows are rebuilt in memory after restart and do not affect backup or restore."}
+}

@@ -277,6 +277,23 @@ impl Record {
 
 static RECORD: Mutex<Option<Record>> = Mutex::new(None);
 
+#[derive(Default)]
+pub(crate) struct Ledger(Mutex<Record>);
+
+impl Ledger {
+    fn with_record<T>(&self, work: impl FnOnce(&mut Record) -> T) -> T {
+        work(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    pub(crate) fn report(&self) -> Value {
+        let mut report = self.with_record(|record| record.report(Instant::now(), unix_ms()));
+        // Waiting counters predate store scopes and are process-wide. Excluding them from
+        // a per-store report prevents another shard's queue from masquerading as this one.
+        report.as_object_mut().expect("hold report is an object").remove("waiting");
+        report
+    }
+}
+
 fn with_record<T>(work: impl FnOnce(&mut Record) -> T) -> T {
     work(RECORD.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(Record::default))
 }
@@ -290,10 +307,19 @@ pub struct WriterHold {
     first: Holder,
     longest: Option<(Holder, Duration)>,
     writes: usize,
+    store: Option<Arc<super::StoreHealth>>,
 }
 
 impl WriterHold {
     pub fn start(kind: HoldKind, holder: &Holder) -> Self {
+        Self::start_with_store(kind, holder, None)
+    }
+
+    pub fn start_in(kind: HoldKind, holder: &Holder, store: Arc<super::StoreHealth>) -> Self {
+        Self::start_with_store(kind, holder, Some(store))
+    }
+
+    fn start_with_store(kind: HoldKind, holder: &Holder, store: Option<Arc<super::StoreHealth>>) -> Self {
         let started = Instant::now();
         with_record(|record| {
             record.in_progress.insert(std::thread::current().id(), Current {
@@ -303,12 +329,20 @@ impl WriterHold {
                 writes: 0,
             });
         });
+        if let Some(store) = &store {
+            store.holds.with_record(|record| {
+                record.in_progress.insert(std::thread::current().id(), Current {
+                    holder: holder.clone(), kind, started, writes: 0,
+                });
+            });
+        }
         Self {
             kind,
             started,
             first: holder.clone(),
             longest: None,
             writes: 0,
+            store,
         }
     }
 
@@ -321,6 +355,14 @@ impl WriterHold {
                 current.writes = writes;
             }
         });
+        if let Some(store) = &self.store {
+            store.holds.with_record(|record| {
+                if let Some(current) = record.in_progress.get_mut(&std::thread::current().id()) {
+                    current.holder = holder.clone();
+                    current.writes = writes;
+                }
+            });
+        }
     }
 
     /// A batched write from `holder` ran for `took` in this hold.
@@ -342,13 +384,22 @@ impl Drop for WriterHold {
         if let Some(observer) = &self.holder().0.observer {
             observer.fetch_max(us(held), Ordering::Relaxed);
         }
-        let over = super::record_store(StoreWork::WriterHold, held);
+        let over = self.store.as_ref().map_or_else(
+            || super::record_store(StoreWork::WriterHold, held),
+            |store| store.record(StoreWork::WriterHold, held),
+        );
         let now = Instant::now();
         let wall = unix_ms();
         with_record(|record| {
             record.in_progress.remove(&std::thread::current().id());
             record.held(now, wall, self, held, over);
         });
+        if let Some(store) = &self.store {
+            store.holds.with_record(|record| {
+                record.in_progress.remove(&std::thread::current().id());
+                record.held(now, wall, self, held, over);
+            });
+        }
     }
 }
 
@@ -357,6 +408,7 @@ impl Drop for WriterHold {
 pub struct ReadHold {
     started: Instant,
     at: &'static Location<'static>,
+    store: Option<Arc<super::StoreHealth>>,
 }
 
 impl ReadHold {
@@ -365,18 +417,31 @@ impl ReadHold {
         Self {
             started: Instant::now(),
             at: Location::caller(),
+            store: None,
         }
+    }
+
+    #[track_caller]
+    pub fn start_in(store: Arc<super::StoreHealth>) -> Self {
+        Self { started: Instant::now(), at: Location::caller(), store: Some(store) }
     }
 }
 
 impl Drop for ReadHold {
     fn drop(&mut self) {
         let held = self.started.elapsed();
-        if super::record_store(StoreWork::ReadTransaction, held) {
+        let over = self.store.as_ref().map_or_else(
+            || super::record_store(StoreWork::ReadTransaction, held),
+            |store| store.record(StoreWork::ReadTransaction, held),
+        );
+        if over {
             let holder = Holder::asked_at(self.at);
             let now = Instant::now();
             let wall = unix_ms();
-            with_record(|record| record.read(now, wall, holder, held));
+            with_record(|record| record.read(now, wall, holder.clone(), held));
+            if let Some(store) = &self.store {
+                store.holds.with_record(|record| record.read(now, wall, holder, held));
+            }
         }
     }
 }
@@ -455,6 +520,7 @@ mod tests {
             first: holder(first),
             longest: None,
             writes: 0,
+            store: None,
         }
     }
 

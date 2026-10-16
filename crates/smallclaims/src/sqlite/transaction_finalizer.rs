@@ -103,11 +103,15 @@ impl<'connection> WriterTransaction<'connection> {
     pub(super) fn new(
         transaction: Transaction<'connection>,
         finalizers: Arc<TransactionFinalizers>,
+        health: Option<Arc<crate::windows::StoreHealth>>,
     ) -> Self {
         Self {
             transaction,
             finalizers,
-            _timer: crate::windows::Timer::start(crate::windows::StoreWork::WriteTransaction),
+            _timer: match health {
+                Some(health) => crate::windows::Timer::start_in(crate::windows::StoreWork::WriteTransaction, health),
+                None => crate::windows::Timer::start(crate::windows::StoreWork::WriteTransaction),
+            },
         }
     }
 

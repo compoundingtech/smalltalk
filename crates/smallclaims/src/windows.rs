@@ -279,10 +279,55 @@ pub fn store_series(kind: StoreWork) -> Series {
         .clone()
 }
 
+/// Windows owned by one physical claim store. The process windows remain available for
+/// aggregate diagnostics, but a shard's samples must never be interpreted as another
+/// store's objective or hide its stalled writer.
+pub struct StoreHealth {
+    series: [Mutex<Series>; 4],
+    pub(crate) holds: holds::Ledger,
+}
+
+impl Default for StoreHealth {
+    fn default() -> Self {
+        Self {
+            series: std::array::from_fn(|_| Mutex::new(Series::default())),
+            holds: holds::Ledger::default(),
+        }
+    }
+}
+
+impl StoreHealth {
+    fn series(&self, kind: StoreWork) -> &Mutex<Series> {
+        &self.series[StoreWork::ALL.iter().position(|work| *work == kind).unwrap()]
+    }
+
+    /// Record in both the process aggregate and this store, using the same objective result.
+    pub fn record(&self, kind: StoreWork, duration: Duration) -> bool {
+        let over = record_store(kind, duration);
+        self.series(kind)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(Instant::now(), duration, over);
+        over
+    }
+
+    pub fn series_snapshot(&self, kind: StoreWork) -> Series {
+        self.series(kind)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn holds_report(&self) -> Value {
+        self.holds.report()
+    }
+}
+
 /// Records how long it lives in `kind` when dropped.
 pub struct Timer {
     kind: StoreWork,
     started: Instant,
+    store: Option<std::sync::Arc<StoreHealth>>,
 }
 
 impl Timer {
@@ -290,13 +335,23 @@ impl Timer {
         Self {
             kind,
             started: Instant::now(),
+            store: None,
         }
+    }
+
+    pub fn start_in(kind: StoreWork, store: std::sync::Arc<StoreHealth>) -> Self {
+        Self { kind, started: Instant::now(), store: Some(store) }
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        record_store(self.kind, self.started.elapsed());
+        let duration = self.started.elapsed();
+        if let Some(store) = &self.store {
+            store.record(self.kind, duration);
+        } else {
+            record_store(self.kind, duration);
+        }
     }
 }
 

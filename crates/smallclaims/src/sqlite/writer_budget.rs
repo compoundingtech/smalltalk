@@ -120,7 +120,7 @@ impl WriterConnection {
         committed_index: Arc<AtomicU64>,
         policy: OwnedHandlerPolicy,
     ) -> Result<Self> {
-        Self::new_inner(connection, committed_index, None, Some(policy))
+        Self::new_inner(connection, committed_index, None, Some(policy), None)
     }
 
     pub fn invalidate_handler_policy(&self) {

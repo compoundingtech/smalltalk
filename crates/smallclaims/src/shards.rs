@@ -82,6 +82,18 @@ impl ShardStores {
     pub fn ids(&self) -> impl Iterator<Item = &ShardId> {
         self.stores.keys()
     }
+
+    /// An explicitly named report for every opened database; no absent shard is shown as empty.
+    pub fn physical_health_reports(
+        &self,
+        snapshot_age: std::time::Duration,
+        snapshot_limit: usize,
+    ) -> Result<BTreeMap<String, serde_json::Value>> {
+        self.stores
+            .iter()
+            .map(|(id, store)| Ok((id.as_str().to_owned(), store.physical_health_report(snapshot_age, snapshot_limit)?)))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +461,64 @@ mod tests {
         )
         .unwrap();
         assert!(moved.bind_shard(&ShardId::parse("work").unwrap()).is_err());
+    }
+
+    #[test]
+    fn writer_and_open_snapshot_health_belong_to_one_store() {
+        let root = tempfile::tempdir().unwrap();
+        let github = ShardId::parse("github").unwrap();
+        let work = ShardId::parse("work").unwrap();
+        let stores = ShardStores::open(
+            root.path(),
+            "node",
+            |_| Box::new(Plain),
+            [github.clone(), work.clone()],
+        )
+        .unwrap();
+        let github_store = stores.get(&github).unwrap();
+        let work_store = stores.get(&work).unwrap();
+        let count = |store: &Store, kind| {
+            store.health
+                .series_snapshot(kind)
+                .snapshot(std::time::Instant::now())["1h"]["count"]
+                .as_u64()
+                .unwrap()
+        };
+        let before_github = count(github_store, crate::windows::StoreWork::WriterHold);
+        let before_work = count(work_store, crate::windows::StoreWork::WriterHold);
+        drop(github_store.connection.write());
+        // The next loan starts after the writer completed and counted the first hold.
+        let next = github_store.connection.write();
+        assert!(count(github_store, crate::windows::StoreWork::WriterHold) > before_github);
+        assert_eq!(count(work_store, crate::windows::StoreWork::WriterHold), before_work);
+        let while_held = stores.physical_health_reports(std::time::Duration::ZERO, 8).unwrap();
+        assert_eq!(while_held["github"]["holds"]["in_progress"].as_array().unwrap().len(), 1);
+        assert!(while_held["work"]["holds"]["in_progress"].as_array().unwrap().is_empty());
+        drop(next);
+
+        let before_write = count(github_store, crate::windows::StoreWork::WriteTransaction);
+        let other_write = count(work_store, crate::windows::StoreWork::WriteTransaction);
+        let mut writer = github_store.connection.write();
+        writer.transaction().unwrap().commit().unwrap();
+        drop(writer);
+        assert!(count(github_store, crate::windows::StoreWork::WriteTransaction) > before_write);
+        assert_eq!(count(work_store, crate::windows::StoreWork::WriteTransaction), other_write);
+
+        let before_read = count(github_store, crate::windows::StoreWork::ReadTransaction);
+        let other_read = count(work_store, crate::windows::StoreWork::ReadTransaction);
+        github_store.read_snapshot(|_| Ok(())).unwrap();
+        assert!(count(github_store, crate::windows::StoreWork::ReadTransaction) > before_read);
+        assert_eq!(count(work_store, crate::windows::StoreWork::ReadTransaction), other_read);
+
+        let live = github_store.readers.register_snapshot();
+        assert_eq!(github_store.readers.open_snapshots_over(std::time::Duration::ZERO, 8).len(), 1);
+        assert!(work_store.readers.open_snapshots_over(std::time::Duration::ZERO, 8).is_empty());
+        let reports = stores.physical_health_reports(std::time::Duration::ZERO, 8).unwrap();
+        assert_eq!(reports["github"]["shard_id"], "github");
+        assert_eq!(reports["work"]["shard_id"], "work");
+        assert_eq!(reports["github"]["open_snapshots"].as_array().unwrap().len(), 1);
+        assert!(reports["work"]["open_snapshots"].as_array().unwrap().is_empty());
+        assert!(reports["github"]["holds"].get("waiting").is_none());
+        drop(live);
     }
 }
