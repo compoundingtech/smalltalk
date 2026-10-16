@@ -116,6 +116,7 @@ pub mod suspension;
 pub(crate) mod publication;
 pub mod seat_snapshot;
 pub mod telemetry;
+pub use smallclaims::task_cpu;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.

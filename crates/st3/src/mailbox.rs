@@ -136,7 +136,7 @@ impl Subscription {
         report["mailbox_replay_ack"] = serde_json::json!(true);
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let (report_tx, mut report_rx) = tokio::sync::watch::channel(report);
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(crate::task_cpu::account("mailbox.subscription", async move {
             loop {
                 let result: Result<()> = async {
                     let mut socket = client.open_mailbox(&fence).await?;
@@ -183,7 +183,7 @@ impl Subscription {
                 // Transport loss changes no delivery state. The next connection replays the graph.
                 tokio::time::sleep(crate::client::driver_retry_pause()).await;
             }
-        });
+        }));
         Self {
             receiver,
             report: report_tx,

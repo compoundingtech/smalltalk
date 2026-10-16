@@ -178,15 +178,15 @@ impl Owner {
             let (sender, receiver) = watch::channel(None);
             state.discovery = Some(receiver.clone());
             let owner = self.clone();
-            tokio::spawn(async move {
+            tokio::spawn(crate::task_cpu::account("changes.discover", async move {
                 let attempted_at = chrono::Utc::now().to_rfc3339();
                 let started = Instant::now();
                 let transport = owner.transport.clone();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || crate::task_cpu::blocking("changes.discover", || {
                     transport
                         .discover()
                         .and_then(Observation::from_advertisement)
-                })
+                }))
                 .await;
                 let result = match result {
                     Ok(result) => result,
@@ -209,7 +209,7 @@ impl Owner {
                 state.observation = observation.clone();
                 state.discovery = None;
                 let _ = sender.send(Some(observation));
-            });
+            }));
             receiver
         };
         drop(state);
@@ -245,9 +245,9 @@ impl Owner {
         state.counters.fetches_started = state.counters.fetches_started.saturating_add(1);
         let (sender, mut receiver) = watch::channel(None);
         let owner = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(crate::task_cpu::account("changes.sync", async move {
             let transport = owner.transport.clone();
-            let result = tokio::task::spawn_blocking(move || transport.sync()).await;
+            let result = tokio::task::spawn_blocking(move || crate::task_cpu::blocking("changes.sync", || transport.sync())).await;
             owner.state.lock().await.syncing = false;
             let result = match result {
                 Ok(Ok(())) => Ok(()),
@@ -255,7 +255,7 @@ impl Owner {
                 Err(error) => Err(error.to_string()),
             };
             let _ = sender.send(Some(result));
-        });
+        }));
         drop(state);
         loop {
             if let Some(result) = receiver.borrow().clone() {

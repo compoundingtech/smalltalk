@@ -159,7 +159,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id.clone());
-        let spawned = std::thread::Builder::new().name("st3-runtime-start".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("st3-runtime-start".into()).spawn(move || crate::task_cpu::blocking("runtime.start", || {
             let _lock = lock;
             let guard = || -> Result<()> {
                 anyhow::ensure!(!store.runtime_start_revoked(&id)?, "start operation was revoked");
@@ -231,7 +231,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             incremental.touch(&format!("local-runtime-start:{subject}"));
             incremental.touch(&subject);
             signal_changed(&notify, &events);
-        });
+        }));
         if let Err(error) = spawned {
             self.start_jobs
                 .live

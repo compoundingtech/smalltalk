@@ -115,9 +115,9 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
         let (log, rows) = (dir.clone(), rows.clone());
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = tokio::task::spawn_blocking(move || crate::task_cpu::blocking("slo.history", || -> anyhow::Result<()> {
             Ok(append(&log, now, &rows()?)?)
-        })
+        }))
         .await;
         match result {
             Ok(Ok(())) => failing = false,

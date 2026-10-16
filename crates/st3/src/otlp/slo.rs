@@ -211,7 +211,7 @@ pub async fn run(exporter: OtlpExporter) {
     let mut failing = false;
     loop {
         tokio::time::sleep(INTERVAL).await;
-        let report = match tokio::task::spawn_blocking(crate::api::request_latency_target_windows).await {
+        let report = match tokio::task::spawn_blocking(|| crate::task_cpu::blocking("slo.export", crate::api::request_latency_target_windows)).await {
             Ok(report) => report,
             Err(error) => {
                 if !failing {
