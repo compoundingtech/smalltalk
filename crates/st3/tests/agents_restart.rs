@@ -1173,7 +1173,7 @@ async fn starts_a_stopped_mission_seat_on_its_own_declaration(shape: Shape) {
         .0;
     let initial_token = fixture.store.selected_desired_token(&subject).unwrap().unwrap();
     let seats = agent_subjects(&fixture.store);
-    assert_eq!(seats, [subject.clone()]);
+    assert_eq!(seats, std::slice::from_ref(&subject));
     // Starting a running mission seat changes nothing and says how to relaunch it.
     let running = succeeded(
         &st(

@@ -32,7 +32,7 @@
   },
   "root_cause": {
     "files": [
-      "crates/st3/src/reconcile.rs",
+      "crates/st3-daemon/src/reconcile.rs",
       "crates/st3/src/main.rs"
     ],
     "defect": "readiness emits a Small Talk message and DING injects terminal line input, but no supported harness-driver wake is acknowledged by a turn or claim, retried within a bound, or escalated as harness.diagnostic"

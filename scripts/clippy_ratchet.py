@@ -8,6 +8,8 @@ import subprocess
 import sys
 
 BASELINE = ".github/clippy-baseline.json"
+# A crate split out of another one: {"new-crate": "origin-crate"}. Optional; see docs/ci.md.
+SPLITS = ".github/clippy-splits.json"
 RUNS = ("clippy-workspace.jsonl", "clippy-model.jsonl")
 
 
@@ -69,6 +71,21 @@ def increases(candidate, ceiling):
             if count > ceiling.get(crate, {}).get(lint, 0)]
 
 
+def folded(counts, splits, previous):
+    """Counts with each split-out crate added back to its origin, for crates the base lacks.
+
+    A crate split out of another one may take warnings from its origin, never add any: against the base
+    revision the two are compared together, so the ceiling stays the origin's own.
+    """
+    result = {crate: dict(lints) for crate, lints in counts.items()}
+    for new, origin in sorted(splits.items()):
+        if new in previous:
+            continue
+        for lint, count in result.pop(new, {}).items():
+            result.setdefault(origin, {})[lint] = result.get(origin, {}).get(lint, 0) + count
+    return result
+
+
 def baseline_at_ref(ref):
     # ls-tree distinguishes the initial rollout (file absent) from a bad/missing base ref.
     files = subprocess.run(["git", "ls-tree", "--name-only", ref, "--", BASELINE],
@@ -80,12 +97,13 @@ def baseline_at_ref(ref):
     return validate_baseline(json.loads(content))
 
 
-def check(observed, baseline, previous=None):
+def check(observed, baseline, previous=None, splits=None):
     failures = []
     if observed["toolchain"] != baseline["toolchain"]:
         failures.append("toolchain differs from baseline: run inside the flake.lock-pinned nix develop shell")
     if previous is not None:
-        failures += ["baseline increased: " + row for row in increases(baseline["counts"], previous["counts"])]
+        counts = folded(baseline["counts"], splits or {}, previous["counts"])
+        failures += ["baseline increased: " + row for row in increases(counts, previous["counts"])]
     failures += ["new warning: " + row for row in increases(observed["counts"], baseline["counts"])]
     if increases(baseline["counts"], observed["counts"]):
         failures.append("warnings removed: lower the committed baseline with --update")
@@ -126,17 +144,19 @@ def main():
         path = Path(BASELINE)
         previous = baseline_at_ref(args.base_ref) if args.base_ref else None
         baseline = validate_baseline(json.loads(path.read_text())) if path.exists() else None
+        splits = json.loads(Path(SPLITS).read_text()) if Path(SPLITS).exists() else {}
         if args.update:
             # Updating can never bless new debt, even outside CI.
-            if baseline is not None and increases(observed["counts"], baseline["counts"]):
-                raise ValueError("cannot update baseline upwards:\n" + "\n".join(
-                    increases(observed["counts"], baseline["counts"])))
-            check(observed, observed, previous)
+            if baseline is not None:
+                upwards = increases(folded(observed["counts"], splits, baseline["counts"]), baseline["counts"])
+                if upwards:
+                    raise ValueError("cannot update baseline upwards:\n" + "\n".join(upwards))
+            check(observed, observed, previous, splits)
             path.write_text(json.dumps(observed, indent=2, sort_keys=True) + "\n")
             baseline = observed
         if baseline is None:
             raise ValueError("missing committed Clippy baseline")
-        check(observed, baseline, previous)
+        check(observed, baseline, previous, splits)
         total = sum(sum(lints.values()) for lints in observed["counts"].values())
         print(f"Clippy ratchet passed: {total} unique workspace warnings")
         for crate, lints in sorted(observed["counts"].items()):
