@@ -543,7 +543,10 @@ for all observed HTTP(S) origins. Cookie/quota audits and a first-document
 local/session-storage audit reject residual state. Case-internal navigation may
 retain its own state; it is never inherited by another case.
 
-The gate takes three options, all unset in CI today (full set, a11y on, no budget).
+The gate takes three options. Pull requests run the stories tagged `critical` with a11y
+off and a 420-second budget; merge groups (observed and signed by Evidence observe) and
+manual runs keep every story with a11y on and no budget, so every tree that reaches main
+has had the full matrix and axe. Which stories are critical is the UI owners' choice.
 `KIT_PLAY_SET=critical` selects only stories tagged `critical` (an empty selection fails);
 `KIT_PLAY_A11Y=off` sets addon-a11y's own `a11y.manual` global so axe does not run, and
 each case must then carry no a11y report, while with a11y on each case must carry exactly

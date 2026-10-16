@@ -255,6 +255,9 @@ assert "github.event.pull_request.head.sha || github.event.merge_group.head_sha"
 assert "github.event.merge_group.base_sha || github.event.before" in changes
 assert "github.event.merge_group.head_sha || github.sha" in changes
 assert "KIT_INPUTS: ${{ needs.fractal-web-changes.outputs.kit-inputs }}" in execution
+assert "KIT_PLAY_SET: ${{ github.event_name == 'pull_request' && 'critical' || 'all' }}" in execution, "PRs run the critical set"
+assert "KIT_PLAY_A11Y: ${{ github.event_name == 'pull_request' && 'off' || 'on' }}" in execution, "merge groups keep axe"
+assert "KIT_PLAY_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '420' || '' }}" in execution, "the per-commit budget"
 assert "github.event.pull_request.draft == false" in changes and "(success())" in changes and "actions/checkout" not in changes, "ready PR detection runs on embedded source"
 assert "needs: [fractal-web-changes, genie-freshness]" in execution
 assert "needs.fractal-web-changes.outputs.relevant == 'true'" in execution

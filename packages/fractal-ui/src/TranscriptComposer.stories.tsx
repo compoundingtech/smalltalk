@@ -55,7 +55,7 @@ async function columns(canvasElement: HTMLElement) {
 }
 
 /** The composer and the transcript rows share one column: equal edges, capped at the lane maximum. */
-export const ReadingColumn: Story = { play: async ({ canvasElement }) => {
+export const ReadingColumn: Story = { tags: ['critical'], play: async ({ canvasElement }) => {
   const { row, composer, lane } = await columns(canvasElement)
   await expect(Math.abs(composer.left - row.left), `composer left ${composer.left} vs transcript left ${row.left}`).toBeLessThanOrEqual(0.5)
   await expect(Math.abs(composer.right - row.right), `composer right ${composer.right} vs transcript right ${row.right}`).toBeLessThanOrEqual(0.5)
@@ -64,7 +64,7 @@ export const ReadingColumn: Story = { play: async ({ canvasElement }) => {
 } }
 export const ReadingColumnLight: Story = { ...ReadingColumn, args: { scheme: 'light' } }
 /** Without the opt-in, the composer keeps filling its host. */
-export const HostWidth: Story = { args: { readingColumn: false }, play: async ({ canvasElement }) => {
+export const HostWidth: Story = { tags: ['critical'], args: { readingColumn: false }, play: async ({ canvasElement }) => {
   const { composer, dock } = await columns(canvasElement)
   await expect(Math.abs(composer.width - dock.width)).toBeLessThanOrEqual(0.5)
 } }
@@ -78,7 +78,7 @@ function PlaceholderStory({ scheme }: { scheme: Scheme }) {
 }
 const keyboardText = /enter|shift|return|ctrl|cmd|⌘|⏎|↵|mod\s*\+/i
 /** Empty-field guidance never carries keyboard instructions; a host override replaces it, still describing the field. */
-export const Placeholder: Story = { render: args => <PlaceholderStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+export const Placeholder: Story = { tags: ['critical'], render: args => <PlaceholderStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
   for (const [testId, expected] of [['default-placeholder', undefined], ['override-placeholder', overridePlaceholder]] as const) {
     const section = canvasElement.querySelector(`[data-testid="${testId}"]`)!
     const guidance = await waitFor(() => { const found = section.querySelector<HTMLElement>('[data-testid="composer-placeholder"]'); if (found === null) throw new Error(`No guidance in ${testId}`); return found })
@@ -120,7 +120,7 @@ async function settleFrames() {
   for (let frame = 0; frame < 3; frame++) await new Promise(resolve => requestAnimationFrame(resolve))
 }
 /** An agent reply keeps a scrolled-up reader's line and offers the jump; the reader's own send brings it into view. */
-export const OwnSendFollows: Story = { render: args => <OwnSendStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
+export const OwnSendFollows: Story = { tags: ['critical'], render: args => <OwnSendStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const viewport = await waitFor(() => { const found = canvasElement.querySelector<HTMLElement>('[data-testid="transcript-scroll"]'); if (found === null || found.querySelectorAll('[data-testid="transcript-turn"]').length < historyTurns.length) throw new Error('History not committed'); return found })
   const jump = canvas.getByText('New messages ↓')

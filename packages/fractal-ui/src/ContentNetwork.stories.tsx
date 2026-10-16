@@ -81,12 +81,12 @@ const deferredStory = (boundary: Boundary, source: string): Story => ({
     await expect(performance.getEntriesByType('resource').filter(entry => entry.name === fixtureUrl)).toHaveLength(fixtureRequestsBefore + (source === sources.Data ? 0 : 1))
   },
 })
-export const TranscriptRemote: Story = deferredStory('Transcript', sources.Remote)
-export const TranscriptLoopback: Story = deferredStory('Transcript', sources.Loopback)
-export const TranscriptMetadata: Story = deferredStory('Transcript', sources.Metadata)
-export const TranscriptData: Story = deferredStory('Transcript', sources.Data)
-export const TranscriptLinked: Story = deferredStory('Transcript', sources.Linked)
-export const TranscriptLocal: Story = deferredStory('Transcript', sources.Local)
+export const TranscriptRemote: Story = { ...deferredStory('Transcript', sources.Remote), tags: ['critical'] }
+export const TranscriptLoopback: Story = { ...deferredStory('Transcript', sources.Loopback), tags: ['critical'] }
+export const TranscriptMetadata: Story = { ...deferredStory('Transcript', sources.Metadata), tags: ['critical'] }
+export const TranscriptData: Story = { ...deferredStory('Transcript', sources.Data), tags: ['critical'] }
+export const TranscriptLinked: Story = { ...deferredStory('Transcript', sources.Linked), tags: ['critical'] }
+export const TranscriptLocal: Story = { ...deferredStory('Transcript', sources.Local), tags: ['critical'] }
 export const EmbraceRemote: Story = deferredStory('Embrace', sources.Remote)
 export const EmbraceLoopback: Story = deferredStory('Embrace', sources.Loopback)
 export const EmbraceMetadata: Story = deferredStory('Embrace', sources.Metadata)
@@ -109,7 +109,7 @@ const allowedStory = (boundary: Boundary): Story => ({ args: { boundary, source:
   const contentUrl = /^(?:https:\/\/example\.invalid\/|http:\/\/127\.0\.0\.1\/|http:\/\/169\.254\.169\.254\/)/
   await expect(performance.getEntriesByType('resource').filter(entry => contentUrl.test(entry.name))).toHaveLength(0)
 } })
-export const TranscriptAllowedAttachment: Story = allowedStory('Transcript')
+export const TranscriptAllowedAttachment: Story = { ...allowedStory('Transcript'), tags: ['critical'] }
 export const EmbraceAllowedAttachment: Story = allowedStory('Embrace')
 export const ToolPreviewAllowedAttachment: Story = allowedStory('ToolPreview')
 /** CSP hosts (img-src 'self' data: blob:) take the source and open it outside the page; the kit never fetches it. */
@@ -131,8 +131,8 @@ const hostOpensStory = (boundary: Boundary, source: string): Story => ({ args: {
   await expect(canvas.getAllByTestId('deferred-image')).toHaveLength(2)
   await expect(performance.getEntriesByType('resource').filter(entry => contentUrl.test(entry.name))).toHaveLength(0)
 } })
-export const TranscriptHostOpensRemote: Story = hostOpensStory('Transcript', sources.Remote)
-export const TranscriptHostOpensLoopback: Story = hostOpensStory('Transcript', sources.Loopback)
+export const TranscriptHostOpensRemote: Story = { ...hostOpensStory('Transcript', sources.Remote), tags: ['critical'] }
+export const TranscriptHostOpensLoopback: Story = { ...hostOpensStory('Transcript', sources.Loopback), tags: ['critical'] }
 export const EmbraceHostOpensRemote: Story = hostOpensStory('Embrace', sources.Remote)
 export const EmbraceHostOpensMetadata: Story = hostOpensStory('Embrace', sources.Metadata)
 export const ToolPreviewHostOpensRemote: Story = hostOpensStory('ToolPreview', sources.Remote)

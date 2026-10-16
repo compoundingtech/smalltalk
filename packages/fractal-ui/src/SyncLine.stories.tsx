@@ -71,7 +71,7 @@ const meta = {
 } satisfies Meta<SyncArgs>
 export default meta
 type Story = StoryObj<SyncArgs>
-export const AllStates: Story = { render: AllStatesStory, play: async ({ canvasElement }) => {
+export const AllStates: Story = { tags: ['critical'], render: AllStatesStory, play: async ({ canvasElement }) => {
   const lines = canvasElement.querySelectorAll<HTMLElement>('[data-testid="sync-line"]')
   if (lines.length === 0) throw new Error('Expected the full synchronization state matrix')
   for (const line of lines) {
@@ -90,9 +90,9 @@ export const LocalFailureZeroCap: Story = { args: { sequence: syncObservations.f
 export const UnknownFailure: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Failed · Unknown') } }
 export const ServerFailure: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Failed') } }
 export const ServerFailureSubscriptionLimit: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Failed · Server · subscription limit') } }
-export const SubscriptionLimitsDark: Story = { render: SubscriptionLimitsStory, args: { scheme: 'dark' }, argTypes: { sequence: { control: false } }, play: subscriptionLimitPlay }
-export const SubscriptionLimitsLight: Story = { render: SubscriptionLimitsStory, args: { scheme: 'light' }, argTypes: { sequence: { control: false } }, play: subscriptionLimitPlay }
-export const TransitionSequence: Story = {
+export const SubscriptionLimitsDark: Story = { tags: ['critical'], render: SubscriptionLimitsStory, args: { scheme: 'dark' }, argTypes: { sequence: { control: false } }, play: subscriptionLimitPlay }
+export const SubscriptionLimitsLight: Story = { tags: ['critical'], render: SubscriptionLimitsStory, args: { scheme: 'light' }, argTypes: { sequence: { control: false } }, play: subscriptionLimitPlay }
+export const TransitionSequence: Story = { tags: ['critical'],
   render: StoryRender,
   play: async ({ canvasElement }) => {
     const next = canvasElement.querySelector<HTMLButtonElement>('button')!
@@ -150,7 +150,7 @@ export const TransitionSequence: Story = {
     } finally { observer.disconnect() }
   },
 }
-export const TransitionSequenceLight: Story = { args: { scheme: 'light' }, play: TransitionSequence.play }
+export const TransitionSequenceLight: Story = { tags: ['critical'], args: { scheme: 'light' }, play: TransitionSequence.play }
 const styles = stylex.create({
   root: { height: '100vh', overflow: 'auto', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: s.md, padding: s.md, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading }, allRoot: { height: '100vh', overflow: 'auto', boxSizing: 'border-box', padding: s.md, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading }, title: { margin: 0, fontSize: t.headingSize, lineHeight: t.headingLeading }, heading: { display: 'flex', alignItems: 'center', gap: s.lg, minHeight: g.band, flexShrink: 0 },
   stateName: { width: g.tooltipMax, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
