@@ -123,8 +123,13 @@ impl Fence {
             cut: None,
             value: None,
         };
+        // Shared-cache snapshots hold table read locks until their transaction ends. The
+        // frontier read locks sqlite_sequence and can reject an unrelated AUTOINCREMENT
+        // publication with SQLITE_LOCKED. Keep shared-memory callers on the unchanged
+        // canonical writer path; reject BEFORE acquiring even a reader or seed loan.
         // Do not join an older ambient snapshot or end an unregistered request transaction.
-        if !Arc::ptr_eq(&self.incarnation, &store.committed_index)
+        if store.shared_memory
+            || !Arc::ptr_eq(&self.incarnation, &store.committed_index)
             || store.path != self.path
             || store.readers.path != self.path
             || store.shared_memory != self.shared_memory

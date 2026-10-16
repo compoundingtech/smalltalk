@@ -4,10 +4,12 @@ This successor implements Root's native-fence direction and exact two-attempt
 progress decision (`message/33b0e7227461f7d0` and `message/36b5b6346537f193`)
 on installed source `4b04f5bdbefb9d7ecac427711a4449866a64f03e`. It supersedes
 the blocker-only implementation at `67001b07`; its four counterexamples remain.
-All 21 authored controls are **UNRUN**, including first compile. Static source
-comparison, rustfmt parsing, diff checks and JSON parsing are the only checks
-performed. No local Cargo, SQLite, compiler, live read, profile, CI action,
-publication or runtime adoption occurred.
+The original private packet had 21 unrun controls. They later passed in the
+qualifying hosted cohort, which also carried a retry-masked log_diet lock failure.
+The shared-memory correction below has 24 controls, all **UNRUN** at its private
+source handoff. Static source comparison, rustfmt parsing, diff checks and JSON
+parsing are the only checks performed for that correction. No local Cargo, SQLite,
+compiler, live read, profile or runtime adoption is claimed.
 
 The source trace remains
 `doc/fleet/smalltalk/speed/2026-10-16/writer-resource-source-trace@479ded00abd546c1cf6dfa1632ccc781ceffa509b15dfe3760ce41c459e27a39`.
@@ -107,8 +109,12 @@ REPLACE shape, not every possible custom trigger program.
 
 CoreStore::open opens one native writer, normalizes its opened filename, and
 constructs ReadPool from that same path. open_memory constructs one unique UUID
-shared-memory URI for both; its native empty filename is accepted only for that
-Store's shared-memory mode. Preparation checks Store/ReadPool path agreement,
+shared-memory URI for both. Preparation rejects this mode before acquiring a
+reader or seed writer loan: its snapshot frontier reads sqlite_sequence and a
+shared-cache table read lock can reject an unrelated AUTOINCREMENT publication.
+The supported shared-memory store retains the unchanged canonical writer path;
+only the off-writer optimization is ineligible. File-backed preparation retains
+the complete native fence and the same-cut snapshot. Preparation checks Store/ReadPool path agreement,
 reader native filename against the seed, and the reader's main schema cookie.
 It rejects foreign Fence/Store incarnations. It does not compare data_version
 between connections.
@@ -213,3 +219,65 @@ Native writer/reader dispatcher files, Store constructors/read_snapshot and this
 observation's dependency/helper bodies have no incoming mutation-seam change.
 The main merge was clean. This is static interaction review, not runtime result
 transfer; the first compile and all 21 controls remain UNRUN.
+
+
+## Shared-memory preparation correction
+
+The normal daemon opens `state_dir/claims.sqlite3` in `main.rs::run_up`
+through `Store::open` (the function's startup `open-store` phase). That constructor
+pairs `GraphStore::open` with a file-backed reader pool. `Store::open_memory` is
+also a public constructor; it pairs `GraphStore::open_memory` with its shared
+memory URI and `shared_memory=true`. `api::AppState` accepts an `Arc<Store>` and
+`api::router` does not constrain the constructor. An in-process daemon can thus
+use a shared-memory store; `tests/log_diet.rs::Daemon::start` does exactly that.
+This correction covers that mode in preparation itself. It does not change the
+log_diet fixture, workload, assertions or retry settings, or assert that every
+embedded daemon uses files.
+
+The new shared-memory check short-circuits before `readers.get`, before the seed
+writer loan and before `read_snapshot`. It produces the existing unusable
+preparation; the caller retains exactly two validation attempts and one canonical
+writer invocation. An existing cached operation can still return at its first
+validation. Neither observation completion admission, currentness, canonical
+inputs, idempotency, attempt receipts nor notifications change. It introduces no
+new retry, public error, read-uncommitted mode or snapshot weakening. It does not
+make arbitrary concurrent shared-cache snapshots safe; it removes this newly
+introduced snapshot from shared-memory resource observation.
+
+The fast-path controls now own temporary file-backed stores for their full
+lifetimes; their assertions remain in place. The original four incomplete-fence
+controls still use shared memory. Three additional controls are authored:
+
+- `a_shared_cache_frontier_blocks_an_unrelated_sequence_publication_but_wal_does_not`
+  keeps the actual `read_snapshot` frontier open while another thread publishes a
+  public `harness.timeline` claim. The memory case requires database-locked naming
+  sqlite_sequence, then success after snapshot release. The WAL case requires
+  success with the snapshot still held. Both require an idempotent repeat.
+- `preparation_never_pins_shared_cache_before_an_unrelated_publication` requires
+  zero seed/read work and no callback entry in shared-memory mode, followed by a
+  successful publication. The file case requires callback entry and successful
+  publication during the snapshot, then refusal of the invalidated native cut.
+  Removing only the new mode guard makes its shared-memory success assertion see
+  the lock error. This is an authored before/after discriminator, not a claimed
+  executed red/green result.
+- `shared_memory_observations_keep_canonical_outcomes_and_two_plus_one_progress`
+  requires baseline and no-change behavior through two unusable attempts and one
+  canonical invocation with no seed/read work, identical no-change results to the
+  direct canonical path, idempotent first-operation replay, and identical refusal
+  with no partial effects when the completion predicate is false.
+
+These three and the 21 inherited controls are unrun for this correction. The
+existing shared-memory log_diet test must pass on its first attempt in the fresh
+hosted cohort; changing its storage mode alone would not qualify this correction.
+Old matching log_diet retry-masked failures belong to this investigation rather
+than being classified as unrelated to resource preparation. No file-backed
+performance or deployment result transfers from the earlier in-memory reports.
+
+SQLite's [shared-cache locking model](https://www.sqlite.org/sharedcache.html)
+retains table locks until a transaction ends and returns SQLITE_LOCKED when a
+required lock is unavailable. Its [result-code reference](https://www.sqlite.org/rescode.html#locked)
+distinguishes that from SQLITE_BUSY. Its [AUTOINCREMENT documentation](https://www.sqlite.org/autoinc.html)
+describes the sqlite_sequence update made when an AUTOINCREMENT maximum grows.
+The held CI logs establish the matching error signature; they do not identify
+which reader held the lock. The authored controls must establish the proposed
+interaction in the pinned stack before a cause claim.

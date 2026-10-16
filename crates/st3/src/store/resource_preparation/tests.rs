@@ -1,7 +1,13 @@
 use super::*;
 
-fn fixture() -> (Store, String) {
-    fixture_for(Store::open_memory("prepared-fixture").unwrap())
+fn fixture() -> (tempfile::TempDir, Store, String) {
+    // Fast-path controls must exercise the eligible file-backed mode. Keep the directory
+    // alive in each caller; separate controls below retain shared-memory behavior.
+    let directory = tempfile::tempdir().unwrap();
+    let (store, revision) = fixture_for(
+        Store::open(&directory.path().join("claims.sqlite3"), "prepared-fixture").unwrap(),
+    );
+    (directory, store, revision)
 }
 
 fn fixture_for(store: Store) -> (Store, String) {
@@ -60,7 +66,7 @@ impl Drop for ResetHook {
 
 #[test]
 fn quiet_preparation_and_two_stale_attempts_report_separate_writer_work() {
-    let (store, revision) = fixture();
+    let (_store_directory, store, revision) = fixture();
     observe(&store, &revision, 1);
     take_counts();
     observe(&store, &revision, 2);
@@ -104,7 +110,7 @@ fn quiet_preparation_and_two_stale_attempts_report_separate_writer_work() {
 
 #[test]
 fn the_native_counter_fences_trigger_without_rowid_replace_delete_and_rollback() {
-    let (store, _) = fixture();
+    let (_store_directory, store, _) = fixture();
     store
         .connection
         .write()
@@ -204,7 +210,7 @@ fn the_native_counter_fences_trigger_without_rowid_replace_delete_and_rollback()
 
 #[test]
 fn native_validation_fences_repair_order_pending_and_schema_changes() {
-    let (store, revision) = fixture();
+    let (_store_directory, store, revision) = fixture();
     observe(&store, &revision, 1);
     let health = store
         .claims_for("observer/fixture", Some("observer.state"))
@@ -260,8 +266,8 @@ fn native_validation_fences_repair_order_pending_and_schema_changes() {
 
 #[test]
 fn tokens_do_not_cross_store_or_fence_incarnations_and_nested_pins_are_unavailable() {
-    let (store, _) = fixture();
-    let (other, _) = fixture();
+    let (_store_directory, store, _) = fixture();
+    let (_other_directory, other, _) = fixture();
     let fence = Fence::new(&store);
     let prepared = fence.prepare(&store, |_| ());
     assert!(fence.prepare(&other, |_| ()).value.is_none());
@@ -432,7 +438,7 @@ fn a_reopened_store_cannot_reuse_the_old_handles_token() {
 
 #[test]
 fn an_ambient_request_loan_uses_one_unchanged_canonical_fallback_without_a_seed() {
-    let (store, revision) = fixture();
+    let (_store_directory, store, revision) = fixture();
     observe(&store, &revision, 1);
     take_counts();
     store
@@ -462,7 +468,7 @@ fn an_ambient_request_loan_uses_one_unchanged_canonical_fallback_without_a_seed(
 
 #[test]
 fn preparation_reads_the_post_seed_cut_and_refuses_a_foreign_reader_file() {
-    let (store, _) = fixture();
+    let (_store_directory, store, _) = fixture();
     store
         .connection
         .write()
@@ -503,8 +509,8 @@ fn preparation_reads_the_post_seed_cut_and_refuses_a_foreign_reader_file() {
 
 #[test]
 fn changed_and_attempt_outcomes_match_the_canonical_path_and_retry_receipts() {
-    let (fast, fast_revision) = fixture();
-    let (old, old_revision) = fixture();
+    let (_fast_directory, fast, fast_revision) = fixture();
+    let (_old_directory, old, old_revision) = fixture();
     for (index, (facts, attempt)) in [
         (json!({"state":"open"}), None),
         (json!({"state":"closed"}), None),
@@ -611,7 +617,7 @@ fn changed_and_attempt_outcomes_match_the_canonical_path_and_retry_receipts() {
 
 #[test]
 fn an_invalid_observation_keeps_the_canonical_error_without_partial_claims() {
-    let (fast, revision) = fixture();
+    let (_fast_directory, fast, revision) = fixture();
     let before = fast.claims_for("resource/fixture", None).unwrap().len();
     let facts = json!({"state": 123});
     let prepared = fast
@@ -652,7 +658,7 @@ fn an_invalid_observation_keeps_the_canonical_error_without_partial_claims() {
 #[test]
 fn no_change_fast_writer_work_does_not_grow_with_resource_history() {
     fn measured(width: usize) -> (Counts, Counts) {
-        let (store, revision) = fixture();
+        let (_store_directory, store, revision) = fixture();
         observe(&store, &revision, 1);
         for index in 0..width {
             store
@@ -742,7 +748,7 @@ fn a_second_connection_commit_is_detected_by_the_same_writer_data_version() {
 
 #[test]
 fn an_observer_repair_reprepares_instead_of_consuming_stale_health() {
-    let (store, revision) = fixture();
+    let (_store_directory, store, revision) = fixture();
     observe(&store, &revision, 1);
     let health = store
         .claims_for("observer/fixture", Some("observer.state"))
@@ -793,7 +799,7 @@ fn an_observer_repair_reprepares_instead_of_consuming_stale_health() {
 #[test]
 fn completion_cancellation_keeps_its_existing_error_and_commits_no_prepared_effect() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (store, revision) = fixture();
+    let (_store_directory, store, revision) = fixture();
     let live = Arc::new(AtomicBool::new(true));
     let cancelled = live.clone();
     let _reset = ResetHook;
@@ -832,7 +838,7 @@ fn completion_cancellation_keeps_its_existing_error_and_commits_no_prepared_effe
 #[test]
 fn a_later_queued_job_rejects_an_earlier_jobs_uncommitted_write() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let (store, _) = fixture();
+    let (_store_directory, store, _) = fixture();
     let store = Arc::new(store);
     let fence = Arc::new(Fence::new(&store));
     let prepared = fence.prepare(&store, |_| ());
@@ -901,7 +907,7 @@ fn a_later_queued_job_rejects_an_earlier_jobs_uncommitted_write() {
 
 #[test]
 fn an_observer_revision_change_keeps_the_existing_refusal_without_partial_effects() {
-    let (store, revision) = fixture();
+    let (_store_directory, store, revision) = fixture();
     let before: u64 = store
         .readers
         .get()
@@ -935,7 +941,7 @@ fn an_observer_revision_change_keeps_the_existing_refusal_without_partial_effect
 
 #[test]
 fn an_opener_arriving_after_preparation_is_not_lost() {
-    let (store, revision) = fixture();
+    let (_store_directory, store, revision) = fixture();
     observe(&store, &revision, 1);
     let _reset = ResetHook;
     BEFORE_VALIDATE.with(|hook| {
@@ -976,7 +982,12 @@ fn an_opener_arriving_after_preparation_is_not_lost() {
 
 #[test]
 fn a_recipient_removed_after_preparation_receives_no_stale_notification() {
-    let store = Store::open_memory("prepared-recipient").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        &directory.path().join("claims.sqlite3"),
+        "prepared-recipient",
+    )
+    .unwrap();
     let source = r#"version 2
 agent "receiver" { workspace "."; command "true" }
 resource "fixture" { kind "vcs.pull-request" }
@@ -1069,5 +1080,220 @@ subscription "fixture" {
             .unwrap()
             .unwrap()["state"],
         "pending"
+    );
+}
+
+// Use the public client admission and the same local AUTOINCREMENT publication as log_diet.
+// Warm up its actor key before pinning so a key-creation failure cannot imitate the lock.
+fn unrelated_timeline(store: &Store, sequence: u64) -> Result<(ClaimRecord, bool), St3Error> {
+    let subject = "agent/invented.sequence-writer";
+    store.append_client_claim_outcome(&ClaimInput {
+        subject: subject.into(),
+        kind: "harness.timeline".into(),
+        actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("operation".into(), json!("append")),
+            ("entry_id".into(), json!(format!("entry-{sequence}"))),
+            ("sequence".into(), json!(sequence)),
+            ("revision".into(), json!(1)),
+            ("role".into(), json!("assistant")),
+            ("entry_type".into(), json!("content")),
+            ("final".into(), json!(true)),
+            (
+                "body".into(),
+                json!({"media_type":"text/plain", "text":"fixture"}),
+            ),
+            ("driver".into(), json!("codex")),
+            ("incarnation_id".into(), json!("invented-incarnation")),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(format!("sequence-writer:{sequence}")),
+    })
+}
+
+fn concurrent_timeline(store: &Store, sequence: u64) -> Result<(ClaimRecord, bool), St3Error> {
+    // A separate thread exercises an unrelated caller, not a write through the pinned reader.
+    // Join before returning; no task or guard escapes on the error path.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| unrelated_timeline(store, sequence))
+            .join()
+            .unwrap()
+    })
+}
+
+#[test]
+fn a_shared_cache_frontier_blocks_an_unrelated_sequence_publication_but_wal_does_not() {
+    let memory = Store::open_memory("sequence-lock").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let file = Store::open(&directory.path().join("claims.sqlite3"), "sequence-lock").unwrap();
+    for store in [&memory, &file] {
+        assert!(unrelated_timeline(store, 1).unwrap().1);
+        // This is the original read_snapshot frontier, before any resource input is read.
+        // The worker finishes while the snapshot is held, on both modes, without sleeps.
+        let result = store
+            .read_snapshot(|_| Ok(concurrent_timeline(store, 2)))
+            .unwrap();
+        if store.shared_memory {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "database-locked", "{error:?}");
+            assert!(error.message.contains("sqlite_sequence"), "{error:?}");
+            // The same admitted publication succeeds once PinnedRead has ended.
+            assert!(unrelated_timeline(store, 2).unwrap().1);
+        } else {
+            assert!(result.unwrap().1);
+        }
+        assert!(
+            !unrelated_timeline(store, 2).unwrap().1,
+            "publication stays idempotent"
+        );
+    }
+}
+
+#[test]
+fn preparation_never_pins_shared_cache_before_an_unrelated_publication() {
+    let memory = Store::open_memory("preparation-lock").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let file = Store::open(&directory.path().join("claims.sqlite3"), "preparation-lock").unwrap();
+    for store in [&memory, &file] {
+        assert!(unrelated_timeline(store, 1).unwrap().1);
+        let fence = Fence::new(store);
+        take_counts();
+        let mut entered = false;
+        let prepared = fence.prepare(store, |_| {
+            entered = true;
+            concurrent_timeline(store, 2)
+        });
+        let counts = take_counts();
+        // Removing the shared-memory guard runs the writer under the frontier pin: this
+        // assertion then fails with the exact sqlite_sequence error, after releasing the pin.
+        if let Some(result) = &prepared.value {
+            assert!(result.is_ok(), "unrelated publication failed: {result:?}");
+        }
+        if store.shared_memory {
+            assert!(
+                !entered,
+                "shared-cache preparation must not acquire a snapshot"
+            );
+            assert!(prepared.cut.is_none() && prepared.value.is_none());
+            assert!(counts.seed.is_empty() && counts.preparation.is_empty());
+            assert!(unrelated_timeline(store, 2).unwrap().1);
+        } else {
+            assert!(entered);
+            assert!(prepared.value.as_ref().unwrap().as_ref().unwrap().1);
+            assert_eq!((counts.seed.len(), counts.preparation.len()), (1, 1));
+            // A successful concurrent WAL write invalidates the old seed, as before.
+            assert!(!fence.current(store, &store.connection.write(), &prepared));
+        }
+    }
+}
+
+#[test]
+fn shared_memory_observations_keep_canonical_outcomes_and_two_plus_one_progress() {
+    let (store, revision) = fixture_for(Store::open_memory("prepared-fixture").unwrap());
+    take_counts();
+    let first = observe(&store, &revision, 1);
+    let baseline = take_counts();
+    assert!(first.baseline);
+    assert_eq!(
+        (baseline.fast, baseline.invalidated, baseline.fallback),
+        (0, 2, 1)
+    );
+    assert!(baseline.seed.is_empty() && baseline.preparation.is_empty());
+    assert_eq!(baseline.writer.len(), 3);
+    assert_eq!(
+        baseline
+            .writer
+            .iter()
+            .filter(|(fallback, ..)| *fallback)
+            .count(),
+        1
+    );
+
+    let before = store.index().unwrap();
+    let actual = observe(&store, &revision, 2);
+    let unchanged = take_counts();
+    let canonical = store
+        .record_resource_observation_attempt(
+            "observer/fixture",
+            &revision,
+            None,
+            "resource/fixture",
+            None,
+            &json!({"state":"open"}),
+            2,
+            &[],
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(canonical).unwrap()
+    );
+    assert_eq!(
+        store.index().unwrap(),
+        before,
+        "no-change fallback appends no history"
+    );
+    assert_eq!(
+        (unchanged.fast, unchanged.invalidated, unchanged.fallback),
+        (0, 2, 1)
+    );
+    assert!(unchanged.seed.is_empty() && unchanged.preparation.is_empty());
+
+    take_counts();
+    let retry = observe(&store, &revision, 1);
+    assert_eq!(
+        serde_json::to_value(first).unwrap(),
+        serde_json::to_value(retry).unwrap()
+    );
+    let replay = take_counts();
+    assert_eq!(
+        (
+            replay.fast,
+            replay.cached,
+            replay.invalidated,
+            replay.fallback
+        ),
+        (0, 1, 0, 0)
+    );
+    let refused = store
+        .record_resource_observation(
+            "observer/fixture",
+            &revision,
+            None,
+            "resource/fixture",
+            None,
+            &json!({"state":"closed"}),
+            3,
+            &[],
+            Some(&|| false),
+        )
+        .unwrap_err();
+    let canonical = store
+        .record_resource_observation_attempt(
+            "observer/fixture",
+            &revision,
+            None,
+            "resource/fixture",
+            None,
+            &json!({"state":"closed"}),
+            3,
+            &[],
+            Some(&|| false),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(
+        (refused.code, refused.message),
+        (canonical.code, canonical.message)
+    );
+    assert_eq!(
+        store.index().unwrap(),
+        before,
+        "cancelled completion has no partial effect"
     );
 }
