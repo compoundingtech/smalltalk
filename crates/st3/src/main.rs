@@ -26387,6 +26387,12 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
     let worker = std::thread::Builder::new()
         .name("st3-wal-checkpoint".into())
         .spawn(move || {
+            // The WAL's own file, measured apart from the frames a checkpoint reports.
+            let wal_path = {
+                let mut wal = path.clone().into_os_string();
+                wal.push("-wal");
+                PathBuf::from(wal)
+            };
             let mut connection = None;
             let mut last_error_log: Option<Instant> = None;
             let mut retry_interval = WAL_CHECKPOINT_INTERVAL;
@@ -26427,6 +26433,10 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                 let now = Instant::now();
                 let duration_ms = started.elapsed().as_millis();
                 let report = result.as_ref().ok();
+                smallclaims::windows::wal::observe(
+                    report,
+                    std::fs::metadata(&wal_path).ok().map(|metadata| metadata.len()),
+                );
                 let stuck = pin.observe(report);
                 let abnormal = abnormal_wal_checkpoint(report) || stuck >= WAL_PIN_REPORT_AFTER;
                 st3::otel::record_wal_checkpoint(trace_started, report, abnormal);

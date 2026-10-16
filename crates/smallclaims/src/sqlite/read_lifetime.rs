@@ -119,6 +119,91 @@ pub fn open_snapshots_over(age: std::time::Duration, limit: usize) -> Vec<ReadLi
     open.into_iter().take(limit).map(|(&id, read)| describe(id, read)).collect()
 }
 
+/// Read loans in every pool, grouped by the fixed route label of the read budget they work
+/// under (`(no budget)` for background work), with each route's oldest checkout and oldest
+/// confirmed snapshot. A checkout need not hold a transaction; a confirmed snapshot has
+/// completed its first read. The `limit` routes with the oldest checkouts come first; the rest
+/// are summed as `(other)`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RouteLoans {
+    pub route: String,
+    pub checkouts: usize,
+    pub snapshot_checkouts: usize,
+    /// Checkouts whose read budget has expired.
+    pub expired: usize,
+    pub oldest_checkout_age_ms: u128,
+    /// Since the first read of the route's oldest confirmed snapshot; `None` when none is.
+    pub oldest_snapshot_confirmed_age_ms: Option<u128>,
+}
+
+pub fn loans_by_route(limit: usize) -> Vec<RouteLoans> {
+    let reads = LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut routes = BTreeMap::<String, RouteLoans>::new();
+    for read in reads.values() {
+        let route = read
+            .budget
+            .as_ref()
+            .map_or("(no budget)", ReadBudget::route)
+            .chars()
+            .take(256)
+            .collect::<String>();
+        let loans = routes.entry(route.clone()).or_insert_with(|| RouteLoans {
+            route,
+            checkouts: 0,
+            snapshot_checkouts: 0,
+            expired: 0,
+            oldest_checkout_age_ms: 0,
+            oldest_snapshot_confirmed_age_ms: None,
+        });
+        loans.checkouts += 1;
+        loans.snapshot_checkouts += usize::from(read.snapshot);
+        loans.expired += usize::from(read.budget.as_ref().is_some_and(ReadBudget::expired));
+        loans.oldest_checkout_age_ms = loans
+            .oldest_checkout_age_ms
+            .max(read.started.elapsed().as_millis());
+        if let Some(started) = read.snapshot_started {
+            let age = started.elapsed().as_millis();
+            loans.oldest_snapshot_confirmed_age_ms =
+                Some(loans.oldest_snapshot_confirmed_age_ms.map_or(age, |old| old.max(age)));
+        }
+    }
+    drop(reads);
+    let mut routes = routes.into_values().collect::<Vec<_>>();
+    routes.sort_by(|a, b| {
+        b.oldest_checkout_age_ms
+            .cmp(&a.oldest_checkout_age_ms)
+            .then_with(|| a.route.cmp(&b.route))
+    });
+    if routes.len() > limit {
+        let rest = routes.split_off(limit);
+        let mut other = RouteLoans {
+            route: "(other)".into(),
+            checkouts: 0,
+            snapshot_checkouts: 0,
+            expired: 0,
+            oldest_checkout_age_ms: 0,
+            oldest_snapshot_confirmed_age_ms: None,
+        };
+        for loans in rest {
+            other.checkouts += loans.checkouts;
+            other.snapshot_checkouts += loans.snapshot_checkouts;
+            other.expired += loans.expired;
+            other.oldest_checkout_age_ms = other
+                .oldest_checkout_age_ms
+                .max(loans.oldest_checkout_age_ms);
+            other.oldest_snapshot_confirmed_age_ms = match (
+                other.oldest_snapshot_confirmed_age_ms,
+                loans.oldest_snapshot_confirmed_age_ms,
+            ) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        routes.push(other);
+    }
+    routes
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn live_read_locations() -> Vec<(String, bool)> {
     LIVE_READS

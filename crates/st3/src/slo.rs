@@ -303,6 +303,8 @@ pub fn store_report(cpu: Value) -> Vec<Value> {
 
 /// Open read snapshots reported beside the writer's holds.
 const OPEN_READS: usize = 8;
+/// Routes whose read loans are reported beside the writer's holds; the rest are summed.
+const LOAN_ROUTES: usize = 8;
 
 /// The writer-hold objective: each hold of the store's single writer against the transaction
 /// target, and who held it; each read transaction past that target, and who kept it open.
@@ -316,6 +318,17 @@ fn writer_hold_row() -> Value {
         "windows": series(StoreWork::WriterHold),
         "read_windows": series(StoreWork::ReadTransaction),
         "open_reads": smallclaims::sqlite::open_snapshots_over(targets.transaction_target(), OPEN_READS),
+        // Every read loan by the route it works for, checked out or with a confirmed snapshot:
+        // a loan held past its budget keeps the WAL from recycling even before it reads.
+        "read_loans": smallclaims::sqlite::loans_by_route(LOAN_ROUTES),
+        "wal": smallclaims::windows::wal::report(),
+        // Where a replication snapshot's build spends its time: waiting for the build lock that
+        // one build holds at a time, reading the envelope inventory, and hashing its digests.
+        "snapshot_build": {
+            "wait": series(StoreWork::SnapshotBuildWait),
+            "inventory": series(StoreWork::SnapshotInventory),
+            "digest": series(StoreWork::SnapshotDigest),
+        },
         "threads": process_threads(),
     });
     if let (Value::Object(row), Value::Object(holds)) = (&mut row, smallclaims::windows::holds::report()) {

@@ -5491,10 +5491,12 @@ impl Store {
         if let Some(snapshot) = current(self)? {
             return Ok(snapshot);
         }
+        let waiting = crate::windows::Timer::start(crate::windows::StoreWork::SnapshotBuildWait);
         let _building = self
             .replication_snapshot_build
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        drop(waiting);
         if let Some(snapshot) = current(self)? {
             return Ok(snapshot);
         }
@@ -5509,6 +5511,7 @@ impl Store {
         &self,
         connection: &Connection,
     ) -> Result<Arc<ReplicationSnapshot>> {
+        let reading = crate::windows::Timer::start(crate::windows::StoreWork::SnapshotInventory);
         let previous = self
             .replication_snapshot
             .lock()
@@ -5616,6 +5619,8 @@ impl Store {
         } else {
             full(connection)?
         };
+        drop(reading);
+        let hashing = crate::windows::Timer::start(crate::windows::StoreWork::SnapshotDigest);
         inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
@@ -5628,6 +5633,7 @@ impl Store {
         let projection_generation = projection_digest::generation(connection)?;
         let projection_digests = projection_digest::tables(connection)?;
         let graph_digest = projection_digest::root(&projection_digests);
+        drop(hashing);
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
