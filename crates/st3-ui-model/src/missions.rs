@@ -232,6 +232,78 @@ fn run_outcome(mission: &st3_client::Mission, now: &str, display: &Display<'_>) 
     ))
 }
 
+/// What st says of the agent whose queue holds a ready step.
+pub(crate) struct QueueOwner {
+    /// Stopped, failed or faulted: the step waits for an agent that cannot take it.
+    pub down: bool,
+}
+
+/// The mission word, first match wins: an open human gate on the mission (decision); no runs
+/// (not started); a blocked mission or step (stalled); completed (done); a failed mission or step
+/// (failed); cancelled; only keep-open steps still running (watching); a step in hand (working); a
+/// ready unclaimed step, unstaffed when its queue owner is down, queued when one queues it, and
+/// unclaimed otherwise; a waiting or pending step (held); standing, running, ready or draft (idle);
+/// otherwise done.
+pub(crate) fn word(
+    mission: &st3_client::Mission,
+    work: &[&MissionStep],
+    decision: bool,
+    queue_owner: impl Fn(&str) -> Option<QueueOwner>,
+) -> Word {
+    let states = work.iter().map(|step| step.state.as_str());
+    if decision {
+        Word::Decision
+    } else if mission.runs.is_empty() && mission.run_details.is_empty() && work.is_empty() {
+        Word::NotStarted
+    } else if mission.state == "blocked" || states.clone().any(|state| state == "blocked") {
+        Word::Stalled
+    } else if mission.state == "completed" {
+        // A run someone set to completed keeps the steps that failed.
+        Word::Done
+    } else if mission.state == "failed" || states.clone().any(|state| state == "failed") {
+        Word::Failed
+    } else if mission.state == "cancelled" {
+        Word::Cancelled
+    } else if !work.is_empty()
+        && work.iter().all(|step| {
+            step.state == "completed" || (in_hand(&step.state) && step.agentless && step.keep_open)
+        })
+        && work.iter().any(|step| step.state != "completed")
+    {
+        // Only st's own keep-open steps are running: an intake that watches.
+        Word::Watching
+    } else if states.clone().any(in_hand) {
+        Word::Working
+    } else if let Some(ready) = work
+        .iter()
+        .find(|step| step.state == "ready" && step.claimant.is_none())
+    {
+        // Who has this step queued decides whether a person is needed.
+        match queue_owner(&ready.id) {
+            Some(owner) if owner.down => Word::Unstaffed,
+            Some(_) => Word::Queued,
+            None => Word::Unclaimed,
+        }
+    } else if states
+        .clone()
+        .any(|state| matches!(state, "waiting" | "pending"))
+    {
+        Word::Held
+    } else if matches!(
+        mission.state.as_str(),
+        "standing" | "running" | "ready" | "draft"
+    ) {
+        Word::Idle
+    } else {
+        Word::Done
+    }
+}
+
+/// Whether a step state means an agent (or st) has it in hand.
+pub(crate) fn in_hand(state: &str) -> bool {
+    matches!(state, "claimed" | "working" | "running" | "verifying")
+}
+
 /// The agent whose queue holds this work, if st says.
 fn queued_for<'a>(
     mut agents: impl Iterator<Item = &'a st3_client::Agent>,
@@ -302,66 +374,12 @@ pub fn adapt<'a>(
                         && item.mission_id.as_deref() == Some(mission.header.id.as_str())
                 })
                 .map(|item| item.header.id.clone());
-            let states = work.iter().map(|step| step.state.as_str());
-            let word = if decision.is_some() {
-                Word::Decision
-            } else if mission.runs.is_empty() && mission.run_details.is_empty() && work.is_empty() {
-                Word::NotStarted
-            } else if mission.state == "blocked" || states.clone().any(|state| state == "blocked") {
-                Word::Stalled
-            } else if mission.state == "completed" {
-                // A run someone set to completed keeps the steps that failed.
-                Word::Done
-            } else if mission.state == "failed" || states.clone().any(|state| state == "failed") {
-                Word::Failed
-            } else if mission.state == "cancelled" {
-                Word::Cancelled
-            } else if !work.is_empty()
-                && work.iter().all(|step| {
-                    step.state == "completed"
-                        || (matches!(
-                            step.state.as_str(),
-                            "claimed" | "working" | "running" | "verifying"
-                        ) && step.agentless
-                            && step.keep_open)
+            let word = word(mission, &work, decision.is_some(), |step| {
+                queued_for(agents.clone(), step).map(|agent| QueueOwner {
+                    down: matches!(agent.state.as_str(), "failed" | "stopped")
+                        || agent.fault.is_some(),
                 })
-                && work.iter().any(|step| step.state != "completed")
-            {
-                // Only st's own keep-open steps are running: an intake that watches.
-                Word::Watching
-            } else if states
-                .clone()
-                .any(|state| matches!(state, "claimed" | "working" | "running" | "verifying"))
-            {
-                Word::Working
-            } else if let Some(ready) = work
-                .iter()
-                .find(|step| step.state == "ready" && step.claimant.is_none())
-            {
-                // Who has this step queued decides whether a person is needed.
-                match queued_for(agents.clone(), &ready.id) {
-                    Some(agent)
-                        if matches!(agent.state.as_str(), "failed" | "stopped")
-                            || agent.fault.is_some() =>
-                    {
-                        Word::Unstaffed
-                    }
-                    Some(_) => Word::Queued,
-                    None => Word::Unclaimed,
-                }
-            } else if states
-                .clone()
-                .any(|state| matches!(state, "waiting" | "pending"))
-            {
-                Word::Held
-            } else if matches!(
-                mission.state.as_str(),
-                "standing" | "running" | "ready" | "draft"
-            ) {
-                Word::Idle
-            } else {
-                Word::Done
-            };
+            });
             let steps = work
                 .iter()
                 .map(|step| {
@@ -473,6 +491,12 @@ pub fn adapt<'a>(
         })
         .collect()
 }
+
+mod presentation;
+pub use presentation::{
+    Action, Actor, Card, Fleet, Gate, Offer, Presentation, Progress, QueuedBehind, Seat, SeatRef,
+    StepPresentation, Stuck, Work, present,
+};
 
 #[cfg(test)]
 mod tests;

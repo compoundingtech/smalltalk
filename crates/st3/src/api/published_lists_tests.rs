@@ -93,12 +93,23 @@ fn act(store: &Store, subject: &str, actor: &str, action: &str, key: &str) {
         .unwrap();
 }
 
+/// Cards as the refresher publishes them, with their presentations. These tests publish no
+/// agents roster.
+fn presented(store: &Store, mut cards: Vec<Value>) -> anyhow::Result<Vec<Value>> {
+    let (_, gates) = store.human_attention()?;
+    for card in &mut cards {
+        present(card, &gates, None);
+    }
+    Ok(cards)
+}
+
 /// What a missions window folds directly: every shown mission in order, with its card.
 fn oracle(store: &Store) -> (Vec<String>, BTreeMap<String, Value>) {
     store
         .read_snapshot(|_| {
             let ids = store.mission_collection_ids(false, 0, 100_000)?;
             let cards = client_v0::mission_list_cards_with(store, &ids, now_ms(), &store.human_attention_runs()?)?;
+            let cards = presented(store, cards)?;
             let cards = cards
                 .into_iter()
                 .map(|card| (card["id"].as_str().unwrap().to_owned(), card))
@@ -146,7 +157,8 @@ fn fold(store: &Store) -> (Arc<Publication<MissionRows>>, bool) {
                 let mut ids = store.mission_collection_ids(false, 0, limit + 1)?;
                 let mut has_more = ids.len() > limit;
                 ids.truncate(limit);
-                let mut items = client_v0::mission_list_cards_with(store, &ids, now, &store.human_attention_runs()?)?;
+                let items = client_v0::mission_list_cards_with(store, &ids, now, &store.human_attention_runs()?)?;
+                let mut items = presented(store, items)?;
                 has_more |= client_v0::bound_mission_cards(&mut items)?;
                 Ok((items, has_more))
             })
@@ -1558,4 +1570,67 @@ fn a_warm_fold_probes_only_the_named_runs_of_the_seats_it_reads() {
     assert!(store.last_seats_read().contains(b));
     assert!(crate::store::named_run_probes() > probes, "B's named run probed");
     fold_work_checked(&store);
+}
+
+/// A mission's presentation reads its gates and the agents its steps name, so a change to either
+/// refolds exactly the missions that read it.
+#[test]
+fn gate_and_agent_changes_refold_the_missions_that_read_them() {
+    use st3_ui_model::missions::Gate;
+    let gate = |mission: &str| Gate { mission: mission.into(), step: None, person: "person/avery".into() };
+    assert_eq!(
+        missions_of_changed_gates(&[gate("mission/a"), gate("mission/b")], &[gate("mission/b"), gate("mission/c")]),
+        ["mission/a".to_owned(), "mission/c".to_owned()].into_iter().collect()
+    );
+    let mut rows = MissionRows::default();
+    let card = |id: &str, step: Value| json!({"id": id, "run_details": [{"steps": [step]}]});
+    rows.cards.insert("mission/queued".into(), Arc::new(card("mission/queued", json!({"id": "step-run/q/next"}))));
+    rows.cards.insert("mission/claimed".into(), Arc::new(card("mission/claimed", json!({"id": "step-run/c/fix", "claimant": "agent/example/keeper"}))));
+    rows.cards.insert("mission/other".into(), Arc::new(card("mission/other", json!({"id": "step-run/o/x", "claimant": "agent/example/other"}))));
+    let roster = |cut, state: &str| {
+        RosterFleet::from_cards(cut, &[
+            json!({"id": "agent/example/keeper", "name": "Keeper", "state": state, "next_work_id": "step-run/q/next"}),
+            json!({"id": "agent/example/other", "name": "Other", "state": "running"}),
+        ])
+    };
+    let before = roster(1, "running");
+    assert!(missions_of_changed_agents(&rows, Some(&before), Some(&roster(2, "running"))).is_empty(), "nothing changed");
+    assert_eq!(
+        missions_of_changed_agents(&rows, Some(&before), Some(&roster(2, "stopped"))),
+        ["mission/claimed".to_owned(), "mission/queued".to_owned()].into_iter().collect(),
+        "the missions that queue on, or are claimed by, the agent that stopped"
+    );
+    assert_eq!(missions_of_changed_agents(&rows, None, Some(&before)).len(), 3, "a first roster presents every card");
+}
+
+/// Before st has published an agents roster, a ready step's word would claim who queues it, so
+/// its card says nothing; once a roster is published, even an empty one, it says.
+#[test]
+fn a_word_that_hinges_on_agent_queues_waits_for_the_first_roster() {
+    let card = |state: &str, step: Value| {
+        json!({
+            "id": "mission/example/ship", "kind": "mission", "revision": "r1",
+            "title": "example/ship", "updated_at": "2026-10-14T10:00:00Z", "state": state,
+            "mission_revision": "r1", "runs": ["mission-run/ship-1"],
+            "run_details": [{
+                "id": "mission-run/ship-1", "requester": "person/avery", "status": state,
+                "phase": "normal", "progress": {"done": 0, "total": 1}, "current_steps": [],
+                "must_act": "agent", "state_since": "2026-10-14T09:00:00Z", "steps": [step],
+            }],
+        })
+    };
+    let step = |state: &str, claimant: Option<&str>| {
+        json!({
+            "id": "step-run/ship-1/build", "path": "build", "state": state, "attempt": 1,
+            "claimant": claimant, "since": "2026-10-14T09:00:00Z",
+        })
+    };
+    let mut ready = card("running", step("ready", None));
+    present(&mut ready, &[], None);
+    assert!(ready.get("presentation").is_none(), "no roster yet: who queues it is unknown");
+    present(&mut ready, &[], Some(&RosterFleet::default()));
+    assert_eq!(ready["presentation"]["word"], "unclaimed", "an empty roster: nobody queues it");
+    let mut working = card("running", step("claimed", Some("agent/example/keeper")));
+    present(&mut working, &[], None);
+    assert_eq!(working["presentation"]["word"], "working", "this word reads no queue");
 }

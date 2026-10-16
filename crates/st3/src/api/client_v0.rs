@@ -5083,7 +5083,17 @@ pub(super) async fn mission_detail(
     let snapshot_index = snapshot.store_index;
     let selected = client_detail_id("mission", &id);
     let items = super::blocking_store(move || {
-        mission_resources(&store, snapshot_index, true, Some(&selected))
+        let mut items = mission_resources(&store, snapshot_index, true, Some(&selected))?;
+        // The presentation the missions list publishes for this mission; a read computes none.
+        if let Some(published) = store.published_missions_list().newest()
+            && let Some(card) = published.rows.cards.get(&selected)
+            && let Some(presentation) = card.get("presentation")
+        {
+            for item in &mut items {
+                item["presentation"] = presentation.clone();
+            }
+        }
+        Ok(items)
     })
     .await?;
     client_detail(items, "mission", &id)

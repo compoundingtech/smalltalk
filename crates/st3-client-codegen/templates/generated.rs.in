@@ -957,6 +957,10 @@ pub struct Mission {
     /// st's own plumbing or a standing observer; false from older daemons.
     #[serde(default)]
     pub system: bool,
+    /// st's presentation of this mission (MissionPresentation in the schema), absent from older
+    /// daemons. Rust readers decode it as `st3_ui_model::missions::Presentation`.
+    #[serde(default)]
+    pub presentation: Option<Value>,
     #[serde(default)]
     pub runs: Vec<String>,
     #[serde(default)]

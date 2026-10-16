@@ -5,7 +5,7 @@
 //! read serves the newest publication under its own cut and never folds.
 
 use super::*;
-use crate::store::mission_list::MissionRows;
+use crate::store::mission_list::{MissionRows, RosterFleet};
 use crate::store::work_list::{WorkRow, WorkRows};
 use crate::store::published_list::{Publication, PublishedList};
 use std::collections::HashMap;
@@ -46,6 +46,15 @@ fn withdraw<R>(store: &Store, list: fn(&Store) -> &PublishedList<R>, name: &'sta
         eprintln!("st3: WARN the {name} list is no longer published; windows fold on read until it is");
     }
     store.withdraw_collection_view(name);
+}
+
+/// Ends a helper task when the refresher that started it ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Ends its list when the refresher task ends, by any path: nothing publishes it again until
@@ -137,6 +146,7 @@ pub fn start_published_lists(state: &AppState) {
         "missions/refresh",
         fold_missions,
         false,
+        true,
     );
     spawn(
         state.store.clone(),
@@ -145,6 +155,7 @@ pub fn start_published_lists(state: &AppState) {
         "work/refresh",
         fold_work,
         true,
+        false,
     );
 }
 
@@ -152,7 +163,7 @@ pub fn start_published_lists(state: &AppState) {
 /// directly.
 #[cfg(test)]
 pub(crate) fn start_published_work(state: &AppState) {
-    spawn(state.store.clone(), |store| store.published_work_list(), "work", "work/refresh", fold_work, true);
+    spawn(state.store.clone(), |store| store.published_work_list(), "work", "work/refresh", fold_work, true, false);
 }
 
 /// Fold and publish the work list once, as its refresher does, for tests that drive it.
@@ -192,6 +203,7 @@ fn spawn<R: Send + Sync + 'static>(
     label: &'static str,
     fold: Fold<R>,
     governed: bool,
+    roster_wakes: bool,
 ) {
     // Held before it starts: from then on a reader refuses rather than reads the list directly,
     // and a window that finds it not ready waits for its next change. A second spawn holds
@@ -206,6 +218,16 @@ fn spawn<R: Send + Sync + 'static>(
         // The writer's callback only wakes this task; it never reads.
         let commits = Arc::clone(&wake);
         let _observer = store.observe_commits(move |_| commits.notify_one());
+        // A list whose rows read the agents roster also folds when a roster is published.
+        let _roster = roster_wakes.then(|| {
+            let mut published = store.subscribe_agent_roster();
+            let wake = Arc::clone(&wake);
+            AbortOnDrop(tokio::spawn(async move {
+                while published.changed().await.is_ok() {
+                    wake.notify_one();
+                }
+            }))
+        });
         // Should this task ever stop, the list ends: a governed list's readers refuse, and an
         // ungoverned list's windows fold on read and follow commits again.
         let _withdraw = Withdraw { store: Arc::clone(&store), list, name };
@@ -366,8 +388,10 @@ struct Plan {
     at: u128,
     leases: HashMap<String, u128>,
     missions: BTreeSet<String>,
-    /// The runs waiting on a person at `cut`, when they were reread, and when.
-    attention: Option<(BTreeSet<String>, u128)>,
+    /// The runs waiting on a person at `cut` and the open gates, when they were reread, and when.
+    attention: Option<(crate::store::HumanAttention, u128)>,
+    /// The agents presentations read.
+    roster: Option<Arc<RosterFleet>>,
 }
 
 impl Plan {
@@ -379,10 +403,12 @@ impl Plan {
         base: &Publication<MissionRows>,
     ) -> anyhow::Result<Publication<MissionRows>> {
         let mut rows = base.rows.clone();
-        if let Some((attention, at)) = self.attention {
+        if let Some(((attention, gates), at)) = self.attention {
             rows.attention_runs = attention;
+            rows.gates = gates;
             rows.attention_read_at_unix_ms = at;
         }
+        rows.roster = self.roster;
         let missions = self.missions.into_iter().collect::<Vec<_>>();
         for chunk in missions.chunks(FOLD_CHUNK) {
             let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
@@ -402,8 +428,11 @@ impl Plan {
 fn missions_from_nothing(store: &Store) -> anyhow::Result<Publication<MissionRows>> {
     let (cut, frontier, ids, mut rows) = store.read_snapshot(|cut| {
         let now = now_ms();
+        let (attention_runs, gates) = store.human_attention()?;
         let rows = MissionRows {
-            attention_runs: store.human_attention_runs()?,
+            attention_runs,
+            gates,
+            roster: roster_fleet(store, None),
             attention_read_at_unix_ms: now,
             folded_at_unix_ms: now,
             next_lease_end_unix_ms: store.next_lease_end(now)?,
@@ -419,6 +448,83 @@ fn missions_from_nothing(store: &Store) -> anyhow::Result<Publication<MissionRow
     rows.frontier = frontier;
     rows.sort();
     Ok(Publication { cut, published_at_unix_ms: now_ms(), valid_until_unix_ms: None, rows })
+}
+
+/// Put a mission's presentation on its card (docs/clients/ui-contract.md, Mission), reading the
+/// agents `fleet` names, or none when st has published no agents roster yet. Without a roster
+/// nothing says which agent queues a ready step, so a card whose word hinges on that (unclaimed,
+/// queued or unstaffed) goes without one rather than claim it; an empty published roster is not
+/// that, since then no agent queues anything. A card it cannot read goes without one too; it
+/// never fails the fold.
+fn present(card: &mut Value, gates: &[st3_ui_model::missions::Gate], fleet: Option<&RosterFleet>) {
+    use st3_ui_model::missions::Word;
+    let none = RosterFleet::default();
+    let presentation = <st3_client::Mission as serde::Deserialize>::deserialize(&*card)
+        .map_err(anyhow::Error::from)
+        .map(|mission| st3_ui_model::missions::present(&mission, gates, fleet.unwrap_or(&none)));
+    match presentation {
+        Ok(presentation)
+            if fleet.is_none()
+                && matches!(presentation.word, Word::Unclaimed | Word::Queued | Word::Unstaffed) => {}
+        Ok(presentation) => match serde_json::to_value(presentation) {
+            Ok(presentation) => card["presentation"] = presentation,
+            Err(error) => eprintln!("st3: WARN mission {} has no presentation: {error:#}", card["id"]),
+        },
+        Err(error) => eprintln!("st3: WARN mission {} has no presentation: {error:#}", card["id"]),
+    }
+}
+
+/// The newest published agents roster as the fleet presentations read, reusing `previous`
+/// while no roster has been published since. None until a roster is published.
+fn roster_fleet(store: &Store, previous: Option<&Arc<RosterFleet>>) -> Option<Arc<RosterFleet>> {
+    // Read before the roster: one published in between is read again at the next wake.
+    let revision = store.agent_roster_revision();
+    if let Some(previous) = previous.filter(|previous| previous.revision == revision) {
+        return Some(Arc::clone(previous));
+    }
+    let (_, cards, _) = store.published_agent_roster(u64::MAX, false)?;
+    Some(Arc::new(RosterFleet::from_cards(revision, &cards)))
+}
+
+/// The shown missions whose presentation reads an agent that changed between two rosters: a
+/// step it holds or queues, or one it claims or is assigned.
+fn missions_of_changed_agents(rows: &MissionRows, before: Option<&RosterFleet>, after: Option<&RosterFleet>) -> BTreeSet<String> {
+    let (Some(before), Some(after)) = (before, after) else {
+        // A roster appeared or went: every presentation changes.
+        return if before.is_some() != after.is_some() { rows.cards.keys().cloned().collect() } else { BTreeSet::new() };
+    };
+    if before.revision == after.revision {
+        return BTreeSet::new();
+    }
+    let changed = after.agents_changed_since(before);
+    if changed.is_empty() {
+        return BTreeSet::new();
+    }
+    let steps = changed.iter().flat_map(|agent| after.steps_of(before, agent)).collect::<BTreeSet<_>>();
+    rows.cards
+        .iter()
+        .filter(|(_, card)| {
+            card["run_details"].as_array().into_iter().flatten().any(|run| {
+                run["steps"].as_array().into_iter().flatten().any(|step| {
+                    step["id"].as_str().is_some_and(|id| steps.contains(&id.to_owned()))
+                        || ["claimant", "assignee"].iter().any(|field| {
+                            step[*field].as_str().is_some_and(|agent| changed.contains(agent))
+                        })
+                })
+            })
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// The missions whose open gates differ between two reads.
+fn missions_of_changed_gates(before: &[st3_ui_model::missions::Gate], after: &[st3_ui_model::missions::Gate]) -> BTreeSet<String> {
+    before
+        .iter()
+        .filter(|gate| !after.contains(gate))
+        .chain(after.iter().filter(|gate| !before.contains(gate)))
+        .map(|gate| gate.mission.clone())
+        .collect()
 }
 
 fn insert_cards(rows: &mut MissionRows, cards: Vec<Value>) {
@@ -454,7 +560,11 @@ fn refold(
             }
         }
     }
-    let cards = client_v0::mission_list_cards_with(store, &shown, now, &rows.attention_runs)?;
+    let mut cards = client_v0::mission_list_cards_with(store, &shown, now, &rows.attention_runs)?;
+    // The first roster refolds every card, so one presented without agents is presented again.
+    for card in &mut cards {
+        present(card, &rows.gates, rows.roster.as_deref());
+    }
     insert_cards(rows, cards);
     Ok(())
 }
@@ -489,25 +599,31 @@ fn missions_since(
             .map(|(id, _)| id.clone()));
         let reread = changes.attention
             || now.saturating_sub(rows.attention_read_at_unix_ms) >= ATTENTION_REREAD_MS;
-        let attention = if reread { Some(store.human_attention_runs()?) } else { None };
-        if let Some(attention) = &attention {
+        let attention = if reread { Some(store.human_attention()?) } else { None };
+        if let Some((attention, gates)) = &attention {
             let moved = attention.symmetric_difference(&rows.attention_runs).collect::<Vec<_>>();
             missions.extend(store.missions_of_runs(moved)?);
+            missions.extend(missions_of_changed_gates(&rows.gates, gates));
         }
+        // An agent a presentation reads changed in a newer roster.
+        let roster = roster_fleet(store, rows.roster.as_ref());
+        missions.extend(missions_of_changed_agents(rows, rows.roster.as_deref(), roster.as_deref()));
         let deadline_passed = base.valid_until_unix_ms.is_some_and(|until| until <= now);
         if cut == base.cut && frontier == rows.frontier && missions.is_empty() && !deadline_passed {
             return Ok(Advance::Current);
         }
         let attention = attention.map(|attention| (attention, now));
         if missions.len() > FOLD_CHUNK {
-            return Ok(Advance::TooMany(Plan { cut, frontier, at: now, leases, missions, attention }));
+            return Ok(Advance::TooMany(Plan { cut, frontier, at: now, leases, missions, attention, roster }));
         }
         let changed = !missions.is_empty();
         let mut rows = rows.clone();
-        if let Some((attention, at)) = attention {
+        if let Some(((attention, gates), at)) = attention {
             rows.attention_runs = attention;
+            rows.gates = gates;
             rows.attention_read_at_unix_ms = at;
         }
+        rows.roster = roster;
         rows.folded_at_unix_ms = now;
         rows.next_lease_end_unix_ms = store.next_lease_end(now)?;
         rows.leases = leases;

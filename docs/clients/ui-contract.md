@@ -339,22 +339,29 @@ projection within 2 KiB, and an attention projection within 16 KiB including its
 
 ### Mission
 
-Served on the `missions` collection as `Mission.presentation`, on `GET /v1/client/missions` and
-on `GET /v1/client/missions/{*id}`. The summary's mission counts read the same projection.
+Served on the `missions` collection as `Mission.presentation`, and on `GET /v1/client/missions`
+and `GET /v1/client/missions/{*id}`. The missions refresher computes it with
+`st3-ui-model::missions::present` as it folds each card. A mission detail read copies the
+published card's presentation and computes none. Until st has published an agents roster (an
+empty published roster counts), nothing says which agent queues a ready step: a card whose word
+would hinge on that (`unclaimed`, `queued`, `unstaffed`) carries no presentation, and every other
+card carries one read without agents. The first roster refolds every card. At startup it follows
+the roster head at once; after the projections are replaced it waits until something reads the
+agents list, so no bound on that wait is promised.
 
 | Field | Meaning |
 |---|---|
 | `word` | The mission word: one of the thirteen `mission` ids in `words.json`. |
 | `system` | The mission is st's own or a standing observer (see [Graph flags](#graph-flags)). |
-| `who` | Who must act now: `{kind, agent, label}`. `kind` is `you`, `agent`, `st` or `nobody`. |
-| `steps[]` | The steps of the open runs, or of the latest run when none is open, in display order: `{id, path, title, word, owner, note, attempts, blockers[], keep_open}`. The step `word` is one of `needs_you`, `done`, `working`, `ready`, `waiting`, `cancelled`, `failed` or `pending`. `owner` is `{kind, agent, label}`, as in `who`. |
+| `who` | Who must act now: `{kind, person, agent, label}`. `kind` is `person` (with `person`), `agent` (with `agent`), `st` or `nobody`. Every reader sees the same row; a client says "you" when the person is its reader. |
+| `steps[]` | The steps of the open runs, or of the latest run when none is open, in display order: `{id, path, title, word, owner, note, attempts, blockers[], keep_open}`. The step `word` is one of `needs_you`, `done`, `working`, `ready`, `waiting`, `cancelled`, `failed` or `pending`. `owner` is shaped like `who`. |
 | `stuck` | For stalled, failed, unstaffed and queued missions: `{step, word, attempts, blockers[], agent}`. The step is the first one that is failed, ready or waiting. `agent` is that step's seat (its claimant, else the agent queuing it) as `{id, label, state}`. Otherwise `null`. |
 | `queued_behind` | For a ready step waiting on a busy agent: `{agent, label, busy_with}`, where `busy_with` is the `{mission, path, label}` it holds. When the agent is not busy, `state` replaces `busy_with`. Otherwise `null`. |
 | `card` | `what-you-can-do` (stalled, failed, unstaffed), `nothing-to-do` (queued), or `null`. |
 | `actions[]` | What a person can do: `{id, action, target, confirm}`. `id` is `retry-step` (`work.retry`), `restart-agent` (`agent.start`, or `runtime.restart` for a running seat), `cancel-run` (`mission.cancel`, `confirm: true`) or `chat` (`message.send` to the stuck agent). Clients run these actions instead of printing CLI hints. |
 | `progress`, `last_progress`, `settled_at` | `{done, total}`; the latest progress summary of a step in hand; and the time it completed, failed or was cancelled (else `null`). |
 
-Precedence is the one in `st3-ui-model::missions::adapt` today, first match wins: an open human
+Precedence (`st3-ui-model::missions::word`, shared with the terminal UI's own adapter), first match wins: an open human
 gate on the mission (decision); no runs (not_started); a blocked mission or step (stalled);
 completed (done); a failed mission or step (failed); cancelled; only keep-open steps still
 running (watching); a step claimed, working or verifying (working); a ready unclaimed step,
@@ -362,16 +369,18 @@ which is unstaffed when its queuing agent is stopped, failed or faulted, queued 
 queues it, and unclaimed otherwise; a waiting or pending step (held); standing, running, ready or
 draft (idle); otherwise done.
 
-`who` is `you` for decision; the stuck or working step's seat (its claimant, else the agent
-queuing it) for working, queued, unstaffed, stalled and failed; `st` when only agentless steps
-are open; and `nobody` otherwise.
+`who` is the person the open gate waits on for decision; the working step's owner for working
+and watching (`st` for an agentless step); the stuck step's seat for queued, unstaffed, stalled
+and failed; and `nobody` otherwise.
 
 The existing `must_act` (`you`, `agent`, `system`, `blocked`, `nobody`) stays on the row for
 older clients. `who` replaces it for display.
 
-**Inputs:** the mission's runs, steps and worker leases; open human-gate attention on it; and the
-state, fault and queue of every agent that claims or queues one of its steps. The missions
-refresher refolds on the first two today, and must also refold when one of those agents changes.
+**Inputs:** the mission's runs, steps and worker leases; the open human gates on it; and the
+state, fault, held step and queue of every agent that claims, is assigned or queues one of its
+steps, from the newest published agents roster. The missions refresher refolds a mission when any
+of these change: its claims and leases as before, a gate opening or closing, and an agent of its
+changing in a newer roster. A roster publication wakes the refresher.
 
 **Today, and what the projection settles:**
 

@@ -894,6 +894,7 @@
             "kind": { "const": "mission" },
             "title": { "type": "string" },
             "state": {"$ref": "#/$defs/MissionState"},
+            "presentation": { "$ref": "#/$defs/MissionPresentation", "description": "st's presentation of this mission: its word, who must act, each step, the stuck step and what a person can do (docs/clients/ui-contract.md, Mission). Absent on older daemons and until st has a published agents roster." },
             "system": { "type": "boolean", "description": "st's own plumbing or a standing observer, which clients fold away until a person asks: declared with `system`, or st's own `mission/__st3/` missions, or (for revisions published before the flag) a `ci` path segment. Absent on older daemons." },
             "mission_revision": { "$ref": "#/$defs/Revision" },
             "runs": { "type": "array", "items": { "$ref": "#/$defs/MissionRunId" } },
@@ -945,6 +946,80 @@
       }
     },
     "WorkState": {"enum": ["waiting-person", "waiting", "ready", "claimed", "blocked", "verifying", "completed", "failed", "cancelled"]},
+    "MissionPresentation": {
+      "type": "object",
+      "required": ["word", "system", "who", "steps", "stuck", "queued_behind", "card", "actions", "progress", "last_progress", "settled_at"],
+      "properties": {
+        "word": { "enum": ["decision", "stalled", "unstaffed", "unclaimed", "queued", "working", "watching", "held", "idle", "done", "failed", "cancelled", "not_started"], "description": "The mission word, by its fixtures/clients/words.json id." },
+        "system": { "type": "boolean" },
+        "who": { "$ref": "#/$defs/PresentationActor", "description": "Who must act now." },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/MissionStepPresentation" }, "description": "The steps of the open runs, or of the latest run, in display order." },
+        "stuck": { "oneOf": [{ "$ref": "#/$defs/MissionStuck" }, { "type": "null" }] },
+        "queued_behind": { "oneOf": [{ "$ref": "#/$defs/MissionQueuedBehind" }, { "type": "null" }] },
+        "card": { "oneOf": [{ "enum": ["what-you-can-do", "nothing-to-do"] }, { "type": "null" }] },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/MissionActionOffer" } },
+        "progress": { "type": "object", "required": ["done", "total"], "properties": { "done": { "type": "integer", "minimum": 0 }, "total": { "type": "integer", "minimum": 0 } } },
+        "last_progress": { "type": ["string", "null"] },
+        "settled_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "When it completed, failed or was cancelled." }
+      }
+    },
+    "PresentationActor": {
+      "type": "object",
+      "required": ["kind"],
+      "description": "A person (a client says 'you' when it is the reader), an agent, st's own agentless work, or nobody.",
+      "properties": {
+        "kind": { "enum": ["person", "agent", "st", "nobody"] },
+        "person": { "$ref": "#/$defs/Id" },
+        "agent": { "$ref": "#/$defs/AgentId" },
+        "label": { "type": "string" }
+      }
+    },
+    "MissionStepPresentation": {
+      "type": "object",
+      "required": ["id", "path", "word", "owner", "attempts", "blockers", "keep_open"],
+      "properties": {
+        "id": { "$ref": "#/$defs/StepRunId" },
+        "path": { "type": "string" },
+        "title": { "type": ["string", "null"] },
+        "word": { "enum": ["needs_you", "done", "working", "ready", "waiting", "cancelled", "failed", "pending"] },
+        "owner": { "$ref": "#/$defs/PresentationActor" },
+        "note": { "type": ["string", "null"], "description": "The queue it waits in, or st's reason while it waits." },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "keep_open": { "type": "boolean" }
+      }
+    },
+    "MissionStuck": {
+      "type": "object",
+      "required": ["step", "word", "attempts", "blockers"],
+      "properties": {
+        "step": { "$ref": "#/$defs/StepRunId" },
+        "word": { "enum": ["needs_you", "done", "working", "ready", "waiting", "cancelled", "failed", "pending"] },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "agent": { "oneOf": [{ "type": "object", "required": ["id", "label", "state"], "properties": { "id": { "$ref": "#/$defs/AgentId" }, "label": { "type": "string" }, "state": { "type": "string" } } }, { "type": "null" }], "description": "The step's seat: its claimant, else its assignee, else the agent queuing it." }
+      }
+    },
+    "MissionQueuedBehind": {
+      "type": "object",
+      "required": ["agent", "label"],
+      "properties": {
+        "agent": { "$ref": "#/$defs/AgentId" },
+        "label": { "type": "string" },
+        "busy_with": { "oneOf": [{ "type": "object", "required": ["mission", "path", "label"], "properties": { "mission": { "$ref": "#/$defs/Id" }, "path": { "type": "string" }, "label": { "type": "string" } } }, { "type": "null" }] },
+        "state": { "type": ["string", "null"] }
+      }
+    },
+    "MissionActionOffer": {
+      "type": "object",
+      "required": ["id", "action", "target", "confirm"],
+      "properties": {
+        "id": { "enum": ["retry-step", "restart-agent", "cancel-run", "chat"] },
+        "action": { "type": "string", "description": "The client-v0 action that does it." },
+        "target": { "$ref": "#/$defs/Id" },
+        "confirm": { "type": "boolean", "description": "Binding: ask for a second tap first." }
+      }
+    },
     "MissionStep": {
       "type": "object",
       "required": ["id", "path", "state", "attempt", "since"],
