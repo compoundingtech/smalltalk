@@ -1458,6 +1458,9 @@ async fn wait_peer_retry<B: Backend>(
     let started = tokio::time::Instant::now();
     let mut deadline = started + delay;
     let mut next_probe = started + PEER_PROBE_INTERVAL;
+    // A probe that failed during this wait says the transport was down; the next one that
+    // answers is the link coming back, not a peer that answers cheaply and refuses real work.
+    let mut transport_was_down = false;
     loop {
         // Check before sleeping as well as after notification: watch channels coalesce
         // events, and an accepted request can predate entry to this retry wait.
@@ -1518,7 +1521,17 @@ async fn wait_peer_retry<B: Backend>(
                     .timeout(PEER_PROBE_TIMEOUT).send().await.is_ok()
             }, if probe_url.is_some() => {
                 next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
-                if alive {
+                if !alive {
+                    transport_was_down = true;
+                } else if transport_was_down {
+                    // The backoff grew while the peer was unreachable, so it can outlast the
+                    // outage by up to its whole length. Dead then alive is the recovery edge:
+                    // try now, and let the caller restart the backoff. Each edge needs a failed
+                    // probe and a later answered one, so a flapping link is dialed at most once
+                    // per two probe intervals; a peer that always answers the probe and refuses
+                    // the exchange never reaches this branch and keeps the 30 second cap below.
+                    return true;
+                } else {
                     // Transport is alive, but another expensive exchange has just failed.
                     // Retain backoff and allow at most one attempt every 30 seconds at the cap.
                     // A cheap probe is not authenticated activity. It must not refresh

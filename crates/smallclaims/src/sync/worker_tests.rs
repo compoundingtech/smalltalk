@@ -2816,6 +2816,124 @@ async fn an_always_failing_http_peer_cannot_refresh_its_own_probe_window() {
     server.abort();
 }
 
+/// A backoff that grew during an outage can outlast it. The wait must end when the link comes
+/// back, not at the 30 second cap measured from when the wait began: that cap is for a peer that
+/// answers the probe and refuses the exchange, which never saw the probe fail first.
+#[tokio::test(start_paused = true)]
+async fn a_peer_whose_probe_recovers_after_failing_is_retried_at_once() {
+    let app = Router::new().route(EXCHANGE_PATH, axum::routing::head(|| async { StatusCode::OK }));
+    // Bound and not yet served: connections complete in the kernel and nothing answers, so each
+    // probe times out, as it does while a link drops traffic.
+    let mut listener = Some(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let url = format!("http://{}", listener.as_ref().unwrap().local_addr().unwrap());
+    let keep_awake = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let (_route_tx, mut routes) = watch::channel(vec![Route::Http(url.clone())]);
+    let mut inbound = fleet.inbound_changed.subscribe();
+    let mut activity = fleet.activity_changed.subscribe();
+    let mut connectivity = fleet.connectivity_changed.subscribe();
+    let http = replication_http_client();
+    let local = Local(Arc::new(plain_memory("birch").unwrap()));
+    let previous = (url, tokio::time::Instant::now());
+    let started = tokio::time::Instant::now();
+    let wait = wait_peer_retry(
+        &local,
+        crate::store::now_ms(),
+        Duration::from_secs(3600),
+        &mut routes,
+        &mut inbound,
+        &mut activity,
+        &mut connectivity,
+        &fleet,
+        "cedar",
+        started,
+        Some(&previous),
+        &http,
+    );
+    tokio::pin!(wait);
+    let mut server = None;
+    let mut recovered_at = None;
+    // Drive sockets without Tokio advancing time ahead of them.
+    for second in 0..40_u64 {
+        if second == 20 {
+            server = Some(tokio::spawn(axum::serve(listener.take().unwrap(), app.clone()).into_future()));
+        }
+        tokio::select! {
+            result = &mut wait => { recovered_at = Some((second, result)); break; }
+            _ = async { for _ in 0..100 { tokio::task::yield_now().await; } } => {}
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let (second, result) = recovered_at.expect("the wait must end once the probe answers");
+    assert!(
+        result && second < 30,
+        "the link came back at second 20: the wait ended at second {second} with {result}; \
+         ending at the 30 second cap with false means the recovery edge was ignored"
+    );
+    keep_awake.abort();
+    if let Some(server) = server {
+        server.abort();
+    }
+}
+
+/// The control for the test above: a peer whose probe never answers is still down, so the wait
+/// runs its whole backoff and then reports no activity.
+#[tokio::test(start_paused = true)]
+async fn a_peer_whose_probe_never_answers_keeps_its_backoff() {
+    // Bound and never served: connections complete in the kernel and nothing answers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let keep_awake = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let (_route_tx, mut routes) = watch::channel(vec![Route::Http(url.clone())]);
+    let mut inbound = fleet.inbound_changed.subscribe();
+    let mut activity = fleet.activity_changed.subscribe();
+    let mut connectivity = fleet.connectivity_changed.subscribe();
+    let http = replication_http_client();
+    let local = Local(Arc::new(plain_memory("birch").unwrap()));
+    let previous = (url, tokio::time::Instant::now());
+    let started = tokio::time::Instant::now();
+    let wait = wait_peer_retry(
+        &local,
+        crate::store::now_ms(),
+        Duration::from_secs(60),
+        &mut routes,
+        &mut inbound,
+        &mut activity,
+        &mut connectivity,
+        &fleet,
+        "cedar",
+        started,
+        Some(&previous),
+        &http,
+    );
+    tokio::pin!(wait);
+    let mut ended = None;
+    // Drive sockets without Tokio advancing time ahead of them.
+    for second in 0..70_u64 {
+        tokio::select! {
+            result = &mut wait => { ended = Some((second, result)); break; }
+            _ = async { for _ in 0..100 { tokio::task::yield_now().await; } } => {}
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let (second, result) = ended.expect("the wait must end at its backoff");
+    assert!(
+        !result && second >= 59,
+        "a peer that never answers the probe must wait out its whole 60 second backoff: ended at second {second} with {result}"
+    );
+    keep_awake.abort();
+    drop(listener);
+}
+
 #[tokio::test]
 async fn concurrent_slow_exports_refuse_more_work_with_authenticated_overload() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
