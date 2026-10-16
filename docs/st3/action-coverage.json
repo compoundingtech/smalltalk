@@ -473,7 +473,7 @@
       "description": "Replace this seat's handoff document from a file or standard input",
       "tests": [
         "crates/st3/tests/agents_restart.rs::a_seat_writes_and_reads_its_handoff_through_the_cli",
-        "crates/st3-daemon/src/api.rs::a_seat_writes_only_its_own_handoff"
+        "crates/st3-daemon/src/api/tests.rs::a_seat_writes_only_its_own_handoff"
       ],
       "verification": "real CLI over a private Unix socket; the daemon refuses another seat's handoff"
     },
