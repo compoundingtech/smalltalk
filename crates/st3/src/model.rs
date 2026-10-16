@@ -2648,6 +2648,10 @@ pub struct StepRunView {
     /// the step is held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nudged_at_unix_ms: Option<u128>,
+    /// What the holder declared this step waits on with `work wait --on`, while the step is held
+    /// and the wait is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<DeclaredWaitView>,
     /// The `work complete` summary for the current attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_summary: Option<String>,
@@ -2658,6 +2662,23 @@ pub struct StepRunView {
     pub not_before_unix_ms: Option<u128>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
+}
+
+/// A wait a step's holder declared with `work wait --on`. It is open until its target moves:
+/// the pull request merges or closes, the step finishes, or the time comes. Then st records
+/// the end on the step and, unless the target already woke the seat, wakes it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeclaredWaitView {
+    /// `pull-request`, `step` or `time`.
+    pub kind: String,
+    /// `OWNER/REPO#N`, a `step-run/` subject, or the time as RFC 3339.
+    pub subject: String,
+    /// The wait's `work.progress` claim.
+    pub claim: String,
+    pub since_unix_ms: u128,
+    /// A time wait's time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_unix_ms: Option<u128>,
 }
 
 impl StepRunView {
@@ -2837,6 +2858,10 @@ pub struct WorkRequest {
     /// action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// `work wait --on`: what the step waits on, such as `OWNER/REPO#N`, a `step-run/` subject or
+    /// a time. Absent for every other action and for a wait that names no target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_on: Option<String>,
     pub idempotency_key: String,
 }
 

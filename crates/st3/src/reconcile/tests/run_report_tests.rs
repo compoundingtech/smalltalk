@@ -221,6 +221,7 @@ fn a_quiet_parent_counts_child_round_progress_and_then_reports_real_silence() {
             reason: None,
             evidence: Vec::new(),
             wait_ms: None,
+            wait_on: None,
             idempotency_key: key.into(),
         };
         fixture

@@ -1203,6 +1203,12 @@ pub struct Work {
     /// When st last nudged this held step's holder for idling with nothing set to wake it.
     #[serde(default)]
     pub nudged_at_unix_ms: Option<u64>,
+    /// What the holder declared this held step waits on with `work wait --on`, while that wait is open, such as `pull request OWNER/REPO#N`.
+    #[serde(default)]
+    pub waiting_on: Option<String>,
+    /// When the open declared wait began.
+    #[serde(default)]
+    pub waiting_since_unix_ms: Option<u64>,
     #[serde(default)]
     pub execution_elapsed_ms: u64,
     #[serde(default)]

@@ -1204,6 +1204,46 @@ so nothing loops. The fault is closed when the reporter is told, the run's repor
 A nested run reports only if its own mission asks. A run that is terminated because the run above
 it ended is reported through the run above it.
 
+## Declared waits
+
+A seat that holds a step says what the step waits on with `work wait --on`:
+
+```sh
+st work wait STEP --on acme/garden#12 --as agent/garden/builder     # a pull request
+st work wait STEP --on step-run/GENERATION/review --as agent/garden/builder   # another step
+st work wait STEP --on 45m --as agent/garden/builder                # a time, or an RFC 3339 time
+```
+
+A pull request covers its checks, reviews, merge queue and merge: a CI run is waited on through
+its pull request. For a person's answer, use `work ask`, which already makes the step wait for
+the person.
+
+st watches the target and wakes the seat when it moves, with the wake sources it already has:
+
+| Target | What wakes the seat | When the wait ends |
+| --- | --- | --- |
+| pull request | the `gh watch` the wait sets, unless the seat already watches the thread | the watch ends: the pull request merged or closed, the watch reached its deadline, or the seat unwatched it |
+| step | a message from `daemon/runtime` | the step completes, fails or is cancelled |
+| time | a message from `daemon/runtime` | the time comes |
+
+The wait is a `work.progress` claim with `wait_on` beside the stopped execution clock. It stays
+open until the target moves, the seat declares another wait or resumes, or the attempt ends.
+When the target moves, st records `work.wait-ended` on the step with why, and the execution
+clock runs again. A pull request's watch already told the seat that it merged or closed, so only
+a step or a time sends a message of its own, once.
+
+The step shows `waiting on` its target while the wait is open: `st work show` prints
+`Waiting on:`. A step with an open declared wait is not [idle-holding](#idle-holders).
+
+A declared wait stops the execution clock like any wait: for what is left of the attempt's 12h
+wait budget, or until a time target, unless `--for` says less. When the budget is spent the wait
+is still declared and watched, and the clock runs. A wait with only `--for` and `--reason` is a
+note: nothing watches it, and it does not keep st from nudging an idle seat.
+
+Each held step's wait is checked when its run is evaluated: the step's newest claims and one
+target, a watch, a step or the clock. A time wait makes the run's evaluation due at its time,
+so nothing polls.
+
 ## Idle holders
 
 A run report tells the run's reporter. An idle-hold nudge tells the seat that holds the work.
@@ -1232,10 +1272,14 @@ clock. A delivered event wakes the seat anyway, which ends its idle period. A mo
 saw but did not deliver never extends a hold: a merge queue reordering, a new head with no check
 verdict yet, or another seat's progress on a step this seat depends on.
 
+A held step with an open [declared wait](#declared-waits) is not idle-holding: st wakes the seat
+when its target moves.
+
 After 30 minutes idle-holding, st sends the seat one message from `daemon/runtime`. The message
 names each held step with its title, goals and last progress line, says how long the seat has been
 idle, and lists the waits that have gone quiet, with each wait's subject and when it last moved.
-It asks the seat to continue the work, set a watch on what it waits for, or release the step.
+It asks the seat to continue the work, declare what the step waits on with `work wait --on`, or
+release the step.
 
 Some movements a source saw but did not deliver mean the seat must act. Today one source can tell:
 a watched pull request that leaves the merge queue without merging and is still out of it 5

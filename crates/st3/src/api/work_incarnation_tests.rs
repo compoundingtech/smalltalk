@@ -66,6 +66,7 @@ mission "catalog" state="ready" {
                 "claim",
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some(SEAT.into()),
                     incarnation: Some("chooser:one".into()),
                     summary: None,
@@ -405,4 +406,33 @@ async fn submitted_incarnation_binds_the_receipt_and_survives_replay() {
     unknown.body["fields"]["submitted_incarnation"] = Value::Null;
     assert!(!crate::model::work_submission_matches(&unknown, &read.subject, read.attempt, SEAT, Some("chooser:one"), &evidence));
 
+}
+
+#[tokio::test]
+async fn a_wait_on_a_pull_request_by_anyone_but_the_holder_sets_no_watch() {
+    let fixture = Fixture::new(false).await;
+    for (actor, incarnation, code) in [
+        ("agent/garden/other", "other:one", "work-not-claimed"),
+        (SEAT, "chooser:old", "wrong-work-incarnation"),
+    ] {
+        let error = fixture
+            .client
+            .post::<_, Value>(
+                &format!("/v1/work/wait/{}", fixture.step),
+                &json!({
+                    "actor": actor, "incarnation": incarnation,
+                    "wait_on": "acme/garden#12", "idempotency_key": format!("wait-{incarnation}"),
+                }),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(code), "{message}");
+        assert!(
+            fixture.state.store.live_watches_of(actor).unwrap().is_empty(),
+            "a refused wait leaves no watch for {actor}"
+        );
+    }
+    let step = fixture.state.store.step_run(&fixture.step).unwrap().unwrap();
+    assert_eq!(step.waiting_on, None);
 }

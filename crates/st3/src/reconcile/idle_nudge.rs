@@ -4,6 +4,9 @@
 //! what it waits on, and asks it to continue, set a watch, or release the step. The nudge is
 //! recorded on each step it names.
 //!
+//! A step whose holder declared what it waits on (`st work wait --on`) is not idle-holding while
+//! that wait is open: st ends the wait and wakes the seat when its target moves.
+//!
 //! Something will wake a seat when its harness is not quiet (a turn, an ask, unsent input,
 //! background jobs or subagents), a message to it is not delivered yet, or one of its waits holds
 //! (see `waits`): it woke the seat within `idle_nudge_quiet_watch` (2 hours by default), or it
@@ -172,7 +175,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
-            if backoff.quiet_due.is_some() {
+            if backoff.quiet_due.is_some()
+                && self
+                    .store
+                    .declared_wait(&step.subject, step.attempt)?
+                    .is_none()
+            {
                 steps.push((step, backoff));
             }
         }
@@ -363,8 +371,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|step| format!("`st work release {} --as {agent}`", step.subject))
             .collect::<Vec<_>>()
             .join(", ");
+        let wait = steps
+            .iter()
+            .map(|step| format!("`st work wait {} --on TARGET --as {agent}`", step.subject))
+            .collect::<Vec<_>>()
+            .join(", ");
         content.push_str(&format!(
-            "\nContinue the work, set `st gh watch` on what you are waiting for, or release the step ({release}).\n\
+            "\nContinue the work, declare what the step waits on so st wakes you when it moves ({wait}; TARGET is OWNER/REPO#N, step-run/..., or a time such as 45m), or release the step ({release}).\n\
              st sends this once per idle period, and at most once every 2 hours per step unless something needs you to act."
         ));
         let title = match steps {

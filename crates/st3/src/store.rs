@@ -193,6 +193,8 @@ pub(crate) mod work_summaries_ivm;
 mod subagents;
 mod watches;
 mod idle_holds;
+mod declared_waits;
+pub use declared_waits::{WORK_WAIT_ENDED_KIND, WaitTarget, WaitWake, describe_wait};
 mod idle_mail;
 pub use idle_holds::WORK_NUDGED_KIND;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
@@ -9267,6 +9269,7 @@ impl Store {
             "release",
             &WorkRequest {
                 wait_ms: None,
+                wait_on: None,
                 actor: Some(input.actor.clone()),
                 incarnation: input.incarnation.clone(),
                 summary: Some(input.note.clone()),
@@ -9310,27 +9313,36 @@ impl Store {
                 "only an extension adds time",
             ));
         }
+        let wait_target = request
+            .wait_on
+            .as_deref()
+            .map(|target| WaitTarget::parse(target, now_ms()))
+            .transpose()?;
         if action == "wait" {
-            if !request
+            // A wait on a target may leave its length to the target: it stops the clock for
+            // what is left of the wait budget, or until a time target.
+            if !(request
                 .wait_ms
                 .is_some_and(|by| (1..=MAX_STEP_WAIT_MS).contains(&by))
+                || request.wait_ms.is_none() && wait_target.is_some())
             {
                 return Err(St3Error::new(
                     "invalid-wait",
                     "a wait stops the execution clock for between 1 millisecond and 12 hours",
                 ));
             }
-            if request
-                .reason
-                .as_deref()
-                .is_none_or(|reason| reason.trim().is_empty())
+            if wait_target.is_none()
+                && request
+                    .reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
             {
                 return Err(St3Error::new(
                     "wait-needs-reason",
-                    "a wait records what the step waits for; pass --reason",
+                    "a wait records what the step waits for; pass --on TARGET or --reason",
                 ));
             }
-        } else if request.wait_ms.is_some() {
+        } else if request.wait_ms.is_some() || wait_target.is_some() {
             return Err(St3Error::new(
                 "invalid-work-action",
                 "only a wait stops the execution clock",
@@ -9594,6 +9606,27 @@ impl Store {
                     .clone()
                     .or_else(|| Some(requested_incarnation.to_owned()));
                 let actor_incarnation = effective_incarnation.clone();
+                if let Some(WaitTarget::Step(target)) = &wait_target {
+                    if *target == subject {
+                        return Err(St3Error::new(
+                            "invalid-wait-target",
+                            "a step cannot wait on itself",
+                        ));
+                    }
+                    let exists = transaction
+                        .prepare_cached("SELECT 1 FROM step_runs WHERE subject=?1")
+                        .and_then(|mut statement| statement.exists([target]))
+                        .map_err(internal)?;
+                    if !exists {
+                        return Err(St3Error::new(
+                            "invalid-wait-target",
+                            format!("there is no step `{target}`"),
+                        ));
+                    }
+                }
+                // How long this wait stops the clock; none when a target wait finds the budget
+                // spent, which still declares the wait.
+                let mut pause_ms = request.wait_ms.map(u128::from);
                 if action == "wait" {
                     // Waits draw on one budget per attempt, so a seat that keeps declaring them
                     // cannot hide a hung step from the execution timeout. The budget is time
@@ -9603,7 +9636,14 @@ impl Store {
                         .map_err(internal)?
                         .waited;
                     let left = u128::from(MAX_STEP_WAIT_MS).saturating_sub(spent);
-                    if u128::from(request.wait_ms.unwrap_or_default()) > left {
+                    if pause_ms.is_none() {
+                        let until = wait_target
+                            .as_ref()
+                            .and_then(WaitTarget::until_unix_ms)
+                            .map_or(left, |until| until.saturating_sub(now).min(left));
+                        pause_ms = (until > 0).then_some(until);
+                    }
+                    if request.wait_ms.is_some_and(|wait_ms| u128::from(wait_ms) > left) {
                         return Err(St3Error::new(
                             "wait-budget-exhausted",
                             format!(
@@ -9732,10 +9772,16 @@ impl Store {
                 }
                 match action {
                     "wait" => {
-                        body["fields"]["clock"] = json!("paused");
-                        body["fields"]["wait_until_unix_ms"] = json!(
-                            now.saturating_add(u128::from(request.wait_ms.unwrap_or_default()))
-                        );
+                        if let Some(pause_ms) = pause_ms {
+                            body["fields"]["clock"] = json!("paused");
+                            body["fields"]["wait_until_unix_ms"] =
+                                json!(now.saturating_add(pause_ms));
+                        } else {
+                            body["fields"]["clock"] = json!("running");
+                        }
+                        if let Some(target) = &wait_target {
+                            body["fields"]["wait_on"] = target.field();
+                        }
                     }
                     "resume" => body["fields"]["clock"] = json!("running"),
                     _ => {}
@@ -18827,6 +18873,7 @@ impl Store {
                 | "work.renewed"
                 | "work.progress"
                 | "work.nudged"
+                | "work.wait-ended"
                 | "work.submitted"
                 | "work.failed"
                 | "work.released"
@@ -27751,6 +27798,7 @@ mission "garden" state="ready" {
                     "claim",
                     &WorkRequest {
                         wait_ms: None,
+                        wait_on: None,
                         actor: Some(actor.into()),
                         incarnation: Some(incarnation.into()),
                         summary: None,
@@ -27768,6 +27816,7 @@ mission "garden" state="ready" {
                 "complete",
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some(actor.into()),
                     incarnation: Some(incarnation.into()),
                     summary: None,
@@ -27944,6 +27993,7 @@ mission "garden" state="ready" {
         let step = run.steps[0].subject.clone();
         let request = |key: &str, wait_ms: Option<u64>, reason: Option<&str>| WorkRequest {
             wait_ms,
+            wait_on: None,
             actor: Some("agent/garden/worker".into()),
             incarnation: Some("garden:one".into()),
             summary: None,
@@ -31925,9 +31975,9 @@ fn project_mission_run_update(
     transaction: &Transaction<'_>,
     claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
-    // Nudges are retained events, never work-state transitions. This also matches
-    // full replay for historical bodies that bypassed today's field admission.
-    if claim.kind == WORK_NUDGED_KIND {
+    // Nudges and ended waits are retained events, never work-state transitions. This also
+    // matches full replay for historical bodies that bypassed today's field admission.
+    if claim.kind == WORK_NUDGED_KIND || claim.kind == WORK_WAIT_ENDED_KIND {
         return Ok(());
     }
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
@@ -33905,6 +33955,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         blockers: Vec::new(),
         not_before_unix_ms: not_before.and_then(|value| value.parse().ok()),
         nudged_at_unix_ms: None,
+        waiting_on: None,
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
         person_answers: Vec::new(),
@@ -33977,6 +34028,7 @@ fn enrich_step_queue_cached(
         step_timeout_extension_at(connection, &view.subject, view.attempt, snapshot_unix_ms)?;
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_nudge_at(connection, view, snapshot_unix_ms)?;
+    declared_waits::enrich_declared_wait_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition_cached(connection, view, definitions)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
@@ -34579,7 +34631,7 @@ fn step_timing_events(
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1
            AND claims.kind IN ('step-run.state','step-run.carried','work.claimed','work.renewed',
-                               'work.progress','work.submitted','work.failed','work.released','work.extended','work.person-asked','work.person-done','work.person-cancelled')
+                               'work.progress','work.wait-ended','work.submitted','work.failed','work.released','work.extended','work.person-asked','work.person-done','work.person-cancelled')
          ORDER BY CANONICAL_ASC(claims)",
     ))?;
     let events = statement
@@ -34822,6 +34874,11 @@ fn fold_step_clock_open(
                     .get("claim_expires_at_unix_ms")
                     .and_then(Value::as_u64)
                     .map(u128::from);
+            }
+            // The target of a declared wait moved: the clock runs again.
+            "work.wait-ended" if paused_until.is_some() => {
+                end_wait(&mut waited, &mut pause_started, &mut paused_until, accepted);
+                started = Some(accepted);
             }
             "work.submitted" | "work.failed" | "work.released" => {
                 if let Some(interval_start) = started {
@@ -41501,6 +41558,7 @@ version 2
         }
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some("worker-one".into()),
             summary: None,
@@ -43435,6 +43493,7 @@ version 2
                     action,
                     &WorkRequest {
                         wait_ms: None,
+                        wait_on: None,
                         actor: Some("agent/worker.one".into()),
                         incarnation: Some("worker-generation".into()),
                         summary: Some("the remote work is complete".into()),
@@ -43523,6 +43582,7 @@ version 2
                 action,
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some("agent/worker.one".into()),
                     incarnation: Some("worker-generation".into()),
                     summary: summary.map(str::to_owned),
@@ -43541,6 +43601,7 @@ version 2
                 "extend",
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some("agent/worker.one".into()),
                     incarnation: Some("worker-generation".into()),
                     summary: None,
@@ -44542,6 +44603,7 @@ version 2
             let (controller, worker, step) = replicated_step_pair();
             let request = |reason: Option<&str>, key: &str| WorkRequest {
                 wait_ms: None,
+                wait_on: None,
                 actor: Some("agent/worker.one".into()),
                 incarnation: Some("worker-generation".into()),
                 summary: None, reason: reason.map(str::to_owned), evidence: Vec::new(),
@@ -45156,6 +45218,7 @@ agent "worker.one" { workspace "/tmp"; command "true"; restart always; }
                     "claim",
                     &WorkRequest {
                         wait_ms: None,
+                        wait_on: None,
                         actor: Some(actor.into()),
                         incarnation: Some(format!("{key}-incarnation")),
                         summary: None,
@@ -50232,6 +50295,7 @@ version 2
         );
         let request = |incarnation: &str, key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some(incarnation.into()),
             summary: None,
@@ -50242,6 +50306,7 @@ version 2
 
         let missing = WorkRequest {
             wait_ms: None,
+            wait_on: None,
             incarnation: None,
             ..request("one", "claim-without-incarnation")
         };
@@ -50395,6 +50460,7 @@ version 2
 
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/source.worker".into()),
             incarnation: Some("worker-one".into()),
             summary: None,
@@ -50500,6 +50566,7 @@ mission "external-blocker" state="ready" {
         store.set_step_state(&subject, "ready", None).unwrap();
         let request = |key: &str, reason: Option<&str>| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/source.ios-owner".into()),
             incarnation: Some("ios-owner-one".into()),
             summary: None,
@@ -50887,6 +50954,7 @@ version 2
             .collect::<BTreeMap<_, _>>();
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/source.worker".into()),
             incarnation: Some("worker-one".into()),
             summary: None,
@@ -51259,6 +51327,7 @@ version 2
                 "claim",
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some("agent/node.worker".into()),
                     incarnation: Some("worker-one".into()),
                     summary: None,
@@ -51627,6 +51696,7 @@ mission "dispatch-repair" state="ready" {
             .unwrap();
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.planner".into()),
             incarnation: Some("current".into()),
             summary: None,
@@ -51723,6 +51793,7 @@ mission "nested-work" state="ready" {
             .unwrap();
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some("current".into()),
             summary: None,
@@ -51798,6 +51869,7 @@ mission "nested-work" state="ready" {
         store.set_step_state(subject, "ready", None).unwrap();
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some("current".into()),
             summary: None,
@@ -53613,6 +53685,7 @@ mission "retry" state="ready" {
         let subject = &run.steps[0].subject;
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some("current".into()),
             summary: None,
@@ -54004,6 +54077,7 @@ mission "takeover" state="ready" {
                 "renew",
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some("agent/worker.one".into()),
                     incarnation: Some("worker-generation".into()),
                     summary: None,
@@ -55366,6 +55440,7 @@ mission "summaries" state="ready" {
         let subject = &run.steps[0].subject;
         let request = |key: &str, summary: Option<&str>| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some("current".into()),
             summary: summary.map(str::to_owned),
@@ -55593,6 +55668,7 @@ version 2
         store.set_step_state(&submitted, "ready", None).unwrap();
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some(worker.clone()),
             incarnation: Some("worker-one".into()),
             summary: Some("the result is ready for verification".into()),
@@ -55696,6 +55772,7 @@ version 2
         store.set_step_state(&active, "ready", None).unwrap();
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some(worker.clone()),
             incarnation: Some("worker-one".into()),
             summary: None,
@@ -55805,6 +55882,7 @@ version 2
         assert_eq!(carried.claim_incarnation.as_deref(), Some("worker-one"));
         let stranger = WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some(format!("agent/{}/stranger", run.id)),
             ..request("stale-generation-complete")
         };
@@ -55935,6 +56013,7 @@ version 2
     fn carry_request(incarnation: &str, key: &str) -> WorkRequest {
         WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some(incarnation.into()),
             summary: None,
@@ -56808,6 +56887,7 @@ version 2
             .unwrap();
         let request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some(worker.clone()),
             incarnation: Some("worker-one".into()),
             summary: None,
@@ -56817,6 +56897,7 @@ version 2
         };
         let child_request = |key: &str| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/node.worker".into()),
             incarnation: Some("worker-one".into()),
             summary: None,
@@ -57039,6 +57120,7 @@ version 2
                 "claim",
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some("agent/node.worker".into()),
                     incarnation: Some("worker-incarnation".into()),
                     summary: None,

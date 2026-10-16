@@ -287,6 +287,7 @@ fn supersession_revokes_a_claimed_worker_and_runs_final_cleanup() {
     store.set_step_state(&step.subject, "ready", None).unwrap();
     let work = |key: &str| WorkRequest {
         wait_ms: None,
+        wait_on: None,
         actor: Some("agent/node.worker".into()),
         incarnation: Some("worker-incarnation".into()),
         summary: None,

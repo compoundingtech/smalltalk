@@ -77,7 +77,7 @@ const SEEDS: &[u64] = &[
 fn corpus() -> &'static BTreeMap<String, st3_schema::ClaimSpec> {
     static CORPUS: std::sync::LazyLock<BTreeMap<String, st3_schema::ClaimSpec>> =
         std::sync::LazyLock::new(|| {
-            serde_json::from_str(include_str!("../../../fixtures/convergence/claims-v2.json"))
+            serde_json::from_str(include_str!("../../../fixtures/convergence/claims-v3.json"))
                 .expect("versioned convergence input schema")
         });
     &CORPUS
@@ -1797,7 +1797,7 @@ fn fixed_sweep() {
         directory.join("summary.json"),
         serde_json::to_vec_pretty(&json!({
             "first":first, "count":count, "failures":failures,
-            "identity":"seeded-convergence-v1", "corpus":"claims-v2.json"
+            "identity":"seeded-convergence-v1", "corpus":"claims-v3.json"
         }))
         .unwrap(),
     )

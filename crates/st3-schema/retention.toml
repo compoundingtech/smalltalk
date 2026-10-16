@@ -185,6 +185,7 @@
 "work.released" = { class = "durable" }
 "work.renewed" = { class = "current", pending = "the step timing fold reads every renewal" }
 "work.submitted" = { class = "durable" }
+"work.wait-ended" = { class = "durable" }
 "workspace.observed" = { class = "current", log = "on-change", pending = "no reader audit yet" }
 
 # The checkpoint rules, in order. Each names the kind it applies to, the conditions under which it

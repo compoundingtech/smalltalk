@@ -67,6 +67,20 @@ fn two_hours_of_waiting_then_ten_minutes_of_review_use_twelve_minutes() {
 }
 
 #[test]
+fn the_end_of_a_declared_wait_starts_the_clock_again() {
+    let mut events = vec![claimed(0), wait(2 * MINUTE, 4 * 60 * MINUTE)];
+    events.extend(renewals(7 * MINUTE, 62 * MINUTE));
+    events.push(event("work.wait-ended", 62 * MINUTE, None, None));
+    events.extend(renewals(67 * MINUTE, 72 * MINUTE));
+
+    let after = timing(&events, 72 * MINUTE);
+    assert_eq!(after.paused_until, None);
+    assert_eq!(after.started, Some(T + 62 * MINUTE));
+    assert_eq!(after.elapsed, 12 * MINUTE);
+    assert_eq!(after.waited, 60 * MINUTE);
+}
+
+#[test]
 fn the_clock_is_stopped_for_the_whole_wait_and_the_view_names_when_it_ends() {
     let mut events = vec![claimed(0), wait(2 * MINUTE, 60 * MINUTE)];
     events.extend(renewals(7 * MINUTE, 90 * MINUTE));
@@ -156,6 +170,7 @@ struct Waiting {
 fn request(key: &str, reason: Option<&str>, wait_ms: Option<u64>) -> WorkRequest {
     WorkRequest {
         wait_ms,
+        wait_on: None,
         actor: Some("agent/node.worker".into()),
         incarnation: Some("current".into()),
         summary: None,

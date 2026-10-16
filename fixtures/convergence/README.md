@@ -11,8 +11,12 @@ reserved fields and remains unchanged for reproducible comparisons.
 Its generation expression is
 `serde_json::to_string_pretty(&st3_schema::registry().claims)`, followed by a
 newline. It adds the four durable review claim kinds and captures the complete
-review request field schema. The simulation includes this version and records
-its filename in audit reports.
+review request field schema.
+
+`claims-v3.json` is generated the same way from the declared-waits registry. It
+adds `work.wait-ended`, which closes a declared wait, and the `wait_on` field the
+work claim kinds carry. The simulation includes this version and records its
+filename in audit reports.
 
 The seeded generator draws kinds and fields from its selected snapshot; each
 tested revision still admits them through its own native registry and store.

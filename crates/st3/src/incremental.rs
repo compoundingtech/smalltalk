@@ -816,6 +816,7 @@ mission "protected-work" state="ready" revision-cutover="when-idle" revisions="h
                     actor: Some(alder.into()),
                     incarnation: Some(format!("{alder}-one")),
                     wait_ms: None,
+                    wait_on: None,
                     summary: None,
                     reason: None,
                     evidence: vec![],

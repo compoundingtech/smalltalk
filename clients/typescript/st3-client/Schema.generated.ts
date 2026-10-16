@@ -2215,7 +2215,11 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   "timeout_ms": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationMillisRange), wholeUnits(1))), NULL_NONE),
   "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "updated_at": Timestamp,
-  "usage": Schema.OptionFromOptionalNullOr(UsageSummary, NULL_NONE)
+  "usage": Schema.OptionFromOptionalNullOr(UsageSummary, NULL_NONE),
+  /** What the holder declared this held step waits on with `work wait --on`, while that wait is open, such as `pull request OWNER/REPO#N`. */
+  "waiting_on": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "What the holder declared this held step waits on with `work wait --on`, while that wait is open, such as `pull request OWNER/REPO#N`." }),
+  /** When the open declared wait began. */
+  "waiting_since_unix_ms": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.DateTimeUtcFromMillis.check(epochRange))), NULL_NONE).annotate({ description: "When the open declared wait began." })
 }).annotate({ identifier: "Work" }))()
 export type Work = typeof Work.Type
 export type WorkEncoded = typeof Work.Encoded

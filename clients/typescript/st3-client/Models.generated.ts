@@ -2607,6 +2607,8 @@ export type Work = ResourceHeader & {
   timeout_ms?: number | null;
   title?: string | null;
   usage?: (UsageSummary | null);
+  waiting_on?: string | null;
+  waiting_since_unix_ms?: number | null;
 };
 
 export type WorkLabel = {

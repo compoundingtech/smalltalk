@@ -82,6 +82,7 @@ fn act(store: &Store, subject: &str, actor: &str, action: &str, key: &str) {
             action,
             &WorkRequest {
                 wait_ms: None,
+                wait_on: None,
                 actor: Some(actor.into()),
                 incarnation: Some(format!("{actor}-1")),
                 summary: Some(format!("{action} by {actor}")),
@@ -230,6 +231,7 @@ fn published_missions_match_the_direct_fold_through_work_leases_failure_and_reti
     assert!(store
         .work_action(&plant, "progress", &WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/garden/nobody".into()),
             incarnation: None,
             summary: Some("not mine".into()),
@@ -464,6 +466,7 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
     store
         .work_action(&plant, "renew", &WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some(ash.clone()),
             incarnation: Some(format!("{ash}-1")),
             summary: None,

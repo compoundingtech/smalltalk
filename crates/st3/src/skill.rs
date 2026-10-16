@@ -142,6 +142,8 @@ mod tests {
             "`work claim STEP --as \"$ST_AGENT\"`",
             "this machine's host facts",
             "`work cancel-ask PERSON_STEP --as \"$ST_AGENT\" --reason TEXT`",
+            "`work wait STEP --on TARGET --as \"$ST_AGENT\"`",
+            "with no `--on` is only a note: nothing watches it",
             "Keys typed into another agent's terminal",
             "`\"$ST3_BIN\" gh watch OWNER/REPO#N --as \"$ST_AGENT\"`",
             "`gh comment OWNER/REPO#N --body-file FILE --as \"$ST_AGENT\"`",

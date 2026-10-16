@@ -81,6 +81,7 @@ impl Idle {
                 "progress",
                 &crate::model::WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some(SEAT.into()),
                     incarnation: Some("seat-one".into()),
                     summary: Some(summary.into()),
@@ -90,6 +91,49 @@ impl Idle {
                 },
             )
             .unwrap();
+    }
+
+    /// Declare a wait on `on`, with an optional reason, as the seat.
+    fn wait_on(&self, step: &str, on: &str) -> crate::model::StepRunView {
+        self.seat
+            .store
+            .work_action(
+                step,
+                "wait",
+                &crate::model::WorkRequest {
+                    wait_ms: None,
+                    wait_on: Some(on.into()),
+                    actor: Some(SEAT.into()),
+                    incarnation: Some("seat-one".into()),
+                    summary: Some(format!("Waiting on {on}.")),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: format!("wait-on-{on}-{}", self.now.get()),
+                },
+            )
+            .unwrap()
+    }
+
+    /// The step as views show it.
+    fn view(&self, step: &str) -> crate::model::StepRunView {
+        self.seat.store.step_run(step).unwrap().unwrap()
+    }
+
+    fn wait_ends(&self, step: &str) -> Vec<crate::model::ClaimRecord> {
+        self.seat
+            .store
+            .claims_for(step, Some(crate::store::WORK_WAIT_ENDED_KIND))
+            .unwrap()
+    }
+
+    fn wait_over(&self) -> Vec<crate::model::MessageView> {
+        self.seat
+            .store
+            .messages(Some(SEAT), true)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.tags.iter().any(|tag| tag == "st3-wait-ended"))
+            .collect()
     }
 
     /// The harness reports `state`, quiet unless it is working.
@@ -262,7 +306,7 @@ fn an_idle_seat_holding_a_step_with_nothing_to_wake_it_is_nudged_once() {
         "{content}"
     );
     assert!(content.contains("idle for 31m"), "{content}");
-    assert!(content.contains("set `st gh watch`"), "{content}");
+    assert!(content.contains("st work wait "), "{content}");
     assert!(
         content.contains(&format!("st work release {step} --as {SEAT}")),
         "{content}"
@@ -792,4 +836,155 @@ fn idle_lookup_cost_is_flat_with_delivered_mail_and_pr_history() {
             .all(|plan| !plan.contains("SCAN ") || plan.contains("SCAN (subquery-"))
     );
     assert!(idle.seat.store.latest_nudge(&step).unwrap().is_none());
+}
+
+#[test]
+fn a_declared_wait_on_a_step_holds_the_nudge_then_wakes_the_seat_when_the_step_finishes() {
+    let idle = fixture();
+    let step = idle.hold("queued", "waits-on-step");
+    let gated = idle.seat.start("gated", "the-other-seat");
+    let prepare = SeatQueueFixture::step(&gated, "prepare");
+    let view = idle.wait_on(&step, &prepare);
+    assert_eq!(view.waiting_on.as_ref().unwrap().kind, "step");
+    assert_eq!(view.waiting_on.as_ref().unwrap().subject, prepare);
+    assert!(view.execution_paused_until_unix_ms.is_some(), "the wait stops the clock");
+    idle.harness("idle");
+
+    idle.at(3 * HOUR);
+    idle.evaluate();
+    idle.seat.reconciler.reconcile_once().unwrap();
+    assert!(idle.nudges().is_empty(), "an open declared wait is not idle-holding");
+    assert!(idle.wait_ends(&step).is_empty());
+    assert!(idle.view(&step).waiting_on.is_some());
+
+    idle.seat.store.set_step_state(&prepare, "completed", None).unwrap();
+    idle.seat.reconciler.reconcile_once().unwrap();
+    let ended = idle.wait_ends(&step);
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        ended[0].body["fields"]["reason"],
+        format!("{prepare} completed").as_str()
+    );
+    let woken = idle.wait_over();
+    assert_eq!(woken.len(), 1);
+    assert!(woken[0].content.contains(&format!("step {prepare}")), "{}", woken[0].content);
+    assert!(woken[0].content.contains(&format!("Step: {step}")), "{}", woken[0].content);
+    let view = idle.view(&step);
+    assert_eq!(view.waiting_on, None);
+    assert_eq!(view.execution_paused_until_unix_ms, None, "the clock runs again");
+
+    // Another pass ends nothing more and wakes nobody again.
+    idle.seat.reconciler.reconcile_once().unwrap();
+    assert_eq!(idle.wait_ends(&step).len(), 1);
+    assert_eq!(idle.wait_over().len(), 1);
+}
+
+#[test]
+fn a_declared_wait_on_a_time_wakes_the_seat_when_it_comes() {
+    let idle = fixture();
+    let step = idle.hold("queued", "waits-on-time");
+    let view = idle.wait_on(&step, "1h");
+    let wait = view.waiting_on.unwrap();
+    assert_eq!(wait.kind, "time");
+    assert_eq!(wait.until_unix_ms, Some(idle.start + HOUR));
+
+    idle.at(59 * MINUTE);
+    idle.seat.reconciler.reconcile_once().unwrap();
+    assert!(idle.wait_ends(&step).is_empty());
+
+    idle.at(61 * MINUTE);
+    idle.seat.reconciler.reconcile_once().unwrap();
+    assert_eq!(idle.wait_ends(&step).len(), 1);
+    assert_eq!(idle.wait_over().len(), 1);
+    assert_eq!(idle.view(&step).waiting_on, None);
+}
+
+#[test]
+fn a_declared_wait_on_a_pull_request_ends_with_its_watch_without_a_second_wake() {
+    let idle = fixture();
+    let step = idle.hold("queued", "waits-on-merge");
+    idle.watch();
+    let view = idle.wait_on(&step, THREAD);
+    assert_eq!(view.waiting_on.as_ref().unwrap().kind, "pull-request");
+    assert_eq!(view.waiting_on.as_ref().unwrap().subject, THREAD);
+    idle.harness("idle");
+
+    idle.at(10 * MINUTE);
+    idle.observe(json!({"merge_queue": {"position": 1, "state": "queued"}}));
+    idle.seat.reconciler.reconcile_once().unwrap();
+    assert!(idle.wait_ends(&step).is_empty());
+
+    idle.at(20 * MINUTE);
+    idle.observe(json!({"merge_queue": null, "state": "closed", "merged": true}));
+    idle.seat.reconciler.reconcile_once().unwrap();
+    let ended = idle.wait_ends(&step);
+    assert_eq!(ended.len(), 1);
+    let reason = ended[0].body["fields"]["reason"].as_str().unwrap();
+    assert!(reason.contains("merged"), "{reason}");
+    assert!(idle.wait_over().is_empty(), "the watch's own wake told the seat");
+    assert_eq!(idle.view(&step).waiting_on, None);
+}
+
+#[test]
+fn a_wait_with_only_a_reason_is_a_note_and_does_not_hold_the_nudge() {
+    let idle = fixture();
+    let step = idle.hold("queued", "note-only");
+    idle.seat
+        .store
+        .work_action(
+            &step,
+            "wait",
+            &crate::model::WorkRequest {
+                wait_ms: Some(u64::try_from(2 * HOUR).unwrap()),
+                wait_on: None,
+                actor: Some(SEAT.into()),
+                incarnation: Some("seat-one".into()),
+                summary: Some("Waiting for the soil report.".into()),
+                reason: Some("soil report".into()),
+                evidence: Vec::new(),
+                idempotency_key: "note-only-wait".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(idle.view(&step).waiting_on, None);
+    idle.harness("idle");
+    idle.at(31 * MINUTE);
+    idle.evaluate();
+    assert_eq!(idle.nudges().len(), 1);
+}
+
+#[test]
+fn a_wait_names_a_target_it_can_watch() {
+    let idle = fixture();
+    let step = idle.hold("queued", "targets");
+    let attempt = |action: &str, on: &str| {
+        idle.seat
+            .store
+            .work_action(
+                &step,
+                action,
+                &crate::model::WorkRequest {
+                    wait_ms: None,
+                    wait_on: Some(on.into()),
+                    actor: Some(SEAT.into()),
+                    incarnation: Some("seat-one".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: format!("target-{action}-{on}"),
+                },
+            )
+            .unwrap_err()
+            .code
+    };
+    assert_eq!(attempt("wait", &step), "invalid-wait-target");
+    assert_eq!(attempt("wait", "step-run/nowhere/work"), "invalid-wait-target");
+    assert_eq!(attempt("wait", "2000-01-01T00:00:00Z"), "invalid-wait-target");
+    assert_eq!(attempt("wait", "the soil report"), "invalid-wait-target");
+    assert_eq!(attempt("progress", "1h"), "invalid-work-action");
+
+    // A later wait with only a reason, or a resume, closes the declared wait.
+    idle.wait_on(&step, "1h");
+    idle.seat.work(&step, "resume", "resume-after-target").unwrap();
+    assert_eq!(idle.view(&step).waiting_on, None);
 }

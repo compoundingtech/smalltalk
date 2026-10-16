@@ -183,7 +183,7 @@ pub fn watch_parts(subject: &str) -> Option<(ThreadRef, String)> {
     ))
 }
 
-fn rfc3339(unix_ms: u128) -> String {
+pub fn rfc3339(unix_ms: u128) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
         i64::try_from(unix_ms).unwrap_or(i64::MAX),
     )

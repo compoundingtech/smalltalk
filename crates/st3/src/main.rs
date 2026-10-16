@@ -4421,12 +4421,21 @@ enum WorkCommand {
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
-    /// Stop the execution clock while claimed work waits for something outside this seat.
+    /// Declare what claimed work waits on, and stop its execution clock meanwhile.
+    ///
+    /// `--on` names what the step waits on: a pull request (`OWNER/REPO#N`: its checks,
+    /// reviews, merge queue and merge), another step (`step-run/...`), or a time (`45m`, or an
+    /// RFC 3339 time). st watches it and wakes this seat when it moves: a pull request through
+    /// `st gh watch`, which the wait sets, a step when it finishes, a time when it comes. The step
+    /// shows `waiting on` its target, and an open wait on a target keeps st from nudging an idle
+    /// seat about it. For a person's answer, use `st work ask`.
     ///
     /// A build slot or the merge queue is waiting, not execution: the step's timeout counts
-    /// only the time it runs. The clock restarts at `work resume`, or after `--for` at the
-    /// latest, so a seat that stops answering cannot hide behind a wait. The lease still
-    /// needs its renewals.
+    /// only the time it runs. The clock restarts at `work resume`, when the target moves, or
+    /// after `--for` at the latest, so a seat that stops answering cannot hide behind a wait.
+    /// Waits share a 12h budget per attempt; a wait on a target stops the clock for what is
+    /// left of it unless `--for` says less. A wait with only `--reason` is a note: nothing
+    /// watches it. The lease still needs its renewals.
     Wait(WorkWaitArgs),
     /// Start the execution clock again after `work wait`.
     #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
@@ -4658,12 +4667,18 @@ struct WorkWaitArgs {
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
     incarnation: Option<String>,
-    /// The longest the clock stays stopped, such as 30m or 4h; at most 12h.
-    #[arg(long = "for")]
-    wait_for: String,
-    /// What the step waits for, such as "build slot" or "merge queue".
-    #[arg(long)]
-    reason: String,
+    /// What the step waits on: OWNER/REPO#N, step-run/..., or a time such as 45m or an RFC
+    /// 3339 time. st wakes this seat when it moves.
+    #[arg(long = "on", value_name = "TARGET")]
+    on: Option<String>,
+    /// The longest the clock stays stopped, such as 30m or 4h; at most 12h. Required without
+    /// `--on`.
+    #[arg(long = "for", required_unless_present = "on")]
+    wait_for: Option<String>,
+    /// What the step waits for, such as "build slot" or "merge queue". Required without
+    /// `--on`.
+    #[arg(long, required_unless_present = "on")]
+    reason: Option<String>,
 }
 
 #[derive(Args)]
@@ -17328,7 +17343,25 @@ async fn run_work(
         WorkCommand::Wait(args) => {
             let actor = args.actor.context("a work wait needs explicit --as")?;
             reject_foreign_agent_actor(&actor)?;
-            let wait_ms = st3::graph::parse_duration(&args.wait_for, true)?;
+            let wait_ms = args
+                .wait_for
+                .as_deref()
+                .map(|wait_for| st3::graph::parse_duration(wait_for, true))
+                .transpose()?;
+            let reason = args
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty());
+            let summary = match (&args.on, reason) {
+                (Some(on), Some(reason)) => format!("Waiting on {}: {reason}.", on.trim()),
+                (Some(on), None) => format!("Waiting on {}.", on.trim()),
+                (None, reason) => format!(
+                    "Waiting for {}; the execution clock is stopped for at most {}.",
+                    reason.unwrap_or_default(),
+                    args.wait_for.as_deref().unwrap_or_default()
+                ),
+            };
             let subject = if args.subject.starts_with("step-run/") {
                 args.subject.clone()
             } else {
@@ -17345,14 +17378,11 @@ async fn run_work(
                     &WorkRequest {
                         actor: Some(actor.clone()),
                         incarnation,
-                        summary: Some(format!(
-                            "Waiting for {}; the execution clock is stopped for at most {}.",
-                            args.reason.trim(),
-                            args.wait_for
-                        )),
-                        reason: Some(args.reason),
+                        summary: Some(summary),
+                        reason: args.reason.clone(),
                         evidence: Vec::new(),
-                        wait_ms: Some(wait_ms),
+                        wait_ms,
+                        wait_on: args.on.clone(),
                         idempotency_key: format!("work:wait:{subject}:{actor}:{nonce}"),
                     },
                 )
@@ -17522,6 +17552,17 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
             "Nudged: {at} ({}), idle while holding it with nothing set to wake it",
             ago(&at, now_ms())
         );
+    }
+    if let Some(waiting_on) = &work.waiting_on {
+        let since = work
+            .waiting_since_unix_ms
+            .and_then(|at| chrono::DateTime::from_timestamp_millis(i64::try_from(at).ok()?))
+            .map(|at| {
+                let at = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                format!(" since {at} ({})", ago(&at, now_ms()))
+            })
+            .unwrap_or_default();
+        let _ = writeln!(output, "Waiting on: {waiting_on}{since}");
     }
     if let Some(reason) = &work.blocked_reason {
         // The store keeps the reason for any state change here, such as a failure or an
@@ -17742,6 +17783,7 @@ async fn post_work(
                 &format!("/v1/work/{action}/{}", urlencoding::encode(&args.subject)),
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some(actor.clone()),
                     incarnation,
                     summary: args.summary,
@@ -24262,6 +24304,7 @@ async fn renew_claimed_work(
                 &format!("/v1/work/renew/{}", urlencoding::encode(&step.subject)),
                 &WorkRequest {
                     wait_ms: None,
+                    wait_on: None,
                     actor: Some(subject.into()),
                     incarnation: step.claim_incarnation,
                     summary: None,

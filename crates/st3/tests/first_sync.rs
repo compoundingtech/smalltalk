@@ -327,6 +327,7 @@ fn run_cycle(store: &Store, workspace: &str, index: usize) {
     for step in &run.steps {
         let request = |action: &str, n: usize| WorkRequest {
             wait_ms: None,
+            wait_on: None,
             actor: Some("agent/bench/builder".into()),
             incarnation: Some(format!("builder-{index}")),
             // A renewal with a summary publishes its claim, as a lease near expiry does.
