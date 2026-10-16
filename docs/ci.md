@@ -407,6 +407,16 @@ invocation retains every non-st2 binary and, while st2 remains a workspace membe
 that binary selection. The unchanged `ci` profile keeps fail-fast disabled and any test failure
 fails the stage. Collection compiles workspace targets, including excluded legacy binaries
 while st2 remains a member; the filters preserve execution coverage rather than avoid compilation.
+
+When a caller passes `--test-threads N`, `scripts/ci-nextest` runs nextest with 3 x N slots and loads
+`.config/nextest-slots.toml` as a tool config. Every test takes 3 slots except the wait-bound st3
+integration modules (`messaging_faults`, `boot_canaries`, `fleet`, `daemon_restart`,
+`codex_bootstrap`, `delivery_probe`, `subagents_seat`, `idle_budget`, `client_only`), which take
+one. N CPU-sized tests still run at once, but the tests that sleep or poll for sockets, timers and
+outage windows no longer hold a CPU-sized slot each, so their waits overlap. A bare
+`cargo nextest run` ignores the file. To move a module in or out of the list, edit the one filter;
+`scripts/ci-nextest-slots-test` keeps the ratio and the module names in step with the script and
+the integration binary. Selection, retries and timeouts are unchanged.
 Matching rendered hooks are installed by a CI binary that calls the driver
 library directly, rather than by the legacy runner CLI.
 

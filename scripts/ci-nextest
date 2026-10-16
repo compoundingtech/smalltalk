@@ -32,10 +32,21 @@ if [[ -n "${CI_TEST_EXTRACTED:-}" ]]; then
 else
   selection=$(python3 scripts/ci-nextest-targets)
 fi
+# Wait-bound tests take one slot and every other test takes SLOT_RATIO (.config/nextest-slots.toml),
+# so the caller's --test-threads N still means N CPU-sized tests at once.
+SLOT_RATIO=3
 arguments=()
 filters=()
+test_threads=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -j|--test-threads)
+      [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || { echo 'invalid --test-threads' >&2; exit 2; }
+      test_threads=$2; shift 2 ;;
+    --test-threads=*)
+      test_threads=${1#*=}
+      [[ "$test_threads" =~ ^[1-9][0-9]*$ ]] || { echo 'invalid --test-threads' >&2; exit 2; }
+      shift ;;
     -E|--filterset|--filter-expr)
       [[ $# -ge 2 && -n "$2" ]] || { echo 'missing nextest filterset' >&2; exit 2; }
       filters+=("$2"); shift 2 ;;
@@ -52,12 +63,17 @@ if [[ ${#filters[@]} -gt 0 ]]; then
   done
   selection="($selection) and ($requested)"
 fi
+# Without a thread count there is nothing to scale: keep the profile's own count and slots.
+slots=()
+if [[ "$action" == run && -n "$test_threads" && " ${arguments[*]} " != *" --no-run "* ]]; then
+  slots=(--test-threads "$((test_threads * SLOT_RATIO))" --tool-config-file "slots:$PWD/.config/nextest-slots.toml")
+fi
 if [[ -n "${CI_TEST_EXTRACTED:-}" ]]; then
   [[ " ${arguments[*]} " != *" --no-run "* ]] || { echo 'archive consumers must not rebuild' >&2; exit 2; }
   target="$CI_TEST_EXTRACTED/workspace/target"
   exec cargo nextest "$action" --binaries-metadata "$target/nextest/binaries-metadata.json" \
     --cargo-metadata "$target/nextest/cargo-metadata.json" --target-dir-remap "$target" \
-    --workspace-remap "$CI_TEST_WORKSPACE" --profile ci -E "$selection" "${partition[@]}" "${arguments[@]}"
+    --workspace-remap "$CI_TEST_WORKSPACE" --profile ci -E "$selection" "${partition[@]}" "${slots[@]}" "${arguments[@]}"
 else
-  exec cargo nextest "$action" --workspace --locked --profile ci -E "$selection" "${partition[@]}" "${arguments[@]}"
+  exec cargo nextest "$action" --workspace --locked --profile ci -E "$selection" "${partition[@]}" "${slots[@]}" "${arguments[@]}"
 fi

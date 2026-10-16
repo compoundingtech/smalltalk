@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""The wait-bound slot scaling must keep its ratio, its module list and its opt-in in step."""
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+script = (root / 'scripts/ci-nextest').read_text()
+config = tomllib.loads((root / '.config/nextest-slots.toml').read_text())
+
+ratio = int(re.search(r'^SLOT_RATIO=(\d+)$', script, re.M).group(1))
+overrides = config['profile']['ci']['overrides']
+assert len(overrides) == 1 and overrides[0]['threads-required'] == ratio, 'ratio and threads-required differ'
+assert set(overrides[0]) == {'filter', 'threads-required'}, 'the slots file may only set threads-required'
+
+# Every named module is a real module of the st3 integration binary, so a rename cannot silently
+# turn the wait-bound list into nothing (every test would then take the full ratio).
+filterset = overrides[0]['filter']
+assert filterset.startswith('not (package(=st3) and binary(=integration) and test(/^(') and filterset.endswith(')::/))')
+modules = filterset.split('test(/^(')[1].split(')::/')[0].split('|')
+declared = set(re.findall(r'^mod (\w+);', (root / 'crates/st3/tests/integration.rs').read_text(), re.M))
+assert modules and set(modules) <= declared, f'unknown integration modules: {set(modules) - declared}'
+assert len(set(modules)) == len(modules), 'a module is listed twice'
+
+
+def invocation(*arguments, **environment):
+    with tempfile.TemporaryDirectory() as work:
+        bin_dir = Path(work) / 'bin'
+        bin_dir.mkdir()
+        record = Path(work) / 'record'
+        fake = bin_dir / 'cargo'
+        fake.write_text(f'''#!/usr/bin/env bash
+if [[ "$1" == metadata ]]; then echo '{{"workspace_members":[],"packages":[]}}'; exit 0; fi
+printf '%s\\n' "$@" > {record}
+''')
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('CI_TEST')}
+        env.update(PATH=f'{bin_dir}:{env["PATH"]}', **environment)
+        result = subprocess.run(['bash', str(root / 'scripts/ci-nextest'), *arguments], cwd=root, env=env,
+                                capture_output=True, text=True)
+        return result, record.read_text().split('\n') if record.exists() else None
+
+
+tool = f'slots:{root}/.config/nextest-slots.toml'
+for spelling in (['--test-threads', '8'], ['--test-threads=8'], ['-j', '8']):
+    result, args = invocation('run', *spelling, '--status-level', 'pass')
+    assert result.returncode == 0, result.stderr
+    assert args[args.index('--test-threads') + 1] == str(8 * ratio), args
+    assert args.count('--test-threads') == 1 and args[args.index('--tool-config-file') + 1] == tool, args
+    assert args[args.index('--status-level') + 1] == 'pass', 'other arguments are kept'
+
+for case in (['run'], ['run', '--test-threads', '8', '--no-run'], ['list', '--test-threads', '8']):
+    result, args = invocation(*case)
+    assert result.returncode == 0, result.stderr
+    assert '--tool-config-file' not in args, f'{case} must keep the profile slots: {args}'
+    if case[0] == 'run' and '--test-threads' not in case:
+        assert '--test-threads' not in args, args
+
+for bad in ('0', 'many', ''):
+    result, _ = invocation('run', '--test-threads', bad)
+    assert result.returncode == 2, 'a bad --test-threads must stop before cargo'
+print('ci-nextest-slots-test: ok')
