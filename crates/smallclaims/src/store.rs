@@ -755,6 +755,9 @@ pub struct Store {
     /// it instead of building their own.
     pub replication_snapshot_build: Mutex<()>,
     pub replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
+    /// Whether a comparison that finds a difference keeps what a reproduction needs. Off unless
+    /// the daemon's divergence check is on, so exchanges cost nothing more by default.
+    pub divergence_capture: std::sync::atomic::AtomicBool,
     /// Held while replicated envelopes are admitted; see `validate_replication_backlog`.
     pub admission: Mutex<()>,
     /// The membership last folded, and the `fleet_generation` it was folded at.
@@ -1024,6 +1027,7 @@ impl Store {
             replication_snapshot: Mutex::new(None),
             replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
+            divergence_capture: std::sync::atomic::AtomicBool::new(false),
             admission: Mutex::new(()),
             membership_cache: Mutex::new(None),
             roots_cache: Mutex::new(None),
@@ -1160,6 +1164,18 @@ pub struct AlignedComparison {
     pub schema_digest: String,
     pub projection_versions: BTreeMap<String, u64>,
     pub differing_tables: Vec<String>,
+    /// What a reproduction of a difference needs, kept only while one is found.
+    pub difference: Option<ComparedDifference>,
+}
+
+/// The two sides of a comparison that found the same envelopes projecting differently.
+#[derive(Clone, Debug, Default)]
+pub struct ComparedDifference {
+    pub inventory_digest: String,
+    pub writer_high_water: BTreeMap<String, u64>,
+    /// Each differing projection's digest here and at the peer.
+    pub digests: BTreeMap<String, (String, String)>,
+    pub peer_build: Option<String>,
 }
 
 /// Live sync measurements for one peer. They are rebuilt by the first exchange after a restart,
@@ -1242,6 +1258,38 @@ impl PeerSyncProgress {
         self.measured = Some(sync);
     }
 
+    /// Each projection this node and the peer project differently from the same envelopes, once
+    /// that has lasted long enough to be a divergence rather than a peer still projecting.
+    pub fn divergences(&self, peer: &str, now: u128) -> Vec<ProjectionDivergence> {
+        let (Some(sync), Some(since), Some(compared)) = (
+            self.view(now),
+            self.graph_differs_since_unix_ms,
+            self.aligned_comparison.as_ref(),
+        ) else {
+            return Vec::new();
+        };
+        let Some(difference) = compared.difference.as_ref().filter(|_| sync.diverged) else {
+            return Vec::new();
+        };
+        let local_build = checkpoint_agreement::checkpoint_build();
+        difference
+            .digests
+            .iter()
+            .map(|(projection, (local, remote))| ProjectionDivergence {
+                peer: peer.to_owned(),
+                projection: projection.clone(),
+                inventory_digest: difference.inventory_digest.clone(),
+                writer_high_water: difference.writer_high_water.clone(),
+                local_digest: local.clone(),
+                peer_digest: remote.clone(),
+                local_build: local_build.clone(),
+                peer_build: difference.peer_build.clone(),
+                since_unix_ms: since,
+                compared_at_unix_ms: compared.at_unix_ms,
+            })
+            .collect()
+    }
+
     /// The last measurement, marked as catching up while it is recent and the peer holds more
     /// than one exchange of envelopes this node lacks.
     pub fn view(&self, now: u128) -> Option<ReplicationPeerSync> {
@@ -1290,6 +1338,18 @@ pub struct CompactEnvelopeId {
 }
 
 impl CompactReplicationInventory {
+    /// Each writer's highest sequence in this inventory.
+    pub fn writer_high_water(&self) -> BTreeMap<String, u64> {
+        let mut high = BTreeMap::new();
+        for envelope in &self.envelopes {
+            if let Some(writer) = self.writers.get(envelope.writer as usize) {
+                let entry = high.entry(writer.clone()).or_insert(0);
+                *entry = (*entry).max(envelope.sequence);
+            }
+        }
+        high
+    }
+
     /// Build from identities already in `ReplicaEnvelopeId` order.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_sorted(identities: impl IntoIterator<Item = ReplicaEnvelopeId>) -> Self {
@@ -5767,6 +5827,7 @@ impl Store {
             envelopes: Vec::new(),
             signature_requests,
             signatures: Vec::new(),
+            build: Some(crate::store::checkpoint_agreement::checkpoint_build()),
         })
     }
 
@@ -5830,6 +5891,7 @@ impl Store {
                 envelopes: self.replica_envelopes(missing)?,
                 signature_requests: Vec::new(),
                 signatures: Vec::new(),
+                build: Some(crate::store::checkpoint_agreement::checkpoint_build()),
             });
         }
         // A peer without range digests (an older build, or an explicit full-inventory request)
@@ -5879,6 +5941,7 @@ impl Store {
             envelopes: self.replica_envelopes(missing)?,
             signature_requests: Vec::new(),
             signatures: Vec::new(),
+            build: Some(crate::store::checkpoint_agreement::checkpoint_build()),
         })
     }
 
@@ -6230,16 +6293,68 @@ impl Store {
             progress.graph_differs_since_unix_ms = None;
             progress.aligned_comparison = None;
         }
-        if graph_equal.is_some() {
+        if let Some(equal) = graph_equal {
+            let differing_tables = projection_digest::differing(
+                &projection_digest::comparable(&snapshot.projection_digests, &incompatible_versions),
+                &projection_digest::comparable(&input.projection_digests, &incompatible_versions),
+            );
+            let capture = !equal
+                && self
+                    .divergence_capture
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            // A difference that lasts keeps the claim range it opened with: the first range
+            // that reproduces it, found with one pass over the inventory, not one per exchange.
+            let opened = progress
+                .graph_differs_since_unix_ms
+                .and(progress.aligned_comparison.as_ref())
+                .and_then(|compared| compared.difference.clone());
+            let difference = capture.then(|| {
+                let missing = String::new;
+                let digests: BTreeMap<String, (String, String)> =
+                    if input.projection_digests.is_empty() {
+                        BTreeMap::from([(
+                            "graph".to_owned(),
+                            (local_graph.clone(), remote_graph.clone()),
+                        )])
+                    } else {
+                        differing_tables
+                            .iter()
+                            .map(|table| {
+                                let local = snapshot.projection_digests.get(table);
+                                let remote = input.projection_digests.get(table);
+                                (
+                                    table.clone(),
+                                    (
+                                        local.cloned().unwrap_or_else(missing),
+                                        remote.cloned().unwrap_or_else(missing),
+                                    ),
+                                )
+                            })
+                            .collect()
+                    };
+                match opened {
+                    // A projection that starts to differ later joins at the opening range.
+                    Some(mut opened) => {
+                        for (table, pair) in digests {
+                            opened.digests.entry(table).or_insert(pair);
+                        }
+                        opened
+                    }
+                    None => ComparedDifference {
+                        inventory_digest: snapshot.inventory.digest.clone(),
+                        writer_high_water: snapshot.inventory.writer_high_water(),
+                        digests,
+                        peer_build: input.build.clone(),
+                    },
+                }
+            });
             progress.aligned_comparison = Some(AlignedComparison {
                 at_unix_ms: now,
                 schema_digest: input.projection_registry_digest.as_ref()
                     .unwrap_or(&input.schema_digest).clone(),
                 projection_versions: input.projection_versions.clone(),
-                differing_tables: projection_digest::differing(
-                    &projection_digest::comparable(&snapshot.projection_digests, &incompatible_versions),
-                    &projection_digest::comparable(&input.projection_digests, &incompatible_versions),
-                ),
+                differing_tables,
+                difference,
             });
         }
         if let Some(equal) = graph_equal {
@@ -7385,6 +7500,45 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
             .values()
             .any(|progress| progress.view(now).is_some_and(|sync| sync.catching_up))
+    }
+
+    /// Keep what a reproduction needs when a comparison finds a difference. Off by default.
+    pub fn capture_divergences(&self, on: bool) {
+        self.divergence_capture
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Every projection that a peer with the same envelopes projects differently, by peer.
+    pub fn replication_divergences(&self) -> Vec<ProjectionDivergence> {
+        let now = now_ms();
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .flat_map(|(peer, progress)| progress.divergences(peer, now))
+            .collect()
+    }
+
+    /// The peers this node has exchanged with since it started.
+    pub fn compared_peers(&self) -> Vec<String> {
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Whether this node's last aligned comparison with `peer` found every projection equal.
+    pub fn replication_projections_agree(&self, peer: &str) -> bool {
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .is_some_and(|progress| {
+                progress.graph_compared_at_unix_ms.is_some()
+                    && progress.graph_differs_since_unix_ms.is_none()
+            })
     }
 
     /// Whether any peer's comparisons say this node's graph has diverged from that peer's.

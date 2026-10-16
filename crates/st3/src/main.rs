@@ -7012,6 +7012,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(migrate_event_payloads(store.clone()));
+    if let Some(interval) = st3::maintenance::divergence_check_interval(
+        std::env::var(st3::maintenance::DIVERGENCE_CHECK_ENV).ok().as_deref(),
+    ) {
+        tokio::spawn(st3::maintenance::check_projection_divergences(store.clone(), interval));
+    }
     tokio::spawn(catch_up_coordination_counts(store.clone()));
     tokio::spawn(copy_stop_deferral_history(store.clone()));
     spawn_response_expiry(store.clone());

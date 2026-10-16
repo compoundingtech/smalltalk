@@ -3142,6 +3142,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("targets", array()),
             ("source_revision", string()),
             ("incarnation", string()),
+            ("reproduction", object()),
         ],
         "operational.recovered" => &[
             ("episode", string()),

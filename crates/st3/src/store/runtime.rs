@@ -74,6 +74,9 @@ pub struct SmalltalkRuntime {
     pub(crate) arrangement_list: super::owner_lists::OwnerList,
     /// Each selected person's summary row, published by the same refresher.
     pub(crate) summary_list: super::summary_list::SummaryList,
+    /// Open projection divergence faults at the last divergence check; `None` until a check
+    /// runs, so the SLO reads no claims for it and shows nothing on a daemon that never checks.
+    pub(crate) open_divergences: Mutex<Option<u64>>,
     /// The current missions list, while a refresher keeps it published.
     pub(crate) published_missions: published_list::PublishedList<mission_list::MissionRows>,
     /// The current work list, while a refresher keeps it published.
