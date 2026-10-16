@@ -595,11 +595,32 @@ impl Store {
         input: &PersonStepResponse,
         cancel: bool,
     ) -> Result<StepRunView, St3Error> {
+        self.finish_person_step_kind(input, cancel, false)
+    }
+
+    /// A sender withdraws only its own informational update, through the same
+    /// cancellation claim and transaction as an ask. It never releases the sender's work.
+    pub fn withdraw_person_update(
+        &self,
+        input: &PersonStepResponse,
+    ) -> Result<StepRunView, St3Error> {
+        self.finish_person_step_kind(input, true, true)
+    }
+
+    fn finish_person_step_kind(
+        &self,
+        input: &PersonStepResponse,
+        cancel: bool,
+        update_only: bool,
+    ) -> Result<StepRunView, St3Error> {
         self.connection.batched(|tx| {
             let subject = normalize_step_run(&input.subject);
             let mut view = step(tx, &subject).map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-step-run", "the person step does not exist"))?;
             let ask = request(tx, &subject).map_err(internal)?;
+            if update_only && ask.as_ref().is_none_or(|ask| !is_update(ask)) {
+                return Err(St3Error::new("invalid-update-withdrawal", "withdraw names an informational update, not an ask or authored work"));
+            }
             // Checked after authority and fences below; a replay compares against it first.
             let resolved = resolve_answer(ask.as_ref(), input, cancel);
             let kind = if cancel { "work.person-cancelled" } else { "work.person-done" };

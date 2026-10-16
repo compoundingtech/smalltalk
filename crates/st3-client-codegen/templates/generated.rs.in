@@ -188,6 +188,9 @@ pub struct PageInfo {
     pub next_cursor: Option<String>,
     #[serde(default)]
     pub cursor_expires_at: Option<String>,
+    /// Unreadable history candidates skipped on this page. Nonzero means incomplete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_items: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3285,10 +3288,23 @@ pub struct AgentRepository {
     pub agent_ids: Vec<String>,
 }
 
+/// Exact prior person instruction and current policy; authentication selects the actor.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationProof {
+    pub person: String,
+    pub policy: String,
+    pub message: String,
+    pub quote: String,
+    pub episode: String,
+}
+
 /// A person's answer to a native harness prompt alert.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptRespondParameters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub target_id: String,
     pub episode: String,
     pub answer: String,

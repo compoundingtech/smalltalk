@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Recheck the landed denial moved-on fence in delegated dismissal writer validation",
+  "replay": {
+    "status": "none",
+    "detail": "No new claim kind, schema, client shape, deployment or operator action in this follow-up."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No new claim kind, schema, client shape, deployment or operator action in this follow-up."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Use the same landed source moved-on predicate in the delegated diagnostic writer guard as in denial preflight. A turn or session-end between preflight and append refuses the prepared close."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No new claim kind, schema, client shape, deployment or operator action in this follow-up."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No new claim kind, schema, client shape, deployment or operator action in this follow-up."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new claim kind, schema, client shape, deployment or operator action in this follow-up."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A cleared denial stays stale with no delegated answer or notice; no native mailbox acceptance or production recovery is claimed."
+  }
+}
