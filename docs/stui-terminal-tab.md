@@ -97,7 +97,7 @@ reach the program; their space actions apply after detaching.
 | DSR / cursor position | CSI 0n / pane-relative CSI row;col R | Daemon's cursor |
 | Window pixels 14t / cell pixels 16t | Virtual window / cell pixel dimensions | Declared kitty font metrics, otherwise estimate |
 | Window cells 18t / screen cells 19t | CSI 8;rows;cols t / CSI 9;rows;cols t | Virtual pane, not outer monitor |
-| DECRQM | Set/reset state; unsupported modes return status 0 | 5522 extended clipboard is unsupported |
+| DECRQM | Set/reset state; unsupported modes return status 0 | 5522 paste events: unavailable 0, available/reset 2, available/set 1 |
 | Kitty keyboard query / modifyOtherKeys query | Active flags / current level | Daemon; no second client answer |
 | OSC 10/11 and indexed color queries | Fixed virtual palette replies, ST terminated | Default foreground c0c0, background 0000; no outer palette query |
 | OSC 52 write | Copies decoded text through outer OSC 52 | No clipboard reads |
@@ -113,6 +113,48 @@ reach the program; their space actions apply after detaching.
 The isolated color probe produces no stray visible OSC 11 reply. Replies go to
 child input. Forwarding the same query to the outer terminal would introduce a
 second answer with different geometry or defaults.
+
+### DECRQM 5522 availability regression
+
+This is a **pty behavior change** in the f8388fe7 pin, not a new stui clipboard
+implementation. pty#148 added mode 5522 tracking and its availability-dependent
+DECRQM reply; pty#152 made an attached writable client past its initial SCREEN
+an answering client. `CSI ? 5522 h` really sets this mode in the pinned producer.
+The probe records actual child-input bytes for these three states:
+
+| Fixture case | Setup | Expected received bytes (hex) |
+| --- | --- | --- |
+| `queries/DECRQM-5522/no-answer-client` | Connect a session socket without ATTACH, before stui starts; enable 5522 in child output | `1b5b3f353532323b302479` (`ESC[?5522;0$y`) |
+| `queries/DECRQM-5522/enabled-False` | stui's normal writable attachment, reset 5522 | `1b5b3f353532323b322479` (`ESC[?5522;2$y`) |
+| `queries/DECRQM-5522/enabled-True` | Same attachment, enable 5522 | `1b5b3f353532323b312479` (`ESC[?5522;1$y`) |
+
+All send `1b5b3f353532322470` (`ESC[?5522$p`). The first case has a real
+connected but unattached, hence non-answering, client; it does not fake a reply
+or rewrite stui's transport. Even an enabled mode reports 0 without availability.
+Its output request is published through the existing child fixture files, and
+the child log supplies the complete reply before the writable attachment starts.
+The matrix resets modes before every subsequent case. The historic baseline is
+unchanged. The OSC 52 read/write probes and stui's own OSC 5522 clipboard read
+in `src/ui/attach.rs` remain unchanged; a DECRQM capability reply is not proof of
+outer-terminal clipboard access.
+
+For hosted positive/negative controls, keep the same resolved pty f8388fe7
+derivation on PATH and the same stui unit-test worker executable for both runs:
+
+```sh
+python3 crates/stui/tests/terminal_tab_probe.py --worker "$STUI_TEST_WORKER" --check
+```
+
+The positive run must pass all three rows and retain its stdout/stderr. In an
+isolated copy of this revision, change **only** the current fixture's
+`queries/DECRQM-5522/enabled-False` received value back to
+`1b5b3f353532323b302479` (the old expectation), then run the exact same command.
+It must fail at that row with expected 0 and actual 2. Do not change either pin,
+rebuild the worker, record a new matrix, or mutate the historic baseline between
+controls. Retain both results and the resolved pty/worker identities. These are
+execution instructions, not evidence that the controls have run. Full hosted
+gates remain required separately.
+
 
 ## Images and terminal-browser
 

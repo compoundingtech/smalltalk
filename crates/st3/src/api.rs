@@ -17512,11 +17512,15 @@ async fn terminal_session(
 }
 
 async fn terminal_proxy(socket: WebSocket, pty_root: std::path::PathBuf, runtime_id: String) {
-    let stream =
-        match tokio::net::UnixStream::connect(pty_root.join(format!("{runtime_id}.sock"))).await {
-            Ok(stream) => stream,
-            Err(_) => return,
-        };
+    let stream = match tokio::net::UnixStream::connect(pty_core::registry::socket_path_in(
+        &pty_root,
+        &runtime_id,
+    ))
+    .await
+    {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
     let (mut writer, mut reader) = socket.split();
     let (mut output_stream, mut input_stream) = stream.into_split();
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

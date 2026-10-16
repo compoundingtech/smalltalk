@@ -98,7 +98,7 @@ pub(super) fn subscribe(
     incarnation: &str,
 ) -> watch::Receiver<ViewState> {
     let key = (
-        pty_root.join(format!("{runtime_id}.sock")),
+        pty_core::registry::socket_path_in(pty_root, runtime_id),
         incarnation.to_owned(),
     );
     let mut watchers = WATCHERS.lock().unwrap_or_else(|error| error.into_inner());

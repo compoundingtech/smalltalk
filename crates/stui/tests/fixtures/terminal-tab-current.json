@@ -1,5 +1,10 @@
 [
   {
+    "case": "queries/DECRQM-5522/no-answer-client",
+    "sent": "1b5b3f353532322470",
+    "received": "1b5b3f353532323b302479"
+  },
+  {
     "case": "main/mouse-0/encoding-0/wheel-modifiers",
     "sent": "1b5b3c36343b363b374d1b5b3c36353b363b374d1b5b3c36383b363b374d1b5b3c36393b363b374d1b5b3c37323b363b374d1b5b3c37333b363b374d1b5b3c37363b363b374d1b5b3c37373b363b374d1b5b3c38303b363b374d1b5b3c38313b363b374d1b5b3c38343b363b374d1b5b3c38353b363b374d1b5b3c38383b363b374d1b5b3c38393b363b374d1b5b3c39323b363b374d1b5b3c39333b363b374d",
     "received": ""
@@ -2552,12 +2557,12 @@
   {
     "case": "queries/DECRQM-5522/enabled-False",
     "sent": "1b5b3f353532322470",
-    "received": "1b5b3f353532323b302479"
+    "received": "1b5b3f353532323b322479"
   },
   {
     "case": "queries/DECRQM-5522/enabled-True",
     "sent": "1b5b3f353532322470",
-    "received": "1b5b3f353532323b302479"
+    "received": "1b5b3f353532323b312479"
   },
   {
     "case": "queries/kitty-keyboard-enabled",

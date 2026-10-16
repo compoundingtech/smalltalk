@@ -3349,7 +3349,7 @@ dependencies = [
 [[package]]
 name = "pty-client"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty?rev=1ae8c187301034d2b343b6ec638f2b74c009f92e#1ae8c187301034d2b343b6ec638f2b74c009f92e"
+source = "git+https://github.com/compoundingtech/pty?rev=f8388fe7a8617d973e720e29107e68ac5ea95987#f8388fe7a8617d973e720e29107e68ac5ea95987"
 dependencies = [
  "libc",
  "pty-core",
@@ -3360,7 +3360,7 @@ dependencies = [
 [[package]]
 name = "pty-core"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty?rev=1ae8c187301034d2b343b6ec638f2b74c009f92e#1ae8c187301034d2b343b6ec638f2b74c009f92e"
+source = "git+https://github.com/compoundingtech/pty?rev=f8388fe7a8617d973e720e29107e68ac5ea95987#f8388fe7a8617d973e720e29107e68ac5ea95987"
 dependencies = [
  "indexmap",
  "libc",
@@ -3368,13 +3368,14 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]
 name = "pty-terminal"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty?rev=1ae8c187301034d2b343b6ec638f2b74c009f92e#1ae8c187301034d2b343b6ec638f2b74c009f92e"
+source = "git+https://github.com/compoundingtech/pty?rev=f8388fe7a8617d973e720e29107e68ac5ea95987#f8388fe7a8617d973e720e29107e68ac5ea95987"
 dependencies = [
  "libghostty-vt",
  "libghostty-vt-sys",
@@ -4789,6 +4790,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallclaims",
+ "tempfile",
  "tokio",
 ]
 

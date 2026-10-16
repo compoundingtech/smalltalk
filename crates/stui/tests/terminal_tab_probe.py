@@ -102,9 +102,11 @@ class Tab:
             raise AssertionError(f"pty {args[0]}: {result.stderr.decode(errors='replace')}")
         return result
 
-    def start(self):
+    def start(self, before_attach=None):
         self.pty_command("run", "--force", "-d", "--id", "copper", "--", *self.command)
         wait_for(lambda: (self.registry / "copper.sock").exists(), bool, "session socket")
+        if before_attach is not None:
+            before_attach()
         self.relay_thread = threading.Thread(target=self.relay, daemon=True)
         self.relay_thread.start()
 
@@ -188,11 +190,14 @@ class Tab:
         return b"".join(bytes.fromhex(row["hex"]) for row in json_lines(self.root / "program.jsonl")
                         if row["kind"] == "input")
 
-    def emit(self, data):
+    def publish_output(self, data):
         self.request_id += 1
         request = {"id": self.request_id, "hex": data.hex()}
         (self.root / "request.new").write_text(json.dumps(request))
         (self.root / "request.new").replace(self.root / "request.json")
+
+    def emit(self, data):
+        self.publish_output(data)
         return wait_for(self.status, lambda status: status and status["title"] == f"copper-{self.request_id}",
                         f"output {self.request_id}")
 
@@ -241,6 +246,20 @@ class Tab:
         self.pty_command("rm", "copper", check=False)
         os.close(self.master)
         os.close(self.slave)
+
+
+def no_answer_client(tab):
+    # A connected, unattached client cannot answer paste requests. Query the real
+    # daemon before starting stui's writable attachment; no transport is rewritten.
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(str(tab.registry / "copper.sock"))
+        raw = b"\x1b[?5522$p"
+        start = len(tab.input())
+        tab.publish_output(RESET + b"\x1b[?5522h" + raw)
+        received = wait_for(lambda: tab.input()[start:], lambda data: data.endswith(b"$y"),
+                            "DECRQM 5522 without an answering client")
+    return {"case": "queries/DECRQM-5522/no-answer-client", "sent": raw.hex(),
+            "received": received.hex()}
 
 
 def matrix(tab):
@@ -658,8 +677,9 @@ def main():
         command = [sys.executable, str(HERE / "copper_probe.py"), directory]
         tab = Tab(args.worker.resolve(), command, directory)
         try:
-            tab.start()
-            rows = matrix(tab)
+            rows = []
+            tab.start(before_attach=lambda: rows.append(no_answer_client(tab)))
+            rows.extend(matrix(tab))
         except Exception:
             print("worker tail:", bytes(tab.output[-2000:]), file=sys.stderr)
             print("relay error:", tab.relay_error, file=sys.stderr)
