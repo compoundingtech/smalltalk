@@ -58,6 +58,7 @@ mod resources;
 mod resource_preparation;
 #[cfg(test)]
 mod resource_preparation_fence_tests;
+mod message_versions;
 mod github_workflow_failures;
 pub mod git_changes;
 pub(crate) mod message_subscriptions;
