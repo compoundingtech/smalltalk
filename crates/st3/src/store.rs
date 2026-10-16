@@ -20489,6 +20489,7 @@ fn enforce_mission_run_capacity(
                ON run_generations.id=mission_runs.current_generation_id
              WHERE mission_runs.mission_id=?1
                AND mission_runs.status IN ('running','standing','blocked')
+               AND mission_runs.phase NOT IN ('final-cancelled','cleanup-cancelled')
              ORDER BY mission_runs.created_at_unix_ms, mission_runs.id",
         )
         .map_err(internal)?;
@@ -36251,6 +36252,11 @@ mod tests {
     }
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    mod run_capacity_tests {
+        use super::*;
+        include!("store/run_capacity_tests.rs");
+    }
 
     mod mission_deadline_probe {
         use super::*;

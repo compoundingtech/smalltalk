@@ -2246,3 +2246,10 @@ is visible from read-only work detail and history reads even while the store wri
 It does not claim dependency predicates have been evaluated. Existing blockers remain
 visible. The waiter disappears on promotion and is excluded for terminal, superseded and
 cleanup owners. Readiness priority is unchanged.
+
+
+A cancellation releases the run's admission capacity as soon as its cancellation phase is
+accepted. Final work and cleanup proceed under their original ownership while a replacement
+run can be admitted. `final-cancelled` and `cleanup-cancelled` runs no longer consume the
+mission's active-run limit or constrain it with a cancelled revision's limit. Live uncancelled
+runs still enforce the strictest limit among their revisions.
