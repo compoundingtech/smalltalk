@@ -111,7 +111,9 @@ function observedContext(route: Route, fabricPath: 'direct' | 'relay' | 'unknown
     case 'fabric': return { carrier: 'fabric', ...(fabricPath === 'direct' || fabricPath === 'relay' ? { path: fabricPath } : {}) };
     case 'lan': return { carrier: 'lan' };
     case 'https': return { carrier: 'https' };
-    default: return { carrier: 'tailscale' };
+    case 'tailnet': return { carrier: 'tailscale' };
+    // No route chosen yet: whatever is measured now is not a measurement of any carrier.
+    default: return { carrier: 'none' };
   }
 }
 
@@ -296,7 +298,12 @@ function useAppStore(proof?: FabricProfile) {
         state.last = Date.now();
         void client.observationsReport(report as never).then(
           () => observations.accepted(batch.report_id),
-          () => { /* the identical batch is sent again at the next measurement; an older member just refuses */ },
+          error => {
+            // A report the member refuses for its content is refused the same way every time: drop it, or nothing
+            // this phone measures is ever reported again. Anything else (no link, an older member, a busy one)
+            // sends the identical batch again at the next measurement.
+            if (error instanceof ClientError && [400, 413, 422].includes(error.status)) observations.refused(batch.report_id);
+          },
         ).finally(() => { state.busy = false; });
       } catch (error) {
         state.busy = false;

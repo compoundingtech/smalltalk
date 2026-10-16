@@ -168,6 +168,20 @@ impl IntervalSeries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bounds the iOS app names its bins with (`canonicalUpperMs` in apps/ios/observations.ts,
+    /// pinned there with the same pairs): a client report whose bins differ is refused.
+    #[test]
+    fn the_phone_names_bins_by_these_bounds() {
+        for (ms, bound) in [
+            (0, 0), (1, 1), (15, 15), (16, 16), (17, 17), (31, 31), (32, 33), (33, 33), (100, 103),
+            (500, 511), (501, 511), (999, 1023), (1000, 1023), (1500, 1535), (3000, 3071),
+            (8526, 8703), (10000, 10239), (59000, 59391), (3_600_000, 3_670_015),
+        ] {
+            assert_eq!(histogram_upper_ms(ms), bound, "{ms}");
+        }
+    }
+
     #[test]
     fn intervals_age_at_original_time_and_exclude_partial_boundaries() {
         let mut series = IntervalSeries::default();

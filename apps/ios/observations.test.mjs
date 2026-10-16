@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { BUCKETS_PER_DOUBLING, KEEP_MS, MAX_INTERVALS_PER_REPORT, MAX_KEPT_INTERVALS, MINUTE_MS, Observations, TARGETS, bucketEdge, bucketOf, toObservationReport } from './observations.ts';
+import { KEEP_MS, MAX_INTERVALS_PER_REPORT, MAX_KEPT_INTERVALS, MAX_LATENCY_MS, MINUTE_MS, Observations, TARGETS, canonicalUpperMs, toObservationReport } from './observations.ts';
 
 const T0 = Date.UTC(2026, 9, 10, 12, 0, 0); // a minute boundary
 function make(options = {}) {
@@ -11,14 +11,46 @@ function make(options = {}) {
 }
 const settle = () => new Promise(resolve => setTimeout(resolve, 0));
 
-// ---- Histogram: 16 buckets for each doubling, a bucket reported by its upper edge in whole ms.
-assert.equal(BUCKETS_PER_DOUBLING, 16);
-assert.equal(bucketOf(1), 0);
-assert.equal(bucketOf(2), 16);
-assert.equal(bucketOf(1000), Math.floor(16 * Math.log2(1000)));
-for (const ms of [1, 3, 58, 89, 300, 1000, 2500, 9999]) {
-  const edge = bucketEdge(bucketOf(ms));
-  assert.ok(edge >= ms && edge <= Math.ceil(ms * 2 ** (1 / 16)) + 1, `${ms} -> ${edge}`);
+// ---- Histogram: bins are named by the member's canonical inclusive upper bound, in whole ms.
+// These pairs are what smallclaims::windows::histogram_upper_ms returns (pinned by a test there too).
+for (const [ms, bound] of [[0, 0], [1, 1], [15, 15], [16, 16], [17, 17], [31, 31], [32, 33], [33, 33], [100, 103], [500, 511], [501, 511], [999, 1023], [1000, 1023], [1500, 1535], [3000, 3071], [8526, 8703], [10000, 10239], [59000, 59391], [3600000, 3670015]]) {
+  assert.equal(canonicalUpperMs(ms), bound, `${ms}`);
+}
+assert.equal(canonicalUpperMs(MAX_LATENCY_MS + 5_000), canonicalUpperMs(MAX_LATENCY_MS), 'a latency past the member\'s limit is kept at it');
+for (let ms = 0; ms < 70_000; ms += 7) {
+  const bound = canonicalUpperMs(ms);
+  assert.equal(canonicalUpperMs(bound), bound, `${ms} -> ${bound} is a bound of its own bin`);
+  assert.ok(bound >= ms && bound - ms <= ms / 16, `${ms} -> ${bound}`);
+}
+
+/** The member's rules for a latency sample (crates/st3/src/api/client_observations.rs), as far as they bear on what the app sends. */
+function memberAccepts(sample) {
+  const p99 = TARGETS[sample.target];
+  const lower = bound => bound < 16 ? bound : bound + 1 - 2 ** (31 - Math.clz32(bound) - 4);
+  let previous = -1, sum = 0, definitelyOver = 0, possiblyOver = 0;
+  for (const [bound, count] of sample.buckets) {
+    if (count <= 0 || bound > canonicalUpperMs(MAX_LATENCY_MS) || canonicalUpperMs(bound) !== bound || previous >= bound) return 'histogram requires sorted unique canonical inclusive ms bin bounds and positive counts';
+    sum += count;
+    if (lower(bound) > p99) definitelyOver += count;
+    if (bound > p99) possiblyOver += count;
+    previous = bound;
+  }
+  if (sum !== sample.count || sample.over_target < definitelyOver || sample.over_target > possiblyOver || sample.buckets.at(-1)[0] !== canonicalUpperMs(sample.max_ms)
+    || (sample.max_ms <= p99 && sample.over_target !== 0) || (sample.max_ms > p99 && sample.over_target === 0)) return 'histogram, max and over-target count disagree';
+  return null;
+}
+
+// ---- What the app sends is what the member accepts, whatever the latencies are.
+{
+  const { observations, state } = make();
+  for (const target of Object.keys(TARGETS)) {
+    for (const ms of [1, 16, 17, 58, 89, 300, TARGETS[target], TARGETS[target] + 1, 1000, 2500, 8526, 9999, 70_000, MAX_LATENCY_MS * 2]) observations.observe(target, ms);
+  }
+  state.now = T0 + 2 * MINUTE_MS;
+  const report = toObservationReport(observations.nextReport());
+  const latency = report.samples.filter(sample => sample.kind === 'latency');
+  assert.equal(latency.length, Object.keys(TARGETS).length);
+  for (const sample of latency) assert.equal(memberAccepts(sample), null, sample.target);
 }
 
 // ---- A latency lands in its minute, on its route, with its misses counted against its target.
@@ -174,6 +206,62 @@ for (const ms of [1, 3, 58, 89, 300, 1000, 2500, 9999]) {
   damaged.observations.observe('ios-connect', 100);
   damaged.state.now = T0 + MINUTE_MS + 1;
   assert.equal(damaged.observations.nextReport().intervals.length, 1, 'a damaged record is dropped and measuring goes on');
+}
+
+// ---- A minute that is closed twice is one interval: the member refuses a report with a minute twice.
+{
+  const { observations, state } = make();
+  state.now = T0 + 10_000;
+  observations.observe('ios-connect', 100);                 // minute 0
+  state.now = T0 + 20_000;
+  observations.setForeground(true);
+  observations.setLive(true);
+  state.now = T0 + MINUTE_MS + 10_000;
+  observations.observe('ios-connect', 200);                 // minute 1 begins: minute 0 is closed, but the share is still in it
+  state.now += 5_000;
+  observations.setLive(false);                              // the rest of minute 0 is counted and it is closed again
+  state.now = T0 + 3 * MINUTE_MS;
+  const report = observations.nextReport();
+  const starts = report.intervals.map(interval => interval.interval_start);
+  assert.deepEqual(starts, [...new Set(starts)], 'no minute twice');
+  const first = report.intervals[0];
+  assert.equal(first.samples.length, 1);
+  assert.equal(first.shares.length, 1);
+  assert.equal(first.shares[0].foreground_ms, 40_000, 'both closes of minute 0 are summed');
+}
+
+// ---- A report the member refuses for its content is dropped; one it never saw is kept.
+{
+  const { observations, state } = make();
+  observations.observe('ios-connect', 100);
+  state.now = T0 + 2 * MINUTE_MS;
+  const first = observations.nextReport();
+  assert.equal(observations.waiting, 1);
+  observations.refused('some-other-report');
+  assert.equal(observations.nextReport().report_id, first.report_id, 'a refusal of another report changes nothing');
+  observations.refused(first.report_id);
+  assert.equal(observations.waiting, 0);
+  assert.equal(observations.nextReport(), null, 'the refused batch is not sent again');
+  observations.observe('ios-connect', 100);
+  state.now = T0 + 4 * MINUTE_MS;
+  assert.notEqual(observations.nextReport().report_id, first.report_id, 'later measurements are reported');
+}
+
+// ---- What an earlier build kept named its bins by index and the member never took it: it is not sent.
+{
+  const { observations, state } = make({ stored: JSON.stringify({ closed: [{ start: T0, series: { 'x|fabric|direct': { target: 'ios-connect', carrier: 'fabric', path: 'direct', count: 1, over_target: 0, max_ms: 100, buckets: { 106: 1 } } }, shares: {} }] }) });
+  await observations.load();
+  assert.equal(observations.waiting, 0);
+  state.now = T0 + 2 * MINUTE_MS;
+  assert.equal(observations.nextReport(), null);
+}
+
+// ---- Before a route is chosen nothing is reported as a carrier.
+{
+  const { observations, state } = make({ context: { carrier: 'none' } });
+  observations.observe('ios-open-to-live', 900);
+  state.now = T0 + 2 * MINUTE_MS;
+  assert.equal(toObservationReport(observations.nextReport()).samples.length, 0);
 }
 
 // ---- A timer that is cancelled, or never ended, records nothing and does not pile up.

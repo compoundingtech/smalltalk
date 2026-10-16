@@ -16,7 +16,8 @@ export const TARGETS = {
   'ios-recover': 10_000,
 } as const;
 export type Target = keyof typeof TARGETS;
-export type Carrier = 'fabric' | 'tailscale' | 'lan' | 'https';
+/** `none`: no route was chosen yet; nothing measured then is reported. */
+export type Carrier = 'fabric' | 'tailscale' | 'lan' | 'https' | 'none';
 export type Context = { carrier: Carrier; path?: 'direct' | 'relay' };
 
 export const MINUTE_MS = 60_000;
@@ -26,9 +27,10 @@ export const MAX_INTERVALS_PER_REPORT = 30;
 export const MAX_SAMPLES_PER_REPORT = 32;
 /** The most closed intervals kept on the device while no member accepts them. */
 export const MAX_KEPT_INTERVALS = 1500;
-/** The histogram has this many buckets for each doubling, as the daemon's windows do. */
-export const BUCKETS_PER_DOUBLING = 16;
+/** The member refuses a latency above this (and a report that carries one). */
+export const MAX_LATENCY_MS = 3_600_000;
 
+/** `buckets` maps a bin's canonical upper bound (ms) to its count. */
 type Series = { target: Target; carrier: Carrier; path?: 'direct' | 'relay'; count: number; over_target: number; max_ms: number; buckets: Record<number, number> };
 type Share = { carrier: Carrier; path?: 'direct' | 'relay'; foreground_ms: number; live_ms: number };
 type Interval = { start: number; series: Record<string, Series>; shares: Record<string, Share> };
@@ -44,9 +46,19 @@ export type Clock = { now(): number; id(): string };
 const floorMinute = (ms: number) => Math.floor(ms / MINUTE_MS) * MINUTE_MS;
 const keyOf = (context: Context, target?: string) => `${target ?? 'share'}|${context.carrier}|${context.path ?? ''}`;
 
-/** The histogram bucket of a latency, and a latency to report for a bucket (its upper edge, in whole ms). */
-export function bucketOf(ms: number): number { return Math.floor(BUCKETS_PER_DOUBLING * Math.log2(Math.max(1, ms))); }
-export function bucketEdge(index: number): number { return Math.ceil(2 ** ((index + 1) / BUCKETS_PER_DOUBLING)); }
+/**
+ * The histogram bin of a latency, named by its upper bound in whole ms, exactly as the member names it
+ * (`smallclaims::windows::histogram_upper_ms`): exact below 16 ms, then 16 bins for each doubling. The
+ * member refuses a report whose bins are not these bounds, or whose last bound is not the bound of its
+ * `max_ms`, so a bin is never anything else.
+ */
+export function canonicalUpperMs(ms: number): number {
+  const value = Math.max(0, Math.min(MAX_LATENCY_MS, Math.round(ms)));
+  if (value < 16) return value;
+  const exponent = 31 - Math.clz32(value);
+  const sub = Math.floor(value / 2 ** (exponent - 4)) - 16;
+  return (16 + sub + 1) * 2 ** (exponent - 4) - 1;
+}
 
 function wire(interval: Interval): WireInterval {
   return {
@@ -55,13 +67,14 @@ function wire(interval: Interval): WireInterval {
     samples: Object.values(interval.series).map(series => ({
       target: series.target, carrier: series.carrier, ...(series.path ? { path: series.path } : {}),
       count: series.count, over_target: series.over_target, max_ms: series.max_ms,
-      buckets: Object.entries(series.buckets).map(([index, count]) => [bucketEdge(Number(index)), count] as [number, number]).sort((a, b) => a[0] - b[0]),
+      buckets: Object.entries(series.buckets).map(([bound, count]) => [Number(bound), count] as [number, number]).sort((a, b) => a[0] - b[0]),
     })),
     shares: Object.values(interval.shares).map(share => ({ carrier: share.carrier, ...(share.path ? { path: share.path } : {}), foreground_ms: share.foreground_ms, live_ms: share.live_ms })),
   };
 }
 
-type Saved = { closed: Interval[]; minutes?: Interval[]; batch?: { report_id: string; intervals: Interval[] } };
+/** `bins: 2` marks bins named by canonical bound; what an earlier build kept named them by index and was never accepted. */
+type Saved = { bins?: number; closed: Interval[]; minutes?: Interval[]; batch?: { report_id: string; intervals: Interval[] } };
 
 export class Observations {
   // Minutes that are not over yet (usually one; a stretch of foreground time can reach back a few).
@@ -87,10 +100,11 @@ export class Observations {
     try {
       const raw = await this.storage.read();
       const saved = raw ? JSON.parse(raw) as Saved : null;
-      if (saved && Array.isArray(saved.closed)) {
+      if (saved && saved.bins === 2 && Array.isArray(saved.closed)) {
         // Minutes an earlier run left open are over by now unless this very minute; the rest join the closed ones.
         for (const interval of (saved.minutes ?? []).filter(valid)) this.add(interval);
-        this.closed = [...saved.closed.filter(valid), ...this.closed].sort((a, b) => a.start - b.start);
+        for (const interval of saved.closed.filter(valid)) this.close(interval);
+        this.closed.sort((x, y) => x.start - y.start);
         if (saved.batch && Array.isArray(saved.batch.intervals) && typeof saved.batch.report_id === 'string' && !this.batch) {
           this.batch = { report_id: saved.batch.report_id, intervals: saved.batch.intervals.filter(valid) };
         }
@@ -102,17 +116,13 @@ export class Observations {
   /** Add a restored not-yet-closed minute, summing into one this run already started in the same minute. */
   private add(restored: Interval): void {
     const present = this.minutes.get(restored.start);
-    if (!present) { this.minutes.set(restored.start, restored); return; }
-    for (const [key, series] of Object.entries(restored.series)) {
-      const into = present.series[key];
-      if (!into) { present.series[key] = series; continue; }
-      into.count += series.count; into.over_target += series.over_target; into.max_ms = Math.max(into.max_ms, series.max_ms);
-      for (const [bucket, count] of Object.entries(series.buckets)) into.buckets[Number(bucket)] = (into.buckets[Number(bucket)] ?? 0) + count;
-    }
-    for (const [key, share] of Object.entries(restored.shares)) {
-      const into = present.shares[key];
-      if (!into) present.shares[key] = share; else { into.foreground_ms += share.foreground_ms; into.live_ms += share.live_ms; }
-    }
+    if (!present) this.minutes.set(restored.start, restored); else fold(present, restored);
+  }
+
+  /** A minute that is over: one closed interval for each minute, however many times it was closed. */
+  private close(interval: Interval): void {
+    const present = this.closed.find(closed => closed.start === interval.start);
+    if (present) fold(present, interval); else this.closed.push(interval);
   }
 
   // ---- Latencies.
@@ -137,12 +147,16 @@ export class Observations {
     const interval = this.intervalAt(this.clock.now());
     const key = keyOf(context, target);
     const series = interval.series[key] ??= { target, carrier: context.carrier, ...(context.path ? { path: context.path } : {}), count: 0, over_target: 0, max_ms: 0, buckets: {} };
-    const whole = Math.round(ms);
+    // A latency the member would refuse is kept at its limit: one bad timer must not spoil the report.
+    const whole = Math.min(MAX_LATENCY_MS, Math.round(ms));
     series.count++;
     if (whole > TARGETS[target]) series.over_target++;
     series.max_ms = Math.max(series.max_ms, whole);
-    const bucket = bucketOf(whole);
-    series.buckets[bucket] = (series.buckets[bucket] ?? 0) + 1;
+    const bound = canonicalUpperMs(whole);
+    series.buckets[bound] = (series.buckets[bound] ?? 0) + 1;
+    // A new minute means earlier ones are over. Only after the write: a minute swept while still empty
+    // would lose what the caller is about to add to it.
+    this.sweep();
   }
 
   // ---- The share of foreground time with a live feed.
@@ -163,6 +177,9 @@ export class Observations {
         if (this.feedLive) share.live_ms += edge - from;
         from = edge;
       }
+      this.since = now;
+      this.sweep();
+      return;
     }
     this.since = now;
   }
@@ -174,8 +191,6 @@ export class Observations {
     if (!interval) {
       interval = { start, series: {}, shares: {} };
       this.minutes.set(start, interval);
-      // A new minute means earlier ones are over.
-      if (this.minutes.size > 1) this.sweep();
     }
     return interval;
   }
@@ -187,7 +202,7 @@ export class Observations {
     for (const [start, interval] of [...this.minutes]) {
       if (start >= current) continue;
       this.minutes.delete(start);
-      if (Object.keys(interval.series).length || Object.keys(interval.shares).length) { this.closed.push(interval); moved = true; }
+      if (Object.keys(interval.series).length || Object.keys(interval.shares).length) { this.close(interval); moved = true; }
     }
     if (moved) this.closed.sort((a, b) => a.start - b.start);
     const floor = this.clock.now() - KEEP_MS;
@@ -235,6 +250,13 @@ export class Observations {
     void this.persist();
   }
 
+  /**
+   * A member refused the report for what is in it (a 4xx that sending it again cannot change): its
+   * intervals are dropped. Kept, the identical batch would be refused at every report and nothing this
+   * phone measures would ever reach the member.
+   */
+  refused(reportId: string): void { this.accepted(reportId); }
+
   /** Keep everything, the minute still open included, for the app going to the background. */
   async flush(): Promise<void> {
     this.advanceShare();
@@ -247,10 +269,24 @@ export class Observations {
 
   private persisting: Promise<void> = Promise.resolve();
   private persist(): Promise<void> {
-    const saved: Saved = { closed: this.closed, minutes: [...this.minutes.values()], ...(this.batch ? { batch: this.batch } : {}) };
+    const saved: Saved = { bins: 2, closed: this.closed, minutes: [...this.minutes.values()], ...(this.batch ? { batch: this.batch } : {}) };
     const encoded = JSON.stringify(saved);
     this.persisting = this.persisting.then(() => this.storage.write(encoded)).catch(() => {});
     return this.persisting;
+  }
+}
+
+/** Sum `from` into `into`, the same minute seen twice. */
+function fold(into: Interval, from: Interval): void {
+  for (const [key, series] of Object.entries(from.series)) {
+    const present = into.series[key];
+    if (!present) { into.series[key] = series; continue; }
+    present.count += series.count; present.over_target += series.over_target; present.max_ms = Math.max(present.max_ms, series.max_ms);
+    for (const [bound, count] of Object.entries(series.buckets)) present.buckets[Number(bound)] = (present.buckets[Number(bound)] ?? 0) + count;
+  }
+  for (const [key, share] of Object.entries(from.shares)) {
+    const present = into.shares[key];
+    if (!present) into.shares[key] = share; else { present.foreground_ms += share.foreground_ms; present.live_ms += share.live_ms; }
   }
 }
 

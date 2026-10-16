@@ -15,7 +15,9 @@ const visit = node => {
 visit(source);
 assert.equal(callbacks.length, 1);
 const callback = ts.transpile(`return (${callbacks[0].getText(source)});`, { target: ts.ScriptTarget.ES2022 });
-const bindSend = new Function('state', 'observations', 'toObservationReport', 'client', callback);
+// A stand-in with the client's shape: the callback only asks `instanceof` and `status`.
+class ClientError extends Error { constructor(status) { super(`status ${status}`); this.status = status; } }
+const bindSend = new Function('state', 'observations', 'toObservationReport', 'client', 'ClientError', callback);
 const setup = (stored = null) => {
   const clock = { at: Date.UTC(2026, 9, 14, 12, 0, 5), now() { return this.at; }, id: () => 'report/demo' };
   const observations = new Observations({ read: async () => stored, write: async () => {} }, clock, () => ({ carrier: 'tailscale' }));
@@ -23,7 +25,7 @@ const setup = (stored = null) => {
   const sent = [];
   const pending = Promise.withResolvers();
   const client = { observationsReport: report => { sent.push(report); return pending.promise; } };
-  state.send = bindSend(state, observations, toObservationReport, client);
+  state.send = bindSend(state, observations, toObservationReport, client, ClientError);
   observations.ready = state.send;
   return { clock, observations, state, sent, pending };
 };
@@ -103,4 +105,18 @@ test('transport rejection releases busy and preserves the batch for the next sen
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(state.busy, false);
+});
+
+test('a report the member refuses for its content is dropped, any other failure keeps it', async () => {
+  for (const [status, kept] of [[400, 0], [413, 0], [422, 0], [404, 1], [429, 1], [503, 1]]) {
+    const { clock, observations, state, pending } = setup();
+    observations.observe('ios-connect', 100);
+    clock.at += MINUTE_MS;
+    state.send();
+    pending.reject(new ClientError(status));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(state.busy, false, `${status}`);
+    assert.equal(observations.waiting, kept, `${status}: a ${kept ? 'retryable' : 'refused'} report`);
+  }
 });
