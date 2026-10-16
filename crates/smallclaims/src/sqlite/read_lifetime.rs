@@ -24,6 +24,7 @@ struct LiveRead {
     snapshot: bool,
     thread: std::thread::ThreadId,
     budget: Option<ReadBudget>,
+    origin: super::telemetry::Origin,
 }
 
 /// Ends the live-read entry after physical connection cleanup on every exit path.
@@ -68,6 +69,7 @@ fn register(pool: Option<u64>, snapshot: bool, connection: Option<u64>) -> LiveR
                 snapshot,
                 thread: std::thread::current().id(),
                 budget: crate::read_budget::current(),
+                origin: super::telemetry::current_origin().unwrap_or_else(super::telemetry::Origin::other),
             },
         );
     LiveReadToken(id)
@@ -94,6 +96,22 @@ pub struct OldestLiveRead {
     pub snapshot: bool,
     pub at: String,
     pub live: usize,
+}
+
+/// Oldest pooled reader scope by the existing bounded route/task vocabulary. Include
+/// explicit snapshots: their short acquisition guard has already dropped while the pin owns it.
+pub(super) fn oldest_loans() -> Vec<(super::telemetry::Origin, std::time::Duration)> {
+    let reads = LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut oldest = BTreeMap::<&str, &LiveRead>::new();
+    for read in reads.values().filter(|read| read.pool.is_some()) {
+        oldest.entry(read.origin.label()).and_modify(|previous| {
+            if read.started < previous.started { *previous = read; }
+        }).or_insert(read);
+    }
+    if oldest.is_empty() {
+        return vec![(super::telemetry::Origin::other(), std::time::Duration::ZERO)];
+    }
+    oldest.values().map(|read| (read.origin.clone(), read.started.elapsed())).collect()
 }
 
 /// Compatibility process-wide oldest checkout. Its age is not WAL pin age.
