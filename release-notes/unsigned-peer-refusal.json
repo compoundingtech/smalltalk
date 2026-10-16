@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Report a peer's unsigned refusal of a replication exchange by its HTTP status and a fixed reason, instead of as a missing x-st3-fleet header, so st replication status says why an exchange carried nothing",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "No database changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; members may upgrade in any order."},
+  "compatibility": {"status": "changed", "detail": "A peer's last_error for an unsigned non-success answer now names the status (for example 'refused the exchange with an unsigned 400 Bad Request: it could not read the request body') instead of 'the signed message has no valid x-st3-fleet header'. An unsigned body is never trusted or quoted; an unsigned success is still rejected. No wire change."},
+  "downtime": {"status": "none", "detail": "A daemon restart to install the build; no extra interruption."},
+  "manual": {"status": "none", "detail": "Nothing to configure."},
+  "recovery": {"status": "none", "detail": "Swap back to the previous binary freely; nothing is persisted."}
+}

@@ -2478,6 +2478,36 @@ async fn post_signed<B: Backend>(
     .into())
 }
 
+/// What an unsigned refusal from `peer` says: its status and, only for the bodies this protocol's
+/// own unsigned refusals carry or for a size refusal, a fixed reason. Any other body is counted,
+/// never quoted, since nothing vouches for what it contains.
+fn unsigned_refusal(peer: &str, status: StatusCode, body: &[u8]) -> String {
+    let reason = [
+        (
+            "replication request body:",
+            "it could not read the request body (larger than it accepts, or not valid deflate)",
+        ),
+        (
+            "replication authentication failed:",
+            "it could not authenticate the request",
+        ),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| body.starts_with(prefix.as_bytes()))
+    .map(|(_, reason)| reason)
+    .or_else(|| {
+        (status == StatusCode::PAYLOAD_TOO_LARGE)
+            .then_some("the request body is larger than it accepts")
+    });
+    match reason {
+        Some(reason) => format!("peer {peer} refused the exchange with an unsigned {status}: {reason}"),
+        None => format!(
+            "peer {peer} answered an unsigned {status} ({} body bytes, not shown)",
+            body.len()
+        ),
+    }
+}
+
 /// Send one signed request to a peer path and return the peer's verified answer, as
 /// `post_signed` does for an exchange.
 #[allow(clippy::too_many_arguments)]
@@ -2534,6 +2564,12 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
     // A build older than a path answers an unsigned 404.
     if status == StatusCode::NOT_FOUND && headers.get(HEADER_SIGNATURE).is_none() {
         anyhow::bail!("peer {} runs a build without `{path}`", peer.name);
+    }
+    // Any other refusal without the fleet's signature is reported by its status, before the
+    // signature check would report only a missing header and hide why the exchange failed. Its
+    // body is never trusted as data; an unsigned success still fails the signature check below.
+    if !status.is_success() && headers.get(HEADER_SIGNATURE).is_none() {
+        anyhow::bail!(unsigned_refusal(&peer.name, status, &bytes));
     }
     let bytes = if deflated(&headers) {
         inflate(&bytes)?
@@ -2621,3 +2657,6 @@ mod tests;
 #[cfg(test)]
 #[path = "transport_error_tests.rs"]
 mod transport_error_tests;
+#[cfg(test)]
+#[path = "unsigned_refusal_tests.rs"]
+mod unsigned_refusal_tests;
