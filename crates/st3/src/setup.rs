@@ -16,33 +16,7 @@ mod screen;
 use st3::client::{Client, Endpoint};
 use st3::config::Config;
 
-type Sink = Box<dyn FnMut(String)>;
-
-thread_local! {
-    /// Where this thread's setup output goes instead of the terminal, while the setup screen
-    /// owns it. The caller prints what was said once the screen has gone.
-    static SINK: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Say one line to the person: on the terminal, or into the sink when one is set.
-pub(crate) fn said(line: impl Into<String>) {
-    let line = line.into();
-    let unsent = SINK.with(|sink| match sink.borrow_mut().as_mut() {
-        Some(send) => {
-            send(line);
-            None
-        }
-        None => Some(line),
-    });
-    if let Some(line) = unsent {
-        println!("{line}");
-    }
-}
-
-/// Set (or clear) this thread's sink; returns the one it replaced.
-pub(crate) fn capture(sink: Option<Sink>) -> Option<Sink> {
-    SINK.with(|current| std::mem::replace(&mut *current.borrow_mut(), sink))
-}
+pub(crate) use crate::onboarding::{capture, said};
 
 macro_rules! say {
     ($($arg:tt)*) => { said(format!($($arg)*)) };

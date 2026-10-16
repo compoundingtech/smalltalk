@@ -28,8 +28,8 @@ use crate::model::{
     WorkSelector,
 };
 use crate::resource::{
-    ObservationRequest, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
-    RegisteredResourceProvider, ResourceProvider,
+    ObservationRequest, ObserverCondition, ProviderRateLimit, RegisteredResourceProvider,
+    ResourceProvider,
 };
 use crate::store::Store;
 
@@ -42,6 +42,11 @@ mod start_jobs;
 mod waits;
 
 pub use idle_nudge::{IDLE_NUDGE_AFTER_MS, IDLE_NUDGE_QUIET_WATCH_MS, IdleNudgeSettings};
+
+/// Register the reconciler's daemon metrics with the meter provider `otel` installed.
+pub fn init_metrics() {
+    crate::reconcile_telemetry::init();
+}
 
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
@@ -880,7 +885,7 @@ pub trait FaultInjection: Send + Sync + 'static {
 }
 
 pub(crate) const FIRST_READINESS_FAULT_AFTER_MS: u128 = 120_000;
-pub(crate) const FIRST_READINESS_FAULT_SCOPE: &str = "scheduler/first-readiness";
+pub(crate) use crate::model::FIRST_READINESS_FAULT_SCOPE;
 
 fn first_readiness_pending(run: &MissionRunView) -> bool {
     run.phase == "normal"
@@ -12567,7 +12572,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             && self.store.selected_desired_kind(agent)?.is_none()
             && intent.subjects.values().any(|desired| {
                 desired.kind == "message"
-                    && crate::store::canonical_child_string(&desired.desired, "to").as_deref()
+                    && crate::model::canonical_child_string(&desired.desired, "to").as_deref()
                         == Some(agent)
             })
             && let Some(source) = mission.declarations_kdl.as_deref()
@@ -13019,7 +13024,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if matches!(status.as_deref(), Some("delivered" | "read" | "closed")) {
                         true
                     } else if let Some(agent) = Self::round_gate_agent(run)
-                        && crate::store::canonical_child_string(&subject.desired, "to").as_deref()
+                        && crate::model::canonical_child_string(&subject.desired, "to").as_deref()
                             == Some(agent)
                         && self.store.selected_desired_kind(agent)?.is_none()
                     {
@@ -16711,94 +16716,6 @@ const RECONCILER_FAILING_TITLE: &str = "The reconciler is failing";
 /// so most faults clear sooner and never reach anyone.
 #[cfg(test)]
 const FAULT_ATTENTION_AFTER_MS: u128 = 120_000;
-
-/// Why an observer cannot observe, and whether a person has to act.
-pub(crate) enum ObserverCondition {
-    /// GitHub rejected the token or refused access. Nothing changes until a person acts.
-    Access(String),
-    /// A rate limit ends at a known reset. It needs a person only when the observer was already
-    /// limited and is still limited after the reset that limit named.
-    RateLimited { reason: String, outlasted: bool },
-    /// Any other failure. A person looks at it once it has lasted an hour.
-    Unreachable(String),
-    /// The daemon rejected the observation itself. It is not polled again on this revision.
-    Rejected(String),
-}
-
-/// How long after a named reset a rate limit counts as outlasting it, for clock skew.
-const RATE_LIMIT_RESET_GRACE_MS: u128 = 60_000;
-const OBSERVER_UNREACHABLE_ATTENTION_MS: u128 = 3_600_000;
-
-impl ObserverCondition {
-    fn of(error: &anyhow::Error, previous: Option<&Value>) -> Self {
-        let reason = error.to_string();
-        if error.downcast_ref::<ProviderForbidden>().is_some()
-            || error.downcast_ref::<ProviderUnauthenticated>().is_some()
-        {
-            return Self::Access(reason);
-        }
-        if error.downcast_ref::<ProviderRateLimit>().is_some() {
-            let outlasted = previous.is_some_and(|actual| {
-                actual.get("state").and_then(Value::as_str) == Some("unreachable")
-                    && actual.get("error_code").and_then(Value::as_str) == Some("rate-limited")
-                    && actual
-                        .get("next_check_unix_ms")
-                        .and_then(Value::as_str)
-                        .and_then(|value| value.parse::<u128>().ok())
-                        .is_some_and(|reset| {
-                            reset.saturating_add(RATE_LIMIT_RESET_GRACE_MS) <= now_ms()
-                        })
-            });
-            return Self::RateLimited { reason, outlasted };
-        }
-        Self::Unreachable(reason)
-    }
-
-    fn code(&self) -> &'static str {
-        match self {
-            Self::Access(_) => "access-denied",
-            Self::RateLimited { .. } => "rate-limited",
-            Self::Unreachable(_) => "unreachable",
-            Self::Rejected(_) => "rejected",
-        }
-    }
-
-    pub(crate) fn needs_person(&self, failing_for_ms: u128) -> bool {
-        match self {
-            Self::Access(_) | Self::Rejected(_) => true,
-            Self::RateLimited { outlasted, .. } => *outlasted,
-            Self::Unreachable(_) => failing_for_ms >= OBSERVER_UNREACHABLE_ATTENTION_MS,
-        }
-    }
-
-    pub(crate) fn title(&self) -> &'static str {
-        match self {
-            Self::Access(_) => "An observer has no access to GitHub",
-            Self::RateLimited { .. } => "A GitHub rate limit outlasted its reset",
-            Self::Unreachable(_) => "An observer has failed for an hour",
-            Self::Rejected(_) => "st rejects an observer's observations",
-        }
-    }
-
-    /// The cause and the command that fixes it. `host` polls the observer.
-    pub(crate) fn reason(&self, subject: &str, host: &str) -> String {
-        let closes = "This item closes when the observer observes again.";
-        match self {
-            Self::Access(reason) => format!(
-                "{subject} cannot observe its resource: {reason}. Give the daemon account's GitHub token access to the repository, with `gh auth login` or `gh auth refresh -h github.com -s repo` as that account. The observer tries again on its own. {closes}"
-            ),
-            Self::RateLimited { reason, .. } => format!(
-                "{subject} is still limited after the reset GitHub named: {reason}. Something else spends the GitHub budget that every host shares; `st doctor` on {host} shows how much of it remains, how much that host's observers spent, and each observer's requests. The observer waits for each reset on its own. {closes}"
-            ),
-            Self::Unreachable(reason) => format!(
-                "{subject} has failed to observe for over an hour: {reason}. Inspect it with `st subject {subject}`. {closes}"
-            ),
-            Self::Rejected(reason) => format!(
-                "st rejected an observation from {subject}: {reason}. Correct the observer's declaration and apply it again; inspect it with `st subject {subject}`. {closes}"
-            ),
-        }
-    }
-}
 
 struct RuntimeStep<'a> {
     spec: &'a StepSpec,
@@ -34040,7 +33957,7 @@ subscription "performance" {{ observer "observer/repo"; to "agent/node.target"; 
                     ("revision".into(), Value::String(revision)),
                     (
                         "next_check_unix_ms".into(),
-                        Value::String((now_ms() - RATE_LIMIT_RESET_GRACE_MS - 1).to_string()),
+                        Value::String((now_ms() - crate::resource::RATE_LIMIT_RESET_GRACE_MS - 1).to_string()),
                     ),
                 ]),
                 evidence: Vec::new(),

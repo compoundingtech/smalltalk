@@ -18,6 +18,24 @@ pub(crate) use crate::config::open_token_file;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 
+pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; failed or rejected credentials are checked again after a 30-second refresh backoff. HTTP requests are never retried.";
+
+tokio::task_local! {
+    /// The observer whose observation sends the GitHub requests in this task.
+    static GITHUB_SPENDER: String;
+}
+
+/// Count the GitHub requests `future` sends against `observer`.
+pub(crate) async fn spend_as<F: Future>(observer: String, future: F) -> F::Output {
+    GITHUB_SPENDER.scope(observer, future).await
+}
+
+/// The reconciler supplies this task-local caller; shell variables and request
+/// headers cannot select an admission identity.
+pub(crate) fn github_spender() -> Option<String> {
+    GITHUB_SPENDER.try_with(Clone::clone).ok()
+}
+
 /// An acquired credential retains its identity so a late 401 cannot evict a newer acquisition.
 /// Deliberately has no Debug implementation: credentials never belong in diagnostics.
 #[derive(Clone)]
@@ -324,7 +342,7 @@ where
     cache
         .acquire_default(lookup)
         .await
-        .context(crate::resource::GITHUB_AUTH_REMEDY)
+        .context(GITHUB_AUTH_REMEDY)
 }
 
 pub(crate) async fn github_auth() -> Result<GithubAuth> {
@@ -387,7 +405,7 @@ pub(crate) async fn send(
             .map(|copy| request_resource(copy.url().path())).unwrap_or("core");
         crate::github_admission::before_send(
             config.state_dir.join("github-admission.json"),
-            crate::resource::github_spender(), resource.into(), config.github.observer_requests_per_hour.map(|cap| cap as usize),
+            github_spender(), resource.into(), config.github.observer_requests_per_hour.map(|cap| cap as usize),
         ).await?;
     }
     match auth {
