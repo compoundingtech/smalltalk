@@ -27,6 +27,97 @@ fn plain_open(path: &Path, origin: &str) -> anyhow::Result<Store> {
     Store::open(path, origin, Arc::new(Plain))
 }
 
+#[tokio::test]
+async fn signed_default_answer_cannot_draw_envelopes_from_a_named_shard() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir().unwrap();
+    let auth = FleetAuth::test("1f91ca65-7793-48cc-866e-ac15690130e1", &[7; 32]);
+    let shard = Arc::new(plain_open(&root.path().join("github.sqlite3"), "birch").unwrap());
+    shard
+        .bind_shard(&crate::shards::ShardId::parse("github").unwrap())
+        .unwrap();
+    shard.bind_fleet(auth.fleet_id()).unwrap();
+    shard
+        .append_claim(&ClaimInput {
+            subject: "note/github".into(),
+            kind: "example.note".into(),
+            actor: None,
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let default = plain_open(&root.path().join("default.sqlite3"), "cedar").unwrap();
+    default.bind_fleet(auth.fleet_id()).unwrap();
+    let answer = default.export_replication_summary(auth.fleet_id()).unwrap();
+    assert_eq!(answer.shard_id, None);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let signing = auth.clone();
+    let app = Router::new().route(
+        EXCHANGE_PATH,
+        post(move |body: Bytes| {
+            let count = count.clone();
+            let signing = signing.clone();
+            let answer = answer.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                let query: ReplicationExchange = serde_json::from_slice(&body).unwrap();
+                assert_eq!(query.shard_id.as_deref(), Some("github"));
+                assert!(
+                    query.envelopes.is_empty(),
+                    "scope check precedes payload push"
+                );
+                let envelope = PeerResponse::new("cedar", 0, answer);
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                let mut response = (StatusCode::OK, bytes.clone()).into_response();
+                response.headers_mut().extend(
+                    signing
+                        .response_headers_for(
+                            EXCHANGE_PATH,
+                            "cedar",
+                            &bytes,
+                            &FleetAuth::body_digest(&body),
+                        )
+                        .unwrap(),
+                );
+                response
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = PeerConfig {
+        name: "cedar".into(),
+        url: format!("http://{}", listener.local_addr().unwrap()),
+    };
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let error = exchange(
+        &replication_http_client(),
+        &Local(shard.clone()),
+        "birch",
+        &peer,
+        &auth,
+        &fleet,
+    )
+    .await
+    .unwrap_err();
+    let mismatch = error.downcast_ref::<PeerShardMismatch>().unwrap();
+    assert_eq!(mismatch.expected.as_deref(), Some("github"));
+    assert_eq!(mismatch.actual, None);
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    assert!(
+        default
+            .replication_inventory()
+            .unwrap()
+            .envelopes
+            .is_empty()
+    );
+    server.abort();
+}
+
 /// Different checkpoint lineages leave payloadless ranges that can never settle through
 /// envelope transport. Both live writers already have a shared range, so a summary alone
 /// cannot prove either of their later gaps. The live ranges are listed ahead of the payloadless
@@ -112,7 +203,10 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
                 };
                 let query: ReplicationExchange = serde_json::from_slice(&decoded).unwrap();
                 assert!(query.envelopes.len() <= crate::store::REPLICATION_PAGE_LIMIT as usize);
-                assert!(!query.inventory.digest.is_empty(), "a request keeps its digest");
+                assert!(
+                    !query.inventory.digest.is_empty(),
+                    "a request keeps its digest"
+                );
                 observed.lock().unwrap().push((
                     query.inventory.buckets.is_empty(),
                     query.inventory.envelopes.len(),
@@ -147,7 +241,9 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
             "one compact round, never a full-inventory round or an unbounded retry"
         );
         assert!(
-            requests.iter().all(|(bare, listed, _)| !bare && *listed <= 512),
+            requests
+                .iter()
+                .all(|(bare, listed, _)| !bare && *listed <= 512),
             "every request carries range digests and a bounded listing: {requests:?}"
         );
     }
@@ -1661,7 +1757,11 @@ mod retry_tests {
                 .last_failed_exchange
                 .as_ref()
                 .expect("the closed Fabric tunnel records its attempted carrier");
-            assert_eq!(failed.carrier, crate::replication::ReplicationCarrier::Fabric, "{probe}");
+            assert_eq!(
+                failed.carrier,
+                crate::replication::ReplicationCarrier::Fabric,
+                "{probe}"
+            );
             assert_eq!(failed.fabric_route.as_deref(), Some("unknown"), "{probe}");
             assert!(peer.last_successful_exchange.is_none(), "{probe}");
             if refused {

@@ -1089,6 +1089,7 @@ async fn dial_peer<B: Backend>(
     // or an exchange over them succeeds. See `wait_peer_retry`.
     let mut early_spent = BTreeSet::new();
     let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
+    let mut misconfigured = Vec::<Route>::new();
     let mut last_attempt_unix_ms = crate::store::now_ms();
     loop {
         // A removed node stops dialing; `st3 doctor` says what to do next.
@@ -1161,6 +1162,7 @@ async fn dial_peer<B: Backend>(
         // and local network changes cannot make that member grant this service.
         if routes.has_changed().unwrap_or(false) {
             refused.clear();
+            misconfigured.clear();
         }
         // Retry waits must retain signs of life received during this attempt, including
         // an inbound request that arrives just before the outbound request fails.
@@ -1172,7 +1174,10 @@ async fn dial_peer<B: Backend>(
             refused.retain(|(route, until)| routes.contains(route) && *until > now);
             (0..routes.len())
                 .map(|offset| routes[(route.wrapping_add(offset)) % routes.len()].clone())
-                .find(|candidate| !refused.iter().any(|(route, _)| route == candidate))
+                .find(|candidate| {
+                    !refused.iter().any(|(route, _)| route == candidate)
+                        && !misconfigured.contains(candidate)
+                })
         };
         if selected.is_none() && !refused.is_empty() {
             let deadline = refused.iter().map(|(_, until)| *until).min().unwrap();
@@ -1190,9 +1195,17 @@ async fn dial_peer<B: Backend>(
             }
             continue;
         }
+        if selected.is_none() && !misconfigured.is_empty() {
+            record_worker(&backend, &name, "misconfigured", attempt_unix_ms, None).await;
+            if routes.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
         last_attempt_unix_ms = attempt_unix_ms;
         record_worker(&backend, &name, "exchange", attempt_unix_ms, None).await;
         let carrier = selected.as_ref().map(Route::carrier).unwrap_or_default();
+        let selected_route = selected.clone();
         let is_http = matches!(selected, Some(Route::Http(_)));
         let fabric_route = selected
             .clone()
@@ -1305,6 +1318,24 @@ async fn dial_peer<B: Backend>(
             Err(error) => {
                 if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
                     fleet.mark_removed(&peer.name, removed);
+                    continue;
+                }
+                if error.is::<PeerShardMismatch>() {
+                    // A shard route pointing at another store is a configuration error.
+                    // Repeating the same exchange cannot repair it. Keep the reason visible
+                    // until the route changes, without sending any shard envelopes.
+                    let _ = backend
+                        .record_failure(
+                            &peer.name,
+                            "shard-mismatch",
+                            &error.to_string(),
+                            Some(carrier),
+                        )
+                        .await;
+                    if let Some(selected_route) = selected_route {
+                        misconfigured.push(selected_route);
+                    }
+                    route = route.wrapping_add(1);
                     continue;
                 }
                 // A peer can leave an HTTP stream open without making progress. Once that
@@ -2186,6 +2217,41 @@ pub async fn exchange<B: Backend>(
     exchange_via(http, backend, node, peer, auth, fleet, Default::default()).await
 }
 
+#[derive(Debug)]
+struct PeerShardMismatch {
+    peer: String,
+    expected: Option<String>,
+    actual: Option<String>,
+}
+
+impl std::fmt::Display for PeerShardMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "peer {} answered for shard {:?}, expected {:?}",
+            self.peer, self.actual, self.expected
+        )
+    }
+}
+
+impl std::error::Error for PeerShardMismatch {}
+
+fn ensure_peer_exchange_shard(
+    peer: &str,
+    sent: &ReplicationExchange,
+    answer: &ReplicationExchange,
+) -> Result<()> {
+    if answer.shard_id != sent.shard_id {
+        return Err(PeerShardMismatch {
+            peer: peer.into(),
+            expected: sent.shard_id.clone(),
+            actual: answer.shard_id.clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn exchange_via<B: Backend>(
     http: &reqwest::Client,
@@ -2240,6 +2306,7 @@ async fn exchange_inner<B: Backend>(
     let started = std::time::Instant::now();
     let (remote, peer_inflates) =
         post_signed(http, backend, peer, node, auth, fleet, &query, false).await?;
+    ensure_peer_exchange_shard(&peer.name, &query, &remote)?;
     let round_trip = started.elapsed();
     let different = remote.inventory.digest != query.inventory.digest;
     let received = backend
@@ -2276,6 +2343,7 @@ async fn exchange_inner<B: Backend>(
         // A peer that says it takes compressed requests gets a large push compressed.
         let (response, _) =
             post_signed(http, backend, peer, node, auth, fleet, &push, peer_inflates).await?;
+        ensure_peer_exchange_shard(&peer.name, &push, &response)?;
         let round_trip = started.elapsed();
         // The peer stores a push before it answers, so its inventory moved if the push landed.
         pushed =
