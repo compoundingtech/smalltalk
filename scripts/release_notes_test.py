@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from release_notes import FIELDS, ImpactError, check_pull_request, collect, render, validate
+from release_notes import FIELDS, ImpactError, check_pull_request, collect, render, validate, version
 
 ROOT = Path(__file__).resolve().parent.parent
 loader = importlib.machinery.SourceFileLoader('release_daily', str(ROOT / 'scripts/release-smalltalk-daily'))
@@ -54,6 +54,17 @@ class ReleaseNotes(unittest.TestCase):
         path = self.repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
+
+    def test_rules_version_reads_the_path_it_had_before_the_library_moved(self):
+        self.git('mv', 'crates/st3-daemon/src/store/checkpoint_rules.rs', 'crates/st3-daemon/src/store/old.rs')
+        (self.repo / 'crates/st3/src/store').mkdir(parents=True)
+        self.git('mv', 'crates/st3-daemon/src/store/old.rs', 'crates/st3/src/store/checkpoint_rules.rs')
+        before_move = self.commit('Library still in crates/st3')
+        self.assertEqual(version(self.repo, before_move, 'rules'), 10)
+        self.assertEqual(version(self.repo, self.base, 'rules'), 10)
+        self.git('rm', '-q', 'crates/st3/src/store/checkpoint_rules.rs')
+        with self.assertRaisesRegex(ImpactError, 'is missing'):
+            version(self.repo, self.commit('No rules file anywhere'), 'rules')
 
     def add_fragment(self, name='change', value=None):
         self.write(f'release-notes/{name}.json', json.dumps(value or fragment()))
