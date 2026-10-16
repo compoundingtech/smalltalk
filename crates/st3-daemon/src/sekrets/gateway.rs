@@ -21,7 +21,7 @@ use super::policy::{Policy, Verdict};
 use super::protocol::{self, CallerView, Reply, Request, RunRequest};
 use super::sandbox::{self, BoundDirectory, Sandbox};
 use super::store::{GatewayStore, Grant, Profile, now_unix_ms, person_name};
-use crate::tiles::registry::{Registry, Tile};
+use crate::tile_registry::{Registry, Tile};
 
 pub const DEFAULT_CONFIG: &str = "/etc/st-sekrets/gateway.toml";
 /// How long the gateway keeps its own log: each daemon has recorded its entries long before.
@@ -123,7 +123,7 @@ fn default_github_api() -> String {
     "https://api.github.com".into()
 }
 fn default_tile_registry() -> PathBuf {
-    crate::tiles::registry::DEFAULT_REGISTRY.into()
+    crate::tile_registry::DEFAULT_REGISTRY.into()
 }
 fn default_checkout_roots() -> Vec<PathBuf> {
     vec!["/home".into()]
@@ -2024,7 +2024,7 @@ command = ["evidence-sign"]
     fn program_and_tile_uid_collision_is_refused_with_readable_registry() {
         for cgroup in [
             "/system.slice/ci-evidence.service".to_owned(),
-            crate::tiles::registry::tools_cgroup("atlas"),
+            crate::tile_registry::tools_cgroup("atlas"),
         ] {
             let root = tempfile::tempdir().unwrap();
             let registry = program_tile_registry();
@@ -2046,7 +2046,7 @@ command = ["evidence-sign"]
     fn unreadable_registry_keeps_program_unit_identity_without_tile_privilege() {
         for (cgroup, expected_program) in [
             ("/system.slice/ci-evidence.service".to_owned(), true),
-            (crate::tiles::registry::tools_cgroup("atlas"), false),
+            (crate::tile_registry::tools_cgroup("atlas"), false),
         ] {
             let root = tempfile::tempdir().unwrap();
             let gateway = Gateway::new(
@@ -2098,7 +2098,7 @@ command = ["evidence-sign"]
             config,
             1000,
             None,
-            Box::new(TestKernel(crate::tiles::registry::tools_cgroup("atlas"))),
+            Box::new(TestKernel(crate::tile_registry::tools_cgroup("atlas"))),
         )
         .unwrap()
         .with_tiles(|| anyhow::bail!("fixture registry unreadable"));

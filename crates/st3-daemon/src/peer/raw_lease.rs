@@ -1,6 +1,6 @@
 //! Signed, per-lease authority proof. PTY traffic is never authorization-watch activity.
 use super::*;
-use crate::api::{RawTerminalLease, RawTerminalLeaseBinding};
+use super::{RawLeaseBinding as RawTerminalLeaseBinding, RawTerminalLease};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
@@ -94,7 +94,7 @@ fn verify(
 
 pub(super) fn gateway_bridge<S>(
     socket: WebSocketStream<S>,
-    lease: Option<Arc<RawTerminalLease>>,
+    lease: Option<Arc<dyn RawTerminalLease>>,
     relay: ClientRelay,
     owner: String,
     member_key: Option<String>,
@@ -130,7 +130,7 @@ where
                         sequence += 1;
                         let nonce = challenge.borrow().clone().expect("watch requires challenge");
                         let Ok(issued) = now_ms() else { break; };
-                        let Ok(proof) = signed(auth,node,&lease.binding,&lease.binding.gateway_epoch,sequence,&nonce,issued) else { break; };
+                        let Ok(proof) = signed(auth,node,lease.binding(),&lease.binding().gateway_epoch,sequence,&nonce,issued) else { break; };
                         if sink.send(Message::Text(proof.into())).await.is_err() { break; }
                         proof_sent = true;
                     }
@@ -157,7 +157,7 @@ where
                             break;
                         };
                         let Ok((proof, sender)) =
-                            verify(auth, &text, &owner, &lease.binding, member_key.as_deref())
+                            verify(auth, &text, &owner, lease.binding(), member_key.as_deref())
                         else {
                             break;
                         };
@@ -179,7 +179,7 @@ where
                             break;
                         }
                         sequence = proof.sequence;
-                        if lease.proof(&lease.binding.gateway_epoch, sequence).is_err() {
+                        if lease.proof(&lease.binding().gateway_epoch, sequence).is_err() {
                             break;
                         }
                     }
@@ -249,7 +249,7 @@ pub(super) async fn receive_owner(
             .headers_mut()
             .insert("x-st3-person", HeaderValue::from_str(&binding.person)?);
         request.headers_mut().insert(
-            crate::api::RAW_ORIGIN_HEADER,
+            super::RAW_ORIGIN_HEADER,
             HeaderValue::from_str(&serde_json::to_string(&binding)?)?,
         );
         request.headers_mut().insert(

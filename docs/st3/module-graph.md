@@ -26,7 +26,7 @@ replace the pattern with a compiler-derived graph or keep the shape list tested.
 
 ## The rule
 
-The graph minus the pairs in `.st/module-layers.json` is acyclic. Today 28 module pairs (74
+The graph minus the pairs in `.st/module-layers.json` is acyclic. Today 4 module pairs (6
 references) point upward, mostly into `store`; they are the allowlist. The rule is enforced two
 ways: a new edge that closes a cycle outside the allowlist fails, and an allowlisted pair that no
 longer exists must be removed, so the list only shrinks. Layers are computed (longest path above

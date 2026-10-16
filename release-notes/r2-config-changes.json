@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Move the [changes] configuration type from changes into config, so config and the modules that use it no longer depend on store",
+  "replay": {"status": "none", "detail": "A type moves between modules unchanged and keeps its old path through a re-export. No claim, projection or replay behaviour changes."},
+  "schema": {"status": "none", "detail": "No database schema, schema version or migration changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and fleet coordination are unchanged."},
+  "compatibility": {"status": "none", "detail": "The [changes] section of the config file parses exactly as before (same struct, fields and serde attributes). No client, protocol, route, CLI output or exit code changes."},
+  "downtime": {"status": "none", "detail": "Nothing to restart beyond a normal upgrade."},
+  "manual": {"status": "none", "detail": "No operator steps."},
+  "recovery": {"status": "none", "detail": "Revert the pull request."}
+}

@@ -156,7 +156,7 @@ async fn membership_only_gateway_holds_raw_writers_and_fences_capabilities() {
         .unwrap();
     let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "raw-owner".into(), FleetAuth::test(fleet, &[7; 32]).with_member_key(Some(owner_key.clone())), member_context(&owner.store, &owner_key, &[], &[], false));
     let peer_task = tokio::spawn(async move {
-        axum::serve(listener, peer_router(peer, smalltalk_routes())).await.unwrap();
+        axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await.unwrap();
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         while tokio::net::UnixStream::connect(&owner_socket)

@@ -50,6 +50,67 @@ type PeerState = smallclaims::sync::PeerState<MainBackend>;
 
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
 const RAW_TERMINAL_PATH: &str = "/v1/peer/raw-terminal";
+
+/// The header that names the gateway a raw PEEK route came from.
+pub(crate) const RAW_ORIGIN_HEADER: &str = "x-st3-raw-origin";
+
+/// What binds a raw PEEK route to the lease its gateway holds.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawLeaseBinding {
+    pub lease_id: String,
+    pub gateway: String,
+    pub gateway_epoch: String,
+    pub actor: String,
+    pub person: String,
+    pub authorization_epoch: String,
+    pub grant_subject: Option<String>,
+    pub grant_digest: Option<String>,
+    pub gateway_member_key: Option<String>,
+    pub owner_member_key: Option<String>,
+    pub terminal: String,
+    pub owner: String,
+    pub incarnation: String,
+    pub mode: String,
+    pub absolute_deadline_unix_ms: u128,
+}
+
+/// A gateway's open PEEK lease as the relay checks it. The API's raw terminal lease implements
+/// it, so the relay carries a lease without naming the API.
+pub(crate) trait RawTerminalLease: Send + Sync {
+    fn binding(&self) -> &RawLeaseBinding;
+    fn revalidate(&self) -> Result<()>;
+    fn check(&self) -> Result<()>;
+    fn proof(&self, epoch: &str, sequence: u64) -> Result<()>;
+    fn expired(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
+/// Pumps an accepted raw terminal websocket into the owner's terminal socket. The daemon binary
+/// passes the API's splice to `run_worker`, so the peer listener serves the route without naming
+/// the API.
+pub type RawSplice = fn(
+    axum::extract::ws::WebSocket,
+    tokio::net::UnixStream,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+tokio::task_local! {
+    /// Set while a request is handled; a read relayed from another machine's owner marks it.
+    static SERVED_REMOTE: Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Run a request's handler with its remote-read flag in scope. The flag follows the handler's
+/// own task. A relay awaited inside a `tokio::spawn` would lose it, so such a spawn must pass
+/// its own flag, as the collections socket does for the conversation follower.
+pub(crate) async fn track_remote_reads<F: Future>(
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    handler: F,
+) -> F::Output {
+    SERVED_REMOTE.scope(flag, handler).await
+}
+
+/// The request being handled read from another machine, so its target is the remote one.
+pub(crate) fn note_remote_read() {
+    let _ = SERVED_REMOTE.try_with(|remote| remote.store(true, std::sync::atomic::Ordering::Relaxed));
+}
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 /// A relayed long poll must answer well inside the relay's 15-second request timeout.
 const CLIENT_READ_MAX_WAIT_MS: u64 = 10_000;
@@ -478,7 +539,7 @@ impl ClientRelay {
         let target = host_id
             .strip_prefix("host/")
             .context("the owner host ID is invalid")?;
-        crate::api::note_remote_read();
+        note_remote_read();
         let started = std::time::Instant::now();
         match self
             .send_toward(
@@ -849,7 +910,7 @@ impl ClientRelay {
         terminal_id: &str,
         incarnation: &str,
         mode: st3_client::RawTerminalMode,
-        lease: Option<Arc<crate::api::RawTerminalLease>>,
+        lease: Option<Arc<dyn RawTerminalLease>>,
     ) -> Result<(tokio::net::UnixStream, tokio::sync::mpsc::Sender<Value>)> {
         let target = host.strip_prefix("host/").context("invalid owner host")?;
         if self.is_dial_out_owner(host) {
@@ -869,7 +930,7 @@ impl ClientRelay {
             lease.revalidate()?;
             path.push_str("&binding=");
             path.push_str(&urlencoding::encode(&serde_json::to_string(
-                &lease.binding,
+                &lease.binding(),
             )?));
         }
         let mut last = None;
@@ -1016,6 +1077,7 @@ async fn receive_raw_terminal(
     State(state): State<PeerState>,
     OriginalUri(uri): OriginalUri,
     Query(query): Query<RawTerminalQuery>,
+    axum::Extension(splice): axum::Extension<RawSplice>,
     headers: HeaderMap,
 ) -> Response {
     let profile = crate::profile::Op::start("GET /v1/peer/raw-terminal", None);
@@ -1030,7 +1092,7 @@ async fn receive_raw_terminal(
     };
     drop(auth_span);
     if query.mode == st3_client::RawTerminalMode::Peek {
-        let binding: crate::api::RawTerminalLeaseBinding = match query
+        let binding: RawLeaseBinding = match query
             .binding
             .as_deref()
             .and_then(|binding| serde_json::from_str(binding).ok())
@@ -1092,7 +1154,7 @@ async fn receive_raw_terminal(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "raw terminal signature failed").into_response(),
     };
     let mut response = websocket.max_message_size(64 * 1024).max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None, None, None, None, None));
+        .on_upgrade(move |socket| splice(socket, transport));
     response.headers_mut().extend(signed);
     response
 }
@@ -1583,7 +1645,7 @@ impl Backend for MainBackend {
             .client
             .post(
                 "/v1/internal/fleet/endpoints",
-                &crate::api::FleetEndpointsRequest {
+                &crate::model::FleetEndpointsRequest {
                     mode: mode.into(),
                     endpoints: endpoints.to_vec(),
                 },
@@ -1652,18 +1714,18 @@ impl Backend for MainBackend {
 }
 
 /// The routes smalltalk serves beside the sync routes on the peer listener.
-fn smalltalk_routes() -> Router<PeerState> {
+fn smalltalk_routes(splice: RawSplice) -> Router<PeerState> {
     relay_trace::init();
     Router::new()
         .route(
             CLIENT_READ_PATH,
             post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
         )
-        .route(RAW_TERMINAL_PATH, get(receive_raw_terminal))
+        .route(RAW_TERMINAL_PATH, get(receive_raw_terminal).layer(axum::Extension(splice)))
 }
 
 /// Run the replication worker: sync this node's store, through its daemon, with the fleet.
-pub async fn run_worker(config: Config) -> Result<()> {
+pub async fn run_worker(config: Config, splice: RawSplice) -> Result<()> {
     config.validate()?;
     let worker = WorkerConfig {
         node: config.node.clone(),
@@ -1698,7 +1760,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
         worker,
         MainBackend::new(config.socket.clone()),
         wake,
-        smalltalk_routes(),
+        smalltalk_routes(splice),
     )
     .await
 }
@@ -1737,7 +1799,7 @@ mod tests {
             },
         };
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = crate::api::track_remote_reads(flag.clone(), relay.read("host/owner-node", &read)).await;
+        let result = track_remote_reads(flag.clone(), relay.read("host/owner-node", &read)).await;
         assert!(result.is_err());
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         // Outside a request there is nothing to mark, and the read still runs.
@@ -1875,7 +1937,7 @@ mod tests {
         let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
 
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
@@ -2084,7 +2146,7 @@ mod tests {
         let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2203,7 +2265,7 @@ mod tests {
         let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2297,7 +2359,7 @@ mod tests {
         let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2480,7 +2542,7 @@ mod tests {
         let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2830,7 +2892,7 @@ mod tests {
             async move {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
-                tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+                tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
                 address
             }
         };
@@ -3019,7 +3081,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let worker = tokio::spawn(async move {
-            axum::serve(listener, peer_router(peer, smalltalk_routes())).await
+            axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await
         });
         gateway.client_relay = ClientRelay::from_config(&Config {
             node: "lag-gateway".into(),
@@ -3181,7 +3243,7 @@ mod tests {
             *request.headers_mut() = auth
                 .request_headers_for(CLIENT_READ_PATH, "near", &body)
                 .unwrap();
-            let router = peer_router(peer.clone(), smalltalk_routes());
+            let router = peer_router(peer.clone(), smalltalk_routes(crate::api::raw_terminal_owner_splice));
             async move {
                 let response = router.oneshot(request).await.unwrap();
                 let status = response.status();
@@ -3529,7 +3591,7 @@ mod tests {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -3676,7 +3738,7 @@ mod tests {
         let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "conversation-owner".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
         let secret = gateway_root.path().join("fleet-secret");
         fs::write(&secret, [7_u8; 32]).unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -3889,7 +3951,7 @@ mod tests {
         let response = relay_trace::test_peer_selector(
             FleetAuth::body_digest(&body),
             "source".into(),
-            peer_router(peer.clone(), smalltalk_routes()).oneshot(request),
+            peer_router(peer.clone(), smalltalk_routes(crate::api::raw_terminal_owner_splice)).oneshot(request),
         )
         .with_subscriber(diagnostic.dispatch())
         .await
@@ -3951,7 +4013,7 @@ mod tests {
         let response = relay_trace::test_peer_selector(
             FleetAuth::body_digest(&body),
             "unconfigured".into(),
-            peer_router(peer, smalltalk_routes()).oneshot(rejected),
+            peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice)).oneshot(rejected),
         )
         .with_subscriber(refusal.dispatch())
         .await
@@ -4490,7 +4552,7 @@ mod tests {
         );
         let state = PeerState::new(MainBackend::new(sockets[1].to_path_buf()), "target".into(), auth.clone(), FleetContext::legacy(BTreeSet::from(["source".into()])));
         let peer_server =
-            tokio::spawn(async move { axum::serve(listener, peer_router(state, smalltalk_routes())).await });
+            tokio::spawn(async move { axum::serve(listener, peer_router(state, smalltalk_routes(crate::api::raw_terminal_owner_splice))).await });
         let peer = PeerConfig {
             name: "target".into(),
             url: format!("http://{address}"),

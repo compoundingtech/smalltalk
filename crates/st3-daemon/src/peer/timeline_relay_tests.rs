@@ -171,7 +171,7 @@ async fn relay_omission_preserves_raw_pages_changes_and_collection_frames() {
         *request.headers_mut() = auth
             .request_headers_for(CLIENT_READ_PATH, "gateway", &body)
             .unwrap();
-        let response = peer_router(peer.clone(), smalltalk_routes())
+        let response = peer_router(peer.clone(), smalltalk_routes(crate::api::raw_terminal_owner_splice))
             .oneshot(request)
             .await
             .unwrap();
@@ -201,7 +201,7 @@ async fn relay_omission_preserves_raw_pages_changes_and_collection_frames() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let peer_server = tokio::spawn(async move {
-        axum::serve(listener, peer_router(peer, smalltalk_routes()))
+        axum::serve(listener, peer_router(peer, smalltalk_routes(crate::api::raw_terminal_owner_splice)))
             .await
             .unwrap();
     });

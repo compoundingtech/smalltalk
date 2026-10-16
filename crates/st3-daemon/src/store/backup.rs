@@ -1,6 +1,6 @@
 //! Backup reads pin a pooled reader and page the sync envelopes; restore uses normal admission.
 use super::*;
-use crate::backup::{Header, PAGE, Record, RestoreReport, TableDigest, write_record};
+use super::backup_format::{Header, PAGE, Record, RestoreReport, TableDigest, write_record};
 use crate::model::{ReplicaEnvelope, ReplicaEnvelopeId, ReplicaEnvelopeSignature};
 use std::io::Write;
 use std::sync::atomic::Ordering;
@@ -20,8 +20,8 @@ impl Store {
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         Ok(Header {
-            format: crate::backup::FORMAT.into(),
-            version: crate::backup::VERSION,
+            format: super::backup_format::FORMAT.into(),
+            version: super::backup_format::VERSION,
             source_build: st_drivers::version::machine_version(),
             source_schema: connection.query_row("PRAGMA user_version", [], |r| r.get(0))?,
             registry_digest: self.runtime.schema_digest(),
@@ -136,7 +136,7 @@ impl Store {
                 );
                 let mut header = self.backup_header()?;
                 if !owned.is_empty() {
-                    header.version = crate::backup::VERSION_WITH_BODIES;
+                    header.version = super::backup_format::VERSION_WITH_BODIES;
                 }
                 let mut hash = Sha256::new();
                 write_record(output, &mut hash, &Record::Header(header.clone()))?;
@@ -225,7 +225,7 @@ impl Store {
                         write_record(
                             output,
                             &mut hash,
-                            &Record::MessageBody(crate::backup::MessageBodyRecord {
+                            &Record::MessageBody(super::backup_format::MessageBodyRecord {
                                 message: subject.clone(),
                                 actor: actor.clone(),
                                 sha256: sha256.clone(),
