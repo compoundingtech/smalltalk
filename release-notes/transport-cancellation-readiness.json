@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "TypeScript request cancellation and collection readiness framing",
+  "replay": {"status": "none", "detail": "No replay or stored-state changes."},
+  "schema": {"status": "none", "detail": "No database schema or migration changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordinated member upgrade changes."},
+  "compatibility": {"status": "changed", "detail": "Adds exported RequestOptions with an optional AbortSignal to HTTP methods, including generated methods. Existing arguments remain in place. Collection onOpen runs once before buffered commands flush; commands issued there follow earlier commands. Known collection frame envelopes are validated before onFrame, while rows and unknown kinds remain raw."},
+  "downtime": {"status": "none", "detail": "No additional restart or interruption required."},
+  "manual": {"status": "none", "detail": "Existing callers need no changes. Cancellation does not prove an action was not delivered and does not retry it."},
+  "recovery": {"status": "none", "detail": "No stored-state recovery changes. Callback failures close the collection socket and reach onEnd once."}
+}
