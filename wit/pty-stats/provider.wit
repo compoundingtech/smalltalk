@@ -1,6 +1,0 @@
-package st2:resource-provider@0.1.0;
-
-world pty-stats-provider {
-  import compoundingtech:st2-pty-stats/pty-stats@0.1.0;
-  export provider-api;
-}
