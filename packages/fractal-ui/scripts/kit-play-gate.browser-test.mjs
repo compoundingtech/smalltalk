@@ -72,6 +72,14 @@ test('critical set without a11y selects tagged stories and asks addon-a11y not t
   assert.ok(receipt.rows.every(row => row.id === 'kit--critical' && row.strict.every(record => record.url.includes('globals=a11y.manual'))))
 })
 
+test('the per-commit set refuses a build whose critical stories are not the ones it names', { timeout: 60000 }, async () => {
+  const { code, receipt } = await runGate({ env: { KIT_PLAY_SET: 'commit', KIT_PLAY_A11Y: 'off' } })
+  assert.equal(code, 1)
+  assert.equal(receipt.pass, false)
+  assert.equal(receipt.cases, 0)
+  assert.match(receipt.fatalError, /names fractal-ui-.*, which is not a critical story/)
+})
+
 test('a11y off rejects a case where axe still ran', { timeout: 60000 }, async () => {
   const { code, receipt } = await runGate({ env: { KIT_PLAY_A11Y: 'off' }, report: [{ type: 'a11y', status: 'passed' }] })
   assert.equal(code, 1)

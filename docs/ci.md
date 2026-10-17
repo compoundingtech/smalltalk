@@ -605,11 +605,21 @@ animations at their end state for the a11y check instead of a fixed 100 ms sleep
 before waiting for them. A play that leaves UI opening after it returns (a hover
 card under the pointer) waits for that state itself rather than relying on the sleep.
 
-The gate takes three options. Pull requests run the stories tagged `critical` with a11y
-off and a 420-second budget; merge groups (observed and signed by Evidence observe) and
-manual runs keep every story with a11y on and no budget, so every tree that reaches main
-has had the full matrix and axe. Which stories are critical is the UI owners' choice.
-`KIT_PLAY_SET=critical` selects only stories tagged `critical` (an empty selection fails);
+The gate takes three options. Pull requests run the per-commit set (`KIT_PLAY_SET=commit`)
+with a11y off and a 100-second budget; merge groups (observed and signed by Evidence
+observe) and manual runs keep every story in all four cases with a11y on and no budget, so
+every tree that reaches main has had the full matrix and axe. Which stories are critical is
+the UI owners' choice. `KIT_PLAY_SET=critical` selects only stories tagged `critical` (an
+empty selection fails). `commit` narrows the critical stories to fit about 60 seconds
+on the 4-vCPU runner (the critical set took about 185 s): each story runs in one case, dark at
+440 or light at 1440 chosen by a hash of its id, so both schemes and both widths stay covered
+across the set; the layout stories in `BOTH_WIDTHS` run dark at 440 and 1440; the stories in
+`MERGE_ONLY` do not run per commit. The lists live in
+`packages/fractal-ui/scripts/kit-play-commit-set.mjs`, name only critical stories (a rename fails
+the gate), and the receipt records what the run omitted. Per commit this leaves out the
+other three cases of every story (the other scheme and width pairs; the `BOTH_WIDTHS` stories
+lose their light cases) and the two `MERGE_ONLY` stories (`transcript--no-green-all-states`,
+`sidebar-roster--hundred-agent-render`); merge groups run all of them.
 `KIT_PLAY_A11Y=off` sets addon-a11y's own `a11y.manual` global so axe does not run, and
 each case must then carry no a11y report, while with a11y on each case must carry exactly
 one passed a11y report; `KIT_PLAY_MAX_SECONDS` is the set's wall-time budget: every case

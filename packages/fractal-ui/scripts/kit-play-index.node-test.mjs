@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { storyIdsFromIndex } from './kit-play-index.mjs'
+import { commitSetCases, diagonalCase, fullCases, BOTH_WIDTHS, MERGE_ONLY } from './kit-play-commit-set.mjs'
 
 const story = { type: 'story', id: 'kit--sample', importPath: './Sample.stories.tsx' }
 const docs = { type: 'docs', id: 'kit--docs', importPath: './Sample.mdx' }
@@ -88,4 +89,22 @@ test('the critical set fails the actual gate before browser execution when nothi
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+test('the per-commit set runs one diagonal case per story, both widths for the layout stories, and omits merge-only stories', () => {
+  const ids = ['a--one', 'a--three', 'b--wide', 'c--heavy']
+  const { ids: kept, cases, omittedStories, omittedCases } = commitSetCases(ids, { mergeOnlyIds: ['c--heavy'], bothWidthsIds: ['b--wide'] })
+  assert.deepEqual(kept, ['a--one', 'a--three', 'b--wide'])
+  assert.deepEqual(omittedStories, ['c--heavy'])
+  assert.equal(cases.length, 1 + 1 + 2)
+  assert.deepEqual(cases.filter(({ id }) => id === 'b--wide').map(({ scheme, width }) => `${scheme}${width}`).sort(), ['dark1440', 'dark440'])
+  assert.equal(omittedCases, ids.length * 4 - cases.length)
+  for (const { id, scheme, width } of cases.filter(({ id }) => id !== 'b--wide')) assert.deepEqual([scheme, width], diagonalCase(id))
+  // Both diagonals are used, so both schemes and both widths stay covered across a set.
+  assert.deepEqual(new Set(['a--one', 'a--three'].map(id => diagonalCase(id).join())), new Set(['dark,440', 'light,1440']))
+  assert.equal(fullCases(['x']).length, 4)
+})
+test('the per-commit set rejects a listed story that is not critical, so a rename cannot drop coverage', () => {
+  assert.throws(() => commitSetCases(['a--one'], { mergeOnlyIds: ['a--renamed'], bothWidthsIds: [] }), /a--renamed, which is not a critical story/)
+  assert.throws(() => commitSetCases(['a--one'], { mergeOnlyIds: [], bothWidthsIds: ['a--gone'] }), /a--gone, which is not a critical story/)
+  assert.equal(new Set([...MERGE_ONLY, ...BOTH_WIDTHS]).size, MERGE_ONLY.length + BOTH_WIDTHS.length, 'a story is merge-only or both-widths, not both')
 })

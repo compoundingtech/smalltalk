@@ -576,11 +576,12 @@ export const fractalWebJobs = {
         env: {
           ...pnpmStoreEnv,
           KIT_INPUTS: '${{ needs.fractal-web-changes.outputs.kit-inputs }}',
-          // Pull requests run the stories tagged critical without axe, within the 7-minute budget;
-          // merge groups (observed and signed) and manual runs keep every story with axe.
-          KIT_PLAY_SET: "${{ github.event_name == 'pull_request' && 'critical' || 'all' }}",
+          // Pull requests run the per-commit set of the critical stories (one scheme-and-width case each, no
+          // axe; scripts/kit-play-commit-set.mjs lists what it leaves out) within a 100-second budget;
+          // merge groups (observed and signed) and manual runs keep every story, in four cases, with axe.
+          KIT_PLAY_SET: "${{ github.event_name == 'pull_request' && 'commit' || 'all' }}",
           KIT_PLAY_A11Y: "${{ github.event_name == 'pull_request' && 'off' || 'on' }}",
-          KIT_PLAY_MAX_SECONDS: "${{ github.event_name == 'pull_request' && '420' || '' }}",
+          KIT_PLAY_MAX_SECONDS: "${{ github.event_name == 'pull_request' && '100' || '' }}",
           BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}',
           HEAD_SHA: '${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}',
         },

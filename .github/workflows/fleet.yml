@@ -3354,6 +3354,9 @@ jobs:
               "packages/fractal-ui/**",
               # Changelog stories render the app's changelog view and seen state.
               "apps/fractal-web/src/changelog/**",
+              "apps/fractal-web/src/web/ColdOpen.stories.tsx",
+              "apps/fractal-web/src/web/coldOpen.fixtures.ts",
+              "apps/fractal-web/src/web/index.html",
               "clients/typescript/st3-scenarios/**",
               "clients/typescript/st3-client/**",
               "package.json*",
@@ -3493,9 +3496,9 @@ jobs:
         env:
           pnpm_config_store_dir: "${{ runner.temp }}/pnpm-store"
           KIT_INPUTS: ${{ needs.fractal-web-changes.outputs.kit-inputs }}
-          KIT_PLAY_SET: ${{ github.event_name == 'pull_request' && 'critical' || 'all' }}
+          KIT_PLAY_SET: ${{ github.event_name == 'pull_request' && 'commit' || 'all' }}
           KIT_PLAY_A11Y: ${{ github.event_name == 'pull_request' && 'off' || 'on' }}
-          KIT_PLAY_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '420' || '' }}
+          KIT_PLAY_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '100' || '' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
       - name: Report job cache coverage

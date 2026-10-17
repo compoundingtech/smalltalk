@@ -56,7 +56,7 @@ To run only the gate after building Storybook, inside `nix develop .#web`:
 node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook-static /tmp/fractal-kit-play-receipt
 ```
 
-Options (environment): `KIT_PLAY_SET=critical` runs only stories tagged `critical` (add `tags: ['critical']` to a story or its meta; the UI owners decide which flows are critical), `KIT_PLAY_A11Y=off` skips the axe check (the separate full run keeps it), and `KIT_PLAY_MAX_SECONDS=<n>` fails a run that takes longer than its budget while still running every case. The receipt records the set, a11y mode, budget and CPU core-minutes.
+Options (environment): `KIT_PLAY_SET=commit` is the per-commit set, a narrowing of the critical stories to one case each (both widths for the layout stories) without two heavy ones; `scripts/kit-play-commit-set.mjs` lists exactly what it omits and the merge gate runs everything. `KIT_PLAY_SET=critical` runs only stories tagged `critical` (add `tags: ['critical']` to a story or its meta; the UI owners decide which flows are critical), `KIT_PLAY_A11Y=off` skips the axe check (the separate full run keeps it), and `KIT_PLAY_MAX_SECONDS=<n>` fails a run that takes longer than its budget while still running every case. The receipt records the set, a11y mode, budget and CPU core-minutes.
 
 ## Stories
 

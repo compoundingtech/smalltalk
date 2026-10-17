@@ -63,6 +63,9 @@ KIT_PATTERNS = (
     "packages/fractal-ui/**",
     # Changelog stories render the app's changelog view and seen state.
     "apps/fractal-web/src/changelog/**",
+    "apps/fractal-web/src/web/ColdOpen.stories.tsx",
+    "apps/fractal-web/src/web/coldOpen.fixtures.ts",
+    "apps/fractal-web/src/web/index.html",
     "clients/typescript/st3-scenarios/**",
     "clients/typescript/st3-client/**",
     "package.json*",
