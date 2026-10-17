@@ -102,9 +102,13 @@ pub fn observe_ci(run: u64, attempt: u64, artifact: u64, predecessors: &[String]
     for id in predecessors {
         oid(id)?;
     }
-    let home = std::env::var_os("HOME").context("protected profile HOME")?;
+    let home = PathBuf::from(std::env::var_os("HOME").context("protected profile HOME")?);
+    let directory = st3_client::product_dirs::resolve(
+        home.join(".config/st"),
+        home.join(".config/fractal"),
+    );
     let configuration: Configuration = serde_json::from_slice(&std::fs::read(
-        PathBuf::from(home).join(".config/st/evidence-ci.json"),
+        directory.join("evidence-ci.json"),
     )?)
     .context("private CI observer configuration")?;
     ensure!(
