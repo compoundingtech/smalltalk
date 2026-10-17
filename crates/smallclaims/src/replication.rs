@@ -276,6 +276,12 @@ pub struct ReplicationWorkerStatus {
     pub phase: String,
     pub last_attempt_at_unix_ms: u128,
     pub next_retry_at_unix_ms: Option<u128>,
+    /// Selected outbound route preference. Absent when an update only changes worker phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_is_preferred: Option<bool>,
+    /// Preferred-route cooldown deadline; cleared when a route update has no pending retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_retry_at_unix_ms: Option<u128>,
 }
 
 /// The carrier attempted locally, or unknown when this host has no dial evidence.

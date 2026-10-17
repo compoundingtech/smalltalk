@@ -10198,6 +10198,17 @@ fn render_replication_peers(
                     at.saturating_sub(now).div_ceil(1000)
                 );
             }
+            if let Some(preferred) = worker.route_is_preferred {
+                let route = if preferred { "preferred" } else { "fallback" };
+                let _ = writeln!(output, "  route {route}");
+            }
+            if let Some(at) = worker.preferred_retry_at_unix_ms {
+                let _ = writeln!(
+                    output,
+                    "  preferred route retry in {}s (unix ms {at})",
+                    at.saturating_sub(now).div_ceil(1000)
+                );
+            }
         }
         if !peer.differing_tables.is_empty() {
             let _ = writeln!(
