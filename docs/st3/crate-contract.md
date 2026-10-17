@@ -1,6 +1,6 @@
 # st3 crates: what is where and who may use what
 
-Four packages come from what used to be the single `st3` package:
+Five packages carry what used to be the single `st3` package and its end-to-end tests:
 
 | package | path | holds |
 |---|---|---|
@@ -8,6 +8,7 @@ Four packages come from what used to be the single `st3` package:
 | `st3-telemetry` | `crates/st3-telemetry` | the library's telemetry modules, which name no store, api or reconcile code: `otel`, `otel_client_class`, `reconcile_telemetry`, `recorder`, `recorder_report`, `relay_trace`, `slo_history`, `startup_telemetry`. It depends on `st3-kernel` and `smallclaims`. st3-daemon re-exports each one at its old path. `otlp`, `telemetry`, `slo`, `incremental` and `recorder_receipts` join once their store use moves up |
 | `st3-daemon` | `crates/st3-daemon` | the library: the claims graph, store, API, reconciliation and every module the daemon runs, its `hooks/`, `fixtures/` and `proptest-regressions/` |
 | `st3` | `crates/st3` | the `st3` binary (`main.rs` and the modules only the binary uses: `cli_help`, `completion`, `directive_note`, `doctor_cli`, `change_cli`, `presentation`, `setup`, `onboarding`), the `st3-fixture` binary, `build.rs`, `tests/`, `examples/`, and an empty library target (`src/package_marker.rs`, see below) |
+| `st3-e2e` | `crates/st3-e2e` | tests only: the tests that start a real daemon and drive a client or the feed against it (st3-client's `device_signing` and `transports`, the st3-feed tests). `st3-client` and `st3-feed` no longer have a dev-dependency on `st3-daemon`; `st3-client` had one, which closed a cycle with the daemon. |
 
 The binary and the tests depend on the library under the name `st3`
 (`st3 = { package = "st3-daemon", path = "../st3-daemon" }`), so `use st3::...` reads the same in
