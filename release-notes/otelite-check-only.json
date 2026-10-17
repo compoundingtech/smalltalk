@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep the test-only OTLP collector out of the installed st3 package identity.",
+  "replay": { "status": "none", "detail": "No projection or replay changes." },
+  "schema": { "status": "none", "detail": "No database or migration changes." },
+  "rules": { "status": "none", "detail": "No checkpoint or fleet rule changes." },
+  "compatibility": { "status": "none", "detail": "Runtime behavior is unchanged. The collector is resolved only when Nix checks run; OTLP export tests use the existing hermetic daemon fixture so they do not depend on the sandbox account's default shell." },
+  "downtime": { "status": "none", "detail": "Collector-only input updates no longer change the installed package identity or trigger a downstream package-based daemon restart." },
+  "manual": { "status": "none", "detail": "No manual configuration changes are required." },
+  "recovery": { "status": "none", "detail": "No persistent state changes." }
+}

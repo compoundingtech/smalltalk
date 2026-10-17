@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 fn st3() -> &'static Path {
-    test_bin!("st3")
+    test_bin!("st3-fixture")
 }
 
 fn otelite(test: &str) -> Option<PathBuf> {
