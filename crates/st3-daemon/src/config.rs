@@ -451,7 +451,7 @@ fn parse_duration_ms(value: &str, name: &str) -> Result<u64> {
 
 impl Default for Config {
     fn default() -> Self {
-        let state_dir = xdg_dir("XDG_STATE_HOME", ".local/state").join("st3");
+        let state_dir = st3_client::product_dirs::state_dir();
         let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| state_dir.join("run"));
@@ -513,9 +513,7 @@ impl Config {
     }
 
     pub fn default_path() -> PathBuf {
-        xdg_dir("XDG_CONFIG_HOME", ".config")
-            .join("st3")
-            .join("config.toml")
+        st3_client::product_dirs::config_dir().join("config.toml")
     }
 
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -948,14 +946,6 @@ pub fn default_agent_workspace(identity: &str) -> Result<PathBuf> {
     Ok(work_root()?.join("agents").join(identity))
 }
 
-fn xdg_dir(variable: &str, home_suffix: &str) -> PathBuf {
-    env::var_os(variable).map(PathBuf::from).unwrap_or_else(|| {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(home_suffix)
-    })
-}
 
 fn host_name() -> String {
     let host = machine_host_name();

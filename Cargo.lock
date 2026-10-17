@@ -4839,6 +4839,7 @@ dependencies = [
  "smallclaims",
  "st-drivers",
  "st-runtime",
+ "st3-client",
  "st3-schema",
  "st3-terminal-direct",
  "tar",

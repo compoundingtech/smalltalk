@@ -113,7 +113,12 @@ fn configured_person() -> Result<Option<String>> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    base.map(|base| person_from_config(&base.join("st3/config.toml")))
+    base.map(|base| {
+        person_from_config(
+            &st3_client::product_dirs::resolve(base.join("st3"), base.join("fractal"))
+                .join("config.toml"),
+        )
+    })
         .transpose()
         .map(Option::flatten)
 }
