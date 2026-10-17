@@ -16152,6 +16152,28 @@ fn claude_attachment_path(fence: &st3::mailbox::Fence) -> String {
     )
 }
 
+/// The daemon's refusal of a binding whose provider has already ended.
+fn provider_ended_before_bind(error: &anyhow::Error) -> bool {
+    st3::client::api_error_code(error) == Some("stale-mailbox-session")
+        && provider_ended_refusal(&format!("{error:#}"))
+}
+
+/// The text of that refusal, as a bind error or a fenced subscription carries it.
+fn provider_ended_refusal(text: &str) -> bool {
+    text.contains("stale-mailbox-session") && text.contains("the provider authority is terminal")
+}
+
+/// Whether the provider's task has returned, waiting briefly for it: its terminal record is
+/// written just before it returns, so the refusal can arrive a moment ahead of the task.
+async fn provider_task_settled(task: &tokio::task::JoinHandle<Result<()>>) -> bool {
+    let settled = async {
+        while !task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), settled).await.is_ok()
+}
+
 struct NativeMailbox {
     subscription: Option<st3::mailbox::Subscription>,
     fence: st3::mailbox::Fence,
@@ -16161,6 +16183,26 @@ struct NativeMailbox {
     last_title_warning: Option<Instant>,
 }
 impl NativeMailbox {
+    /// A mailbox with no subscription, for a provider that ended before it could be bound.
+    fn unbound(subject: &str, incarnation: &str, driver: &str, state: &mut NativeLoopState) -> Self {
+        let component = if matches!(driver, "codex" | "opencode") {
+            "delivery"
+        } else {
+            "title"
+        };
+        let fence = state
+            .mailbox_fence
+            .get_or_insert_with(|| st3::mailbox::Fence::new(subject, incarnation, component))
+            .clone();
+        Self {
+            subscription: None,
+            fence,
+            messages: Vec::new(),
+            queued: BTreeMap::new(),
+            replayed: false,
+            last_title_warning: None,
+        }
+    }
     async fn start(
         client: &Client,
         subject: &str,

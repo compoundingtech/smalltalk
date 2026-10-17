@@ -173,3 +173,24 @@ async fn retry_worker_does_not_keep_store_alive_during_scheduled_backoff() {
     assert!(weak.upgrade().is_none());
     worker.abort();
 }
+#[test]
+fn only_the_terminal_provider_refusal_counts_as_an_ended_provider() {
+    assert!(provider_ended_refusal(
+        "st API returned 422 stale-mailbox-session: the provider authority is terminal"
+    ));
+    for other in [
+        "st API returned 422 stale-mailbox-session: the provider session was superseded",
+        "st API returned 422 mailbox-session-starting: waiting for provider ownership",
+        "st API returned 500 internal: the provider authority is terminal",
+    ] {
+        assert!(!provider_ended_refusal(other), "{other}");
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn a_provider_task_that_has_returned_is_settled_and_one_that_has_not_is_not() {
+    let done = tokio::spawn(async { Ok(()) });
+    assert!(provider_task_settled(&done).await);
+    let running = tokio::spawn(std::future::pending::<Result<()>>());
+    assert!(!provider_task_settled(&running).await);
+    running.abort();
+}
