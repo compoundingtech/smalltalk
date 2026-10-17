@@ -6,6 +6,7 @@ pub use checkout::{agent_branch, checkout_label};
 mod contract;
 pub mod device;
 mod generated;
+pub mod product_dirs;
 /// W3C context injection, enabled by the optional `trace-propagation` feature.
 pub mod propagation;
 pub use contract::*;
@@ -50,8 +51,8 @@ pub fn discover_unix_endpoint(explicit: Option<PathBuf>) -> Result<PathBuf, Clie
         return Ok(path);
     }
 
-    let config_path = xdg_path("XDG_CONFIG_HOME", ".config")?
-        .join("st3")
+    let config_base = xdg_path("XDG_CONFIG_HOME", ".config")?;
+    let config_path = product_dirs::resolve(config_base.join("st3"), config_base.join("fractal"))
         .join("config.toml");
     match std::fs::read_to_string(&config_path) {
         Ok(document) => {
@@ -71,10 +72,12 @@ pub fn discover_unix_endpoint(explicit: Option<PathBuf>) -> Result<PathBuf, Clie
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(runtime).join("st3.sock"));
     }
-    Ok(xdg_path("XDG_STATE_HOME", ".local/state")?
-        .join("st3")
-        .join("run")
-        .join("st3.sock"))
+    let state_base = xdg_path("XDG_STATE_HOME", ".local/state")?;
+    Ok(
+        product_dirs::resolve(state_base.join("st3"), state_base.join("fractal"))
+            .join("run")
+            .join("st3.sock"),
+    )
 }
 
 fn configured_socket(document: &str) -> Result<Option<PathBuf>, ClientError> {

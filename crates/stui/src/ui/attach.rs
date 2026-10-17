@@ -90,7 +90,7 @@ pub fn terminal_answers(_timeout: std::time::Duration) -> bool {
     false
 }
 
-/// Where pasted images are kept: `$XDG_STATE_HOME/st3/stui/attachments`.
+/// Where pasted images are kept, below the selected product state directory.
 pub fn dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -98,7 +98,8 @@ pub fn dir() -> Option<PathBuf> {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
         })?;
     base.is_absolute()
-        .then(|| base.join("st3").join("stui").join("attachments"))
+        .then(|| st3_client::product_dirs::resolve(base.join("st3"), base.join("fractal"))
+            .join("stui").join("attachments"))
 }
 
 /// A pasted path that names an image file on this machine.

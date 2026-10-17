@@ -75,6 +75,7 @@ pub fn validate(name: &str) -> Result<()> {
 pub struct Instance {
     name: String,
     root: PathBuf,
+    legacy_root: PathBuf,
 }
 
 impl Instance {
@@ -83,7 +84,8 @@ impl Instance {
         anyhow::ensure!(home.is_absolute(), "HOME is not an absolute directory");
         Ok(Self {
             name: name.to_owned(),
-            root: home.join(ROOT_DIRECTORY).join(name),
+            root: st3_client::product_dirs::instance_root(home, name),
+            legacy_root: home.join(ROOT_DIRECTORY).join(name),
         })
     }
 
@@ -130,7 +132,8 @@ impl Instance {
 
     /// The instance's default work root: where its agents work, beside the rest of the instance.
     pub fn work_dir(&self) -> PathBuf {
-        self.root.join("work")
+        // Workspaces are a separate migration; do not move them with config/state.
+        self.legacy_root.join("work")
     }
 
     /// Where a macOS app bundle for this instance is installed, never the shared application folder.
@@ -298,6 +301,22 @@ pub fn service_environment() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_root_preserves_the_unmoved_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let new = home.path().join(".fractal-instance/try");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(
+            new.join(st3_client::product_dirs::RECEIPT_FILE),
+            format!("{}\n", st3_client::product_dirs::MIGRATION_ID),
+        ).unwrap();
+        let instance = Instance::new(home.path(), "try").unwrap();
+        assert_eq!(instance.root(), new);
+        assert_eq!(instance.state_home(), new.join("state"));
+        assert_eq!(instance.config_home(), new.join("config"));
+        assert_eq!(instance.work_dir(), home.path().join(".st-instance/try/work"));
+    }
 
     fn instance(name: &str) -> Instance {
         Instance::new(Path::new("/home/example"), name).unwrap()

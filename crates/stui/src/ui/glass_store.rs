@@ -146,7 +146,7 @@ pub(crate) fn person_state(person: &str) -> Option<(PathBuf, String)> {
     let mut hasher = DefaultHasher::new();
     person.hash(&mut hasher);
     Some((
-        base.join("st3").join("stui"),
+        st3_client::product_dirs::resolve(base.join("st3"), base.join("fractal")).join("stui"),
         format!("{:016x}", hasher.finish()),
     ))
 }

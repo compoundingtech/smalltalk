@@ -569,8 +569,8 @@ pub fn profile_path() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .context("Set XDG_CONFIG_HOME or HOME for the device profile")?;
     ensure!(base.is_absolute(), "The config directory must be absolute");
-    // Preserve the existing stui location: both entrypoints now use this profile.
-    Ok(base.join("st3/stui-devices.json"))
+    Ok(crate::product_dirs::resolve(base.join("st3"), base.join("fractal"))
+        .join("stui-devices.json"))
 }
 
 pub fn assistant_profile_path() -> Result<PathBuf> {
