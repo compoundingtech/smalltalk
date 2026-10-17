@@ -91,7 +91,7 @@ pub struct GithubConfig {
 impl GithubConfig {
     pub fn is_default(&self) -> bool { self == &Self::default() }
 
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.observer_requests_per_hour.is_none_or(|cap| (1..=1000).contains(&cap)),
             "github.observer_requests_per_hour must be1..1000 or omitted for meter-only");
         anyhow::ensure!(self.token_file.is_none() || self.sekrets_profile.is_none(),
@@ -109,7 +109,7 @@ impl GithubConfig {
 
 /// Validate the opened descriptor before reading its contents, including on every reload.
 /// Nonblocking open lets a configured FIFO fail validation without hanging startup.
-pub(crate) fn open_token_file(path: &Path) -> Result<fs::File> {
+pub fn open_token_file(path: &Path) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = fs::OpenOptions::new()
         .read(true)
@@ -121,7 +121,7 @@ pub(crate) fn open_token_file(path: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
-pub(crate) fn validate_token_file_metadata(metadata: &fs::Metadata, effective_uid: u32) -> Result<()> {
+pub fn validate_token_file_metadata(metadata: &fs::Metadata, effective_uid: u32) -> Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     anyhow::ensure!(
         metadata.is_file(),
@@ -394,11 +394,11 @@ impl OtlpConfig {
         Ok(())
     }
 
-    pub(crate) fn logs_url(&self) -> String {
+    pub fn logs_url(&self) -> String {
         format!("{}/v1/logs", self.endpoint.trim_end_matches('/'))
     }
 
-    pub(crate) fn headers(&self) -> Result<std::collections::BTreeMap<String, String>> {
+    pub fn headers(&self) -> Result<std::collections::BTreeMap<String, String>> {
         let Some(path) = &self.headers_file else {
             return Ok(Default::default());
         };

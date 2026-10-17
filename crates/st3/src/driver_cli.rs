@@ -30,7 +30,7 @@ pub(super) fn run_driver_hook() -> ExitCode {
         )
     };
     let code = if name == "claude-observe" {
-        st3::telemetry::hook(&env, run)
+        st3::telemetry::hook(&env, run, st3::driver_hook::submit_telemetry)
     } else {
         st3::telemetry::local_only();
         run()

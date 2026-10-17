@@ -4,8 +4,8 @@ Four packages come from what used to be the single `st3` package:
 
 | package | path | holds |
 |---|---|---|
-| `st3-kernel` | `crates/st3-kernel` | the library's leaf modules, which name no store, api or reconcile code: `accounts`, `archive`, `boot`, `cli_output`, `conversation_header`, `conversation_search`, `disk`, `evidence`, `fleet`, `gate_kinds`, `gate_report`, `github_admission`, `harness_events`, `hooks`, `instance`, `lane`, `memory`, `model`, `native_views`, `pricing`, `projection`, `publication`, `read_cache`, `rules`, `seat_queue`, `skill`, `terminal_binding`. st3-daemon re-exports each one at its old path (`pub use st3_kernel::model;`), so `crate::model` and `st3::model` read the same |
-| `st3-telemetry` | `crates/st3-telemetry` | the library's telemetry modules, which name no store, api or reconcile code: `otel`, `otel_client_class`, `reconcile_telemetry`, `recorder`, `recorder_report`, `relay_trace`, `slo_history`, `startup_telemetry`. It depends on `st3-kernel` and `smallclaims`. st3-daemon re-exports each one at its old path. `otlp`, `telemetry`, `slo`, `incremental` and `recorder_receipts` join once their store use moves up |
+| `st3-kernel` | `crates/st3-kernel` | the library's leaf modules, which name no store, api or reconcile code: `accounts`, `archive`, `boot`, `cli_output`, `config`, `conversation_header`, `conversation_search`, `disk`, `evidence`, `fleet`, `gate_kinds`, `gate_report`, `github_admission`, `harness_events`, `hooks`, `instance`, `lane`, `memory`, `model`, `native_views`, `pricing`, `projection`, `publication`, `read_cache`, `rules`, `seat_queue`, `skill`, `terminal_binding`. st3-daemon re-exports each one at its old path (`pub use st3_kernel::model;`), so `crate::model` and `st3::model` read the same |
+| `st3-telemetry` | `crates/st3-telemetry` | the library's telemetry modules, which name no store, api, client or reconcile code: `incremental`, `otel`, `otel_client_class`, `otlp`, `reconcile_telemetry`, `recorder`, `recorder_report`, `relay_trace`, `slo`, `slo_history`, `startup_telemetry`, `telemetry`. It depends on `st3-kernel` and `smallclaims`. st3-daemon re-exports each one at its old path. What would name the store or the API is a trait the daemon implements (`incremental::ChangeSource`, `otlp::ObservationSource`) or a value the caller passes (`telemetry::hook`'s submit, `otlp::run_slo`'s windows reader). `recorder_receipts` writes claims through the store and stays in st3-daemon; the unit tests that need the store, the graph or the API live in st3-daemon's `telemetry_tests` |
 | `st3-daemon` | `crates/st3-daemon` | the library: the claims graph, store, API, reconciliation and every module the daemon runs, its `hooks/`, `fixtures/` and `proptest-regressions/` |
 | `st3` | `crates/st3` | the `st3` binary (`main.rs` and the modules only the binary uses: `cli_help`, `completion`, `directive_note`, `doctor_cli`, `change_cli`, `presentation`, `setup`, `onboarding`), the `st3-fixture` binary, `build.rs`, `tests/`, `examples/`, and an empty library target (`src/package_marker.rs`, see below) |
 
@@ -54,7 +54,8 @@ macros. Other crates use a part of it:
   `test_support`; a kernel unit test that needs daemon code (intent parsing, a store constant) lives
   in st3-daemon's `kernel_tests` and reaches the kernel through the re-exports. A module joins the
   kernel once nothing it names (in production code or its tests) is outside the kernel.
-- **st3-telemetry names nothing above the kernel.** Its modules reach `st3_kernel` and `smallclaims` only;
-  `startup_telemetry`'s source-reading test still reads `crates/st3/src/main.rs` through `include_str!`.
+- **st3-telemetry names nothing above the kernel.** Its modules reach `st3_kernel` and `smallclaims` only.
+  Two tests read source files through `include_str!`: `startup_telemetry` reads `crates/st3/src/main.rs`
+  (`../../st3/src/main.rs`) and `slo` reads `crates/st3-daemon/src/api.rs` (`../../st3-daemon/src/api.rs`).
 
 `scripts/check-module-layers` reports the first three.

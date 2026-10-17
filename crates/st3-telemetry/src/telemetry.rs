@@ -10,8 +10,24 @@ use serde_json::{Value, json};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-use crate::driver_hook::HookEnv;
-use crate::model::ClaimInput;
+use st3_kernel::model::ClaimInput;
+
+/// What a hook sees of its process environment.
+pub trait HookEnv {
+    fn var(&self, name: &str) -> Option<String>;
+    fn raw_var(&self, name: &str) -> Option<String> {
+        self.var(name)
+    }
+}
+
+impl HookEnv for BTreeMap<String, String> {
+    fn raw_var(&self, name: &str) -> Option<String> {
+        self.get(name).cloned()
+    }
+    fn var(&self, name: &str) -> Option<String> {
+        self.get(name).filter(|value| !value.is_empty()).cloned()
+    }
+}
 
 pub const KIND: &str = "harness.telemetry";
 /// This bounds daemon admission, independently of collector availability or outage retries.
@@ -77,7 +93,13 @@ impl Visit for Fields {
 
 /// Run the event hook unchanged, collecting the invocation only at its actual application
 /// point. Stderr filtering cannot silence the warning capture. Telemetry cannot change its exit.
-pub fn hook(env: &dyn HookEnv, run: impl FnOnce() -> u8) -> u8 {
+///
+/// `submit` hands the signal to the local daemon; the caller owns the client and its configuration.
+pub fn hook(
+    env: &dyn HookEnv,
+    run: impl FnOnce() -> u8,
+    submit: impl FnOnce(&dyn HookEnv, &ClaimInput) -> anyhow::Result<()>,
+) -> u8 {
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -146,25 +168,4 @@ pub fn hook(env: &dyn HookEnv, run: impl FnOnce() -> u8) -> u8 {
         let _ = submit(env, &claim);
     }
     code
-}
-
-fn submit(env: &dyn HookEnv, claim: &ClaimInput) -> anyhow::Result<()> {
-    let endpoint = match env.var("ST3_ENDPOINT") {
-        Some(endpoint) => crate::client::Endpoint::parse(endpoint),
-        None => {
-            crate::client::Endpoint::Unix(crate::config::Config::load_client_unvalidated(None)?.0.socket)
-        }
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let client = crate::client::Client::new(endpoint);
-        tokio::time::timeout(
-            HOOK_SUBMIT_TIMEOUT,
-            client.post::<_, Value>("/v1/claims", claim),
-        )
-        .await??;
-        Ok(())
-    })
 }

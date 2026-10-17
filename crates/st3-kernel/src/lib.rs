@@ -5,6 +5,7 @@ pub mod cli_output;
 pub mod accounts;
 pub mod archive;
 pub mod boot;
+pub mod config;
 pub mod conversation_search;
 pub mod disk;
 /// Offline signed gate observations in immutable git notes refs.
