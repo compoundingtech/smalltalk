@@ -41,6 +41,15 @@ production_build() (
 )
 
 
+kit_storybook() (
+  # The module graph proves every bundled repository file is a declared kit input.
+  local stats_dir
+  stats_dir=$(mktemp -d "${TMPDIR:-/tmp}/fractal-kit-stats.XXXXXX")
+  trap 'rm -rf "$stats_dir"' EXIT
+  pnpm --filter @smalltalk/fractal-ui build-storybook --stats-json "$stats_dir"
+  python3 scripts/ci-fractal-web-kit-graph "$stats_dir/preview-stats.json"
+)
+
 kit_plays() (
   local receipt_dir
   receipt_dir=$(mktemp -d "${TMPDIR:-/tmp}/fractal-kit-plays.XXXXXX")
@@ -74,7 +83,7 @@ case "${KIT_INPUTS:-true}" in
     lane "UI kit play index contracts" node --test packages/fractal-ui/scripts/kit-play-index.node-test.mjs
     lane "UI kit context isolation controls" node packages/fractal-ui/scripts/kit-play-isolation.browser-test.mjs
     lane "UI kit gate set, a11y and budget controls" node --test packages/fractal-ui/scripts/kit-play-gate.browser-test.mjs
-    lane "UI kit Storybook" pnpm --filter @smalltalk/fractal-ui build-storybook
+    lane "UI kit Storybook and module graph" kit_storybook
     lane "UI kit strict plays (440/1440 × dark/light)" kit_plays
     ;;
   false)

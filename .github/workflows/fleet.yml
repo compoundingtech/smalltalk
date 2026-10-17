@@ -3349,8 +3349,11 @@ jobs:
               ".github/repo-settings.json*",
           )
           # Keep workspace dependency coverage in sync with the guarded package graph in ci-fractal-web-test.
+          # scripts/ci-fractal-web-kit-graph fails the kit lane when the built Storybook bundles a file outside these.
           KIT_PATTERNS = (
               "packages/fractal-ui/**",
+              # Changelog stories render the app's changelog view and seen state.
+              "apps/fractal-web/src/changelog/**",
               "clients/typescript/st3-scenarios/**",
               "clients/typescript/st3-client/**",
               "package.json*",
