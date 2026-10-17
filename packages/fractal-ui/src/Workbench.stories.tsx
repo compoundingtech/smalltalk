@@ -68,7 +68,7 @@ export const Dark: Story = {}
 export const Light: Story = { args: { scheme: 'light' } }
 export const OnePane: Story = { args: { state: 'one' } }
 /** The exact reviewed idle sample seed keeps plain Enter's immediate-send case independent of running policy. */
-export const IdleSample: Story = { args: { state: 'one', seed: 'idle' }, play: async ({ canvasElement }) => {
+export const IdleSample: Story = { tags: ['critical'], args: { state: 'one', seed: 'idle' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const input = canvas.getByTestId('composer-input')
   await userEvent.clear(input)
@@ -78,7 +78,7 @@ export const IdleSample: Story = { args: { state: 'one', seed: 'idle' }, play: a
   await expect(canvas.queryByText(/will send after run/)).toBeNull()
 } }
 /** Plain Enter queues during a run; a modifier explicitly steers without draining that queue. */
-export const RunningQueueAndSteer: Story = { args: { state: 'one', seed: 'running' }, play: async ({ canvasElement }) => {
+export const RunningQueueAndSteer: Story = { tags: ['critical'], args: { state: 'one', seed: 'running' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const input = canvas.getByTestId('composer-input')
   await userEvent.clear(input)
@@ -111,7 +111,7 @@ export const RendererOverride: Story = { render: function Render(args) {
 } }
 
 /** Effect 3 optional fields also permit an explicitly present undefined value. */
-export const OptionalSnapshotFields: Story = { args: { state: 'one' }, play: async () => {
+export const OptionalSnapshotFields: Story = { tags: ['critical'], args: { state: 'one' }, play: async () => {
   const workspace = 'kit-b-optional-codec'
   const layout: WorkbenchLayout = {
     kind: 'split', split: 'right', ratio: undefined,
@@ -127,7 +127,7 @@ export const OptionalSnapshotFields: Story = { args: { state: 'one' }, play: asy
 } }
 
 /** Closing a nested pane promotes its neighbour without losing ratios or the exact host identity. */
-export const KeyboardCloseAndSnapshot: Story = { args: { state: 'nested' }, play: async ({ canvasElement }) => {
+export const KeyboardCloseAndSnapshot: Story = { tags: ['critical'], args: { state: 'nested' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await userEvent.click(canvas.getByRole('button', { name: 'Reset layout' }))
   await settle()
@@ -154,7 +154,7 @@ export const KeyboardCloseAndSnapshot: Story = { args: { state: 'nested' }, play
   await settle()
   await expect(separator.getAttribute('aria-valuenow')).toBe('78')
 } }
-export const KeyboardTabsAndTerminal: Story = { args: { state: 'tabs' }, play: async ({ canvasElement }) => {
+export const KeyboardTabsAndTerminal: Story = { tags: ['critical'], args: { state: 'tabs' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await userEvent.click(canvas.getByRole('button', { name: 'Reset layout' }))
   const first = canvas.getByRole('tab', { name: 'worker-1' })
@@ -177,7 +177,7 @@ export const KeyboardTabsAndTerminal: Story = { args: { state: 'tabs' }, play: a
   await userEvent.click(canvas.getByRole('button', { name: 'Hide terminal' }))
   await expect(canvas.queryByTestId('terminal-drawer')).toBeNull()
 } }
-export const KeyboardSplitPreservesHost: Story = { args: { state: 'one' }, play: async ({ canvasElement }) => {
+export const KeyboardSplitPreservesHost: Story = { tags: ['critical'], args: { state: 'one' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await userEvent.click(canvas.getByRole('button', { name: 'Reset layout' }))
   const host = canvasElement.querySelector('[data-pane-key="agent:worker-1"]')!
@@ -192,7 +192,7 @@ export const KeyboardSplitPreservesHost: Story = { args: { state: 'one' }, play:
   await expect(editor).toHaveValue('Preserve across split')
   await expect(canvas.getByRole('separator', { name: 'Resize split panes' })).toHaveAttribute('aria-valuenow', '50')
 } }
-export const HostToolReveal: Story = { args: { state: 'two' }, play: async ({ canvasElement }) => {
+export const HostToolReveal: Story = { tags: ['critical'], args: { state: 'two' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await userEvent.click(canvas.getByRole('button', { name: 'Reset layout' }))
   const file = canvas.getByRole('button', { name: 'sample/rows.ts' })
@@ -218,7 +218,7 @@ export const HostToolReveal: Story = { args: { state: 'two' }, play: async ({ ca
   await expect(file).toHaveAttribute('aria-expanded', 'true')
   await expect(fileDiff.getByTestId('diff-code')).toBeVisible()
 } }
-export const AllStates: Story = { render: args => <main aria-label="Workbench states" {...stylex.props(styles.matrix)}>{(['one', 'two', 'three', 'dragging'] as const).map(state => <section key={state} {...stylex.props(styles.specimen)}><h2>{state} · W3/H1/P3/D2</h2><WorkbenchStory {...args} state={state} persist={false} /></section>)}</main>, play: async ({ canvasElement }) => {
+export const AllStates: Story = { tags: ['critical'], render: args => <main aria-label="Workbench states" {...stylex.props(styles.matrix)}>{(['one', 'two', 'three', 'dragging'] as const).map(state => <section key={state} {...stylex.props(styles.specimen)}><h2>{state} · W3/H1/P3/D2</h2><WorkbenchStory {...args} state={state} persist={false} /></section>)}</main>, play: async ({ canvasElement }) => {
   await settle()
   // Syntax tokens belong to kit A; these assertions target newly reachable UI counts, markers and washes.
   const chrome = canvasElement.querySelectorAll('[data-testid="pane-header"] span, [data-testid="diff-panel"] span, [data-testid="diff-code"] > div')

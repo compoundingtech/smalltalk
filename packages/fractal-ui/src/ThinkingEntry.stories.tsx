@@ -13,7 +13,7 @@ function ThinkingStory({ scheme = 'dark', streaming = false }: { scheme?: Scheme
 const meta = { title: 'Fractal UI/Thinking Entry', component: ThinkingStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', streaming: false }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ThinkingStory>
 export default meta
 type Story = StoryObj<typeof meta>
-export const Settled: Story = { play: async ({ canvasElement }) => {
+export const Settled: Story = { tags: ['critical'], play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const thinking = canvas.getByRole('button', { name: 'Thinking' })
   await expect(thinking).toHaveAttribute('aria-expanded', 'false')
@@ -30,7 +30,7 @@ export const Settled: Story = { play: async ({ canvasElement }) => {
   await expect(thinking).toHaveAttribute('aria-expanded', 'false')
   await expect(canvasElement.querySelector('[data-testid="markdown"]')).toBeNull()
 } }
-export const Streaming: Story = { args: { streaming: true }, play: async ({ canvasElement }) => {
+export const Streaming: Story = { tags: ['critical'], args: { streaming: true }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const thinking = canvas.getByRole('button', { name: 'Thinking' })
   await expect(thinking).toHaveAttribute('aria-expanded', 'false')

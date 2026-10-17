@@ -163,7 +163,7 @@ const tabTo = async (element: HTMLElement) => {
   await expect(element).toHaveFocus()
 }
 
-export const Idle: Story = {
+export const Idle: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   play: async ({ canvasElement }) => {
     const field = textbox(canvasElement)
@@ -187,7 +187,7 @@ export const Idle: Story = {
   },
 }
 export const IdleLight: Story = { ...Idle, args: { scheme: 'light' } }
-export const TypingMultiLine: Story = {
+export const TypingMultiLine: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'typing multi-line' },
   play: async ({ canvasElement }) => {
@@ -201,7 +201,7 @@ export const TypingMultiLine: Story = {
     await expect(log.getByText(/Mentions: agent\/review, agent:review, file\/src\/composer\/draft\.ts/)).toBeVisible()
   },
 }
-export const Running: Story = {
+export const Running: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'running' },
   play: async ({ canvasElement }) => {
@@ -217,7 +217,7 @@ export const Running: Story = {
     await waitFor(() => expect(within(receiptLog(canvasElement)).getByText('Include the unread counter in the review.')).toBeVisible())
   },
 }
-export const QueuedTwice: Story = {
+export const QueuedTwice: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'queued x2' },
   play: async ({ canvasElement }) => {
@@ -229,7 +229,7 @@ export const QueuedTwice: Story = {
     await expect(queue.getAllByLabelText('Queued message effort').map(node => node.textContent)).toEqual(['Effort: medium'])
   },
 }
-export const FailedSendRestored: Story = {
+export const FailedSendRestored: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'failed send (restored)' },
   play: async ({ canvasElement }) => {
@@ -237,7 +237,7 @@ export const FailedSendRestored: Story = {
     await waitFor(() => expect(textbox(canvasElement).textContent).toContain('Send the generated review summary.'))
   },
 }
-export const OfflineDraft: Story = {
+export const OfflineDraft: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'offline draft' },
   play: async ({ canvasElement }) => {
@@ -250,7 +250,7 @@ export const OfflineDraft: Story = {
     await waitFor(() => expect(canvas.getByRole('button', { name: 'Send' })).toBeEnabled())
   },
 }
-export const ImageAttached: Story = {
+export const ImageAttached: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'image attached' },
   play: async ({ canvasElement }) => {
@@ -268,7 +268,7 @@ export const AllStates: Story = {
 export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }
 
 /** Readout and picker tooltips: keyboard focus reaches the full value once, without native titles. */
-export const TargetTooltips: Story = {
+export const TargetTooltips: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'running' },
   render: args => <Surface scheme={args.scheme}><div {...stylex.props(styles.gallery)}>{(['K1', 'K2', 'K3'] as const).map(target => <div key={target} {...stylex.props(styles.narrow)}><ComposerFrame policy={{ ...decided, target }} state={args.state} effort={args.effort} frameId={`tooltip.${target}`} /></div>)}</div></Surface>,
@@ -305,7 +305,7 @@ export const TargetTooltips: Story = {
 export const TargetTooltipsLight: Story = { ...TargetTooltips, args: { scheme: 'light', state: 'running' } }
 
 /** Suggestion popup geometry: 4px above the form, sticky group headers, 28px rows, first result active on open. */
-export const MentionPopup: Story = {
+export const MentionPopup: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { mentions: 'M3' },
   play: async ({ canvasElement }) => {
@@ -348,7 +348,7 @@ export const MentionPopup: Story = {
   },
 }
 export const MentionPopupLight: Story = { ...MentionPopup, args: { scheme: 'light', mentions: 'M3' } }
-export const SlashCommands: Story = {
+export const SlashCommands: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   play: async ({ canvasElement }) => {
     const page = within(canvasElement.ownerDocument.body)
@@ -363,7 +363,7 @@ export const SlashCommands: Story = {
 }
 
 /** IME composition owns Enter: confirming a candidate never sends; Enter after composition does. */
-export const ImeComposition: Story = {
+export const ImeComposition: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   play: async ({ canvasElement }) => {
     const field = textbox(canvasElement)
@@ -379,7 +379,7 @@ export const ImeComposition: Story = {
   },
 }
 /** Shift+Enter inserts a newline; the composer grows instead of sending. */
-export const ShiftEnterNewline: Story = {
+export const ShiftEnterNewline: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   play: async ({ canvasElement }) => {
     const field = textbox(canvasElement)
@@ -400,7 +400,7 @@ function RemountingComposer(args: ComposerArgs) {
   </Surface>
 }
 /** Drafts persist per key across remounts, including structured chips. */
-export const DurableDraft: Story = {
+export const DurableDraft: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   render: args => <RemountingComposer {...args} />,
   play: async ({ canvasElement }) => {
@@ -420,7 +420,7 @@ const effortFrames = (['supported', 'unsupported', 'unknown', 'queued'] as const
   id, effort: id === 'queued' ? 'supported' as const : id, state: id === 'queued' ? 'queued x2' as const : 'typing multi-line' as const,
 }))
 /** Effort is conversation-frame metadata: one-shot by default, optionally kept for the next messages. */
-export const EffortSupported: Story = {
+export const EffortSupported: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'typing multi-line', effort: 'supported' },
   play: async ({ canvasElement }) => {
@@ -453,7 +453,7 @@ export const EffortSupported: Story = {
     await expect(picker).toHaveAccessibleName('Select effort: Medium')
   },
 }
-export const EffortUnsupported: Story = {
+export const EffortUnsupported: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'typing multi-line', effort: 'unsupported' },
   play: async ({ canvasElement }) => {
@@ -464,7 +464,7 @@ export const EffortUnsupported: Story = {
     await tooltipFor(canvas.getByRole('group', { name: 'Effort unsupported reason' }), 'This harness does not support per-message effort.')
   },
 }
-export const EffortUnknown: Story = {
+export const EffortUnknown: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'typing multi-line', effort: 'unknown' },
   play: async ({ canvasElement }) => {
@@ -484,7 +484,7 @@ const footerBudgetFrames = ([320, 360, 451] as const).flatMap(composerWidth =>
     composerWidth, policy: { layout, target, running, mentions: 'M2' } satisfies ComposerPolicy, frameId: `footer-budget.${composerWidth}.${layout}.${target}.${running}`,
   })))))
 /** The declared width is the real form width; every footer control stays inside its running composer. */
-export const FooterWidthBudget: Story = {
+export const FooterWidthBudget: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   args: { state: 'running', effort: 'supported' },
   render: args => <Surface scheme={args.scheme} testId="composer-footer-width-budget"><div aria-label="Footer width budget previews" {...stylex.props(styles.budgetPreviews)}>{footerBudgetFrames.map(frame => <ComposerFrame key={frame.frameId} {...frame} state="running" effort="supported" />)}</div></Surface>,
@@ -530,7 +530,7 @@ export const FooterWidthBudget: Story = {
 export const FooterWidthBudgetLight: Story = { ...FooterWidthBudget, args: { scheme: 'light', state: 'running', effort: 'supported' } }
 
 /** C1/C3 use a pill only when the actual lane leaves enough editor space; draft wrapping and C3 focus use a slab. */
-export const LayoutShapes: Story = {
+export const LayoutShapes: Story = { tags: ['critical'],
   beforeEach: clearDrafts,
   render: args => <Surface scheme={args.scheme}><div {...stylex.props(styles.gallery)}>{(['C1', 'C2', 'C3'] as const).map(layout => <div key={layout} {...stylex.props(styles.geometryLane(768))}><ComposerFrame policy={{ ...decided, layout }} state="idle" effort={args.effort} frameId={`layout.${layout}`} /></div>)}</div></Surface>,
   play: async ({ canvasElement }) => {
@@ -569,7 +569,7 @@ function LabelResize({ scheme }: { readonly scheme: Scheme }) {
     </EmbraceRuntimeProvider>
   </div></Surface>
 }
-export const KitLabelResize: Story = {
+export const KitLabelResize: Story = { tags: ['critical'],
   render: args => <LabelResize scheme={args.scheme} />,
   play: async ({ canvasElement }) => {
     const form = canvasElement.querySelector('form')!
@@ -608,7 +608,7 @@ function PlainAdapter({ scheme }: { readonly scheme: Scheme }) {
     <div aria-label="Adapter messages" role="log" {...stylex.props(styles.receipts)}>{sent.map((line, index) => <p key={index} {...stylex.props(styles.receipt)}>{line}</p>)}</div>
   </div></Surface>
 }
-export const PlainTextAdapter: Story = {
+export const PlainTextAdapter: Story = { tags: ['critical'],
   beforeEach: () => { try { sessionStorage.removeItem('composition.draft.kit-composer.plain-adapter') } catch { /* Storage may be disabled. */ } },
   render: args => <PlainAdapter scheme={args.scheme} />,
   play: async ({ canvasElement }) => {

@@ -16,7 +16,7 @@ const meta = { title: 'Fractal UI/Thread header', component: ThreadHeaderStory, 
 export default meta
 type Story = StoryObj<typeof meta>
 /** The host knows why the terminal is unavailable: the toggle stays in place, disabled and described. */
-export const TerminalDisabled: Story = { args: { terminalDisabledReason: terminalReason }, play: async ({ canvasElement }) => {
+export const TerminalDisabled: Story = { tags: ['critical'], args: { terminalDisabledReason: terminalReason }, play: async ({ canvasElement }) => {
   const header = within(canvasElement).getByTestId('thread-header')
   const toggle = within(header).getByRole('button', { name: 'Toggle terminal drawer' })
   await expect(toggle).toBeVisible()
@@ -28,7 +28,7 @@ export const TerminalDisabled: Story = { args: { terminalDisabledReason: termina
 } }
 export const TerminalDisabledLight: Story = { ...TerminalDisabled, args: { ...TerminalDisabled.args, scheme: 'light' } }
 /** Without a reason the unavailable terminal leaves no toggle behind. */
-export const TerminalHidden: Story = { play: async ({ canvasElement }) => {
+export const TerminalHidden: Story = { tags: ['critical'], play: async ({ canvasElement }) => {
   const header = within(canvasElement).getByTestId('thread-header')
   await expect(within(header).queryByRole('button', { name: 'Toggle terminal drawer' })).toBeNull()
   await expect(within(header).getByRole('button', { name: 'Toggle right panel' })).toBeVisible()

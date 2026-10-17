@@ -585,7 +585,10 @@ animations at their end state for the a11y check instead of a fixed 100 ms sleep
 before waiting for them. A play that leaves UI opening after it returns (a hover
 card under the pointer) waits for that state itself rather than relying on the sleep.
 
-The gate takes three options, all unset in CI today (full set, a11y on, no budget).
+The gate takes three options. Pull requests run the stories tagged `critical` with a11y
+off and a 420-second budget; merge groups (observed and signed by Evidence observe) and
+manual runs keep every story with a11y on and no budget, so every tree that reaches main
+has had the full matrix and axe. Which stories are critical is the UI owners' choice.
 `KIT_PLAY_SET=critical` selects only stories tagged `critical` (an empty selection fails);
 `KIT_PLAY_A11Y=off` sets addon-a11y's own `a11y.manual` global so axe does not run, and
 each case must then carry no a11y report, while with a11y on each case must carry exactly
