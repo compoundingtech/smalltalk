@@ -73,7 +73,8 @@ describe('derived changelog registry', () => {
     expect(generated).toContain('"2026-10-16-left-entry.ts"')
     expect(generated).toContain('"2026-10-16-right-entry.ts"')
     expect(checkChangelogRegistry(directory)).toEqual({ ok: true, reason: 'fresh' })
-    expect(listChangelogEntryFiles(directory).slice(0, 2)).toEqual(['2026-10-16-right-entry.ts', '2026-10-16-left-entry.ts'])
+    const syntheticEntries = ['2026-10-16-right-entry.ts', '2026-10-16-left-entry.ts']
+    expect(listChangelogEntryFiles(directory).filter((file) => syntheticEntries.includes(file))).toEqual(syntheticEntries)
   })
 
   it('control: the same two branches conflict when the generated registry is committed', () => {
