@@ -25,6 +25,7 @@ export type SidebarAgentRowProps = SidebarClock & {
   readonly extraSignals?: readonly ExtraSignal[]
   readonly discRefinement?: DiscRefinement
   readonly active?: boolean
+  /** Overrides `SidebarQueryContext` for this row and its nested rows. A per-row prop re-renders every row on each keystroke; prefer the context. */
   readonly query?: string
   readonly actions?: SidebarActions
   readonly onOpen?: (row: Row) => void
@@ -33,9 +34,15 @@ export type SidebarAgentRowProps = SidebarClock & {
   readonly inTree?: boolean
   readonly treeExpanded?: boolean
 }
-/** Fuzzy highlighting uses the upstream matcher, not a second search implementation. */
-export function Highlight({ value, query = '' }: { readonly value: string; readonly query?: string }) {
-  const matched = matchPositions({ query, text: value })
+/**
+ * The host's sidebar search query. Only `Highlight` reads it, so a keystroke re-renders the
+ * highlighted titles while memoized rows with unchanged props skip rendering.
+ */
+export const SidebarQueryContext = React.createContext('')
+/** Fuzzy highlighting uses the upstream matcher, not a second search implementation. An explicit `query` takes precedence over `SidebarQueryContext`. */
+export function Highlight({ value, query }: { readonly value: string; readonly query?: string }) {
+  const contextQuery = React.useContext(SidebarQueryContext)
+  const matched = matchPositions({ query: query ?? contextQuery, text: value })
   if (matched.size === 0) return <>{value}</>
   return <>{Array.from(value, (letter, index) => matched.has(index) ? <mark key={index} {...stylex.props(styles.mark)}>{letter}</mark> : letter)}</>
 }
@@ -115,7 +122,7 @@ export function AgentHoverCard({ row, ...clock }: { readonly row: Row } & Sideba
     </dl>
   </div>
 }
-export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, variant = 'SR-2', layout = 'SR2-A', glyph = 'SG-1', extraSignals = defaultExtraSignals, discRefinement = 'G1', active = false, query = '', now, actions, onOpen, onMarkRead, onToggleChildren, inTree = false, treeExpanded }: SidebarAgentRowProps) {
+export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, variant = 'SR-2', layout = 'SR2-A', glyph = 'SG-1', extraSignals = defaultExtraSignals, discRefinement = 'G1', active = false, query, now, actions, onOpen, onMarkRead, onToggleChildren, inTree = false, treeExpanded }: SidebarAgentRowProps) {
   const title = sidebarRowTitle(item)
   const host = item.host
   const metadata = React.useMemo(() => sidebarRowDescription(item), [item])
