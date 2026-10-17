@@ -453,6 +453,16 @@ fn rollout_drains_then_resumes_once_across_disk_reopens() {
             ))
             .is_err()
     );
+    seat.step();
+    let verification_index = seat.store.index().unwrap();
+    for _ in 0..8 {
+        seat.step();
+    }
+    assert_eq!(
+        seat.store.index().unwrap(),
+        verification_index,
+        "unchanged verification must not append runtime observations while waiting for the native binding"
+    );
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -530,6 +540,7 @@ fn rollout_session_mismatch_stops_only_failed_replacement_and_never_falls_back()
         "{:?}",
         seat.operation().reason
     );
+    seat.step();
     seat.binding("replacement-1", "wrong-session");
     seat.step();
     assert_eq!(seat.operation().phase, "failed");
@@ -736,7 +747,6 @@ fn rollout_recovers_a_spawn_receipt_gap_from_the_exact_driver_marker() {
     let member = seat.desired().member.unwrap();
     seat.runtime.start(&member).unwrap();
     seat.append("harness.observed",json!({"state":"idle","driver":"claude","incarnation_id":"replacement-1","quiescent":true,"rollout_operation":operation.id}));
-    seat.binding("replacement-1", "native-one");
     seat.reopen();
     seat.step();
     assert_eq!(
@@ -746,6 +756,8 @@ fn rollout_recovers_a_spawn_receipt_gap_from_the_exact_driver_marker() {
         seat.operation().reason
     );
     seat.reopen();
+    seat.step();
+    seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
     assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
@@ -777,6 +789,7 @@ fn rollout_supersession_after_positive_exit_starts_only_the_new_winner() {
     assert_eq!(current.native_session_id.as_deref(), Some("native-one"));
     seat.step();
     seat.step();
+    seat.step();
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -796,6 +809,7 @@ fn rollout_retry_after_failed_verification_keeps_the_original_conversation() {
     for _ in 0..5 {
         seat.step();
     }
+    seat.step();
     seat.binding("replacement-1", "wrong-session");
     seat.step();
     seat.step(); // Persist positive exit of the failed replacement before retry.
@@ -835,6 +849,7 @@ fn rollout_retry_after_failed_verification_keeps_the_original_conversation() {
         seat.runtime.starts.lock().unwrap()[1].environment[crate::suspension::RESUME_ENV],
         "native-one"
     );
+    seat.step();
     seat.binding("replacement-2", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -858,6 +873,7 @@ fn rollout_newer_identical_receipt_before_spawn_verifies_the_captured_launch_tok
         seat.step();
     }
     assert_eq!(seat.operation().id, request.id);
+    seat.step();
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -1232,7 +1248,13 @@ fn manual_rollout_keeps_ready_work_wakes_on_the_original_incarnation() {
 
 #[test]
 fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
+    assert_manual_rollout_after_exit("");
+    assert_manual_rollout_after_exit("native-one");
+}
+
+fn assert_manual_rollout_after_exit(native_session: &str) {
     let seat = Seat::new();
+    seat.binding("original-1", native_session);
     seat.publish_mode(2, "second", None, false, true);
     seat.runtime
         .observation
@@ -1259,22 +1281,23 @@ fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
     let (_, old) = rollout::launched_member(&seat.store, SUBJECT, "original-1")
         .unwrap()
         .unwrap();
-    seat.binding("original-1", "");
-    assert!(
-        seat.store
-            .request_rollout(
-                SUBJECT,
-                &selected.desired_token,
-                &old,
-                "original-1",
-                "person/operator",
-                &Policy::when_idle(1_800_000, false),
-                "manual-ended-missing-binding",
-            )
-            .is_err()
-    );
-    assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
-    seat.binding("original-1", "native-one");
+    if native_session.is_empty() {
+        assert!(
+            seat.store
+                .request_rollout(
+                    SUBJECT,
+                    &selected.desired_token,
+                    &old,
+                    "original-1",
+                    "person/operator",
+                    &Policy::when_idle(1_800_000, false),
+                    "manual-ended-missing-binding",
+                )
+                .is_err()
+        );
+        assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+        return;
+    }
     seat.store
         .request_rollout(
             SUBJECT,
@@ -1293,6 +1316,7 @@ fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
     for _ in 0..4 {
         seat.step();
     }
+    seat.step();
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -1435,6 +1459,7 @@ fn suspended_non_launch_publications_preserve_hold_and_resume_updated_environmen
                 if edit.starts_with("env") {
                     assert_eq!(started.environment["COLOR"], "blue");
                 }
+                seat.reconcile();
                 seat.binding("replacement-1", "native-one");
                 seat.reconcile();
                 assert_eq!(
@@ -1580,6 +1605,7 @@ fn suspended_manual_rollout_refuses_then_resumes_old_before_explicit_cutover() {
         assert_eq!(starts[0].environment[crate::suspension::RESUME_ENV], "native-one");
         assert!(!starts[0].environment.contains_key(crate::suspension::CONTINUE_ENV));
     }
+    seat.reconcile();
     seat.binding("replacement-1", "native-one");
     seat.reconcile();
     assert_eq!(
@@ -1610,6 +1636,7 @@ fn suspended_manual_rollout_refuses_then_resumes_old_before_explicit_cutover() {
         assert_eq!(starts[1].environment[crate::suspension::RESUME_ENV], "native-one");
         assert!(!starts[1].environment.contains_key(crate::suspension::CONTINUE_ENV));
     }
+    seat.step();
     seat.binding("replacement-2", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -1636,6 +1663,7 @@ fn resume_with_pending_manual_publication_launches_old_and_keeps_pending() {
         assert_eq!(starts[0].environment[crate::suspension::RESUME_ENV], "native-one");
         assert!(!starts[0].environment.contains_key(crate::suspension::CONTINUE_ENV));
     }
+    seat.reconcile();
     seat.binding("replacement-1", "native-one");
     seat.reopen();
     seat.reconcile();
