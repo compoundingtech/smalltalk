@@ -88,3 +88,38 @@ records legacy option rejection, exact raw argv and inherited execution context,
 sibling-scope survival, unreachable-manager fallback, and a native driver seat
 reply before and after daemon service restart. Its supplied-runtime boundary
 is explicit; native stock Ubuntu 22.04 installation is not established.
+
+## Amendment 1 — 2026-10-08
+
+Launch environment values were passed on process command lines, where service
+managers and process listings can record them. The launchers now export the
+resolved environment to the PTY process and pass only `--env NAME`. PTY resolves
+each name from that inherited environment and persists the resolved overlay
+for restart. The shared `PTY_PLACEMENT_ENV` set owns `PTY_ROOT` and the deprecated
+`PTY_SESSION_DIR`: the canonical runtime root wins after the overlay, and the
+legacy variable is removed (also from inherited environments). Declared legacy
+placement receives a value-free, name-only diagnostic. Other resolved
+environment precedence remains unchanged.
+
+Captured launcher output can echo environment values. It is classified privately;
+launch failure reasons expose a closed diagnostic kind plus exit status rather
+than copying stdout/stderr into replicated claims and claim-trace output.
+Kinds are `launcher-incompatible`, `placement-conflict`, `session-in-use`,
+`spawn-failed`, and `unknown`; the implementation specification records their
+matching signatures and priority. The older name-only-rejecting launcher is
+therefore distinguishable from other exit-1 failures without exposing its text.
+No raw-output file or journal sink is added.
+
+The fixed `--description=st seat` already keeps the command line out of the
+unit description, so this amendment adds no scope description of its own and
+leaves the outer argument order above unchanged.
+
+This removes environment values from generated environment arguments, not from
+explicitly authored argv or tag expansions. Seat-declared
+environment values stored in replicated graph claims remain a known exposure
+outside this amendment's fix.
+
+Evidence: launcher environment/argv regression tests, runtime-selected registry
+precedence with declared canonical/legacy placement controls, and sentinel-bearing
+failed launchers with value-free reasons.
+R42's ratified requirements text is unchanged.

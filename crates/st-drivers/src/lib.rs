@@ -17,6 +17,9 @@
 #[path = "../../../scripts/ci-test-paths.rs"]
 mod ci_test_paths;
 
+#[path = "../../pty-launch-environment.rs"]
+mod pty_launch_environment;
+
 /// A temporary directory whose path is already canonical. macOS puts temporary directories
 /// below the `/var` and `/tmp` symlinks, and its file watcher reports the physical path, so a
 /// test that compares paths needs the spelling the code under test sees.

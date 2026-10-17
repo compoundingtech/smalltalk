@@ -282,9 +282,10 @@ impl PtyCli {
         resolve_task_cwd(target, spec_dir, &self.catalog_root)
     }
 
-    /// The st2-owned part of a PTY task's environment. This same final map is both inherited by the
-    /// initial `pty run` process and persisted through repeatable `--env KEY=VALUE` arguments, so a
-    /// manual `pty restart` recreates the task without snapshotting unrelated ambient OS variables.
+    /// The st2-owned part of a PTY task's environment. This same final map is inherited by the
+    /// initial `pty run` process and named through repeatable `--env KEY` arguments, so a manual
+    /// `pty restart` recreates the task without snapshotting unrelated ambient OS variables —
+    /// while no environment value is ever placed on a command line.
     fn managed_task_env(&self, target: &TaskTarget) -> BTreeMap<OsString, OsString> {
         let mut env = BTreeMap::from([
             (
@@ -305,12 +306,13 @@ impl PtyCli {
             env.insert(OsString::from("ST_HOOKS"), path.into_os_string());
         }
         for (key, value) in &target.env {
-            let value = if key == "PTY_ROOT" {
-                effective_pty_root(&self.catalog_root).into_os_string()
-            } else {
-                OsString::from(self.expand(value))
-            };
-            env.insert(OsString::from(key), value);
+            if crate::pty_launch_environment::PTY_PLACEMENT_ENV.contains(&key.as_str()) {
+                if key != "PTY_ROOT" {
+                    eprintln!("st: ignoring runtime-owned placement variable {key}");
+                }
+                continue;
+            }
+            env.insert(OsString::from(key), OsString::from(self.expand(value)));
         }
         env
     }
@@ -390,10 +392,16 @@ impl PtyCli {
             cmd.arg("--tag").arg("keep=true");
         }
         // Apply the resolved managed overlay to the initial launcher exactly as before, and also
-        // persist it in PTY metadata for manual restart. PTY applies repeated `--env` entries
-        // last-wins, then forcibly injects the new session's own PTY_SESSION identity.
+        // name it through `--env` for manual restart. The values themselves travel in the
+        // launcher's inherited environment (set above): the pty launcher resolves each name-only
+        // `--env` from that environment, then applies repeated entries last-wins and forcibly
+        // injects the new session's own PTY_SESSION identity.
         let managed_env = self.managed_task_env(target);
         cmd.envs(&managed_env);
+        crate::pty_launch_environment::configure_pty_placement(
+            &mut cmd,
+            &effective_pty_root(&self.catalog_root),
+        );
         // Coding-agent command runners commonly set NO_COLOR for their own captured output. That
         // ambient preference belongs to the launcher, not to the interactive agent it happens to
         // reconcile. Agent Spec env remains authoritative when an agent deliberately opts out.
@@ -401,11 +409,8 @@ impl PtyCli {
             cmd.env_remove("NO_COLOR");
             cmd.arg("--unset-env").arg("NO_COLOR");
         }
-        for (key, value) in &managed_env {
-            let mut assignment = key.clone();
-            assignment.push("=");
-            assignment.push(value);
-            cmd.arg("--env").arg(assignment);
+        for key in managed_env.keys() {
+            cmd.arg("--env").arg(key);
         }
         cmd.arg("--");
         match &target.launch {
@@ -663,7 +668,7 @@ impl PtyCli {
             anyhow::bail!(
                 "`pty metadata patch --id {}` failed: {}",
                 presentation.pty_id,
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.status
             );
         }
         Ok(())
@@ -697,7 +702,7 @@ impl PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty list --json` failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                out.status
             );
         }
         serde_json::from_slice(&out.stdout)
@@ -715,7 +720,7 @@ impl PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty stats --json` failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                out.status
             );
         }
         serde_json::from_slice(&out.stdout)
@@ -733,7 +738,7 @@ impl PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty stats --json {pty_id}` failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                out.status
             );
         }
         serde_json::from_slice(&out.stdout)
@@ -826,9 +831,9 @@ impl Runner for PtyCli {
         // immediate `pty run` fails "id already in use". Reap the lingering corpse + brief backoff +
         // retry closes the window WITHIN the pass, instead of leaving `--once` to error and relying on a
         // later loop cycle to self-heal (loop mode did; `--once` had one shot). Bounded; on a persistent
-        // failure it surfaces the error unchanged.
+        // failure it surfaces a closed diagnostic kind and exit status, never launcher output.
         const SPAWN_ATTEMPTS: u32 = 4;
-        let mut last_err = String::new();
+        let mut last_failure = None;
         for attempt in 0..SPAWN_ATTEMPTS {
             let mut cmd = crate::isolate::wrap(&unit, program.as_os_str(), &arg_refs);
             apply_command_env(&inner, &mut cmd);
@@ -843,8 +848,12 @@ impl Runner for PtyCli {
             } else {
                 stderr.trim()
             };
-            last_err = format!("{}: {detail}", out.status);
-            let corpse_race = last_err.contains("already in use");
+            let corpse_race = detail.contains("already in use");
+            let kind = crate::pty_launch_environment::classify_pty_launch_failure(
+                &out.stderr,
+                &out.stdout,
+            );
+            last_failure = Some((kind, out.status));
             if !corpse_race || attempt + 1 == SPAWN_ATTEMPTS {
                 break;
             }
@@ -856,7 +865,12 @@ impl Runner for PtyCli {
                 .output();
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
-        anyhow::bail!("spawning pty '{}' failed: {last_err}", target.pty_id);
+        let (kind, status) = last_failure.expect("PTY spawn attempts are nonzero");
+        anyhow::bail!(
+            "spawning pty '{}' failed: {} ({status})",
+            target.pty_id,
+            kind.as_str(),
+        );
     }
 
     fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
@@ -872,7 +886,7 @@ impl Runner for PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty kill {pty_id}` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.status
             );
         }
         Ok(())
@@ -910,7 +924,7 @@ impl Runner for PtyCli {
         }
         anyhow::bail!(
             "`pty rm {pty_id}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            out.status
         )
     }
 
@@ -923,7 +937,7 @@ impl Runner for PtyCli {
         if !out.status.success() {
             anyhow::bail!(
                 "`pty rm {pty_id}` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.status
             );
         }
         Ok(())

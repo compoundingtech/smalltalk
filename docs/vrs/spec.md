@@ -903,8 +903,8 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   same effective color policy. Adoption of an already-live task remains
   non-mutating: this policy is applied only when st2 creates a generation.
 - **R42:** [Launch argv](ontology.md#launch-argv) is opaque at every
-  st2-added wrapper boundary. In Linux systemd scope mode the exact outer
-  command order is:
+  st2-added wrapper boundary. Generated environment arguments name variables,
+  not their values. In Linux systemd scope mode the exact outer command order is:
 
   ```text
   systemd-run --user --scope --collect --quiet --no-ask-password --unit=<unit> "--description=st seat" --expand-environment=no -- <program> <arg>...
@@ -921,12 +921,43 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   environment substitution. Detached and degraded-detached modes remain
   `<program> <arg>...` pass-throughs with no outer command.
 
+  Launch environment values reach the task through the process environment the
+  wrapper inherits: the PTY launcher receives name-only `--env <NAME>` flags
+  and resolves each value from that environment, so a service manager or
+  process listing records names only for those generated environment flags.
+  The resolved managed overlay still wins over the launcher's environment;
+  the shared `PTY_PLACEMENT_ENV` set identifies `PTY_ROOT` and the deprecated
+  `PTY_SESSION_DIR` as runtime-owned controls. The runtime-selected `PTY_ROOT`
+  wins, and `PTY_SESSION_DIR` is removed after the overlay (including inherited
+  values). Declared legacy placement is ignored with a name-only diagnostic.
+  Spawn and observation share a registry; other member-environment precedence
+  is unchanged. Captured launcher output is classified privately. PTY launch
+  failure reasons contain a closed diagnostic kind plus exit status, never
+  captured text that could echo environment values into replicated claims or
+  traces. The kinds, in matching priority order, are:
+
+  - `launcher-incompatible`: the older name-only-rejecting `Invalid env format`
+    / `Use --env KEY=VALUE` diagnostic (not the new parser's name-only grammar).
+  - `placement-conflict`: conflicting canonical/legacy roots or an overlong root.
+  - `session-in-use`: the existing occupied-ID diagnostic; retry behavior remains
+    unchanged.
+  - `spawn-failed`: recognized daemon exit/start or publication-timeout diagnostics.
+  - `unknown`: anything unrecognized, including undecodable output.
+
+  These are diagnostic categories, not a guarantee of the underlying root cause.
+  No raw-output file or journal sink is added.
+
+  This mechanism does not sanitize explicitly authored argv or tag expansions.
+  Seat-declared environment values stored in replicated graph claims remain a
+  known exposure outside the command-line and unit-description fix.
+
   `src/isolate.rs::tests::wrap_scope_disables_expansion_and_preserves_dollar_bearing_argv`
   fixes the complete wrapper order and proves literal `$HOME`, `${UNSET}`, and
   `$$` after the separator.
   `src/isolate.rs::tests::wrap_detached_modes_preserve_exact_program_and_argv`
-  proves both pass-through modes. The live-system distinction and unaffected
-  scope semantics are recorded in the
+  proves both pass-through modes. `src/run/tests.rs::build_run_command_names_the_complete_managed_environment_without_its_values`
+  proves the managed environment is named without its values. The live-system
+  distinction and unaffected scope semantics are recorded in the
   [systemd scope argv experiment](.experiments/2026-09-05-systemd-scope-argv-transparency.md)
   and [`0016-systemd-scope-wrappers-disable-environment-expansion`](.decisions/0016-systemd-scope-wrappers-disable-environment-expansion.md).
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,

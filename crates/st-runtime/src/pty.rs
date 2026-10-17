@@ -377,14 +377,22 @@ impl PtyRuntime {
             arguments.push(OsString::from("--no-display-name"));
         }
         let mut terminal_env = env.clone();
+        for key in crate::pty_launch_environment::PTY_PLACEMENT_ENV {
+            if key != "PTY_ROOT" && terminal_env.remove(key).is_some() {
+                eprintln!("st: ignoring runtime-owned placement variable {key}");
+            }
+        }
         terminal_env
             .entry("TERM".into())
             .or_insert_with(|| "xterm-256color".into());
-        for (key, value) in &terminal_env {
-            arguments.extend([
-                OsString::from("--env"),
-                OsString::from(format!("{key}={value}")),
-            ]);
+        // Name-only `--env`: the pty launcher resolves each name against its
+        // inherited environment (exported to it below), so no seat
+        // environment value is ever placed on a command line that a service
+        // manager or process listing records. The daemon still persists the
+        // resolved values in its session record, so a manual restart
+        // reproduces the same environment.
+        for key in terminal_env.keys() {
+            arguments.extend([OsString::from("--env"), OsString::from(key)]);
         }
         let mut effective_tags = tags.clone();
         if let Some((_, operation)) = cutover {
@@ -424,16 +432,26 @@ impl PtyRuntime {
             .iter()
             .map(OsString::as_os_str)
             .collect::<Vec<_>>();
+        // The launcher's final environment is known before the host systemd session is
+        // chosen, so the seat overlay joins the base here rather than after wrapping.
+        let launcher_environment = self.command_environment.as_ref().map(|base| {
+            let mut environment = base.clone();
+            environment.extend(terminal_env.clone());
+            environment
+        });
         const ATTEMPTS: u32 = 4;
-        let mut last_error = String::new();
+        let mut last_failure = None;
         for attempt in 0..ATTEMPTS {
             let mut command = crate::isolate::wrap_in(
                 &unit,
                 std::ffi::OsStr::new(&self.binary),
                 &argument_refs,
-                self.command_environment.as_ref(),
+                launcher_environment.as_ref(),
             );
-            command.env("PTY_ROOT", &self.root);
+            if launcher_environment.is_none() {
+                command.envs(&terminal_env);
+            }
+            crate::pty_launch_environment::configure_pty_placement(&mut command, &self.root);
             // A later failed attempt cannot close a producer created by an earlier
             // attempt. Only failure to create the first launcher proves rejection.
             let operation = (attempt == 0)
@@ -466,8 +484,15 @@ impl PtyRuntime {
                 crate::protect_servers(std::slice::from_ref(&published));
                 return Ok(());
             }
-            last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if !last_error.contains("already in use") || attempt + 1 == ATTEMPTS {
+            // Classify captured output privately; only the closed kind and status
+            // can become a replicated failure reason.
+            let kind = crate::pty_launch_environment::classify_pty_launch_failure(
+                &output.stderr,
+                &output.stdout,
+            );
+            let id_in_use = String::from_utf8_lossy(&output.stderr).contains("already in use");
+            last_failure = Some((kind, output.status));
+            if !id_in_use || attempt + 1 == ATTEMPTS {
                 break;
             }
             if self
@@ -482,7 +507,8 @@ impl PtyRuntime {
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
         let _ = std::fs::remove_file(&fence);
-        anyhow::bail!("spawn PTY failed: {last_error}")
+        let (kind, status) = last_failure.expect("PTY spawn attempts are nonzero");
+        anyhow::bail!("spawn PTY failed: {} ({status})", kind.as_str())
     }
 
     fn acquire_spawn_lock(&self, id: &str) -> Result<File> {
@@ -1129,6 +1155,18 @@ exit 0
         binary
     }
 
+    /// The variable names the built argv passed as name-only `--env` flags, in
+    /// order. The fake pty writes one argument per line, so each name is the line
+    /// after a `--env` line.
+    fn env_flag_names(arguments: &str) -> Vec<&str> {
+        let lines = arguments.lines().collect::<Vec<_>>();
+        lines
+            .iter()
+            .zip(lines.iter().skip(1))
+            .filter_map(|(flag, name)| (flag == &"--env").then_some(*name))
+            .collect()
+    }
+
     fn write_record(registry: &Path, name: &str, record: serde_json::Value) {
         fs::create_dir_all(registry).unwrap();
         fs::write(registry.join(format!("{name}.json")), record.to_string()).unwrap();
@@ -1506,7 +1544,8 @@ exit 0
             .unwrap();
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(arguments.contains("st3.isolation="));
-        assert!(arguments.contains("TERM=xterm-256color"));
+        assert_eq!(env_flag_names(&arguments), ["TERM"]);
+        assert!(!arguments.contains("TERM="));
         assert!(arguments.contains("--force"));
         if crate::isolation_mode() == crate::Isolation::Scope {
             assert!(arguments.contains("st3.scope-unit=st3-work-"));
@@ -1528,8 +1567,153 @@ exit 0
         .unwrap();
 
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
-        assert!(arguments.contains("TERM=screen-256color"));
-        assert!(!arguments.contains("TERM=xterm-256color"));
+        assert_eq!(env_flag_names(&arguments), ["TERM"]);
+        assert!(
+            !arguments.contains("TERM="),
+            "terminal type values must stay off the argument list:\n{arguments}"
+        );
+    }
+
+    #[test]
+    fn spawn_passes_environment_values_by_name_not_on_the_argument_list() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-secret",
+            "  printenv > \"$0.env\"\n  publish new",
+        );
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        const SECRET: &str = "synthetic-seat-secret-7c31";
+        runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::from([("SEAT_TOKEN".into(), SECRET.into())]),
+                None,
+                &BTreeMap::new(),
+                None,
+            )
+            .unwrap();
+
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        // The argument list names the variable and never carries its value.
+        assert_eq!(env_flag_names(&arguments), ["SEAT_TOKEN", "TERM"]);
+        assert!(
+            !arguments.contains(SECRET),
+            "the seat environment value leaked onto the launcher argv:\n{arguments}"
+        );
+        // The launcher still resolved the name from its inherited environment.
+        let inherited = fs::read_to_string(binary.with_extension("env")).unwrap();
+        assert!(inherited.contains(&format!("SEAT_TOKEN={SECRET}")));
+    }
+
+    #[test]
+    fn spawn_keeps_the_runtime_registry_when_the_seat_declares_pty_root() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let declared = root.path().join("seat-registry");
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-root",
+            "  for key in PTY_ROOT ST_AGENT ST3_BIN PATH ST3_ROLLOUT_OPERATION ST3_ROLLOUT_PREDECESSOR TERM; do printf '%s=' \"$key\"; printenv \"$key\"; done > \"$0.env\"\n  publish new",
+        );
+        let environment: BTreeMap<String, String> = BTreeMap::from([
+            ("PTY_ROOT".into(), declared.to_string_lossy().into_owned()),
+            ("ST_AGENT".into(), "synthetic-agent".into()),
+            ("ST3_BIN".into(), "/synthetic/runtime-bin".into()),
+            // Include the NixOS system tools as well as conventional Unix locations.
+            ("PATH".into(), "/run/current-system/sw/bin:/usr/bin:/bin".into()),
+            ("ST3_ROLLOUT_OPERATION".into(), "synthetic-operation".into()),
+            ("ST3_ROLLOUT_PREDECESSOR".into(), "synthetic-predecessor".into()),
+            ("TERM".into(), "screen-256color".into()),
+        ]);
+        let runtime = PtyRuntime::new(registry.clone())
+            .with_binary(binary.to_string_lossy());
+        spawn_work(&runtime, root.path(), &environment).unwrap();
+        assert!(registry.join("work.json").exists());
+        assert!(!declared.exists());
+        let inherited = fs::read_to_string(binary.with_extension("env")).unwrap();
+        assert!(
+            inherited
+                .lines()
+                .any(|line| line == format!("PTY_ROOT={}", registry.display()))
+        );
+        for (key, value) in environment.iter().filter(|(key, _)| key.as_str() != "PTY_ROOT") {
+            assert!(inherited.lines().any(|line| line == format!("{key}={value}")));
+        }
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        assert!(env_flag_names(&arguments).contains(&"PTY_ROOT"));
+        assert!(!arguments.contains(declared.to_str().unwrap()));
+    }
+
+    #[test]
+    fn spawn_keeps_legacy_placement_values_out_of_the_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-legacy-root",
+            "  test \"${PTY_SESSION_DIR+x}\" != x || exit 9\n  publish new",
+        );
+        let runtime = PtyRuntime::new(registry.clone()).with_binary(binary.to_string_lossy());
+        spawn_work(
+            &runtime,
+            root.path(),
+            &BTreeMap::from([("PTY_SESSION_DIR".into(), "synthetic-legacy-root-8e1d".into())]),
+        ).unwrap();
+        assert!(registry.join("work.json").exists());
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        assert!(!env_flag_names(&arguments).contains(&"PTY_SESSION_DIR"));
+    }
+
+    #[test]
+    fn spawn_failure_reason_never_contains_launcher_output() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-secret-failure",
+            "  printf '%s\\n' \"$SEAT_TOKEN\" >&2\n  printf '%s\\n' \"$SEAT_TOKEN\"\n  exit 23",
+        );
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        const SECRET: &str = "synthetic-failure-secret-d739";
+        let error = spawn_work(
+            &runtime,
+            root.path(),
+            &BTreeMap::from([
+                ("SEAT_TOKEN".into(), SECRET.into()),
+                ("PTY_SESSION_DIR".into(), SECRET.into()),
+            ]),
+        ).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(reason.contains("spawn PTY failed"));
+        assert!(reason.contains("23"));
+        assert!(!reason.contains(SECRET));
+    }
+
+    #[test]
+    fn spawn_reports_an_incompatible_launcher_without_its_output() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-old-launcher",
+            "  printf 'Invalid env format: \"NAME\". Use --env KEY=VALUE\\n%s\\n' \"$SEAT_TOKEN\" >&2\n  exit 1",
+        );
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        const SECRET: &str = "synthetic-old-launcher-secret-836e";
+        let error = spawn_work(
+            &runtime,
+            root.path(),
+            &BTreeMap::from([("SEAT_TOKEN".into(), SECRET.into())]),
+        ).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(reason.contains("launcher-incompatible"));
+        assert!(reason.contains("exit status: 1"));
+        assert!(!reason.contains(SECRET));
+        assert!(!reason.contains("Invalid env format"));
     }
 
     #[test]
