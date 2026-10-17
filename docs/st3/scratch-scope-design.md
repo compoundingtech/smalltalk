@@ -21,7 +21,7 @@ evidence, not an installed-build or runtime test receipt.
 * [main.rs](../../crates/st3/src/main.rs) and [fleet_cli.rs](../../crates/st3/src/fleet_cli.rs): `fleet_person`
   requires a person path for invite; `run_fleet` can found a fleet without that helper. Create and join already lock the state
   admission boundary. A separate state directory alone supplies no agent bootstrap authority.
-* [api.rs](../../crates/st3-daemon/src/api.rs): `harness_ancestor` and `guard_bound_request` bind Linux
+* [api.rs](../../crates/st3-api/src/api.rs): `harness_ancestor` and `guard_bound_request` bind Linux
   harness requests to their agent. Invite creation and revocation require `concrete_person`.
   The non-Linux ancestry helper returns `None`; it cannot authenticate a Mac scratch owner.
 * [setup.rs](../../crates/st3/src/setup.rs): setup refuses an agent process. Do not remove

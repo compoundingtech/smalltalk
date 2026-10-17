@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Moved the peer relay, the reconciler (with six helper modules) and the HTTP API (with seven helper modules) into the st3-peer, st3-reconcile and st3-api crates on top of st3-store; st3-daemon re-exports every module at its old path and keeps the seat hooks, service and tiles.",
+  "replay": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  }
+}

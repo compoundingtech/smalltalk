@@ -12,7 +12,7 @@
     },
     {
       "name": "protocol",
-      "globs": ["crates/st-wire/**", "crates/st-resource-protocol/**", "crates/st3-client/**", "crates/st3-client-codegen/**", "clients/**", "wit/**", "crates/st3-daemon/src/api.rs", "crates/st3-daemon/src/api/**", "crates/st3-daemon/src/peer.rs", "crates/st3-daemon/src/peer/**", "crates/st3-telemetry/src/relay_trace.rs", "docs/st3/client-v0/**", "docs/st3/ios-fabric-protocol.md"],
+      "globs": ["crates/st-wire/**", "crates/st-resource-protocol/**", "crates/st3-client/**", "crates/st3-client-codegen/**", "clients/**", "wit/**", "crates/st3-api/src/api.rs", "crates/st3-api/src/api/**", "crates/st3-peer/src/peer.rs", "crates/st3-peer/src/peer/**", "crates/st3-telemetry/src/relay_trace.rs", "docs/st3/client-v0/**", "docs/st3/ios-fabric-protocol.md"],
       "forces": ["integration", "client contract tests", "codegen --check", "scripts/read-contract-report"]
     },
     {
@@ -25,7 +25,7 @@
     },
     {
       "name": "authorization",
-      "globs": ["crates/st3-daemon/src/api/client_v0*", "crates/st3-daemon/src/api/client_web*", "crates/st3-store/src/sekrets/**", "crates/st3-store/src/sekrets.rs", "crates/st3-kernel/src/accounts.rs", "crates/st3-store/src/store/accounts.rs", "crates/st3-store/src/store/roster_admission.rs", "crates/st3-store/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
+      "globs": ["crates/st3-api/src/api/client_v0*", "crates/st3-api/src/api/client_web*", "crates/st3-store/src/sekrets/**", "crates/st3-store/src/sekrets.rs", "crates/st3-kernel/src/accounts.rs", "crates/st3-store/src/store/accounts.rs", "crates/st3-store/src/store/roster_admission.rs", "crates/st3-store/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
       "content": [
         {"globs": ["crates/**"], "pattern": "(?i)\\b(trusted[_ ]keys?|pairing|device[_ ]key|signing[_ ]key|verify_signature)\\b"}
       ],
@@ -43,9 +43,9 @@
     },
     {
       "name": "routing-and-delivery",
-      "globs": ["crates/st3-store/src/mailbox.rs", "crates/st3-daemon/src/api/mailbox*", "crates/st3-store/src/store/mailbox_*", "crates/st3-daemon/src/placement.rs", "crates/st3-store/src/suspension.rs", "crates/st3-store/src/rollout.rs", "crates/st3-daemon/src/reconcile.rs", "crates/st3-daemon/src/reconcile/**"],
+      "globs": ["crates/st3-store/src/mailbox.rs", "crates/st3-api/src/api/mailbox*", "crates/st3-store/src/store/mailbox_*", "crates/st3-reconcile/src/placement.rs", "crates/st3-store/src/suspension.rs", "crates/st3-store/src/rollout.rs", "crates/st3-reconcile/src/reconcile.rs", "crates/st3-reconcile/src/reconcile/**"],
       "content": [
-        {"globs": ["crates/st3-daemon/src/api.rs"], "pattern": "\\.(route|nest|merge|fallback)\\("}
+        {"globs": ["crates/st3-api/src/api.rs"], "pattern": "\\.(route|nest|merge|fallback)\\("}
       ],
       "forces": ["integration", "delivery and messaging fault suites"]
     },

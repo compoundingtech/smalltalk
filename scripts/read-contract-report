@@ -299,8 +299,8 @@ def registered_handler_definitions(source_root, route_handlers):
     production_by_path = {}
     for key, handler in route_handlers.items():
         parts = handler.split("::")
-        path = (source_root / "crates/st3-daemon/src/api.rs" if len(parts) == 1 else
-                source_root / "crates/st3-daemon/src/api" / ("/".join(parts[:-1]) + ".rs"))
+        path = (source_root / "crates/st3-api/src/api.rs" if len(parts) == 1 else
+                source_root / "crates/st3-api/src/api" / ("/".join(parts[:-1]) + ".rs"))
         if path not in production_by_path:
             try:
                 source = path.read_text()
@@ -841,12 +841,12 @@ def report(root, ledger_path, manifest_path=None):
         blockers.append("historical ledger is malformed or unreadable")
     try:
         route_handlers = registered_route_handlers(
-            (root / "crates/st3-daemon/src/api.rs").read_text(),
-            (root / "crates/st3-daemon/src/peer.rs").read_text(),
+            (root / "crates/st3-api/src/api.rs").read_text(),
+            (root / "crates/st3-peer/src/peer.rs").read_text(),
         )
         routes = set(route_handlers)
         handler_definitions = registered_handler_definitions(root, route_handlers)
-        peer_source = (root / "crates/st3-daemon/src/peer.rs").read_text()
+        peer_source = (root / "crates/st3-peer/src/peer.rs").read_text()
         claim_specs = registered_claim_specs(
             (root / "crates/st3-schema/src/lib.rs").read_text(),
             (root / "crates/st3-schema/src/directive_notes.rs").read_text(),

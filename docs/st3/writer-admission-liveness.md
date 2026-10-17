@@ -15,7 +15,7 @@ remain independent. There is no global blocking-thread cap.
 
 ## POST and PUT audit
 
-The router is in `crates/st3-daemon/src/api.rs`. Both PUT routes are `/v1/notes` and
+The router is in `crates/st3-api/src/api.rs`. Both PUT routes are `/v1/notes` and
 `/v1/client/glasses/{id}`. Every JSON POST/PUT, and the Bytes extractor on
 `POST /v1/client/blobs`, can await a slow request body before doing any write. These
 extractors now return pending polls without retaining writer capacity or a blocking

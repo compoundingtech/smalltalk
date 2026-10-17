@@ -2421,7 +2421,7 @@ fn removed_legacy_handlers_are_absent_from_cli_and_server_sources() {
         );
     }
 
-    let server_source = include_str!("../../st3-daemon/src/api.rs");
+    let server_source = include_str!("../../st3-api/src/api.rs");
     for handler in [
         "watch_resource",
         "unwatch_resource",

@@ -91,7 +91,7 @@ class Classify(unittest.TestCase):
         "clients/**/generated/**",
         "crates/smallclaims/src/**/migrat*",
         "crates/smallclaims/src/**/replay*",
-        "crates/st3-daemon/src/api/client_web*",
+        "crates/st3-api/src/api/client_web*",
         "crates/st3-store/src/sekrets.rs",
     }
 

@@ -1,7 +1,7 @@
 # Seat status truth
 
 One place in st decides what a seat's status is: the agent card that `overlay_agent_resources`
-(`crates/st3-daemon/src/api.rs`) finishes on every read, with the read's own clock. stui, the phone app,
+(`crates/st3-api/src/api.rs`) finishes on every read, with the read's own clock. stui, the phone app,
 the web app and `st agents show` render that card. None of them re-derives a state from the raw
 fields, so they cannot disagree.
 

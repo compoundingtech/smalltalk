@@ -9,15 +9,9 @@
 #[path = "../../../scripts/ci-test-paths.rs"]
 mod ci_test_paths;
 
-pub use st3_kernel::cli_output;
-// cli_output exports these macros at its crate root; the library exported them at its own.
-pub use st3_kernel::{cli_print, cli_println};
-pub use st3_kernel::{
-    accounts, conversation_header, native_views, config, fleet, gate_kinds, github_admission, harness_events, hooks, lane, model, pricing, publication,
-    seat_queue, terminal_binding,
-};
+pub use st3_kernel::*;
+pub use st3_telemetry::*;
 pub use smallclaims::{performance, profile};
-pub use st3_telemetry::{incremental, otel, otlp, recorder, reconcile_telemetry, slo};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -27,6 +21,7 @@ pub mod backup;
 pub mod checkout;
 pub mod external_sessions;
 pub mod recorder_receipts;
+pub mod remote_terminal;
 pub mod render;
 pub mod blobs;
 pub mod changes;
@@ -39,8 +34,10 @@ pub mod github_http;
 pub mod github_watch;
 pub mod graph;
 pub mod mailbox;
+pub mod maintenance;
 pub mod message_body;
 pub mod mission;
+pub mod node_identity;
 pub mod native_resume;
 pub mod person_request;
 pub mod provenance;

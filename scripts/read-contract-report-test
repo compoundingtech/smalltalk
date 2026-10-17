@@ -70,8 +70,8 @@ class ReadContractReportTest(unittest.TestCase):
                                      **self.evidence("fixture")}}
 
     def test_real_source_registration_matches_pinned_inventory(self):
-        api_source = (ROOT / "crates/st3-daemon/src/api.rs").read_text()
-        peer_source = (ROOT / "crates/st3-daemon/src/peer.rs").read_text()
+        api_source = (ROOT / "crates/st3-api/src/api.rs").read_text()
+        peer_source = (ROOT / "crates/st3-peer/src/peer.rs").read_text()
         handlers = report.registered_route_handlers(api_source, peer_source)
         actual = report.registered_routes(api_source, peer_source)
         self.assertEqual(set(handlers), actual)
@@ -87,7 +87,7 @@ class ReadContractReportTest(unittest.TestCase):
         )
         self.assertEqual(
             definitions["GET /v1/client/capabilities"]["source_file"],
-            "crates/st3-daemon/src/api.rs",
+            "crates/st3-api/src/api.rs",
         )
         self.assertEqual(
             definitions["POST /v1/internal/client-read/forward"]["handler"],
@@ -96,7 +96,7 @@ class ReadContractReportTest(unittest.TestCase):
         with self.assertRaisesRegex(report.InventoryError, "0 lexical candidate definitions"):
             report.registered_handler_definitions(ROOT, {"GET /invented": "missing_handler"})
         invented_root = self.artifact.parent / "invented-source"
-        invented_api = invented_root / "crates/st3-daemon/src/api.rs"
+        invented_api = invented_root / "crates/st3-api/src/api.rs"
         invented_api.parent.mkdir(parents=True, exist_ok=True)
         invented_api.write_text('''#[cfg(test)]
 mod alternate_test_module {
@@ -143,7 +143,7 @@ async fn real_production_handler() {}
             report.registered_claim_specs(schema, directive.replace("pub const KIND:", "pub const OTHER:"))
         with self.assertRaisesRegex(report.InventoryError, "cannot be parsed"):
             report.registered_claim_specs(schema.replace("directive_notes::KIND,", "other::KIND,", 1), directive)
-        peer = (ROOT / "crates/st3-daemon/src/peer.rs").read_text()
+        peer = (ROOT / "crates/st3-peer/src/peer.rs").read_text()
         self.assertEqual(len(report.registered_client_read_variants(peer)), 10)
         self.assertEqual(report.registered_peer_protocol_routes(peer), {
             "POST /v1/peer/client-read", "POST /v1/internal/client-read/forward"
@@ -151,7 +151,7 @@ async fn real_production_handler() {}
 
     def test_cfg_macro_and_ambiguous_handler_locations_remain_nonqualifying(self):
         invented_root = self.artifact.parent / "conditional-source"
-        api = invented_root / "crates/st3-daemon/src/api.rs"
+        api = invented_root / "crates/st3-api/src/api.rs"
         api.parent.mkdir(parents=True, exist_ok=True)
         api.write_text('''#[cfg(feature = "invented")]
 async fn conditional_handler() {}
@@ -193,7 +193,7 @@ async fn real_handler() {}
         self.assertIn("async fn real_handler()", production)
 
     def test_new_client_read_variant_changes_inventory(self):
-        peer = (ROOT / "crates/st3-daemon/src/peer.rs").read_text()
+        peer = (ROOT / "crates/st3-peer/src/peer.rs").read_text()
         changed = peer.replace("pub enum ClientReadOperation {",
                                "pub enum ClientReadOperation {\n    Invented { value: String },", 1)
         self.assertIn("Invented", report.registered_client_read_variants(changed))
@@ -206,16 +206,16 @@ async fn real_handler() {}
                     report.registered_client_read_variants(unsupported)
 
     def test_unknown_path_expression_is_rejected(self):
-        source = (ROOT / "crates/st3-daemon/src/api.rs").read_text().replace(
+        source = (ROOT / "crates/st3-api/src/api.rs").read_text().replace(
             '"/v1/health", get(health)', 'crate::peer::UNKNOWN_PATH, get(health)', 1
         )
-        peer = (ROOT / "crates/st3-daemon/src/peer.rs").read_text()
+        peer = (ROOT / "crates/st3-peer/src/peer.rs").read_text()
         with self.assertRaisesRegex(report.InventoryError, "unknown route path expression"):
             report.registered_routes(source, peer)
 
     def test_router_setup_requires_the_known_slo_initializer(self):
-        source = (ROOT / "crates/st3-daemon/src/api.rs").read_text()
-        peer = (ROOT / "crates/st3-daemon/src/peer.rs").read_text()
+        source = (ROOT / "crates/st3-api/src/api.rs").read_text()
+        peer = (ROOT / "crates/st3-peer/src/peer.rs").read_text()
         self.assertIn("GET /v1/health", report.registered_routes(source, peer))
         for changed in (
             source.replace("crate::slo::install();", "crate::slo::skip();", 1),
@@ -225,8 +225,8 @@ async fn real_handler() {}
                 report.registered_routes(changed, peer)
 
     def test_unknown_method_nest_and_helper_registrations_are_rejected(self):
-        source = (ROOT / "crates/st3-daemon/src/api.rs").read_text()
-        peer = (ROOT / "crates/st3-daemon/src/peer.rs").read_text()
+        source = (ROOT / "crates/st3-api/src/api.rs").read_text()
+        peer = (ROOT / "crates/st3-peer/src/peer.rs").read_text()
         variants = (
             (source.replace("get(health)", "get(health).head(other)", 1),
              "unknown route method chain"),
@@ -456,8 +456,8 @@ async fn real_handler() {}
         self.assertFalse(report.complete_kind_mutation_edge("invented.kind", edge, HEAD))
 
     def test_otherwise_complete_self_reported_manifest_stays_red(self):
-        peer = (ROOT / "crates/st3-daemon/src/peer.rs").read_text()
-        routes = report.registered_routes((ROOT / "crates/st3-daemon/src/api.rs").read_text(), peer)
+        peer = (ROOT / "crates/st3-peer/src/peer.rs").read_text()
+        routes = report.registered_routes((ROOT / "crates/st3-api/src/api.rs").read_text(), peer)
         # Invented baseline assembled from checked source: no private survey path is needed.
         ledger = {"get": [], "operations": [], "cli": [{"command": "invented read"}]}
         for key in sorted(routes):
@@ -537,7 +537,7 @@ async fn real_handler() {}
                       same_revision["blockers"])
 
         measured = self.artifact.parent / "measured-source"
-        for relative in ("crates/st3-daemon/src/api.rs", "crates/st3-daemon/src/peer.rs",
+        for relative in ("crates/st3-api/src/api.rs", "crates/st3-peer/src/peer.rs",
                          "crates/st3-schema/src/lib.rs"):
             destination = measured / relative
             destination.parent.mkdir(parents=True, exist_ok=True)

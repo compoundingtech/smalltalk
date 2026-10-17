@@ -30,6 +30,10 @@
       "clippy::unnecessary_get_then_check": 1,
       "clippy::unnecessary_lazy_evaluations": 1
     },
+    "st3-api": {
+      "clippy::collapsible_if": 2,
+      "clippy::manual_next_back": 1
+    },
     "st3-client": {
       "clippy::large_enum_variant": 1,
       "clippy::manual_is_multiple_of": 1
@@ -37,18 +41,17 @@
     "st3-client-codegen": {
       "clippy::useless_format": 2
     },
-    "st3-daemon": {
-      "clippy::collapsible_if": 5,
-      "clippy::empty_line_after_doc_comments": 2,
-      "clippy::manual_next_back": 1,
-      "clippy::needless_return": 1,
-      "clippy::type_complexity": 3,
-      "clippy::useless_format": 1
-    },
     "st3-feed": {
       "clippy::filter_map_bool_then": 1,
       "clippy::if_same_then_else": 1,
       "clippy::too_many_arguments": 1
+    },
+    "st3-reconcile": {
+      "clippy::collapsible_if": 3,
+      "clippy::empty_line_after_doc_comments": 2,
+      "clippy::needless_return": 1,
+      "clippy::type_complexity": 3,
+      "clippy::useless_format": 1
     },
     "st3-store": {
       "clippy::cloned_ref_to_slice_refs": 5,

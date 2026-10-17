@@ -816,7 +816,7 @@ not browser-specific back/forward-cache eligibility. This proves the early path 
 is loading; it does not promise that every network's WebSocket handshake outruns an already-cached
 bundle. Both commands close their ephemeral servers and browser sessions in `finally`.
 
-The daemon's existing [`CollectionSubscribe`](../../crates/st3-daemon/src/api/client_v0.rs)
+The daemon's existing [`CollectionSubscribe`](../../crates/st3-api/src/api/client_v0.rs)
 derives Serde deserialization without `deny_unknown_fields`, so the optional trace field
 is accepted and ignored by older servers.
 

@@ -19,11 +19,11 @@
 //! | `smalltalk-ios <version> (<build>)` | `App` | clients/swift/St3Client/Sources/St3Client/Client.swift:11-13, apps/ios/store.tsx:112, clients/typescript/st3-views/clientName.ts:2-4 |
 //! | `smalltalk-ide <version>` | `App` | clients/typescript/st3-views/clientName.ts:7 (test clientName.test.mjs:7), docs/clients/build-your-own.md:98 |
 //! | `smalltalk-example-tui <version>` | `App` | examples/client-tui via docs/clients/build-your-own.md:79 — the `smalltalk-` product family prefix |
-//! | `st3 replication-worker` | `ReplicationWorker` | crates/st3-daemon/src/service.rs (worker command), crates/st3-daemon/src/peer.rs (`run_worker`); reserved header shape |
+//! | `st3 replication-worker` | `ReplicationWorker` | crates/st3-daemon/src/service.rs (worker command), crates/st3-peer/src/peer.rs (`run_worker`); reserved header shape |
 //! | `st3 driver omp-channel`, `agent/<seat> · st3 driver omp-channel` | `OmpChannel` | reserved channel header shape; `omp-channel` wins over the `driver` rule below |
 //! | `st3 driver omp`, `st3 driver codex`, `agent/<seat> · st3 driver <driver>` | `Driver` | crates/st3-daemon/src/external_sessions.rs (driver commands); synthetic seat prefixes exercise trailing-token matching |
 //! | `st3 driver-hook`, `claude-observe`, `claude-statusline`, any `hook` token | `Hook` | crates/st3-daemon/src/driver_hook.rs:22-25 (`HOOKS`, `SUBCOMMAND`), crates/st3-telemetry/src/telemetry.rs (`hook`); reserved — hooks reach the daemon through claims, not this header |
-//! | `peer`, `fabric`, `relay` tokens | `Peer` | crates/st3-daemon/src/peer.rs:51-68 (peer/client-read routes); reserved — peer traffic authenticates with fleet headers, not `x-st3-client` |
+//! | `peer`, `fabric`, `relay` tokens | `Peer` | crates/st3-peer/src/peer.rs:51-68 (peer/client-read routes); reserved — peer traffic authenticates with fleet headers, not `x-st3-client` |
 //! | `web`, `browser` tokens | `Web` | reserved for browser clients only (docs/st3/observability.md vocabulary); no producer today |
 //! | `curl` | `Other` | ad-hoc client, deliberately not the CLI command family |
 //! | anything else present | `Other` | closed-vocabulary fallback (docs/st3/observability.md) |

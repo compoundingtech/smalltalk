@@ -76,7 +76,7 @@ source inspection alone does not establish iOS viability.
 ## Member exposure and authorization
 
 Expose exactly the **paired-only** gateway socket, whose router is
-[`fabric_router`](../../crates/st3-daemon/src/api.rs) and whose configured path is
+[`fabric_router`](../../crates/st3-api/src/api.rs) and whose configured path is
 `client_gateway_socket` (normally `st3-client.sock`). Do not expose `st3.sock`:
 that is the privileged local API. A generic socket exposure is sufficient; no
 new server-side Rust service is needed.

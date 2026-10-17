@@ -1,9 +1,9 @@
 {
   "version": 1,
   "client_commands": [
-    {"command":"collections.inventory","tests":["crates/st3/tests/client_only.rs::an_older_member_reads_fleet_on_focus_without_attempting_inventory_subscriptions","crates/st3-e2e/tests/feed/inventory.rs::inventories_follow_sources_switch_periods_leave_and_reconnect_over_a_real_socket","crates/st3/tests/client_only.rs::the_fleet_inventory_screen_sends_no_request_after_its_first_frames_for_more_than_a_minute","crates/st3/tests/client_only.rs::the_usage_inventory_screen_sends_no_request_after_its_first_frames_for_more_than_a_minute","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::clients_inventory_follows_connect_disconnect_and_reconnect","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::usage_inventory_open_period_uses_wall_time_on_an_empty_graph","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::usage_inventory_follows_rollups_limits_and_reconnect_for_selected_period","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::machines_inventory_follows_runtime_transport_and_reconnect","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::devices_inventory_follows_pairing_revocation_and_reconnect","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::terminals_inventory_follows_runtime_changes_and_reconnect","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::sessions_inventory_follows_files_process_exit_and_reconnect","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::inventory_subscriptions_refuse_invalid_filters_limits_and_authority","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::idle_inventory_windows_do_not_reread_across_the_old_client_intervals","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::inventory_pairing_expiry_ends_held_windows_without_a_clock_poll","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::devices_inventory_expires_a_hidden_row_and_updates_has_more_at_its_deadline","crates/st3-daemon/src/api/client_v0/collection_refresh_tests.rs::clients_inventory_expires_recent_requests_at_their_deadline"],"behavior":"Optional authorized bounded screen inventories deliver v0 snapshots and changes; reconnect reads current sources, device and recent-client membership expires at actual deadlines, and native sessions follow files and process exits. Phone inventory hooks use these authorized reads through screen-scoped subscriptions; Node fake-feed tests verify shared slots, period selection, refresh, reconnect, grace cleanup and 72-second idle without requests; native adapter event tests verify protocol heartbeat delivery."},
-    {"command":"resources.list","tests":["crates/stui/src/ui/observed_resources.rs::optional_resource_read_lists_typed_prs_repositories_and_other_subjects_over_unix","crates/stui/src/ui/glass.rs::sidebar_graph_resources_open_tabs_and_finder_selection_only_previews_filing","crates/st3-daemon/src/api/client_v0.rs::resources_list_filters_latest_observations_and_fences_pages","crates/st3-daemon/src/api/client_v0.rs::resources_list_requires_projection_read_scope"],"behavior":"Existing optional bounded observation read; typed PR/repository/other catalog windows, canonical subjects, filing over Unix, missing rows retained, clicks only navigate, Enter only previews."},
-    {"command":"observations.report","tests":["crates/st3-daemon/src/api/client_observations.rs::observation_paired_session_transport_reader_doctor_and_body_limits","crates/st3-daemon/src/api/client_observations.rs::observation_dedup_conflict_overlap_and_history_failure_have_no_partial_acceptance","crates/st3-daemon/src/api/client_observations.rs::observation_history_is_bounded_rotates_expires_and_survives_restart"],"behavior":"Paired-only local diagnostics; no graph mutation, snapshot fence, replicated ACK or durable receipt. Memory dedup/overlap survives identical retries only within bounded process retention; JSONL history persists independently."}
+    {"command":"collections.inventory","tests":["crates/st3/tests/client_only.rs::an_older_member_reads_fleet_on_focus_without_attempting_inventory_subscriptions","crates/st3-e2e/tests/feed/inventory.rs::inventories_follow_sources_switch_periods_leave_and_reconnect_over_a_real_socket","crates/st3/tests/client_only.rs::the_fleet_inventory_screen_sends_no_request_after_its_first_frames_for_more_than_a_minute","crates/st3/tests/client_only.rs::the_usage_inventory_screen_sends_no_request_after_its_first_frames_for_more_than_a_minute","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::clients_inventory_follows_connect_disconnect_and_reconnect","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::usage_inventory_open_period_uses_wall_time_on_an_empty_graph","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::usage_inventory_follows_rollups_limits_and_reconnect_for_selected_period","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::machines_inventory_follows_runtime_transport_and_reconnect","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::devices_inventory_follows_pairing_revocation_and_reconnect","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::terminals_inventory_follows_runtime_changes_and_reconnect","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::sessions_inventory_follows_files_process_exit_and_reconnect","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::inventory_subscriptions_refuse_invalid_filters_limits_and_authority","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::idle_inventory_windows_do_not_reread_across_the_old_client_intervals","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::inventory_pairing_expiry_ends_held_windows_without_a_clock_poll","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::devices_inventory_expires_a_hidden_row_and_updates_has_more_at_its_deadline","crates/st3-api/src/api/client_v0/collection_refresh_tests.rs::clients_inventory_expires_recent_requests_at_their_deadline"],"behavior":"Optional authorized bounded screen inventories deliver v0 snapshots and changes; reconnect reads current sources, device and recent-client membership expires at actual deadlines, and native sessions follow files and process exits. Phone inventory hooks use these authorized reads through screen-scoped subscriptions; Node fake-feed tests verify shared slots, period selection, refresh, reconnect, grace cleanup and 72-second idle without requests; native adapter event tests verify protocol heartbeat delivery."},
+    {"command":"resources.list","tests":["crates/stui/src/ui/observed_resources.rs::optional_resource_read_lists_typed_prs_repositories_and_other_subjects_over_unix","crates/stui/src/ui/glass.rs::sidebar_graph_resources_open_tabs_and_finder_selection_only_previews_filing","crates/st3-api/src/api/client_v0.rs::resources_list_filters_latest_observations_and_fences_pages","crates/st3-api/src/api/client_v0.rs::resources_list_requires_projection_read_scope"],"behavior":"Existing optional bounded observation read; typed PR/repository/other catalog windows, canonical subjects, filing over Unix, missing rows retained, clicks only navigate, Enter only previews."},
+    {"command":"observations.report","tests":["crates/st3-api/src/api/client_observations.rs::observation_paired_session_transport_reader_doctor_and_body_limits","crates/st3-api/src/api/client_observations.rs::observation_dedup_conflict_overlap_and_history_failure_have_no_partial_acceptance","crates/st3-api/src/api/client_observations.rs::observation_history_is_bounded_rotates_expires_and_survives_restart"],"behavior":"Paired-only local diagnostics; no graph mutation, snapshot fence, replicated ACK or durable receipt. Memory dedup/overlap survives identical retries only within bounded process retention; JSONL history persists independently."}
   ],
   "typed_actions": [
     {
@@ -56,14 +56,14 @@
     {
       "action": "arrangement.edit",
       "tests": [
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner",
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_edit_recovers_receipt_gap_without_accepting_a_changed_action_id",
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones",
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts",
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_fenced_retire_recovers_receipt_gap",
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_create_race_returns_typed_exists_and_exact_retry_receipt",
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_folder_race_and_validation_refusals_stay_typed",
-        "crates/st3-daemon/src/api/client_v0/arrangements.rs::selected_arrangement_survives_byte_window_edits_and_retirement",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::arrangement_edit_recovers_receipt_gap_without_accepting_a_changed_action_id",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::arrangement_fenced_retire_recovers_receipt_gap",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::arrangement_create_race_returns_typed_exists_and_exact_retry_receipt",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::arrangement_folder_race_and_validation_refusals_stay_typed",
+        "crates/st3-api/src/api/client_v0/arrangements.rs::selected_arrangement_survives_byte_window_edits_and_retirement",
         "crates/st3-store/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
         "crates/st3-store/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
       ],
@@ -473,7 +473,7 @@
       "description": "Replace this seat's handoff document from a file or standard input",
       "tests": [
         "crates/st3/tests/agents_restart.rs::a_seat_writes_and_reads_its_handoff_through_the_cli",
-        "crates/st3-daemon/src/api/tests.rs::a_seat_writes_only_its_own_handoff"
+        "crates/st3-api/src/api/tests.rs::a_seat_writes_only_its_own_handoff"
       ],
       "verification": "real CLI over a private Unix socket; the daemon refuses another seat's handoff"
     },
@@ -916,7 +916,7 @@
       "description": "Pin the separate SCG read attestor and downward response budgets for one assistant grant",
       "tests": [
         "crates/st3/src/main_tests.rs::assistant_read_trust_cli_pins_explicit_keys_and_downward_budgets",
-        "crates/st3-daemon/src/api/client_v0/assistant/authorization_tests.rs::assistant_response_budget_includes_envelope_and_supports_downward_policy"
+        "crates/st3-api/src/api/client_v0/assistant/authorization_tests.rs::assistant_response_budget_includes_envelope_and_supports_downward_policy"
       ],
       "verification": "CLI parse and real read-proof authorization; trusted-local configured owner only"
     },
@@ -1491,7 +1491,7 @@
       "command": "st missions show",
       "description": "Explain one mission run, its goals, state, work, and usage",
       "tests": [
-        "crates/st3-daemon/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
+        "crates/st3-api/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2350,7 +2350,7 @@
       "command": "st work ls",
       "description": "List current actionable work; use --as to filter one agent or --all for history",
       "tests": [
-        "crates/st3-daemon/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
+        "crates/st3-api/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2455,7 +2455,7 @@
       "command": "st work show",
       "description": "Explain one work item, its owner, readiness, lease, and evidence",
       "tests": [
-        "crates/st3-daemon/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
+        "crates/st3-api/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2511,8 +2511,8 @@
         "crates/stui/src/ui/mod.rs::automatic_images_use_visible_image_lines_graphics_and_one_read_at_a_time",
         "crates/stui/src/ui/content.rs::chunks_assemble_the_entire_original_json_from_zero",
         "crates/stui/src/ui/content.rs::chunks_reject_changed_identity_and_non_progressing_offsets",
-        "crates/st3-daemon/src/api/client_v0/conversation_blocks.rs::truncated_tool_output_http_chunks_return_complete_native_body_without_writes",
-        "crates/st3-daemon/src/api/client_v0/conversation_blocks.rs::http_owner_chunks_negotiate_bound_bytes_and_visibly_invalidate_without_writes"
+        "crates/st3-api/src/api/client_v0/conversation_blocks.rs::truncated_tool_output_http_chunks_return_complete_native_body_without_writes",
+        "crates/st3-api/src/api/client_v0/conversation_blocks.rs::http_owner_chunks_negotiate_bound_bytes_and_visibly_invalidate_without_writes"
       ],
       "verification": "content-control reducer and viewport queue; chunk assembly and identity checks; real owner HTTP chunk transport returns complete content without durable writes"
     },
