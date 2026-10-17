@@ -90,6 +90,8 @@ it('a conversation switch traces subscribe -> first frame -> painted transcript 
     const subscribe = commands.find((command) => command['kind'] === 'subscribe' && command['collection'] === 'conversation')!
     const child = spans.find((span) => span.name === FOLLOW_SUBSCRIBE_SPAN)!
     expect(Option.getOrUndefined(child.parent)).toBe(switchRoot)
+    expect(child.traceId).toBe(switchRoot.traceId)
+    expect(spans.some((span) => span.name === FIRST_FRAME_SPAN)).toBe(false)
     // Probe HTTP also names its own SDK child, and keeps context even without an active UX root.
     const probe = spans.find((span) => span.name === 'st3.socket.probe')!
     expect(Option.getOrUndefined(probe.parent)).toBe(reloadRoot)
@@ -120,7 +122,7 @@ it('a conversation switch traces subscribe -> first frame -> painted transcript 
 
     yield* Effect.promise(() => vi.advanceTimersByTimeAsync(250))
     expect(ring.getSnapshot().spans.map((span) => span.name)).toEqual(expect.arrayContaining([
-      'wf.ux.switch', 'wf.ux.switch.data_ready', 'st3.snapshot', FOLLOW_SUBSCRIBE_SPAN, FIRST_FRAME_SPAN,
+      'wf.ux.switch', 'wf.ux.switch.data_ready', 'st3.snapshot', FOLLOW_SUBSCRIBE_SPAN,
     ]))
     const root = spans.find((span) => span === switchRoot)!
     expect(root.status._tag).toBe('Ended')
@@ -129,14 +131,9 @@ it('a conversation switch traces subscribe -> first frame -> painted transcript 
     expect(child.status._tag).toBe('Ended')
     expect(child.attributes.get('wf.ux.outcome')).toBe('observed')
     expect(child.attributes.get('wf.subscription.kind')).toBe('conversation')
-    const firstFrame = spans.find((span) => span.name === FIRST_FRAME_SPAN && span.attributes.get('wf.subscription.kind') === 'conversation')!
-    expect(firstFrame.parent._tag).toBe('None')
-    expect(firstFrame.attributes.get('wf.ux.outcome')).toBe('observed')
-    expect(firstFrame.attributes.get('wf.ux.budget_ms')).toBe(30_000)
-    expect(firstFrame.attributes.get('wf.ux.budget_phase')).toBe('subscribe-to-first-frame')
-    expect(firstFrame.attributes.get('wf.ux.budget_met')).toBe(true)
+    expect(spans.some((span) => span.name === FIRST_FRAME_SPAN)).toBe(false)
     // Bounded labels only: the ref never becomes an attribute value.
-    for (const span of [root, child, firstFrame])
+    for (const span of [root, child])
       expect([...span.attributes.values()].some((value) => String(value).includes(ref))).toBe(false)
   }).pipe(
     Effect.provide(

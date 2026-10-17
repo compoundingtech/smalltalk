@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep fractal-web switch subscriptions in the switch trace; create independent first-frame roots only when no UX parent is active.",
+  "replay": {
+    "status": "none",
+    "detail": "Client telemetry only; existing claims are not replayed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or persisted claim format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or fleet coordination changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The existing subscribe trace field is unchanged. The daemon tolerates but does not extract it; daemon first-frame spans remain independent roots linked to the WebSocket upgrade context."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption is required for this client-only telemetry change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Export remains opt-in through the explicitly configured endpoint; no relay, collector or server setup is added."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new rollback or roll-forward requirements; reverting restores the previous client span layout."
+  }
+}

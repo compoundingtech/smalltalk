@@ -22,8 +22,8 @@
  *
  * Tracing (`trace.ts`, `firstFrame.ts`): SDK HTTP calls run under their own `st3.*` span (a child
  * of `parentSpan`) whose `traceparent` they carry; socket opens carry the caller's `traceContext`.
- * Each subscribe attempt opens a bounded `wf.ux.first_frame` root (and an `st3.follow.subscribe`
- * child of `parentSpan`) whose context the subscribe command carries.
+ * Each subscribe attempt opens a bounded `st3.follow.subscribe` child of `parentSpan`, falling
+ * back to an independent `wf.ux.first_frame` root without a parent, and carries that context.
  * `adoptEarlyCollections` adopts the socket `index.html` opened before the bundle (`early.ts`).
  */
 import {

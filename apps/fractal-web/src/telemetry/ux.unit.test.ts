@@ -1,5 +1,6 @@
-import { Tracer } from 'effect'
+import { Option, Tracer } from 'effect'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { FIRST_FRAME_SPAN, FOLLOW_SUBSCRIBE_SPAN, makeFirstFrames } from '../../packages/st3-sdk/src/effect/firstFrame.ts'
 import { makeSpanRing } from './spanRing.ts'
 import { makeUxTelemetry } from './ux.ts'
 
@@ -21,7 +22,7 @@ const harness = () => {
   const paints = new Set<() => void>()
   const ready = vi.fn()
   const ux = makeUxTelemetry({ tracer: () => tracer, now: () => at, timeOrigin: 0, paint: (callback) => { paints.add(callback); return () => { paints.delete(callback) } }, onFirstPaint: ready })
-  return { ux, ready, snapshot: () => { vi.advanceTimersByTime(250); return ring.getSnapshot() }, ended, time: (value: number) => { at = value }, paint: () => { const callbacks = [...paints]; paints.clear(); for (const callback of callbacks) callback() } }
+  return { ux, tracer, ready, snapshot: () => { vi.advanceTimersByTime(250); return ring.getSnapshot() }, ended, time: (value: number) => { at = value }, paint: () => { const callbacks = [...paints]; paints.clear(); for (const callback of callbacks) callback() } }
 }
 
 afterEach(() => vi.useRealTimers())
@@ -71,6 +72,54 @@ describe('bounded perceived UX', () => {
     expect(h.snapshot().spans[1]).toMatchObject({ name: 'wf.ux.switch', label: 'cold', durationMs: 30, attributes: { 'wf.ux.data_ready_ms': 20, 'wf.ux.slot_count': 3, 'wf.ux.painted': true } })
     expect(JSON.stringify(h.snapshot())).not.toContain('private-id')
     h.ux.dispose()
+  })
+  it('parents every switch subscription kind to the switch without independent first-frame roots', () => {
+    const h = harness()
+    const firstFrames = makeFirstFrames({ tracer: h.tracer, parentSpan: h.ux.activeSpan })
+    h.ux.beginSwitch({ ref: 'session/selected', warm: false, slotCount: 3 })
+    const root = h.ux.activeSpan()!
+    for (const kind of ['window', 'conversation', 'terminal'] as const) {
+      const attempt = firstFrames.begin({ kind, label: kind === 'window' ? 'agents' : kind })
+      attempt.end('observed')
+      attempt.end('disposed')
+      const child = h.ended.at(-1)!
+      expect(child.name).toBe(FOLLOW_SUBSCRIBE_SPAN)
+      expect(child.traceId).toBe(root.traceId)
+      expect(Option.getOrUndefined(child.parent)).toBe(root)
+      expect(attempt.trace).toEqual({ traceparent: `00-${root.traceId}-${child.spanId}-01` })
+      expect(child.attributes.get('wf.ux.outcome')).toBe('observed')
+    }
+    expect(h.ended).toHaveLength(3)
+    expect(h.ended.some((span) => span.name === FIRST_FRAME_SPAN)).toBe(false)
+    h.ux.dispose()
+    h.snapshot()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+  it('falls back to independent first-frame roots once no UX parent is active', () => {
+    const h = harness()
+    const firstFrames = makeFirstFrames({ tracer: h.tracer, parentSpan: h.ux.activeSpan })
+    h.ux.shellCommitted()
+    h.ux.rosterCommitted()
+    h.paint()
+    expect(h.ux.activeSpan()).toBeUndefined()
+    const traces = new Set<string>()
+    for (const kind of ['window', 'conversation', 'terminal'] as const) {
+      const attempt = firstFrames.begin({ kind, label: kind === 'window' ? 'agents' : kind })
+      attempt.end('observed')
+      const root = h.ended.at(-1)!
+      expect(root.name).toBe(FIRST_FRAME_SPAN)
+      expect(root.parent._tag).toBe('None')
+      expect(attempt.trace).toEqual({ traceparent: `00-${root.traceId}-${root.spanId}-01` })
+      expect(root.attributes.get('wf.ux.budget_ms')).toBe(30_000)
+      expect(root.attributes.get('wf.ux.budget_phase')).toBe('subscribe-to-first-frame')
+      expect(root.attributes.get('wf.ux.budget_met')).toBe(true)
+      traces.add(root.traceId)
+    }
+    expect(traces.size).toBe(3)
+    expect(h.ended.some((span) => span.name === FOLLOW_SUBSCRIBE_SPAN)).toBe(false)
+    h.ux.dispose()
+    h.snapshot()
+    expect(vi.getTimerCount()).toBe(0)
   })
   it('does not complete a superseding selection on an old committed paint', () => {
     const h = harness()
