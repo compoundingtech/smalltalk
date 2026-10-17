@@ -7982,14 +7982,21 @@ impl Store {
     pub fn record_replication_worker(
         &self,
         peer: &str,
-        worker: crate::replication::ReplicationWorkerStatus,
+        mut worker: crate::replication::ReplicationWorkerStatus,
     ) {
-        self.replication_sync
+        let mut sync = self
+            .replication_sync
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(peer.to_owned())
-            .or_default()
-            .worker = Some(worker);
+            .unwrap_or_else(PoisonError::into_inner);
+        let progress = sync.entry(peer.to_owned()).or_default();
+        // Exchange polling and retry probes report phase without selecting a new route.
+        if worker.route_is_preferred.is_none()
+            && let Some(previous) = &progress.worker
+        {
+            worker.route_is_preferred = previous.route_is_preferred;
+            worker.preferred_retry_at_unix_ms = previous.preferred_retry_at_unix_ms;
+        }
+        progress.worker = Some(worker);
     }
 
     /// The latest sync measurement for each configured peer that has one.

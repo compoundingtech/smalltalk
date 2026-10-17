@@ -2335,6 +2335,31 @@ fn replication_status_renders_the_fabric_grant_reason() {
 }
 
 #[test]
+fn replication_status_names_fallback_and_preferred_retry_deadline() {
+    let mut peer = peer_status("cedar", None);
+    peer.worker = Some(
+        serde_json::from_value(serde_json::json!({
+            "phase": "idle", "last_attempt_at_unix_ms": 1000,
+            "next_retry_at_unix_ms": null, "route_is_preferred": false,
+            "preferred_retry_at_unix_ms": 61_000
+        }))
+        .unwrap(),
+    );
+    let output = render_replication_peers(&[peer.clone()], "local", 1000);
+    assert!(output.contains("  route fallback"), "{output}");
+    assert!(
+        output.contains("preferred route retry in 60s (unix ms 61000)"),
+        "{output}"
+    );
+    let worker = peer.worker.as_mut().unwrap();
+    worker.route_is_preferred = Some(true);
+    worker.preferred_retry_at_unix_ms = None;
+    let output = render_replication_peers(&[peer], "local", 1000);
+    assert!(output.contains("  route preferred"), "{output}");
+    assert!(!output.contains("preferred route retry"), "{output}");
+}
+
+#[test]
 fn replication_status_says_not_catching_up_when_nothing_closes_the_gap() {
     let now = 1_000_000;
     let peer = |sync: st3::model::ReplicationPeerSync| ReplicationPeerStatus {

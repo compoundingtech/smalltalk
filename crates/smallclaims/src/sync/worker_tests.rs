@@ -1127,7 +1127,7 @@ mod retry_tests {
         let (notify, _) = watch::channel(0);
         let fleet = FleetContext::legacy(BTreeSet::from(["beacon".into()]));
         let dialer = tokio::spawn(dial_peer(
-            Local(local),
+            Local(local.clone()),
             "harbor".into(),
             "beacon".into(),
             routes,
@@ -1144,13 +1144,29 @@ mod retry_tests {
         }
         for _ in 0..20 {
             tick().await;
-            if fleet.activity.read().unwrap().contains_key("beacon") {
+            if local
+                .replication_status(false, None, &["beacon".into()])
+                .unwrap()
+                .peers[0]
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.preferred_retry_at_unix_ms.is_some())
+            {
                 break;
             }
         }
         assert!(fleet.activity.read().unwrap().contains_key("beacon"));
         assert!(attempts.lock()[0], "preferred fails first");
         assert_eq!(attempts.lock().last(), Some(&false), "fallback succeeds");
+        let worker = local
+            .replication_status(false, None, &["beacon".into()])
+            .unwrap()
+            .peers
+            .remove(0)
+            .worker
+            .unwrap();
+        assert_eq!(worker.route_is_preferred, Some(false));
+        assert!(worker.preferred_retry_at_unix_ms.is_some());
         preferred_up.store(true, Ordering::SeqCst);
         // Local writes wake the worker throughout cooldown, but neither retry early nor
         // slide the deadline on each successful fallback exchange.
@@ -1167,6 +1183,15 @@ mod retry_tests {
             }
         }
         assert_eq!(attempts.lock().last(), Some(&true), "preferred recovers");
+        let worker = local
+            .replication_status(false, None, &["beacon".into()])
+            .unwrap()
+            .peers
+            .remove(0)
+            .worker
+            .unwrap();
+        assert_eq!(worker.route_is_preferred, Some(true));
+        assert_eq!(worker.preferred_retry_at_unix_ms, None);
         preferred_up.store(false, Ordering::SeqCst);
         let before = attempts.lock().len();
         for _ in 0..20 {
@@ -2656,7 +2681,7 @@ async fn worker_phase_status_is_local_and_reports_retry_deadline() {
     let attempt = crate::store::now_ms();
     for phase in ["exchange", "backoff", "idle"] {
         let retry = (phase == "backoff").then_some(Duration::from_secs(30));
-        record_worker(&Local(store.clone()), "cedar", phase, attempt, retry).await;
+        record_worker(&Local(store.clone()), "cedar", phase, attempt, retry, None).await;
         let status = store
             .replication_status(false, None, &["cedar".into()])
             .unwrap();
@@ -2680,6 +2705,61 @@ async fn worker_phase_status_is_local_and_reports_retry_deadline() {
         retry_delay(Duration::from_secs(3600), &fleet, "absent"),
         Duration::from_secs(3600)
     );
+}
+
+#[tokio::test]
+async fn worker_route_status_survives_phase_updates_and_clears_preferred_retry() {
+    let store = Arc::new(plain_memory("birch").unwrap());
+    let backend = Local(store.clone());
+    let attempt = crate::store::now_ms();
+    let index = store.index().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    record_worker(
+        &backend,
+        "cedar",
+        "idle",
+        attempt,
+        None,
+        Some((false, Some(deadline))),
+    )
+    .await;
+    let status = || {
+        serde_json::to_value(
+            store
+                .replication_status(false, None, &["cedar".into()])
+                .unwrap(),
+        )
+        .unwrap()["peers"][0]["worker"]
+            .clone()
+    };
+    let fallback = status();
+    assert_eq!(fallback["route_is_preferred"], false);
+    let retry = fallback["preferred_retry_at_unix_ms"].as_u64().unwrap();
+    assert!(u128::from(retry) > attempt);
+    assert!(u128::from(retry) <= crate::store::now_ms() + 60_000);
+    // A lower-level exchange or probe updates phase without forgetting the chosen route.
+    record_worker(&backend, "cedar", "exchange", attempt, None, None).await;
+    assert_eq!(status()["route_is_preferred"], false);
+    assert_eq!(status()["preferred_retry_at_unix_ms"], retry);
+    record_worker(
+        &backend,
+        "cedar",
+        "exchange",
+        attempt,
+        None,
+        Some((true, None)),
+    )
+    .await;
+    assert_eq!(status()["route_is_preferred"], true);
+    assert!(status().get("preferred_retry_at_unix_ms").is_none());
+    assert_eq!(store.index().unwrap(), index, "route status is host-local");
+    let legacy: crate::replication::ReplicationWorkerStatus = serde_json::from_value(
+        serde_json::json!({"phase": "idle", "last_attempt_at_unix_ms": attempt,
+            "next_retry_at_unix_ms": null}),
+    )
+    .unwrap();
+    assert_eq!(legacy.route_is_preferred, None);
+    assert_eq!(legacy.preferred_retry_at_unix_ms, None);
 }
 
 #[tokio::test]

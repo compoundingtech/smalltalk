@@ -379,6 +379,7 @@ After a successful exchange on a fallback route, the worker keeps using it for a
 Successful fallback exchanges do not extend that cooldown. If the preferred route
 still fails, normal route failover resumes; Fabric grant refusals retain their
 separate, longer cooldown.
+Per-peer worker status reports `route_is_preferred` and `preferred_retry_at_unix_ms`; `st replication status` shows the preferred/fallback selection and pending preferred-route retry deadline.
 
 The peer HTTP listener is not the privileged local Unix API: it exposes only fleet replication,
 join, and owner-forwarded client operations. Replication and forwarded client requests require
