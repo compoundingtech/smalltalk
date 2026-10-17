@@ -25,7 +25,7 @@
     },
     {
       "name": "authorization",
-      "globs": ["crates/st3-api/src/api/client_v0*", "crates/st3-api/src/api/client_web*", "crates/st3-store/src/sekrets/**", "crates/st3-store/src/sekrets.rs", "crates/st3-kernel/src/accounts.rs", "crates/st3-store/src/store/accounts.rs", "crates/st3-store/src/store/roster_admission.rs", "crates/st3-store/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
+      "globs": ["crates/st3-api/src/api/client_v0*", "crates/st3-api/src/api/client_web*", "crates/st3-secrets/src/sekrets/**", "crates/st3-secrets/src/sekrets.rs", "crates/st3-kernel/src/accounts.rs", "crates/st3-store/src/store/accounts.rs", "crates/st3-store/src/store/roster_admission.rs", "crates/st3-store/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
       "content": [
         {"globs": ["crates/**"], "pattern": "(?i)\\b(trusted[_ ]keys?|pairing|device[_ ]key|signing[_ ]key|verify_signature)\\b"}
       ],

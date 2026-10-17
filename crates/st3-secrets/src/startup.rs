@@ -345,7 +345,7 @@ impl Startup {
         });
         #[cfg(feature = "test-support")]
         if progress.phase == "full-replay/base-claims" && progress.processed == Some(0) {
-            crate::test_support::pause_startup_replay();
+            pause_startup_replay();
         }
     }
 
@@ -550,3 +550,40 @@ mod unsupported_platform_tests {
         assert!(super::paths(&socket).iter().all(|path| !path.exists()));
     }
 }
+
+/// The login shell a fixture daemon runs under, set once by the fixture executable.
+#[cfg(any(test, feature = "test-support"))]
+static LOGIN_SHELL: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn login_shell() -> Option<&'static std::path::Path> {
+    LOGIN_SHELL.get().map(std::path::PathBuf::as_path)
+}
+
+#[cfg(feature = "test-support")]
+pub fn set_login_shell(shell: std::path::PathBuf) {
+    LOGIN_SHELL.set(shell).expect("initialize fixture shell once");
+}
+
+/// An isolated startup test can inspect the real daemon while its replay is in flight.
+#[cfg(feature = "test-support")]
+pub fn pause_startup_replay() {
+    if login_shell().is_none() {
+        return;
+    }
+    let Some(directory) = std::env::var_os("ST3_TEST_STARTUP_REPLAY_BARRIER") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    std::fs::write(directory.join("entered"), b"replay in progress")
+        .expect("publish replay barrier");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !directory.join("release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup test did not release replay"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
