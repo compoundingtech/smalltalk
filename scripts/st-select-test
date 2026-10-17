@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Controls for scripts/st-select and its Rust plugin: the declared lists must cover what the Rust code reads.
+
+An under-declared input list is the dangerous direction (a stale pass), so these tests read the Rust sources and fail
+when a compile-time include, a run-time path joined onto CARGO_MANIFEST_DIR, or a build-stamp reader appears that the
+plugin does not account for. They need no build and no network.
+"""
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+import unittest.mock
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+select = load('st_select', ROOT / 'scripts/st-select')
+rust = load('st_select_rust', ROOT / 'scripts/st-select.d/rust.py')
+
+RUST_ROOTS = ('crates', 'src', 'tests', 'examples', 'components', 'vendor')
+INCLUDE = re.compile(r'include(?:_str|_bytes)?!\s*\(\s*concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"]+)"'
+                     r'|include(?:_str|_bytes)?!\s*\(\s*"([^"]+)"')
+MANIFEST_JOIN = re.compile(r'CARGO_MANIFEST_DIR"\s*\)\s*\)?\s*\.join\(\s*"([^"]+)"', re.S)
+# Once a file has resolved the repository root, every later `.join("literal")` and `"literal/..."` path in it may be
+# relative to that root; those literals whose first component is a tracked top-level entry are checked as repo paths.
+# Reviewed hits of the root pass that are not repository-root reads, with the reason.
+ROOT_LITERAL_REVIEWED = {
+    ('crates/st3/tests/examples.rs', 'AGENTS.md'): 'joined onto eval seat workspaces under evals/st3 (examples.rs:980-990)',
+    ('crates/st3/tests/examples.rs', 'CLAUDE.md'): 'joined onto eval seat workspaces under evals/st3 (examples.rs:980-990)',
+}
+ANY_JOIN = re.compile(r'\.join\(\s*"([^"{}]+)"\s*\)')
+STAMP_READERS = re.compile(r'ST_BUILD_STAMP_LOCAL|AGENT_SPEC_REVISION|LOCAL_STAMP|machine_version\(')
+# Every reader of the git-derived build stamp, reviewed: they read its SHAPE (a full sha, or a dirty/unknown marker), so
+# any clean commit with the same inputs gives the same result. A new reader must be reviewed and added here.
+STAMP_ALLOWED = {
+    'crates/st-drivers/src/version.rs', 'crates/agent-spec/src/lib.rs', 'src/catalog_graph.rs', 'src/agent_publish.rs',
+    'src/main.rs', 'crates/st3/tests/version.rs', 'crates/st3/tests/client_v0_contract.rs',
+}
+
+
+def rust_files():
+    listing = subprocess.run(['git', 'ls-files', '-z', '--', *RUST_ROOTS, 'scripts/ci-test-paths.rs'],
+                             cwd=ROOT, capture_output=True, check=True).stdout.decode()
+    return [p for p in listing.split('\0') if p.endswith('.rs')]
+
+
+def resolve(source, relative):
+    """The repository path a literal relative to `source`'s directory (or its crate's manifest) names, or None."""
+    path = (ROOT / source).parent / relative
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return None
+
+
+def crate_dir(source):
+    directory = (ROOT / source).parent
+    while directory != ROOT and not (directory / 'Cargo.toml').exists():
+        directory = directory.parent
+    return directory
+
+
+class PluginLists(unittest.TestCase):
+    def test_every_declared_input_exists(self):
+        for path in rust.INPUTS:
+            with self.subTest(path=path):
+                self.assertTrue((ROOT / path).exists(), path)
+
+    def test_inputs_and_not_mine_do_not_overlap_except_by_explicit_carve_out(self):
+        # A NOT_MINE root may contain an input (apps/ holds the font one st3 test reads); inputs win in st-select.
+        for path in rust.INPUTS:
+            self.assertFalse(path in rust.NOT_MINE, path)
+
+    def test_inputs_cover_the_base_policy_list(self):
+        policy = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
+        declared = policy['checks'].get(rust.CHECK, {}).get('inputs') or []
+        for path in declared:
+            with self.subTest(path=path):
+                self.assertTrue(select.under(path, rust.INPUTS), f'policy input {path} is not in the Rust plugin list')
+
+    def test_every_top_level_entry_is_classified(self):
+        listing = subprocess.run(['git', 'ls-tree', '--name-only', 'HEAD'], cwd=ROOT, capture_output=True, check=True)
+        for name in listing.stdout.decode().split():
+            if name in ('.gitattributes', '.gitignore'):
+                continue  # deliberately unknown: they change what git and the whole-tree lints see
+            with self.subTest(name=name):
+                self.assertTrue(select.under(name, rust.INPUTS) or select.under(name, rust.NOT_MINE)
+                                or any(i.startswith(name + '/') for i in rust.INPUTS), name)
+
+
+class RustReads(unittest.TestCase):
+    def test_compile_time_includes_resolve_inside_the_inputs(self):
+        missing = []
+        for source in rust_files():
+            text = (ROOT / source).read_text(errors='replace')
+            for match in INCLUDE.finditer(text):
+                if match.group(1):
+                    target = resolve(crate_dir(source).relative_to(ROOT).as_posix() + '/Cargo.toml', match.group(1).lstrip('/'))
+                else:
+                    target = resolve(source, match.group(2))
+                if target and not select.under(target, rust.INPUTS):
+                    missing.append(f'{source}: {target}')
+        self.assertEqual(missing, [])
+
+    def test_manifest_relative_runtime_paths_resolve_inside_the_inputs(self):
+        missing = []
+        for source in rust_files():
+            text = (ROOT / source).read_text(errors='replace')
+            for match in MANIFEST_JOIN.finditer(text):
+                manifest = crate_dir(source).relative_to(ROOT).as_posix() + '/Cargo.toml'
+                target = resolve(manifest, match.group(1))
+                if target == '.':
+                    for literal in ANY_JOIN.findall(text):
+                        top = literal.split('/')[0]
+                        if (top in ('', '.', '..', 'target') or not (ROOT / top).exists()
+                                or (source, literal) in ROOT_LITERAL_REVIEWED):
+                            continue
+                        if not select.under(literal, rust.INPUTS):
+                            missing.append(f'{source}: {literal} (from the repository root)')
+                elif target and not target.startswith('target/') and not select.under(target, rust.INPUTS):
+                    missing.append(f'{source}: {target}')
+        self.assertEqual(sorted(set(missing)), [])
+
+    def test_build_stamp_readers_are_the_reviewed_ones(self):
+        readers = set()
+        for source in rust_files():
+            # Production code reports the stamp; only test code could assert on its value.
+            if source.endswith('build.rs') or not ('/tests/' in f'/{source}' or 'test_support' in source):
+                continue
+            if STAMP_READERS.search((ROOT / source).read_text(errors='replace')):
+                readers.add(source)
+        self.assertEqual(sorted(readers - STAMP_ALLOWED), [], 'review the new reader, then add it to STAMP_ALLOWED')
+
+    def test_whole_tree_lints_are_the_always_run_class(self):
+        integration = (ROOT / 'tests/integration.rs').read_text()
+        for module in ('public_repo', 'native_only', 'vrs_ledger'):
+            self.assertIn(f'mod {module};', integration)
+            self.assertIn(module, rust.ALWAYS['whole-tree-lints'][-1])
+
+
+class ProofVerdict(unittest.TestCase):
+    BASE = {'satisfied': True, 'tier': 'full', 'record': 'r' * 40}
+
+    def verdict(self, **inputs):
+        return select.proof_verdict(dict(self.BASE, inputs=inputs))
+
+    def test_absent_retry_count_is_unknown_never_zero(self):
+        self.assertEqual(self.verdict(run_attempt='1'), ('r' * 40, 'retries-unknown'))
+
+    def test_unparsable_retry_count_is_unknown(self):
+        self.assertEqual(self.verdict(stage_flaky='linux-tests=?'), ('r' * 40, 'retries-unknown'))
+        self.assertEqual(self.verdict(stage_flaky=''), ('r' * 40, 'retries-unknown'))
+
+    def test_any_retried_test_refuses_the_proof(self):
+        self.assertEqual(self.verdict(stage_flaky='linux-tests=0,linux-tests-shard-2=1'), (None, 'proof-had-retries'))
+        self.assertEqual(self.verdict(nextest_flaky='3'), (None, 'proof-had-retries'))
+
+    def test_clean_first_attempt_with_zero_retries_is_proof(self):
+        self.assertEqual(self.verdict(run_attempt='1', stage_flaky='linux-tests=0,linux-tests-shard-2=0'), ('r' * 40, 'match'))
+
+    def test_rerun_workflow_and_unsatisfied_records_are_refused(self):
+        self.assertEqual(self.verdict(run_attempt='2', stage_flaky='linux-tests=0'), (None, 'proof-was-a-rerun'))
+        self.assertEqual(select.proof_verdict({'satisfied': False, 'reason': 'stale_tree'}), (None, 'no-record:stale_tree'))
+        self.assertEqual(select.proof_verdict(dict(self.BASE, tier='degraded')), (None, 'no-record:unsatisfied'))
+
+
+class Classification(unittest.TestCase):
+    def repo(self, files):
+        directory = Path(tempfile.mkdtemp(prefix='st-select-test-'))
+        self.addCleanup(subprocess.run, ['rm', '-rf', str(directory)])
+        subprocess.run(['git', 'init', '-q', str(directory)], check=True)
+        for path, text in files.items():
+            (directory / path).parent.mkdir(parents=True, exist_ok=True)
+            (directory / path).write_text(text)
+        subprocess.run(['git', '-C', str(directory), 'add', '-A'], check=True)
+        ident = ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false']
+        subprocess.run(['git', '-C', str(directory), *ident, 'commit', '-qm', 'base'], check=True)
+        return directory
+
+    def test_under_is_path_component_exact(self):
+        self.assertTrue(select.under('crates/st3/src/lib.rs', ('crates',)))
+        self.assertTrue(select.under('Cargo.toml', ('Cargo.toml',)))
+        self.assertFalse(select.under('crates-extra/x', ('crates',)))
+        self.assertFalse(select.under('Cargo.toml.bak', ('Cargo.toml',)))
+
+    def test_report_names_all_for_shared_inputs_and_the_reverse_closure_otherwise(self):
+        metadata = {
+            'workspace_root': '/w', 'workspace_members': ['a', 'b', 'c'],
+            'packages': [{'id': i, 'name': n, 'manifest_path': f'/w/crates/{n}/Cargo.toml'} for i, n in
+                         (('a', 'lib-a'), ('b', 'uses-a'), ('c', 'alone'))],
+            'resolve': {'nodes': [{'id': 'a', 'deps': []}, {'id': 'b', 'deps': [{'pkg': 'a'}]}, {'id': 'c', 'deps': []}]},
+        }
+        self.assertEqual(rust.report(metadata, ['crates/lib-a/src/lib.rs'])['crates'], ['lib-a', 'uses-a'])
+        self.assertEqual(rust.report(metadata, ['crates/alone/src/lib.rs'])['crates'], ['alone'])
+        self.assertEqual(rust.report(metadata, ['Cargo.lock'])['crates'], 'all')
+
+
+
+class Sign(unittest.TestCase):
+    def test_the_aggregate_file_is_the_facts_and_every_scratch_file_is_removed(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            facts = argv[argv.index('--aggregate') + 1]
+            seen['facts'] = json.loads(Path(facts).read_text())
+            seen['paths'] = [facts, argv[1]]
+            return subprocess.CompletedProcess(argv, 0, 'signed', '')
+
+        line = {'check': 'linux-gate', 'decision': 'covered', 'key': 'k' * 40, 'proof': 'p' * 40,
+                'plugin': 'rust@x', 'inputs_sha256': 'i' * 16}
+        always = {'whole-tree-lints': {'command': ['true'], 'exit_code': 0, 'output_sha256': '0' * 64}}
+        with unittest.mock.patch.object(select, 'git', lambda *a, **k: subprocess.CompletedProcess(a, 0, b'#tool', b'')), \
+                unittest.mock.patch.object(select.subprocess, 'run', fake_run):
+            self.assertEqual(select.sign('base', line, always, '1', ROOT), (0, 'signed'))
+        self.assertEqual(seen['facts']['command'], ['st-select', 'select', 'linux-gate'])
+        self.assertEqual(seen['facts']['exit_code'], 0)
+        self.assertEqual(seen['facts']['inputs']['always_whole_tree_lints'], '0:' + '0' * 16)
+        for path in seen['paths']:
+            self.assertFalse(Path(path).exists(), path)
+
+    def test_a_signed_run_decision_names_its_record_and_a_refusal_names_none(self):
+        summary = json.dumps({'record': 'r' * 40, 'exit_code': 1, 'verified': False, 'pushed': False}, indent=2)
+        self.assertEqual(select.signed_record(summary + '\n'), 'r' * 40)
+        self.assertIsNone(select.signed_record('evidence-wrap: the signer refused: inputs must be short nonempty strings'))
+        self.assertIsNone(select.signed_record('{not json'))
+
+    def test_the_facts_inputs_pass_the_signers_own_rules_for_both_decisions(self):
+        signer = load('evidence_sign', ROOT / 'scripts/evidence-sign')
+        always = {'whole-tree-lints': {'command': ['true'], 'exit_code': 0, 'output_sha256': '0' * 64}}
+        lines = [{'check': 'linux-gate', 'decision': 'covered', 'key': 'k' * 40, 'proof': 'p' * 40,
+                  'plugin': 'rust@x', 'inputs_sha256': 'i' * 16},
+                 {'check': 'linux-gate', 'decision': 'run', 'key': None, 'proof': None,
+                  'plugin': 'rust@x', 'inputs_sha256': 'i' * 16}]
+        for line in lines:
+            seen = {}
+
+            def fake_run(argv, **kw):
+                seen['inputs'] = json.loads(Path(argv[argv.index('--aggregate') + 1]).read_text())['inputs']
+                return subprocess.CompletedProcess(argv, 0, '', '')
+
+            with unittest.mock.patch.object(select, 'git', lambda *a, **k: subprocess.CompletedProcess(a, 0, b'#tool', b'')), \
+                    unittest.mock.patch.object(select.subprocess, 'run', fake_run):
+                select.sign('base', line, always, '1', ROOT)
+            for name, value in seen['inputs'].items():
+                self.assertRegex(name, signer.EXTRA_INPUT, line['decision'])
+                self.assertTrue(isinstance(value, str) and 0 < len(value) <= 500, (line['decision'], name, value))
+
+if __name__ == '__main__':
+    unittest.main()

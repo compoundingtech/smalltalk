@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Decide, locally and in shadow, whether a change needs a check's real run or is covered by a signed pass.
+
+  scripts/st-select [--base origin/main] [--head HEAD] [--json] [--sign] [--plugin rust]
+
+For each plugin (scripts/st-select.d/<name>.py; one per language, each owning one required check) it:
+  1. merges the head into the base tip (`git merge-tree --write-tree`); a conflict runs everything;
+  2. classifies every path the change touches (merge base to head, no rename detection) as one of the plugin's
+     inputs, on its reviewed not-mine list, or unknown; one unknown path runs the check;
+  3. projects the merged tree and the base tip onto the plugin's inputs (`evidence-verify --project`, the same key
+     producers sign as source_inputs) and, when the keys are equal, asks evidence-verify for a satisfied full
+     record of the base tip's tree. That record is the proof: it covered a tree whose inputs are byte-identical
+     to the tree the queue would merge. A head tree that does not match the merged result is never asked about;
+  4. prints one decision line per check:
+       check=C decision=covered|run key=K proof=RECORD|none plugin=P@SHA inputs_sha256=S reason=R
+With --sign the plugin's always-run checks (tests that read every file, so no key covers them) run in a fresh
+worktree of the head, and their result, the decision and the proof are signed as one record for the head's tree
+under the check name `select.<check>` through evidence-wrap --aggregate. That name and its command are no policy's,
+so the record can never skip a CI job; it says "on this tree the always-run checks passed and the heavy check was
+covered by record Z". Nothing is pushed. Shadow only: st-select never decides what CI runs.
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+PLUGINS = HERE / 'st-select.d'
+REPOSITORY = 'compoundingtech/smalltalk'
+WALK = 50  # first-parent commits searched for a record with the same key
+
+
+def git(*args, check=True, cwd=None):
+    done = subprocess.run(['git', '-c', 'core.fsmonitor=false', *args], capture_output=True, cwd=cwd,
+                          env={k: v for k, v in os.environ.items() if not k.startswith('GIT_')})
+    if check and done.returncode != 0:
+        raise RuntimeError(f'git {" ".join(args)}: {done.stderr.decode(errors="replace").strip()}')
+    return done
+
+
+def out(*args, **kw):
+    return git(*args, **kw).stdout.decode().strip()
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(f'st_select_{name}', PLUGINS / f'{name}.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.SHA256 = hashlib.sha256((PLUGINS / f'{name}.py').read_bytes()).hexdigest()
+    return module
+
+
+def under(path, roots):
+    return any(path == r or path.startswith(r + '/') for r in roots)
+
+
+def policy_inputs(base, check):
+    try:
+        policy = json.loads(out('show', f'{base}:.st/evidence-skip-policy.json'))
+    except (RuntimeError, ValueError):
+        return None
+    inputs = policy.get('checks', {}).get(check, {}).get('inputs')
+    return tuple(inputs) if inputs else None
+
+
+def verifier(base):
+    """evidence-verify as it is on the base, never the change's copy."""
+    scratch = tempfile.NamedTemporaryFile('wb', suffix='-evidence-verify', delete=False)
+    scratch.write(git('show', f'{base}:scripts/evidence-verify').stdout)
+    scratch.close()
+    return scratch.name
+
+
+def project(tool, tree, check, paths):
+    done = subprocess.run([sys.executable, tool, '--tree', tree, '--check', check, '--project', '--paths', ','.join(paths)],
+                          capture_output=True, text=True)
+    return json.loads(done.stdout)['source_inputs']
+
+
+def proof_for(tool, base, tree, check, keys_from):
+    done = subprocess.run([sys.executable, tool, '--tree', tree, '--check', check, '--policy-from', keys_from,
+                           '--keys-from', keys_from, '--repository', REPOSITORY], capture_output=True, text=True)
+    try:
+        result = json.loads(done.stdout)
+    except ValueError:
+        return None, 'verify-error'
+    return proof_verdict(result)
+
+
+def proof_verdict(result):
+    """(record or None, reason) for one verifier result. Only a full, satisfied record from a first-attempt workflow
+    with a recorded retry count of zero is proof. The count lives in the record's inputs as `stage_flaky` (the
+    linux-gate aggregate, `linux-tests=<n>,...`) or `nextest_flaky` (a shard). An ABSENT count means retries unknown,
+    never zero: such a record is refused as proof, and its id is still returned so a report can count the candidate."""
+    if not result.get('satisfied') or result.get('tier') != 'full':
+        return None, f'no-record:{result.get("reason", "unsatisfied")}'
+    inputs = result.get('inputs', {})
+    if str(inputs.get('run_attempt', '1')) != '1':
+        return None, 'proof-was-a-rerun'
+    counts = [inputs[k] for k in ('stage_flaky', 'nextest_flaky') if k in inputs]
+    if not counts:
+        return result['record'], 'retries-unknown'
+    numbers = []
+    for value in counts:
+        for part in str(value).split(','):
+            number = part.rpartition('=')[2].strip()
+            if not number.isdigit():
+                return result['record'], 'retries-unknown'
+            numbers.append(int(number))
+    if any(numbers):
+        return None, 'proof-had-retries'
+    return result['record'], 'match'
+
+
+def decide(plugin, base, head, tool, keys_from):
+    check = plugin.CHECK
+    declared = policy_inputs(base, check)
+    inputs = declared or plugin.INPUTS
+    line = {'check': check, 'plugin': f'{plugin.__name__[10:]}@{plugin.SHA256[:12]}',
+            'inputs_sha256': hashlib.sha256('\0'.join(sorted(inputs)).encode()).hexdigest()[:16],
+            'inputs_from': 'policy' if declared else 'plugin', 'key': None, 'proof': None}
+    base_tip = out('rev-parse', '--verify', f'{base}^{{commit}}')
+    merged = git('merge-tree', '--write-tree', base_tip, head, check=False)
+    if merged.returncode != 0:
+        return dict(line, decision='run', reason='merge-conflict', changed=[])
+    merged_tree = merged.stdout.decode().split('\n', 1)[0].strip()
+    fork = out('merge-base', base_tip, head)
+    diff = git('diff', '--name-only', '--no-renames', '-z', fork, head, check=False)
+    if diff.returncode != 0:
+        return dict(line, decision='run', reason='diff-failed', changed=[])
+    changed = [p for p in diff.stdout.decode().split('\0') if p]
+    line['changed'] = changed
+    unknown = [p for p in changed if not under(p, inputs) and not under(p, plugin.NOT_MINE)]
+    owned = [p for p in changed if under(p, inputs)]
+    if unknown:
+        return dict(line, decision='run', reason=f'unknown-path:{unknown[0]}')
+    key = project(tool, merged_tree, check, inputs)
+    base_key = project(tool, out('rev-parse', f'{base_tip}^{{tree}}'), check, inputs)
+    line['key'] = key
+    if key is None:
+        return dict(line, decision='run', reason='no-key')
+    if key != base_key:
+        return dict(line, decision='run', reason=f'inputs-changed:{owned[0] if owned else "merge"}')
+    # Any tree with the same key counts (the policy's input-key rule): walk the base's first-parent history while the
+    # key stays the same and take the NEWEST tree that has any record for the check. Its verdict decides, so a newer
+    # failure with this key stops the walk; an older pass behind it is never reached.
+    proof, reason = None, 'no-record'
+    for commit in out('rev-list', '--first-parent', f'--max-count={WALK}', base_tip).split():
+        tree = out('rev-parse', f'{commit}^{{tree}}')
+        if commit != base_tip and project(tool, tree, check, inputs) != key:
+            break
+        proof, reason = proof_for(tool, base, tree, check, keys_from)
+        if not reason.startswith(('no-record:stale_tree', 'no-record:no_record')):
+            break
+    if proof is None or reason != 'match':
+        # retries-unknown keeps the candidate's id in `proof` for reports, but the decision is run.
+        return dict(line, decision='run', proof=proof, reason=reason)
+    return dict(line, decision='covered', proof=proof, reason='match')
+
+
+def run_always(plugin, tree):
+    """Run the plugin's always-run checks in the head's fresh worktree; the cargo target dir is scratch."""
+    results = {}
+    env = dict(os.environ, CARGO_TARGET_DIR=str(tree.parent / 'target'))
+    for name, argv in plugin.ALWAYS.items():
+        done = subprocess.run(argv, cwd=tree, env=env, capture_output=True)
+        results[name] = {'command': argv, 'exit_code': done.returncode,
+                         'output_sha256': hashlib.sha256(done.stdout + done.stderr).hexdigest()}
+        if done.returncode != 0:
+            sys.stderr.write(done.stderr.decode(errors='replace')[-3000:])
+    return results
+
+
+def sign(base, line, always, attempt, tree):
+    """One record for the head's tree: the always-run results, the decision and its proof."""
+    facts = {'command': ['st-select', 'select', line['check']],
+             'exit_code': 0 if line['decision'] == 'covered' and all(r['exit_code'] == 0 for r in always.values()) else 1,
+             'output': {'decision': line, 'always': always},
+             # evidence-sign takes only nonempty values under names matching ^[a-z][a-z0-9_]{0,39}$.
+             'inputs': {'source_inputs': line['key'] or 'none', 'covered_by': line['proof'] or 'none',
+                        'plugin': line['plugin'], 'inputs_sha256': line['inputs_sha256'],
+                        **{'always_' + re.sub(r'[^a-z0-9_]', '_', n.lower()): f'{r["exit_code"]}:{r["output_sha256"][:16]}'
+                           for n, r in always.items()}}}
+    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as facts_file:
+        json.dump(facts, facts_file)
+    tools = {n: tempfile.NamedTemporaryFile('wb', suffix=f'-{n}', delete=False) for n in ('evidence-wrap', 'evidence-sign')}
+    for name, tool_file in tools.items():
+        tool_file.write(git('show', f'{base}:scripts/{name}').stdout)
+        tool_file.close()
+    signer = os.environ.get('EVIDENCE_SIGNER') or json.dumps([sys.executable, tools['evidence-sign'].name])
+    try:
+        done = subprocess.run([sys.executable, tools['evidence-wrap'].name, '--check', f'select.{line["check"]}',
+                               '--attempt', attempt, '--signer', signer, '--keys-from', base, '--aggregate', facts_file.name],
+                              capture_output=True, text=True, cwd=tree)
+    finally:
+        for path in [facts_file.name, *(t.name for t in tools.values())]:
+            os.unlink(path)
+    return done.returncode, (done.stdout + done.stderr).strip()
+
+
+def signed_record(text):
+    """The record id from evidence-wrap's JSON summary, or None when nothing was signed."""
+    start = text.find('{')
+    try:
+        summary = json.JSONDecoder().raw_decode(text[start:])[0] if start >= 0 else {}
+    except ValueError:
+        return None
+    return summary.get('record') if isinstance(summary, dict) else None
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--base', default='origin/main')
+    parser.add_argument('--head', default='HEAD')
+    parser.add_argument('--plugin', action='append', help='plugin name under scripts/st-select.d (default: all)')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--sign', action='store_true', help='run the always-run checks and sign the decision for the head')
+    parser.add_argument('--attempt', default='1')
+    parser.add_argument('--tools-from', help='take evidence-verify from this commit instead of the base (replaying old bases)')
+    args = parser.parse_args(argv)
+    names = args.plugin or sorted(p.stem for p in PLUGINS.glob('*.py'))
+    head = out('rev-parse', '--verify', f'{args.head}^{{commit}}')
+    tool = verifier(args.tools_from or args.base)
+    status = 0
+    try:
+        for name in names:
+            plugin = load(name)
+            line = decide(plugin, args.base, head, tool, args.tools_from or args.base)
+            if args.json:
+                print(json.dumps(line, sort_keys=True))
+            else:
+                print(' '.join(f'{k}={line[k] if line[k] is not None else "none"}'
+                               for k in ('check', 'decision', 'key', 'proof', 'plugin', 'inputs_sha256', 'inputs_from', 'reason')))
+            if args.sign:
+                scratch = Path(tempfile.mkdtemp(prefix='st-select-'))
+                tree = scratch / 'tree'
+                try:
+                    git('worktree', 'add', '--detach', '-q', str(tree), head)
+                    always = run_always(plugin, tree)
+                    code, text = sign(args.base, line, always, args.attempt, tree)
+                finally:
+                    git('worktree', 'remove', '--force', str(tree), check=False)
+                    shutil.rmtree(scratch, ignore_errors=True)
+                # evidence-wrap exits with the record's exit code, so a signed `run` decision exits 1 too:
+                # whether a record was signed is read from its summary, not from the exit code.
+                record = signed_record(text)
+                print(f'check=select.{plugin.CHECK} signed={"yes" if record else "no"} record={record or "none"} '
+                      + ' '.join(f'{n}={r["exit_code"]}' for n, r in always.items()))
+                if code != 0:
+                    if not record:
+                        print(text, file=sys.stderr)
+                    status = 1
+    finally:
+        os.unlink(tool)
+    return status
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
