@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Temporarily disable the broad Fractal fixture/app denylist scan that fails unrelated PRs on inherited source; track restoration in #2895.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No runtime authority or admission changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Fixture generation, privacy integration, schema decoding, freshness and the remaining web checks still run. Broad denylist scan coverage is explicitly disabled pending #2895."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No reruns or workflow settings changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Restore the scan invocation after the Fractal owner resolves #2895 and validates current main."
+  }
+}

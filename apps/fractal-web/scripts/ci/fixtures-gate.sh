@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The single fixtures gate developers and CI run. Proves the synthetic world is deterministic,
 # decodes against this repository's canonical client schema, keeps every identity inside the
-# synthetic namespace, carries no denylisted content, and that committed reference examples are
+# synthetic namespace, and that committed reference examples are
 # fresh output of the generator. Requires the pinned `nix develop .#web` toolchain and
 # `pnpm install --frozen-lockfile` at the repository root for the schema runtime.
 set -euo pipefail
@@ -12,7 +12,10 @@ trap 'rm -rf "$out"' EXIT
 node "$fixtures/generate.mjs" --seed 138 --out "$out"
 # Generic public rules only: real identities are never committed. Owners additionally run the
 # same scanner with --policy and their private identity list before publishing a diff.
-node "$fixtures/scan.mjs" "$out" "$root/apps/fractal-web" "$root/scripts/ci-fractal-web"
+# Temporarily disabled at Nathan's direction: inherited app-source matches fail unrelated PRs.
+# Restore after https://github.com/compoundingtech/smalltalk/issues/2895 is resolved.
+# node "$fixtures/scan.mjs" "$out" "$root/apps/fractal-web" "$root/scripts/ci-fractal-web"
+echo "WARNING: broad fixture/app denylist scan disabled; tracking smalltalk#2895" >&2
 node --test "$fixtures/privacy.integration.test.mjs"
 node "$fixtures/verify.mjs" --fixtures "$out" --native "$root/clients/typescript/st3-client/Schema.generated.ts"
 # Committed reference examples must equal fresh generator output exactly: no drift, no extra files.
