@@ -3,13 +3,14 @@ import { Alert, Linking, Pressable, ScrollView, useWindowDimensions, View } from
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
-import { ANSWERS, alertsIn, answerLabel, cleanMessageText, isRequest, offeredAnswers, pendingCalls, pendingQuestions, promptAlertKey, promptAnswers, promptCalls, questionAnswer, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
+import { ANSWERS, alertsIn, answerLabel, requestImages, cleanMessageText, isRequest, offeredAnswers, pendingCalls, pendingQuestions, promptAlertKey, promptAnswers, promptCalls, questionAnswer, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
 import { agentName } from '../agentsView';
 import type { RootParams } from '../navigation';
 import { attentionKindLabel } from '../presentation';
 import { useStore } from '../store';
 import { theme } from '../theme';
 import { Button, Markdown, Note, T, useTextAppearance } from '../ui';
+import { MailImageView, useWindowViewport } from '../imageBox';
 
 // Alerts in an agent's conversation: everything that waits on the person and belongs to this
 // agent, above the conversation, answerable there. Each is a line that opens to its question and
@@ -155,12 +156,16 @@ export function StructuredRequestView({ item, request, from, onAnswered }: { ite
     { text: 'Cancel', style: 'cancel' },
     { text: 'Send', onPress: () => void actions.done(item, answer.label, answer.id).then(done => { if (done) onAnswered(); }) },
   ]);
+  // The images the ask carries, read from st by its person step, as a message's are by the message.
+  const images = useMemo(() => requestImages(request, item.source_id), [request, item.source_id]);
+  const viewport = useWindowViewport();
   const words = () => Alert.prompt(`Answer ${from}`, item.title, text => { if (text.trim()) void actions.done(item, text.trim()).then(done => { if (done) onAnswered(); }); });
   return <View style={{ gap: 8 }}>
     {request.recommendation ? <T><T dim>recommends  </T><T bold color={theme.green}>{label(request.recommendation.answer)}</T><T soft>  {request.recommendation.reason}</T></T> : null}
     <RequestQuestion text={request.question} />
     {request.summary ? <Markdown text={spaced(request.summary)} color={theme.subtext0} /> : null}
     {request.reasons?.length ? <View style={{ gap: 2 }}>{request.reasons.map((reason, index) => <T key={index}><T color={theme.lavender}>•  </T>{reason}</T>)}</View> : null}
+    {images.length ? <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>{images.map(image => <MailImageView key={image.sha256} image={image} viewport={viewport} />)}</View> : null}
     {request.subjects?.map((subject, index) => subject.url
       ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
       : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}

@@ -37,3 +37,11 @@ assert.equal(filePath('file:///srv/a.md'), '/srv/a.md');
 assert.equal(filePath('https://example.com/a'), undefined);
 assert.equal(filePath('doc/example/spec'), undefined);
 assert.deepEqual(inline('[spec](/srv/repo/spec.md)'), [{ text: 'spec', style: 'link', url: undefined, path: '/srv/repo/spec.md' }]);
+
+// An image in Markdown is a link that opens it, never a bang and never fetched to draw it (as stui).
+assert.deepEqual(inline('Plant it?  ![north bed](https://example.com/north-bed.png)'), [
+  { text: 'Plant it?  ', style: 'plain' },
+  { text: '▣ north bed', style: 'link', url: 'https://example.com/north-bed.png' },
+  { text: ' · image link', style: 'plain' },
+]);
+assert.equal(inline('![](https://example.com/a.png)')[0].text, '▣ image');
