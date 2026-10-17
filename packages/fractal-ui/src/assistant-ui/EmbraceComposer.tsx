@@ -324,12 +324,16 @@ function PlainComposer({ targetLabel, disabledReason, toolbar, style, onRequestS
   const canCancel = useAuiState(s => s.composer.canCancel)
   const canStop = actions === undefined && canCancel
   const [stopping, setStopping] = React.useState(false)
+  const stopPending = React.useRef(false)
+  stopPending.current = stopping
   const [seenRefusal, setSeenRefusal] = React.useState(stopRefusal)
   if (seenRefusal !== stopRefusal) { setSeenRefusal(stopRefusal); if (stopRefusal !== undefined) setStopping(false) }
   if (!canCancel && stopping) setStopping(false)
-  const stop = () => { if (stopping) return; setStopping(true); aui.composer.cancel() }
+  const stop = () => { if (stopPending.current) return; stopPending.current = true; setStopping(true); aui.composer.cancel() }
   return (
     <ComposerPrimitive.Root
+      tabIndex={-1}
+      aria-label="Message composer"
       {...stylex.props(styles.root, style, cold && styles.cold)}
       onSubmit={event => { if (readOnly || onRequestSubmit !== undefined) event.preventDefault(); if (!readOnly) onRequestSubmit?.(false) }}
       onCompositionStartCapture={() => { composing.current = true }}
