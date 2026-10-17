@@ -41,7 +41,7 @@ export const deliverySender = (from: string | undefined): Sender =>
         from?.startsWith('user/') === true ||
         from?.startsWith('person/') === true
       ? { kind: 'human', label: from.slice(from.indexOf('/') + 1), via: 'wf / st' }
-      : { kind: 'system', label: from ?? 'Small Talk', via: 'st' }
+      : { kind: 'system', label: from ?? 'Fractal', via: 'st' }
 
 /** st's native injection is an explicit envelope, not a human message merely because role=user. */
 export const proseItem = (item: TextItem): TextItem => {
@@ -177,7 +177,7 @@ export const structuredEvent = ({
       ...base,
       kind: 'resource-observed',
       title: 'Resource observed',
-      sender: { kind: 'system', label: 'Small Talk', via: 'daemon' },
+      sender: { kind: 'system', label: 'Fractal', via: 'daemon' },
       text: ref ?? 'Resource observation received',
       data,
     }

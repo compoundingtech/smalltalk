@@ -879,7 +879,7 @@ fn build_registry() -> Registry {
             "A mission-run lane: an ordered line of entries its run works through front first.",
             false,
         ),
-        ("message", "message/ID", "A Small Talk message.", true),
+        ("message", "message/ID", "A Fractal message.", true),
         (
             "observer",
             "observer/RUN/LOCAL_ID",

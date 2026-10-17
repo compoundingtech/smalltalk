@@ -163,10 +163,10 @@ def prepare(home, job, built):
             'CFBundlePackageType': 'APPL', 'CFBundleVersion': '1', 'LSUIElement': True}
     if HELPER in built:
         # macOS asks on behalf of the outermost app, so its name and usage strings are the ones shown.
-        info['CFBundleDisplayName'] = 'Small Talk'
+        info['CFBundleDisplayName'] = 'Fractal'
         info['NSMicrophoneUsageDescription'] = (
-            'Small Talk listens while you dictate a message in the terminal interface, and transcribes it on this Mac.')
-        info['NSSpeechRecognitionUsageDescription'] = 'Small Talk transcribes your dictated messages on this Mac.'
+            'Fractal listens while you dictate a message in the terminal interface, and transcribes it on this Mac.')
+        info['NSSpeechRecognitionUsageDescription'] = 'Fractal transcribes your dictated messages on this Mac.'
 
     (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     metadata = resources / 'deploy-payload.json'

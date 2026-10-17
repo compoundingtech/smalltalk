@@ -789,7 +789,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
         const images = mailImages(message);
         push(entry, str(message.message_id)!, {
           kind: 'mail',
-          from: !from && !to ? 'Small Talk' : name(from),
+          from: !from && !to ? 'Fractal' : name(from),
           to: !from && !to ? '' : name(to ?? ''),
           subject: str(message.title) ?? '',
           // A message may be only its images.

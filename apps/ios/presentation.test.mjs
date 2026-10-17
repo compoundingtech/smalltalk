@@ -57,7 +57,7 @@ assert.equal(missionGroup({ ...stuck, state: 'completed' }), 'Archive');
 
 // Small Talk st joined into a conversation shows who wrote to whom and its title.
 assert.deepEqual(smallTalkPresentation({ message_id: 'message/1', from: 'agent/example/cos/standing/cos', to: 'person/alex', title: 'Release is ready' }), { from: 'COS → alex', text: 'Release is ready' });
-assert.deepEqual(smallTalkPresentation({ message_id: 'message/2', from: 'agent/example/app' }), { from: 'App → someone', text: 'Small Talk' });
+assert.deepEqual(smallTalkPresentation({ message_id: 'message/2', from: 'agent/example/app' }), { from: 'App → someone', text: 'Fractal' });
 
 
 // (3) A crash-looping seat must stand out rather than read as a normal row.

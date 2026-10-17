@@ -85,7 +85,7 @@ final class Listener {
 
   func start(locale wanted: Locale) async throws {
     guard await AVCaptureDevice.requestAccess(for: .audio) else {
-      fail("the microphone is off for Small Talk in System Settings › Privacy & Security › Microphone")
+      fail("the microphone is off for Fractal in System Settings › Privacy & Security › Microphone")
     }
     let locale = await SpeechTranscriber.supportedLocale(equivalentTo: wanted) ?? Locale(identifier: "en-US")
     let transcriber = SpeechTranscriber(

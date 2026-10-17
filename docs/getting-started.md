@@ -134,7 +134,7 @@ without the key stays on `bypass` until you ask for a change. See
 When a usable harness is available, the first run, the one that creates your configuration,
 asks before it starts anything. It says that the built-in Fractal Assistant is an agent that runs on your
 own harness account, so it uses that harness's usage and quota, and which access mode it
-runs in, then asks `Start the built-in Smalltalk Assistant now?` (default yes). `--yes` answers yes and
+runs in, then asks `Start the built-in Fractal Assistant now?` (default yes). `--yes` answers yes and
 `--assistant false` declines; a decline prints `Not started. Run st setup --onboarding when you
 want it.` On yes, setup creates `agent/st/assistant` and starts `mission/st/onboarding`, and says
 what it created and how to stop it. When setup publishes the Assistant during a plain `st`
@@ -142,7 +142,7 @@ launch, the interface opens that conversation. You can also open its conversatio
 The Assistant greets you and plays three short acts, in about five minutes. First, two agents
 talk to each other (a Claude and a Codex when both are ready). Second, a small mission runs in a split
 beside the conversation. Third, an alert from the Assistant appears above the message input, where you
-can read it and dismiss it, and the Assistant asks what you want to accomplish in Smalltalk today. That
+can read it and dismiss it, and the Assistant asks what you want to accomplish in Fractal today. That
 question ends onboarding; it starts real work only if you answer. Say `skip` at any point to stop, and
 `st setup --onboarding` brings the tour back. The Assistant stays available afterward.
 The follow-on [mission guide](missions-in-practice.md) explains how to declare

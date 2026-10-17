@@ -38,7 +38,7 @@ pub(super) fn developer_tools(environment: &BTreeMap<String, String>) -> DoctorC
             "source-build tools are on this account's login PATH; compilation was not tested".into()
         } else {
             format!(
-                "missing from this account's login PATH: {}; these tools are needed to build Smalltalk from source",
+                "missing from this account's login PATH: {}; these tools are needed to build Fractal from source",
                 missing.join(", ")
             )
         },
@@ -63,7 +63,7 @@ pub(super) fn human_outage_message(error: &anyhow::Error) -> Option<String> {
         return None;
     }
     Some(format!(
-        "the st daemon at {} is unavailable. Run `st` to open Smalltalk, or `st setup` to set up or start its background service, then retry this command",
+        "the st daemon at {} is unavailable. Run `st` to open Fractal, or `st setup` to set up or start its background service, then retry this command",
         outage.endpoint()
     ))
 }

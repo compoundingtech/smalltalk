@@ -209,5 +209,5 @@ export function pingPresentation(text: string): { from: string | null; text: str
 export function smallTalkPresentation(body: unknown): { from: string; text: string } {
   const message = (body && typeof body === 'object' ? body : {}) as { from?: unknown; to?: unknown; title?: unknown };
   const name = (id: unknown) => typeof id === 'string' ? senderName(id) : 'someone';
-  return { from: `${name(message.from)} → ${name(message.to)}`, text: typeof message.title === 'string' && message.title.trim() ? message.title : 'Small Talk' };
+  return { from: `${name(message.from)} → ${name(message.to)}`, text: typeof message.title === 'string' && message.title.trim() ? message.title : 'Fractal' };
 }

@@ -86,7 +86,7 @@ result that is recorded.
    it now appears above the message input, that they can read it and dismiss it, and ask them to try.
    Wait for them with `st conversations wait --as "$ST_AGENT" --from PERSON --timeout 30s`. On `no
    reply`, say in one short line that it stays there until they dismiss it, and carry on.
-2. Ask: "What do you want to accomplish in Smalltalk today?" Wait the same way. Listen, then ask short
+2. Ask: "What do you want to accomplish in Fractal today?" Wait the same way. Listen, then ask short
    follow-ups, one at a time, to learn the kind of work, the project folder and the harness. Offer to plan
    it. When they say yes, create their seat with `st agents new` in the folder they named (the work folder
    when they name none), send it a first message, and tell them where to find it. Or write and start a

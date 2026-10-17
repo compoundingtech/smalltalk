@@ -61,7 +61,7 @@ while time.monotonic()<deadline:
   # Never answer passwords or provider login requests.
   if b"\x1b[?1049h" in raw and b" working" in plain and not frame:
    frame=True; frame_at=time.monotonic()
- focused=bool(re.search(rb"Message Smalltalk Assistant[ \t]*\xc2\xb7[ \t]*type or click",plain))
+ focused=bool(re.search(rb"Message Fractal Assistant[ \t]*\xc2\xb7[ \t]*type or click",plain))
  if frame and not navigated and (not request.get("expect_assistant") or focused or time.monotonic()-frame_at>=request.get("assistant_focus_timeout",15)):
   initial_screen=plain.decode(errors="replace"); assistant_focused=focused
   os.write(master,b"\x0b"); time.sleep(0.2); os.write(master,b"home"); time.sleep(0.2); os.write(master,b"\r")
@@ -392,7 +392,7 @@ class Run:
             if scenario=="both":
                 self.check("harness-choice",p.get("answers",[]).count("Which harness")==1,"several harnesses ask one choice; scripted selection is Claude")
             if scenario=="assistant-lifecycle":
-                self.check("assistant-ui-focus",p.get("assistant_focused",False),"focused Message Smalltalk Assistant type-or-click composer hint appeared before navigation")
+                self.check("assistant-ui-focus",p.get("assistant_focused",False),"focused Message Fractal Assistant type-or-click composer hint appeared before navigation")
         else:
             r=self.execute("Setup flags",shlex.join(argv)); ok=r["exit"]==0; text=self.output(r)
         if not self.check("setup-success",ok,"real candidate setup completed"): return
@@ -514,13 +514,13 @@ class Run:
             self.check("fixture-policy",r["exit"]==0 and readable["exit"]==0,"candidate policy helper succeeds and ordinary user can read its fragment")
 
     def harness_checks(self,scenario):
-        """Prove the native driver without depending on the future built-in Smalltalk Assistant."""
+        """Prove the native driver without depending on the future built-in Fractal Assistant."""
         harness="claude" if scenario.startswith("claude-") or scenario=="both" else "codex"
         subject="agent/fixture/onboarding-harness"
         r=self.execute("Disposable workspace","mkdir -p ~/fixture-workspace")
         if not self.check("fixture-workspace",r["exit"]==0,"private workspace created for the explicit test seat"): return
         r=self.cli("Create disposable provider seat","agents","new","fixture/onboarding-harness","--harness",harness,"--workspace","/home/ada/fixture-workspace",timeout=35)
-        if not self.check("fixture-seat-start",r["exit"]==0,"explicit "+harness+" seat starts without built-in Smalltalk Assistant"):
+        if not self.check("fixture-seat-start",r["exit"]==0,"explicit "+harness+" seat starts without built-in Fractal Assistant"):
             self.cli("Stop failed fixture seat","agents","stop",subject,"--as","person/ada")
             return
         try:
@@ -630,7 +630,7 @@ class Run:
         original,ready=self.wait_seat(subject)
         if not self.check("lifecycle-original-seat",ready,"assistant running before stop/cancel"): return
         previous=seat_incarnation(original)
-        r=self.cli("Stop built-in Smalltalk Assistant","agents","stop",subject,"--as","person/ada")
+        r=self.cli("Stop built-in Fractal Assistant","agents","stop",subject,"--as","person/ada")
         stopped,ready=self.wait_seat(subject,stopped=True)
         if not self.check("assistant-stopped",r["exit"]==0 and ready,"explicit stop leaves assistant stopped and non-actionable in history"): return
         r=self.cli("Cancel original onboarding run","missions","cancel","mission-run/st/onboarding","--reason","fixture","--as","person/ada")
@@ -734,7 +734,7 @@ def main():
     parser.add_argument("--image",help="prebuilt Docker image implementing the embedded clean-systemd recipe")
     parser.add_argument("--fixtures",type=Path,default=Path(__file__).resolve().parent/"st3-boot-canaries")
     parser.add_argument("--strict-release",action="store_true")
-    parser.add_argument("--harness-only",action="store_true",help="test a disposable native-driver seat without requiring the built-in Smalltalk Assistant or onboarding")
+    parser.add_argument("--harness-only",action="store_true",help="test a disposable native-driver seat without requiring the built-in Fractal Assistant or onboarding")
     parser.add_argument("--require-wrap-up",action="store_true",help="also require mission completion; basic native fixtures only read and claim")
     parser.add_argument("--mission-timeout",type=int,default=90)
     parser.add_argument("--no-reboot",action="store_true")

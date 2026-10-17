@@ -127,7 +127,7 @@ def main():
 
     # A draft has no tag yet. Publishing it creates the tag at exactly this commit, so a partial
     # draft can be inspected and deleted without leaving a tag behind.
-    run('gh', 'release', 'create', tag, '--target', sha, '--draft', '--title', f'Smalltalk {tag}',
+    run('gh', 'release', 'create', tag, '--target', sha, '--draft', '--title', f'Fractal {tag}',
         '--notes-file', str(notes), *assets)
     run('gh', 'release', 'edit', tag, '--draft=false')
     tagged = run('git', 'ls-remote', 'origin', f'refs/tags/{tag}^{{}}', f'refs/tags/{tag}', cwd=repo).split()

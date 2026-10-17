@@ -30,7 +30,7 @@ const plist = fileURLToPath(new URL('smalltalk/Info.plist', native));
 const read = spawnSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plist], { encoding: 'utf8' });
 if (read.status !== 0) throw new Error('Cannot read generated app Info.plist');
 const info = JSON.parse(read.stdout);
-info.CFBundleDisplayName = 'Small Talk Fabric Proof';
+info.CFBundleDisplayName = 'Fractal Fabric Proof';
 info.CFBundleURLTypes = [{ CFBundleURLName: identifier, CFBundleURLSchemes: [identifier] }];
 const write = spawnSync('/usr/bin/plutil', ['-convert', 'xml1', '-o', plist, '--', '-'], { input: JSON.stringify(info), encoding: 'utf8' });
 if (write.status !== 0) throw new Error('Cannot write generated app Info.plist');

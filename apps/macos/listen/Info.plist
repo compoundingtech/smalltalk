@@ -9,7 +9,7 @@
   <key>CFBundleName</key>
   <string>Small Talk</string>
   <key>CFBundleDisplayName</key>
-  <string>Small Talk</string>
+  <string>Fractal</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleVersion</key>
@@ -21,8 +21,8 @@
   <key>LSUIElement</key>
   <true/>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Small Talk listens while you dictate a message in Small Talk, and transcribes it on this Mac.</string>
+  <string>Fractal listens while you dictate a message in Fractal, and transcribes it on this Mac.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
-  <string>Small Talk transcribes your dictated messages on this Mac.</string>
+  <string>Fractal transcribes your dictated messages on this Mac.</string>
 </dict>
 </plist>
