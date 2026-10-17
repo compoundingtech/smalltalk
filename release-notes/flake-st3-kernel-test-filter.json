@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Restore Nix test coverage by passing st3-kernel with --exclude in the st2 suite and -p in the st3 suite instead of as a positional test-name filter",
+  "replay": {
+    "status": "none",
+    "detail": "Runtime claims and replay behavior are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, schema version or claim registration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint and admission rule versions are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only Nix test package selection changes; installed binaries and native CI test selection are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No daemon interruption or restart is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting reintroduces the positional test-name filter and the resulting Nix test-coverage defect."
+  }
+}
