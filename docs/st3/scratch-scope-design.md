@@ -26,7 +26,7 @@ evidence, not an installed-build or runtime test receipt.
   The non-Linux ancestry helper returns `None`; it cannot authenticate a Mac scratch owner.
 * [setup.rs](../../crates/st3/src/setup.rs): setup refuses an agent process. Do not remove
   `ST_AGENT` or send a person actor to evade this check.
-* [fixture.rs](../../crates/st3/src/fixture.rs), [test_support.rs](../../crates/st3-daemon/src/test_support.rs)
+* [fixture.rs](../../crates/st3/src/fixture.rs), [test_support.rs](../../crates/st3-store/src/test_support.rs)
   and [Cargo.toml](../../crates/st3/Cargo.toml) provide a separate, non-installed
   `st3-fixture` executable requiring `test-support`. It initializes test state that disables
   ancestry binding in its server and clears seat environment in fixture subprocess helpers.

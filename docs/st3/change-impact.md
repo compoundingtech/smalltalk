@@ -9,7 +9,7 @@ The classes and the rule that selects them are in `.st/risky-classes.json`, and
 A class matches on **paths** (globs, `**` crosses directories) and, where the path is too broad to
 be risky as a whole, on **content**: an added or removed diff line that matches a pattern in files
 under the class's globs. Content patterns exist because the store's schema lives in
-`crates/st3-daemon/src/store.rs` and `store/`, which are not risky files; an added index or trigger there
+`crates/st3-store/src/store.rs` and `store/`, which are not risky files; an added index or trigger there
 is a schema change (release notes already treat it as one).
 
 | class | selects | forces |

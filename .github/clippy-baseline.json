@@ -38,23 +38,27 @@
       "clippy::useless_format": 2
     },
     "st3-daemon": {
-      "clippy::cloned_ref_to_slice_refs": 5,
-      "clippy::collapsible_if": 18,
-      "clippy::double_ended_iterator_last": 1,
+      "clippy::collapsible_if": 5,
       "clippy::empty_line_after_doc_comments": 2,
       "clippy::manual_next_back": 1,
-      "clippy::needless_borrow": 1,
-      "clippy::needless_question_mark": 1,
       "clippy::needless_return": 1,
-      "clippy::redundant_closure": 1,
-      "clippy::too_many_arguments": 1,
-      "clippy::type_complexity": 8,
+      "clippy::type_complexity": 3,
       "clippy::useless_format": 1
     },
     "st3-feed": {
       "clippy::filter_map_bool_then": 1,
       "clippy::if_same_then_else": 1,
       "clippy::too_many_arguments": 1
+    },
+    "st3-store": {
+      "clippy::cloned_ref_to_slice_refs": 5,
+      "clippy::collapsible_if": 13,
+      "clippy::double_ended_iterator_last": 1,
+      "clippy::needless_borrow": 1,
+      "clippy::needless_question_mark": 1,
+      "clippy::redundant_closure": 1,
+      "clippy::too_many_arguments": 1,
+      "clippy::type_complexity": 5
     },
     "st3-ui-model": {
       "clippy::field_reassign_with_default": 4

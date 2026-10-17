@@ -64,8 +64,8 @@
         "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_create_race_returns_typed_exists_and_exact_retry_receipt",
         "crates/st3-daemon/src/api/client_v0/arrangements.rs::arrangement_folder_race_and_validation_refusals_stay_typed",
         "crates/st3-daemon/src/api/client_v0/arrangements.rs::selected_arrangement_survives_byte_window_edits_and_retirement",
-        "crates/st3-daemon/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
-        "crates/st3-daemon/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
+        "crates/st3-store/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
+        "crates/st3-store/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
       ],
       "behavior": "real API handler and store tests: stale layout fences merge; fenced retirement compares the current revision and refuses concurrent edits without writes; unfenced retirement remains unconditional; stale authority and launch fences refuse without edits; replay preserves receipts and rejects changed action identity; fenced retirement recovers receipt gaps; agent attribution preserves person ownership; projected heads survive reopen, upgrade backfill and replication"
     },
@@ -87,9 +87,9 @@
     {
       "action": "prompt.respond",
       "tests": [
-        "crates/st3-daemon/src/store/tests.rs::a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits",
+        "crates/st3-store/src/store/tests.rs::a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits",
         "crates/st3-daemon/src/driver_hook.rs::a_permission_hook_returns_the_persons_answer_and_nothing_else",
-        "crates/st3-daemon/src/store/tests.rs::a_codex_permission_prompt_is_answered_and_records_its_driver",
+        "crates/st3-store/src/store/tests.rs::a_codex_permission_prompt_is_answered_and_records_its_driver",
         "crates/st-drivers/src/codex_app_server/tests.rs::an_approval_answered_in_st_is_sent_once_and_only_for_this_thread",
         "crates/st-drivers/src/codex_app_server/tests.rs::a_persons_answer_takes_each_approval_methods_own_decision_words"
       ],
@@ -1143,7 +1143,7 @@
       "description": "Whether the check run or commit status named CHECK passed on a commit or branch head",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart",
-        "crates/st3-daemon/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
+        "crates/st3-store/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
       ],
       "verification": "real CLI with private HTTP fixture covers pass/wait/broken and obsolete refs across daemon restarts"
     },
@@ -1152,7 +1152,7 @@
       "description": "Whether a pull request has merged; one that closed unmerged cannot pass",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart",
-        "crates/st3-daemon/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
+        "crates/st3-store/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
       ],
       "verification": "real CLI with private HTTP fixture covers pass/wait/broken and obsolete refs across daemon restarts"
     },
@@ -1746,10 +1746,10 @@
       "command": "st sekrets",
       "description": "Run any CLI with credentials no seat can read, through the sekrets gateway",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
-        "crates/st3-daemon/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
-        "crates/st3-daemon/src/sekrets/tests.rs::git_in_a_checkout_runs_none_of_the_checkouts_programs",
-        "crates/st3-daemon/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
+        "crates/st3-store/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3-store/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
+        "crates/st3-store/src/sekrets/tests.rs::git_in_a_checkout_runs_none_of_the_checkouts_programs",
+        "crates/st3-store/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1757,7 +1757,7 @@
       "command": "st sekrets enable",
       "description": "Register this host's daemon key with the gateway, so seats can be told from their person",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+        "crates/st3-store/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1765,8 +1765,8 @@
       "command": "st sekrets grant",
       "description": "Give an agent or another person the use of a profile, narrowed by a policy",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1774,7 +1774,7 @@
       "command": "st sekrets grants",
       "description": "List grants of this person's profiles, and grants to this caller",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1782,7 +1782,7 @@
       "command": "st sekrets lock",
       "description": "Stop all use of sekrets, or one person's",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+        "crates/st3-store/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1790,7 +1790,7 @@
       "command": "st sekrets log",
       "description": "Show the calls and changes this person may read",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles"
+        "crates/st3-store/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1798,8 +1798,8 @@
       "command": "st sekrets login",
       "description": "Run a tool's own login as the sekrets user, so the credential lands in a profile",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
-        "crates/st3-daemon/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
+        "crates/st3-store/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1807,7 +1807,7 @@
       "command": "st sekrets presets",
       "description": "List policy presets",
       "tests": [
-        "crates/st3-daemon/src/sekrets/policy.rs::deny_follows_allow_and_options_match_long_short_and_bundled_forms"
+        "crates/st3-store/src/sekrets/policy.rs::deny_follows_allow_and_options_match_long_short_and_bundled_forms"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1815,8 +1815,8 @@
       "command": "st sekrets profile create",
       "description": "Create a profile you own, with its command policy",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1824,8 +1824,8 @@
       "command": "st sekrets profile policy",
       "description": "Replace a profile's policy",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
-        "crates/st3-daemon/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
+        "crates/st3-store/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1833,7 +1833,7 @@
       "command": "st sekrets profile rm",
       "description": "Remove a profile, its home and its values, and end its grants",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1841,7 +1841,7 @@
       "command": "st sekrets profile show",
       "description": "Show a profile you own or were granted, with its policy and the names of its values",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1849,7 +1849,7 @@
       "command": "st sekrets profiles",
       "description": "List profiles this caller may use",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1857,8 +1857,8 @@
       "command": "st sekrets put",
       "description": "Put a value read from standard input into a profile, as an environment variable its commands get",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1866,7 +1866,7 @@
       "command": "st sekrets revoke",
       "description": "Remove a grant",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1874,7 +1874,7 @@
       "command": "st sekrets setup",
       "description": "Print the root commands that create the sekrets user, its store and the gateway service",
       "tests": [
-        "crates/st3-daemon/src/sekrets/cli.rs::the_setup_script_names_each_person_and_a_root_owned_binary"
+        "crates/st3-store/src/sekrets/cli.rs::the_setup_script_names_each_person_and_a_root_owned_binary"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1882,7 +1882,7 @@
       "command": "st sekrets unlock",
       "description": "Allow use again",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+        "crates/st3-store/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1890,7 +1890,7 @@
       "command": "st sekrets unset",
       "description": "Remove a value from a profile",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+        "crates/st3-store/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
@@ -1898,7 +1898,7 @@
       "command": "st sekrets whoami",
       "description": "Show who the gateway takes this caller for",
       "tests": [
-        "crates/st3-daemon/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+        "crates/st3-store/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
       ],
       "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },

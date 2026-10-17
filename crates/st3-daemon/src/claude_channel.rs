@@ -1411,7 +1411,7 @@ mod tests {
         }
         let record = json!({"type":"user","message":{"role":"user","content":"QUARTZ"}});
         writeln!(file, "\n{record}").unwrap();
-        assert_eq!(transcript.appended(&path).unwrap(), [record.clone()]);
+        assert_eq!(transcript.appended(&path).unwrap(), std::slice::from_ref(&record));
         // Replacement at the same path can be longer than the old file; inode
         // identity must still trigger a fresh tail rather than skipping proof.
         let replacement = root.path().join("replacement.jsonl");
