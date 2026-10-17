@@ -423,11 +423,15 @@ fn native_follow_resynchronizes_a_real_window_gap_without_any_claim_change() {
                 assert_eq!(delta["items"].as_array().unwrap().len(), 2);
                 assert!(!has_stored_availability_notice(&delta));
             }
+            let (_, resolved) = resolve_conversation(&fixture.state, &fixture.session_id).unwrap();
+            let source = conversation_blocks::source(&fixture.state, &fixture.session_id, resolved.managed.as_ref()).unwrap();
             let (authoritative, _, native, _) = conversation_first_page_at_generation(
                 &fixture.state,
                 &new_client_snapshot(&fixture.state),
                 &session,
                 &fixture.session_id,
+                resolved.managed.as_ref(),
+                Some(&source),
             )
             .unwrap();
             assert!(native);
@@ -493,6 +497,9 @@ fn native_pages_exclude_stored_availability_notices_and_truncation_entries() {
             Some(ApiError::internal(
                 "synthetic native-read failure selects stored fallback",
             )),
+            super::super::managed_session_owner_at(
+                &fixture.state.store, fixture.state.store.index().unwrap(), &fixture.session_id,
+            ).unwrap().as_ref(),
         )
         .unwrap()
         .0
@@ -539,11 +546,15 @@ fn native_pages_exclude_stored_availability_notices_and_truncation_entries() {
         delta["items"].as_array().unwrap().is_empty(),
         "there was no native notice to remove or mirrored truncation entry to append"
     );
+    let (_, resolved) = resolve_conversation(&fixture.state, &fixture.session_id).unwrap();
+    let source = conversation_blocks::source(&fixture.state, &fixture.session_id, resolved.managed.as_ref()).unwrap();
     let (after, _, native, _) = conversation_first_page_at_generation(
         &fixture.state,
         &new_client_snapshot(&fixture.state),
         &session,
         &fixture.session_id,
+        resolved.managed.as_ref(),
+        Some(&source),
     )
     .unwrap();
     assert!(native);

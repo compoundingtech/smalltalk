@@ -244,6 +244,7 @@ pub mod agent_messages;
 pub mod coordination;
 pub mod agent_view;
 pub mod conversation_reads;
+pub use conversation_reads::Owner as ConversationOwner;
 pub mod usage_period;
 pub mod runtime;
 pub mod published_views;
@@ -1281,11 +1282,58 @@ const UNREPAIRED_CLAIM: &str = "NOT EXISTS (
 // Custom actual-state kinds can also supply a runtime id; a fixed kind allowlist is incomplete.
 const RUNTIME_ID_FIELD: &str = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.runtime_id' ELSE '$.fields.runtime_id' END)";
-static RUNTIME_ID_INDEX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(
-    "CREATE INDEX IF NOT EXISTS claims_runtime_id_subject_index
-     ON claims({RUNTIME_ID_FIELD}, subject, store_index)
-     WHERE {ACTUAL_STATE_CLAIM} AND typeof({RUNTIME_ID_FIELD})='text'"
-));
+static RUNTIME_ID_INDEX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let mut indexes = format!(
+        "CREATE INDEX IF NOT EXISTS claims_runtime_id_subject_index
+         ON claims({RUNTIME_ID_FIELD}, subject, store_index)
+         WHERE {ACTUAL_STATE_CLAIM} AND typeof({RUNTIME_ID_FIELD})='text';
+         CREATE INDEX IF NOT EXISTS claims_actual_accepted_index
+         ON claims(subject, length(accepted_at_unix_ms), accepted_at_unix_ms)
+         WHERE {ACTUAL_STATE_CLAIM};
+         CREATE INDEX IF NOT EXISTS claims_runtime_origin_accepted_index
+         ON claims(subject, origin, length(accepted_at_unix_ms), accepted_at_unix_ms)
+         WHERE kind='runtime.observed';"
+    );
+    for field in ["runtime_id", "incarnation_id"] {
+        let predicate = identity_field_predicate(field);
+        indexes.push_str(&format!(
+            "CREATE INDEX IF NOT EXISTS claims_identity_{field}_accepted_index
+             ON claims(subject, length(accepted_at_unix_ms), accepted_at_unix_ms)
+             WHERE {ACTUAL_STATE_CLAIM} AND {predicate};"
+        ));
+    }
+    indexes
+});
+
+/// Include transition resets as well as explicit values (including JSON null). The same
+/// registry that drives the full fold defines which omitted fields a transition clears.
+fn identity_field_predicate(field: &str) -> String {
+    let resets = st3_schema::registry().claims.iter()
+        .filter(|(_, spec)| spec.cardinality == st3_schema::Cardinality::StateTransition
+            && spec.fields.contains_key(field))
+        .map(|(kind, _)| format!("'{}'", kind.replace('\'', "''")))
+        .collect::<Vec<_>>();
+    let present = format!(
+        "json_type(body, CASE WHEN json_type(body,'$.fields') IS NULL
+         THEN '$.{field}' ELSE '$.fields.{field}' END) IS NOT NULL"
+    );
+    let writes = if resets.is_empty() {
+        present
+    } else {
+        format!("({present} OR (kind IN ({}) AND
+            json_type(body, CASE WHEN json_type(body,'$.fields') IS NULL
+            THEN '$' ELSE '$.fields' END)='object'))", resets.join(","))
+    };
+    // Attribution-only opener receipts return before merge_observation writes identity
+    // fields. Its remaining prior-state-dependent work touches facts, not these fields.
+    let opener_kinds = RESOURCE_OPENER_KINDS.iter()
+        .map(|kind| format!("'{kind}'")).collect::<Vec<_>>().join(",");
+    format!("({writes}) AND COALESCE((kind='resource.observed'
+        AND json_extract(body, CASE WHEN json_type(body,'$.fields') IS NULL
+            THEN '$.kind' ELSE '$.fields.kind' END) IN ({opener_kinds})
+        AND json_type(body, CASE WHEN json_type(body,'$.fields') IS NULL
+            THEN '$.attribution_only' ELSE '$.fields.attribution_only' END)='true'),0)=0")
+}
 
 /// The predicate of `claims_current_view_index`, word for word, so SQLite can use the index.
 const CURRENT_VIEW_CLAIM: &str = "(kind='intent.desired'
@@ -8443,10 +8491,12 @@ fn normalize_resource_observation(
     Ok(Some(fields))
 }
 
+const RESOURCE_OPENER_KINDS: &[&str] = &["vcs.issue", "vcs.pull-request"];
+
 /// The resource kinds whose `opened_by` and `opened_by_run` outlast every later observation
 /// (Nathan, 2026-10-03, #778 rule 5).
 fn carries_opener(kind: &str) -> bool {
-    matches!(kind, "vcs.issue" | "vcs.pull-request")
+    RESOURCE_OPENER_KINDS.contains(&kind)
 }
 
 fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, Value>, St3Error> {
@@ -10535,6 +10585,71 @@ fn message_view_tx(
 
 fn latest_actual(connection: &Connection, subject: &str) -> Result<Option<Value>> {
     latest_actual_at(connection, subject, None)
+}
+
+/// Select one canonical runtime observation per origin, not every actual-state event.
+/// Genuine rivals retain the existing desired-host and checkpoint-aware causal proof.
+fn identity_actual_source_at(
+    connection: &Connection,
+    subject: &str,
+    through: u64,
+) -> Result<(Option<String>, Option<String>, bool)> {
+    let mut statement = connection.prepare_cached(&format!(
+        "WITH RECURSIVE origins(origin) AS (
+            SELECT (SELECT origin FROM claims INDEXED BY claims_runtime_origin_accepted_index
+                    WHERE subject=?1 AND kind='runtime.observed' ORDER BY origin LIMIT 1)
+            UNION ALL
+            SELECT (SELECT origin FROM claims INDEXED BY claims_runtime_origin_accepted_index
+                    WHERE subject=?1 AND kind='runtime.observed' AND origin>origins.origin
+                    ORDER BY origin LIMIT 1)
+            FROM origins WHERE origin IS NOT NULL
+         )
+         SELECT claims.id, claims.kind, claims.origin, claims.body FROM claims
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.id IN (
+             SELECT (SELECT claims.id FROM claims INDEXED BY claims_runtime_origin_accepted_index
+                     JOIN batches ON batches.id=claims.batch_id
+                     WHERE claims.subject=?1 AND claims.origin=origins.origin
+                       AND claims.kind='runtime.observed' AND +claims.store_index<=?2
+                       AND {UNREPAIRED_CLAIM}
+                     ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1)
+             FROM origins WHERE origin IS NOT NULL
+         ) ORDER BY {CANONICAL_ORDER}"
+    ))?;
+    let parsed = statement.query_map(params![subject, through], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?.into_iter()
+        .map(|(id, kind, origin, body)| Ok((id, kind, origin, serde_json::from_str::<Value>(&body)?)))
+        .collect::<Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return Ok(connection.prepare_cached(&format!(
+            "SELECT claims.id, claims.origin FROM claims INDEXED BY claims_actual_accepted_index
+             JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND +claims.store_index<=?2
+               AND {ACTUAL_STATE_CLAIM} AND {UNREPAIRED_CLAIM}
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))?.query_row(params![subject, through], |row| {
+            Ok((Some(row.get(0)?), Some(row.get(1)?), false))
+        }).optional()?.unwrap_or((None, None, false)));
+    }
+    if parsed.len() == 1 {
+        let (id, _, origin, _) = parsed.into_iter().next().expect("one runtime source");
+        return Ok((Some(id), Some(origin), false));
+    }
+    let desired = desired_row_at(connection, subject, Some(through))?;
+    let member = desired.as_ref().and_then(|row| row.member.as_deref())
+        .and_then(|member| serde_json::from_str::<crate::model::MemberSpec>(member).ok());
+    let rows = parsed.iter().map(|(id, kind, origin, body)| {
+        (id.as_str(), kind.as_str(), origin.as_str(), body)
+    }).collect::<Vec<_>>();
+    let (id, origin, rivals) = select_actual_source(
+        &rows, member.as_ref().map(|member| member.host.as_str()),
+    ).expect("runtime sources are nonempty");
+    let rivals = rivals.iter().map(String::as_str).collect::<Vec<_>>();
+    let conflict = !rivals.is_empty()
+        && !subject_descends_from_all(connection, subject, through, &id, &rivals)?;
+    Ok((Some(id), Some(origin), conflict))
 }
 
 fn selected_actual_source_at(
