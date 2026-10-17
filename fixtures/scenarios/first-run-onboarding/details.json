@@ -17,7 +17,7 @@
       "_tag": "changes",
       "at_ms": 5000,
       "removes": [],
-      "store": 6,
+      "store": 8,
       "upserts": [
         {
           "active_runs": 1,
@@ -67,7 +67,7 @@
       "_tag": "changes",
       "at_ms": 16000,
       "removes": [],
-      "store": 19,
+      "store": 12,
       "upserts": [
         {
           "active_runs": 0,

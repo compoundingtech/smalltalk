@@ -6,7 +6,7 @@ import { liveSync } from '../kit/variants.ts'
 import type { CastAgentSpec } from '../kit/cast.ts'
 import type { ConversationEvent } from '../kit/slice.ts'
 import type { WorldDefinition } from '../kit/world.ts'
-import { fleetMidRefactor } from './fleetMidRefactor.ts'
+import { syntheticFleetMidRefactor } from './fleetMidRefactor.ts'
 
 const SEED = 24
 const roles: readonly CastAgentSpec['role'][] = ['builder', 'reviewer', 'migrator', 'docs', 'tester', 'release']
@@ -32,7 +32,7 @@ export const huge: WorldDefinition = {
     })),
   },
   slices: (ctx) => {
-    const inherited = fleetMidRefactor.slices(ctx)
+    const inherited = syntheticFleetMidRefactor.slices(ctx)
     const source = { _tag: 'synthetic', seed: SEED } as const
     const base = { ...inherited, conversation: { ...inherited.conversation, source } }
     const roster = { ...rosterVariants.huge!(ctx, base), source }

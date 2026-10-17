@@ -7,7 +7,7 @@ import { SLICE_KINDS, type AnySlice } from '../src/kit/slice.ts'
 import { foldSlice } from '../src/kit/fold.ts'
 import { ANCHOR_MS } from '../src/kit/time.ts'
 import { createReplay, manualClock } from '../src/replay/index.ts'
-import { fleetMidRefactor } from '../src/worlds/fleetMidRefactor.ts'
+import { syntheticFleetMidRefactor } from '../src/worlds/fleetMidRefactor.ts'
 import { failedSyncOpenFail } from '../src/worlds/failedSyncOpenFail.ts'
 import { failedSyncResyncCoded } from '../src/worlds/failedSyncResyncCoded.ts'
 import { failedSyncForbidden } from '../src/worlds/failedSyncForbidden.ts'
@@ -21,7 +21,7 @@ import { failedSyncPageCursorExpired } from '../src/worlds/failedSyncPageCursorE
 const definitions = [failedSyncOpenFail, failedSyncResyncCoded, failedSyncForbidden, failedSyncNonClientResponse, failedSyncSubscriptionError, failedSyncSubscriptionLimitLegacy, failedSyncCapabilityAbsent, failedSyncRateLimited, failedSyncCursorGap, failedSyncPageCursorExpired]
 const NOWS = [ANCHOR_MS, ANCHOR_MS + 123_456_789]
 /** The reference fleet each failed-sync world must preserve, built once per clock. */
-const fleets = NOWS.map((now) => buildWorld(fleetMidRefactor, genericVariants, now))
+const fleets = NOWS.map((now) => buildWorld(syntheticFleetMidRefactor, genericVariants, now))
 
 describe.each(definitions)('$id', (definition) => {
   it('strict-decodes both clocks, folds every event and preserves the fleet', () => {
@@ -136,7 +136,7 @@ describe.each(definitions)('$id', (definition) => {
 })
 
 it('covers every active sync matrix row and excludes pending rows', () => {
-  const world = buildWorld(fleetMidRefactor, genericVariants, ANCHOR_MS)
+  const world = buildWorld(syntheticFleetMidRefactor, genericVariants, ANCHOR_MS)
   const active = ['live', 'connecting', 'requested', 'socket-dropped', 'reconnected', 'closed-unknown', 'resync-coded', 'resync-uncoded', 'forbidden', 'non-client-response', 'open-fail', 'subscription-error', 'subscription-limit-local', 'subscription-limit-legacy', 'evicted', 'capability-absent', 'rate-limited', 'cursor-gap', 'page-cursor-expired', 'progress-absent']
   for (const variant of active) {
     const slice = world.with({ sync: variant }).slices.sync
@@ -150,7 +150,7 @@ it('covers every active sync matrix row and excludes pending rows', () => {
 
 it('withholds requested snapshots, then releases progress-absent without invented stages', async () => {
   for (const variant of ['requested', 'progress-absent']) {
-    const world = buildWorld(fleetMidRefactor, genericVariants, ANCHOR_MS, { sync: variant })
+    const world = buildWorld(syntheticFleetMidRefactor, genericVariants, ANCHOR_MS, { sync: variant })
     const clock = manualClock(world.now)
     const replay = createReplay(world, { clock })
     const frames: CollectionFrame[] = []
@@ -169,7 +169,7 @@ it('withholds requested snapshots, then releases progress-absent without invente
 })
 
 it('holds connecting socket opens without reporting transport failure', async () => {
-  const world = buildWorld(fleetMidRefactor, genericVariants, ANCHOR_MS, { sync: 'connecting' })
+  const world = buildWorld(syntheticFleetMidRefactor, genericVariants, ANCHOR_MS, { sync: 'connecting' })
   const clock = manualClock(world.now)
   const replay = createReplay(world, { clock })
   const client = new St3Client({ baseUrl: 'http://scenario.invalid', fetchImpl: replay.fetch })

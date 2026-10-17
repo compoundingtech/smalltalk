@@ -86,7 +86,7 @@
       "_tag": "changes",
       "at_ms": 18000,
       "removes": [],
-      "store": 18,
+      "store": 10,
       "upserts": [
         {
           "active_runs": 0,

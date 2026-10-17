@@ -5,8 +5,8 @@
   "loading": false,
   "slice": "terminal",
   "source": {
-    "_tag": "synthetic",
-    "seed": 4
+    "_tag": "recorded",
+    "recording": "first-run-onboarding"
   },
   "state": {
     "terminals": []
@@ -14,67 +14,283 @@
   "timeline": [
     {
       "_tag": "terminal-create",
-      "at_ms": 6000,
+      "at_ms": 3983,
       "record": {
         "cast": {
           "events": [
             [
               0,
               "o",
-              "\u001b[32msprout\u001b[0m:builder $ pnpm test smoke\r\n"
-            ],
-            [
-              0.392,
-              "o",
-              "Running sprout smoke check\r\n"
-            ],
-            [
-              0.826,
-              "o",
-              "\u001b[32m3 tests passed; 0 failures\u001b[0m\r\n"
-            ],
-            [
-              0.876,
-              "o",
-              "\u001b[32msprout\u001b[0m:builder $ "
+              "$ pnpm test smoke\n\u001b[32m3 tests passed; 0 failures\u001b[0m\n"
             ]
           ],
           "header": {
-            "height": 12,
-            "title": "pnpm test smoke",
+            "height": 24,
+            "title": "example.sprout.builder",
             "version": 2,
-            "width": 100
+            "width": 80
           },
-          "started_at_ms": 6000
+          "started_at_ms": 4237
         },
-        "incarnation": "pty-20:1",
+        "incarnation": "incarnation#1",
         "owner": "agent/example/sprout/builder",
         "runtime": {
-          "desired_revision": "desired-1",
+          "desired_revision": null,
           "id": "runtime/example-sprout-builder-shell",
-          "incarnation_id": "pty-20:1",
+          "incarnation_id": "incarnation#1",
           "kind": "runtime",
           "owner_host_id": "host/quarry",
           "owner_id": "agent/example/sprout/builder",
-          "revision": "rt-shell-1",
+          "revision": "a36d611bdd4e9df295b251af",
           "runtime_id": "example-sprout-builder-shell",
           "runtime_kind": "terminal",
           "state": "running",
           "terminal_id": "terminal/example-sprout-builder",
-          "updated_at": "2030-01-01T12:00:06.000Z"
+          "updated_at": "2030-01-01T12:00:04.198Z"
         },
-        "screens": [],
+        "screens": [
+          {
+            "at_ms": 3983,
+            "screen": {
+              "columns": 80,
+              "cursor": {
+                "blinking": false,
+                "column": 0,
+                "row": 1,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 22,
+                      "text": "scenario harness ready"
+                    }
+                  ],
+                  "text": "scenario harness ready",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "kitty_keyboard": 0,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 2875042815661289,
+              "revision": "a36d611bdd4e9df295b251af",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
+              "terminal_id": "terminal/example-sprout-builder",
+              "title": "example.sprout.builder",
+              "truncated": false
+            }
+          }
+        ],
         "terminal": "terminal/example-sprout-builder"
       },
-      "store": 12
+      "store": 4
     },
     {
       "_tag": "screen",
-      "at_ms": 6000,
+      "at_ms": 4018,
       "screen": {
-        "columns": 100,
+        "columns": 80,
         "cursor": {
-          "blinking": true,
+          "blinking": false,
           "column": 0,
           "row": 1,
           "style": "block",
@@ -87,16 +303,11 @@
             "row": 0,
             "runs": [
               {
-                "cells": 6,
-                "fg": 2,
-                "text": "sprout"
-              },
-              {
-                "cells": 26,
-                "text": ":builder $ pnpm test smoke"
+                "cells": 22,
+                "text": "scenario harness ready"
               }
             ],
-            "text": "sprout:builder $ pnpm test smoke",
+            "text": "scenario harness ready",
             "truncated": false,
             "wrapped": false
           },
@@ -105,72 +316,6 @@
             "row": 1,
             "runs": [],
             "text": "",
-            "truncated": false,
-            "wrapped": false
-          }
-        ],
-        "modes": {
-          "alternate_screen": false,
-          "application_cursor": false,
-          "application_keypad": false,
-          "bracketed_paste": false,
-          "focus_events": false,
-          "mouse_encoding": "default",
-          "mouse_tracking": "none"
-        },
-        "next_sequence": 1,
-        "revision": "cast-1",
-        "rows": 12,
-        "runtime_incarnation": "pty-20:1",
-        "terminal_id": "terminal/example-sprout-builder",
-        "title": "pnpm test smoke",
-        "truncated": false
-      },
-      "store": 12,
-      "terminal": "terminal/example-sprout-builder"
-    },
-    {
-      "_tag": "screen",
-      "at_ms": 6392,
-      "screen": {
-        "columns": 100,
-        "cursor": {
-          "blinking": true,
-          "column": 0,
-          "row": 2,
-          "style": "block",
-          "visible": true
-        },
-        "kind": "terminal-screen",
-        "lines": [
-          {
-            "redacted": false,
-            "row": 0,
-            "runs": [
-              {
-                "cells": 6,
-                "fg": 2,
-                "text": "sprout"
-              },
-              {
-                "cells": 26,
-                "text": ":builder $ pnpm test smoke"
-              }
-            ],
-            "text": "sprout:builder $ pnpm test smoke",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 1,
-            "runs": [
-              {
-                "cells": 26,
-                "text": "Running sprout smoke check"
-              }
-            ],
-            "text": "Running sprout smoke check",
             "truncated": false,
             "wrapped": false
           },
@@ -181,6 +326,174 @@
             "text": "",
             "truncated": false,
             "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 16,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 17,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 18,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 19,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 20,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 21,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 22,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 23,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
           }
         ],
         "modes": {
@@ -189,29 +502,30 @@
           "application_keypad": false,
           "bracketed_paste": false,
           "focus_events": false,
+          "kitty_keyboard": 0,
           "mouse_encoding": "default",
           "mouse_tracking": "none"
         },
-        "next_sequence": 2,
-        "revision": "cast-2",
-        "rows": 12,
-        "runtime_incarnation": "pty-20:1",
+        "next_sequence": 2875042815661289,
+        "revision": "a36d611bdd4e9df295b251af",
+        "rows": 24,
+        "runtime_incarnation": "incarnation#1",
         "terminal_id": "terminal/example-sprout-builder",
-        "title": "pnpm test smoke",
+        "title": "example.sprout.builder",
         "truncated": false
       },
-      "store": 12,
+      "store": 5,
       "terminal": "terminal/example-sprout-builder"
     },
     {
       "_tag": "screen",
-      "at_ms": 6826,
+      "at_ms": 4253,
       "screen": {
-        "columns": 100,
+        "columns": 80,
         "cursor": {
-          "blinking": true,
+          "blinking": false,
           "column": 0,
-          "row": 3,
+          "row": 5,
           "style": "block",
           "visible": true
         },
@@ -222,16 +536,11 @@
             "row": 0,
             "runs": [
               {
-                "cells": 6,
-                "fg": 2,
-                "text": "sprout"
-              },
-              {
-                "cells": 26,
-                "text": ":builder $ pnpm test smoke"
+                "cells": 22,
+                "text": "scenario harness ready"
               }
             ],
-            "text": "sprout:builder $ pnpm test smoke",
+            "text": "scenario harness ready",
             "truncated": false,
             "wrapped": false
           },
@@ -240,11 +549,11 @@
             "row": 1,
             "runs": [
               {
-                "cells": 26,
-                "text": "Running sprout smoke check"
+                "cells": 17,
+                "text": "$ pnpm test smoke"
               }
             ],
-            "text": "Running sprout smoke check",
+            "text": "$ pnpm test smoke",
             "truncated": false,
             "wrapped": false
           },
@@ -269,6 +578,171 @@
             "text": "",
             "truncated": false,
             "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "scenario turn 1 output complete"
+              }
+            ],
+            "text": "scenario turn 1 output complete",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 16,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 17,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 18,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 19,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 20,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 21,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 22,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 23,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
           }
         ],
         "modes": {
@@ -277,116 +751,19 @@
           "application_keypad": false,
           "bracketed_paste": false,
           "focus_events": false,
+          "kitty_keyboard": 0,
           "mouse_encoding": "default",
           "mouse_tracking": "none"
         },
-        "next_sequence": 3,
-        "revision": "cast-3",
-        "rows": 12,
-        "runtime_incarnation": "pty-20:1",
+        "next_sequence": 3356830379042117,
+        "revision": "bed04fa506545ec6eeb0b42f",
+        "rows": 24,
+        "runtime_incarnation": "incarnation#1",
         "terminal_id": "terminal/example-sprout-builder",
-        "title": "pnpm test smoke",
+        "title": "example.sprout.builder",
         "truncated": false
       },
-      "store": 12,
-      "terminal": "terminal/example-sprout-builder"
-    },
-    {
-      "_tag": "screen",
-      "at_ms": 6876,
-      "screen": {
-        "columns": 100,
-        "cursor": {
-          "blinking": true,
-          "column": 17,
-          "row": 3,
-          "style": "block",
-          "visible": true
-        },
-        "kind": "terminal-screen",
-        "lines": [
-          {
-            "redacted": false,
-            "row": 0,
-            "runs": [
-              {
-                "cells": 6,
-                "fg": 2,
-                "text": "sprout"
-              },
-              {
-                "cells": 26,
-                "text": ":builder $ pnpm test smoke"
-              }
-            ],
-            "text": "sprout:builder $ pnpm test smoke",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 1,
-            "runs": [
-              {
-                "cells": 26,
-                "text": "Running sprout smoke check"
-              }
-            ],
-            "text": "Running sprout smoke check",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 2,
-            "runs": [
-              {
-                "cells": 26,
-                "fg": 2,
-                "text": "3 tests passed; 0 failures"
-              }
-            ],
-            "text": "3 tests passed; 0 failures",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 3,
-            "runs": [
-              {
-                "cells": 6,
-                "fg": 2,
-                "text": "sprout"
-              },
-              {
-                "cells": 11,
-                "text": ":builder $ "
-              }
-            ],
-            "text": "sprout:builder $ ",
-            "truncated": false,
-            "wrapped": false
-          }
-        ],
-        "modes": {
-          "alternate_screen": false,
-          "application_cursor": false,
-          "application_keypad": false,
-          "bracketed_paste": false,
-          "focus_events": false,
-          "mouse_encoding": "default",
-          "mouse_tracking": "none"
-        },
-        "next_sequence": 4,
-        "revision": "cast-4",
-        "rows": 12,
-        "runtime_incarnation": "pty-20:1",
-        "terminal_id": "terminal/example-sprout-builder",
-        "title": "pnpm test smoke",
-        "truncated": false
-      },
-      "store": 12,
+      "store": 6,
       "terminal": "terminal/example-sprout-builder"
     }
   ],

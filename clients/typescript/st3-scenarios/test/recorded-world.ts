@@ -5,6 +5,10 @@ import { decodeRecording, decodeScript, importRecording, normalizeRecording, typ
 
 export const RECORDINGS_DIR = new URL('../recordings/', import.meta.url)
 export const PROOF_NAME = 'fleet-mid-refactor-proof'
+export const NARRATIVE_RECORDING_NAMES = [
+  'fleet-mid-refactor', 'ci-failing-fix', 'long-debug-rabbit-hole', 'first-run-onboarding',
+  'merge-conflict-standoff', 'offline-reconnect-storm', 'release-candidate-polish',
+] as const
 
 export interface RecordedProof {
   readonly world: World

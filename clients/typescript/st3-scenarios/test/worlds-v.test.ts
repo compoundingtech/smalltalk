@@ -9,7 +9,7 @@ import { buildWorld, type World, type WorldDefinition } from '../src/kit/world.t
 import { genericVariants } from '../src/kit/variants.ts'
 import { foldSlice } from '../src/kit/fold.ts'
 import { ANCHOR_MS, parseTimestamp } from '../src/kit/time.ts'
-import { SLICE_KINDS, type AnySlice, type TimelineEvent } from '../src/kit/slice.ts'
+import { SLICE_KINDS, type AnySlice } from '../src/kit/slice.ts'
 import { wireValues } from '../src/kit/wire.ts'
 
 const expectDeclaredCast = (world: World, value: unknown): void => {
@@ -117,15 +117,23 @@ for (const { id } of catalog.filter((entry) => entry.id !== 'huge')) for (const 
     const world = base.with({ [kind]: variant })
     const slice = world.slices[kind]
     expect(decodeSlice(id, slice)).toEqual([])
+    if (base.slices[kind].source._tag === 'recorded' && variant !== 'default' && variant !== 'loading') {
+      expect(slice.source).toEqual({ _tag: 'synthetic', seed: world.seed })
+    }
     expectDeclaredCast(world, slice)
     const offsets = slice.timeline.map((event) => event.at_ms)
     expect(offsets).toEqual([...offsets].sort((a, b) => a - b))
-    const events = SLICE_KINDS.flatMap<TimelineEvent>((sliceKind) => world.slices[sliceKind].timeline)
-      .sort((a, b) => a.at_ms - b.at_ms)
+    const events = SLICE_KINDS.flatMap((sliceKind) => world.slices[sliceKind].timeline.map((event, index) => ({ sliceKind, event, index })))
+      .sort((a, b) => a.event.at_ms - b.event.at_ms)
     let store = 1
-    for (const event of events) {
-      if (['changes', 'thread-create', 'thread-remove', 'terminal-create', 'terminal-remove', 'entries', 'replace', 'incarnation', 'end'].includes(event._tag)) store += 1
-      expect(event.store).toBe(store)
+    for (const { sliceKind, event, index } of events) {
+      if (world.slices[sliceKind].source._tag === 'recorded') {
+        expect(event.store).toBe(base.slices[sliceKind].timeline[index]?.store)
+        store = Math.max(store, event.store)
+      } else {
+        if (['changes', 'thread-create', 'thread-remove', 'terminal-create', 'terminal-remove', 'entries', 'replace', 'incarnation', 'end'].includes(event._tag)) store += 1
+        expect(event.store).toBe(store)
+      }
     }
     if (kind === 'conversation' && variant !== 'default' && variant !== 'loading') {
       for (const thread of world.slices.conversation.state.threads) {

@@ -1,15 +1,15 @@
 import type { Selector } from '../kit/slice.ts'
 import type { WorldDefinition } from '../kit/world.ts'
-import { fleetMidRefactor } from './fleetMidRefactor.ts'
+import { syntheticFleetMidRefactor } from './fleetMidRefactor.ts'
 
 /** Discovery succeeds while all initial resource replies remain outstanding. */
 export const loading: WorldDefinition = {
-  ...fleetMidRefactor,
+  ...syntheticFleetMidRefactor,
   id: 'loading',
   title: 'Waiting for first replies',
   narrative: 'Discovery succeeded. Collection, conversation and terminal requests are still waiting for their first replies.',
   slices: (ctx) => {
-    const base = fleetMidRefactor.slices(ctx)
+    const base = syntheticFleetMidRefactor.slices(ctx)
     const selectors: Selector[] = [
       ...(['agents', 'missions', 'work', 'attention'] as const).map((collection) => ({ collection })),
       ...base.conversation.state.threads.map((thread) => ({ collection: 'conversation' as const, conversation: thread.agent })),

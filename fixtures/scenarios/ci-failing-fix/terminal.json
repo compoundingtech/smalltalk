@@ -5,8 +5,8 @@
   "loading": false,
   "slice": "terminal",
   "source": {
-    "_tag": "synthetic",
-    "seed": 21
+    "_tag": "recorded",
+    "recording": "ci-failing-fix"
   },
   "state": {
     "terminals": [
@@ -16,90 +16,50 @@
             [
               0,
               "o",
-              "\u001b[32matlas\u001b[0m:builder $ pnpm --filter @atlas/api test\r\n"
+              "$ pnpm --filter @atlas/api test\n\u001b[31mFAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit\nTypeError: Expected a number, received undefined\nat parseOptions (packages/api/src/options.ts:18)\nTests: 1 failed, 47 passed; exit 1\u001b[0m\n"
             ],
             [
-              0.81,
+              0.274,
               "o",
-              "\u001b[31mFAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit\u001b[0m\r\n"
+              "$ git bisect run pnpm --filter @atlas/api test\n\u001b[32mcandidate 1: refactor request logging — good\ncandidate 2: update API fixtures — good\ncandidate 3: bump option-schema 4.0 to 4.1 — bad\nfirst bad change: option-schema now validates undefined before applying defaults\u001b[0m\n"
             ],
             [
-              1.151,
+              0.869,
               "o",
-              "\u001b[31mTypeError: Expected a number, received undefined\u001b[0m\r\n"
-            ],
-            [
-              1.61,
-              "o",
-              "\u001b[31mat parseOptions (packages/api/src/options.ts:18)\u001b[0m\r\n"
-            ],
-            [
-              2.237,
-              "o",
-              "\u001b[31mTests: 1 failed, 47 passed; exit 1\u001b[0m\r\n"
-            ],
-            [
-              2.287,
-              "o",
-              "\u001b[32matlas\u001b[0m:builder $ "
-            ],
-            [
-              50,
-              "o",
-              "pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build\r\n"
-            ],
-            [
-              50.745,
-              "o",
-              "\u001b[32mPASS packages/api/test/parseOptions.test.ts\u001b[0m\r\n"
-            ],
-            [
-              51.218,
-              "o",
-              "\u001b[32mTests: 48 passed, 0 failed\u001b[0m\r\n"
-            ],
-            [
-              51.765,
-              "o",
-              "\u001b[32mCI retry #2: typecheck, test, build all passed\u001b[0m\r\n"
-            ],
-            [
-              51.815,
-              "o",
-              "\u001b[32matlas\u001b[0m:builder $ "
+              "$ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build\n\u001b[32mPASS packages/api/test/parseOptions.test.ts\nTests: 48 passed, 0 failed\nCI retry #2: typecheck, test, build all passed\u001b[0m\n"
             ]
           ],
           "header": {
-            "height": 12,
-            "title": "pnpm --filter @atlas/api test",
+            "height": 24,
+            "title": "example.atlas.builder",
             "version": 2,
-            "width": 100
+            "width": 80
           },
-          "started_at_ms": -30000
+          "started_at_ms": -68
         },
-        "incarnation": "pty-15:1",
+        "incarnation": "incarnation#1",
         "owner": "agent/example/atlas/builder",
         "runtime": {
-          "desired_revision": "desired-1",
+          "desired_revision": null,
           "id": "runtime/example-atlas-builder-shell",
-          "incarnation_id": "pty-15:1",
+          "incarnation_id": "incarnation#1",
           "kind": "runtime",
           "owner_host_id": "host/meadow",
           "owner_id": "agent/example/atlas/builder",
-          "revision": "rt-shell-1",
+          "revision": "755a18f5f9e0cf6a445f4910",
           "runtime_id": "example-atlas-builder-shell",
           "runtime_kind": "terminal",
           "state": "running",
           "terminal_id": "terminal/example-atlas-builder",
-          "updated_at": "2030-01-01T11:59:30.000Z"
+          "updated_at": "2030-01-01T12:00:00.120Z"
         },
         "screens": [
           {
-            "at_ms": -30000,
+            "at_ms": -298,
             "screen": {
-              "columns": 100,
+              "columns": 80,
               "cursor": {
-                "blinking": true,
+                "blinking": false,
                 "column": 0,
                 "row": 1,
                 "style": "block",
@@ -112,22 +72,193 @@
                   "row": 0,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 40,
-                      "text": ":builder $ pnpm --filter @atlas/api test"
+                      "cells": 22,
+                      "text": "scenario harness ready"
                     }
                   ],
-                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "text": "scenario harness ready",
                   "truncated": false,
                   "wrapped": false
                 },
                 {
                   "redacted": false,
                   "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
                   "runs": [],
                   "text": "",
                   "truncated": false,
@@ -140,26 +271,27 @@
                 "application_keypad": false,
                 "bracketed_paste": false,
                 "focus_events": false,
+                "kitty_keyboard": 0,
                 "mouse_encoding": "default",
                 "mouse_tracking": "none"
               },
-              "next_sequence": 1,
-              "revision": "cast-1",
-              "rows": 12,
-              "runtime_incarnation": "pty-15:1",
+              "next_sequence": 3135423856816036,
+              "revision": "b23a6c134afa461ebab56720",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
               "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm --filter @atlas/api test",
+              "title": "example.atlas.builder",
               "truncated": false
             }
           },
           {
-            "at_ms": -29190,
+            "at_ms": -261,
             "screen": {
-              "columns": 100,
+              "columns": 80,
               "cursor": {
-                "blinking": true,
+                "blinking": false,
                 "column": 0,
-                "row": 2,
+                "row": 1,
                 "style": "block",
                 "visible": true
               },
@@ -170,22 +302,260 @@
                   "row": 0,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 40,
-                      "text": ":builder $ pnpm --filter @atlas/api test"
+                      "cells": 22,
+                      "text": "scenario harness ready"
                     }
                   ],
-                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "text": "scenario harness ready",
                   "truncated": false,
                   "wrapped": false
                 },
                 {
                   "redacted": false,
                   "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "kitty_keyboard": 0,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 3135423856816036,
+              "revision": "b23a6c134afa461ebab56720",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "example.atlas.builder",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -53,
+            "screen": {
+              "columns": 80,
+              "cursor": {
+                "blinking": false,
+                "column": 0,
+                "row": 8,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 22,
+                      "text": "scenario harness ready"
+                    }
+                  ],
+                  "text": "scenario harness ready",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 31,
+                      "text": "$ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "$ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
                   "runs": [
                     {
                       "cells": 70,
@@ -199,79 +569,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 2,
-                  "runs": [],
-                  "text": "",
-                  "truncated": false,
-                  "wrapped": false
-                }
-              ],
-              "modes": {
-                "alternate_screen": false,
-                "application_cursor": false,
-                "application_keypad": false,
-                "bracketed_paste": false,
-                "focus_events": false,
-                "mouse_encoding": "default",
-                "mouse_tracking": "none"
-              },
-              "next_sequence": 2,
-              "revision": "cast-2",
-              "rows": 12,
-              "runtime_incarnation": "pty-15:1",
-              "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm --filter @atlas/api test",
-              "truncated": false
-            }
-          },
-          {
-            "at_ms": -28849,
-            "screen": {
-              "columns": 100,
-              "cursor": {
-                "blinking": true,
-                "column": 0,
-                "row": 3,
-                "style": "block",
-                "visible": true
-              },
-              "kind": "terminal-screen",
-              "lines": [
-                {
-                  "redacted": false,
-                  "row": 0,
-                  "runs": [
-                    {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 40,
-                      "text": ":builder $ pnpm --filter @atlas/api test"
-                    }
-                  ],
-                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 1,
-                  "runs": [
-                    {
-                      "cells": 70,
-                      "fg": 1,
-                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
-                    }
-                  ],
-                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 2,
+                  "row": 3,
                   "runs": [
                     {
                       "cells": 48,
@@ -285,93 +583,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 3,
-                  "runs": [],
-                  "text": "",
-                  "truncated": false,
-                  "wrapped": false
-                }
-              ],
-              "modes": {
-                "alternate_screen": false,
-                "application_cursor": false,
-                "application_keypad": false,
-                "bracketed_paste": false,
-                "focus_events": false,
-                "mouse_encoding": "default",
-                "mouse_tracking": "none"
-              },
-              "next_sequence": 3,
-              "revision": "cast-3",
-              "rows": 12,
-              "runtime_incarnation": "pty-15:1",
-              "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm --filter @atlas/api test",
-              "truncated": false
-            }
-          },
-          {
-            "at_ms": -28390,
-            "screen": {
-              "columns": 100,
-              "cursor": {
-                "blinking": true,
-                "column": 0,
-                "row": 4,
-                "style": "block",
-                "visible": true
-              },
-              "kind": "terminal-screen",
-              "lines": [
-                {
-                  "redacted": false,
-                  "row": 0,
-                  "runs": [
-                    {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 40,
-                      "text": ":builder $ pnpm --filter @atlas/api test"
-                    }
-                  ],
-                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 1,
-                  "runs": [
-                    {
-                      "cells": 70,
-                      "fg": 1,
-                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
-                    }
-                  ],
-                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 2,
-                  "runs": [
-                    {
-                      "cells": 48,
-                      "fg": 1,
-                      "text": "TypeError: Expected a number, received undefined"
-                    }
-                  ],
-                  "text": "TypeError: Expected a number, received undefined",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 3,
+                  "row": 4,
                   "runs": [
                     {
                       "cells": 48,
@@ -385,107 +597,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 4,
-                  "runs": [],
-                  "text": "",
-                  "truncated": false,
-                  "wrapped": false
-                }
-              ],
-              "modes": {
-                "alternate_screen": false,
-                "application_cursor": false,
-                "application_keypad": false,
-                "bracketed_paste": false,
-                "focus_events": false,
-                "mouse_encoding": "default",
-                "mouse_tracking": "none"
-              },
-              "next_sequence": 4,
-              "revision": "cast-4",
-              "rows": 12,
-              "runtime_incarnation": "pty-15:1",
-              "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm --filter @atlas/api test",
-              "truncated": false
-            }
-          },
-          {
-            "at_ms": -27763,
-            "screen": {
-              "columns": 100,
-              "cursor": {
-                "blinking": true,
-                "column": 0,
-                "row": 5,
-                "style": "block",
-                "visible": true
-              },
-              "kind": "terminal-screen",
-              "lines": [
-                {
-                  "redacted": false,
-                  "row": 0,
-                  "runs": [
-                    {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 40,
-                      "text": ":builder $ pnpm --filter @atlas/api test"
-                    }
-                  ],
-                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 1,
-                  "runs": [
-                    {
-                      "cells": 70,
-                      "fg": 1,
-                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
-                    }
-                  ],
-                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 2,
-                  "runs": [
-                    {
-                      "cells": 48,
-                      "fg": 1,
-                      "text": "TypeError: Expected a number, received undefined"
-                    }
-                  ],
-                  "text": "TypeError: Expected a number, received undefined",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 3,
-                  "runs": [
-                    {
-                      "cells": 48,
-                      "fg": 1,
-                      "text": "at parseOptions (packages/api/src/options.ts:18)"
-                    }
-                  ],
-                  "text": "at parseOptions (packages/api/src/options.ts:18)",
-                  "truncated": false,
-                  "wrapped": false
-                },
-                {
-                  "redacted": false,
-                  "row": 4,
+                  "row": 5,
                   "runs": [
                     {
                       "cells": 34,
@@ -499,7 +611,148 @@
                 },
                 {
                   "redacted": false,
-                  "row": 5,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 31,
+                      "text": "scenario turn 1 output complete"
+                    }
+                  ],
+                  "text": "scenario turn 1 output complete",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
                   "runs": [],
                   "text": "",
                   "truncated": false,
@@ -512,26 +765,27 @@
                 "application_keypad": false,
                 "bracketed_paste": false,
                 "focus_events": false,
+                "kitty_keyboard": 0,
                 "mouse_encoding": "default",
                 "mouse_tracking": "none"
               },
-              "next_sequence": 5,
-              "revision": "cast-5",
-              "rows": 12,
-              "runtime_incarnation": "pty-15:1",
+              "next_sequence": 2064477220478476,
+              "revision": "755a18f5f9e0cf6a445f4910",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
               "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm --filter @atlas/api test",
+              "title": "example.atlas.builder",
               "truncated": false
             }
           },
           {
-            "at_ms": -27713,
+            "at_ms": 0,
             "screen": {
-              "columns": 100,
+              "columns": 80,
               "cursor": {
-                "blinking": true,
-                "column": 16,
-                "row": 5,
+                "blinking": false,
+                "column": 0,
+                "row": 8,
                 "style": "block",
                 "visible": true
               },
@@ -542,22 +796,30 @@
                   "row": 0,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 40,
-                      "text": ":builder $ pnpm --filter @atlas/api test"
+                      "cells": 22,
+                      "text": "scenario harness ready"
                     }
                   ],
-                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "text": "scenario harness ready",
                   "truncated": false,
                   "wrapped": false
                 },
                 {
                   "redacted": false,
                   "row": 1,
+                  "runs": [
+                    {
+                      "cells": 31,
+                      "text": "$ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "$ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
                   "runs": [
                     {
                       "cells": 70,
@@ -571,7 +833,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 2,
+                  "row": 3,
                   "runs": [
                     {
                       "cells": 48,
@@ -585,7 +847,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 3,
+                  "row": 4,
                   "runs": [
                     {
                       "cells": 48,
@@ -599,7 +861,7 @@
                 },
                 {
                   "redacted": false,
-                  "row": 4,
+                  "row": 5,
                   "runs": [
                     {
                       "cells": 34,
@@ -613,19 +875,150 @@
                 },
                 {
                   "redacted": false,
-                  "row": 5,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
                   "runs": [
                     {
-                      "cells": 5,
-                      "fg": 2,
-                      "text": "atlas"
-                    },
-                    {
-                      "cells": 11,
-                      "text": ":builder $ "
+                      "cells": 31,
+                      "text": "scenario turn 1 output complete"
                     }
                   ],
-                  "text": "atlas:builder $ ",
+                  "text": "scenario turn 1 output complete",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 16,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 17,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 18,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 19,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 20,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 21,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 22,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 23,
+                  "runs": [],
+                  "text": "",
                   "truncated": false,
                   "wrapped": false
                 }
@@ -636,15 +1029,16 @@
                 "application_keypad": false,
                 "bracketed_paste": false,
                 "focus_events": false,
+                "kitty_keyboard": 0,
                 "mouse_encoding": "default",
                 "mouse_tracking": "none"
               },
-              "next_sequence": 6,
-              "revision": "cast-6",
-              "rows": 12,
-              "runtime_incarnation": "pty-15:1",
+              "next_sequence": 2064477220478476,
+              "revision": "755a18f5f9e0cf6a445f4910",
+              "rows": 24,
+              "runtime_incarnation": "incarnation#1",
               "terminal_id": "terminal/example-atlas-builder",
-              "title": "pnpm --filter @atlas/api test",
+              "title": "example.atlas.builder",
               "truncated": false
             }
           }
@@ -656,13 +1050,13 @@
   "timeline": [
     {
       "_tag": "screen",
-      "at_ms": 20000,
+      "at_ms": 246,
       "screen": {
-        "columns": 100,
+        "columns": 80,
         "cursor": {
-          "blinking": true,
+          "blinking": false,
           "column": 0,
-          "row": 6,
+          "row": 15,
           "style": "block",
           "visible": true
         },
@@ -673,22 +1067,30 @@
             "row": 0,
             "runs": [
               {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 40,
-                "text": ":builder $ pnpm --filter @atlas/api test"
+                "cells": 22,
+                "text": "scenario harness ready"
               }
             ],
-            "text": "atlas:builder $ pnpm --filter @atlas/api test",
+            "text": "scenario harness ready",
             "truncated": false,
             "wrapped": false
           },
           {
             "redacted": false,
             "row": 1,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "$ pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "$ pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
             "runs": [
               {
                 "cells": 70,
@@ -702,7 +1104,7 @@
           },
           {
             "redacted": false,
-            "row": 2,
+            "row": 3,
             "runs": [
               {
                 "cells": 48,
@@ -716,7 +1118,7 @@
           },
           {
             "redacted": false,
-            "row": 3,
+            "row": 4,
             "runs": [
               {
                 "cells": 48,
@@ -730,7 +1132,7 @@
           },
           {
             "redacted": false,
-            "row": 4,
+            "row": 5,
             "runs": [
               {
                 "cells": 34,
@@ -744,25 +1146,182 @@
           },
           {
             "redacted": false,
-            "row": 5,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 78,
-                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
-              }
-            ],
-            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "row": 6,
+            "runs": [],
+            "text": "",
             "truncated": false,
             "wrapped": false
           },
           {
             "redacted": false,
-            "row": 6,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "scenario turn 1 output complete"
+              }
+            ],
+            "text": "scenario turn 1 output complete",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [
+              {
+                "cells": 46,
+                "text": "$ git bisect run pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "$ git bisect run pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [
+              {
+                "cells": 44,
+                "fg": 2,
+                "text": "candidate 1: refactor request logging — good"
+              }
+            ],
+            "text": "candidate 1: refactor request logging — good",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [
+              {
+                "cells": 39,
+                "fg": 2,
+                "text": "candidate 2: update API fixtures — good"
+              }
+            ],
+            "text": "candidate 2: update API fixtures — good",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 2,
+                "text": "candidate 3: bump option-schema 4.0 to 4.1 — bad"
+              }
+            ],
+            "text": "candidate 3: bump option-schema 4.0 to 4.1 — bad",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [
+              {
+                "cells": 80,
+                "fg": 2,
+                "text": "first bad change: option-schema now validates undefined before applying defaults"
+              }
+            ],
+            "text": "first bad change: option-schema now validates undefined before applying defaults",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "scenario turn 3 output complete"
+              }
+            ],
+            "text": "scenario turn 3 output complete",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 16,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 17,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 18,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 19,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 20,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 21,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 22,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 23,
             "runs": [],
             "text": "",
             "truncated": false,
@@ -775,29 +1334,30 @@
           "application_keypad": false,
           "bracketed_paste": false,
           "focus_events": false,
+          "kitty_keyboard": 0,
           "mouse_encoding": "default",
           "mouse_tracking": "none"
         },
-        "next_sequence": 7,
-        "revision": "cast-7",
-        "rows": 12,
-        "runtime_incarnation": "pty-15:1",
+        "next_sequence": 721410388842739,
+        "revision": "2901e71f6d8f35242d22cec5",
+        "rows": 24,
+        "runtime_incarnation": "incarnation#1",
         "terminal_id": "terminal/example-atlas-builder",
-        "title": "pnpm --filter @atlas/api test",
+        "title": "example.atlas.builder",
         "truncated": false
       },
-      "store": 15,
+      "store": 6,
       "terminal": "terminal/example-atlas-builder"
     },
     {
       "_tag": "screen",
-      "at_ms": 20745,
+      "at_ms": 894,
       "screen": {
-        "columns": 100,
+        "columns": 80,
         "cursor": {
-          "blinking": true,
+          "blinking": false,
           "column": 0,
-          "row": 7,
+          "row": 21,
           "style": "block",
           "visible": true
         },
@@ -808,22 +1368,30 @@
             "row": 0,
             "runs": [
               {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 40,
-                "text": ":builder $ pnpm --filter @atlas/api test"
+                "cells": 22,
+                "text": "scenario harness ready"
               }
             ],
-            "text": "atlas:builder $ pnpm --filter @atlas/api test",
+            "text": "scenario harness ready",
             "truncated": false,
             "wrapped": false
           },
           {
             "redacted": false,
             "row": 1,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "$ pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "$ pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
             "runs": [
               {
                 "cells": 70,
@@ -837,7 +1405,7 @@
           },
           {
             "redacted": false,
-            "row": 2,
+            "row": 3,
             "runs": [
               {
                 "cells": 48,
@@ -851,7 +1419,7 @@
           },
           {
             "redacted": false,
-            "row": 3,
+            "row": 4,
             "runs": [
               {
                 "cells": 48,
@@ -865,7 +1433,7 @@
           },
           {
             "redacted": false,
-            "row": 4,
+            "row": 5,
             "runs": [
               {
                 "cells": 34,
@@ -879,25 +1447,131 @@
           },
           {
             "redacted": false,
-            "row": 5,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 78,
-                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
-              }
-            ],
-            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "row": 6,
+            "runs": [],
+            "text": "",
             "truncated": false,
             "wrapped": false
           },
           {
             "redacted": false,
-            "row": 6,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "scenario turn 1 output complete"
+              }
+            ],
+            "text": "scenario turn 1 output complete",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [
+              {
+                "cells": 46,
+                "text": "$ git bisect run pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "$ git bisect run pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [
+              {
+                "cells": 44,
+                "fg": 2,
+                "text": "candidate 1: refactor request logging — good"
+              }
+            ],
+            "text": "candidate 1: refactor request logging — good",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [
+              {
+                "cells": 39,
+                "fg": 2,
+                "text": "candidate 2: update API fixtures — good"
+              }
+            ],
+            "text": "candidate 2: update API fixtures — good",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 2,
+                "text": "candidate 3: bump option-schema 4.0 to 4.1 — bad"
+              }
+            ],
+            "text": "candidate 3: bump option-schema 4.0 to 4.1 — bad",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [
+              {
+                "cells": 80,
+                "fg": 2,
+                "text": "first bad change: option-schema now validates undefined before applying defaults"
+              }
+            ],
+            "text": "first bad change: option-schema now validates undefined before applying defaults",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "scenario turn 3 output complete"
+              }
+            ],
+            "text": "scenario turn 3 output complete",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [
+              {
+                "cells": 69,
+                "text": "$ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+              }
+            ],
+            "text": "$ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 16,
             "runs": [
               {
                 "cells": 43,
@@ -911,156 +1585,7 @@
           },
           {
             "redacted": false,
-            "row": 7,
-            "runs": [],
-            "text": "",
-            "truncated": false,
-            "wrapped": false
-          }
-        ],
-        "modes": {
-          "alternate_screen": false,
-          "application_cursor": false,
-          "application_keypad": false,
-          "bracketed_paste": false,
-          "focus_events": false,
-          "mouse_encoding": "default",
-          "mouse_tracking": "none"
-        },
-        "next_sequence": 8,
-        "revision": "cast-8",
-        "rows": 12,
-        "runtime_incarnation": "pty-15:1",
-        "terminal_id": "terminal/example-atlas-builder",
-        "title": "pnpm --filter @atlas/api test",
-        "truncated": false
-      },
-      "store": 15,
-      "terminal": "terminal/example-atlas-builder"
-    },
-    {
-      "_tag": "screen",
-      "at_ms": 21218,
-      "screen": {
-        "columns": 100,
-        "cursor": {
-          "blinking": true,
-          "column": 0,
-          "row": 8,
-          "style": "block",
-          "visible": true
-        },
-        "kind": "terminal-screen",
-        "lines": [
-          {
-            "redacted": false,
-            "row": 0,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 40,
-                "text": ":builder $ pnpm --filter @atlas/api test"
-              }
-            ],
-            "text": "atlas:builder $ pnpm --filter @atlas/api test",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 1,
-            "runs": [
-              {
-                "cells": 70,
-                "fg": 1,
-                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
-              }
-            ],
-            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 2,
-            "runs": [
-              {
-                "cells": 48,
-                "fg": 1,
-                "text": "TypeError: Expected a number, received undefined"
-              }
-            ],
-            "text": "TypeError: Expected a number, received undefined",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 3,
-            "runs": [
-              {
-                "cells": 48,
-                "fg": 1,
-                "text": "at parseOptions (packages/api/src/options.ts:18)"
-              }
-            ],
-            "text": "at parseOptions (packages/api/src/options.ts:18)",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 4,
-            "runs": [
-              {
-                "cells": 34,
-                "fg": 1,
-                "text": "Tests: 1 failed, 47 passed; exit 1"
-              }
-            ],
-            "text": "Tests: 1 failed, 47 passed; exit 1",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 5,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 78,
-                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
-              }
-            ],
-            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 6,
-            "runs": [
-              {
-                "cells": 43,
-                "fg": 2,
-                "text": "PASS packages/api/test/parseOptions.test.ts"
-              }
-            ],
-            "text": "PASS packages/api/test/parseOptions.test.ts",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 7,
+            "row": 17,
             "runs": [
               {
                 "cells": 26,
@@ -1074,170 +1599,7 @@
           },
           {
             "redacted": false,
-            "row": 8,
-            "runs": [],
-            "text": "",
-            "truncated": false,
-            "wrapped": false
-          }
-        ],
-        "modes": {
-          "alternate_screen": false,
-          "application_cursor": false,
-          "application_keypad": false,
-          "bracketed_paste": false,
-          "focus_events": false,
-          "mouse_encoding": "default",
-          "mouse_tracking": "none"
-        },
-        "next_sequence": 9,
-        "revision": "cast-9",
-        "rows": 12,
-        "runtime_incarnation": "pty-15:1",
-        "terminal_id": "terminal/example-atlas-builder",
-        "title": "pnpm --filter @atlas/api test",
-        "truncated": false
-      },
-      "store": 15,
-      "terminal": "terminal/example-atlas-builder"
-    },
-    {
-      "_tag": "screen",
-      "at_ms": 21765,
-      "screen": {
-        "columns": 100,
-        "cursor": {
-          "blinking": true,
-          "column": 0,
-          "row": 9,
-          "style": "block",
-          "visible": true
-        },
-        "kind": "terminal-screen",
-        "lines": [
-          {
-            "redacted": false,
-            "row": 0,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 40,
-                "text": ":builder $ pnpm --filter @atlas/api test"
-              }
-            ],
-            "text": "atlas:builder $ pnpm --filter @atlas/api test",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 1,
-            "runs": [
-              {
-                "cells": 70,
-                "fg": 1,
-                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
-              }
-            ],
-            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 2,
-            "runs": [
-              {
-                "cells": 48,
-                "fg": 1,
-                "text": "TypeError: Expected a number, received undefined"
-              }
-            ],
-            "text": "TypeError: Expected a number, received undefined",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 3,
-            "runs": [
-              {
-                "cells": 48,
-                "fg": 1,
-                "text": "at parseOptions (packages/api/src/options.ts:18)"
-              }
-            ],
-            "text": "at parseOptions (packages/api/src/options.ts:18)",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 4,
-            "runs": [
-              {
-                "cells": 34,
-                "fg": 1,
-                "text": "Tests: 1 failed, 47 passed; exit 1"
-              }
-            ],
-            "text": "Tests: 1 failed, 47 passed; exit 1",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 5,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 78,
-                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
-              }
-            ],
-            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 6,
-            "runs": [
-              {
-                "cells": 43,
-                "fg": 2,
-                "text": "PASS packages/api/test/parseOptions.test.ts"
-              }
-            ],
-            "text": "PASS packages/api/test/parseOptions.test.ts",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 7,
-            "runs": [
-              {
-                "cells": 26,
-                "fg": 2,
-                "text": "Tests: 48 passed, 0 failed"
-              }
-            ],
-            "text": "Tests: 48 passed, 0 failed",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 8,
+            "row": 18,
             "runs": [
               {
                 "cells": 46,
@@ -1251,7 +1613,44 @@
           },
           {
             "redacted": false,
-            "row": 9,
+            "row": 19,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 20,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "scenario turn 6 output complete"
+              }
+            ],
+            "text": "scenario turn 6 output complete",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 21,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 22,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 23,
             "runs": [],
             "text": "",
             "truncated": false,
@@ -1264,205 +1663,19 @@
           "application_keypad": false,
           "bracketed_paste": false,
           "focus_events": false,
+          "kitty_keyboard": 0,
           "mouse_encoding": "default",
           "mouse_tracking": "none"
         },
-        "next_sequence": 10,
-        "revision": "cast-10",
-        "rows": 12,
-        "runtime_incarnation": "pty-15:1",
+        "next_sequence": 2500844920674733,
+        "revision": "8e281552299adcd497439525",
+        "rows": 24,
+        "runtime_incarnation": "incarnation#1",
         "terminal_id": "terminal/example-atlas-builder",
-        "title": "pnpm --filter @atlas/api test",
+        "title": "example.atlas.builder",
         "truncated": false
       },
-      "store": 15,
-      "terminal": "terminal/example-atlas-builder"
-    },
-    {
-      "_tag": "screen",
-      "at_ms": 21815,
-      "screen": {
-        "columns": 100,
-        "cursor": {
-          "blinking": true,
-          "column": 16,
-          "row": 9,
-          "style": "block",
-          "visible": true
-        },
-        "kind": "terminal-screen",
-        "lines": [
-          {
-            "redacted": false,
-            "row": 0,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 40,
-                "text": ":builder $ pnpm --filter @atlas/api test"
-              }
-            ],
-            "text": "atlas:builder $ pnpm --filter @atlas/api test",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 1,
-            "runs": [
-              {
-                "cells": 70,
-                "fg": 1,
-                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
-              }
-            ],
-            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 2,
-            "runs": [
-              {
-                "cells": 48,
-                "fg": 1,
-                "text": "TypeError: Expected a number, received undefined"
-              }
-            ],
-            "text": "TypeError: Expected a number, received undefined",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 3,
-            "runs": [
-              {
-                "cells": 48,
-                "fg": 1,
-                "text": "at parseOptions (packages/api/src/options.ts:18)"
-              }
-            ],
-            "text": "at parseOptions (packages/api/src/options.ts:18)",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 4,
-            "runs": [
-              {
-                "cells": 34,
-                "fg": 1,
-                "text": "Tests: 1 failed, 47 passed; exit 1"
-              }
-            ],
-            "text": "Tests: 1 failed, 47 passed; exit 1",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 5,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 78,
-                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
-              }
-            ],
-            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 6,
-            "runs": [
-              {
-                "cells": 43,
-                "fg": 2,
-                "text": "PASS packages/api/test/parseOptions.test.ts"
-              }
-            ],
-            "text": "PASS packages/api/test/parseOptions.test.ts",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 7,
-            "runs": [
-              {
-                "cells": 26,
-                "fg": 2,
-                "text": "Tests: 48 passed, 0 failed"
-              }
-            ],
-            "text": "Tests: 48 passed, 0 failed",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 8,
-            "runs": [
-              {
-                "cells": 46,
-                "fg": 2,
-                "text": "CI retry #2: typecheck, test, build all passed"
-              }
-            ],
-            "text": "CI retry #2: typecheck, test, build all passed",
-            "truncated": false,
-            "wrapped": false
-          },
-          {
-            "redacted": false,
-            "row": 9,
-            "runs": [
-              {
-                "cells": 5,
-                "fg": 2,
-                "text": "atlas"
-              },
-              {
-                "cells": 11,
-                "text": ":builder $ "
-              }
-            ],
-            "text": "atlas:builder $ ",
-            "truncated": false,
-            "wrapped": false
-          }
-        ],
-        "modes": {
-          "alternate_screen": false,
-          "application_cursor": false,
-          "application_keypad": false,
-          "bracketed_paste": false,
-          "focus_events": false,
-          "mouse_encoding": "default",
-          "mouse_tracking": "none"
-        },
-        "next_sequence": 11,
-        "revision": "cast-11",
-        "rows": 12,
-        "runtime_incarnation": "pty-15:1",
-        "terminal_id": "terminal/example-atlas-builder",
-        "title": "pnpm --filter @atlas/api test",
-        "truncated": false
-      },
-      "store": 15,
+      "store": 7,
       "terminal": "terminal/example-atlas-builder"
     }
   ],

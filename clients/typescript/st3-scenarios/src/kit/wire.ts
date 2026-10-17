@@ -38,6 +38,7 @@ export const wireValues = (slice: AnySlice): WireValue[] => {
       list('/state/resources', slice.state.resources ?? [], 'Resource')
       list('/state/runtimes', slice.state.runtimes, 'Runtime')
       list('/state/machines', slice.state.machines, 'Machine')
+      slice.state.recorded_history?.forEach((event, index) => list(`/state/recorded_history/${index}/upserts`, event.upserts, 'Resource'))
       break
     case 'details':
       list('/state/missions', slice.state.missions, 'Mission')
@@ -51,6 +52,7 @@ export const wireValues = (slice: AnySlice): WireValue[] => {
       break
     case 'conversation':
       slice.state.threads.forEach((thread, index) => list(`/state/threads/${index}/items`, thread.items, 'TimelineEntry'))
+      slice.state.recorded_history?.forEach((event, index) => list(`/state/recorded_history/${index}/items`, event.items, 'TimelineEntry'))
       break
     case 'terminal':
       slice.state.terminals.forEach((record, index) => {
@@ -59,6 +61,7 @@ export const wireValues = (slice: AnySlice): WireValue[] => {
           out.push({ pointer: `/state/terminals/${index}/screens/${at}/screen`, definition: 'TerminalScreen', value: screen.screen }),
         )
       })
+      slice.state.recorded_history?.forEach((item, index) => out.push({ pointer: `/state/recorded_history/${index}/screen`, definition: 'TerminalScreen', value: item.screen }))
       break
     case 'sync':
       if (slice.state.capabilities !== undefined) out.push({ pointer: '/state/capabilities', definition: 'Capabilities', value: slice.state.capabilities })

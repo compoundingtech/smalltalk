@@ -190,7 +190,7 @@
       "_tag": "changes",
       "at_ms": 8000,
       "removes": [],
-      "store": 10,
+      "store": 8,
       "upserts": [
         {
           "capacity": {
@@ -234,7 +234,7 @@
       "_tag": "changes",
       "at_ms": 18000,
       "removes": [],
-      "store": 17,
+      "store": 9,
       "upserts": [
         {
           "active_work_count": 1,

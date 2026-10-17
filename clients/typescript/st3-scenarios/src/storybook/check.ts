@@ -57,6 +57,12 @@ const texts = (value: unknown): string[] => {
   return Object.entries(value).flatMap(([key, item]) => key === 'text' && typeof item === 'string' ? [item.slice(0, 24)] : texts(item))
 }
 
+const containsText = (value: unknown, marker: string): boolean => {
+  if (typeof value === 'string') return value.includes(marker)
+  if (typeof value !== 'object' || value === null) return false
+  return Object.values(value).some((item: unknown) => containsText(item, marker))
+}
+
 const markers = (world: World, kind: SliceKind, atMs: number): string[] => {
   if (world.slices[kind].loading) return []
   let values: (string | null | undefined)[]
@@ -106,10 +112,10 @@ const contrastFailures = (left: World, right: World, kind: SliceKind, atMs: numb
   const leftMarkers = markers(left, kind, atMs)
   const rightMarkers = markers(right, kind, atMs)
   const sides = [
-    { label: left.slices[kind].variant, own: leftMarkers, other: rightMarkers, markup: contentMarkup(leftMarkup) },
-    { label: right.slices[kind].variant, own: rightMarkers, other: leftMarkers, markup: contentMarkup(rightMarkup) },
+    { label: left.slices[kind].variant, own: leftMarkers, other: rightMarkers, markup: contentMarkup(leftMarkup), source: left.slices[kind].loading ? undefined : foldSlice(left.slices[kind], atMs).state },
+    { label: right.slices[kind].variant, own: rightMarkers, other: leftMarkers, markup: contentMarkup(rightMarkup), source: right.slices[kind].loading ? undefined : foldSlice(right.slices[kind], atMs).state },
   ]
-  const failures = sides.flatMap(({ label, own, other, markup }) => {
+  const failures = sides.flatMap(({ label, own, other, markup, source }) => {
     const ownTexts = [...new Set(own)]
     const otherTexts = [...new Set(other)]
     const textMarkup = markup.replace(/<[^>]*>/g, '')
@@ -122,7 +128,9 @@ const contrastFailures = (left: World, right: World, kind: SliceKind, atMs: numb
     })
     return [
       ...ownTexts.filter((marker) => !textMarkup.includes(escapeHtml(marker))).map((marker) => `${label} does not render expected marker ${JSON.stringify(marker)}`),
-      ...otherTexts.filter((marker) => !ownTexts.includes(marker) && textMarkup.includes(escapeHtml(marker))).map((marker) => `${label} still renders the other side's marker ${JSON.stringify(marker)}`),
+      // A marker is not distinguishing when it already occurs elsewhere in this wire state,
+      // for example a prior recorded terminal command rather than its latest screen.
+      ...otherTexts.filter((marker) => !containsText(source, marker) && textMarkup.includes(escapeHtml(marker))).map((marker) => `${label} still renders the other side's marker ${JSON.stringify(marker)}`),
       ...countFailures,
     ]
   })

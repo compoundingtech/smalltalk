@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Session } from '@smalltalk/st3-client'
-import { ANCHOR_MS, agent, buildWorld, foldSlice, genericVariants, loadWorld, terminalRecord, terminalRun, wireValues, type RawResource, type Slice, type SyncEvent, type TerminalRecord, type WorldDefinition } from '../src/index.ts'
+import { ANCHOR_MS, agent, buildWorld, foldSlice, genericVariants, terminalRecord, terminalRun, wireValues, type RawResource, type Slice, type SyncEvent, type TerminalRecord, type WorldDefinition } from '../src/index.ts'
 import { drawCast } from '../src/kit/cast.ts'
 import { rngFromSeed } from '../src/kit/rng.ts'
 import { entry, thread } from '../src/kit/factories/turn.ts'
@@ -10,9 +10,10 @@ import { createReplay, manualClock, type Replay } from '../src/replay/index.ts'
 import { decodeSlice } from '../scripts/decode.ts'
 import { sliceFile, sliceTimes } from '../scripts/emit.ts'
 
+import { syntheticFleetMidRefactor } from '../src/worlds/fleetMidRefactor.ts'
 const replays: Replay[] = []
 afterEach(() => { for (const replay of replays.splice(0)) replay.close() })
-const base = () => loadWorld('fleet-mid-refactor', { now: ANCHOR_MS })
+const base = () => buildWorld(syntheticFleetMidRefactor, genericVariants, ANCHOR_MS)
 const setup = (timeline: SyncEvent[] = []) => {
   const original = base()
   const world = original.with({ sync: { ...original.slices.sync, timeline } })

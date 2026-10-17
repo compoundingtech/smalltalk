@@ -13,6 +13,7 @@ import type { Slice } from '../kit/slice.ts'
 import { parseTimestamp } from '../kit/time.ts'
 import { liveSync } from '../kit/variants.ts'
 import type { Slices, WorldDefinition } from '../kit/world.ts'
+import { adoptNarrativeRecording } from './narrativeAdoption.ts'
 
 const SEED = 21
 const command = 'pnpm --filter @atlas/api test'
@@ -25,7 +26,7 @@ const redOutput = [
 const greenOutput = ['PASS packages/api/test/parseOptions.test.ts', 'Tests: 48 passed, 0 failed', 'CI retry #2: typecheck, test, build all passed']
 
 /** A dependency regression is bisected and repaired without reverting the bump. */
-export const ciFailingFix: WorldDefinition = {
+export const syntheticCiFailingFix: WorldDefinition = {
   id: 'ci-failing-fix',
   title: 'CI failing fix',
   narrative: 'main is red after option-schema 4.1 changes omitted-value handling. A bisect finds the bump, a one-line default restores the contract, and the CI retry turns green.',
@@ -148,3 +149,5 @@ const build = (ctx: FactoryContext): Slices => {
   }
   return { roster, details, attention, conversation, terminal, sync: { ...liveSync(ctx, { conversation }), variant: 'default', source } }
 }
+
+export const ciFailingFix: WorldDefinition = adoptNarrativeRecording(syntheticCiFailingFix)

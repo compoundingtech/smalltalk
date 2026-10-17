@@ -44,6 +44,8 @@ export interface RosterState {
   readonly machines: Machine[]
   /** Agent display order. */
   readonly order: Id[]
+  /** Captured historical resource versions; transport selects these by index, not response copies. */
+  readonly recorded_history?: readonly ChangesEvent[]
 }
 
 export interface DetailsState {
@@ -82,6 +84,8 @@ export interface ConversationThread {
 
 export interface ConversationState {
   readonly threads: ConversationThread[]
+  /** Captured prebaseline windows and older-page entries, separate from the future timeline. */
+  readonly recorded_history?: readonly Extract<ConversationEvent, { readonly _tag: 'replace' }>[]
 }
 
 export interface TerminalRecord {
@@ -98,6 +102,8 @@ export interface TerminalRecord {
 
 export interface TerminalState {
   readonly terminals: TerminalRecord[]
+  /** Captured HTTP screen projections, including the read preceding a first subscription. */
+  readonly recorded_history?: readonly { readonly at_ms: number; readonly screen: TerminalScreen }[]
 }
 
 /**
