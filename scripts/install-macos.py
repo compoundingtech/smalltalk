@@ -26,6 +26,7 @@ if INSTANCE and not (len(INSTANCE) <= 24 and re.fullmatch(r'[a-z0-9]+(-[a-z0-9]+
     raise SystemExit('invalid instance name: lowercase letters, digits and single hyphens, at most 24 characters')
 IDENTIFIER = os.environ.get('ST_MACOS_BUNDLE_ID') or (
     'com.compoundingtech.smalltalk.instance.' + INSTANCE if INSTANCE else 'com.compoundingtech.smalltalk')
+# arn:lmig:smalltalk:2026-10-16-service-labels-fractal — service writers retain old labels.
 SERVICES = (['com.compoundingtech.st3.instance.' + INSTANCE, 'com.compoundingtech.st3.instance.' + INSTANCE + '.replication']
             if INSTANCE else ['com.compoundingtech.st3', 'com.compoundingtech.st3.replication'])
 LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'

@@ -498,6 +498,8 @@ async fn stages(
     next.node = form.machine.clone();
     next.codex_work_without_asking = form.codex;
     next.validate()?;
+    let should_start = !daemon_ready(&next).await && start.args.start.unwrap_or(true);
+    st3::service::preflight(form.login && should_start)?;
 
     reporter.step("Saving your name and this machine's name");
     merge_config(&start.path, &next)?;
@@ -516,7 +518,7 @@ async fn stages(
     };
     check_login_path(&executable);
 
-    if !daemon_ready(&next).await && start.args.start.unwrap_or(true) {
+    if should_start {
         reporter.step("Starting st");
         start_daemon(
             &next,

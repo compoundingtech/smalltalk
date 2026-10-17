@@ -267,7 +267,14 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
         let directory = root.join("status-bin");
         std::fs::create_dir_all(&directory).unwrap();
         let systemctl = directory.join("systemctl");
-        std::fs::write(&systemctl, "#!/bin/sh\nprintf '%s\\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=running'\n").unwrap();
+        std::fs::write(&systemctl, r#"#!/bin/sh
+if [ "$2" != show ]; then exit 9; fi
+if [ "$3" = st3.service ]; then
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=running'
+else
+    printf '%s\n' 'LoadState=not-found' 'ActiveState=inactive' 'SubState=dead'
+fi
+"#).unwrap();
         std::fs::set_permissions(systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
         let service = command(root)
             .env(
@@ -284,6 +291,8 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
         );
         let service: Value = serde_json::from_slice(&service.stdout).unwrap();
         assert_eq!(service["services"][0]["running"], true);
+        assert_eq!(service["services"][0]["name"], "st3.service");
+        assert_eq!(service["services"][1]["installed"], false);
         assert!(
             service["services"][0]["state"]
                 .as_str()

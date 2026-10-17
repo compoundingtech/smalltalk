@@ -7,6 +7,7 @@ fn directory_is_empty(path: &Path) -> bool {
 }
 
 pub(super) async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
+    st3::service::preflight(!args.no_service)?;
     let config = Config::load_unvalidated(None)?;
     let client = Client::new(endpoint.clone());
     let config_dir = Config::default_path()
@@ -131,7 +132,7 @@ pub(super) async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> R
         !local_only || args.erase_local_graph,
         "this machine's graph exists nowhere else; pass --erase-local-graph to erase it"
     );
-    if !args.no_service && services_installed() {
+    if !args.no_service && services_installed()? {
         st3::service::stop_owned_runtimes(&config)?;
         st3::service::uninstall()?;
     } else if client.get::<Value>("/v1/health").await.is_ok()

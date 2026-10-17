@@ -118,6 +118,7 @@ pub(super) fn launchd(
     let previous_replication = read_existing_file(replication_plist)?;
     let candidate = render_launchd_plist(spec);
     let replication_candidate = render_launchd_replication_plist(spec);
+    // arn:lmig:smalltalk:2026-10-16-service-labels-fractal — write old labels.
     fs::write(plist, &candidate)?;
     if spec.config.fleet_id.is_some() {
         fs::write(replication_plist, &replication_candidate)?;
@@ -197,6 +198,7 @@ pub(super) fn systemd(
     }
     let previous = read_existing_file(unit_path)?;
     let previous_replication = read_existing_file(replication_path)?;
+    // arn:lmig:smalltalk:2026-10-16-service-labels-fractal — write old unit names.
     fs::write(unit_path, render_systemd_user_unit(spec))?;
     if spec.config.fleet_id.is_some() {
         fs::write(replication_path, render_systemd_replication_unit(spec))?;

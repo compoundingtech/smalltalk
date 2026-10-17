@@ -1072,7 +1072,15 @@ async fn invalid_admission_preserves_running_daemon_and_never_stops_services() {
     let manager = node.root.join("bin/systemctl");
     fs::write(
         &manager,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\n'\n", log.display()),
+        format!(r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+if [ "$2" != show ]; then exit 9; fi
+if [ "$3" = st3.service ]; then
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=running'
+else
+    printf '%s\n' 'LoadState=not-found' 'ActiveState=inactive' 'SubState=dead'
+fi
+"#, log.display()),
     ).unwrap();
     fs::set_permissions(manager, fs::Permissions::from_mode(0o700)).unwrap();
     node.env.push((
@@ -1092,10 +1100,10 @@ async fn invalid_admission_preserves_running_daemon_and_never_stops_services() {
             String::from_utf8_lossy(&output.stderr).contains(message),
             "{output:?}"
         );
-        assert_eq!(
-            fs::read_to_string(log).unwrap(),
-            "",
-            "preconditions must precede even service inspection"
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(
+            calls.lines().all(|line| line.starts_with("--user show ")),
+            "admission preconditions may inspect services but must never mutate them: {calls}"
         );
         assert_eq!(
             node.client().get::<Value>("/v1/health").await.unwrap()["node"],
@@ -1136,7 +1144,7 @@ async fn invalid_admission_preserves_running_daemon_and_never_stops_services() {
     node.stop();
     node.migrate(&["--anchor"]);
     // A native member no longer needs legacy fleet_id in config.toml. Create must
-    // inspect saved membership before it even asks whether services are installed.
+    // reject saved membership without changing any service.
     fs::write(
         node.root.join("config/st3/config.toml"),
         format!("node = \"{}\"\nperson = \"{PERSON}\"\n", node.name),

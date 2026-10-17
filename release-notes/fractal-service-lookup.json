@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Native CLI service lookups accept Fractal daemon and replication names as well as existing names, and reject conflicting installations before service mutations.",
+  "replay": { "status": "none", "detail": "No claim replay or projection changes." },
+  "schema": { "status": "none", "detail": "No persisted schema changes." },
+  "rules": { "status": "none", "detail": "No checkpoint or sync changes." },
+  "compatibility": { "status": "changed", "detail": "CLI status, restart, stop, reset and uninstall resolve st3/fractal systemd units and launchd labels, including instances. Linux also recognises Home Manager's smalltalk.service. Legacy and Fractal families coexisting are an error; multiple legacy units retain the previous CLI target. Installers continue writing existing names and refuse only renamed services, permitting HM-only legacy hosts. Setup, uninstall and fleet settings commands preflight conflicts before fallback or mutation when service management is enabled. Systemd probes reject incomplete manager responses instead of inventing installed units; not-found units are not installed, while manager-confirmed active processes remain detectable without unit files. Script and Home Manager cutover support remains separate." },
+  "downtime": { "status": "none", "detail": "Lookup-only expansion: no service is renamed or restarted by upgrading the binary." },
+  "manual": { "status": "none", "detail": "No host migration is performed or required by this change." },
+  "recovery": { "status": "none", "detail": "Existing service definitions and drop-ins are unchanged." }
+}
