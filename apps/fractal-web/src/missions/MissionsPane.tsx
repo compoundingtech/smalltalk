@@ -6,6 +6,7 @@ import * as React from 'react'
 import * as Aria from 'react-aria-components'
 
 import { ago } from '../../../../clients/typescript/st3-views/time.ts'
+import { earliestChange, nextCivilChange, nextDurationChange } from '@smalltalk/fractal-ui/human-time/format'
 import { colorVars as c, spaceVars as s, typeVars as t } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { useDataSource, useNow } from '../data/react.tsx'
 import type { Feed } from '../data/source.ts'
@@ -32,7 +33,10 @@ export const MissionsPane = ({ onOpenAgent }: { readonly onOpenAgent?: (ref: str
   const missions = useAtomValue(source.missions)
   const agents = useAtomValue(source.agents)
   const attention = useAtomValue(source.attention)
-  const now = useNow()
+  const now = useNow(now => earliestChange(now, [
+    nextCivilChange(now),
+    ...(missions._tag === 'Observed' ? missions.value.map(mission => nextDurationChange(DateTime.toEpochMillis(mission.updated_at), now, { maxUnits: 1 })) : []),
+  ]))
   const [all, setAll] = React.useState(false)
   const [open, setOpen] = React.useState<string>()
   const rows = React.useMemo((): readonly Row[] => {

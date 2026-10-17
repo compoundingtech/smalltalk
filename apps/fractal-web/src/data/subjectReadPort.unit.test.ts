@@ -13,7 +13,7 @@ import {
 
 const envelope = (value: unknown) => ({
   api_version: 'st3.client.v0',
-  snapshot: { id: 'snapshot/test' },
+  snapshot: { id: 'snapshot/test', created_at: '1970-01-01T00:00:03Z' },
   value,
 })
 
@@ -82,18 +82,19 @@ describe('native subject reads', () => {
         ),
       )
     expect(Array.from(await one())[0]).toEqual(
-      observed({ value: { reference: 'blob/document', bytes: [65] } }),
+      observed({ value: { reference: 'blob/document', bytes: [65] }, snapshotCreatedAt: DateTime.makeUnsafe(3000) }),
     )
     failed = true
     expect(Array.from(await one())[0]).toEqual({
       _tag: 'Observed',
       value: { reference: 'blob/document', bytes: [65] },
+      snapshotCreatedAt: DateTime.makeUnsafe(3000),
       freshness: 'stale',
       error: { reason: 'failed', detail: 'Gateway disconnected' },
     })
     failed = false
     expect(Array.from(await one())[0]).toEqual(
-      observed({ value: { reference: 'blob/document', bytes: [65] } }),
+      observed({ value: { reference: 'blob/document', bytes: [65] }, snapshotCreatedAt: DateTime.makeUnsafe(3000) }),
     )
   })
 

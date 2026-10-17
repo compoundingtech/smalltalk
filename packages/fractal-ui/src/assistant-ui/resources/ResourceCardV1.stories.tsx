@@ -5,6 +5,9 @@ import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { ResourceCardV1 } from './ResourceCardV1'
 import type { ResourceData } from './resource-model'
 import { spaceVars as s, surfaceVars as surface, textVars as ink, typeVars as t, geometryVars as g } from '../composition-tokens.stylex'
+import { baselineTheme } from '../neutral-theme'
+import { lightTheme } from '../composition-theme'
+import { ThemePortal } from '../taste/ThemePortal'
 
 /** Synthetic fully reported diff; every count and preview is known. */
 const resource: ResourceData = {
@@ -16,15 +19,17 @@ const resource: ResourceData = {
   ],
 }
 
+interface Args { scheme: 'dark' | 'light' }
 const meta = {
   title: 'Fractal UI/Resources/Resource Card',
-  component: ResourceCardV1,
   parameters: { layout: 'fullscreen', docs: { description: { component: 'Resource card hover and standalone dialog: the hover card is the only hover disclosure and the dialog keeps the full detail as its description.' } } },
-} satisfies Meta
+  args: { scheme: 'dark' },
+  argTypes: { scheme: { control: 'inline-radio', options: ['dark', 'light'] } },
+} satisfies Meta<Args>
 export default meta
-type Story = StoryObj
+type Story = StoryObj<Args>
 
-export const HoverAndDialog: Story = { name: 'Hover and dialog · no native titles', render: () => <main {...stylex.props(styles.root)}><div {...stylex.props(styles.frame)}><ResourceCardV1 resource={resource} variant="RC-2" /></div></main>, play: async ({ canvasElement }) => {
+export const HoverAndDialog: Story = { name: 'Hover and dialog · no native titles', render: ({ scheme }) => <main {...stylex.props(styles.root, ...baselineTheme, ...(scheme === 'light' ? lightTheme : []))}><ThemePortal><div {...stylex.props(styles.frame)}><ResourceCardV1 resource={resource} variant="RC-2" /></div></ThemePortal></main>, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   await expect(canvasElement.querySelectorAll('[title]')).toHaveLength(0)
   // Label-in-name: every resource button is named by its own visible content.

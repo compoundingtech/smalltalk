@@ -27,10 +27,12 @@ import type {
   ConversationSearch,
 } from '@smalltalk/st3-client/schema'
 import type { ErrorEnvelope } from '@smalltalk/st3-client'
+import type { Timestamp } from '@smalltalk/st3-client/schema'
 import type { MessageSendInput } from '@st3/sdk/effect'
 import type { ConnectionState } from '@st3/sdk/effect'
 import type { FeedSync, FeedSyncObservation } from './feedSync.ts'
 import * as Atom from 'effect/reactivity/Atom'
+import { systemClock, type HumanClock } from '@smalltalk/fractal-ui/human-time/clock'
 
 import type { ConversationItem } from '../conversation/model.ts'
 import type { ProposedMissionFields } from '../missions/model.ts'
@@ -46,6 +48,7 @@ import type { AlertActionPort } from '../conversation/alerts/alert-action-port.t
 import type { DocumentPort } from '../documents/document-port.ts'
 import type { SubjectReads } from './subjectReadPort.ts'
 
+import type { NativeDetailsSource } from './nativeDetailsSource.ts'
 import type { TraceQuery, TraceSeries } from './sessionTrace.ts'
 /**
  * One followed projection as a feature sees it. Fixtures can produce every case (what `AllStates`
@@ -57,6 +60,8 @@ export type Feed<A> =
       readonly _tag: 'Observed'
       readonly value: A
       readonly freshness: 'live' | 'stale'
+      /** Producer snapshot time, not the client's receipt or display clock. */
+      readonly snapshotCreatedAt?: Timestamp
       /** Explicitly bounded published evidence; absence makes no completeness claim. */
       readonly coverage?: { readonly _tag: 'Partial' }
       /** A newer transcript read failed; these are still the last trusted rows, not a repair. */
@@ -115,6 +120,9 @@ export interface Agent {
   readonly state?: string
   readonly description?: string
   readonly usage: Known<UsageSummary>
+  readonly incarnationId?: string
+  /** Only occupancy newer than a retained incarnation transition may claim current context. */
+  readonly contextObservedAfter?: number
   /** Requested checkout, not confirmation of a successful checkout. */
   readonly checkout: Known<AgentCheckout>
   readonly workspace: Known<string>
@@ -245,14 +253,18 @@ export interface DataSource {
   /** Status bar / live picker bar text, e.g. `fixtures` or `dev gateway · read-only`. */
   readonly label: string
   readonly gateway?: string
-  /** Fixtures: the world's fixed base time. Live: `wallClock`. Every relative timestamp reads this. */
+  /** Fixture time, or a minute-coarse invalidation for live atom-side projections. */
   readonly now: Atom.Atom<number>
+  /** Live views wake at their own label deadlines; fixtures follow their now atom. */
+  readonly clock?: HumanClock
   readonly grants: Atom.Atom<Grants>
   /** Native operations are optional in fixture adapters, never fabricated locally. */
   readonly contentSearch?: ContentSearchPort
   readonly attachments?: AttachmentPort
   /** Schema-coupled native family reads; unsupported native producers carry an explicit reason. */
   readonly subjectReads: SubjectReads
+  /** Visible Details uses shared native getter facts; no private harness decoding. */
+  readonly nativeDetails?: NativeDetailsSource
   readonly connection: Atom.Atom<ConnectionState>
   /** Browser reachability is a local signal, not a claim about the gateway's host. */
   readonly network?: Atom.Atom<NetworkReachability>
@@ -314,13 +326,16 @@ export interface DataSource {
 export const observed = <A>({
   value,
   freshness = 'live',
+  snapshotCreatedAt,
 }: {
   readonly value: A
   readonly freshness?: 'live' | 'stale'
+  readonly snapshotCreatedAt?: Timestamp
 }): Feed<A> => ({
   _tag: 'Observed',
   value,
   freshness,
+  ...(snapshotCreatedAt === undefined ? {} : { snapshotCreatedAt }),
 })
 /** The feed before the first observation arrives. */
 export const waiting: Feed<never> = { _tag: 'Waiting' }
@@ -343,9 +358,13 @@ export const unavailable = ({
   ...(retryable === undefined ? {} : { retryable }),
 })
 
-/** Live sources' clock for ages and countdowns; ticks once a second while observed. */
-export const wallClock: Atom.Atom<number> = Atom.make((get) => {
-  const timer = setInterval(() => get.setSelf(Date.now()), 1000)
-  get.addFinalizer(() => clearInterval(timer))
-  return Date.now()
+const minute = 60_000
+/** Keep the pending minute until it fires; recomputing it while scheduling would skip every tick. */
+export const minuteClock = (clock: HumanClock): Atom.Atom<number> => Atom.make((get) => {
+  const nextMinute = () => (Math.floor(clock.now() / minute) + 1) * minute
+  let pending = nextMinute()
+  get.addFinalizer(clock.subscribe(() => { pending = nextMinute(); get.setSelf(clock.now()) }, () => pending))
+  return clock.now()
 })
+
+export const wallClock: Atom.Atom<number> = minuteClock(systemClock)

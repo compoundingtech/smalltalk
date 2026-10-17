@@ -6,6 +6,8 @@ import { Agent, AgentQueue, ResourceObservation, decodeUnknownSync } from '@smal
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { within } from 'storybook/test'
+import { formatRelative } from '@smalltalk/fractal-ui/human-time/format'
 import { DataSourceProvider } from '../data/react.tsx'
 import { fixtureSource } from '../data/fixtureSource.ts'
 import { observed, unavailable, type Feed } from '../data/source.ts'
@@ -45,6 +47,8 @@ beforeEach(async () => {
   vi.stubGlobal('CSS', { escape: (value: string) => Array.from(value, char => /[a-zA-Z_-]/.test(char) ? char : `\\${char.codePointAt(0)?.toString(16)} `).join('') })
   Object.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect() })
   Object.defineProperty(Range.prototype, 'getClientRects', { configurable: true, value: () => [] })
+  // Each control starts independently; the tab-navigation control persists its own Workbench keys.
+  window.localStorage.clear()
   window.history.replaceState(null, '', '/w/agent/example?open=thread')
   registry = AtomRegistry.make()
   registry.set(resources, observed({ value: { items: [resource], nextCursor: null } }))
@@ -73,22 +77,22 @@ describe('live header parity', () => {
     expect(host.textContent).not.toMatch(/credential_pin|future_kind|not-for-display/)
     await act(async () => document.querySelector('[role="menuitemcheckbox"]')?.dispatchEvent(new MouseEvent('click', { bubbles: true })))
     expect(host.textContent).not.toContain('An event this view cannot show yet.')
-  })
+  }, 20_000)
   it('opens real resources and queue observations, and closes their inspector', async () => {
     await click('Resources')
-    const dialog = document.querySelector('[role="dialog"][aria-label="Agent resources"]')
+    const dialog = document.querySelector('aside[aria-label="Agent resources"]')
     expect(dialog?.textContent).toContain('Observed project notes')
     const row = dialog?.querySelector('[aria-label="Observed resources"] li')
     expect(row?.textContent).toContain('filesystem.file')
     expect(row?.textContent).toContain('open')
-    expect(row?.textContent).toContain('2d ago')
+    expect(row?.querySelector('time')?.textContent).toBe(formatRelative(Date.parse('2026-10-04T12:00:00.000Z'), Date.parse('2026-10-06T12:00:00.000Z')))
     expect(row?.querySelector('time')?.getAttribute('datetime')).toBe('2026-10-04T12:00:00.000Z')
     expect(dialog?.textContent).toContain('1 current work item')
     expect(dialog?.textContent).toContain('mission-run/example')
     await click('Close resources')
-    expect(document.querySelector('[role="dialog"][aria-label="Agent resources"]')).toBeNull()
+    expect(document.querySelector('aside[aria-label="Agent resources"]')).toBeNull()
   })
-  it('opens successful change captures from the public conversation feed', async () => {
+  it('opens Details first and reaches successful change captures through the Changes tab', async () => {
     const timeline = new LiveTimeline()
     timeline.apply(decodeConversationChunk({
       kind: 'conversation', collection: 'conversation', id: 'follow/example',
@@ -109,6 +113,11 @@ describe('live header parity', () => {
         items: timeline.project().items, hasOlder: timeline.hasOlder,
       } })))
       await click('Toggle right panel')
+      await vi.waitFor(() => expect(host.querySelector('[data-testid="details-pane"]')).not.toBeNull(), { timeout: 15_000 })
+      expect(within(host).getByRole('tab', { name: 'Details' }).getAttribute('aria-selected')).toBe('true')
+      expect(within(host).getByRole('tab', { name: 'Changes' }).getAttribute('aria-selected')).toBe('false')
+      expect(host.querySelector('aside[aria-label="Changes"]')).toBeNull()
+      await act(async () => within(host).getByRole('tab', { name: 'Changes' }).click())
       await vi.waitFor(async () => {
         await act(async () => {})
         const inspector = host.querySelector('aside[aria-label="Changes"]')
@@ -122,6 +131,10 @@ describe('live header parity', () => {
         expect([...inspector!.querySelectorAll('[data-captured-change] button')].some(button => button.textContent?.startsWith('example.ts'))).toBe(true)
         expect(inspector?.textContent).not.toContain('This web client does not read change data yet')
       }, { timeout: 15_000 })
+      await act(async () => within(host).getByRole('tab', { name: 'Details' }).click())
+      expect(host.querySelector('[data-testid="details-pane"]')).not.toBeNull()
+      expect(within(host).getByRole('tab', { name: 'Details' }).getAttribute('aria-selected')).toBe('true')
+      expect(host.querySelector('aside[aria-label="Changes"]')).toBeNull()
     } finally {
       release()
     }

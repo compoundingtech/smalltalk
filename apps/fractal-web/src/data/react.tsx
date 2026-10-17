@@ -1,4 +1,5 @@
 import { RegistryContext, useAtomValue } from '@effect/atom-react'
+import { HumanClockProvider, useClockTime, useClockWake, type HumanClock } from '@smalltalk/fractal-ui/human-time/clock'
 /** Shared derivations over generated rows, installed once per data source. */
 import type { Agent as AgentRow, Attention, Mission } from '@smalltalk/st3-client/schema'
 import * as Atom from 'effect/reactivity/Atom'
@@ -11,6 +12,7 @@ import type { SubjectSummary } from '../shell/context.tsx'
 import { createProjections } from './projections.ts'
 import { type Agent, type DataSource, type Feed, type Fleet, observed } from './source.ts'
 import type { FeedSync, FeedSyncObservation } from './feedSync.ts'
+import { createObservedClock, type ObservedClock } from './observedClock.ts'
 
 /** Navigable observations plus the actual availability of each independently followed family. */
 export interface SubjectIndex {
@@ -26,6 +28,7 @@ export interface SubjectIndex {
 
 interface DerivedData {
   readonly source: DataSource
+  readonly observedClock: Atom.Atom<ObservedClock>
   readonly fleet: Atom.Atom<Feed<Fleet>>
   readonly missions: Atom.Atom<Feed<readonly MissionView[]>>
   readonly subjects: Atom.Atom<readonly SubjectSummary[]>
@@ -145,6 +148,7 @@ const derive = (source: DataSource) => {
   )
   return {
     source,
+    observedClock: createObservedClock(source),
     fleet,
     missions,
     subjects,
@@ -199,9 +203,10 @@ export const DataSourceProvider = ({
     value = derive(source)
     derived.set(source, value)
   }
+  const clock = React.useMemo<HumanClock>(() => source.clock ?? ({ now: () => registry.get(source.now), subscribe: onTick => registry.subscribe(source.now, onTick) }), [source, registry])
   return (
     <RegistryContext.Provider value={registry}>
-      <DataContext.Provider value={value}>{children}</DataContext.Provider>
+      <DataContext.Provider value={value}><HumanClockProvider clock={clock}>{children}</HumanClockProvider></DataContext.Provider>
     </RegistryContext.Provider>
   )
 }
@@ -336,5 +341,19 @@ export const useTerminal = (terminalRef: string) =>
 export const useEnvelope = (ref: string) => useAtomValue(useDataSource().envelope(ref))
 /** Observe source gateway events. */
 export const useEvents = () => useAtomValue(useDataSource().events)
-/** Observe the source clock. */
-export const useNow = (): number => useAtomValue(useDataSource().now)
+/** Read wall time; wake only when this view's output can next change. */
+export const useNow = (next?: (now: number) => number | undefined): number => {
+  const now = useClockTime()
+  useClockWake(next?.(now))
+  return now
+}
+const pausedAt = (clock: ObservedClock): number | undefined => clock._tag === 'Paused' ? clock.now : undefined
+/** Freeze presentation time on transport loss without substituting it for data freshness. */
+export const useObservedNow = (next?: (now: number) => number | undefined): ObservedClock => {
+  const paused = useAtomValue(useData().observedClock, pausedAt)
+  const now = useNow(paused === undefined ? next : undefined)
+  return paused === undefined ? { _tag: 'Live', now } : { _tag: 'Paused', now: paused }
+}
+const clockState = (clock: ObservedClock): ObservedClock['_tag'] => clock._tag
+export const useObservedClockState = (): ObservedClock['_tag'] =>
+  useAtomValue(useData().observedClock, clockState)

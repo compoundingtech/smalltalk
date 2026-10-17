@@ -28,6 +28,7 @@ import {
   useNow,
   useSubjectSelection,
 } from '../data/react.tsx'
+import { earliestChange, nextDurationChange } from '@smalltalk/fractal-ui/human-time/format'
 import type { Feed, Fleet } from '../data/source.ts'
 import { folders } from '../folders/client.ts'
 import { liveAncestor, project, type ProjectedFolder } from '../folders/core.mts'
@@ -836,7 +837,8 @@ const AgentFolderRow = React.memo(
     const feed = useAgent(workspace.id)
     const agent = feed._tag === 'Observed' ? feed.value : undefined
     const status = agentStatus({ agent, fleet: feed })
-    const now = useNow()
+    const now = useNow(now => earliestChange(now, [agent?.statusSince, agent?.lastActivityAt._tag === 'Known' ? agent.lastActivityAt.value : undefined].map(at =>
+      at === undefined ? undefined : nextDurationChange(at, now, { maxUnits: 1 }))))
     const description = agent?.description?.trim() ?? ''
     const activityAt = agent?.lastActivityAt._tag === 'Known' ? agent.lastActivityAt.value : undefined
     const activate = () => {

@@ -1,7 +1,7 @@
 import type { ClientOptions } from '@smalltalk/st3-client'
 import { DateTime, Effect } from 'effect'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { gatewayResources } from '../resources/agent/source.ts'
 import recording from './subjectReadPort.gateway.fixtures.json' with { type: 'json' }
@@ -93,6 +93,42 @@ describe('synthetic native gateway contracts', () => {
   contract('glass', recording.cases.glass, (reads) => reads.glass)
   contract('device', recording.cases.device, (reads) => reads.device)
   contract('machine', recording.cases.machine, (reads) => reads.machine)
+  it('retains decoded producer snapshot metadata through last-good failure and reader remount', async () => {
+    const registry = AtomRegistry.make()
+    const fixture = recording.cases.session
+    let fail = false
+    let hold = false
+    const reads = gatewaySubjectReads({
+      registry,
+      options: { baseUrl: 'http://gateway.invalid', fetchImpl: async (input, init) => {
+        if (String(input).endsWith('/capabilities')) return Response.json(recording.capabilities)
+        if (hold) return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+        })
+        if (fail) return Response.json({ error: 'failed' }, { status: 500 })
+        return Response.json({ ...fixture.payload, snapshot: { ...fixture.payload.snapshot, created_at: '1970-01-01T00:00:03Z' } })
+      } },
+    })
+    const atom = reads.session.feed(fixture.ref)
+    let release = registry.mount(atom)
+    try {
+      await vi.waitFor(() => expect(registry.get(atom)).toMatchObject({ _tag: 'Observed', freshness: 'live' }))
+      const first = registry.get(atom)
+      expect(first._tag).toBe('Observed')
+      if (first._tag !== 'Observed') throw new TypeError('Expected native session observation')
+      expect(DateTime.isDateTime(first.snapshotCreatedAt)).toBe(true)
+      expect(first.snapshotCreatedAt === undefined ? undefined : DateTime.toEpochMillis(first.snapshotCreatedAt)).toBe(3000)
+      fail = true
+      registry.refresh(atom)
+      await vi.waitFor(() => expect(registry.get(atom)).toMatchObject({ _tag: 'Observed', freshness: 'stale', error: { reason: 'failed' } }))
+      expect(registry.get(atom)).toMatchObject({ value: first.value, snapshotCreatedAt: first.snapshotCreatedAt })
+      release()
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      hold = true
+      release = registry.mount(atom)
+      expect(registry.get(atom)).toMatchObject({ _tag: 'Observed', freshness: 'stale', value: first.value, snapshotCreatedAt: first.snapshotCreatedAt })
+    } finally { release(); registry.dispose() }
+  })
   it('mission-run: resolves an opaque run from authoritative recorded mission detail', async () => {
     const fixture = recording.cases.missionRun
     const reads = gatewaySubjectReads({

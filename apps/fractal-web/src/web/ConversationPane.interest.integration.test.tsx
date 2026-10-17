@@ -455,6 +455,7 @@ describe('LiveAgentWorkspace retained panes', () => {
   const ux: UxTelemetry = {
     activeSpan: () => undefined,
     traceContext: () => undefined,
+    beginOpen: () => ({ phase: () => {}, contentCommitted: () => () => {}, cancel: () => {} }),
     shellCommitted: () => () => {},
     rosterCommitted: () => () => {},
     beginSwitch: () => {},

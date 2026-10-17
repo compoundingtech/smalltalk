@@ -26,6 +26,8 @@ import type { NativeSubjectView } from '../resources/react.tsx'
 import type { RegisteredRenderer, RegisteredSubjectRenderer, Registry } from '../resources/registry.ts'
 import type { SubjectEnvelope } from '../resources/envelope.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
+import type { Feed } from '../data/source.ts'
+import type { DetailsDisplayObservation, DetailsSection, TraceAccumulationWindow, TraceCoverage, TraceFact, TraceSubagent } from '@smalltalk/fractal-ui/assistant-ui'
 
 export interface AgentRowProps {
   readonly agentRef: string
@@ -60,3 +62,32 @@ export interface ExtensionFixtures {
   readonly envelopes: readonly SubjectEnvelope[]
   readonly subjects: readonly SubjectSummary[]
 }
+
+/** A host contribution supplements independently scoped facts, never native session accounting. */
+export interface DetailsSupplementQuery {
+  readonly agentRef: string
+  readonly nativeSessionId?: string
+  /** False permits matching retained observations only, never another provider read. */
+  readonly canRefresh?: boolean
+  /** Native identity/root prerequisites are still acquiring; missing fields are not settled absence. */
+  readonly nativeRootPending?: boolean
+  readonly incarnationId?: string
+  /** Canonical native host reference used for identity, not a formatted display name. */
+  readonly host?: string
+  readonly harness?: string
+}
+export interface DetailsSupplement {
+  readonly nativeSessionId: string
+  readonly totalUsd: TraceFact<number>
+  readonly usdWindow: TraceFact<TraceAccumulationWindow>
+  readonly coverage: TraceCoverage
+  readonly subagents: TraceFact<readonly TraceSubagent[]>
+  readonly subagentsWindow: TraceFact<TraceAccumulationWindow>
+  readonly subagentCount: TraceFact<number>
+  readonly durations?: readonly DetailsDisplayObservation[]
+  /** Client time of the last successful read, not the producer's observation time. */
+  readonly receivedAtMs?: number
+}
+export type UseDetailsSupplement = (query: DetailsSupplementQuery) => Feed<DetailsSupplement>
+/** Protected host metadata sections are independent of any trace/root binding. */
+export type UseDetailsSections = (query: { readonly agentRef: string }) => readonly DetailsSection[]

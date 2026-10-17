@@ -26,7 +26,11 @@
     "test:transcript": "node --test --test-force-exit src/assistant-ui/composition/Transcript.unit.test.mjs",
     "check:shell-imports": "node scripts/check-shell-imports.mjs",
     "test:human-time": "node --test --test-force-exit src/time/human-time.unit.test.mjs",
+    "test:clock": "node --test --test-force-exit src/time/clock.unit.test.mjs",
+    "test:side-panel": "node --test --test-force-exit src/assistant-ui/composition/SidePanel.integration.test.mjs",
     "test:work-log": "node --test --test-force-exit src/assistant-ui/taste/work-log.unit.test.mjs",
+    "test:tab-strip": "node --experimental-strip-types src/assistant-ui/workbench/tab-strip-layout.unit.test.ts",
+    "check:details": "node scripts/details-run-gates.mjs",
     "check:sidebar-fitting": "node scripts/check-sidebar-fitting.mjs"
   },
   "dependencies": {
@@ -49,6 +53,7 @@
     "@storybook/addon-docs": "10.6.1",
     "@tailwindcss/vite": "4.2.2",
     "@stylexjs/unplugin": "0.19.0",
+    "jsdom": "26.1.0",
     "tailwindcss": "4.2.2",
     "typescript": "6.0.3",
     "@types/node": "26.6.4",

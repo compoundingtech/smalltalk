@@ -21,11 +21,14 @@ const header = {
 const agent: Agent = { ref: 'agent/fixture/readonly', terminal: '', name: 'Reported name', lifecycle: unknown, host: 'Reported host', connected: true, activity: 'idle', status: 'idle', usage: unknown, checkout: unknown, workspace: unknown, startedAt: unknown, endedAt: unknown, blockedOn: unknown, ask: unknown, lastActivityAt: unknown }
 
 describe('resource card seam', () => {
-  it('keeps unknown counts explicit instead of rendering zero', () => {
-    const card = renderToStaticMarkup(createElement(ResourceCardV1, { resource }))
-    expect(card).toMatch(/Changed files · count unknown/)
-    expect(card).not.toMatch(/\+0|−0|0 changed/)
-    expect(renderToStaticMarkup(createElement(ResourceCardV1, { resource: { ...resource, files: [] } }))).not.toMatch(/\+0|−0/)
+  it('omits unreported counts instead of rendering zero or literal unknown metadata', () => {
+    for (const files of [[file], []]) {
+      const card = renderToStaticMarkup(createElement(ResourceCardV1, { resource: { ...resource, files } }))
+      // The kit names an uncounted diff by its painted label alone; a missing count is omitted, never invented.
+      expect(card).toContain('>Changed files</span>')
+      expect(card).not.toMatch(/\d+ changed files?/)
+      expect(card).not.toMatch(/unknown|\+0|−0|0 changed/i)
+    }
   })
   it('renders a reported zero as zero', () => {
     const zero: ResourceFile = { ...file, added: { _tag: 'Known', value: 0 }, removed: { _tag: 'Known', value: 0 }, lines: { _tag: 'Known', value: [] } }

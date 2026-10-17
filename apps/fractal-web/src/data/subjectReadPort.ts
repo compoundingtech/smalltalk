@@ -101,25 +101,24 @@ const retainedReader = <T>({
   read,
   registry,
 }: {
-  readonly read: SubjectReader<T>['read']
+  readonly read: (ref: string) => Effect.Effect<Extract<Feed<T>, { readonly _tag: 'Observed' }>, SubjectReadFailure>
   readonly registry: AtomRegistry.AtomRegistry
 }): SubjectReader<T> => {
-  const cache = new Map<string, T>()
+  const cache = new Map<string, Extract<Feed<T>, { readonly _tag: 'Observed' }>>()
   const changes = (ref: string) =>
     Stream.fromEffectSchedule(
       read(ref).pipe(
         Effect.match({
-          onSuccess: (value): Feed<T> => {
-            cache.set(ref, value)
-            return observed({ value })
+          onSuccess: (feed): Feed<T> => {
+            cache.set(ref, feed)
+            return feed
           },
           onFailure: ({ reason, detail }): Feed<T> => {
             const value = cache.get(ref)
             return value === undefined
               ? unavailable({ reason, detail })
               : {
-                  _tag: 'Observed',
-                  value,
+                  ...value,
                   freshness: 'stale',
                   error: { reason, detail },
                 }
@@ -135,7 +134,7 @@ const retainedReader = <T>({
         changes(ref).pipe(Stream.runForEach((next) => Effect.sync(() => get.setSelf(next)))),
       )
       get.addFinalizer(() => Effect.runFork(Fiber.interrupt(fiber)))
-      return value === undefined ? waiting : observed({ value, freshness: 'stale' })
+      return value === undefined ? waiting : { ...value, freshness: 'stale' }
     }),
   )
   return subjectReaderFromAtom({ feed, registry })
@@ -313,7 +312,7 @@ export const gatewaySubjectReads = ({
       readonly client: St3Client
       readonly ref: string
       readonly signal: AbortSignal
-    }) => Promise<{ readonly value: unknown }>
+    }) => Promise<{ readonly value: unknown; readonly snapshot?: { readonly created_at: unknown } }>
   }) =>
     retainedReader({
       read: Effect.fn('SubjectReadPort.read')((ref: string) =>
@@ -330,7 +329,12 @@ export const gatewaySubjectReads = ({
               signal: signal,
             })
             signal.throwIfAborted()
-            return decode(response.value)
+            return {
+              _tag: 'Observed' as const,
+              value: decode(response.value),
+              freshness: 'live' as const,
+              ...(response.snapshot === undefined ? {} : { snapshotCreatedAt: Native.decodeUnknownSync(Native.Timestamp)(response.snapshot.created_at) }),
+            }
           },
           catch: (cause) =>
             new SubjectReadFailure({

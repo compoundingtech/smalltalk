@@ -1,9 +1,17 @@
 // The host owns decoded facts and the clock.
-import type { SyncStatus } from './sync-status'
+import { earliestChange } from '../../time/human-time'
+import type { SyncStatus, SyncFailureCause } from './sync-status'
 export type { SyncStatus, SyncStage, StaleReason, SyncFailureCause } from './sync-status'
 export interface SyncLineValue { readonly text: string; readonly tone: 'neutral' | 'warning' | 'error'; readonly animate: boolean; readonly announce: string }
 export interface SyncLineInput { readonly status: SyncStatus; readonly label: string; readonly now: number; readonly observedAt: number; readonly gateway?: string; readonly socket?: boolean }
 export interface SyncObservation { readonly status: SyncStatus; readonly observedAt: number }
+/** Permissions and unsupported resources cannot be recovered by repeating the same request. */
+export const canRetrySyncFailure = (cause: SyncFailureCause): boolean =>
+  !(cause._tag === 'Server' && (cause.code === 'forbidden' || cause.code === 'unsupported'))
+export const syncFailureRecovery = (cause: SyncFailureCause): string =>
+  cause._tag === 'Server' && cause.code === 'forbidden' ? 'Ask an administrator.'
+    : cause._tag === 'Server' && cause.code === 'unsupported' ? 'These details are not available here.'
+      : 'Retry to load details.'
 /** Client-only transition clock, kept outside the generated wire union. Same-stage progress frames retain it. */
 export function observeSyncStatus(previous: SyncObservation | undefined, status: SyncStatus, now: number): SyncObservation {
   const key = status._tag === 'Progress' ? `${status._tag}/${status.stage}` : status._tag === 'Stale' ? `${status._tag}/${status.reason._tag}` : status._tag
@@ -95,4 +103,33 @@ export function syncLine({ status, label, now, observedAt, gateway, socket = fal
       break
   }
   return { text, tone, animate, announce }
+}
+
+/** Main's sync copy uses whole seconds, including long waits; preserve that vocabulary. */
+const nextSecond = (start: number, now: number): number => start + (Math.floor(Math.max(0, now - start) / 1000) + 1) * 1000
+
+/** The next visibility threshold or displayed-second step of syncLine. */
+export function syncLineNextChange({ status, now, observedAt, socket = false }: SyncLineInput): number | undefined {
+  switch (status._tag) {
+    case 'Connecting': return earliestChange(now, [observedAt + 400, socket ? nextSecond(observedAt, now) : undefined])
+    case 'Requested': return earliestChange(now, [observedAt + 400, observedAt + 5000, nextSecond(observedAt, now)])
+    case 'Progress': {
+      const start = status.reportedAt - status.elapsedMs
+      return earliestChange(now, [start + 400, status.reportedAt + 5000, observedAt + 10_000, nextSecond(start, now), now - status.reportedAt >= 5000 ? nextSecond(status.reportedAt, now) : undefined])
+    }
+    case 'Stale':
+      switch (status.reason._tag) {
+        case 'Unknown': return nextSecond(status.lastLiveAt ?? observedAt, now)
+        case 'Quiet': return nextSecond(status.reason.lastFrameAt, now)
+        case 'Resync': return earliestChange(now, [observedAt + 400])
+        case 'Reconnecting': {
+          const target = status.reason.nextAt
+          const remaining = target - now
+          return earliestChange(now, [observedAt + 2000, socket && remaining > 0 ? target - (Math.ceil(remaining / 1000) - 1) * 1000 : undefined])
+        }
+        case 'Evicted': return undefined
+      }
+    case 'Live':
+    case 'Failed': return undefined
+  }
 }

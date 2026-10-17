@@ -78,6 +78,7 @@ lane "App unit tests" pnpm --filter fractal-web test
 lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts
 lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts
 lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck
+lane "UI kit tab-strip policy" pnpm -C packages/fractal-ui run test:tab-strip
 case "${KIT_INPUTS:-true}" in
   true)
     lane "UI kit play index contracts" node --test packages/fractal-ui/scripts/kit-play-index.node-test.mjs
