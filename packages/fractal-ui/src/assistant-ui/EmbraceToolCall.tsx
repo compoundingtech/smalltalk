@@ -4,7 +4,8 @@ import { makeAssistantToolUI, useAuiState } from '@assistant-ui/react'
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import { Button, Disclosure, DisclosurePanel } from 'react-aria-components'
 import type { ConversationItem } from './embrace-converter'
-import { accentTokens, tokens, geometry, density } from './embrace-tokens.stylex'
+import { tokens, geometry, density } from './embrace-tokens.stylex'
+import { interactionVars as interaction } from './composition-tokens.stylex'
 import { EmbraceDiffPreview, EmbraceMarkdownPreview } from './EmbraceToolPreview'
 import { embraceToolKind as toolKind, embraceToolNeedsAttention, type EmbraceToolKind as ToolKind } from './embrace-tool-attention'
 export { embraceToolNeedsAttention } from './embrace-tool-attention'
@@ -189,13 +190,13 @@ export const EmbraceToolRegistrations = () => <><EmbraceEditToolUI /><EmbraceMar
 
 const styles = stylex.create({
   run: { display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 },
-  groupTrigger: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: density.gap, minHeight: `calc(${density.toolHeight} + ${geometry.toolExtraHeight})`, paddingBlock: density.toolY, paddingInline: density.toolX, borderWidth: 1, borderStyle: 'solid', borderColor: tokens.line, borderRadius: geometry.toolRadius, backgroundColor: tokens.recess, color: tokens.ink, fontFamily: geometry.toolFont, fontSize: density.senderSize, textAlign: 'left', cursor: 'pointer', outlineOffset: 3, outlineColor: accentTokens.accent },
+  groupTrigger: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: density.gap, minHeight: `calc(${density.toolHeight} + ${geometry.toolExtraHeight})`, paddingBlock: density.toolY, paddingInline: density.toolX, borderWidth: 1, borderStyle: 'solid', borderColor: tokens.line, borderRadius: geometry.toolRadius, backgroundColor: tokens.recess, color: tokens.ink, fontFamily: geometry.toolFont, fontSize: density.senderSize, textAlign: 'left', cursor: 'pointer', outlineOffset: 3, outlineColor: interaction.focusRing },
   groupStatus: { color: tokens.muted, fontSize: 11 },
   call: { minWidth: 0, color: tokens.ink },
   card: { borderWidth: 1, borderStyle: 'solid', borderColor: tokens.line, borderRadius: geometry.toolRadius, backgroundColor: tokens.panel, overflow: 'hidden' },
   promoted: { borderInlineStartWidth: 2, borderInlineStartStyle: 'solid', borderInlineStartColor: tokens.line },
   row: { display: 'flex', alignItems: 'center', gap: density.gap, minWidth: 0, minHeight: `calc(${density.toolHeight} + ${geometry.toolExtraHeight})`, boxSizing: 'border-box', paddingBlock: density.toolY, paddingInline: density.toolX, color: tokens.ink, fontFamily: geometry.toolFont, fontSize: density.senderSize, lineHeight: 1.5 },
-  trigger: { width: '100%', borderWidth: geometry.toolBorder, borderStyle: 'solid', borderColor: tokens.line, borderRadius: geometry.toolRadius, backgroundColor: { default: geometry.toolBackground, ':hover': tokens.recess }, cursor: 'pointer', textAlign: 'left', outlineColor: accentTokens.accent, outlineOffset: -2 },
+  trigger: { width: '100%', borderWidth: geometry.toolBorder, borderStyle: 'solid', borderColor: tokens.line, borderRadius: geometry.toolRadius, backgroundColor: { default: geometry.toolBackground, ':hover': tokens.recess }, cursor: 'pointer', textAlign: 'left', outlineColor: interaction.focusRing, outlineOffset: -2 },
   indicator: { width: 16, flexShrink: 0, textAlign: 'center', color: tokens.muted },
   label: { flexGrow: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   status: { flexShrink: 0, color: tokens.muted, fontSize: 10, textTransform: 'capitalize' },
@@ -207,5 +208,5 @@ const styles = stylex.create({
   question: { margin: 0, fontSize: 13, fontWeight: 600 },
   options: { marginBlock: 5, paddingInlineStart: 20, fontSize: 12 },
   rawDetails: { color: tokens.muted, fontSize: 11 },
-  rawSummary: { cursor: 'pointer', outlineColor: accentTokens.accent, outlineOffset: 3 },
+  rawSummary: { cursor: 'pointer', outlineColor: interaction.focusRing, outlineOffset: 3 },
 })

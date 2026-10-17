@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Unify menu, checkbox and tooltip surfaces with scheme-aware composition tokens, reduced-motion transitions and one kit focus ring.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No storage changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "changed", "detail": "Family menu, checkbox and tooltip APIs use the shared React Aria composition surfaces. Tooltip delay defaults to 500ms. Menus retain keyboard dismissal and trigger focus restoration. The global tokens.css focus outline now paints interactionVars.focusRing through --fractal-focus-ring instead of --accent, and stays as a live-migration bridge until app controls paint their own ring." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "None." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}

@@ -1,6 +1,6 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
-import { colorVars as c, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
+import { interactionVars as interaction, colorVars as c, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 import type { AgentRowData, AgentStatus, FolderGroupData } from '../composition-model'
 import { Icon } from './Icons'
 
@@ -95,7 +95,7 @@ const styles = stylex.create({
   groupChevron: { fontSize: t.metaSize, color: c.sidebarFgMuted, transform: 'rotate(-90deg)', transition: 'transform 150ms ease' },
   groupChevronOpen: { transform: 'none' },
   groupRows: { display: 'flex', flexDirection: 'column', gap: 2 },
-  row: { display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'stretch', textAlign: 'left', borderWidth: 0, backgroundColor: 'transparent', borderRadius: r.md, paddingBlock: s.sm, paddingInline: s.lg, cursor: 'pointer', color: c.fg, transition: 'background-color 150ms ease', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: -2 } },
+  row: { display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'stretch', textAlign: 'left', borderWidth: 0, backgroundColor: 'transparent', borderRadius: r.md, paddingBlock: s.sm, paddingInline: s.lg, cursor: 'pointer', color: c.fg, transition: 'background-color 150ms ease', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: -2 } },
   rowActive: { backgroundColor: c.rowActive },
   rowTitle: { display: 'flex', alignItems: 'baseline', gap: s.sm, minWidth: 0 },
   rowTitleText: { fontSize: t.uiSize, lineHeight: t.uiLeading, color: c.fgSoft, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexGrow: 1 },
@@ -107,8 +107,8 @@ const styles = stylex.create({
   glyphRing: { position: 'absolute', inset: -2, borderRadius: '50%', borderWidth: 1, borderStyle: 'dashed', borderColor: c.running, animationName: spin, animationDuration: '1.2s', animationTimingFunction: 'linear', animationIterationCount: 'infinite' },
   glyphElapsed: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.sidebarFgMuted },
   footer: { height: 40, display: 'flex', alignItems: 'center', gap: s.xs, paddingInline: s.lg, flexShrink: 0 },
-  ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.sidebarFgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
-  ghostLg: { width: 32, height: 32, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.sidebarFgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
+  ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.sidebarFgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: 1 } },
+  ghostLg: { width: 32, height: 32, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.sidebarFgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: 1 } },
   dotIdle: { backgroundColor: c.fgMuted },
   dotWorking: { backgroundColor: c.running },
   dotDone: { backgroundColor: c.done, color: c.sidebar },

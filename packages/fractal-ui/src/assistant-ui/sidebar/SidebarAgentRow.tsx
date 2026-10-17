@@ -2,7 +2,8 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Icon } from '../composition/Icons'
-import { Button, Dialog, DialogTrigger, Menu, MenuItem, MenuTrigger, Popover, Tooltip, TooltipTrigger, VisuallyHidden } from 'react-aria-components'
+import { Button, Dialog, DialogTrigger, MenuTrigger, Popover, Tooltip, TooltipTrigger, VisuallyHidden } from 'react-aria-components'
+import { Menu, MenuItem, Popover as MenuPopover } from '../composition/Controls'
 import { accentVars as accent, borderVars as border, elevationVars as elevation, geometryVars as g, radiusVars as r, spaceVars as s, statusVars as tone, surfaceVars as surface, textVars as ink, typeVars as t } from '../composition-tokens.stylex'
 import { matchPositions, type SidebarActions, type SidebarAgentRow as Row } from './model'
 import { SidebarStatus, type DiscRefinement, type GlyphVariant } from './SidebarStatus'
@@ -180,18 +181,18 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
       <VisuallyHidden><span id={descriptionId} data-row-description>{metadata}</span></VisuallyHidden>
       <div {...stylex.props(styles.actions)}>
         <DialogTrigger><TooltipTrigger delay={150} closeDelay={300} isOpen={hoverOpen} onOpenChange={setHoverOpen}><VisuallyHidden isFocusable><Button ref={detailsTrigger} aria-label={`Reported details for ${title}`} onPress={() => setHoverOpen(false)} {...stylex.props(styles.iconButton)}><Icon name="message" /></Button></VisuallyHidden><Tooltip triggerRef={tooltipAnchor} placement="right" {...stylex.props(styles.hovercard)}><AgentHoverCard row={item} {...clock} /></Tooltip></TooltipTrigger><Popover triggerRef={tooltipAnchor} placement="right" {...stylex.props(styles.hovercard)}><Dialog aria-label={`Reported details for ${title}`}><AgentRowDetails row={item} {...clock} /></Dialog></Popover></DialogTrigger>
-        <MenuTrigger><Button ref={menuTrigger} data-agent-menu="true" aria-label={`Actions for ${title}`} className={({ isHovered, isPressed, isFocusVisible }) => stylex.props(styles.iconButton, styles.menuButton, (hoverOpen || isHovered || isPressed || isFocusVisible) && styles.menuVisible, variant === 'SR-1' && styles.menuSingle).className ?? ''}><Icon name="gear" /></Button><Popover placement="bottom end" {...stylex.props(styles.popover)}><Menu aria-label={`Actions for ${title}`} {...stylex.props(styles.menu)}>
-          <MenuItem id="open" isDisabled={!canOpen} onAction={open} {...stylex.props(styles.menuItem)}>Open conversation</MenuItem>
-          {callbacks?.split !== undefined && <MenuItem id="split-right" onAction={() => callbacks.split?.(item.ref, 'right')} {...stylex.props(styles.menuItem)}>Open in split right</MenuItem>}
-          {callbacks?.split !== undefined && <MenuItem id="split-below" onAction={() => callbacks.split?.(item.ref, 'below')} {...stylex.props(styles.menuItem)}>Open in split below</MenuItem>}
-          <MenuItem id="reported-details" onAction={() => { requestAnimationFrame(() => detailsTrigger.current?.click()) }} {...stylex.props(styles.menuItem)}>Reported agent details</MenuItem>
-          {callbacks?.details !== undefined && <MenuItem id="details" onAction={() => callbacks.details?.(item.ref)} {...stylex.props(styles.menuItem)}>Agent details</MenuItem>}
-          {(callbacks?.terminal !== undefined || callbacks?.resource !== undefined) && item.terminal !== undefined && <MenuItem id="terminal" onAction={() => callbacks?.terminal !== undefined ? callbacks.terminal(item.terminal!, ownerId) : callbacks?.resource?.(item.terminal!, ownerId)} {...stylex.props(styles.menuItem)}>Open terminal</MenuItem>}
-          {callbacks?.resource !== undefined && item.mission !== undefined && <MenuItem id="mission" onAction={() => callbacks.resource?.(item.mission!, ownerId)} {...stylex.props(styles.menuItem)}>Open mission</MenuItem>}
-          {callbacks?.resource !== undefined && item.worktree !== undefined && <MenuItem id="worktree" onAction={() => callbacks.resource?.(item.worktree!, ownerId)} {...stylex.props(styles.menuItem)}>Open worktree</MenuItem>}
-          {callbacks?.resource !== undefined && item.pullRequest !== undefined && <MenuItem id="pr" onAction={() => callbacks.resource?.(item.pullRequest!.ref, ownerId)} {...stylex.props(styles.menuItem)}>Open pull request</MenuItem>}
-          {(item.unread ?? 0) > 0 && onMarkRead !== undefined && <MenuItem id="read" onAction={() => onMarkRead?.(item.ref)} {...stylex.props(styles.menuItem)}>Mark read</MenuItem>}
-        </Menu></Popover></MenuTrigger>
+        <MenuTrigger><Button ref={menuTrigger} data-agent-menu="true" aria-label={`Actions for ${title}`} className={({ isHovered, isPressed, isFocusVisible }) => stylex.props(styles.iconButton, styles.menuButton, (hoverOpen || isHovered || isPressed || isFocusVisible) && styles.menuVisible, variant === 'SR-1' && styles.menuSingle).className ?? ''}><Icon name="gear" /></Button><MenuPopover placement="bottom end"><Menu aria-label={`Actions for ${title}`}>
+          <MenuItem id="open" isDisabled={!canOpen} onAction={open}>Open conversation</MenuItem>
+          {callbacks?.split !== undefined && <MenuItem id="split-right" onAction={() => callbacks.split?.(item.ref, 'right')}>Open in split right</MenuItem>}
+          {callbacks?.split !== undefined && <MenuItem id="split-below" onAction={() => callbacks.split?.(item.ref, 'below')}>Open in split below</MenuItem>}
+          <MenuItem id="reported-details" onAction={() => { requestAnimationFrame(() => detailsTrigger.current?.click()) }}>Reported agent details</MenuItem>
+          {callbacks?.details !== undefined && <MenuItem id="details" onAction={() => callbacks.details?.(item.ref)}>Agent details</MenuItem>}
+          {(callbacks?.terminal !== undefined || callbacks?.resource !== undefined) && item.terminal !== undefined && <MenuItem id="terminal" onAction={() => callbacks?.terminal !== undefined ? callbacks.terminal(item.terminal!, ownerId) : callbacks?.resource?.(item.terminal!, ownerId)}>Open terminal</MenuItem>}
+          {callbacks?.resource !== undefined && item.mission !== undefined && <MenuItem id="mission" onAction={() => callbacks.resource?.(item.mission!, ownerId)}>Open mission</MenuItem>}
+          {callbacks?.resource !== undefined && item.worktree !== undefined && <MenuItem id="worktree" onAction={() => callbacks.resource?.(item.worktree!, ownerId)}>Open worktree</MenuItem>}
+          {callbacks?.resource !== undefined && item.pullRequest !== undefined && <MenuItem id="pr" onAction={() => callbacks.resource?.(item.pullRequest!.ref, ownerId)}>Open pull request</MenuItem>}
+          {(item.unread ?? 0) > 0 && onMarkRead !== undefined && <MenuItem id="read" onAction={() => onMarkRead?.(item.ref)}>Mark read</MenuItem>}
+        </Menu></MenuPopover></MenuTrigger>
         {item.children.length > 0 && <Button data-row-column="children" slot={inTree ? 'chevron' : undefined} isDisabled={!inTree && onToggleChildren === undefined} aria-labelledby="" aria-label={`${expanded ? 'Collapse' : 'Expand'} ${item.children.length} subagents`} aria-expanded={expanded} onPress={inTree ? undefined : () => onToggleChildren?.(item.ref)} {...stylex.props(styles.iconButton, styles.childrenToggle, variant === 'SR-2' && styles.childrenTop, variant === 'SR-1' && styles.childrenSingle)}><Icon name={expanded ? 'chevron-down' : 'chevron-right'} />{extraSignals.includes('X-subs') && <span data-row-signal="X-subs" data-line1-drop="subs">{item.children.length}</span>}</Button>}
       </div>
     </div>
@@ -205,7 +206,7 @@ const styles = stylex.create({
   // The row is the containing block for its visually hidden details trigger; without it the
   // absolutely positioned trigger escapes every scroll clip and extends the document.
   rowWrap: { position: 'relative', display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr) ${g.controlSm} var(--sidebar-metric-track, ${g.sidebarMetric}) max-content`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, rowGap: s.xs2, minWidth: 0, width: '100%', boxSizing: 'border-box', paddingInline: s.sm, borderRadius: r.sm, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, color: ink.fg, ':hover': { backgroundColor: surface.rowHover } },
-  row: { display: 'grid', gridColumn: '2 / -1', gridRow: '1 / -1', gridTemplateColumns: 'subgrid', gridTemplateRows: 'subgrid', alignItems: 'center', minWidth: 0, width: '100%', height: '100%', padding: s.zero, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fg, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading, textAlign: 'start', cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: '-2px' } },
+  row: { display: 'grid', gridColumn: '2 / -1', gridRow: '1 / -1', gridTemplateColumns: 'subgrid', gridTemplateRows: 'subgrid', alignItems: 'center', minWidth: 0, width: '100%', height: '100%', padding: s.zero, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fg, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading, textAlign: 'start', cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: `calc(-1 * ${g.focusRing})` } },
   'SR-1': { height: g.controlLg, gridTemplateRows: '1fr' }, 'SR-2': { height: g.sidebarRow, gridTemplateRows: `${g.controlSm} ${g.controlSm}`, rowGap: s.zero }, 'SR-3': { height: g.sidebarThree, gridTemplateRows: `${t.uiLeading} ${g.controlSm} ${t.metaLeading}` },
   active: { backgroundColor: surface.rowActive },
   glyph: { gridColumn: '1', gridRow: '1', display: 'flex', alignItems: 'center', justifyContent: 'center' },
@@ -236,7 +237,5 @@ const styles = stylex.create({
   cardChildren: { margin: s.zero, padding: s.zero, listStyleType: 'none', color: ink.fgSoft },
   detailLabel: { margin: s.zero, color: ink.fgSoft },
   detailValue: { margin: s.zero, minWidth: 0, color: ink.fg },
-  popover: { backgroundColor: surface.raised, color: ink.fg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.md, padding: s.sm, minWidth: g.menuMin, boxShadow: elevation.popover, fontFamily: t.fontSans, fontSize: t.metaSize, zIndex: 30 },
-  menu: { outline: 'none' }, menuItem: { display: 'flex', alignItems: 'center', minHeight: g.menuRow, paddingInline: s.md, borderRadius: r.sm, cursor: 'pointer', outline: 'none', ':is([data-focused])': { backgroundColor: surface.rowActive }, ':is([data-focus-visible])': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   mark: { backgroundColor: surface.rowActive, color: ink.fg, fontWeight: t.weightSemibold }, children: { borderInlineStartWidth: g.hairline, borderInlineStartStyle: 'solid', borderInlineStartColor: border.border },
 })

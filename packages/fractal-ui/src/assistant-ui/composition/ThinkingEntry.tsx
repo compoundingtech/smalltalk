@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Button as AriaButton } from 'react-aria-components'
-import { accentVars as accent, textVars as text, borderVars as border, surfaceVars as surface, spaceVars as s, geometryVars as g, typeVars as t, radiusVars as r, motionVars as m } from '../composition-tokens.stylex'
+import { interactionVars as interaction, textVars as text, borderVars as border, surfaceVars as surface, spaceVars as s, geometryVars as g, typeVars as t, radiusVars as r, motionVars as m } from '../composition-tokens.stylex'
 import { Markdown } from './Markdown'
 import { Icon } from './Icons'
 
@@ -25,7 +25,7 @@ export function ThinkingEntry({ text: value, streaming = false }: { text: string
 
 const styles = stylex.create({
   thinking: { color: text.fgMuted, fontSize: t.uiSize, lineHeight: t.uiLeading },
-  thinkingControl: { display: 'grid', gridTemplateColumns: g.workRowColumns, alignItems: 'center', gap: s.sm, width: '100%', padding: 0, minHeight: g.toolRow, borderWidth: 0, backgroundColor: surface.transparent, color: text.fgMuted, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading, textAlign: 'left', cursor: 'pointer', transitionProperty: 'background-color, color', transitionDuration: m.fast, transitionTimingFunction: m.ease, '@media (prefers-reduced-motion: reduce)': { transitionDuration: '0s' }, ':hover': { color: text.fgSoft, backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  thinkingControl: { display: 'grid', gridTemplateColumns: g.workRowColumns, alignItems: 'center', gap: s.sm, width: '100%', padding: 0, minHeight: g.toolRow, borderWidth: 0, backgroundColor: surface.transparent, color: text.fgMuted, fontFamily: t.fontSans, fontSize: t.uiSize, lineHeight: t.uiLeading, textAlign: 'left', cursor: 'pointer', transitionProperty: 'background-color, color', transitionDuration: m.fast, transitionTimingFunction: m.ease, '@media (prefers-reduced-motion: reduce)': { transitionDuration: '0s' }, ':hover': { color: text.fgSoft, backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   slot: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: g.icon },
   label: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   disclosure: { opacity: { default: 0.5, [stylex.when.ancestor(':hover')]: 1, [stylex.when.ancestor(':focus-visible')]: 1 }, transitionProperty: 'opacity', transitionDuration: m.fast, transitionTimingFunction: m.ease, '@media (prefers-reduced-motion: reduce)': { transitionDuration: '0s' } },

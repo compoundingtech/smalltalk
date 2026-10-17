@@ -6,7 +6,7 @@ import { Button } from 'react-aria-components'
 import { EmbraceScrollViewport } from './assistant-ui/EmbraceScrollViewport'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
-import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex'
+import { interactionVars as interaction, surfaceVars as surface, textVars as ink, borderVars as border, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex'
 
 function ScrollStory({ scheme = 'dark' }: { scheme?: Scheme }) {
   const [count, setCount] = React.useState(40)
@@ -50,6 +50,6 @@ export const AllStates: Story = { render: args => <ScrollStory {...args} /> }
 export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }
 const styles = stylex.create({
   root: { display: 'flex', flexDirection: 'column', height: '100vh', boxSizing: 'border-box', padding: s.lg, gap: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans }, actions: { display: 'flex', gap: s.md },
-  button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, backgroundColor: surface.controlFill, color: ink.fg, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, backgroundColor: surface.controlFill, color: ink.fg, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   frame: { display: 'flex', flex: '1 1 0', minHeight: 0, width: '100%' }, narrow: { width: '50%' }, viewport: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', overflowAnchor: 'none' }, rows: { display: 'flex', flexDirection: 'column', gap: s.lg }, row: { padding: s.lg, minHeight: g.resourceCard, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: border.border, fontSize: t.bodySize, lineHeight: t.bodyLeading },
 })

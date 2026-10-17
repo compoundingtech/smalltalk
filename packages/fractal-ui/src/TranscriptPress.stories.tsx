@@ -10,7 +10,7 @@ import type { TextItem, ToolCallItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems } from './assistant-ui/taste/work-log'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
-import { accentVars as accent, borderVars as border, geometryVars as g, radiusVars as r, surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
+import { interactionVars as interaction, borderVars as border, geometryVars as g, radiusVars as r, surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
 
 const now = Date.parse('2026-01-15T12:30:00Z')
 const minute = (index: number) => new Date(Date.parse('2026-01-15T12:00:00Z') + index * 60_000).toISOString()
@@ -309,7 +309,7 @@ const styles = stylex.create({
   root: { height: '100vh', width: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
   transcript: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' },
   toolbar: { display: 'flex', alignItems: 'center', gap: s.md, padding: s.md, flexShrink: 0, fontSize: t.metaSize },
-  button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   hostViewport: { flex: '1 1 0', minHeight: 0, overflowY: 'auto' },
   hostRow: { minHeight: 72, display: 'flex', alignItems: 'center', paddingInline: s.md },
   growingRoot: { height: 'auto', display: 'block' },

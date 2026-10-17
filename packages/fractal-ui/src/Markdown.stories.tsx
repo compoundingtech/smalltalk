@@ -9,7 +9,7 @@ import { Markdown, ResourceChip, completeStreamingTail, type InlineResource } fr
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme } from './assistant-ui/composition-theme'
 import { ThemePortal } from './assistant-ui/taste/ThemePortal'
-import { accentVars as accent, borderVars as border, geometryVars as g, radiusVars as r, spaceVars as s, surfaceVars as surface, textVars as ink, typeVars as t } from './assistant-ui/composition-tokens.stylex'
+import { interactionVars as interaction, borderVars as border, geometryVars as g, radiusVars as r, spaceVars as s, surfaceVars as surface, textVars as ink, typeVars as t } from './assistant-ui/composition-tokens.stylex'
 
 const richText = [
   '# [**Selection** and *ordering*](https://example.com/docs/selection_(stable) "Selection guide")',
@@ -299,6 +299,6 @@ const styles = stylex.create({
   lane: { width: '100%', maxWidth: g.lane, minWidth: 0, marginInline: 'auto' },
   inputNarrow: { maxWidth: g.polishNarrow },
   toolbar: { display: 'flex', alignItems: 'center', gap: s.md, marginBlockEnd: s.lg },
-  button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary }, ':disabled': { color: ink.fgMuted, cursor: 'default' } },
+  button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing }, ':disabled': { color: ink.fgMuted, cursor: 'default' } },
   heading: { marginBlock: s.lg, fontSize: t.headingSize, lineHeight: t.headingLeading },
 })

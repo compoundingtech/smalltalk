@@ -1,5 +1,9 @@
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
+import * as stylex from '@stylexjs/stylex'
+import { Checkbox as SurfaceCheckbox, Menu as SurfaceMenu, MenuItem as SurfaceMenuItem, MenuTrigger as SurfaceMenuTrigger, Popover as SurfacePopover, Tooltip as SurfaceTooltip } from './assistant-ui/composition/Controls'
+import { borderVars as border, geometryVars as g, interactionVars as interaction, spaceVars as s, typeVars as t } from './assistant-ui/composition-tokens.stylex'
+import { lightTheme } from './assistant-ui/composition-theme'
 
 export type Direction = 'folio' | 'relay' | 'orbit'
 export type Scheme = 'light' | 'dark'
@@ -8,7 +12,7 @@ export type Tone = 'neutral' | 'good' | 'warning' | 'danger'
 export interface Theme { direction: Direction; scheme: Scheme; density: Density }
 
 export function ThemeRoot({ direction, scheme, density, children, className = '' }: Theme & { children: React.ReactNode; className?: string }) {
-  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} className={`bg-canvas text-ink font-sans text-chrome ${className}`}>{children}</div>
+  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} className={`${stylex.props(scheme === 'light' && lightTheme).className ?? ''} bg-canvas text-ink font-sans text-chrome ${className}`}>{children}</div>
 }
 
 /* Icons — original inline strokes, no icon-font or asset dependencies. */
@@ -26,8 +30,8 @@ const toneBg: Record<Tone, string> = { neutral: 'bg-recess', good: 'bg-good/12',
 export type ButtonSize = 'sm' | 'md'
 export function Button({ variant = 'secondary', size = 'md', square = false, className = '', ...props }: Aria.ButtonProps & { variant?: 'primary' | 'secondary' | 'quiet' | 'danger'; size?: ButtonSize; square?: boolean }) {
   const variantClass = variant === 'primary' ? 'bg-accent text-on-accent border-accent' : variant === 'quiet' ? 'bg-transparent border-transparent text-muted' : variant === 'danger' ? 'bg-transparent border-danger text-danger' : 'bg-panel border-line text-ink'
-  const sizeClass = size === 'sm' ? 'min-h-[calc(var(--control-height)*0.78)] px-2 text-[11px]' : 'min-h-control px-3'
-  return <Aria.Button {...props} className={`inline-flex items-center justify-center gap-2 rounded-control border font-semibold transition-colors cursor-pointer data-[hovered]:bg-selection data-[hovered]:text-ink data-[hovered]:border-line data-[pressed]:translate-y-px data-[disabled]:opacity-45 data-[disabled]:cursor-not-allowed ${square ? 'w-[var(--control-height)] px-0' : ''} ${sizeClass} ${variantClass} ${className}`} />
+  const sizeClass = size === 'sm' ? 'min-h-[calc(var(--control-height)*0.78)] px-2' : 'min-h-control px-3'
+  return <Aria.Button {...props} className={Aria.composeRenderProps(className, className => `${stylex.props(styles.focus, size === 'sm' && styles.denseType).className} inline-flex items-center justify-center gap-2 rounded-control border font-semibold transition-colors cursor-pointer data-[hovered]:bg-selection data-[hovered]:text-ink data-[hovered]:border-line data-[pressed]:translate-y-px data-[disabled]:opacity-45 data-[disabled]:cursor-not-allowed ${square ? 'w-[var(--control-height)] px-0' : ''} ${sizeClass} ${variantClass} ${className}`)} />
 }
 
 /* Pill / Badge / StatusDot / Spinner / Progress — labeled state surfaces. */
@@ -87,45 +91,39 @@ export function EmptyState({ title, hint, action }: { title: string; hint: strin
 /* Input / Toggle / Checkbox — form controls. */
 export function Input({ label, value, onChange, placeholder, autoFocusKey = '/', clearKey = 'Escape' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; autoFocusKey?: string | null; clearKey?: string | null }) {
   return <Aria.TextField aria-label={label} value={value} onChange={onChange} className="flex w-full min-h-control items-center gap-2 rounded-control border border-line bg-panel px-3 focus-within:border-accent transition-colors">
-    <Aria.Input placeholder={placeholder} onKeyDown={event => { if (clearKey && value !== '' && event.key === clearKey) { event.preventDefault(); onChange('') } }} className="w-full bg-transparent text-ink outline-none placeholder:text-muted" />{value === '' && autoFocusKey ? <Kbd>{autoFocusKey}</Kbd> : <Button aria-label={`Clear ${label.toLowerCase()}`} square size="sm" variant="quiet" onPress={() => onChange('')}><XCircleIcon /></Button>}
+    <Aria.Input placeholder={placeholder} onKeyDown={event => { if (clearKey && value !== '' && event.key === clearKey) { event.preventDefault(); onChange('') } }} className={`${focusClass} w-full bg-transparent text-ink placeholder:text-muted`} />{value === '' && autoFocusKey ? <Kbd>{autoFocusKey}</Kbd> : <Button aria-label={`Clear ${label.toLowerCase()}`} square size="sm" variant="quiet" onPress={() => onChange('')}><XCircleIcon /></Button>}
   </Aria.TextField>
 }
 export function Toggle({ label, isSelected, onChange }: { label: string; isSelected: boolean; onChange: (selected: boolean) => void }) {
-  return <Aria.Switch aria-label={label} isSelected={isSelected} onChange={onChange} className="inline-flex cursor-pointer items-center gap-2.5 text-[12px]">
+  return <Aria.Switch aria-label={label} isSelected={isSelected} onChange={onChange} className={`${stylex.props(styles.focus, styles.metaType).className} inline-flex cursor-pointer items-center gap-2.5`}>
     <span className={`relative inline-flex h-4.5 w-8 shrink-0 items-center rounded-full border transition-colors duration-[var(--motion-duration)] ${isSelected ? 'bg-accent border-accent' : 'bg-recess border-line'}`}><span aria-hidden="true" className={`absolute size-3 rounded-full bg-panel border transition-[left] duration-[var(--motion-duration)] ${isSelected ? 'left-[calc(100%-16px)] border-accent' : 'left-0.5 border-line'}`} /></span>
     {label}
   </Aria.Switch>
 }
 export function Checkbox({ label, isDisabled, isIndeterminate = false, defaultSelected }: { label: React.ReactNode; isDisabled?: boolean; isIndeterminate?: boolean; defaultSelected?: boolean }) {
-  return <Aria.Checkbox isDisabled={isDisabled} isIndeterminate={isIndeterminate} defaultSelected={defaultSelected} className="group inline-flex cursor-pointer items-center gap-2.5 text-[12px] data-[disabled]:cursor-not-allowed data-[disabled]:opacity-45">
-    <span className="grid size-4 place-items-center rounded-[calc(var(--radius)*0.6)] border border-line bg-panel text-on-accent transition-colors group-data-[selected]:border-accent group-data-[selected]:bg-accent group-data-[indeterminate]:border-accent group-data-[indeterminate]:bg-accent">
-      <span className="hidden group-data-[selected]:block group-data-[indeterminate]:hidden"><CheckIcon width="11" height="11" strokeWidth="2.4" /></span>
-      <span className="hidden group-data-[indeterminate]:block"><span aria-hidden="true" className="block h-0.5 w-2 rounded bg-on-accent" /></span>
-    </span>
-    {label}
-  </Aria.Checkbox>
+  return <SurfaceCheckbox isDisabled={isDisabled} isIndeterminate={isIndeterminate} defaultSelected={defaultSelected}>{label}</SurfaceCheckbox>
 }
 
 /* Tooltip, Menu, Modal, Tabs, Table — compound surfaces. */
-export function Tooltip({ label, placement = 'bottom', delay = 350, children }: { label: string; placement?: 'top' | 'bottom'; delay?: number; children: React.ReactNode }) {
-  return <Aria.TooltipTrigger delay={delay} closeDelay={0}>{children}<Aria.Tooltip placement={placement} offset={6} className="z-50 rounded-control bg-ink px-2.5 py-1.5 text-[11px] font-sans text-panel shadow-lg">{label}</Aria.Tooltip></Aria.TooltipTrigger>
+export function Tooltip({ label, shortcut, placement = 'bottom', delay = 500, children }: { label: string; shortcut?: string; placement?: 'top' | 'bottom'; delay?: number; children: React.ReactNode }) {
+  return <SurfaceTooltip label={label} shortcut={shortcut} placement={placement} delay={delay}>{children}</SurfaceTooltip>
 }
 export interface MenuItemSpec { id: string; label: string; kbd?: string; separatorBefore?: boolean }
 export function Menu({ items, onAction, ariaLabel = 'Actions' }: { items: readonly MenuItemSpec[]; onAction?: (key: React.Key) => void; ariaLabel?: string }) {
-  return <Aria.Menu aria-label={ariaLabel} onAction={onAction} className="min-w-52 p-1 outline-none">
+  return <SurfaceMenu aria-label={ariaLabel} onAction={onAction}>
     {items.map(item => <React.Fragment key={item.id}>
-      {item.separatorBefore ? <Aria.Separator className="my-1 border-t border-line" /> : null}
-      <Aria.MenuItem id={item.id} textValue={item.label} className="flex items-center justify-between gap-4 rounded-control px-3 py-unit cursor-pointer data-[focused]:bg-selection data-[focused]:outline-none"><span>{item.label}</span>{item.kbd ? <Kbd>{item.kbd}</Kbd> : null}</Aria.MenuItem>
+      {item.separatorBefore ? <Aria.Separator {...stylex.props(styles.separator)} /> : null}
+      <SurfaceMenuItem id={item.id} textValue={item.label} shortcut={item.kbd}>{item.label}</SurfaceMenuItem>
     </React.Fragment>)}
-  </Aria.Menu>
+  </SurfaceMenu>
 }
 export function MenuTrigger({ items, onAction, ariaLabel, children }: { items: readonly MenuItemSpec[]; onAction?: (key: React.Key) => void; ariaLabel?: string; children: React.ReactNode }) {
-  return <Aria.MenuTrigger>{children}<Aria.Popover placement="bottom end" className="border border-line rounded-panel bg-panel shadow-xl overflow-hidden"><Menu items={items} onAction={onAction} ariaLabel={ariaLabel} /></Aria.Popover></Aria.MenuTrigger>
+  return <SurfaceMenuTrigger>{children}<SurfacePopover placement="bottom end"><Menu items={items} onAction={onAction} ariaLabel={ariaLabel} /></SurfacePopover></SurfaceMenuTrigger>
 }
 export function DialogBody({ title, children, close }: { title: string; children: React.ReactNode; close: () => void }) {
-  return <Aria.Dialog aria-label={title} className="outline-none p-5">
+  return <Aria.Dialog aria-label={title} className={`${focusClass} p-5`}>
     <Aria.Heading slot="title" className="font-display text-xl font-semibold">{title}</Aria.Heading>
-    <Aria.Button slot="close" aria-label="Close" className="absolute top-3 right-3 cursor-pointer text-muted data-[hovered]:text-ink"><XCircleIcon /></Aria.Button>
+    <Aria.Button slot="close" aria-label="Close" className={`${focusClass} absolute top-3 right-3 cursor-pointer text-muted data-[hovered]:text-ink`}><XCircleIcon /></Aria.Button>
     {children}
   </Aria.Dialog>
 }
@@ -139,19 +137,19 @@ export function Modal({ theme, title, children, trigger }: { theme: Theme; title
 export function Tabs({ tabs, selectedKey, onSelectionChange, shouldForceMount = false, children }: { tabs: readonly { id: string; label: string }[]; selectedKey: string; onSelectionChange?: (key: React.Key) => void; shouldForceMount?: boolean; children: Record<string, React.ReactNode> }) {
   return <Aria.Tabs selectedKey={selectedKey} onSelectionChange={onSelectionChange}>
     <Aria.TabList aria-label="Views" className="flex gap-1 border-b border-line px-4">
-      {tabs.map(tab => <Aria.Tab key={tab.id} id={tab.id} className="cursor-pointer border-b-2 border-transparent px-3 py-3 font-semibold text-muted capitalize data-[selected]:border-accent data-[selected]:text-ink data-[hovered]:text-ink transition-colors">{tab.label}</Aria.Tab>)}
+      {tabs.map(tab => <Aria.Tab key={tab.id} id={tab.id} className={`${focusClass} cursor-pointer border-b-2 border-transparent px-3 py-3 font-semibold text-muted capitalize data-[selected]:border-accent data-[selected]:text-ink data-[hovered]:text-ink transition-colors`}>{tab.label}</Aria.Tab>)}
     </Aria.TabList>
-    {tabs.map(tab => <Aria.TabPanel key={tab.id} id={tab.id} shouldForceMount={shouldForceMount} className={selectedKey === tab.id ? '' : 'hidden'}>{children[tab.id]}</Aria.TabPanel>)}
+    {tabs.map(tab => <Aria.TabPanel key={tab.id} id={tab.id} shouldForceMount={shouldForceMount} className={`${focusClass} ${selectedKey === tab.id ? '' : 'hidden'}`}>{children[tab.id]}</Aria.TabPanel>)}
   </Aria.Tabs>
 }
 export interface TableColumnSpec<Row> { id: string; label: string; render: (row: Row) => React.ReactNode; isRowHeader?: boolean }
 export function Table<Row extends { id: string }>({ ariaLabel, columns, rows, compact = false, sticky = false }: { ariaLabel: string; columns: readonly TableColumnSpec<Row>[]; rows: readonly Row[]; compact?: boolean; sticky?: boolean }) {
-  return <Aria.Table aria-label={ariaLabel} selectionMode="single" className={`w-full text-left border-collapse ${compact ? 'text-[12px]' : ''}`}>
+  return <Aria.Table aria-label={ariaLabel} selectionMode="single" className={`${stylex.props(styles.focus, compact && styles.metaType).className} w-full text-left border-collapse`}>
     <Aria.TableHeader className={sticky ? 'sticky top-0 z-10 bg-panel' : ''}>
-      {columns.map(column => <Aria.Column key={column.id} isRowHeader={column.isRowHeader} className="border-b border-line px-3 py-unit font-normal text-muted">{column.label}</Aria.Column>)}
+      {columns.map(column => <Aria.Column key={column.id} isRowHeader={column.isRowHeader} className={`${focusClass} border-b border-line px-3 py-unit font-normal text-muted`}>{column.label}</Aria.Column>)}
     </Aria.TableHeader>
-    <Aria.TableBody>{rows.map(row => <Aria.Row key={row.id} id={row.id} className="cursor-pointer data-[selected]:bg-selection">
-      {columns.map(column => <Aria.Cell key={column.id} className="border-b border-line/60 px-3 py-unit">{column.render(row)}</Aria.Cell>)}
+    <Aria.TableBody>{rows.map(row => <Aria.Row key={row.id} id={row.id} className={`${focusClass} cursor-pointer data-[selected]:bg-selection`}>
+      {columns.map(column => <Aria.Cell key={column.id} className={`${focusClass} border-b border-line/60 px-3 py-unit`}>{column.render(row)}</Aria.Cell>)}
     </Aria.Row>)}</Aria.TableBody>
   </Aria.Table>
 }
@@ -181,13 +179,13 @@ export function CommandMenu({ groups, placeholder = 'Type a command…', emptyHi
     <Aria.Autocomplete inputValue={query} onInputChange={setQuery}>
       <Aria.SearchField aria-label="Find a command" className="flex items-center gap-2 border-b border-line px-3 py-2.5">
         <span aria-hidden="true" className="text-accent"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="6.8" cy="6.8" r="4.6" /><path d="M10.4 10.4 14 14" /></svg></span>
-        <Aria.Input placeholder={placeholder} className="w-full bg-transparent text-ink outline-none placeholder:text-muted" />
+        <Aria.Input placeholder={placeholder} className={`${focusClass} w-full bg-transparent text-ink placeholder:text-muted`} />
         {query !== '' ? <Button aria-label="Clear command search" square size="sm" variant="quiet" onPress={() => setQuery('')}><XCircleIcon /></Button> : <Kbd>/</Kbd>}
       </Aria.SearchField>
       <Aria.ListBox aria-label="Commands" onAction={key => { const item = groups.flatMap(group => group.items).find(candidate => candidate.id === key); item?.onSelect?.(); setStatus(item ? `Ran: ${item.label}` : ''); onAction?.(key) }} renderEmptyState={() => <p className="px-4 py-5 text-[12px] text-muted">{emptyHint}</p>} className="max-h-[min(28rem,60vh)] overflow-auto p-2">
         {filtered.map(group => <Aria.ListBoxSection key={group.id}>
           <Aria.Header className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-widest text-muted">{group.label}</Aria.Header>
-          {group.items.map(item => <Aria.ListBoxItem key={item.id} id={item.id} textValue={item.label} className="flex cursor-pointer items-center justify-between gap-4 rounded-control px-3 py-unit data-[focused]:bg-selection data-[focused]:outline-none data-[hovered]:bg-recess">
+          {group.items.map(item => <Aria.ListBoxItem key={item.id} id={item.id} textValue={item.label} className={`${focusClass} flex cursor-pointer items-center justify-between gap-4 rounded-control px-3 py-unit data-[focused]:bg-selection data-[hovered]:bg-recess`}>
             {/* Description stays reachable via aria-describedby; hiding it from the text walk keeps the name equal to the visible label (WCAG 2.5.3). */}
             <span className="min-w-0"><Aria.Text slot="label" className="block truncate font-semibold">{item.label}</Aria.Text>{item.description ? <Aria.Text slot="description" aria-hidden="true" className="block truncate text-[11px] text-muted">{item.description}</Aria.Text> : null}</span>
             {item.kbd ? <span aria-hidden="true"><Kbd>{item.kbd}</Kbd></span> : null}
@@ -202,10 +200,25 @@ export function CommandMenu({ groups, placeholder = 'Type a command…', emptyHi
 /* ContextCard — preview on hover AND keyboard focus (350 ms intent delay). */
 export function ContextCard({ title, children, preview }: { title: string; children: React.ReactNode; preview: React.ReactNode }) {
   return <Aria.TooltipTrigger delay={350} closeDelay={0}>
-    <Aria.Button className="w-full cursor-pointer rounded-panel border border-line bg-panel p-3 text-left transition-colors data-[hovered]:bg-recess data-[focus-visible]:outline data-[focus-visible]:outline-2 data-[focus-visible]:outline-offset-2 data-[focus-visible]:outline-accent">
+    <Aria.Button className={`${focusClass} w-full cursor-pointer rounded-panel border border-line bg-panel p-3 text-left transition-colors data-[hovered]:bg-recess`}>
       <span className="mb-1 block text-[10px] font-semibold uppercase tracking-widest text-accent">{title}</span>
       {children}
     </Aria.Button>
     <Aria.Tooltip placement="top start" offset={8} className="z-50 max-w-80 rounded-panel border border-line bg-panel p-3 text-[12px] font-sans leading-relaxed text-ink shadow-xl">{preview}</Aria.Tooltip>
   </Aria.TooltipTrigger>
 }
+
+const styles = stylex.create({
+  focus: {
+    ':is([data-focus-visible], :focus-visible)': {
+      outlineWidth: g.focusRing,
+      outlineStyle: 'solid',
+      outlineColor: interaction.focusRing,
+      outlineOffset: g.focusOffset,
+    },
+  },
+  separator: { height: g.hairline, marginBlock: s.xs, borderWidth: 0, backgroundColor: border.border },
+  denseType: { fontSize: t.denseSize },
+  metaType: { fontSize: t.metaSize },
+})
+const focusClass = stylex.props(styles.focus).className

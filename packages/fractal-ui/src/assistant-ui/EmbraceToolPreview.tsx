@@ -1,7 +1,8 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Markdown, type MarkdownProps, type MarkdownImageOpener, type MarkdownImageResolver } from './composition/Markdown'
-import { accentTokens, tokens } from './embrace-tokens.stylex'
+import { tokens } from './embrace-tokens.stylex'
+import { interactionVars as interaction } from './composition-tokens.stylex'
 import type { ToolDiff } from './embrace-tool-preview'
 
 export const EmbraceDiffPreview = ({ diffs }: { readonly diffs: readonly ToolDiff[] }) => (
@@ -50,7 +51,7 @@ const styles = stylex.create({
   caption: { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 10, padding: 8, fontSize: 11, color: tokens.ink, backgroundColor: tokens.recess, overflowWrap: 'anywhere' },
   countAdded: { color: tokens.muted },
   countRemoved: { color: tokens.muted },
-  diffScroll: { overflowX: 'auto', outlineColor: { default: accentTokens.accent, ':focus-visible': accentTokens.accent }, outlineOffset: -2 },
+  diffScroll: { overflowX: 'auto', outlineColor: { default: interaction.focusRing, ':focus-visible': interaction.focusRing }, outlineOffset: -2 },
   diffTable: { borderCollapse: 'collapse', width: '100%', fontFamily: 'monospace', fontSize: 11, lineHeight: 1.6, color: tokens.ink },
   lineNumber: { width: 36, minWidth: 36, paddingInline: 5, textAlign: 'right', color: tokens.muted, userSelect: 'none' },
   sign: { width: 16, textAlign: 'center', userSelect: 'none' },

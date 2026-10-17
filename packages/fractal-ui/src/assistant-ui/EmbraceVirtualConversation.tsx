@@ -11,6 +11,7 @@ import {
 
 import { readScrollAnchor, saveScrollAnchor, ScrollController } from './embrace-virtual/ScrollController'
 import { accentTokens, tokens } from './embrace-tokens.stylex'
+import { interactionVars as interaction } from './composition-tokens.stylex'
 
 export interface EmbraceVirtualConversationProps<T extends { readonly id: string }> {
   readonly items: readonly T[]
@@ -162,6 +163,6 @@ const styles = stylex.create({
     fontFamily: 'inherit',
     fontSize: '12px',
     cursor: 'pointer',
-    outlineColor: accentTokens.accent,
+    outlineColor: interaction.focusRing,
   },
 })

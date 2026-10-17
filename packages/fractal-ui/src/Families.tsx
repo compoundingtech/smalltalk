@@ -1,4 +1,6 @@
 import * as React from 'react'
+import * as stylex from '@stylexjs/stylex'
+import { lightTheme } from './assistant-ui/composition-theme'
 import { Badge, Button, Checkbox, CheckIcon, CodeBlock, CommandMenu, ContextCard, CopyIcon, Description, EmptyState, Entity, Input, Kbd, MenuTrigger, Modal, Note, Pill, Progress, Spinner, StatusDot, Table, Tabs, Toggle, Tooltip, XCircleIcon, type CommandGroup, type Theme } from './kit'
 
 const familyLabel = 'text-[10px] font-semibold uppercase tracking-widest text-muted mb-3'
@@ -28,7 +30,7 @@ export function Families({ direction = 'folio', scheme = 'light', density = 'com
   const [tab, setTab] = React.useState<React.Key>('editor')
   const [input, setInput] = React.useState('')
   const [toggle, setToggle] = React.useState(true)
-  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} className="min-h-screen bg-canvas p-4 font-sans text-chrome text-ink md:p-7">
+  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} className={['min-h-screen bg-canvas p-4 font-sans text-chrome text-ink md:p-7', stylex.props(scheme === 'light' && lightTheme).className].filter(Boolean).join(' ')}>
     <header className="mx-auto max-w-[1400px] border-b border-line pb-5">
       <p className="mb-2 text-[10px] uppercase tracking-[.2em] text-muted">Fractal UI / component families</p>
       <h1 className="font-display text-3xl font-semibold">Twenty-two families, one language</h1>

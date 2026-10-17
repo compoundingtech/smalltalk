@@ -7,7 +7,8 @@ import {
 } from '@assistant-ui/react'
 import { readingColumnStyles } from './reading-column.stylex'
 import type { ConversationItem } from './embrace-data/model'
-import { accentTokens, tokens, geometry, density } from './embrace-tokens.stylex'
+import { tokens, geometry, density } from './embrace-tokens.stylex'
+import { interactionVars as interaction, geometryVars as g } from './composition-tokens.stylex'
 import { EmbraceVirtualConversation } from './EmbraceVirtualConversation'
 import { WorkLogV1 } from './taste/WorkLogV1'
 import { committedWorkLogs, type WorkLogProjection } from './taste/work-log'
@@ -176,7 +177,7 @@ const styles = stylex.create({
   avatar: { display: geometry.avatarDisplay, placeItems: 'center', width: density.avatarSize, height: density.avatarSize, backgroundColor: tokens.recess, borderRadius: geometry.avatarRadius, color: tokens.muted, fontSize: '10px' },
   muted: { color: tokens.muted },
   actions: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px', marginTop: '6px', fontSize: '11px' },
-  button: { backgroundColor: tokens.recess, color: tokens.ink, borderWidth: '1px', borderStyle: 'solid', borderColor: tokens.line, borderRadius: '4px', paddingBlock: '4px', paddingInline: '8px', fontSize: '11px', cursor: 'pointer', ':focus-visible': { outline: `2px solid ${accentTokens.accent}`, outlineOffset: '2px' }, ':disabled': { opacity: 0.45, cursor: 'not-allowed' } },
+  button: { backgroundColor: tokens.recess, color: tokens.ink, borderWidth: '1px', borderStyle: 'solid', borderColor: tokens.line, borderRadius: '4px', paddingBlock: '4px', paddingInline: '8px', fontSize: '11px', cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: g.focusOffset }, ':disabled': { opacity: 0.45, cursor: 'not-allowed' } },
   attachment: { display: 'inline-flex', padding: '6px', borderWidth: '1px', borderStyle: 'solid', borderColor: tokens.line, borderRadius: '4px' },
   error: { color: tokens.danger, paddingBlock: '6px' },
   edit: { display: 'flex', flexDirection: 'column', gap: '6px' },

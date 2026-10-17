@@ -1,12 +1,13 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { useDrag } from 'react-aria'
-import { Button, Menu, MenuItem, MenuTrigger, Popover } from 'react-aria-components'
+import { Button } from 'react-aria-components'
+import { Menu, MenuItem, MenuTrigger, Popover } from '../composition/Controls'
 import { Workbench } from './Workbench'
 import { AGENT_DRAG_MIME, openAgentAtPath, type AgentPlacement } from './agent-drag'
 import { findGroupPath, group, split, type WorkbenchLayout } from './workbench-model'
 import { decidedAppearance, useWorkbenchFixture } from './workbench-fixtures'
-import { surfaceVars as sf, textVars as tx, borderVars as bd, accentVars as ac, spaceVars as s, typeVars as t, geometryVars as g, radiusVars as r } from '../composition-tokens.stylex'
+import { interactionVars as interaction, surfaceVars as sf, textVars as tx, borderVars as bd, spaceVars as s, typeVars as t, geometryVars as g, radiusVars as r } from '../composition-tokens.stylex'
 import { lightTheme } from '../composition-theme'
 import { Icon } from '../composition/Icons'
 
@@ -24,13 +25,13 @@ export function AgentDragRow({ onOpen, agentKey = draggedAgent, title = 'worker-
       </button>
       <MenuTrigger>
         <Button aria-label={`${title} actions`} {...stylex.props(styles.actions)}><Icon name="chevron-down" /></Button>
-        <Popover placement="bottom end" {...stylex.props(styles.popover)}>
-          <Menu aria-label={`Open ${title}`} onAction={key => onOpen(key as AgentPlacement)} {...stylex.props(styles.menu)}>
-            <MenuItem id="center" {...stylex.props(styles.item)}>Open as tab</MenuItem>
-            <MenuItem id="right" {...stylex.props(styles.item)}>Open in split right</MenuItem>
-            <MenuItem id="below" {...stylex.props(styles.item)}>Open in split below</MenuItem>
-            <MenuItem id="left" {...stylex.props(styles.item)}>Open in split left</MenuItem>
-            <MenuItem id="above" {...stylex.props(styles.item)}>Open in split above</MenuItem>
+        <Popover placement="bottom end">
+          <Menu aria-label={`Open ${title}`} onAction={key => onOpen(key as AgentPlacement)}>
+            <MenuItem id="center">Open as tab</MenuItem>
+            <MenuItem id="right">Open in split right</MenuItem>
+            <MenuItem id="below">Open in split below</MenuItem>
+            <MenuItem id="left">Open in split left</MenuItem>
+            <MenuItem id="above">Open in split above</MenuItem>
           </Menu>
         </Popover>
       </MenuTrigger>
@@ -66,10 +67,7 @@ const styles = stylex.create({
   toolbar: { display: 'flex', alignItems: 'center', gap: s.md, flexShrink: 0, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: bd.border, padding: s.sm, boxSizing: 'border-box' },
   heading: { display: 'flex', alignItems: 'center', height: g.band, paddingInline: s.sm, fontSize: t.metaSize, fontWeight: t.weightMedium },
   row: { display: 'flex', alignItems: 'center', gap: s.xs2 },
-  agent: { display: 'flex', alignItems: 'center', gap: s.sm, flexGrow: 1, height: g.controlLg, paddingInline: s.sm, borderWidth: 0, borderRadius: r.control, backgroundColor: sf.transparent, color: tx.fg, fontSize: t.metaSize, cursor: 'grab', ':hover': { backgroundColor: sf.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: ac.primary } },
+  agent: { display: 'flex', alignItems: 'center', gap: s.sm, flexGrow: 1, height: g.controlLg, paddingInline: s.sm, borderWidth: 0, borderRadius: r.control, backgroundColor: sf.transparent, color: tx.fg, fontSize: t.metaSize, cursor: 'grab', ':hover': { backgroundColor: sf.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   agentTitle: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  actions: { display: 'flex', alignItems: 'center', justifyContent: 'center', width: g.controlMd, height: g.controlMd, borderWidth: 0, borderRadius: r.control, backgroundColor: sf.transparent, color: tx.fgMuted, ':hover': { backgroundColor: sf.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: ac.primary } },
-  popover: { backgroundColor: sf.raised, color: tx.fg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: bd.border, borderRadius: r.md },
-  menu: { display: 'flex', flexDirection: 'column', padding: s.xs2, outlineStyle: 'none', fontFamily: t.fontSans, fontSize: t.metaSize },
-  item: { paddingInline: s.sm, paddingBlock: s.xs, borderRadius: r.sm, cursor: 'pointer', outlineStyle: 'none', ':focus': { backgroundColor: sf.rowHover } },
+  actions: { display: 'flex', alignItems: 'center', justifyContent: 'center', width: g.controlMd, height: g.controlMd, borderWidth: 0, borderRadius: r.control, backgroundColor: sf.transparent, color: tx.fgMuted, ':hover': { backgroundColor: sf.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
 })

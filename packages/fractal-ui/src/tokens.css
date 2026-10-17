@@ -102,9 +102,17 @@
 }
 [data-workshop] { color-scheme: light; }
 [data-workshop][data-scheme='dark'] { color-scheme: dark; }
+/* LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-12-fractal-focus-ring-fallback — DELETE at contraction — https://www.notion.so/3f7e3d41f4a381839fa5f7b257ba8f3c */
+/* Global fallback ring for app controls that do not paint their own focus yet:
+   the apps/fractal-web ui-compat wrappers (src/ui-compat/components.tsx), the
+   AgentUsage Button (src/shell/AgentUsage.tsx) and the DevBar trigger. Driven by
+   interactionVars.focusRing through its literal alias. Exit: each adopts
+   interactionVars.focusRing in its own StyleX style; then delete this rule and
+   focusRingBridgeVars. */
 [data-focus-visible], [data-workshop] :focus-visible {
-  outline: 2px solid var(--accent); outline-offset: 3px;
+  outline: 2px solid var(--fractal-focus-ring); outline-offset: 3px;
 }
+/* LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-12-fractal-focus-ring-fallback */
 [data-workshop] ::selection { background: var(--selection); }
 @media (prefers-reduced-motion: reduce) {
   [data-workshop], [data-workshop] * { --motion-duration: 0ms; }

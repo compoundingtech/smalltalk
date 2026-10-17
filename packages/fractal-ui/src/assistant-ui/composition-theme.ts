@@ -1,5 +1,5 @@
 import * as stylex from '@stylexjs/stylex'
-import { surfaceVars, textVars, borderVars, accentVars, statusVars, colorVars } from './composition-tokens.stylex'
+import { surfaceVars, textVars, borderVars, accentVars, interactionVars, focusRingBridgeVars, elevationVars, statusVars, colorVars } from './composition-tokens.stylex'
 
 export type Scheme = 'dark' | 'light'
 
@@ -41,6 +41,22 @@ const accentVarsTheme = stylex.createTheme(accentVars, {
   onPrimary: '#ffffff',
 })
 
+const interactionTheme = stylex.createTheme(interactionVars, {
+  focusRing: accentVars.primary,
+  composerFocusBorder: 'rgba(27, 78, 216, 0.4)',
+  wash: 'rgba(39, 39, 42, 0.06)',
+})
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-12-fractal-focus-ring-fallback — DELETE at contraction — https://www.notion.so/3f7e3d41f4a381839fa5f7b257ba8f3c
+// Re-resolve the global fallback ring's alias at the themed element.
+const focusRingBridgeTheme = stylex.createTheme(focusRingBridgeVars, {
+  '--fractal-focus-ring': interactionVars.focusRing,
+})
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-12-fractal-focus-ring-fallback
+const elevationTheme = stylex.createTheme(elevationVars, {
+  popover: '0 18px 44px -18px rgb(0 0 0 / 20%)',
+  dialog: '0 24px 64px -24px rgb(0 0 0 / 20%)',
+})
+
 export const lightStatusTheme = stylex.createTheme(statusVars, {
   running: '#2563eb',
   runningFg: '#1d4ed8',
@@ -78,6 +94,6 @@ const colorTheme = stylex.createTheme(colorVars, {
   scrollThumbHover: 'rgba(0, 0, 0, 0.25)',
 })
 
-export const lightThemeWithoutStatus = [surfaceVarsTheme, textVarsTheme, borderVarsTheme, accentVarsTheme, colorTheme] as const
+export const lightThemeWithoutStatus = [surfaceVarsTheme, textVarsTheme, borderVarsTheme, accentVarsTheme, interactionTheme, focusRingBridgeTheme, elevationTheme, colorTheme] as const
 export const lightTheme = [...lightThemeWithoutStatus, lightStatusTheme] as const
 export const lightThemes = { color: colorTheme }

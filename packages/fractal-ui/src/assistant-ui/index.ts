@@ -22,7 +22,7 @@ export type { MarkdownProps, MarkdownImageResolution, MarkdownImageResolver, Mar
 export { ThinkingEntry } from './composition/ThinkingEntry.tsx'
 export { ErrorOverlay, ErrorOverlayHost, useErrorOverlaySurface } from './composition/ErrorOverlay.tsx'
 export type { ErrorOverlayNotice } from './composition/ErrorOverlay.tsx'
-export { colorVars, typeVars, radiusVars, spaceVars, geometryVars, geometryNumbers } from './composition-tokens.stylex.ts'
+export { colorVars, typeVars, radiusVars, spaceVars, geometryVars, geometryNumbers, interactionVars } from './composition-tokens.stylex.ts'
 export { lightTheme as compositionLightTheme } from './composition-theme.ts'
 export { darkTheme as assistantDarkTheme } from './embrace-theme.ts'
 export { toolDiffs } from './embrace-tool-preview.ts'
@@ -31,7 +31,8 @@ export type { AgentRowData, AgentStatus } from './composition-model.ts'
 export { liveComposerDarkTheme, liveAccentTheme } from './embrace-theme.ts'
 
 export { Icon as CompositionIcon } from './composition/Icons'
-export { Button as CompositionButton, IconButton as CompositionIconButton } from './composition/Controls'
+export { Button as CompositionButton, IconButton as CompositionIconButton, Menu, MenuItem, MenuTrigger, Popover, Checkbox, Tooltip, TooltipSurface } from './composition/Controls'
+export type { MenuProps, MenuItemProps, PopoverProps, CheckboxProps, TooltipProps, TooltipSurfaceProps } from './composition/Controls'
 
 /** Controlled sidebar row; the host owns clock and data. */
 export { SidebarAgentRow, AgentHoverCard, sidebarRowDescription, sidebarRowAccessibleName } from './sidebar/SidebarAgentRow.tsx'

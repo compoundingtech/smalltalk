@@ -9,7 +9,7 @@ import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { createPortal } from 'react-dom'
 import { Button, Disclosure, DisclosurePanel } from 'react-aria-components'
-import { surfaceVars as surface, textVars as ink, borderVars as border, statusVars as tone, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g, elevationVars as elevation } from '../composition-tokens.stylex'
+import { interactionVars as interaction, surfaceVars as surface, textVars as ink, borderVars as border, statusVars as tone, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g, elevationVars as elevation } from '../composition-tokens.stylex'
 import { Icon } from './Icons'
 
 export interface ErrorOverlayNotice {
@@ -84,9 +84,9 @@ const styles = stylex.create({
   title: { color: tone.dangerFg, fontWeight: t.weightSemibold },
   detail: { color: ink.fgSoft, overflowWrap: 'anywhere' },
   reason: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  rawTrigger: { minHeight: g.controlSm, padding: 0, borderWidth: 0, backgroundColor: surface.transparent, color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { color: ink.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: tone.danger } },
+  rawTrigger: { minHeight: g.controlSm, padding: 0, borderWidth: 0, backgroundColor: surface.transparent, color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { color: ink.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   rawOutput: { margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: t.fontMono, fontSize: t.metaSize },
   command: { marginBlockEnd: s.sm, padding: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.codeBg },
-  action: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minHeight: g.controlSm, paddingInline: s.sm, flexShrink: 0, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: tone.danger } },
-  close: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: g.controlSm, minHeight: g.controlSm, padding: 0, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fgMuted, cursor: 'pointer', flexShrink: 0, ':hover': { color: ink.fg, backgroundColor: surface.rowActive }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: tone.danger } },
+  action: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minHeight: g.controlSm, paddingInline: s.sm, flexShrink: 0, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
+  close: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: g.controlSm, minHeight: g.controlSm, padding: 0, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fgMuted, cursor: 'pointer', flexShrink: 0, ':hover': { color: ink.fg, backgroundColor: surface.rowActive }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
 })

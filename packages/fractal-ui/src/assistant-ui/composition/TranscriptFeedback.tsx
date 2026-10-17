@@ -3,7 +3,7 @@ import * as stylex from '@stylexjs/stylex'
 import { Button } from 'react-aria-components'
 import type { SendState } from '../embrace-data/model'
 import { Icon } from './Icons'
-import { surfaceVars as surface, textVars as ink, accentVars as accent, statusVars as status, typeVars as t, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
+import { interactionVars as interaction, surfaceVars as surface, textVars as ink, statusVars as status, typeVars as t, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 
 export interface TranscriptEmptyState { readonly title: string; readonly body?: string }
 const sendFailureCopy: Readonly<Record<Extract<SendState, { _tag: 'Failed' }>['reason']['_tag'], string>> = {
@@ -48,7 +48,7 @@ const styles = stylex.create({
   emptyTitle: { margin: 0, fontSize: t.uiSize, lineHeight: t.uiLeading, fontWeight: t.weightMedium, color: ink.fgSoft },
   emptyDetail: { margin: 0, fontSize: t.metaSize, lineHeight: t.metaLeading, color: ink.fgMuted },
   sendFailure: { display: 'flex', flexDirection: 'column', gap: s.xs2, marginTop: s.xs2 },
-  sendFailureLine: { display: 'inline-flex', alignItems: 'center', gap: s.xs, alignSelf: 'flex-start', minHeight: g.controlSm, padding: 0, borderWidth: 0, backgroundColor: surface.transparent, color: status.dangerFg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  sendFailureLine: { display: 'inline-flex', alignItems: 'center', gap: s.xs, alignSelf: 'flex-start', minHeight: g.controlSm, padding: 0, borderWidth: 0, backgroundColor: surface.transparent, color: status.dangerFg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   sendUnconfirmedLine: { color: ink.fgMuted },
   sendFailureDetail: { color: ink.fgMuted, fontSize: t.metaSize, lineHeight: t.metaLeading, overflowWrap: 'anywhere' },
 })

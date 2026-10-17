@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Tabs, TabList, Tab, TabPanel, Select, SelectValue, Button as AriaButton, ToggleButton, Popover, ListBox, ListBoxItem } from 'react-aria-components'
-import { surfaceVars as surface, textVars as text, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
+import { interactionVars as interaction, surfaceVars as surface, textVars as text, borderVars as border, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 import { surfaceOptions } from '../composition-model'
 import { Icon } from './Icons'
 import { Button, IconButton, Tooltip } from './Controls'
@@ -175,11 +175,11 @@ const styles = stylex.create({
   surfaceHead: { minHeight: g.controlLg, boxSizing: 'border-box', display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg, flexShrink: 0, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: border.border },
   title: { margin: 0, fontSize: t.uiSize, fontWeight: t.weightMedium, color: text.fg, flexShrink: 0 },
   tabs: { display: 'flex', alignItems: 'center', gap: s.xs, minWidth: 0, overflowX: 'auto' },
-  tab: { height: g.controlSm, maxWidth: g.tabMax, display: 'inline-flex', alignItems: 'center', paddingInline: s.md, color: text.fgMuted, borderRadius: r.control, fontSize: t.metaSize, whiteSpace: 'nowrap', flexShrink: 0, cursor: 'pointer', ':hover': { color: text.fg }, ':is([data-selected])': { backgroundColor: surface.rowActive, color: text.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  tab: { height: g.controlSm, maxWidth: g.tabMax, display: 'inline-flex', alignItems: 'center', paddingInline: s.md, color: text.fgMuted, borderRadius: r.control, fontSize: t.metaSize, whiteSpace: 'nowrap', flexShrink: 0, cursor: 'pointer', ':hover': { color: text.fg }, ':is([data-selected])': { backgroundColor: surface.rowActive, color: text.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   body: { display: 'flex', flexDirection: 'column', minHeight: 0, flexGrow: 1 },
   toolbar: { minHeight: g.controlLg, boxSizing: 'border-box', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: s.xs, paddingInline: s.lg, paddingBlock: 0, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: border.border, flexShrink: 0 },
-  iconToggle: { width: g.controlSm, height: g.controlSm, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, padding: 0, borderWidth: 0, borderRadius: r.control, backgroundColor: 'transparent', color: text.fgMuted, cursor: 'pointer', ':is([data-selected])': { backgroundColor: surface.rowActive, color: text.fg }, ':hover': { backgroundColor: surface.rowHover, color: text.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
-  scopePicker: { display: 'flex', alignItems: 'center', gap: s.xs, backgroundColor: 'transparent', borderWidth: 0, color: text.fgMuted, height: g.controlMd, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  iconToggle: { width: g.controlSm, height: g.controlSm, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, padding: 0, borderWidth: 0, borderRadius: r.control, backgroundColor: 'transparent', color: text.fgMuted, cursor: 'pointer', ':is([data-selected])': { backgroundColor: surface.rowActive, color: text.fg }, ':hover': { backgroundColor: surface.rowHover, color: text.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
+  scopePicker: { display: 'flex', alignItems: 'center', gap: s.xs, backgroundColor: 'transparent', borderWidth: 0, color: text.fgMuted, height: g.controlMd, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   popover: { backgroundColor: surface.raised, borderRadius: r.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, padding: s.xs, color: text.fg },
   option: { padding: s.md, fontSize: t.metaSize, borderRadius: r.sm, cursor: 'pointer', ':is([data-focused])': { backgroundColor: surface.rowHover }, ':is([data-disabled])': { color: text.fgMuted, cursor: 'default' } },
   unavailable: { color: text.fgMuted },
@@ -187,12 +187,12 @@ const styles = stylex.create({
   files: { minHeight: 0, flexGrow: 1, overflowY: 'auto' },
   fileSection: { borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: border.border },
   fileHead: { minHeight: g.controlLg, display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg },
-  fileToggle: { display: 'flex', alignItems: 'center', gap: s.sm, flexGrow: 1, minWidth: 0, padding: 0, minHeight: g.controlMd, backgroundColor: 'transparent', borderWidth: 0, color: text.fgMuted, textAlign: 'left', cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  fileToggle: { display: 'flex', alignItems: 'center', gap: s.sm, flexGrow: 1, minWidth: 0, padding: 0, minHeight: g.controlMd, backgroundColor: 'transparent', borderWidth: 0, color: text.fgMuted, textAlign: 'left', cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   path: { fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, color: text.fg, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   added: { fontFamily: t.fontMono, fontSize: t.denseSize, color: status.diffAdded, fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
   removed: { fontFamily: t.fontMono, fontSize: t.denseSize, color: text.fgMuted, fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
   spacer: { flexGrow: 1 },
-  code: { minHeight: 0, overflowX: 'auto', fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: t.uiLeading, paddingBottom: s.lg, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: `calc(0px - ${g.focusRing})` } },
+  code: { minHeight: 0, overflowX: 'auto', fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: t.uiLeading, paddingBottom: s.lg, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: `calc(0px - ${g.focusRing})` } },
   codeRow: { display: 'flex', alignItems: 'stretch', minHeight: t.uiLeading, minWidth: '100%' },
   addedRow: { backgroundColor: `color-mix(in srgb, ${status.diffAddTint} 9%, transparent)` },
   removedRow: { backgroundColor: status.diffRemovedWash },
@@ -201,7 +201,7 @@ const styles = stylex.create({
   removedGutter: { backgroundColor: surface.washSubtle, borderLeftColor: status.diffRemoved, color: status.diffRemoved },
   codeText: { fontFamily: 'inherit', fontSize: 'inherit', lineHeight: 'inherit', paddingInline: s.sm, color: text.fgSoft, whiteSpace: 'pre', flexGrow: 1 },
   wrappedText: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', minWidth: 0, flexBasis: 0 },
-  hunk: { width: '100%', minHeight: g.toolRow, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: t.fontSans, fontSize: t.denseSize, color: text.fgMuted, borderWidth: 0, backgroundColor: 'transparent', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  hunk: { width: '100%', minHeight: g.toolRow, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: t.fontSans, fontSize: t.denseSize, color: text.fgMuted, borderWidth: 0, backgroundColor: 'transparent', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing } },
   split: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)' },
   splitCell: { minWidth: 0, overflowX: 'auto', borderRightWidth: g.hairline, borderRightStyle: 'solid', borderRightColor: border.border },
   empty: { margin: 0, padding: s.lg, fontFamily: t.fontSans, fontSize: t.metaSize, color: text.fgMuted },

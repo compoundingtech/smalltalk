@@ -111,6 +111,20 @@ Every foreground/background pair used for text meets WCAG AA (≥ 4.5:1) in all 
 
 ## Assistant-ui surfaces
 
+### Menus, tooltips and focus
+
+The composition controls are the shared React Aria surface implementation used by the family adapters and assistant-ui. `Menu`, `MenuItem`, `Popover` and `MenuTrigger` preserve React Aria selection, Escape dismissal and trigger focus restoration. Menu surfaces use raised fill, a hairline border, an 8px radius, 4px padding and scheme-specific elevation; they size to their rows between `menuMin` and `menuMax`, and a label wider than `menuMax` truncates on one line. Items are at least 28px high with 14/20 text, a 16px leading slot and a 14px SVG selection mark. Hover and keyboard focus use a 6% foreground wash and lift the shortcut from muted to soft ink so it stays above 4.5:1 on the wash; keyboard focus also has the inset accent ring. `Checkbox` uses a 14px SVG control with accent fill when selected, inside a 24px-high target.
+
+`Tooltip` accepts a label, an optional shortcut, controlled open state and a StyleX override. It opens on hover and keyboard focus after 350ms and uses main's shared `tooltipStyles` surface with inverse fill, a control radius, dense type and a 4px offset. It sizes to its text up to `tooltipMax` and wraps beyond it. `TooltipSurface` applies that same exported surface inside an existing React Aria trigger when a composite widget owns its focus target. Keyboard-focused tooltips reopen after 100ms without scrolling; Escape cancels reopening and only one kit tooltip opens at a time. Run `pnpm --filter @smalltalk/fractal-ui test:controls` for these production interaction regressions. Menu entry/exit fades and scales over 150ms; reduced-motion preferences disable those animations.
+Tooltip shortcut hints inherit the inverse foreground, giving 17.32:1 contrast in dark mode and 14.89:1 in light mode. Raised menu shortcuts retain their separate muted/active ink.
+
+Kit focus outlines consume `interactionVars.focusRing`, except `SidebarAgentRow`, which retains `accentVars.primary` and soft metadata ink. The shared geometry tokens own ring width and offset. `Surface primitives` stories cover both schemes at 440 and 1440, selection, Escape focus restoration, label/shortcut disclosure and reduced motion.
+
+<!-- LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-12-fractal-focus-ring-fallback — DELETE at contraction — https://www.notion.so/3f7e3d41f4a381839fa5f7b257ba8f3c -->
+Until every app control paints its own ring, `tokens.css` keeps a global fallback outline on React Aria `[data-focus-visible]` targets and workshop `:focus-visible`. It reads `--fractal-focus-ring`, a literal-name alias of `interactionVars.focusRing` that the light theme re-resolves, so the fallback and kit rings share one colour. The `Surface primitives` plays assert the fallback's width, style and colour in both schemes.
+<!-- LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-12-fractal-focus-ring-fallback -->
+
+
 ### Gated transcript and work log
 
 `Transcript` is the locked U2·F3·Y3 presentation: left-aligned prompts with an accent rule, four-line highlighted tool previews with a host-owned Open action, and a thin synchronization/run progress rail above the header status. Render it under `EmbraceRuntimeProvider` with the same source references used by the runtime. The host supplies `TranscriptTurn` boundaries, work/lifecycle facts, sender captions, retry actions, output navigation and the observation clock. The transcript never creates a transport or turn state machine.
@@ -198,7 +212,7 @@ Workbench pane identities survive layout changes through persistent pane slots. 
 
 `DiffPanel` is exported from `@smalltalk/fractal-ui/assistant-ui`, not from `@smalltalk/fractal-ui/assistant-ui/shell`. Its source highlighting loads the Markdown grammar graph, and the shell entry stays runtime-free. `pnpm check:shell-imports` walks the shell entry's import graph and fails if Markdown, refractor or the assistant-ui runtime becomes reachable.
 
-The composer preserves kit send, cancellation, byte-limit and token-history contracts while adding adaptive pill/slab geometry, grouped mention/command popovers, effort selection, and the recipient/model toolbar. `ComposerSession` owns only device-local draft persistence and composer interaction policy; transports and runtime facts remain host-owned. Its tooltips retain the gated 150 ms delay and viewport-clamped, wrapping contents; Workbench/DiffPanel share the 350 ms Controls tooltip instead.
+The composer preserves kit send, cancellation, byte-limit and token-history contracts while adding adaptive pill/slab geometry, grouped mention/command popovers, effort selection, and the recipient/model toolbar. `ComposerSession` owns only device-local draft persistence and composer interaction policy; transports and runtime facts remain host-owned. Its toolbar tooltips retain viewport-clamped, wrapping contents; Workbench/DiffPanel use the shared 500ms Controls tooltip.
 
 The Workbench thread dock uses the reviewed route's composition composer policy, distinct from `ComposerSession`'s R3 choice: idle Enter sends immediately; during a run Enter queues and modified Enter explicitly steers. `IdleSample` seeds the route's exact `designItems('idle', 'sample')` messages with explicit idle host facts. `RunningQueueAndSteer` keeps the running case separate and asserts both actions without changing the queue. Neither fixture infers a runtime state from a header label.
 

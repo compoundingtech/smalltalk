@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Button } from 'react-aria-components'
-import { colorVars as c, typeVars as t, radiusVars as r, geometryVars as g } from '../composition-tokens.stylex'
+import { interactionVars as interaction, colorVars as c, typeVars as t, radiusVars as r, geometryVars as g } from '../composition-tokens.stylex'
 import { SidebarStatus as StatusGlyph } from '../sidebar/SidebarStatus'
 import { Icon } from './Icons'
 import type { AgentStatus } from '../sidebar/model'
@@ -201,8 +201,8 @@ export function TerminalDrawer({ lines, open, height, onHeight }: { lines: reado
 }
 
 const styles = stylex.create({
-  splitVertical: { width: 1, alignSelf: 'stretch', backgroundColor: c.borderStrong, cursor: 'col-resize', position: 'relative', flexShrink: 0, touchAction: 'none', '::after': { content: '""', position: 'absolute', insetInline: -3, insetBlock: 0 }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: -1 } },
-  splitHorizontal: { height: 1, width: '100%', backgroundColor: c.borderStrong, cursor: 'row-resize', position: 'relative', flexShrink: 0, touchAction: 'none', '::after': { content: '""', insetInline: 0, insetBlock: -3, position: 'absolute' }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: -1 } },
+  splitVertical: { width: 1, alignSelf: 'stretch', backgroundColor: c.borderStrong, cursor: 'col-resize', position: 'relative', flexShrink: 0, touchAction: 'none', '::after': { content: '""', position: 'absolute', insetInline: -3, insetBlock: 0 }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: -1 } },
+  splitHorizontal: { height: 1, width: '100%', backgroundColor: c.borderStrong, cursor: 'row-resize', position: 'relative', flexShrink: 0, touchAction: 'none', '::after': { content: '""', insetInline: 0, insetBlock: -3, position: 'absolute' }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: -1 } },
   header: { height: g.band, display: 'flex', alignItems: 'center', gap: g.gutter, paddingInline: g.gutter, flexShrink: 0, minWidth: 0 },
   breadcrumb: { display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, fontSize: t.uiSize, lineHeight: t.uiLeading },
   crumbFolder: { color: c.fgMuted, maxWidth: 160, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 0 },
@@ -210,8 +210,8 @@ const styles = stylex.create({
   crumbTitle: { color: c.fg, fontWeight: t.weightMedium, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
   actionSlot: { display: 'flex', alignItems: 'center', gap: 8 },
   actions: { marginInlineStart: 'auto', display: 'flex', alignItems: 'center', gap: 6 },
-  outlineXs: { height: g.controlSm, display: 'inline-flex', alignItems: 'center', paddingInline: 6, borderWidth: 1, borderStyle: 'solid', borderColor: c.borderStrong, backgroundColor: 'rgba(255, 255, 255, 0.025)', color: c.fg, borderRadius: r.control, fontSize: t.metaSize, lineHeight: t.metaLeading, fontWeight: t.weightMedium, cursor: 'pointer', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
-  ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.fgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
+  outlineXs: { height: g.controlSm, display: 'inline-flex', alignItems: 'center', paddingInline: 6, borderWidth: 1, borderStyle: 'solid', borderColor: c.borderStrong, backgroundColor: 'rgba(255, 255, 255, 0.025)', color: c.fg, borderRadius: r.control, fontSize: t.metaSize, lineHeight: t.metaLeading, fontWeight: t.weightMedium, cursor: 'pointer', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: 1 } },
+  ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.fgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: 1 } },
   ghostOn: { color: c.fg, backgroundColor: c.rowHover },
   ghostDisabled: { color: c.fgMuted, cursor: 'default', ':hover': { backgroundColor: 'transparent', color: c.fgMuted } },
   disabledWrap: { display: 'inline-flex' },

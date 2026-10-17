@@ -1,5 +1,8 @@
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
+import * as stylex from '@stylexjs/stylex'
+import { lightTheme } from './assistant-ui/composition-theme'
+import { interactionVars as interaction, geometryVars as geometry } from './assistant-ui/composition-tokens.stylex'
 import { Badge, Button, Checkbox, CodeBlock, CommandMenu, ContextCard, Description, EmptyState, Entity, Input, Kbd, MenuTrigger, Modal, Note, Pill, Progress, Spinner, StatusDot, Table, Tabs, Toggle, Tooltip, type CommandGroup, type Theme } from './kit'
 
 export const directions = {
@@ -8,11 +11,15 @@ export const directions = {
   orbit: { name: 'Orbit', index: '03', description: 'A calm navigation instrument. Indigo layers, amber bearings, generous curves.', character: 'Composed / approachable / continuous', motion: '240 ms · settling ease', radius: '14 / 20 px', type: 'Verdana / Verdana / Consolas' },
 } as const
 
+const focusStyles = stylex.create({
+  control: { ':is([data-focus-visible], :focus-visible)': { outlineWidth: geometry.focusRing, outlineStyle: 'solid', outlineColor: interaction.focusRing, outlineOffset: geometry.focusOffset } },
+})
+
 function Choice({ label, value, options, onChange }: { label: string; value: string; options: readonly string[]; onChange: (value: string) => void }) {
   return <Aria.RadioGroup aria-label={label} value={value} onChange={onChange} className="flex flex-col gap-1.5">
     <Aria.Label className="text-[10px] font-semibold uppercase tracking-widest text-muted">{label}</Aria.Label>
     <div className="flex flex-wrap gap-1 rounded-control border border-line bg-panel p-1">
-      {options.map(option => <Aria.Radio key={option} value={option} className="flex min-h-control cursor-pointer items-center rounded-control px-3 py-1 capitalize transition-colors data-[selected]:bg-accent data-[selected]:text-on-accent data-[hovered]:bg-selection data-[hovered]:text-ink">{option}</Aria.Radio>)}
+      {options.map(option => <Aria.Radio key={option} value={option} className={['flex min-h-control cursor-pointer items-center rounded-control px-3 py-1 capitalize transition-colors data-[selected]:bg-accent data-[selected]:text-on-accent data-[hovered]:bg-selection data-[hovered]:text-ink', stylex.props(focusStyles.control).className].join(' ')}>{option}</Aria.Radio>)}
     </div>
   </Aria.RadioGroup>
 }
@@ -88,7 +95,7 @@ function Conversation({ theme }: { theme: Theme }) {
       </div>
     </article>
     <div className="rounded-panel border border-line bg-recess p-3">
-      <Aria.TextField aria-label="Message draft" className="block"><Aria.TextArea placeholder="Add a note or a next step…" className="min-h-12 w-full resize-y bg-transparent p-1 text-ink placeholder:text-muted" /></Aria.TextField>
+      <Aria.TextField aria-label="Message draft" className="block"><Aria.TextArea placeholder="Add a note or a next step…" className={['min-h-12 w-full resize-y bg-transparent p-1 text-ink placeholder:text-muted', stylex.props(focusStyles.control).className].join(' ')} /></Aria.TextField>
       <div className="flex items-center justify-between text-[11px] text-muted"><span>Local workshop · no messages are sent</span><Button isDisabled>Send</Button></div>
     </div>
   </div>
@@ -106,7 +113,7 @@ function Sidebar() {
   return <aside className="border-b border-line bg-recess p-3 lg:border-b-0 lg:border-r">
     <div className="flex items-center justify-between px-2 py-3"><span className="text-[10px] font-semibold uppercase tracking-widest text-muted">Example project</span><Pill>5 threads</Pill></div>
     <Aria.ListBox aria-label="Threads" selectionMode="single" defaultSelectedKeys={['cache']} className="flex flex-col gap-2">
-      {threads.map(thread => <Aria.ListBoxItem key={thread.id} id={thread.id} textValue={thread.title} className="cursor-pointer rounded-control border border-transparent p-unit data-[selected]:border-line data-[selected]:bg-panel data-[hovered]:bg-selection">
+      {threads.map(thread => <Aria.ListBoxItem key={thread.id} id={thread.id} textValue={thread.title} className={['cursor-pointer rounded-control border border-transparent p-unit data-[selected]:border-line data-[selected]:bg-panel data-[hovered]:bg-selection', stylex.props(focusStyles.control).className].join(' ')}>
         <div className="mb-1 flex justify-between gap-2 font-semibold"><span className="truncate">{thread.title}</span><span className="text-[10px] font-normal text-muted tabular">{thread.time}</span></div>
         <p className="mb-2 text-[11px] text-muted">{thread.detail}</p>
         <StatusDot state={thread.state} label={thread.status} />
@@ -150,7 +157,7 @@ export function Workshop({ direction = 'folio', scheme = 'light', density = 'com
   const [tab, setTab] = React.useState<React.Key>('conversation')
   const [pinned, setPinned] = React.useState(true)
   const [filter, setFilter] = React.useState('')
-  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} className="min-h-screen bg-canvas p-4 font-sans text-chrome text-ink md:p-7">
+  return <div data-workshop data-direction={direction} data-scheme={scheme} data-density={density} className={['min-h-screen bg-canvas p-4 font-sans text-chrome text-ink md:p-7', stylex.props(scheme === 'light' && lightTheme).className].filter(Boolean).join(' ')}>
     <header className="mx-auto flex max-w-[1500px] flex-wrap items-center justify-between gap-6 border-b border-line pb-5">
       <div><p className="mb-2 text-[10px] uppercase tracking-[.2em] text-muted">Fractal UI / visual language workshop</p><h1 className="font-display text-3xl font-semibold">{info.index} <span className="text-accent">{info.name}</span></h1></div>
       <div className="flex flex-wrap gap-4">

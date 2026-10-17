@@ -88,7 +88,7 @@ const geometryVarsTheme = stylex.createTheme(geometryVars, {
   panelDefault: '540px', panelMin: '360px',
   controlSm: '24px', controlMd: '28px', controlLg: '32px',
   toolRow: '24px',
-  menuRow: '32px',
+  menuRow: '28px', checkbox: '14px',
   gutter: 'clamp(12px, 1.25vw, 20px)',
   drawerDefault: '220px', drawerMin: '120px',
   footer: '40px',
@@ -110,7 +110,7 @@ const geometryVarsTheme = stylex.createTheme(geometryVars, {
   inventoryColumns: { default: 'minmax(0, 1fr)', '@media (min-width: 48rem)': 'repeat(2, minmax(0, 1fr))', '@media (min-width: 80rem)': 'repeat(4, minmax(0, 1fr))' },
   workshopColumns: { default: 'minmax(0, 1fr)', '@media (min-width: 80rem)': 'minmax(0, 1fr) 340px' },
   contextColumns: { default: 'minmax(0, 1fr)', '@media (min-width: 64rem)': '250px minmax(0, 1fr)' },
-  menuMin: '208px', sectionTitle: '18px', dialogTitle: '20px', switchSelectedLeft: 'calc(100% - 16px)',
+  menuMin: '208px', menuMax: '320px', sectionTitle: '18px', dialogTitle: '20px', switchSelectedLeft: 'calc(100% - 16px)',
   sidebarThree: '68px', workExpandedMax: 'min(18rem, 50dvh)', timelineStub: '16px',
   transcriptFrameHeight: '640px',
   estimatedMessageHeight: '160px',
@@ -119,7 +119,7 @@ const geometryVarsTheme = stylex.createTheme(geometryVars, {
 
 const motionVarsTheme = stylex.createTheme(motionVars, {
   fast: '150ms', standard: '200ms', reveal: '600ms', spin: '1s', pulse: '2s',
-  ease: 'ease', linear: 'linear',
+  ease: 'ease', linear: 'linear', surfaceTransform: 'scale(0.98)',
 })
 
 const elevationVarsTheme = stylex.createTheme(elevationVars, {
