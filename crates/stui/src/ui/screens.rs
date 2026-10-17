@@ -35,10 +35,6 @@ fn alerts_out_of_date(world: &World) -> Option<String> {
     Some(why.join("; "))
 }
 
-/// The tabs everyone sees. Worktrees stays hidden until the graph models worktrees: its screens
-/// only have invented data to show (Nathan, 2026-09-28).
-pub const TABS: [&str; 5] = ["Now", "Agents", "Missions", "Fleet", "Usage"];
-
 pub enum Item {
     Header {
         title: String,

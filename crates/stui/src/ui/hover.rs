@@ -302,7 +302,7 @@ mod tests {
     fn opaque_layers_hide_hits_and_clip_a_partly_covered_highlight() {
         let mut ui = Ui::new(demo::world());
         ui.frame.borrow_mut().area = Rect::new(0, 0, 20, 6);
-        ui.hit(Rect::new(0, 0, 10, 1), Hit::Tab(1));
+        ui.hit(Rect::new(0, 0, 10, 1), Hit::Usage);
         ui.cover(Rect::new(5, 0, 5, 2));
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 6));
         buf.set_style(buf.area, theme::text().bg(theme::BASE));
@@ -313,7 +313,7 @@ mod tests {
         assert!(ui.input_event(motion(6, 0)));
         assert!(
             ui.hover.target.get().is_none(),
-            "blank overlay cells hide the tab"
+            "blank overlay cells hide the target"
         );
         ui.hit(Rect::new(5, 0, 3, 1), Hit::Key('x'));
         assert!(ui.input_event(motion(6, 0)));
@@ -323,7 +323,6 @@ mod tests {
     #[test]
     fn overlays_drags_focus_loss_and_frame_changes_cannot_keep_old_hover() {
         let mut ui = Ui::new(demo::world());
-        ui.glasses = Some(glass::Glasses::open(None, None));
         let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
         terminal.draw(|frame| ui.render(frame)).unwrap();
         assert!(ui.input_event(motion(1, 0)));

@@ -65,7 +65,7 @@ fn attach_default_probe_worker() -> Result<()> {
     ui.live = true;
     // This device's own choice, from the isolated XDG_STATE_HOME the harness wrote (or none).
     ui.load_prefs();
-    ui.glasses = Some(glass::Glasses::open(None, None));
+    ui.glasses = glass::Glasses::open(None, None);
     let mut answered: Vec<String> = Vec::new();
     let mut opened = 0;
     let mut last = String::new();
@@ -198,7 +198,7 @@ fn attach_default_probe_worker() -> Result<()> {
 fn attach_redraw_cost() {
     use ratatui::backend::TestBackend;
     let mut ui = Ui::new(demo::world());
-    ui.glasses = Some(glass::Glasses::open(None, None));
+    ui.glasses = glass::Glasses::open(None, None);
     ui.open_in_glass(Pane::Terminal(AGENT.into()), glass::Open::Tab);
     let (stui, _daemon) = std::os::unix::net::UnixStream::pair().unwrap();
     ui.terminal = Some(TerminalView {

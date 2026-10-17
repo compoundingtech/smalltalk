@@ -43,7 +43,7 @@ entries are visible after successful presentation; cancelled opens have no succe
 sample. Open failures retain the feed's typed refusal or transcript-not-bound notice.
 Focused input keys have individual timestamps in a fixed array. Freshness starts
 when the feed receives a decoded window, before maintaining its view, and ends
-after a frame displays that window's rows (or the classic alert badge). Hidden
+after a frame displays that window's rows. Hidden
 windows produce no latency sample. Reconnects end when live state is presented.
 Direct attempts count only devices with a local daemon; ordinary paired-device
 gateway routes do not reduce the direct-route success percentage. Terminal opens

@@ -58,7 +58,7 @@ impl Ui {
     /// Start listening for the focused input, or say why voice is not here.
     pub(crate) fn start_voice(&mut self) {
         // A conversation's message box for now; Home's answer boxes draw differently.
-        if self.tab != 1 {
+        if self.tab() != 1 {
             self.flash("Voice works in a conversation's message box for now");
             return;
         }

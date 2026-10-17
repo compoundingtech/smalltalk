@@ -24,7 +24,6 @@ fn terminal_ui_arguments_and_help_match_the_documented_surface() {
         "--client",
         "--local",
         "--space",
-        "--classic",
         "--demo",
         "--glass",
         "--glasses",
@@ -39,7 +38,12 @@ fn terminal_ui_arguments_and_help_match_the_documented_surface() {
         ));
     }
     assert!(Cli::try_parse_from(["st", "ui", "--client", "--local"]).is_err());
-    assert!(Cli::try_parse_from(["st", "ui", "--space", "harbor", "--classic"]).is_err());
+    // `--classic` is gone: it still parses, so stui can say what to run instead, and help
+    // no longer names it.
+    assert!(matches!(
+        Cli::try_parse_from(["st", "ui", "--classic"]).unwrap().command,
+        Command::Ui(_)
+    ));
     assert!(Cli::try_parse_from(["st", "ui", "pair"]).is_err());
     assert!(Cli::try_parse_from(["st", "ui", "--space"]).is_err());
     assert!(
