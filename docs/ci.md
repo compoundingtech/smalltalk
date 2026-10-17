@@ -615,6 +615,46 @@ counts and per-case seconds and adds reset, page-creation, guard, navigation-to-
 post-DOM readiness, assertion and close timings. The strict lifecycle assertions,
 story-identity checks, matrix size and job timeout are unchanged.
 
+Kit-input changes fan execution out into two non-fail-fast shards. Each validates the
+**full** Storybook index, selects the set requested by `KIT_PLAY_SET`, then partitions
+that set by `SHA-256(storyId) mod N`; adding a story cannot move existing stories.
+`kitShardCount` in `.github/workflows/workspace-ci.ts` configures N. CI keeps its
+defaults: all stories, a11y on, and no play budget. `KIT_PLAY_A11Y` and
+`KIT_PLAY_MAX_SECONDS` apply unchanged to each shard. Every selected story still
+runs all four width/theme cases with the same runner and assertions.
+Empty shards fail unless N exceeds the selected story count. App/static lanes and the
+isolation/negative controls run only on shard 0; independent strict subshells prevent
+an app failure from suppressing the kit attempt. App-only changes schedule just shard 0.
+The incoming #2958 app play suite belongs inside that shard-0 app subshell, with no
+`KIT_PLAY_SHARD_*` environment (those variables are scoped to the kit invocation).
+
+Every shard publishes `receipt.json` in an artifact named
+`kit-play-<run_id>-<github.sha>-shard-<index>-attempt-<run_attempt>`, even on a play failure, and
+adds a `kit i/N` summary row with completed/expected cases, passes, failures and play
+minutes. The semantic `fractal-web` gate requires matrix success **and** all N receipts:
+their selected-set indexes must agree, and the union of unique story/width/theme cases
+must match exactly that set (the full story index by default, or the critical index
+with `KIT_PLAY_SET=critical`). Missing, duplicate, failed or unexpected shards fail closed.
+Artifacts and receipts are bound to the workflow run ID, checked-out head SHA
+(`github.sha`, including a PR's tested merge SHA) and attempt. The gate downloads
+only this run/head's artifacts, checks each receipt against its artifact name and
+the current workflow provenance, and selects each shard's newest available attempt.
+An older successful attempt of the **same run and same SHA** is allowed so GitHub's
+“rerun failed jobs” need not rerun successful browser shards. A newer failure cannot
+fall back to an older success; duplicate attempts, future attempts, mixed heads,
+mixed runs and missing shards fail closed. A new head/run cannot reuse old receipts.
+
+Storybook builds once per shard rather than introducing a third, serialized build job
+and transferring the full static asset tree. In [the #2901 baseline web job](https://github.com/compoundingtech/smalltalk/actions/runs/38651083493/job/116150585943),
+Storybook took 9.878 seconds (0.165 runner-minutes); runner initialization through the
+frozen install took 142.457 seconds (2.374 runner-minutes). Duplicating the small build
+is cheaper than another similarly prepared build job, even before artifact transfer.
+These are baseline observations, not promises about cold runners. The existing timed
+`UI kit Storybook` lane and receipt `storybookBuildSeconds` measure the new PR's actual
+cost: extra build runner-minutes are the sum of nonzero-shard build seconds / 60;
+play runner-minutes are the sum of all shards' `playMinutes`.
+Browser/build measurement is deliberately CI-only.
+
 Run SDK tests with their own `vitest.config.ts`, not the parent app's narrower test patterns.
 The rejected-mission diagnostic proof checks its fixture against the generated decoder:
 negative step attempts are rejected, while person assignees are valid actor references.

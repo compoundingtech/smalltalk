@@ -287,7 +287,8 @@ assert "fractalCssAssets()" in (root / "apps/fractal-web/vite.config.ts").read_t
 print("passed: the CSS asset guard proves its negatives before guarding the app production build")
 
 # Exercise the actual conditional lane wiring without launching browsers or installing dependencies.
-kit_lanes = lanes[lanes.index('case "${KIT_INPUTS:-true}" in'):]
+kit_lanes = lanes[lanes.index('case "${KIT_INPUTS:-true}" in'):lanes.index('\nkit_status=$?')]
+kit_lanes = kit_lanes.removesuffix('\n)')
 for required in (False, True):
     with tempfile.TemporaryDirectory() as scratch:
         summary = Path(scratch, "summary")
@@ -300,3 +301,125 @@ for required in (False, True):
         if not required:
             assert "skipped: no kit inputs changed (base..head)" in summary.read_text()
         print(f"passed: kit lanes {'run' if required else 'skip explicitly'}")
+
+# Run the real shell control flow with only lane commands replaced. In particular,
+# never call a strict suite function in an `if`/`||` that disables Bash errexit.
+fake_lane = r'''lane() {
+  printf '%s\n' "$1"
+  case "$1" in
+    "App unit tests") if [ "${FAIL_APP:-0}" -ne 0 ]; then return "$FAIL_APP"; fi ;;
+    "UI kit Storybook") if [ "${FAIL_BUILD:-0}" -ne 0 ]; then return "$FAIL_BUILD"; fi ;;
+    "UI kit play index contracts") if [ "${FAIL_INDEX:-0}" -ne 0 ]; then return "$FAIL_INDEX"; fi ;;
+    "UI kit strict plays"*) if [ "${FAIL_KIT:-0}" -ne 0 ]; then return "$FAIL_KIT"; fi ;;
+  esac
+}
+'''
+control_flow = lanes[:lanes.index("lane() {")] + fake_lane + lanes[lanes.index("toolchain() {"):]
+for shard, app, kit, build, index, expected in (
+    (0, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0),
+    (0, 7, 0, 0, 0, 7), (0, 0, 9, 0, 0, 9),
+    (0, 7, 9, 0, 0, 7), (0, 0, 0, 11, 0, 11),
+    (0, 0, 0, 0, 13, 13),
+):
+    with tempfile.TemporaryDirectory() as scratch:
+        result = subprocess.run(["bash", "-c", control_flow, str(root / "scripts/ci-fractal-web")],
+                                capture_output=True, text=True, env={**os.environ,
+                                    "GITHUB_STEP_SUMMARY": str(Path(scratch, "summary")),
+                                    "KIT_INPUTS": "true", "KIT_SHARD_INDEX": str(shard),
+                                    "FAIL_APP": str(app), "FAIL_KIT": str(kit),
+                                    "FAIL_BUILD": str(build), "FAIL_INDEX": str(index)})
+        assert result.returncode == expected, (expected, result)
+        assert ("App unit tests" in result.stdout) == (shard == 0), result.stdout
+        assert ("UI kit context isolation controls" in result.stdout) == (shard == 0 and not index), result.stdout
+        assert ("UI kit strict plays" in result.stdout) == (not build and not index), result.stdout
+print("passed: app/static lanes and controls run once; suite failures propagate independently")
+
+# Exercise the production hash/receipt aggregator without a browser.
+subprocess.run(["node", "--input-type=module", "-"], cwd=root, check=True, input=r'''
+import assert from 'node:assert/strict'
+import { shardNumber, shardStories, aggregateShards as aggregate, shardArtifactName } from './packages/fractal-ui/scripts/kit-play-shards.mjs'
+import { storyIdsFromIndex } from './packages/fractal-ui/scripts/kit-play-index.mjs'
+const provenance = { runId: '1234', runAttempt: 2, headSha: 'a'.repeat(40) }
+const aggregateShards = (receipts, count) => aggregate(receipts, count, provenance)
+const ids = Array.from({ length: 313 }, (_, i) => `story-${i}`).sort()
+assert.equal(shardNumber('story-0', 2), 1)
+for (const count of [1, 2, 3]) {
+  const shards = Array.from({ length: count }, (_, i) => shardStories(ids, i, count))
+  assert.deepEqual(shards.flat().sort(), ids)
+  for (const id of ids) {
+    assert.equal(shardNumber(id, count), shardNumber(id, count))
+    assert.equal(shards[shardNumber(id, count)].includes(id), true)
+  }
+  assert.deepEqual(shardStories([...ids].reverse(), 0, count).sort(), shards[0])
+  assert.deepEqual(shardStories([...ids, 'new-story'], 0, count).filter(id => id !== 'new-story'), shards[0])
+  const receipts = shards.map((selected, shardIndex) => ({
+    ...provenance, pass: true, fullIds: ids, shardIndex, shardCount: count,
+    rows: selected.flatMap(id => ['dark', 'light'].flatMap(scheme => [440, 1440].map(width => ({ id, scheme, width, pass: true })))),
+  }))
+  assert.equal(aggregateShards(receipts, count).cases, 1252)
+  assert.throws(() => aggregateShards(receipts.slice(1), count))
+  const invalid = change => { const copy = structuredClone(receipts); change(copy); assert.throws(() => aggregateShards(copy, count)) }
+  invalid(copy => { copy[0].rows.pop() })
+  invalid(copy => { copy[0].rows[0].pass = false })
+  invalid(copy => { copy[0].pass = false })
+  invalid(copy => { copy[0].rows[0] = copy[0].rows[1] })
+  invalid(copy => { copy[0].rows = [] })
+  invalid(copy => { copy[0].shardIndex = count })
+  invalid(copy => { copy[0].headSha = 'b'.repeat(40) })
+  invalid(copy => { delete copy[0].headSha })
+  invalid(copy => { copy[0].runId = '9999' })
+  invalid(copy => { copy[0].runAttempt = 3 })
+  invalid(copy => { delete copy[0].runAttempt })
+  // Rerun-failed-jobs: retain an older successful shard of the same run/head.
+  const mixed = structuredClone(receipts)
+  mixed[0].runAttempt = 1
+  assert.equal(aggregateShards(mixed, count).pass, true)
+  assert.throws(() => aggregateShards(mixed.slice(1), count))
+  const newer = { ...receipts[0], runAttempt: 2, pass: false }
+  assert.throws(() => aggregateShards([...mixed, newer], count))
+  assert.throws(() => aggregateShards([newer, ...mixed], count))
+  // A successful rerun supersedes an older failure, independent of listing order.
+  const olderFailed = { ...receipts[0], runAttempt: 1, pass: false }
+  assert.equal(aggregateShards([...receipts, olderFailed], count).pass, true)
+  assert.equal(aggregateShards([olderFailed, ...receipts], count).pass, true)
+  assert.equal(shardArtifactName(receipts[0]), `kit-play-1234-${provenance.headSha}-shard-0-attempt-2`)
+  if (count > 1) {
+    invalid(copy => { copy[1] = copy[0] })
+    invalid(copy => { copy[1].fullIds = ids.slice(1) })
+  }
+}
+// The selected-set inventory, not all stories, defines a critical run's union.
+const index = { v: 5, entries: Object.fromEntries(ids.map((id, i) => [id, {
+  id, type: 'story', importPath: './fixture.stories.ts', tags: i < 94 ? ['critical'] : [],
+}])) }
+const criticalIds = storyIdsFromIndex(index, { tag: 'critical' }).sort()
+assert.equal(criticalIds.length, 94)
+const criticalReceipts = [0, 1].map(shardIndex => ({
+  ...provenance, pass: true, set: 'critical', a11y: 'off', maxSeconds: 420,
+  fullIds: criticalIds, shardIndex, shardCount: 2,
+  rows: shardStories(criticalIds, shardIndex, 2).flatMap(id =>
+    ['dark', 'light'].flatMap(scheme => [440, 1440].map(width => ({ id, scheme, width, pass: true })))),
+}))
+assert.deepEqual(aggregateShards(criticalReceipts, 2), { stories: 94, cases: 376, shards: 2, pass: true })
+const missingCriticalCase = structuredClone(criticalReceipts)
+missingCriticalCase[0].rows.pop()
+assert.throws(() => aggregateShards(missingCriticalCase, 2))
+const wrongCriticalIndex = structuredClone(criticalReceipts)
+wrongCriticalIndex[1].fullIds = ids
+assert.throws(() => aggregateShards(wrongCriticalIndex, 2))
+assert.throws(() => shardStories(['story-0', 'story-0'], 0, 2))
+assert.throws(() => shardStories(['story-0', 'story-2'], 0, 2))
+assert.deepEqual(shardStories(['story-0'], 0, 2), [])
+for (const count of [0, -1, NaN, 1.5]) assert.throws(() => shardStories(ids, 0, count))
+console.log('passed: stable hashes, exact union, configurable count, missing/empty/failed/duplicate shards')
+console.log('passed: workflow provenance, same-head older attempts, newest-attempt precedence')
+''', text=True)
+assert "fail-fast: false" in execution
+assert "KIT_SHARD_INDEX: ${{ matrix.shard }}" in execution
+assert "KIT_SHARD_COUNT:" in execution
+assert "kit-play-${{ github.run_id }}-${{ github.sha }}-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}" in execution
+assert "kit-play-${{ github.run_id }}-${{ github.sha }}-shard-*-attempt-*" in gate_job
+assert "actions/upload-artifact@v4" in execution
+assert "actions/download-artifact@v4" in gate_job
+assert "kit-play-shards.mjs" in gate_job
+print("passed: matrix shards preserve receipts and semantic gate validates complete coverage")
