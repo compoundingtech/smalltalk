@@ -38,7 +38,7 @@
     },
     {
       "name": "config-and-build",
-      "globs": ["**/Cargo.toml", "Cargo.lock", ".cargo/**", "flake.nix", "flake.lock", "nix/**", ".config/nextest.toml", ".github/**", "scripts/ci-*", "crates/st3/build.rs", "crates/st3-daemon/src/config.rs"],
+      "globs": ["**/Cargo.toml", "Cargo.lock", ".cargo/**", "flake.nix", "flake.lock", "nix/**", ".config/nextest.toml", ".github/**", "scripts/ci-*", "crates/st3/build.rs", "crates/st3-kernel/src/config.rs"],
       "forces": ["every required check in full"]
     },
     {

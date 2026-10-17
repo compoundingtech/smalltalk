@@ -22,7 +22,7 @@ pub mod changes;
 pub(crate) mod checkout;
 pub mod claude_channel;
 pub mod client;
-pub mod config;
+pub use st3_kernel::config;
 pub use st3_kernel::conversation_search;
 pub mod creation;
 pub mod repositories;
