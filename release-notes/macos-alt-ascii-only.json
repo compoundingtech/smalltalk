@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "On macOS an Alt-modified key reaches a stui terminal tab's child with an Escape prefix only when it is a single ASCII character; an Option-composed character stays as text",
+  "replay": {
+    "status": "none",
+    "detail": "No replay; no stored data or projection changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and fleet coordination are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "macOS only, stui terminal tabs: narrows the Escape prefix added for Alt by the previous change so a composed character such as an a with a ring that arrives with Alt set is delivered as the encoder wrote it. Linux is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No extra interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to configure."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing is persisted; swapping to the previous binary needs no step."
+  }
+}

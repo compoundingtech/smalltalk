@@ -1120,12 +1120,13 @@ fn encode_key(actor: &TerminalActor, key: &pty_terminal::KeyEvent, keypad: bool)
     let mut bytes = actor.encode_key(key);
     // The key encoder follows Ghostty's macOS rule that Option composes characters, and
     // pty-terminal does not tell it otherwise. The outer terminal has already decided what
-    // Alt meant by the time stui sees it, so an Alt press that came out as plain text still
-    // carries the Escape prefix a legacy child expects.
+    // Alt meant by the time stui sees it, so an Alt press that came out as one plain ASCII
+    // character still carries the Escape prefix a legacy child expects. A composed character
+    // (several bytes, such as Option+a as a with a ring) and any escape sequence stay as encoded.
     if cfg!(target_os = "macos")
         && key.mods.contains(Mods::ALT)
         && key.action != KeyAction::Release
-        && bytes.first().is_some_and(|byte| *byte != 0x1b)
+        && matches!(bytes.as_slice(), [byte] if byte.is_ascii_graphic())
     {
         bytes.insert(0, 0x1b);
     }
@@ -1203,6 +1204,8 @@ mod tests {
         assert_eq!(encode_key(&term, &alt_a, false), b"\x1ba");
         let plain_a = protocol_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
         assert_eq!(encode_key(&term, &plain_a, false), b"a");
+        let composed = protocol_key(key(KeyCode::Char('\u{e5}'), KeyModifiers::ALT)).unwrap();
+        assert!(!encode_key(&term, &composed, false).starts_with(b"\x1b"));
     }
 
     #[test]
