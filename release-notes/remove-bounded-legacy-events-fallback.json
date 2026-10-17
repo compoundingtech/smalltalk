@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Remove the CLI's unreachable fallback from paged events to legacy event history.",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No database or wire schema changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "Released daemons advertising bounded_legacy_events also provide the page route. Daemons without the capability remain refused when that route is absent; a capability-advertising daemon with a missing route now reports the normal unexpected-response error. The daemon API and health capability are unchanged."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover."}
+}

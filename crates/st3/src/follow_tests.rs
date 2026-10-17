@@ -184,6 +184,40 @@ async fn trace_follow_advances_empty_filtered_pages_and_stops_on_resync() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn trace_follow_reports_a_missing_page_route_without_reading_legacy_history() {
+    let output = scripted_cli(
+        &[
+            "--json",
+            "trace",
+            "show",
+            SUBJECT,
+            "--after-index",
+            "10",
+            "--follow",
+        ],
+        vec![
+            (
+                "/v1/claims?limit=100&order=asc&subject=host%2Ffollow-fixture&after_index=10"
+                    .into(),
+                Reply::Value(json!({"claims": [], "next_cursor": null})),
+            ),
+            (events_path(10), Reply::MissingRoute),
+            (
+                "/v1/health".into(),
+                Reply::Value(json!({"features":{"bounded_legacy_events":1}})),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        output.result.unwrap_err().to_string(),
+        "st API returned 404: "
+    );
+    assert_eq!(output.requests.len(), 3);
+    assert!(output.stdout.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn trace_follow_refuses_an_endpoint_version_transition_without_entering_legacy_feed() {
     let output = scripted_cli(
         &[
@@ -202,11 +236,12 @@ async fn trace_follow_refuses_an_endpoint_version_transition_without_entering_le
                 Reply::Value(json!({"claims": [], "next_cursor": null})),
             ),
             (events_path(10), Reply::MissingRoute),
+            ("/v1/health".into(), Reply::Value(json!({"features":{}}))),
         ],
     )
     .await;
     assert!(output.result.is_err());
-    assert_eq!(output.requests.len(), 2);
+    assert_eq!(output.requests.len(), 3);
     assert!(output.stdout.is_empty());
     let message = output.result.unwrap_err().to_string();
     assert!(message.contains("2026-10-16 13:50 UTC"));
@@ -222,9 +257,12 @@ async fn trace_follow_refuses_an_endpoint_version_transition_without_entering_le
 }
 
 #[tokio::test(start_paused = true)]
-async fn non_trace_missing_page_requires_upgrade_without_reading_health_or_history() {
+async fn non_trace_missing_page_requires_upgrade_without_reading_history() {
     let path = events_path(10);
-    let client = Client::scripted_follow_test(vec![(path.clone(), Reply::MissingRoute)]);
+    let client = Client::scripted_follow_test(vec![
+        (path.clone(), Reply::MissingRoute),
+        ("/v1/health".into(), Reply::Value(json!({"features":{}}))),
+    ]);
     let error = LocalEventFeed::default()
         .read(&client, path.split_once('?').unwrap().1)
         .await
@@ -233,7 +271,7 @@ async fn non_trace_missing_page_requires_upgrade_without_reading_health_or_histo
     assert!(error.to_string().contains("2026-10-16 13:50 UTC"));
     assert!(error.to_string().contains("--edge --no-run"));
     assert!(error.to_string().contains("st service restart"));
-    assert_eq!(client.follow_test_result().0.len(), 1);
+    assert_eq!(client.follow_test_result().0.len(), 2);
 }
 
 #[tokio::test(start_paused = true)]
