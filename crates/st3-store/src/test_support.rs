@@ -8,11 +8,9 @@ use std::sync::OnceLock;
 #[cfg(feature = "test-support")]
 pub mod events;
 
-static LOGIN_SHELL: OnceLock<PathBuf> = OnceLock::new();
-
-pub fn login_shell() -> Option<&'static Path> {
-    LOGIN_SHELL.get().map(PathBuf::as_path)
-}
+pub use crate::startup::login_shell;
+#[cfg(feature = "test-support")]
+pub use crate::startup::pause_startup_replay;
 
 /// A temporary directory whose path is already canonical. macOS puts temporary directories
 /// below the `/var` and `/tmp` symlinks, and st3 records the canonical path it resolves, so a
@@ -61,9 +59,7 @@ pub fn initialize_fixture() -> tempfile::TempDir {
     .expect("write fixture shell");
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700))
         .expect("executable fixture shell");
-    LOGIN_SHELL
-        .set(shell)
-        .expect("initialize fixture shell once");
+    crate::startup::set_login_shell(shell);
     root
 }
 
@@ -221,28 +217,6 @@ pub fn git() -> Command {
             "commit.gpgsign=false",
         ]);
     command
-}
-
-/// An isolated startup test can inspect the real daemon while its replay is in flight.
-#[cfg(feature = "test-support")]
-pub fn pause_startup_replay() {
-    if login_shell().is_none() {
-        return;
-    }
-    let Some(directory) = std::env::var_os("ST3_TEST_STARTUP_REPLAY_BARRIER") else {
-        return;
-    };
-    let directory = PathBuf::from(directory);
-    std::fs::write(directory.join("entered"), b"replay in progress")
-        .expect("publish replay barrier");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !directory.join("release").exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "startup test did not release replay"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
 }
 
 /// Fixture-only barrier AFTER the actual owned provider has exited and its wrapper returned.

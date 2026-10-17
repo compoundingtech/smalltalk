@@ -11,6 +11,7 @@ mod ci_test_paths;
 
 pub use st3_kernel::*;
 pub use st3_telemetry::*;
+pub use st3_secrets::*;
 pub use smallclaims::{performance, profile};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -25,7 +26,6 @@ pub mod remote_terminal;
 pub mod render;
 pub mod blobs;
 pub mod changes;
-pub mod client;
 pub mod client_values;
 pub mod declaration_syntax;
 pub mod environment;
@@ -44,13 +44,10 @@ pub mod provenance;
 pub mod references;
 pub mod resource;
 pub mod rollout;
-pub mod sekrets;
 pub mod sekrets_daemon;
 pub mod silent;
-pub mod startup;
 pub mod store;
 pub mod suspension;
-pub mod tile_registry;
 
 pub use graph::{parse_intent, validate_mission_runtimes};
 pub use model::{NormalizedIntent, St3Error};

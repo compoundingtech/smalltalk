@@ -84,6 +84,44 @@ pub struct Fence {
     pub token: String,
 }
 
+impl Fence {
+    pub fn new(subject: &str, incarnation: &str, component: &str) -> Self {
+        let mut token = [0_u8; 16];
+        getrandom::fill(&mut token).expect("creating a mailbox binding token");
+        Self {
+            subject: subject.into(),
+            incarnation: incarnation.into(),
+            component: component.into(),
+            epoch: 0,
+            token: hex::encode(token),
+        }
+    }
+    /// Initial allocation is idempotent under this random request token. Reexec and reconnect
+    /// carry the returned epoch; neither the client's clock nor a lost response changes ownership.
+    pub async fn bind(&mut self, client: &Client) -> Result<()> {
+        if self.epoch != 0 {
+            return Ok(());
+        }
+        let mut retry = DriverRetry::default();
+        loop {
+            match client.post("/v1/mailbox/bind", &*self).await {
+                Ok(bound) => {
+                    *self = bound;
+                    return Ok(());
+                }
+                Err(error)
+                    if api_error_code(&error).is_some_and(|code| {
+                        !matches!(code, "internal" | "database-busy" | "database-locked" | "mailbox-session-starting" | "mailbox-authority-unavailable")
+                    }) =>
+                {
+                    return Err(error);
+                }
+                Err(error) => tokio::time::sleep(retry.failed(&error)).await,
+            }
+        }
+    }
+}
+
 /// The daemon route a replication worker hands a read to when it must forward it.
 pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 const FOLLOW_OUTAGE_LIMIT: Duration = Duration::from_secs(5 * 60);

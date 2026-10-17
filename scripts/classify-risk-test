@@ -92,7 +92,7 @@ class Classify(unittest.TestCase):
         "crates/smallclaims/src/**/migrat*",
         "crates/smallclaims/src/**/replay*",
         "crates/st3-api/src/api/client_web*",
-        "crates/st3-store/src/sekrets.rs",
+        "crates/st3-secrets/src/sekrets.rs",
     }
 
     def test_every_glob_matches_a_tracked_file_or_is_listed(self):

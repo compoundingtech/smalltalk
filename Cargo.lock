@@ -5151,6 +5151,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "st3-secrets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hex",
+ "libc",
+ "pty-client",
+ "pty-core",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "smallclaims",
+ "st-drivers",
+ "st3-client",
+ "st3-kernel",
+ "st3-secrets",
+ "st3-telemetry",
+ "st3-terminal-direct",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.27.0",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "st3-store"
 version = "0.1.0"
 dependencies = [
@@ -5184,6 +5219,7 @@ dependencies = [
  "st3-client",
  "st3-kernel",
  "st3-schema",
+ "st3-secrets",
  "st3-store",
  "st3-telemetry",
  "st3-terminal-direct",
