@@ -9,7 +9,8 @@ import type { Agent } from '../data/source.ts'
 
 // An agent's actions, as stui's agent actions menu offers them (crates/stui/src/ui/screens.rs,
 // `agent_actions`): what can be done to it now, in the same order and words. What changes the
-// seat asks to confirm first; starting or resuming does not.
+// seat asks to confirm first; starting or resuming does not. Interrupt only stops the current turn,
+// as the composer's Stop and Esc do, so it does not ask either.
 
 export type AgentActionKey = 'interrupt' | AgentControl | 'copy'
 
@@ -28,7 +29,7 @@ export const agentActions = (agent: { readonly state?: string; readonly activity
   const running = agent.state !== undefined && RUNNING.has(agent.state)
   return [
     ...(running && agent.activity === 'working'
-      ? [{ key: 'interrupt', label: 'Interrupt', what: 'stop its current turn, as Esc does in its own screen', confirm: true } as const]
+      ? [{ key: 'interrupt', label: 'Interrupt', what: 'stop its current turn, as Esc does in its own screen', confirm: false } as const]
       : []),
     ...(running
       ? ([

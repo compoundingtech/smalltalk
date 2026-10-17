@@ -31,7 +31,7 @@ describe('agentActions', () => {
     expect(keys('stopped')).toEqual(['start', 'resume', 'copy'])
     expect(keys('suspended')).toEqual(['start', 'resume', 'copy'])
     expect(agentActions({ state: 'running', activity: 'working' }).filter((row) => row.confirm).map((row) => row.key))
-      .toEqual(['interrupt', 'restart', 'suspend', 'retire'])
+      .toEqual(['restart', 'suspend', 'retire'])
   })
 })
 
