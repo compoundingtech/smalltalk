@@ -563,7 +563,9 @@ export const fractalWebJobs = {
     name: 'fractal-web-execution',
     needs: ['fractal-web-changes', 'genie-freshness'],
     if: "${{ !cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' && needs.genie-freshness.result == 'success' }}",
-    'runs-on': 'ubuntu-latest',
+    // Strict kit plays are CPU-bound: 4 vCPU ubuntu-latest took 9-15 min, 8 vCPU 3 min 45 s
+    // (doc/fleet/factory/test-speed/web-setup-audit). Same shape and queue policy as the Linux stages.
+    'runs-on': [...linuxStageRunner],
     'timeout-minutes': 25,
     permissions: { contents: 'read' },
     defaults: { run: { shell: 'bash' } },

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Run fractal-web-execution on the 8 vCPU Namespace stage shape instead of 4 vCPU ubuntu-latest; the CPU-bound strict kit plays drop from 9-15 minutes to under 4.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "No application or API change. CI only: the same lanes, kit play matrix, isolation, assertions and 25-minute timeout run on a different runner class. The job joins the Linux stages' Namespace queue and priority policy." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Revert to runs-on: ubuntu-latest." }
+}
