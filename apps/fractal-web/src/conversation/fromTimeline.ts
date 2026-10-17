@@ -7,6 +7,7 @@ import { DateTime, Option, Schema } from 'effect'
 
 import type { ConversationItem, ToolCallItem, ToolResult } from './model.ts'
 import { contentEvent, proseItem, withoutShownDeliveries } from './semantics.ts'
+import { q101OmpEnvelopeStopgap } from './q101OmpEnvelopeStopgap.ts'
 
 /**
  * Fixture-only D08 proposal, not part of the st3 wire contract.
@@ -160,6 +161,10 @@ const itemOf = ({
       if (internal !== undefined) return internal
       const reasoning = parseNativeReasoning(entry)
       if (reasoning !== undefined) return reasoning
+      const notice = entry.body.media_type === 'text/plain' && entry.role === 'system' && entry.final
+        ? q101OmpEnvelopeStopgap({ id: entry.id, role: entry.role, text: entry.body.text ?? '', at: entryTimestamp(entry) })
+        : undefined
+      if (notice !== undefined) return notice
       const event = contentEvent({
         id: entry.id,
         text: entry.body.text ?? '',
