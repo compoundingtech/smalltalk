@@ -877,6 +877,15 @@ agent "example/bridge" {
         let bare = format!("/v1/client/blobs/{hash}");
         let (status, _, _) = call(&app, "GET", &bare, "person/blair", None, vec![]).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "a bystander cannot read it unnamed");
+        // A message reads only what it carries: naming it beside a sha256 it does not carry is
+        // refused, though its reader may read the message and the bytes are held here.
+        let other = png(2048, 9);
+        assert_eq!(upload("image/png", other.clone()).await.0, StatusCode::OK);
+        let other_hash = hex::encode(Sha256::digest(&other));
+        let forged = format!("/v1/client/blobs/{other_hash}?message={}", sent.subject);
+        let (status, _, body) = call(&app, "GET", &forged, "person/blair", None, vec![]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{}", json_of(&body));
+        assert_eq!(json_of(&body)["code"], "forbidden");
         let (status, _, bytes) = call(&app, "GET", &bare, "person/alex", None, vec![]).await;
         assert_eq!(
             (status, bytes.len()),
@@ -908,8 +917,9 @@ agent "example/bridge" {
         }
         assert_eq!(collected, image);
 
-        // After the retention window the bytes are gone and the message is not.
-        assert_eq!(BlobDir::under(root.path()).sweep(Duration::ZERO), 1);
+        // After the retention window the bytes are gone (the image and the other upload) and the
+        // message is not.
+        assert_eq!(BlobDir::under(root.path()).sweep(Duration::ZERO), 2);
         let (status, _, body) = call(&app, "GET", &path, "agent/robin", None, vec![]).await;
         assert_eq!(status, StatusCode::GONE, "{}", json_of(&body));
         assert_eq!(json_of(&body)["code"], "blob-expired");

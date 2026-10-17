@@ -1,4 +1,4 @@
-import { Component, createRef, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ActionSheetIOS, FlatList, Image, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, TextInput, View, type ViewToken } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import * as Clipboard from 'expo-clipboard';
@@ -19,7 +19,9 @@ import { wholeText, wholeTextFailure } from '../messageBody';
 import { draftSize, messageLimit, restoreDraft, sendReason } from '../composer';
 import { addImages, fromDataUri, MAX_IMAGES, megabytes, picked, type Picked } from '../images';
 import { rememberBounded } from '../boundedCache';
-import { ConversationImageViewport, VisibleConversationImage, type VisibleImageState } from '../visibleConversationImages';
+import { ConversationImageViewport } from '../visibleConversationImages';
+import { ImageBox, MailImageView, useWindowViewport } from '../imageBox';
+import { IMAGES } from '../imageView';
 import { dictationAvailable, startDictation } from '../modules/st-dictation';
 import type { RootScreen } from '../navigation';
 import { openSubagentConversation } from '../conversationNavigation';
@@ -528,49 +530,20 @@ const EntryView = memo(function EntryView(props: { entry: ConversationEntry; con
   </View>;
 });
 
-type NativeImage = { uri: string; size: number };
 type ConversationImageProps = { conversationId: string; reference: ConversationContentRef; viewport: ConversationImageViewport; client: St3Client | null };
 
-// Class lifecycle owns native measurement and invalidates late responses on unmount.
-// All mounted images share the viewport queue; FlatList overscan never authorizes reads.
-class VisibleConversationImageView extends Component<ConversationImageProps, VisibleImageState<NativeImage>> {
-  state: VisibleImageState<NativeImage> = { kind: 'closed' };
-  private box = createRef<View>();
-  private unregister?: () => void;
-  private image = new VisibleConversationImage<NativeImage>(this.props.viewport, async current => {
-    const { client, conversationId, reference } = this.props;
+// A transcript's image, read in chunks from st (and from the owner of the message through it) only
+// while it is on screen; st names its real type and size before the bytes arrive.
+function VisibleConversationImageView({ conversationId, reference, viewport, client }: ConversationImageProps) {
+  const load = (current: () => boolean) => IMAGES.read(`${conversationId}:${reference.ref}`, async () => {
     if (!client) throw new Error('Connect to the server and try again.');
     const content = await loadConversationContent(reference, async (ref, offset) => {
       if (!current()) throw new Error('Image is no longer visible.');
       return (await client.conversationContentChunk(conversationId, ref, offset)).value;
     });
-    return { uri: contentImageUri(content), size: content.bytes.length };
-  }, state => this.setState(state));
-
-  componentDidMount() {
-    this.unregister = this.props.viewport.register({
-      measure: done => this.box.current?.measureInWindow((x, y, width, height) => done({ x, y, width, height })),
-      visible: shown => this.image.setVisible(shown),
-    });
-  }
-
-  componentWillUnmount() { this.image.dispose(); this.unregister?.(); }
-
-  render() {
-    const state = this.state;
-    return <View style={styles.entry}>
-      <View ref={this.box} collapsable={false} style={styles.mailImage} onLayout={() => this.props.viewport.refresh()}>
-        {state.kind === 'image'
-          ? <Image accessibilityLabel="Fetched conversation image" source={{ uri: state.image.uri, cache: 'reload' }} style={StyleSheet.absoluteFill} resizeMode="contain" onError={() => this.image.fail('The image could not be displayed. Try again.')} />
-          : <T dim style={{ padding: 6 }}>{state.kind === 'failed' ? 'Image unavailable' : state.kind === 'loading' ? 'Loading image…' : 'Image'}</T>}
-      </View>
-      {state.kind === 'image' ? <T dim>{megabytes(state.image.size)}</T> : null}
-      {state.kind === 'failed' ? <View>
-        <T color={theme.red}>Could not load image: {state.message}</T>
-        <Pressable accessibilityRole="button" onPress={() => this.image.retry()}><T color={theme.accent}>Retry loading image</T></Pressable>
-      </View> : null}
-    </View>;
-  }
+    return contentImageUri(content);
+  });
+  return <View style={styles.entry}><ImageBox facts={{ mediaType: reference.media_type, size: reference.size }} viewport={viewport} load={load} /></View>;
 }
 
 function ConversationImageView(props: Omit<ConversationImageProps, 'client'>) {
@@ -604,17 +577,20 @@ function FetchedContent({ conversationId, reference, entry, onOpenSession }: { c
   </View>;
 }
 
-const EntryBodyView = memo(function EntryBodyView({ entry, open, onToggle, brief = false, onOpenSession }: { entry: ConversationEntry; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void }) {
+const EntryBodyView = memo(function EntryBodyView({ entry, open, onToggle, brief = false, onOpenSession, imageViewport }: { entry: ConversationEntry; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void; imageViewport?: ConversationImageViewport }) {
   const body = entry.body;
   switch (body.kind) {
     case 'user':
+      // An image alone in the person's turn: the image view below is the turn.
+      if (!body.text) return <T color={c(RULES.user.time)} style={{ alignSelf: 'flex-end', paddingHorizontal: 12, paddingTop: 6 }}>{entry.at}</T>;
       return <View style={[styles.user, { backgroundColor: c(RULES.user.fill) }]}>
         <T color={c(RULES.user.time)} style={{ alignSelf: 'flex-end' }}>{entry.at}</T>
         <T color={c(RULES.user.text)}>{body.text}</T>
       </View>;
     case 'assistant':
+      if (!body.text) return null;
       return <View style={styles.entry}><Markdown selectable={false} text={body.text} color={c(RULES.assistant)} /></View>;
-    case 'mail': return <MailView entry={entry} body={body} open={open} onToggle={onToggle} brief={brief} />;
+    case 'mail': return <MailView entry={entry} body={body} open={open} onToggle={onToggle} brief={brief} imageViewport={imageViewport} />;
     case 'event': {
       const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : c(RULES.event.label);
       return <View style={[styles.entry, { flexDirection: 'row' }]}>
@@ -687,7 +663,9 @@ type Mail = Extract<ConversationEntry['body'], { kind: 'mail' }>;
 // Mail the person is part of leads; mail between others stays back and folds to a few rows,
 // like a tool call, until tapped. Mail to the person is filled like their own messages, and
 // their own says how far it got: ✓ st has it, ✓✓ the agent has it.
-const MailView = memo(function MailView({ entry, body, open, onToggle, brief = false }: { entry: ConversationEntry; body: Mail; open: boolean; onToggle: (id: string) => void; brief?: boolean }) {
+const MailView = memo(function MailView({ entry, body, open, onToggle, brief = false, imageViewport }: { entry: ConversationEntry; body: Mail; open: boolean; onToggle: (id: string) => void; brief?: boolean; imageViewport?: ConversationImageViewport }) {
+  // Outside a conversation's list (a fetched turn, a card), the window is the viewport.
+  const windowViewport = useWindowViewport();
   const rule = RULES.mail;
   const toYou = body.to === 'you';
   const look = folds(body) ? rule.between_others : rule.involving_you;
@@ -718,7 +696,7 @@ const MailView = memo(function MailView({ entry, body, open, onToggle, brief = f
       <T color={c(RULES.tool.collapse.color)}>{whole.loading ? '  loading the whole message…' : `  show the whole message · ${kib(body.whole.bytes)}`}</T>
     </Pressable> : null}
     {whole.note ? <T color={theme.waiting} style={{ fontSize: 12 }}>{whole.note}</T> : null}
-    {body.images ? <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>{body.images.map(image => <MailImageView key={image.sha256} image={image} />)}</View> : null}
+    {body.images ? <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>{body.images.map(image => <MailImageView key={image.sha256} image={image} viewport={imageViewport ?? windowViewport} />)}</View> : null}
     {long ? <T color={c(RULES.tool.collapse.color)}>{open ? `  ${RULES.tool.collapse.text}` : '  … more · tap to show'}</T> : null}
   </Pressable>;
 });
@@ -740,28 +718,10 @@ function useWholeText(whole: { message: string; bytes: number } | undefined) {
   return { ...state, load };
 }
 
-// An image a message carries, read from st when shown. Its box keeps one size while it loads,
-// so the conversation does not move under the reader.
-function MailImageView({ image }: { image: MailImage }) {
-  const { actions } = useStore();
-  const [uri, setUri] = useState<string | null>(null), [failed, setFailed] = useState('');
-  useEffect(() => {
-    let live = true;
-    actions.image(image).then(next => { if (live) setUri(next); }, error => { if (live) setFailed(error instanceof Error ? error.message : String(error)); });
-    return () => { live = false; };
-  }, [image.sha256]); // eslint-disable-line react-hooks/exhaustive-deps
-  const label = `${image.name ?? 'image'} · ${megabytes(image.size)}`;
-  return <View style={styles.mailImage} accessibilityLabel={label}>
-    {uri ? <Image source={{ uri }} style={StyleSheet.absoluteFill} resizeMode="contain" />
-      : <T dim style={{ fontSize: 11, padding: 6 }}>{failed ? `🖼 ${label}\n${failed}` : `🖼 ${label}…`}</T>}
-  </View>;
-}
-
 const styles = StyleSheet.create({
   tray: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 10, paddingTop: 8, backgroundColor: theme.mantle, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2 },
   thumb: { width: 56, height: 56, borderRadius: 6, backgroundColor: theme.surface0 },
   unthumb: { position: 'absolute', top: -6, right: -6, width: 20, height: 20, borderRadius: 10, backgroundColor: theme.surface1, alignItems: 'center', justifyContent: 'center' },
-  mailImage: { width: 200, height: 150, borderRadius: 6, overflow: 'hidden', backgroundColor: theme.surface0 },
   screen: { flex: 1, backgroundColor: theme.base },
   freshness: { paddingHorizontal: 12, paddingVertical: 3, backgroundColor: theme.base },
   strip: { paddingHorizontal: 12, paddingVertical: 6, borderBottomColor: theme.surface0, borderBottomWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.base },

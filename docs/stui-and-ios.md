@@ -71,4 +71,4 @@ On your daemon machine, make a separate challenge for the phone:
 st devices --as person/ada pair --full-control 'Garden iPhone'
 ```
 
-In the app, enter the reachable gateway URL, pairing ID, and code. Open **Agents**, select your worker, and send a message. [Build and run the iOS app](ios-app.md) has the Xcode prerequisites, simulator and Debug workflow, signing details, and pairing troubleshooting.
+In the app, enter the reachable gateway URL, pairing ID, and code. Open **Agents**, select your worker, and send a message. Images in a conversation and on an ask's card show as a box naming the image, its type and its size; each loads when it scrolls into view. Tap one to zoom (pinch, **Close**) or **Share** it to save it or open it in another app; see [what shows where](st3/attachments.md#what-shows-where). [Build and run the iOS app](ios-app.md) has the Xcode prerequisites, simulator and Debug workflow, signing details, and pairing troubleshooting.

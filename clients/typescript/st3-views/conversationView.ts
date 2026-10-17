@@ -203,6 +203,27 @@ function attribute(head: string, name: string): string | undefined {
 function unescapeXml(text: string): string {
   return text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
 }
+/**
+ * The images a delivery names, `<attachment path="…/<sha256>.png" media_type="image/png" bytes="…"
+ * name="…"/>`, as the message's own images: read from st by the message, never by the seat's path,
+ * which stays private. What is left is the delivery's text; an image past its retention
+ * (`unavailable="expired"`) says so in it. As stui reads them (st3-conversation-ui `delivered_images`).
+ */
+export function deliveredImages(block: string, message: string | undefined): { text: string; images: MailImage[] } {
+  const images: MailImage[] = [];
+  const text = block.replace(/<attachment\s[^>]*?\/>/g, element => {
+    const name = attribute(element, 'name'), mediaType = attribute(element, 'media_type') ?? '';
+    const leaf = (attribute(element, 'path') ?? '').split(/[\\/]/).pop()?.split('.')[0] ?? '';
+    if (/^[0-9a-f]{64}$/i.test(leaf) && mediaType.startsWith('image/') && message?.startsWith('message/')) {
+      const bytes = Number(attribute(element, 'bytes'));
+      images.push({ sha256: leaf, message, mediaType, ...(name ? { name } : {}), size: Number.isFinite(bytes) ? bytes : 0 });
+      return '';
+    }
+    const why = attribute(element, 'unavailable') === 'expired' ? 'expired' : mediaType || 'not available here';
+    return `[${name ?? 'attachment'} · ${why}]`;
+  });
+  return { text: text.trimEnd(), images };
+}
 function field(block: string, tag: string): string | undefined {
   return takeBlocks({ value: block }, tag)[0]?.trim();
 }
@@ -266,7 +287,8 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     const graph = attribute(head, 'graph');
     if (graph) enveloped.add(graph);
     if (graph && shown.has(graph)) { delivered.add(graph); return; }
-    bodies.push({ kind: 'mail', from: attribute(head, 'from') ?? 'someone', to: attribute(head, 'to') ?? '', subject: attribute(head, 'subject') ?? '', text: cleanMessageText(unescapeXml(block), filters).trim() });
+    const { text: said, images } = deliveredImages(block, graph);
+    bodies.push({ kind: 'mail', from: attribute(head, 'from') ?? 'someone', to: attribute(head, 'to') ?? '', subject: attribute(head, 'subject') ?? '', text: cleanMessageText(unescapeXml(said), filters).trim(), ...(images.length ? { images } : {}) });
   });
   const channelHeads = [...text.value.matchAll(/<channel\b[^>]*>/g)].map(match => match[0]);
   const senders = channelHeads.map(head => attribute(head, 'from') ?? 'someone');
@@ -281,8 +303,8 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     // Mail the stream does not show reads as that mail, never as the delivery's other lines
     // (Nathan, 2026-10-03: "delivered to the agent: The person reads replies in st…").
     if (envelope) {
-      const inner = takeBlocks({ value: block }, 'smalltalk-message')[0] ?? '';
-      bodies.push({ kind: 'mail', from: attribute(envelope, 'from') ?? senders[index] ?? 'someone', to: attribute(envelope, 'to') ?? '', subject: attribute(envelope, 'subject') ?? '', text: cleanMessageText(unescapeXml(inner), filters).trim() });
+      const { text: inner, images } = deliveredImages(takeBlocks({ value: block }, 'smalltalk-message')[0] ?? '', id);
+      bodies.push({ kind: 'mail', from: attribute(envelope, 'from') ?? senders[index] ?? 'someone', to: attribute(envelope, 'to') ?? '', subject: attribute(envelope, 'subject') ?? '', text: cleanMessageText(unescapeXml(inner), filters).trim(), ...(images.length ? { images } : {}) });
       return;
     }
     const subject = block.split('\n').map(line => line.trim()).find(line => line.startsWith('Subject:'))?.slice('Subject:'.length).trim() ?? shorten(cleanMessageText(block, filters), 70);
@@ -809,7 +831,12 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
     mail = undefined;
     switch (entry.type) {
       case 'content': {
-        const raw = contentText(entry.body) || (contentReferences(entry.body).length ? '[content available on demand]' : '');
+        // An image alone in a turn is its image view; the text st writes in its place
+        // (`[image · load from owner]`) is not the person's or the agent's words (as stui).
+        const imageOnly = Array.isArray(body.blocks) && body.blocks.some(block => record(block).kind === 'image')
+          && body.blocks.every(block => ['image', 'source_record'].includes(str(record(block).kind) ?? ''))
+          && ['', '[image]', '[image · load from owner]'].includes(contentText(entry.body).trim());
+        const raw = imageOnly ? '' : contentText(entry.body) || (contentReferences(entry.body).length ? '[content available on demand]' : '');
         const nativeBlocks = Array.isArray(body.blocks) && body.blocks.some(block => record(block).kind !== 'text');
         // Typed extension blocks (irc, job, status) replace the entry's text fallback, role
         // aside; `tool_start` belongs to its call and is never drawn alone.
@@ -819,7 +846,9 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
           extension.forEach((part, index) => push(entry, extension.length === 1 ? entry.id : `${entry.id}#${index}`, part));
           break;
         }
-        if ((entry.role === 'user' || entry.role === 'system') && (nativeBlocks || raw.startsWith('[unrecognized '))) {
+        if (imageOnly) {
+          push(entry, entry.id, entry.role === 'assistant' ? { kind: 'assistant', text: '' } : { kind: 'user', text: '' });
+        } else if ((entry.role === 'user' || entry.role === 'system') && (nativeBlocks || raw.startsWith('[unrecognized '))) {
           // A native entry's text is data #1574 exposed; it is shown as it arrived.
           const shown = nativeBlocks ? raw : cleanMessageText(raw, filters);
           push(entry, entry.id, entry.role === 'user' ? {kind:'user',text:shown} : {kind:'event',tone:'quiet',text:shown});

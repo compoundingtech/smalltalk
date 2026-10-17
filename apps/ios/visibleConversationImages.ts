@@ -54,7 +54,13 @@ export class ConversationImageViewport {
   }
 }
 
-export type VisibleImageState<TImage> = { kind: 'closed' } | { kind: 'loading' } | { kind: 'failed'; message: string } | { kind: 'image'; image: TImage };
+export type VisibleImageState<TImage> = { kind: 'closed' } | { kind: 'loading' } | { kind: 'failed'; message: string; code?: string } | { kind: 'image'; image: TImage };
+
+/** st's code for a failed read (`remote-unavailable`, `blob-expired`, …), when the error carries one. */
+export function errorCode(error: unknown): string | undefined {
+  const code = (error as { response?: { code?: unknown } } | null)?.response?.code;
+  return typeof code === 'string' ? code : undefined;
+}
 
 type PendingImageRead = { generation: number; phase: 'queued' | 'reading'; cancelQueued?: () => void };
 
@@ -64,6 +70,7 @@ type PendingImageRead = { generation: number; phase: 'queued' | 'reading'; cance
 export class VisibleConversationImage<TImage> {
   private state: VisibleImageState<TImage> = { kind: 'closed' };
   private visible = false;
+  private held = false;
   private generation = 0;
   private disposed = false;
   private pending?: PendingImageRead;
@@ -79,11 +86,21 @@ export class VisibleConversationImage<TImage> {
     this.visible = visible;
     if (!visible) {
       if (this.pending?.phase === 'queued') this.cancel();
-      if (this.state.kind === 'loading') this.publish({ kind: 'closed' });
+      // A shown image leaves memory with the screen: its bytes are read again (or taken from
+      // the bounded cache) when it comes back.
+      if (this.state.kind === 'loading' || (this.state.kind === 'image' && !this.held)) this.publish({ kind: 'closed' });
     } else if (this.state.kind === 'closed') {
       if (this.pending) this.publish({ kind: 'loading' });
       else this.enqueue();
     }
+  }
+
+  /** Keep a shown image while it is zoomed: the full-screen zoom covers its box, which may then
+   * measure as hidden. Letting go closes it if its box did leave the screen meanwhile. */
+  hold(held: boolean): void {
+    if (this.disposed) return;
+    this.held = held;
+    if (!held && !this.visible && this.state.kind === 'image') this.publish({ kind: 'closed' });
   }
 
   retry(): void { if (this.visible && this.state.kind === 'failed') this.enqueue(); }
@@ -123,7 +140,8 @@ export class VisibleConversationImage<TImage> {
     } catch (error) {
       // Owner failures remain explicit-retry failures even if the image went offscreen.
       if (!revoked && !this.disposed && this.generation === pending.generation) {
-        this.publish({ kind: 'failed', message: error instanceof Error ? error.message : String(error) });
+        const code = errorCode(error);
+        this.publish({ kind: 'failed', message: error instanceof Error ? error.message : String(error), ...(code ? { code } : {}) });
       }
     } finally {
       if (this.pending === pending) {

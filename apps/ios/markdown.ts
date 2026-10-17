@@ -49,6 +49,10 @@ export function inline(text: string): Run[] {
     } else if (rest.startsWith('`') && rest.indexOf('`', 1) > 0) {
       const end = rest.indexOf('`', 1);
       flush(); runs.push({ text: rest.slice(1, end), style: 'code' }); rest = rest.slice(end + 1);
+    } else if ((match = /^!\[([^\]]*)\]\(([^)]*)\)/.exec(rest))) {
+      // An image is a link that opens it, as in stui: one on the web is never fetched just to draw it.
+      flush(); runs.push({ text: `▣ ${match[1].trim() || 'image'}`, style: 'link', url: /^https?:\/\//.test(match[2]) ? match[2] : undefined, ...(filePath(match[2]) ? { path: filePath(match[2]) } : {}) });
+      plain += ' · image link'; rest = rest.slice(match[0].length);
     } else if ((match = /^\[([^\]]*)\]\(([^)]*)\)/.exec(rest))) {
       // An address opens; a path names a file on the machine the writer works on (an agent's
       // `[spec](/home/…/spec.md)`), which this phone cannot read but can copy.

@@ -1,3 +1,5 @@
+import type { MailImage } from './conversationView.ts';
+
 // A request card as stui shows one (crates/stui/src/ui/screens.rs, `report` and the Request
 // card): a JSON report reads as its telling fields, a yes-or-no question gets Yes and No, and
 // every answer (Nothing to do included) completes the waiting step with a short reason.
@@ -83,4 +85,22 @@ export function personAnswer(request: Request | null | undefined, chosen: string
   if (request.type === 'feedback' || (request.type === 'choice' && request.custom)) return { text };
   const changes = request.answers?.find(answer => answer.outcome === 'request_changes');
   return changes ? { id: changes.id, text } : 'This asks you to pick one of its answers.';
+}
+
+/**
+ * The images an ask carries, read from st by its person step (`step`, the attention's
+ * `source_id`) the way a message's images are read by the message, as stui reads them.
+ */
+export function requestImages(request: { attachments?: ReadonlyArray<{ sha256: string; media_type: string; name?: unknown; size: number }> } | null | undefined, step: string): MailImage[] {
+  return (request?.attachments ?? []).filter(attachment => attachment.media_type.startsWith('image/')).map(attachment => {
+    const name = optionalText(attachment.name);
+    return { sha256: attachment.sha256, message: step, mediaType: attachment.media_type, ...(name ? { name } : {}), size: attachment.size };
+  });
+}
+
+/** A name as decoded (an Option) or as sent (a string or null). */
+function optionalText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value || undefined;
+  const option = value as { _tag?: string; value?: unknown } | null | undefined;
+  return option?._tag === 'Some' && typeof option.value === 'string' ? option.value || undefined : undefined;
 }
