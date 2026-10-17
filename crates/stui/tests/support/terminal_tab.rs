@@ -50,7 +50,6 @@ fn terminal_tab_probe_worker() -> Result<()> {
         picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
         ui.picker = Some(picker);
     }
-    ui.glasses = Some(glass::Glasses::open(None, None));
     let agent = if std::env::var_os("STUI_PROBE_AGENT").is_some() {
         "agent/example/atlas/builder"
     } else {

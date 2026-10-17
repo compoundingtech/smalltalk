@@ -2,8 +2,9 @@
 
 `st` in a terminal opens spaces on the live graph: splits with their own tabs, each showing a conversation,
 a mission, a terminal, Now or usage. `st ui --space NAME` opens a named space. `st ui --demo`
-shows them on invented data and sends nothing. `st ui --classic` keeps the layout from before
-spaces for now; it is going away ([#1166](https://github.com/compoundingtech/smalltalk/issues/1166)).
+shows them on invented data and sends nothing. Spaces are stui's only layout: the layout from
+before them is gone ([#1166](https://github.com/compoundingtech/smalltalk/issues/1166)), and
+`st ui --classic` refuses with what to run instead.
 The screens follow [docs/clients/ui-contract.md](../../docs/clients/ui-contract.md), shared with the
 iOS app.
 
@@ -27,8 +28,8 @@ credentials, offline cache, and automatic reconnect. `--client` requires a saved
 `--local` selects the local daemon even when a pairing exists. While offline, the terminal UI keeps its last
 display, shows the last connection time, queues no mutations, and offers `r` to retry now.
 
-Keys (`?` shows them all): `Ctrl+K` opens anything (agents, missions, machines, spaces, and what
-was said in conversations); `Tab` and `Shift+Tab` move between a split's tabs; `Alt+arrows` move
+Keys (`?` shows them all): `Ctrl+K` opens anything (agents, missions, machines, spaces, what
+was said in conversations, Now, Usage and the Fleet list); `Tab` and `Shift+Tab` move between a split's tabs; `Alt+arrows` move
 between splits; `Ctrl+T`, `Ctrl+V`, `Ctrl+X` and `Ctrl+W` open a tab, split right or below, and
 close a tab; `Ctrl+S` shows the sidebar and `Ctrl+H` opens Now over the space; `Ctrl+Q` quits.
 Middle-click a tab to close it: press and release over the same tab. This uses the same
@@ -48,7 +49,9 @@ of its attached terminal: click it to show it, click an answer to send it, or cl
 answers an alert. When the link to the
 terminal drops, its status line says `reconnecting`, why, the next try and `Ctrl+\ conversation`;
 it attaches again by itself, waiting 1, 2, 4… up to 32 seconds between tries. Scrolling to the top of a conversation loads the page before it. Now cards show
-their own keys; `y` confirms what a card asks, and Enter never does.
+their own keys; `y` confirms what a card asks, and Enter never does. Now has no sections behind
+it: no key, click or update turns it into another list, and Esc gives the keys back to the
+focused split.
 
 A seat can ask the interface to show something with `st ui open agent/NAME` (also `mission/NAME`,
 `mission-run/NAME/RUN` and `machine/NAME`), `--split` and `--below` for a split, `--keep-focus` to leave
@@ -158,7 +161,6 @@ Fresh workspaces show the host and `Ctrl+K: New terminal`, with a welcome row. A
 existing device's explicit sidebar visibility choice is kept. Older daemons lacking
 sixteen-subscription capacity keep the three live conversations and terminal; their
 sidebar shows grouped resources until the daemon supports the optional window.
-The classic layout keeps its existing tabbed lists.
 
 With the sidebar focused, `n` names a new folder, `m` on a resource chooses its folder,
 `r` renames the selected folder, `d` asks to delete it, and `+` on a folder opens the
@@ -195,5 +197,6 @@ Older members read inventories when their relevant view opens or its period
 changes; Fleet says these inventories are read, not followed. Read errors and
 partial windows stay visible. Connection generations fence legacy results, so a
 late read cannot replace a newer member's streamed rows. The actual-binary idle
-transport test runs `scripts/stui-test-client --classic` with `STUI_TIMING_LOG`
-on a private daemon, holding Fleet and Usage idle beyond every old read interval.
+transport test runs `scripts/stui-test-client` with `STUI_TIMING_LOG` on a private
+daemon, opening the Fleet list and Usage from Ctrl+K and holding them idle beyond every old
+read interval.

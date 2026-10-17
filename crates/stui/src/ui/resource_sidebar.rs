@@ -726,11 +726,7 @@ impl Ui {
                 ),
             };
             let style = if index == self.resource_sidebar.selected
-                && (self.resource_sidebar.focused
-                    || self
-                        .glasses
-                        .as_ref()
-                        .is_some_and(|glasses| glasses.sidebar.focused))
+                && (self.resource_sidebar.focused || self.glasses.sidebar.focused)
             {
                 Style::default().fg(theme::CRUST).bg(theme::ACCENT)
             } else {
@@ -786,14 +782,8 @@ impl Ui {
                 };
                 if let Some(pane) = pane {
                     self.resource_sidebar.focused = false;
-                    if let Some(glasses) = self.glasses.as_mut() {
-                        glasses.sidebar.focused = false;
-                    }
-                    if self.glasses.is_some() {
-                        self.open_in_glass(pane, Open::Tab);
-                    } else {
-                        self.open(&row.open);
-                    }
+                    self.glasses.sidebar.focused = false;
+                    self.open_in_glass(pane, Open::Tab);
                     if row.kind == "Terminals" {
                         self.attach_terminal(&row.open);
                     }
@@ -813,9 +803,7 @@ impl Ui {
             KeyCode::Esc => {
                 if self.resource_sidebar.filter.is_empty() && !self.resource_sidebar.filtering {
                     self.resource_sidebar.focused = false;
-                    if let Some(glasses) = self.glasses.as_mut() {
-                        glasses.sidebar.focused = false;
-                    }
+                    self.glasses.sidebar.focused = false;
                 }
                 self.resource_sidebar.filter.clear();
                 self.resource_sidebar.filtering = false;
@@ -1113,7 +1101,6 @@ mod tests {
     #[test]
     fn opening_and_collapsing_only_navigate_and_do_not_edit_arrangements() {
         let mut ui = Ui::new(super::super::demo::world());
-        ui.glasses = Some(super::super::glass::Glasses::open(None, None));
         ui.resource_sidebar.arrangements.push(arrangement());
         let before = ui.resource_sidebar.arrangements.clone();
         ui.open_resource_row(0);
@@ -1141,7 +1128,6 @@ mod tests {
         world.machines = super::super::view::Load::Ready(Vec::new());
         world.host = "example-linux".into();
         let mut ui = Ui::new(world);
-        ui.glasses = Some(super::super::glass::Glasses::open(None, None));
         ui.set_world(ui.world.clone());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
