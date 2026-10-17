@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A scheduled workflow runs the whole required test set once a day with debug assertions on",
+  "replay": {"status": "none", "detail": "CI only."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "No product behaviour change; not a required check."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "none", "detail": "A failed daily run opens or comments on one issue."},
+  "recovery": {"status": "none", "detail": "Revert the commit."}
+}
