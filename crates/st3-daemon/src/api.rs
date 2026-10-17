@@ -107,7 +107,7 @@ pub use tile_endpoint::{
     SOCKET as TILE_ENDPOINT_SOCKET, spawn as spawn_tile_endpoints,
     spawn_from as spawn_tile_endpoints_from,
 };
-pub use published_lists::start_published_lists;
+pub use published_lists::{start_published_lists, wait_published_lists_at_least};
 mod changes;
 
 #[cfg(test)]
@@ -436,6 +436,8 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Build routes only. The owner starts background publications with
+/// [`start_published_lists`]; a bare router refuses unpublished current runtime reads.
 pub fn router(state: AppState) -> Router {
     crate::relay_trace::init();
     delivery_presence::start();
@@ -1659,8 +1661,8 @@ fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> V
 }
 
 fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
-    // The work list's refresher ended: nothing publishes it until the daemon restarts.
-    if matches!(code, Some(published_lists::WORK_LIST_ENDED | client_v0::published_missions::ENDED)) {
+    // An ended list publishes nothing until the daemon restarts.
+    if matches!(code, Some(published_lists::WORK_LIST_ENDED | client_v0::published_missions::ENDED | "runtime-list-ended")) {
         return false;
     }
     // An unconfirmed mutation needs the exact original request, not a generic
@@ -1738,6 +1740,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "mission-list-ended"
         | "runtime-not-local"
         | "runtime-authority-indeterminate"
+        | "runtime-list-not-ready"
+        | "runtime-list-ended"
         | "remote-unavailable"
         | "terminal-unavailable"
         | "conversation-content-invalidated"

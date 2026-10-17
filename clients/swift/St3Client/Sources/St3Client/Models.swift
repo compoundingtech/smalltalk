@@ -51,23 +51,21 @@ public struct ErrorEnvelope: Codable, Error, Sendable {
 }
 
 public enum ErrorCode: Codable, Sendable, Equatable {
-    case recipientRetired, lifecycleUnavailable, retirementUpgradeRequired
-    case notFound, forbidden, unsupportedCapability, validationFailed, idempotencyConflict
-    case attentionMigrated
-    case issuerRequired
-    case suspendAuthoredSessionSelection
+    case recipientRetired, lifecycleUnavailable, retirementUpgradeRequired, attentionMigrated
     case arrangementExists
     case arrangementFolderExists, arrangementRetired, arrangementLimit, arrangementFolderDeleted
     case arrangementCycle, arrangementBodyTooLarge, arrangementOwnerForbidden
     case invalidArrangementSubject, invalidArrangementAction, invalidArrangementOperations
     case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
-    case staleFence, cursorGap, pageCursorExpired, rateLimited
-    case agentRosterCutNotReady
+    case notFound, forbidden, unsupportedCapability, validationFailed, idempotencyConflict
+    case issuerRequired, suspendAuthoredSessionSelection
+    case staleFence, cursorGap, pageCursorExpired, agentRosterCutNotReady, rateLimited
+    case runtimeNotLocal, runtimeAuthorityIndeterminate, runtimeListNotReady, runtimeListEnded
+    case remoteUnavailable, terminalUnavailable, terminalEnded, timelineHistoryIncomplete
     case projectionDetailTooLarge, projectionDetailInvalidSource
-    case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
-    case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
+    case conversationContentInvalidated, transcriptUnavailable
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge, messageStoreFull, longMessageSignatureUnsupported
-    case responseBudgetExceeded, contentNotText
+    case responseBudgetExceeded, contentNotText, `internal`
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -100,6 +98,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "message-too-large": .messageTooLarge; case "message-store-full": .messageStoreFull; case "long-message-signature-unsupported": .longMessageSignatureUnsupported
         case "response-budget-exceeded": .responseBudgetExceeded; case "content-not-text": .contentNotText
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
+        case "runtime-list-not-ready": .runtimeListNotReady; case "runtime-list-ended": .runtimeListEnded
         default: .unknown(raw)
         }
     }
@@ -132,6 +131,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .messageTooLarge: "message-too-large"; case .messageStoreFull: "message-store-full"; case .longMessageSignatureUnsupported: "long-message-signature-unsupported"
         case .responseBudgetExceeded: "response-budget-exceeded"; case .contentNotText: "content-not-text"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
+        case .runtimeListNotReady: "runtime-list-not-ready"; case .runtimeListEnded: "runtime-list-ended"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)

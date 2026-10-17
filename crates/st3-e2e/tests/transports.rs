@@ -41,7 +41,15 @@ fn state(root: &Path, name: &str) -> AppState {
     }
 }
 
-fn publish_terminal(state: &AppState, incarnation: &str) {
+async fn publish_fixture_lists(state: &AppState) {
+    let seeded_cut = state.store.index().unwrap();
+    st3::api::start_published_lists(state);
+    tokio::time::timeout(Duration::from_secs(10),
+        st3::api::wait_published_lists_at_least(&state.store, seeded_cut))
+        .await.expect("transport fixture publishes every seeded graph cut").unwrap();
+}
+
+async fn publish_terminal(state: &AppState, incarnation: &str) {
     state
         .store
         .append_claim(&ClaimInput {
@@ -93,6 +101,7 @@ fn publish_terminal(state: &AppState, incarnation: &str) {
     state
         .event_notify
         .send_modify(|generation| *generation = generation.saturating_add(1));
+    publish_fixture_lists(state).await;
 }
 
 /// A PTY session socket that answers ATTACH/PEEK with replay, then live output until exit.
@@ -245,7 +254,7 @@ async fn serve_terminal_state(
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = state(root.path(), name);
-    publish_terminal(&state, "terminal-demo-runtime:i1");
+    publish_terminal(&state, "terminal-demo-runtime:i1").await;
     let pty = FakePty::start(&state, rows, columns);
     let app = st3::api::router(state.clone());
     let server_socket = socket.clone();
@@ -366,7 +375,7 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_unix() {
     let (_root, state, pty, client, server) =
         serve_terminal_state("raw-client-unix", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
-    publish_terminal(&state, &incarnation);
+    publish_terminal(&state, &incarnation).await;
     let mut replay = b"terminal ready\r\n$ ".to_vec();
     for mode in [RawTerminalMode::Attach, RawTerminalMode::Peek] {
         assert_raw_terminal_transport(&client, &pty, &incarnation, mode, &mut replay).await;
@@ -380,7 +389,7 @@ async fn dropping_a_controlled_raw_connector_closes_a_backpressured_attachment()
     let (_root, state, pty, client, server) =
         serve_terminal_state("raw-client-drop", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
-    publish_terminal(&state, &incarnation);
+    publish_terminal(&state, &incarnation).await;
     let attachment = client
         .raw_terminal_attachment(
             "terminal/agent/terminal-demo",
@@ -433,12 +442,14 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_paired_gateways() {
     let (_root, state, pty, local, unix_server) =
         serve_terminal_state("raw-client-paired", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
-    publish_terminal(&state, &incarnation);
-    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
-    device_name: "Raw terminal device".into(),
-    person_id: "person/avery".into(),
-    full_control: Some(true),
-    scopes: None, }).await.unwrap();
+    publish_terminal(&state, &incarnation).await;
+    let challenge = local.pairing_begin_person(&PersonPairingBegin {
+        api_version: st3_client::API_VERSION.into(),
+        device_name: "Raw terminal device".into(),
+        person_id: "person/avery".into(),
+        full_control: Some(true),
+        scopes: None,
+    }).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = st3::api::fabric_router(state.clone());
@@ -605,7 +616,7 @@ async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
         "an unchanged screen must not be sent again"
     );
 
-    publish_terminal(&state, "terminal-demo-runtime:i2");
+    publish_terminal(&state, "terminal-demo-runtime:i2").await;
     let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("a changed incarnation must end the stream promptly");
@@ -713,7 +724,7 @@ async fn a_terminal_rides_the_collection_socket_and_its_end_leaves_the_rest() {
 
     // A new incarnation ends the terminal subscription with stale-fence. The agents
     // subscription on the same socket sees the observation and keeps going.
-    publish_terminal(&state, "terminal-demo-runtime:i2");
+    publish_terminal(&state, "terminal-demo-runtime:i2").await;
     let mut ended = false;
     let mut agents_changed = false;
     while !(ended && agents_changed) {
@@ -1014,7 +1025,7 @@ mission "example/definition" state="ready" {
     let intent = st3::graph::parse_intent(source, "client-definition").unwrap();
     state.store.apply_internal(&intent, "definition-fixture").unwrap();
     // An observed runtime alone has no desired declaration to reconstruct.
-    publish_terminal(&state, "terminal-demo-runtime:i1");
+    publish_terminal(&state, "terminal-demo-runtime:i1").await;
     let app = st3::api::router(state.clone());
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&socket).await;
@@ -1122,7 +1133,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     let socket = root.path().join("st3.sock");
     let server_socket = socket.clone();
     let state = state(root.path(), "client-unix");
-    publish_terminal(&state, "terminal-demo-runtime:i1");
+    publish_terminal(&state, "terminal-demo-runtime:i1").await;
     let _pty = FakePty::start(&state, 24, 80);
     let intent = st3::graph::parse_intent(
         "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
@@ -1152,6 +1163,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     };
     let ada_step = ask("person/ada");
     let alex_step = ask("person/alex");
+    publish_fixture_lists(&state).await;
     let app = st3::api::router(state.clone());
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&socket).await;
@@ -1475,7 +1487,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     );
 
     let replacement_fence = attach_terminal(&client, "unix-replaced").await;
-    publish_terminal(&state, "terminal-demo-runtime:i2");
+    publish_terminal(&state, "terminal-demo-runtime:i2").await;
     assert!(
         client
             .terminal_stream(
@@ -1529,7 +1541,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
 async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credentials() {
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path(), "client-loopback");
-    publish_terminal(&state, "terminal-demo-runtime:fabric-i1");
+    publish_terminal(&state, "terminal-demo-runtime:fabric-i1").await;
     let _pty = FakePty::start(&state, 24, 80);
 
     let socket = root.path().join("st3.sock");
