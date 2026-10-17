@@ -8,9 +8,9 @@
 //! (default 250) appends one line to `slow.jsonl`. Every ten seconds, `in-flight.jsonl` records
 //! the oldest 32 unfinished operation labels/callers and ages, including queue wait. At most
 //! 4096 weak registrations are retained; overflow starts are counted cumulatively, not kept.
-//! Samples are skipped when all tracked work is younger than one second. The current
-//! in-flight log and its single rotated predecessor are each capped at 8 MiB; labels and
-//! callers are capped at 256 UTF-8 bytes with explicit truncation flags.
+//! Samples are skipped when all tracked work is younger than one second. Each JSONL output
+//! retains an active file and one predecessor, each capped at `ST3_PROFILE_FILE_BYTES`
+//! (default 8 MiB). Labels and callers in in-flight samples are capped at 256 UTF-8 bytes.
 //! Already recorded operations can remain live in workers; this is marked explicitly. Unset,
 //! every hook is one relaxed atomic load.
 //!
@@ -20,13 +20,14 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex as OutputMutex;
 use serde_json::{Value, json};
 
 mod cost_counters;
@@ -50,7 +51,7 @@ const IN_FLIGHT_LINES: usize = 32;
 const IN_FLIGHT_INTERVAL: Duration = Duration::from_secs(10);
 const IN_FLIGHT_MIN_AGE: Duration = Duration::from_secs(1);
 const IN_FLIGHT_FIELD_BYTES: usize = 256;
-const IN_FLIGHT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const PROFILE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 fn in_flight_field(value: &str) -> (&str, bool) {
     let mut end = value.len().min(IN_FLIGHT_FIELD_BYTES);
@@ -147,11 +148,14 @@ pub fn init_from_env() {
         .and_then(|value| value.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(250));
-    let slow = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("slow.jsonl"))
-        .ok();
+    let file_bytes = std::env::var("ST3_PROFILE_FILE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(PROFILE_FILE_BYTES);
+    let slow = OutputMutex::new(ProfileLog::new(&dir, "slow.jsonl", file_bytes));
+    let minutes = OutputMutex::new(ProfileLog::new(&dir, "minutes.jsonl", file_bytes));
+    let in_flight_log = OutputMutex::new(ProfileLog::new(&dir, "in-flight.jsonl", file_bytes));
     let state = State {
         dir,
         slow_after,
@@ -162,7 +166,9 @@ pub fn init_from_env() {
         writer_holder: Mutex::new(None),
         thread_labels: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(InFlight::default()),
-        slow: Mutex::new(slow),
+        slow,
+        minutes,
+        in_flight_log,
     };
     if STATE.set(state).is_err() {
         return;
@@ -215,7 +221,9 @@ struct State {
     /// The label each thread runs now, for attributing sampled thread CPU.
     thread_labels: Mutex<HashMap<i32, Arc<str>>>,
     in_flight: Mutex<InFlight>,
-    slow: Mutex<Option<File>>,
+    slow: OutputMutex<ProfileLog>,
+    minutes: OutputMutex<ProfileLog>,
+    in_flight_log: OutputMutex<ProfileLog>,
 }
 
 #[derive(Default)]
@@ -1094,10 +1102,8 @@ fn write_slow(
     if let (Value::Object(line), Value::Object(detail)) = (&mut line, acc_json(acc, 6)) {
         line.extend(detail);
     }
-    let mut slow = state.slow.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(file) = slow.as_mut() {
-        let _ = writeln!(file, "{line}");
-    }
+    let mut slow = state.slow.lock();
+    let _ = slow.append(&line);
 }
 
 fn percentile(sorted: &[u64], percent: usize) -> u64 {
@@ -1261,49 +1267,82 @@ fn flush_in_flight(state: &State, now: Instant) {
     if oldest_ms < IN_FLIGHT_MIN_AGE.as_secs_f64() * 1_000.0 {
         return;
     }
-    let _ = append_in_flight(&state.dir, &snapshot, IN_FLIGHT_FILE_BYTES);
+    let mut log = state.in_flight_log.lock();
+    let _ = log.append(&snapshot);
 }
 
-/// Single profiler writer, two bounded files. Oversized files from older versions are
-/// discarded rather than retained as an oversized predecessor. I/O failure drops a sample.
-fn append_in_flight(dir: &std::path::Path, sample: &Value, limit: u64) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(sample)?;
-    line.push(b'\n');
-    let bytes = line.len() as u64;
-    if bytes > limit {
-        return Ok(());
-    }
-    let path = dir.join("in-flight.jsonl");
-    let previous = dir.join("in-flight.jsonl.1");
-    let size = match fs::metadata(&path) {
-        Ok(file) => file.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error),
-    };
-    if size.saturating_add(bytes) > limit {
-        match fs::remove_file(&previous) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        if size <= limit {
-            fs::rename(&path, &previous)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-    } else {
-        match fs::metadata(&previous) {
-            Ok(file) if file.len() > limit => fs::remove_file(&previous)?,
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+/// Each output owns its serialization lock. Open only after rotation, and close after each
+/// append, so no writer can retain a handle into a renamed predecessor.
+struct ProfileLog {
+    path: PathBuf,
+    previous: PathBuf,
+    limit: u64,
+}
+
+impl ProfileLog {
+    fn new(dir: &std::path::Path, name: &str, limit: u64) -> Self {
+        Self {
+            path: dir.join(name),
+            previous: dir.join(format!("{name}.1")),
+            limit,
         }
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?
-        .write_all(&line)
+
+    fn size(path: &std::path::Path) -> std::io::Result<u64> {
+        match fs::metadata(path) {
+            Ok(file) => Ok(file.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn discard(path: &std::path::Path, bytes: u64) -> std::io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                eprintln!(
+                    "st3: profile retention dropped {bytes} bytes from {}",
+                    path.display()
+                );
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn append(&mut self, sample: &Value) -> std::io::Result<()> {
+        // Enforce a reduced limit and remove unbounded legacy files even if this sample
+        // itself is oversized. Never preserve an oversized file as a predecessor.
+        let mut size = Self::size(&self.path)?;
+        if size > self.limit {
+            Self::discard(&self.path, size)?;
+            size = 0;
+        }
+        let previous_size = Self::size(&self.previous)?;
+        if previous_size > self.limit {
+            Self::discard(&self.previous, previous_size)?;
+        }
+        let mut line = serde_json::to_vec(sample)?;
+        line.push(b'\n');
+        let bytes = line.len() as u64;
+        if bytes > self.limit {
+            eprintln!(
+                "st3: profile retention dropped oversized record ({bytes} bytes, limit {}) for {}",
+                self.limit,
+                self.path.display()
+            );
+            return Ok(());
+        }
+        if size.saturating_add(bytes) > self.limit {
+            Self::discard(&self.previous, Self::size(&self.previous)?)?;
+            fs::rename(&self.path, &self.previous)?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?
+            .write_all(&line)
+    }
 }
 
 fn flush_minute(state: &State) {
@@ -1382,13 +1421,9 @@ fn flush_minute(state: &State) {
         "ops": ops,
         "callers": callers,
     });
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state.dir.join("minutes.jsonl"))
-    {
-        let _ = writeln!(file, "{line}");
-    }
+    let mut minutes = state.minutes.lock();
+    let _ = minutes.append(&line);
+    drop(minutes);
     let mut total = state.total.lock().unwrap_or_else(PoisonError::into_inner);
     let totals = total
         .iter_mut()
@@ -1595,32 +1630,84 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_log_rotates_one_predecessor_and_discards_oversized_old_files() {
+    fn profile_logs_rotate_and_keep_the_newest_complete_records() {
+        for name in ["slow.jsonl", "minutes.jsonl", "in-flight.jsonl"] {
+            let dir = tempfile::tempdir().unwrap();
+            let limit = 27; // Three nine-byte records per file.
+            let mut log = ProfileLog::new(dir.path(), name, limit);
+            for at in 0..10 {
+                log.append(&json!({"at": at})).unwrap();
+                let retained = ProfileLog::size(&log.path).unwrap()
+                    + ProfileLog::size(&log.previous).unwrap();
+                assert!(retained <= 2 * limit);
+            }
+            let mut retained = Vec::new();
+            for path in [&log.previous, &log.path] {
+                let text = fs::read_to_string(path).unwrap();
+                assert!(text.ends_with('\n'));
+                assert!(text.len() as u64 <= limit);
+                retained.extend(text.lines().map(|line| {
+                    serde_json::from_str::<Value>(line).unwrap()["at"]
+                        .as_u64()
+                        .unwrap()
+                }));
+            }
+            assert_eq!(retained, [6, 7, 8, 9]);
+            assert_eq!(fs::read_to_string(&log.path).unwrap(), "{\"at\":9}\n");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn profile_logs_bound_legacy_files_and_oversized_records_after_restart() {
+        for name in ["slow.jsonl", "minutes.jsonl", "in-flight.jsonl"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut log = ProfileLog::new(dir.path(), name, 27);
+            fs::write(&log.path, [b'x'; 28]).unwrap();
+            fs::write(&log.previous, [b'x'; 28]).unwrap();
+            log.append(&json!({"oversized": "x".repeat(100)})).unwrap();
+            assert!(!log.path.exists());
+            assert!(!log.previous.exists());
+            log.append(&json!({"at": 1})).unwrap();
+            drop(log);
+            let mut log = ProfileLog::new(dir.path(), name, 9);
+            log.append(&json!({"at": 2})).unwrap();
+            let previous = fs::read(&log.previous).unwrap();
+            let current = fs::read(&log.path).unwrap();
+            log.append(&json!({"oversized": "x".repeat(100)})).unwrap();
+            assert_eq!(fs::read(&log.previous).unwrap(), previous);
+            assert_eq!(fs::read(&log.path).unwrap(), current);
+            assert_eq!(current, b"{\"at\":2}\n");
+            assert!(previous.len() + current.len() <= 18);
+        }
+    }
+
+    #[test]
+    fn concurrent_slow_writers_rotate_under_one_output_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let first = json!({"at": 1, "operations": ["first"]});
-        let limit = (serde_json::to_vec(&first).unwrap().len() + 1) as u64;
-        let second = json!({"at": 2, "operations": ["next"]});
-        append_in_flight(dir.path(), &first, limit).unwrap();
-        append_in_flight(dir.path(), &second, limit).unwrap();
-        let current = dir.path().join("in-flight.jsonl");
-        let previous = dir.path().join("in-flight.jsonl.1");
-        assert_eq!(
-            serde_json::from_str::<Value>(fs::read_to_string(&previous).unwrap().trim()).unwrap(),
-            first
-        );
-        append_in_flight(dir.path(), &second, limit).unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(fs::read_to_string(&previous).unwrap().trim()).unwrap(),
-            second
-        );
-        fs::write(&previous, vec![b'x'; limit as usize + 1]).unwrap();
-        fs::write(&current, vec![b'x'; limit as usize + 1]).unwrap();
-        append_in_flight(dir.path(), &second, limit).unwrap();
-        assert!(!previous.exists());
-        assert!(fs::metadata(&current).unwrap().len() <= limit);
-        let retained = fs::read(&current).unwrap();
-        append_in_flight(dir.path(), &json!({"oversized": "x".repeat(1024)}), limit).unwrap();
-        assert_eq!(fs::read(&current).unwrap(), retained);
+        let log = Arc::new(OutputMutex::new(ProfileLog::new(dir.path(), "slow.jsonl", 27)));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let log = Arc::clone(&log);
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        log.lock().append(&json!({"at": 0})).unwrap();
+                    }
+                });
+            }
+        });
+        let mut log = log.lock();
+        log.append(&json!({"at": 9})).unwrap();
+        for path in [&log.previous, &log.path] {
+            let text = fs::read_to_string(path).unwrap();
+            assert!(text.len() <= 27);
+            assert!(text.ends_with('\n'));
+            for line in text.lines() {
+                serde_json::from_str::<Value>(line).unwrap();
+            }
+        }
+        let current = fs::read_to_string(&log.path).unwrap();
+        assert_eq!(current.lines().last(), Some("{\"at\":9}"));
     }
 
     #[test]

@@ -172,6 +172,7 @@ load.
 | --- | --- |
 | `ST3_PROFILE_DIR` | Turns profiling on and names the directory it writes to. |
 | `ST3_PROFILE_SLOW_MS` | Writes a line for each operation slower than this. The default is 250. |
+| `ST3_PROFILE_FILE_BYTES` | Positive byte cap for each JSONL file, including each record's newline. The default is 8 MiB (8,388,608 bytes). Invalid or zero values use the default. Read once at startup. |
 | `ST3_PROFILE_PTRACER` | Linux only. Lets any process of the same user trace the daemon, so a stack sampler such as `eu-stack` can attach on hosts that allow tracing only a process's own children. |
 
 The daemon records each request route (`GET /v1/messages/page`) and each background pass (`task
@@ -196,9 +197,18 @@ It writes four files:
 - `totals.json` holds the totals since the daemon started.
 - `in-flight.jsonl` samples unfinished work every ten seconds when at least one tracked
   operation is a second old. It keeps the oldest 32 labels/callers and ages, including
-  queue wait; at most 4,096 weak registrations are retained. The current file and its
-  single rotated predecessor are capped at 8 MiB each. Labels and callers are capped
+  queue wait; at most 4,096 weak registrations are retained. Labels and callers are capped
   at 256 UTF-8 bytes with visible truncation flags.
+
+Each JSONL output retains its active file and one `.1` predecessor, both bounded by
+`ST3_PROFILE_FILE_BYTES`. The default maximum retained JSONL length is 48 MiB across all
+six files; `totals.json` is replaced separately and is not included in this bound.
+Rotation discards the old predecessor and keeps complete records in chronological order.
+Each append opens the active file under its output lock after any rotation, so concurrent
+slow writers cannot continue writing to a predecessor. On the next append, oversized
+files left by an older version or a reduced cap are removed. A record larger than the
+cap is dropped whole. These drops emit `st3: profile retention dropped ...` on stderr.
+Archive diagnostics before reducing the cap if older records must be kept.
 
 Work on a thread that runs no named operation appears as `(unlabeled THREAD)`.
 

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bound all profiler JSONL outputs with size-based rotation and one retained predecessor.",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "No database schema changes."},
+  "rules": {"status": "none", "detail": "No checkpoint or digest changes."},
+  "compatibility": {"status": "changed", "detail": "Slow, minute, and in-flight JSONL output each retain two files capped at 8 MiB by default, for 48 MiB combined. Complete records larger than the cap and oversized legacy files are dropped. Drops are logged on stderr. Totals remain replaced separately."},
+  "manual": {"status": "changed", "detail": "Set ST3_PROFILE_FILE_BYTES to a positive byte limit before daemon startup to override the per-file cap. Invalid or zero values use the default. Archive older diagnostic logs before starting the updated daemon if they must be kept."},
+  "recovery": {"status": "changed", "detail": "Retention removes diagnostic data on append; removed logs cannot be restored without a separate archive. No application data migration or recovery is required."},
+  "downtime": {"status": "unknown", "detail": "A normal daemon restart applies the code and configuration; restart duration has not been measured."}
+}
