@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A test-support-only client clock skew lets the daemon restart test pass the 90 s client freshness horizon without sleeping; the product client clock is unchanged",
+  "replay": {
+    "status": "none",
+    "detail": "No stored history or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, claim or configuration schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination version change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The skew exists only with the test-support feature; production builds read the real clock."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration and no restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting restores the 95 s sleep in the test; nothing stored depends on it."
+  }
+}

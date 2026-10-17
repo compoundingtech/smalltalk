@@ -740,9 +740,10 @@ time.sleep(300)
     assert_eq!(before["harness_state"], "idle", "{before}");
     assert_eq!(before["observation"], "current", "{before}");
     daemon.stop().await;
-    // Exceed the real client freshness horizon, not a test-only shortened timeout. Open a
-    // fresh Store too: the driver's spool and mailbox fence must survive real cache loss.
-    tokio::time::sleep(Duration::from_secs(95)).await;
+    // Pass the real 90 s client freshness horizon by running the client clock 95 s ahead, not by a
+    // test-only shortened timeout and not by sleeping through it. Open a fresh Store too: the
+    // driver's spool and mailbox fence must survive real cache loss.
+    st3::test_support::skew_client_clock(95_000);
     assert_alive(&mut driver, "the quiet driver");
     daemon.store = Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap());
     daemon.start_admitted_protocol().await;
@@ -755,6 +756,8 @@ time.sleep(300)
     assert!(daemon.has_diagnostic(seat, incarnation, "claude-channel-attached"));
     assert_alive(&mut driver, "the same quiet driver after daemon restart");
     assert_eq!(driver.id(), original_pid);
+    // New reports carry the real clock again: stop skewing before the transition below.
+    st3::test_support::skew_client_clock(0);
     // A provider transition bypasses the five-minute unchanged-evidence guard. Require the
     // fresh idle record to recover through the restarted daemon without restarting the seat.
     writer.observe(Observation::new(Activity::Active, BlockedOn::None, InputBuffer::Empty)).unwrap();
