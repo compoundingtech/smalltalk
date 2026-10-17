@@ -322,7 +322,7 @@ fn state_dir() -> Option<PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
         })?;
-    Some(base.join("st3"))
+    Some(st3_client::product_dirs::resolve(base.join("st3"), base.join("fractal")))
 }
 
 #[cfg(test)]

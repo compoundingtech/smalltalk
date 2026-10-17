@@ -124,6 +124,11 @@ Namespace as overflow for ordinary PRs. The second test shard and supporting job
 macOS CI is currently disabled; its retained workflow is not a required check.
 See [CI operations](ci.md) for stage scope, routing, caches, and failure inspection.
 
+The standalone Rust client's generated `crates/st3-client/src/lib.rs` must be
+regenerated with `cargo run -p st3-client-codegen`, including after changes to
+directory discovery. Commit the generator's exact output rather than hand-formatting
+it; `cargo run -p st3-client-codegen -- --check` checks freshness.
+
 ## Shared UI models
 
 [Build your own client](clients/build-your-own.md) maps the Rust and TypeScript pieces

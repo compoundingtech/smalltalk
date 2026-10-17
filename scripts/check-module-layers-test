@@ -126,6 +126,88 @@ class ModuleLayers(unittest.TestCase):
         out = self.run_script("--layers").stdout.splitlines()
         self.assertEqual([line.split()[1:] for line in out], [["c"], ["b"], ["a"]])
 
+    # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-state-dirs-fractal — DELETE at contraction — #3032
+    def test_r11_allows_only_the_resolver_namespace_in_leaf_crates(self):
+        for crate in ("st3-kernel", "st3-telemetry"):
+            with self.subTest(crate=crate):
+                self.write(f"crates/{crate}/src/instance.rs",
+                           "use st3_client::product_dirs as dirs;\n"
+                           "fn path() { st3_client :: product_dirs :: state_dir(); }\n"
+                           "#[cfg(test)] mod tests { use st3_client::product_dirs::RECEIPT_FILE; }\n")
+                self.assertEqual(ml.client_boundary_findings(str(self.root)), [])
+
+    def test_r11_rejects_other_client_paths_and_root_aliases(self):
+        for crate in ("st3-kernel", "st3-telemetry"):
+            for source in [
+                "use st3_client::device;",
+                "use st3_client::product_dirs_extra;",
+                "use st3_client as client;",
+                "extern crate st3_client as client;",
+                "use st3_client::{product_dirs, device};",
+                "#[cfg(test)] mod tests { use st3_client::Client; }",
+            ]:
+                with self.subTest(crate=crate, source=source):
+                    path = f"crates/{crate}/src/instance.rs"
+                    self.write(path, source)
+                    self.assertTrue(ml.client_boundary_findings(str(self.root)))
+                    self.assertIn("forbidden st3_client reference", self.run_script().stderr)
+                    self.write(path, "")
+
+    def test_r11_boundary_ignores_comments_and_string_literals(self):
+        self.write("crates/st3-kernel/src/instance.rs",
+                   '// st3_client::device\n/* st3_client::Client */\n'
+                   'const SOURCE: &str = r#"use st3_client::device;"#;\n'
+                   'const TEXT: &str = "st3_client::Client";\n')
+        self.assertEqual(ml.client_boundary_findings(str(self.root)), [])
+    # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-state-dirs-fractal
+
+    def test_leaf_crates_reject_client_dependency_aliases_in_every_table(self):
+        sections = [
+            "dependencies", "dev-dependencies", "build-dependencies",
+            'target.\'cfg(unix)\'.dependencies',
+            'target.\'cfg(unix)\'.dev-dependencies',
+            'target.\'cfg(unix)\'.build-dependencies',
+        ]
+        for crate in ("st3-kernel", "st3-telemetry"):
+            path = f"crates/{crate}/Cargo.toml"
+            for section in sections:
+                with self.subTest(crate=crate, section=section):
+                    self.write(path, f'[{section}]\nclient = {{ package = "st3-client", path = "../st3-client" }}\n')
+                    self.assertIn("aliases st3-client as client", self.run_script().stderr)
+                    self.write(path, f'[{section}]\nst3-client = {{ path = "../st3-client" }}\n')
+                    self.assertEqual(ml.client_boundary_findings(str(self.root)), [])
+            self.write(path, "")
+
+    def test_leaf_crates_resolve_inherited_client_aliases(self):
+        for crate in ("st3-kernel", "st3-telemetry"):
+            path = f"crates/{crate}/Cargo.toml"
+            for section in ("dependencies", "target.'cfg(unix)'.dependencies"):
+                with self.subTest(crate=crate, section=section):
+                    self.write("Cargo.toml",
+                               '[workspace.dependencies]\n'
+                               'client = { package = "st3-client", path = "crates/st3-client" }\n')
+                    self.write(path, f'[{section}]\nclient = {{ workspace = true }}\n')
+                    result = self.run_script()
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("aliases st3-client as client", result.stderr)
+                    self.write("Cargo.toml",
+                               '[workspace.dependencies]\n'
+                               'st3-client = { path = "crates/st3-client" }\n')
+                    self.write(path, f'[{section}]\nst3-client = {{ workspace = true }}\n')
+                    self.assertEqual(ml.client_boundary_findings(str(self.root)), [])
+            self.write(path, "")
+
+    def test_leaf_crates_reject_client_api_in_all_cargo_target_directories(self):
+        for crate in ("st3-kernel", "st3-telemetry"):
+            for target in ("tests", "benches", "examples"):
+                with self.subTest(crate=crate, target=target):
+                    path = f"crates/{crate}/{target}/nested/client.rs"
+                    self.write(path, "use st3_client::Client;\n")
+                    result = self.run_script()
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(path + ":1: forbidden st3_client reference", result.stderr)
+                    self.write(path, "")
+
     def split_packages(self, daemon_version="0.1.0", daemon_deps="", build=True, binary_deps=""):
         self.write("crates/st3/Cargo.toml", f'[package]\nname = "st3"\nversion = "0.1.0"\n\n[dependencies]\nstui = "1"\n{binary_deps}')
         self.write("crates/st3-daemon/Cargo.toml",

@@ -243,6 +243,82 @@ def layers(edges):
 BINARY_SIDE_CRATES = ("stui", "st3-conversation-ui")
 
 
+def client_alias_findings(manifest_path, workspace_dependencies):
+    """Reject renamed client dependencies after resolving workspace inheritance."""
+    if not os.path.isfile(manifest_path):
+        return []
+    with open(manifest_path, "rb") as handle:
+        manifest = tomllib.load(handle)
+    problems = []
+
+    def inspect(table, location=()):
+        for key, value in table.items():
+            if not isinstance(value, dict):
+                continue
+            if key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                for name, spec in value.items():
+                    resolved = workspace_dependencies.get(name, {}) \
+                        if isinstance(spec, dict) and spec.get("workspace") is True else spec
+                    package = resolved.get("package", name) if isinstance(resolved, dict) else name
+                    if name != "st3-client" and package == "st3-client":
+                        section = ".".join((*location, key))
+                        problems.append(
+                            f"{manifest_path}: [{section}] aliases st3-client as {name}; "
+                            "the client dependency must retain its canonical name"
+                        )
+            else:
+                inspect(value, (*location, key))
+
+    inspect(manifest)
+    return problems
+
+
+def client_boundary_findings(root):
+    """The kernel and telemetry may not reach the standalone client's API."""
+    problems = []
+    workspace_dependencies = {}
+    workspace_manifest = os.path.join(root, "Cargo.toml")
+    if os.path.isfile(workspace_manifest):
+        with open(workspace_manifest, "rb") as handle:
+            workspace_dependencies = tomllib.load(handle).get("workspace", {}).get("dependencies", {})
+    for crate in ("st3-kernel", "st3-telemetry"):
+        crate_directory = os.path.join(root, "crates", crate)
+        problems.extend(client_alias_findings(
+            os.path.join(crate_directory, "Cargo.toml"), workspace_dependencies
+        ))
+        for target in ("src", "tests", "benches", "examples"):
+            for base, _, names in os.walk(os.path.join(crate_directory, target)):
+                for name in sorted(names):
+                    if not name.endswith(".rs"):
+                        continue
+                    path = os.path.join(base, name)
+                    with open(path, errors="replace") as handle:
+                        source = strip_comments(handle.read())
+                    # Literals (including source snippets in tests) do not name a crate.
+                    code, cursor = [], 0
+                    while cursor < len(source):
+                        end = _skip_literal(source, cursor)
+                        if end != cursor:
+                            code.append("".join("\n" if c == "\n" else " " for c in source[cursor:end]))
+                            cursor = end
+                        else:
+                            code.append(source[cursor])
+                            cursor += 1
+                    source = "".join(code)
+                    for match in re.finditer(r"\bst3_client\b", source):
+                        allowed = False
+                        # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-state-dirs-fractal — DELETE at contraction — #3032
+                        # The standalone client owns the single R11 directory resolver.
+                        allowed = re.match(r"\s*::\s*product_dirs\b", source[match.end():]) is not None
+                        # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-state-dirs-fractal
+                        if not allowed:
+                            line = source.count("\n", 0, match.start()) + 1
+                            problems.append(
+                                f"{os.path.relpath(path, root)}:{line}: forbidden st3_client reference"
+                            )
+    return problems
+
+
 def crate_findings(root):
     """Facts about the st3 and st3-daemon packages that docs/st3/crate-contract.md promises.
 
@@ -319,7 +395,7 @@ def findings(root):
     cycle = find_cycle(without(edges, allowed & present))
     if cycle:
         problems.append("module cycle outside the allowlist: " + " -> ".join(cycle))
-    return problems + crate_findings(root)
+    return problems + crate_findings(root) + client_boundary_findings(root)
 
 
 def reverse_closure(edges, start):

@@ -426,16 +426,18 @@ fn span_batch_config() -> BatchConfig {
 }
 
 fn cli_backoff_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(runtime).join("st3/otel-cli-backoff"));
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
         .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".local/state"))
         })?;
-    Some(base.join("st3/otel-cli-backoff"))
+    Some(st3_client::product_dirs::resolve(base.join("st3"), base.join("fractal")).join("otel-cli-backoff"))
 }
 
 fn unix_seconds() -> u64 {

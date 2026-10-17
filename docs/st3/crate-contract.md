@@ -4,8 +4,8 @@ Five packages carry what used to be the single `st3` package and its end-to-end 
 
 | package | path | holds |
 |---|---|---|
-| `st3-kernel` | `crates/st3-kernel` | the library's leaf modules, which name no store, api or reconcile code: `accounts`, `archive`, `boot`, `cli_output`, `config`, `conversation_header`, `conversation_search`, `disk`, `evidence`, `fleet`, `gate_kinds`, `gate_report`, `github_admission`, `harness_events`, `hooks`, `instance`, `lane`, `memory`, `model`, `native_views`, `pricing`, `projection`, `publication`, `read_cache`, `rules`, `seat_queue`, `skill`, `terminal_binding`. st3-daemon re-exports each one at its old path (`pub use st3_kernel::model;`), so `crate::model` and `st3::model` read the same |
-| `st3-telemetry` | `crates/st3-telemetry` | the library's telemetry modules, which name no store, api, client or reconcile code: `incremental`, `otel`, `otel_client_class`, `otlp`, `reconcile_telemetry`, `recorder`, `recorder_report`, `relay_trace`, `slo`, `slo_history`, `startup_telemetry`, `telemetry`. It depends on `st3-kernel` and `smallclaims`. st3-daemon re-exports each one at its old path. What would name the store or the API is a trait the daemon implements (`incremental::ChangeSource`, `otlp::ObservationSource`) or a value the caller passes (`telemetry::hook`'s submit, `otlp::run_slo`'s windows reader). `recorder_receipts` writes claims through the store and stays in st3-daemon; the unit tests that need the store, the graph or the API live in st3-daemon's `telemetry_tests` |
+| `st3-kernel` | `crates/st3-kernel` | the library's leaf modules, which name no store, api or reconcile code: `accounts`, `archive`, `boot`, `cli_output`, `config`, `conversation_header`, `conversation_search`, `disk`, `evidence`, `fleet`, `gate_kinds`, `gate_report`, `github_admission`, `harness_events`, `hooks`, `instance`, `lane`, `memory`, `model`, `native_views`, `pricing`, `projection`, `publication`, `read_cache`, `rules`, `seat_queue`, `skill`, `terminal_binding`. st3-daemon re-exports each one at its old path (`pub use st3_kernel::model;`), so `crate::model` and `st3::model` read the same. <!-- LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-state-dirs-fractal — DELETE at contraction — #3032 --> R11 allows the dependency on `st3-client` only for `st3_client::product_dirs`: the standalone client owns the single resolver for the R11 state-directory migration. <!-- LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-state-dirs-fractal --> |
+| `st3-telemetry` | `crates/st3-telemetry` | the library's telemetry modules, which name no store, api, client or reconcile code: `incremental`, `otel`, `otel_client_class`, `otlp`, `reconcile_telemetry`, `recorder`, `recorder_report`, `relay_trace`, `slo`, `slo_history`, `startup_telemetry`, `telemetry`. It depends on `st3-kernel` and `smallclaims`. st3-daemon re-exports each one at its old path. What would name the store or the API is a trait the daemon implements (`incremental::ChangeSource`, `otlp::ObservationSource`) or a value the caller passes (`telemetry::hook`'s submit, `otlp::run_slo`'s windows reader). `recorder_receipts` writes claims through the store and stays in st3-daemon; the unit tests that need the store, the graph or the API live in st3-daemon's `telemetry_tests`. <!-- LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-state-dirs-fractal — DELETE at contraction — #3032 --> R11 allows the dependency on `st3-client` only for `st3_client::product_dirs`: the standalone client owns the single resolver for the R11 state-directory migration. <!-- LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-state-dirs-fractal --> |
 | `st3-daemon` | `crates/st3-daemon` | the library: the claims graph, store, API, reconciliation and every module the daemon runs, its `hooks/`, `fixtures/` and `proptest-regressions/` |
 | `st3` | `crates/st3` | the `st3` binary (`main.rs` and the modules only the binary uses: `cli_help`, `completion`, `directive_note`, `doctor_cli`, `change_cli`, `presentation`, `setup`, `onboarding`), the `st3-fixture` binary, `build.rs`, `tests/`, `examples/`, and an empty library target (`src/package_marker.rs`, see below) |
 | `st3-e2e` | `crates/st3-e2e` | tests only: the tests that start a real daemon and drive a client or the feed against it (st3-client's `device_signing` and `transports`, the st3-feed tests). `st3-client` and `st3-feed` no longer have a dev-dependency on `st3-daemon`; `st3-client` had one, which closed a cycle with the daemon. |
@@ -55,8 +55,23 @@ macros. Other crates use a part of it:
   `test_support`; a kernel unit test that needs daemon code (intent parsing, a store constant) lives
   in st3-daemon's `kernel_tests` and reaches the kernel through the re-exports. A module joins the
   kernel once nothing it names (in production code or its tests) is outside the kernel.
+  <!-- LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-state-dirs-fractal — DELETE at contraction — #3032 -->
+  The sole R11 exception is `st3_client::product_dirs`: the standalone client owns
+  the single resolver for the R11 state-directory migration. No other client API
+  is allowed, including through crate aliases or grouped root imports.
+  Remove this edge and its resolver at migration contraction.
+  <!-- LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-state-dirs-fractal -->
 - **st3-telemetry names nothing above the kernel.** Its modules reach `st3_kernel` and `smallclaims` only.
   Two tests read source files through `include_str!`: `startup_telemetry` reads `crates/st3/src/main.rs`
   (`../../st3/src/main.rs`) and `slo` reads `crates/st3-daemon/src/api.rs` (`../../st3-daemon/src/api.rs`).
+  <!-- LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-state-dirs-fractal — DELETE at contraction — #3032 -->
+  The sole R11 exception is `st3_client::product_dirs`, for the same standalone
+  resolver ownership reason. `scripts/check-module-layers` enforces this exact
+  namespace exception in `src/`, `tests/`, `benches/` and `examples/` of both crates;
+  all other client API paths remain forbidden. Renaming `st3-client` in any
+  dependency table, including dev/build and target-specific dependencies resolved
+  through `[workspace.dependencies]`, is forbidden as well.
+  Remove this edge and its resolver at contraction.
+  <!-- LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-state-dirs-fractal -->
 
 `scripts/check-module-layers` reports the first three.

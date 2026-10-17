@@ -30,7 +30,7 @@ pub fn conversation_first(prefs: &Prefs) -> Option<bool> {
     prefs.conversation_first
 }
 
-/// `$XDG_STATE_HOME/st3/stui/prefs.json` (or under `~/.local/state`).
+/// Preferences below the selected product state directory.
 pub fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -38,7 +38,8 @@ pub fn path() -> Option<PathBuf> {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
         })?;
     base.is_absolute()
-        .then(|| base.join("st3").join("stui").join("prefs.json"))
+        .then(|| st3_client::product_dirs::resolve(base.join("st3"), base.join("fractal"))
+            .join("stui").join("prefs.json"))
 }
 
 pub fn load(path: &Path) -> Prefs {
