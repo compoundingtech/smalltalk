@@ -47,10 +47,10 @@ impl Checkout {
         let repository = std::fs::canonicalize(&self.repository)
             .with_context(|| format!("repository {} is unavailable", self.repository.display()))?;
         let repository =
-            crate::repositories::workspace_repository(&repository).unwrap_or(repository);
+            workspace_repository(&repository).unwrap_or(repository);
         anyhow::ensure!(
             workspace.join(".git").exists()
-                && crate::repositories::workspace_repository(workspace).as_ref()
+                && workspace_repository(workspace).as_ref()
                     == Some(&repository)
                 && crate::resource::checked_out_branch(workspace).as_deref() == Some(&self.branch),
             "workspace {} is not a worktree of {} on branch {}; choose a new workspace or the matching branch",
@@ -270,6 +270,33 @@ pub(crate) mod test_support {
         );
         clone
     }
+}
+
+/// Read Git's directory pointers on the owning host during reconciliation. Checks only the
+/// declared workspace and its ancestors, with no search through other host directories.
+pub(crate) fn workspace_repository(workspace: &Path) -> Option<PathBuf> {
+    let workspace = std::fs::canonicalize(workspace).ok()?;
+    for root in workspace.ancestors() {
+        let dot_git = root.join(".git");
+        if dot_git.is_dir() {
+            return Some(root.to_path_buf());
+        }
+        if dot_git.is_file() {
+            let pointer = std::fs::read_to_string(dot_git).ok()?;
+            let git_dir = root.join(pointer.strip_prefix("gitdir:")?.trim());
+            if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
+                let common = std::fs::canonicalize(git_dir.join(common.trim())).ok()?;
+                return Some(if common.file_name().is_some_and(|name| name == ".git") {
+                    common.parent()?.to_path_buf()
+                } else {
+                    // Bare repositories keep their shared Git directory at the repository root.
+                    common
+                });
+            }
+            return Some(root.to_path_buf());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

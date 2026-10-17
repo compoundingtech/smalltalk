@@ -43,6 +43,26 @@ pub const PROVIDER_CONTINUE_MS: u128 = 1_000;
 
 pub use crate::github_admission::ProviderRateLimit;
 
+/// The resource a GitHub repository's observations land on: `resource/github/OWNER/REPO`.
+pub fn default_resource(locator: &str) -> String {
+    format!("resource/github/{}", locator.to_ascii_lowercase())
+}
+mod observer_condition;
+pub(crate) use observer_condition::ObserverCondition;
+#[cfg(test)]
+pub(crate) use observer_condition::RATE_LIMIT_RESET_GRACE_MS;
+
+/// Whether `seen` is the same comment as `known` or one created after it.
+pub(crate) fn newer_comment(seen: &Value, known: &Value) -> bool {
+    let created = |comment: &Value| {
+        comment
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    seen.get("id") == known.get("id") || created(seen) >= created(known)
+}
+
 /// GitHub rejected the token itself. Nothing changes until a person signs in again.
 #[derive(Debug)]
 pub struct ProviderUnauthenticated {
@@ -475,21 +495,7 @@ fn github_cache() -> &'static GithubCache {
     CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
-tokio::task_local! {
-    /// The observer whose observation sends the GitHub requests in this task.
-    static GITHUB_SPENDER: String;
-}
-
-/// Count the GitHub requests `future` sends against `observer`.
-pub(crate) async fn spend_as<F: Future>(observer: String, future: F) -> F::Output {
-    GITHUB_SPENDER.scope(observer, future).await
-}
-
-/// The reconciler supplies this task-local caller; shell variables and request
-/// headers cannot select an admission identity.
-pub(crate) fn github_spender() -> Option<String> {
-    GITHUB_SPENDER.try_with(Clone::clone).ok()
-}
+pub(crate) use crate::github_http::{github_spender, spend_as};
 
 /// Requests sent outside any observation.
 const GITHUB_UNATTRIBUTED: &str = "unattributed";
@@ -705,9 +711,7 @@ fn record_github_response(status: reqwest::StatusCode, headers: &reqwest::header
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let spender = GITHUB_SPENDER
-        .try_with(Clone::clone)
-        .unwrap_or_else(|_| GITHUB_UNATTRIBUTED.to_owned());
+    let spender = github_spender().unwrap_or_else(|| GITHUB_UNATTRIBUTED.to_owned());
     github_usage()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -902,7 +906,7 @@ async fn github_graphql(
         .context("the GitHub GraphQL response has no data")
 }
 
-pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; failed or rejected credentials are checked again after a 30-second refresh backoff. HTTP requests are never retried.";
+pub(crate) use crate::github_http::GITHUB_AUTH_REMEDY;
 
 pub(crate) use crate::github_http::github_auth;
 

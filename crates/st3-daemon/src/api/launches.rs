@@ -1247,7 +1247,7 @@ fn render_planning_graph(mission: &crate::model::MissionSpec) -> String {
                 lines.push(format!("{indent}  produces {}", product.subject));
             }
             for gate in &step.gates {
-                lines.push(format!("{indent}  gate {}", crate::graph::gate_name(gate)));
+                lines.push(format!("{indent}  gate {}", crate::gate_parse::gate_name(gate)));
             }
             if let Some(nested) = &step.nested_mission {
                 append(nested, &format!("{indent}  "), lines);
@@ -1262,7 +1262,7 @@ fn render_planning_graph(mission: &crate::model::MissionSpec) -> String {
         lines.push(format!("  produces {}", product.subject));
     }
     for gate in &mission.gates {
-        lines.push(format!("  gate {}", crate::graph::gate_name(gate)));
+        lines.push(format!("  gate {}", crate::gate_parse::gate_name(gate)));
     }
     append(mission, "  ", &mut lines);
     lines.join("\n")
