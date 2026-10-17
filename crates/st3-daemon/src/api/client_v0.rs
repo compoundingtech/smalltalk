@@ -23346,18 +23346,39 @@ mission "example/zero-run" state="ready" {
         let mut previous = None;
         let mut written = 0;
         for history in [32, 512, 7_900] {
-            for index in written..history {
+            if written == 0 {
                 state.store.append_claim(&ClaimInput {
                     subject: "agent/runtime-perf".into(),
-                    kind: if index == 0 { "runtime.observed" } else { "harness.diagnostic" }.into(),
+                    kind: "runtime.observed".into(),
                     actor: Some("agent/runtime-perf".into()),
-                    fields: serde_json::from_value(if index == 0 {
-                        json!({"runtime_id": "fixed-runtime", "status": "running", "terminal": false})
-                    } else {
-                        json!({"code": "retained-diagnostic", "reason": format!("retained diagnostic {index}")})
-                    }).unwrap(),
+                    fields: serde_json::from_value(
+                        json!({"runtime_id": "fixed-runtime", "status": "running", "terminal": false}),
+                    ).unwrap(),
                     evidence: Vec::new(), expected_subject: None, idempotency_key: None,
                 }).unwrap();
+                written = 1;
+            }
+            // The retained history goes in one transaction per step, as in the other history
+            // fixtures: one commit per diagnostic made the 7,900 of them most of the test.
+            {
+                let mut connection = state.store.connection.write();
+                let transaction = connection.transaction().unwrap();
+                for index in written..history {
+                    crate::store::append_claim_tx(
+                        &transaction,
+                        &state.store.origin,
+                        "agent/runtime-perf",
+                        "harness.diagnostic",
+                        Some("agent/runtime-perf"),
+                        &json!({"fields": {
+                            "code": "retained-diagnostic",
+                            "reason": format!("retained diagnostic {index}"),
+                        }}),
+                        &[],
+                        None,
+                    ).unwrap();
+                }
+                transaction.commit().unwrap();
             }
             written = history;
             let snapshot = new_client_snapshot(&state);
