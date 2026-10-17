@@ -7,6 +7,7 @@
 
 use super::doc::{Doc, DocExt};
 use super::screens::{Item, ListState, Listing};
+use super::objectives;
 use super::text;
 use super::theme;
 use super::view::{Load, World};
@@ -312,6 +313,8 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             });
             ids.push(id.clone());
         }
+        // Objectives and budgets sit beside the accounts, red when one needs attention.
+        objectives::list(world, &mut items, &mut ids);
         let mut total = Total::default();
         rows.iter().for_each(|row| total.add(row));
         items.push(Item::Header {
@@ -357,6 +360,9 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             ))));
         }
     }
+    if rows.is_empty() && world.usage_limits.is_empty() {
+        objectives::list(world, &mut items, &mut ids);
+    }
     if let Some(estimate) = &world.agent_messages {
         items.push(Item::Header {
             title: "agent messages, daily (UTC)".into(),
@@ -401,7 +407,8 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
         Load::Ready(rows)
             if rows.is_empty()
                 && world.usage_limits.is_empty()
-                && world.agent_messages.is_none() =>
+                && world.agent_messages.is_none()
+                && world.slo.ready().is_none_or(|slo| slo.is_empty()) =>
         {
             ListState::Empty("No spend recorded in this period.")
         }
@@ -572,6 +579,11 @@ fn span_of(ms: u64) -> String {
 /// One group's spend in detail (the whole period's with no id): its total, how its tokens
 /// split, and where they went by step, agent, model and host.
 pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc {
+    if let Some(id) = id
+        && objectives::slo_id(id).is_some()
+    {
+        return objectives::detail(world, id, hours, width);
+    }
     let mut doc = Doc::new();
     let rows = match &world.usage {
         Load::Ready(rows) => rows,

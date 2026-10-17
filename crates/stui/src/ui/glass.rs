@@ -5394,6 +5394,8 @@ mod tests {
     fn usage_in_a_narrow_pane_reads_whole_a_limit_to_a_line_and_notes_wrapped() {
         // Nathan, 2026-10-06: the usage view was cut off and double spaced.
         let mut ui = glass();
+        // Without objectives and budgets, which the next test covers, so the summary stays on screen.
+        ui.world.slo = Load::Ready(Vec::new());
         ui.toggle_usage();
         let shown = screen(&ui);
         let lines = shown.lines().collect::<Vec<_>>();
@@ -5508,6 +5510,45 @@ mod tests {
     }
 
     #[test]
+    fn usage_shows_objectives_and_budgets_red_when_missed_or_nearly_spent_and_charts_the_selection() {
+        let mut ui = glass();
+        ui.click(Hit::Usage);
+        let shown = screen(&ui);
+        for text in ["accounts", "budgets", "objectives", "request-latency", "0% left", "anthropic-weekl", "6% left"] {
+            assert!(shown.contains(text), "the Usage list shows {text}:\n{shown}");
+        }
+        // A missed objective and a nearly spent budget draw red; a met one does not.
+        let red_rows = |ui: &Ui| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            terminal.draw(|frame| ui.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .filter(|y| (0..buffer.area.width).any(|x| buffer[(x, *y)].fg == theme::RED))
+                .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let red = red_rows(&ui);
+        assert!(red.contains("request-latency") && red.contains("anthropic-weekl"), "{red}");
+        assert!(!red.contains("openai-weekly") && !red.contains("94% left") && !red.contains("59% left"), "{red}");
+        // Selecting the missed objective opens its explanation and chart.
+        for _ in 0..40 {
+            if ui.selected_id().as_deref() == Some("slo/request-latency") {
+                break;
+            }
+            press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(ui.selected_id().as_deref(), Some("slo/request-latency"));
+        let detail = screen(&ui);
+        assert!(detail.contains("error budget left · last 24 hours"), "{detail}");
+        assert!(detail.contains("Ninety-nine in a"), "{detail}");
+        assert!(detail.contains("100% │"), "{detail}");
+        if std::env::var_os("SLO_PANE_SCREEN").is_some() {
+            println!("{detail}");
+        }
+    }
+
+    #[test]
     fn inventory_demand_tracks_the_shown_sidebar_and_usage_overlay() {
         let mut ui = glass();
         let initial = ui.inventories_wanted();
@@ -5529,6 +5570,7 @@ mod tests {
     #[test]
     fn usage_floats_over_the_glass_and_a_row_shows_its_spend_whatever_the_list_groups_by() {
         let mut ui = glass();
+        ui.world.slo = Load::Ready(Vec::new());
         assert_eq!(ui.usage_wanted(), None, "nothing shows usage yet");
         ui.click(Hit::Usage);
         assert_eq!(ui.usage_wanted(), Some(24));

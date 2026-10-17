@@ -41,6 +41,10 @@ pub struct Extras {
     pub summary: Option<st3_client::Summary>,
     pub inventory_supported: Option<bool>,
     pub inventory_partial: Vec<String>,
+    /// Objectives and budgets read on demand while the Usage view shows, and the history of
+    /// each one that was selected.
+    pub slo: Load<Vec<st3_client::SloRow>>,
+    pub slo_history: BTreeMap<String, Load<st3_client::SloHistory>>,
 }
 
 fn now() -> String {
@@ -253,6 +257,8 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
             Some(Ok(period)) => period.agent_messages.clone(),
             _ => None,
         },
+        slo: extras.slo.clone(),
+        slo_history: extras.slo_history.clone(),
         clients: match &model.clients {
             Some(Ok(list)) => Load::Ready(
                 list.items

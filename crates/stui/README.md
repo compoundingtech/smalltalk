@@ -197,3 +197,12 @@ partial windows stay visible. Connection generations fence legacy results, so a
 late read cannot replace a newer member's streamed rows. The actual-binary idle
 transport test runs `scripts/stui-test-client --classic` with `STUI_TIMING_LOG`
 on a private daemon, holding Fleet and Usage idle beyond every old read interval.
+
+The Usage tab also lists budgets and objectives under the accounts. A budget is an allowance that
+resets (an account's weekly or 5-hour limit); an objective is a target over a window with an error
+budget. A row is red when its objective is missed or its budget has 10% or less left, and selecting
+a row shows its target, current reading, the daemon's plain-language explanation and a chart of the
+budget left over the period. The rows come from `slo.list` and the chart from `slo.history`, both
+read from this member's daemon: the list is read when Usage is shown and again when a limits reading
+changes, never on a timer, and the chart once for each selected row and period. A member without
+the routes shows that its daemon needs an update.

@@ -399,6 +399,10 @@ enum Fetched {
     /// The Fleet tab's machines and paired devices.
     Observations { generation: u64, outcome: Result<(Vec<st3_client::ResourceObservation>, bool), String> },
     Inventory { generation: u64, result: InventoryRead },
+    /// The objectives and budgets the Usage view shows, or why st could not say.
+    Slo { generation: u64, outcome: Result<Vec<st3_client::SloRow>, String> },
+    /// What was left of one objective or budget across the chart period.
+    SloHistory { generation: u64, id: String, outcome: Result<st3_client::SloHistory, String> },
     /// st's conversation search for the palette's query, or why st could not say.
     Said(String, Result<st3_client::ConversationSearch, String>),
     /// A send finished: the pending token and st's message id, or why it failed and whether st's
@@ -624,6 +628,13 @@ pub fn run(context: Context) -> Result<()> {
     let mut inventory_grace = InventoryGrace::default();
     let mut inventory_sent: Option<Inventories> = None;
     let mut usage_wanted_hours = None;
+    // Objectives and budgets are read when the Usage view shows and again when an account's
+    // limits are measured anew, never on a timer; a chart is read once per selection and period.
+    let mut slo_shown = false;
+    let mut slo_signature: Option<u64> = None;
+    let mut slo_stale = false;
+    let mut slo_reading = false;
+    let mut slo_history_asked = BTreeSet::<(String, u64)>::new();
     let mut legacy_requested = BTreeSet::new();
     // When each polled inventory first failed on this run of failures: a read that fails for a
     // moment (a daemon catching up) is not said; one that keeps failing is.
@@ -717,6 +728,7 @@ pub fn run(context: Context) -> Result<()> {
                     extras.inventory_supported = None;
                     extras.inventory_partial.clear();
                     inventory_sent = None; legacy_requested.clear(); legacy_pending.clear();
+                    slo_stale = true; slo_reading = false; slo_history_asked.clear();
                     extras.live = false;
                     attached = None;
                     shown_tab = usize::MAX;
@@ -1245,6 +1257,27 @@ pub fn run(context: Context) -> Result<()> {
                         InventoryRead::Usage(_, _) => {},
                     }
                 }
+                Fetched::Slo { generation, outcome } => {
+                    slo_reading = false;
+                    if generation != resources_generation { continue; }
+                    match outcome {
+                        Ok(rows) => {
+                            extras.slo = Load::Ready(rows);
+                            // A chart open now is read again beside the fresh rows.
+                            slo_history_asked.clear();
+                        }
+                        Err(why) if matches!(extras.slo, Load::Ready(_)) => ui.flash(format!("Could not read objectives and budgets again: {why}")),
+                        Err(why) => extras.slo = Load::Failed(why),
+                    }
+                }
+                Fetched::SloHistory { generation, id, outcome } => {
+                    if generation != resources_generation { continue; }
+                    match outcome {
+                        Ok(history) => { extras.slo_history.insert(id, Load::Ready(history)); }
+                        Err(why) if matches!(extras.slo_history.get(&id), Some(Load::Ready(_))) => ui.flash(format!("Could not read the chart again: {why}")),
+                        Err(why) => { extras.slo_history.insert(id, Load::Failed(why)); }
+                    }
+                }
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
                 Fetched::TerminalStarted(id) => ui.terminal_started(id),
                 Fetched::Native { agent, direct } => {
@@ -1360,6 +1393,40 @@ pub fn run(context: Context) -> Result<()> {
         let visible = ui.inventories_wanted();
         if let Some(hours) = visible.usage_hours && usage_wanted_hours != Some(hours) {
             usage_wanted_hours = Some(hours); model.usage = None; changed = true;
+        }
+        let usage_shown = visible.usage_hours.is_some();
+        let signature = match &model.usage {
+            Some(Ok(period)) => period.limits.iter().map(|limit| limit.measured_at_unix_ms).max(),
+            _ => None,
+        };
+        if usage_shown && (!slo_shown || signature != slo_signature) { slo_stale = true; }
+        slo_shown = usage_shown;
+        slo_signature = signature;
+        if usage_shown && extras.live && slo_stale && !slo_reading {
+            slo_stale = false; slo_reading = true;
+            let reader = client.clone(); let tx = fetched_tx.clone(); let generation = resources_generation;
+            runtime.spawn(async move {
+                let outcome = reader.slo_list().await.map(|reply| reply.value.rows).map_err(|error| super::objectives::error(&error));
+                let _ = tx.send(Fetched::Slo { generation, outcome });
+            });
+        }
+        // The chart of the objective or budget selected, or open in the focused pane.
+        let charted = selected.iter().cloned()
+            .chain(match ui.focused_pane() { Some(super::pane::Pane::Usage(Some(id))) => Some(id), _ => None })
+            .filter_map(|id| super::objectives::slo_id(&id).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        if usage_shown && extras.live && !slo_reading {
+            let hours = ui.usage_hours.min(super::objectives::CHART_HOURS);
+            for id in charted {
+                if !slo_history_asked.insert((id.clone(), hours)) { continue; }
+                let reader = client.clone(); let tx = fetched_tx.clone(); let generation = resources_generation;
+                runtime.spawn(async move {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                    let outcome = reader.slo_history(&id, Some(now.saturating_sub(hours * 3_600_000)), None, Some(super::objectives::CHART_STEPS)).await
+                        .map(|reply| reply.value).map_err(|error| super::objectives::error(&error));
+                    let _ = tx.send(Fetched::SloHistory { generation, id, outcome });
+                });
+            }
         }
         if extras.inventory_supported == Some(true) {
             let held = inventory_grace.followed(visible, Instant::now());

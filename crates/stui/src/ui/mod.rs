@@ -48,6 +48,7 @@ pub mod requests;
 pub mod screens;
 pub mod text;
 pub mod theme;
+mod objectives;
 mod usage;
 mod voice;
 // The live client fills the variants and fields the demo does not use.

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Show objectives and budgets in the terminal UI usage pane, red when an objective is missed or a budget is nearly spent, with a chart of the selected row",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, projection or replay change; the pane reads slo.list and slo.history."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client-only change. Against a daemon without the slo routes the pane says its daemon needs an update."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal restart on deploy."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to configure."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swapping back to an older build removes the rows from the pane."
+  }
+}
