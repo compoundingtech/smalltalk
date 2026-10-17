@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { markStart, measureEnd } from './perfMarks.ts'
 import { useAtomValue } from '@effect/atom-react'
 import { systemEventsPreference } from './conversationPreferences.ts'
 import { EmbraceComposer } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx'
@@ -66,22 +67,37 @@ export const ConversationPane = ({
   }, [visible, state._tag])
   React.useLayoutEffect(() => {
     const node = boundary.current
-    if (node === null || ux === undefined || !visible || !observed) return
+    if (node === null || !visible || !observed) return
     let cancelPaint: (() => void) | undefined
+    let cancelOpen: (() => void) | undefined
+    let cancelSwitch: (() => void) | undefined
+    let tailFrame = 0
     const committed = () => {
-      if (cancelPaint !== undefined) return
+      if (tailFrame !== 0) return
       const lane = node.querySelector('[data-testid="transcript-scroll"]')
       if (lane === null || lane.querySelector('[data-testid="transcript-placeholder"]') !== null) return
       if (lane.querySelector(hasTurns ? '[data-testid="transcript-turn"]' : '[data-testid="transcript-empty"]') === null) return
-      cancelPaint = ux.transcriptCommitted(agentRef)
-      observer.disconnect()
+      if (cancelOpen === undefined) {
+        cancelOpen = measureEnd('open_transcript', agentRef)
+        cancelPaint = ux?.transcriptCommitted(agentRef)
+      }
+      // The viewport's own frame restores/pins its scroll position first. A restored
+      // reading position is not a tail sample: wait until the actual tail is shown.
+      tailFrame = requestAnimationFrame(() => {
+        tailFrame = 0
+        if (lane.scrollHeight - lane.clientHeight - lane.scrollTop > 2) return
+        cancelSwitch = measureEnd('switch_to_tail', agentRef)
+        observer.disconnect()
+        node.removeEventListener('scroll', committed, true)
+      })
     }
     // The external-store runtime adopts messages after the parent's layout commit.
     // Observe only this visible pane, and stop after its first real content commit.
     const observer = new MutationObserver(committed)
     observer.observe(node, { childList: true, subtree: true })
+    node.addEventListener('scroll', committed, true)
     committed()
-    return () => { observer.disconnect(); cancelPaint?.() }
+    return () => { observer.disconnect(); node.removeEventListener('scroll', committed, true); cancelAnimationFrame(tailFrame); cancelPaint?.(); cancelOpen?.(); cancelSwitch?.() }
   }, [agentRef, observed, hasTurns, ux, visible])
   // Diagnostics stay in data-wf-* attributes; the kit renders only the fixed unavailable copy.
   return <div ref={boundary} style={{ display: 'contents' }} aria-hidden={!visible}
@@ -173,7 +189,11 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     <LiveAgentAlerts agentRef={agentRef} items={state._tag === 'Observed' ? state.items : []} ux={ux} />
     <LiveAgentTodos agentRef={agentRef} />
     {/* An unreadable conversation keeps its composer and draft; the binding names why sending waits. */}
-    <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, paddingBottom: spaceVars.lg }}>
+    <div data-testid="conversation-composer-dock" onInputCapture={(event) => {
+      if (!(event.target instanceof HTMLTextAreaElement)) return
+      markStart('keystroke_paint')
+      measureEnd('keystroke_paint')
+    }} style={{ flexShrink: 0, paddingBottom: spaceVars.lg }}>
       <EmbraceComposer variant="C1" readingColumn disabledReason={binding.disabledReason} {...(stopRefusal === undefined ? {} : { stopRefusal: stopRefusal.detail })} />
     </div>
   </EmbraceRuntimeProvider>
