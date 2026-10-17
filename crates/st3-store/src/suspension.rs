@@ -200,12 +200,17 @@ fn evidence(claim: &ClaimRecord, index: usize) -> Option<&str> {
 }
 
 /// The seat's requester-authored suspends and resumes, oldest first.
-fn requests(store: &Store, subject: &str) -> Result<Vec<ClaimRecord>> {
+fn requests(store: &Store, subject: &str, at: Option<u64>) -> Result<Vec<ClaimRecord>> {
     let mut requests = store.claims_for(subject, Some("runtime.action.requested"))?;
     requests.retain(|claim| {
-        claim.actor.is_some() && matches!(action(claim), Some("suspend" | "resume"))
+        at.is_none_or(|index| claim.store_index <= index)
+            && claim.actor.is_some() && matches!(action(claim), Some("suspend" | "resume"))
     });
     Ok(requests)
+}
+
+fn operation_at(store: &Store, key: &str, at: Option<u64>) -> Result<Option<ClaimRecord>> {
+    Ok(store.operation_claim(key)?.filter(|claim| at.is_none_or(|index| claim.store_index <= index)))
 }
 
 fn apply_failure(state: &mut Suspension, claim: &ClaimRecord) {
@@ -227,7 +232,7 @@ fn apply_failure(state: &mut Suspension, claim: &ClaimRecord) {
 }
 
 /// The phase of the suspend request `request`.
-fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
+fn suspend_state(store: &Store, request: &ClaimRecord, at: Option<u64>) -> Result<Suspension> {
     let mut state = Suspension {
         action: "suspend".into(),
         phase: "quiescing".into(),
@@ -239,12 +244,12 @@ fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
         requested_at_unix_ms: request.accepted_at_unix_ms,
         ..Suspension::default()
     };
-    if let Some(failed) = store.operation_claim(&suspend_failed_key(&request.id))? {
+    if let Some(failed) = operation_at(store, &suspend_failed_key(&request.id), at)? {
         state.phase = "failed".into();
         apply_failure(&mut state, &failed);
         return Ok(state);
     }
-    let snapshot = store.operation_claim(&suspend_snapshot_key(&request.id))?;
+    let snapshot = operation_at(store, &suspend_snapshot_key(&request.id), at)?;
     if let Some(snapshot) = &snapshot {
         state.phase = "snapshotting".into();
         state.harness = field(snapshot, "harness").map(str::to_owned);
@@ -252,7 +257,7 @@ fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
         state.source_host = field(snapshot, "source_host").map(str::to_owned);
         state.updated_at_unix_ms = snapshot.accepted_at_unix_ms;
     }
-    if let Some(completed) = store.operation_claim(&suspend_completed_key(&request.id))? {
+    if let Some(completed) = operation_at(store, &suspend_completed_key(&request.id), at)? {
         state.phase = "suspended".into();
         state.suspended_at_unix_ms = Some(completed.accepted_at_unix_ms);
         state.updated_at_unix_ms = completed.accepted_at_unix_ms;
@@ -264,18 +269,26 @@ fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
 /// applies. A stop or an applied launch change ends it. A pending manual publication still
 /// selects the incumbent launch for suspension and resume.
 pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
-    let requests = requests(store, subject)?;
+    current_at(store, subject, None)
+}
+
+/// Suspend/resume evidence and launch ancestry at a client snapshot.
+pub fn current_at(store: &Store, subject: &str, at: Option<u64>) -> Result<Option<Suspension>> {
+    let requests = requests(store, subject, at)?;
     let Some(request) = requests.last() else {
         return Ok(None);
     };
-    if store.selected_desired_kind(subject)?.as_deref() != Some("agent") {
+    // Only an agent declaration at this snapshot can be suspended; a stopped seat has none,
+    // whatever manual launch is still pending.
+    if store.selected_desired_kind_at(subject, at)?.as_deref() != Some("agent") {
         return Ok(None);
     }
-    let lineage = store.suspension_lineage(subject)?;
+    let lineage = store.suspension_lineage_at(subject, at)?;
+    let visible = |index: u64| at.is_none_or(|at| index <= at);
     let mut moved = false;
     if action(request) == Some("resume") && field(request, "host").is_some() {
         for token in &lineage {
-            if store.claim_by_id(token)?.is_some_and(|selected| {
+            if store.claim_by_id(token)?.filter(|claim| visible(claim.store_index)).is_some_and(|selected| {
                 selected.body.get("evidence").and_then(Value::as_array)
                     .is_some_and(|items| items.iter().any(|id| id.as_str() == Some(&request.id)))
             }) { moved = true; break; }
@@ -285,17 +298,17 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
         .is_some_and(|token| lineage.iter().any(|item| item == token));
     if !applies
         && let Some(token) = evidence(request, 0)
-        && let Some((incumbent, _)) = crate::rollout::pending_manual_launch(store, subject)?
+        && let Some((incumbent, _)) = crate::rollout::pending_manual_launch_at(store, subject, at)?
     {
-        let incumbent_lineage = store.suspension_lineage_from(&incumbent)?;
-        let request_lineage = store.suspension_lineage_from(token)?;
+        let incumbent_lineage = store.suspension_lineage_from_at(&incumbent, at)?;
+        let request_lineage = store.suspension_lineage_from_at(token, at)?;
         applies = request_lineage.iter().any(|token| incumbent_lineage.contains(token));
     }
     if !moved && !applies {
         return Ok(None);
     }
     if action(request) == Some("suspend") {
-        return suspend_state(store, request).map(Some);
+        return suspend_state(store, request, at).map(Some);
     }
     // A resume names the suspend it resumes; without that suspension it has nothing to resume.
     let Some(suspend) =
@@ -303,7 +316,7 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
     else {
         return Ok(None);
     };
-    let mut state = suspend_state(store, suspend)?;
+    let mut state = suspend_state(store, suspend, at)?;
     if state.phase != "suspended" {
         return Ok(None);
     }
@@ -316,7 +329,7 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
     state.source_host = field(request, "source_host").map(str::to_owned).or(state.source_host);
     state.phase = if state.host.is_some() { "fencing-source" } else { "restoring" }.into();
     for (suffix, phase) in [("transfer", "transferring"), ("restored", "restoring")] {
-        if let Some(claim) = store.operation_claim(&format!("agent-resume-{suffix}:{}", request.id))? {
+        if let Some(claim) = operation_at(store, &format!("agent-resume-{suffix}:{}", request.id), at)? {
             state.phase = phase.into();
             state.updated_at_unix_ms = claim.accepted_at_unix_ms;
         }
@@ -326,22 +339,30 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
     if moved && matches!(state.phase.as_str(), "fencing-source" | "transferring") {
         state.phase = "restoring".into();
     }
-    if let Some(failed) = store.operation_claim(&resume_failed_key(&request.id))? {
+    if let Some(failed) = operation_at(store, &resume_failed_key(&request.id), at)? {
         // A resume that fails leaves the seat suspended on the same snapshot, with the reason.
         state.phase = "suspended".into();
         apply_failure(&mut state, &failed);
         return Ok(Some(state));
     }
-    if let Some(started) = store.operation_claim(&resume_started_key(&request.id))? {
+    if let Some(started) = operation_at(store, &resume_started_key(&request.id), at)? {
         state.phase = "verifying".into();
         state.updated_at_unix_ms = started.accepted_at_unix_ms;
     }
-    if let Some(completed) = store.operation_claim(&resume_completed_key(&request.id))? {
+    if let Some(completed) = operation_at(store, &resume_completed_key(&request.id), at)? {
         state.phase = "resumed".into();
         state.incarnation_id = field(&completed, "incarnation_id").map(str::to_owned);
         state.updated_at_unix_ms = completed.accepted_at_unix_ms;
     }
     Ok(Some(state))
+}
+
+/// Original completed suspension, not the requester of a subsequently failed resume.
+pub fn completed_suspend_at(store: &Store, request_id: &str, at: u64) -> Result<Option<Suspension>> {
+    let Some(request) = store.claim_by_id(request_id)?.filter(|claim| claim.store_index <= at && action(claim) == Some("suspend")) else {
+        return Ok(None);
+    };
+    Ok(Some(suspend_state(store, &request, Some(at))?).filter(|state| state.phase == "suspended"))
 }
 
 /// The native session the seat's driver bound for `incarnation`, with its harness.

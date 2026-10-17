@@ -2,20 +2,46 @@ use super::*;
 use crate::rollout::{Operation, Policy, Selection};
 
 fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>, St3Error> {
+    selection_at(connection, subject, None)
+}
+
+/// The selection at a client snapshot, or the live one when `at` is `None`.
+fn selection_at(
+    connection: &Connection,
+    subject: &str,
+    at: Option<u64>,
+) -> Result<Option<Selection>, St3Error> {
     owned_sets::guard_member(connection, subject)?;
-    let Some(row) = current_desired_row(connection, subject).map_err(internal)? else {
+    let Some(row) = desired_row_at(connection, subject, at).map_err(internal)? else {
         return Ok(None);
     };
-    let desired = connection.query_row("SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
-        [subject],desired_from_row).map_err(internal)?;
-    for view in owned_sets::selected(connection, None)? {
-        let members = owned_sets::effective_members(connection, &view, None)?;
+    let desired = match at {
+        None => connection.query_row("SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
+            [subject],desired_from_row).map_err(internal)?,
+        Some(_) => {
+            let desired = serde_json::from_str(&row.body).unwrap_or(Value::Null);
+            DesiredSubject {
+                accountable: st3_schema::accountable::from_desired(&desired)
+                    .map_err(internal)?
+                    .map(str::to_owned),
+                subject: subject.into(),
+                kind: row.kind.clone(),
+                desired,
+                member: row.member.as_deref().and_then(|value| serde_json::from_str(value).ok()),
+                owner_run: row.owner_run.clone(),
+                owner_generation: row.owner_generation.clone(),
+                owner_step: None,
+            }
+        }
+    };
+    for view in owned_sets::selected(connection, at)? {
+        let members = owned_sets::effective_members(connection, &view, at)?;
         let Some((member, _, _)) = members.get(subject) else {
             continue;
         };
         // Retirement keeps the last authored seat policy even though its desired node is stop.
         let manual = if desired.kind == "stop" {
-            owned_sets::manual_member(connection, member)?
+            owned_sets::manual_member_at(connection, member, at)?
         } else {
             crate::rollout::manual(&desired)
         };
@@ -55,13 +81,23 @@ fn operation_for_selection(
     subject: &str,
     selected: &Selection,
 ) -> Result<Option<Operation>, St3Error> {
+    operation_for_selection_at(connection, subject, selected, None)
+}
+
+/// The operation `selected` has, from the claims accepted at or before `at`.
+fn operation_for_selection_at(
+    connection: &Connection,
+    subject: &str,
+    selected: &Selection,
+    at: Option<u64>,
+) -> Result<Option<Operation>, St3Error> {
     smallclaims::touched::note_read(|| subject.to_owned());
     let mut query = connection.prepare_cached(&canonical_sql(
         "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
-         FROM claims WHERE subject=?1 AND kind IN ('runtime.action.requested','runtime.action.succeeded','runtime.action.failed','runtime.action.deadline-reached')
+         FROM claims WHERE subject=?1 AND store_index<=?2 AND kind IN ('runtime.action.requested','runtime.action.succeeded','runtime.action.failed','runtime.action.deadline-reached')
          ORDER BY CANONICAL_ASC(claims)" )).map_err(internal)?;
     let claims = query
-        .query_map([subject], claim_from_row)
+        .query_map(params![subject, at.unwrap_or(i64::MAX as u64)], claim_from_row)
         .map_err(internal)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(internal)?;
@@ -71,7 +107,7 @@ fn operation_for_selection(
         .as_ref()
         .map(|m| m.host.clone())
         .or_else(|| {
-            selected_actual_source_at(connection, subject, None, None)
+            selected_actual_source_at(connection, subject, at, None)
                 .ok()
                 .and_then(|v| v.1)
         });
@@ -342,6 +378,29 @@ impl Store {
     }
     pub fn rollout_selection(&self, subject: &str) -> Result<Option<Selection>, St3Error> {
         selection(&self.readers.get(), subject)
+    }
+    /// `rollout_selection` at a client snapshot.
+    pub(crate) fn rollout_selection_at(
+        &self,
+        subject: &str,
+        at: Option<u64>,
+    ) -> Result<Option<Selection>, St3Error> {
+        selection_at(&self.readers.get(), subject, at)
+    }
+    /// The rollout of the declaration selected at a client snapshot, from claims accepted by then.
+    pub(crate) fn rollout_at(
+        &self,
+        subject: &str,
+        at: Option<u64>,
+    ) -> Result<Option<Operation>, St3Error> {
+        if at.is_none() {
+            return self.rollout(subject);
+        }
+        let connection = self.readers.get();
+        let Some(selected) = selection_at(&connection, subject, at)? else {
+            return Ok(None);
+        };
+        operation_for_selection_at(&connection, subject, &selected, at)
     }
     pub fn rollout(&self, subject: &str) -> Result<Option<Operation>, St3Error> {
         self.rollout_and_selection(subject)

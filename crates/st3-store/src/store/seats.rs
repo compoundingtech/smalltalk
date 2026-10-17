@@ -1457,6 +1457,15 @@ impl Store {
         Ok(observations)
     }
 
+    /// Suspension ancestry selected at a client snapshot; stopped declarations have none.
+    pub fn suspension_lineage_at(&self, subject: &str, at: Option<u64>) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let Some(row) = desired_row_at(&connection, subject, at)?.filter(|row| row.kind == "agent") else {
+            return Ok(Vec::new());
+        };
+        desired_lineage_from_tx(&connection, row.claim_id, same_declared_launch)
+    }
+
     /// Suspension follows all non-launch edits, independently of process retry budgets.
     pub fn suspension_lineage(&self, subject: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
@@ -1466,8 +1475,25 @@ impl Store {
         desired_lineage_from_tx(&connection, row.claim_id, same_declared_launch)
     }
 
-    pub fn suspension_lineage_from(&self, token: &str) -> Result<Vec<String>> {
-        desired_lineage_from_tx(&self.readers.get(), token.to_owned(), same_declared_launch)
+    /// Suspension ancestry from `token`, over the claims accepted at or before `at`.
+    pub fn suspension_lineage_from_at(&self, token: &str, at: Option<u64>) -> Result<Vec<String>> {
+        desired_lineage_from_at_tx(&self.readers.get(), token.to_owned(), same_declared_launch, at)
+    }
+
+    /// The kind of the declaration selected at a client snapshot.
+    pub fn selected_desired_kind_at(&self, subject: &str, at: Option<u64>) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        desired_row_at(&connection, subject, at).map(|row| row.map(|row| row.kind))
+    }
+
+    /// `latest_actual_value` at a client snapshot.
+    pub fn latest_actual_value_at(&self, subject: &str, at: Option<u64>) -> Result<Option<Value>> {
+        if at.is_none() {
+            return self.latest_actual_value(subject);
+        }
+        smallclaims::touched::note_read(|| subject.to_owned());
+        latest_actual_at(&self.readers.get(), subject, at)
     }
 
     /// Commit one restored move against the exact declaration its resume request named.
@@ -2040,6 +2066,20 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// Incarnation-bound terminal evidence at the same snapshot as the client projection.
+    pub fn terminal_harness_at(
+        &self,
+        subject: &str,
+        at_index: u64,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        // The ended harness is read from the seat's own claims, so the evaluation that reads
+        // it must be revisited when one arrives.
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        Ok(harness_fold_at(&connection, subject, Some(at_index), true, false, true)?
+            .filter(|harness| harness.state == "ended"))
     }
 
     /// The seat's harness for the one question the login attention item asks: does it need a

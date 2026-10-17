@@ -546,6 +546,18 @@ export const AgentDelivery = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentDelivery = typeof AgentDelivery.Type
 export type AgentDeliveryEncoded = typeof AgentDelivery.Encoded
 
+export const AgentEndReason = /*#__PURE__*/ (() => Schema.Struct({
+  "actor": optionalKey(Schema.String),
+  "diagnostic": optionalKey(Schema.String),
+  "ended_at": Timestamp,
+  "exit_code": optionalKey(Schema.Int),
+  "exit_signal": optionalKey(Schema.String),
+  "kind": Schema.Literals(["completed","stopped-by-person","stopped-by-agent","crashed","harness-exited","host-lost","retired"]),
+  "reason": optionalKey(Schema.String)
+}).annotate({ identifier: "AgentEndReason" }))()
+export type AgentEndReason = typeof AgentEndReason.Type
+export type AgentEndReasonEncoded = typeof AgentEndReason.Encoded
+
 export const AgentHandoff = /*#__PURE__*/ (() => Schema.Struct({
   "desired_token": Schema.String,
   "destination": Schema.String,
@@ -810,6 +822,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   /** When a `down` seat began waiting for a session; null in every other state. */
   "down_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "When a `down` seat began waiting for a session; null in every other state." }),
   "driver": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  /** Derived terminal reason; absent when evidence is missing or stale. Never infer completion from absence. */
+  "end_reason": Schema.OptionFromOptionalNullOr(AgentEndReason, NULL_NONE).annotate({ description: "Derived terminal reason; absent when evidence is missing or stale. Never infer completion from absence." }),
   /** Current member reconcile failure; cleared by a successful pass. */
   "fault": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current member reconcile failure; cleared by a successful pass." }),
   /** Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes. */

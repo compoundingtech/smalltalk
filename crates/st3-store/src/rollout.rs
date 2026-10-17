@@ -199,21 +199,31 @@ pub fn pending_manual_launch(
     store: &Store,
     subject: &str,
 ) -> Result<Option<(String, MemberSpec)>> {
-    let Some(selected) = store.rollout_selection(subject)? else {
+    pending_manual_launch_at(store, subject, None)
+}
+
+/// `pending_manual_launch` over the evidence a client snapshot `at` can see: the selected
+/// declaration, its rollout, the runtime's actual state and the launch record.
+pub(crate) fn pending_manual_launch_at(
+    store: &Store,
+    subject: &str,
+    at: Option<u64>,
+) -> Result<Option<(String, MemberSpec)>> {
+    let Some(selected) = store.rollout_selection_at(subject, at)? else {
         return Ok(None);
     };
     if !selected.manual || selected.desired.kind != "agent"
-        || store.rollout(subject)?.is_some_and(|o| o.phase != "superseded")
+        || store.rollout_at(subject, at)?.is_some_and(|o| o.phase != "superseded")
     {
         return Ok(None);
     }
-    let Some(actual) = store.latest_actual_value(subject)? else {
+    let Some(actual) = store.latest_actual_value_at(subject, at)? else {
         return Ok(None);
     };
     let Some(incarnation) = actual["incarnation_id"].as_str() else {
         return Ok(None);
     };
-    let Some((token, old)) = launched_member(store, subject, incarnation)? else {
+    let Some((token, old)) = launched_member_at(store, subject, incarnation, at)? else {
         return Ok(None);
     };
     Ok(selected.desired.member.as_ref()
@@ -226,17 +236,29 @@ pub fn launched_member(
     subject: &str,
     incarnation: &str,
 ) -> Result<Option<(String, MemberSpec)>> {
+    launched_member_at(store, subject, incarnation, None)
+}
+
+/// `launched_member` from the start receipts and declaration claims accepted at or before `at`.
+fn launched_member_at(
+    store: &Store,
+    subject: &str,
+    incarnation: &str,
+    at: Option<u64>,
+) -> Result<Option<(String, MemberSpec)>> {
+    let visible = |index: u64| at.is_none_or(|at| index <= at);
     for claim in store
         .observations_for(subject, "runtime.action.succeeded")?
         .into_iter()
         .rev()
+        .filter(|claim| visible(claim.store_index))
     {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         if fields["action"] != "start" || fields["incarnation_id"].as_str() != Some(incarnation) {
             continue;
         }
         if let Some(token) = fields["desired_token"].as_str()
-            && let Some(claim) = store.claim_by_id(token)?
+            && let Some(claim) = store.claim_by_id(token)?.filter(|claim| visible(claim.store_index))
             && let Ok(desired) = serde_json::from_value::<DesiredSubject>(claim.body)
             && let Some(member) = desired.member
         {
