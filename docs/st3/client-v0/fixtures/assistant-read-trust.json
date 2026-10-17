@@ -1,9 +1,0 @@
-{
-  "api_version": "st3.client.v0",
-  "issuer": "person/operator",
-  "key_id": "scg-attestor/placeholder-1",
-  "attestor_public_key": "placeholder-attestor-pin-not-a-real-key-000",
-  "shim_public_key": "placeholder-shim-pin-not-a-real-key-0000000",
-  "default_response_bytes": 4096,
-  "max_response_bytes": 16384
-}
