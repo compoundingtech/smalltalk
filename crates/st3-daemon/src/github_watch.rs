@@ -164,12 +164,7 @@ pub fn is_standing_observer(subject: &str, spec: &ObserverSpec) -> bool {
 
 /// The thread a watch subject names, and the seat it belongs to.
 pub fn watch_parts(subject: &str) -> Option<(ThreadRef, String)> {
-    let rest = subject.strip_prefix("subscription/watch/")?;
-    let mut parts = rest.splitn(4, '/');
-    let owner = parts.next()?;
-    let repository = parts.next()?;
-    let number = parts.next()?.parse().ok()?;
-    let agent = parts.next()?;
+    let (owner, repository, number, agent) = crate::incremental::split_watch_subject(subject)?;
     Some((
         ThreadRef {
             owner: owner.into(),

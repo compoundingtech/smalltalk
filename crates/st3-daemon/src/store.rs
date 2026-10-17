@@ -8497,7 +8497,8 @@ const LOCAL_OBSERVATION_FLOOR_QUERY: &str =
     "SELECT COALESCE(MIN(+id), (SELECT COALESCE(MAX(id), 0) + 1 FROM local_observations))
      FROM local_observations WHERE after_store_index >= ?1";
 
-const LOCAL_OBSERVATION_ID_PREFIX: &str = "local-observation/";
+use st3_kernel::model::LOCAL_OBSERVATION_ID_PREFIX;
+pub use st3_kernel::model::local_observation_position;
 
 fn local_retention(kind: &str) -> bool {
     st3_schema::registry()
@@ -9357,18 +9358,6 @@ fn publish_pending_usage_tx(
 
 fn local_observation_id(origin: &str, id: i64) -> String {
     format!("{LOCAL_OBSERVATION_ID_PREFIX}{origin}/{id}")
-}
-
-/// The local log position of a record that `append_local_observation` or a local
-/// observation read produced; `None` for a claim.
-pub fn local_observation_position(record: &ClaimRecord) -> Option<u64> {
-    record
-        .id
-        .strip_prefix(LOCAL_OBSERVATION_ID_PREFIX)?
-        .rsplit_once('/')?
-        .1
-        .parse()
-        .ok()
 }
 
 /// Claims in store order, each local observation after the claim it follows.
@@ -10989,21 +10978,36 @@ fn mailbox_harness_ended(
     Ok(true)
 }
 
-/// See [`Store::changes_since`].
-#[derive(Clone, Debug, Default)]
-pub struct ChangeFeed {
-    pub index: u64,
-    pub local: i64,
-    pub changes: Vec<Change>,
+pub use crate::incremental::{Change, ChangeFeed};
+
+impl crate::otlp::ObservationSource for Store {
+    fn export_cursor(&self) -> Result<u64> {
+        self.otlp_export_cursor()
+    }
+
+    fn observations_after(&self, cursor: u64, limit: usize) -> Result<Vec<ClaimRecord>> {
+        self.local_observations_after(cursor, limit)
+    }
+
+    fn save_export_cursor(
+        self: Arc<Self>,
+        cursor: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+        Box::pin(async move {
+            let store = self.clone();
+            self.connection
+                .write_workers()
+                .spawn_blocking(move || store.set_otlp_export_cursor(cursor))
+                .await??;
+            Ok(())
+        })
+    }
 }
 
-/// One new claim or local observation.
-#[derive(Clone, Debug)]
-pub struct Change {
-    pub subject: String,
-    pub kind: String,
-    pub actor: Option<String>,
-    pub body: String,
+impl crate::incremental::ChangeSource for Store {
+    fn changes_since(&self, index: u64, local: i64) -> Result<ChangeFeed> {
+        Store::changes_since(self, index, local)
+    }
 }
 
 fn change_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Change> {

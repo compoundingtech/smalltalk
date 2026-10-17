@@ -17,10 +17,23 @@ use sha2::{Digest as _, Sha256};
 mod slo;
 pub use slo::run as run_slo;
 
-use crate::model::ClaimRecord;
-use crate::store::{Store, local_observation_position};
+use crate::model::{ClaimRecord, local_observation_position};
 
 pub use crate::config::OtlpConfig;
+
+/// The local observation log this exporter reads and the cursor it keeps. The store implements
+/// it, so this module names no store code.
+pub trait ObservationSource: Send + Sync + 'static {
+    /// The last local observation the exporter delivered.
+    fn export_cursor(&self) -> Result<u64>;
+    /// Local observations written after `cursor`, oldest first.
+    fn observations_after(&self, cursor: u64, limit: usize) -> Result<Vec<ClaimRecord>>;
+    /// Record that every observation up to `cursor` was delivered, on the source's writer.
+    fn save_export_cursor(
+        self: Arc<Self>,
+        cursor: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+}
 
 /// The most observations sent in one request.
 pub const OTLP_BATCH: usize = 512;
@@ -70,14 +83,14 @@ impl OtlpExporter {
 
     /// Export the next batch after the stored cursor. The cursor moves only when the
     /// collector accepts the batch.
-    pub async fn export_once(&self, store: &Arc<Store>) -> Result<ExportOutcome> {
+    pub async fn export_once<S: ObservationSource>(&self, store: &Arc<S>) -> Result<ExportOutcome> {
         let cursor = {
             let store = store.clone();
-            tokio::task::spawn_blocking(move || store.otlp_export_cursor()).await??
+            tokio::task::spawn_blocking(move || store.export_cursor()).await??
         };
         let batch = {
             let store = store.clone();
-            tokio::task::spawn_blocking(move || store.local_observations_after(cursor, OTLP_BATCH))
+            tokio::task::spawn_blocking(move || store.observations_after(cursor, OTLP_BATCH))
                 .await??
         };
         let Some(last) = batch.last().and_then(local_observation_position) else {
@@ -98,8 +111,7 @@ impl OtlpExporter {
         if let Some(traces) = otlp_hook_traces(&self.node, &batch) {
             self.send(&self.traces_url, &traces).await?;
         }
-        let store = store.clone();
-        store.connection.write_workers().spawn_blocking(move || store.set_otlp_export_cursor(last)).await??;
+        store.clone().save_export_cursor(last).await?;
         Ok(ExportOutcome {
             exported: batch.len(),
             skipped,
@@ -126,7 +138,7 @@ impl OtlpExporter {
 }
 
 /// Export until the process stops. A failure backs off up to five minutes.
-pub async fn run(store: Arc<Store>, exporter: OtlpExporter) {
+pub async fn run<S: ObservationSource>(store: Arc<S>, exporter: OtlpExporter) {
     let mut backoff = Duration::from_secs(1);
     loop {
         match exporter.export_once(&store).await {
@@ -535,6 +547,7 @@ fn any_value(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
     use crate::model::ClaimInput;
     use axum::Router;
     use axum::extract::State;

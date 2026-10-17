@@ -15,7 +15,47 @@ use std::sync::Mutex;
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::store::{Change, Store};
+/// One new claim or local observation.
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub subject: String,
+    pub kind: String,
+    pub actor: Option<String>,
+    pub body: String,
+}
+
+/// What a source of changes answers: the changes after an index and a local observation, and the
+/// indexes the answer reaches.
+#[derive(Clone, Debug, Default)]
+pub struct ChangeFeed {
+    pub index: u64,
+    pub local: i64,
+    pub changes: Vec<Change>,
+}
+
+/// The change feed a pass reads. The store implements it, so this module names no store code.
+pub trait ChangeSource {
+    /// What changed after store index `index` and local observation `local`: each new claim and
+    /// local observation as subject, kind, actor and body.
+    fn changes_since(&self, index: u64, local: i64) -> Result<ChangeFeed>;
+}
+
+impl<T: ChangeSource + ?Sized> ChangeSource for std::sync::Arc<T> {
+    fn changes_since(&self, index: u64, local: i64) -> Result<ChangeFeed> {
+        (**self).changes_since(index, local)
+    }
+}
+
+/// The owner, repository, thread number and agent name of a `subscription/watch/…` subject.
+pub fn split_watch_subject(subject: &str) -> Option<(&str, &str, u64, &str)> {
+    let rest = subject.strip_prefix("subscription/watch/")?;
+    let mut parts = rest.splitn(4, '/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    let number = parts.next()?.parse().ok()?;
+    let agent = parts.next()?;
+    Some((owner, repository, number, agent))
+}
 
 /// Shared, so a file watcher or timer can mark what it changed.
 #[derive(Clone, Default)]
@@ -88,8 +128,8 @@ pub fn change_keys(change: &Change) -> Vec<String> {
             }
         }
         "intent.desired" => {
-            if let Some((_, agent)) = crate::github_watch::watch_parts(&change.subject) {
-                keys.push(format!("watches:{agent}"));
+            if let Some((_, _, _, agent)) = split_watch_subject(&change.subject) {
+                keys.push(format!("watches:agent/{agent}"));
             }
             keys.extend(field("owner_run").map(|run| format!("owned:{run}")));
             keys.extend(field("owner_step").map(|step| format!("owned-step:{step}")));
@@ -120,7 +160,7 @@ pub fn change_keys(change: &Change) -> Vec<String> {
 
 impl Incremental {
     /// Read what changed since the last pass and mark the items that read it.
-    pub fn observe(&self, store: &Store) -> Result<()> {
+    pub fn observe<S: ChangeSource + ?Sized>(&self, store: &S) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -496,6 +536,17 @@ mod tests {
     }
 
     use super::*;
+    use crate::store::Store;
+
+    #[test]
+    fn a_watch_subject_names_its_thread_and_seat() {
+        assert_eq!(
+            split_watch_subject("subscription/watch/acme/garden/12/example/planner"),
+            Some(("acme", "garden", 12, "example/planner"))
+        );
+        assert_eq!(split_watch_subject("subscription/watch/acme/garden/x/planner"), None);
+        assert_eq!(split_watch_subject("intent/acme/garden/12/planner"), None);
+    }
 
     fn change(subject: &str, kind: &str, actor: Option<&str>, body: &str) -> Change {
         Change {

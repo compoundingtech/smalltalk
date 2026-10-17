@@ -1414,7 +1414,7 @@ fn request_latency_snapshot() -> Vec<Value> {
 }
 
 /// Only the targets' live windows, for the collector: see `slo/targets.toml`.
-pub(crate) fn request_latency_target_windows() -> Value {
+pub fn request_latency_target_windows() -> Value {
     request_latency().lock().unwrap().targets_only(Instant::now())
 }
 

@@ -3233,3 +3233,18 @@ mod person_inbox_tests {
         assert!(!PERSON_HAS_NO_INBOX.contains("NO REPLY"));
     }
 }
+
+/// The id prefix of a record that `append_local_observation` produced: `local-observation/{origin}/{id}`.
+pub const LOCAL_OBSERVATION_ID_PREFIX: &str = "local-observation/";
+
+/// The local log position of a record that `append_local_observation` or a local
+/// observation read produced; `None` for a claim.
+pub fn local_observation_position(record: &ClaimRecord) -> Option<u64> {
+    record
+        .id
+        .strip_prefix(LOCAL_OBSERVATION_ID_PREFIX)?
+        .rsplit_once('/')?
+        .1
+        .parse()
+        .ok()
+}

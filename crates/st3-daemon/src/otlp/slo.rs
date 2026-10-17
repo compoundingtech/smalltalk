@@ -207,11 +207,13 @@ async fn send_once(exporter: &OtlpExporter, report: &Value, now_unix_ms: u64) ->
 
 /// Send the windows once a minute until the process stops. A failed send is reported once and
 /// dropped: the next minute's windows replace it.
-pub async fn run(exporter: OtlpExporter) {
+///
+/// `windows` reads the live request-latency windows against the targets, as the daemon's API holds them.
+pub async fn run(exporter: OtlpExporter, windows: fn() -> Value) {
     let mut failing = false;
     loop {
         tokio::time::sleep(INTERVAL).await;
-        let report = match tokio::task::spawn_blocking(crate::api::request_latency_target_windows).await {
+        let report = match tokio::task::spawn_blocking(windows).await {
             Ok(report) => report,
             Err(error) => {
                 if !failing {

@@ -6,6 +6,8 @@
 
 use super::*;
 
+pub use crate::slo::DatabaseSize;
+
 /// The `meta` key holding recent samples:
 /// `[[unix_ms, live_bytes, file_bytes, wal_bytes, main_file_bytes], ...]`, oldest first. Samples
 /// written before the files were measured have three elements.
@@ -55,35 +57,6 @@ impl Sample {
     fn physical(self) -> Option<u64> {
         Some(self.main? + self.wal?)
     }
-}
-
-/// One measurement of the store.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct DatabaseSize {
-    pub measured_at_unix_ms: u128,
-    /// The store's pages, including free ones and those committed to the WAL but not yet copied
-    /// into the main file.
-    pub file_bytes: u64,
-    /// The pages in use: the file less its free pages, which SQLite reuses before growing.
-    pub live_bytes: u64,
-    /// How much `live_bytes` grew a day, from the sample nearest a day ago (or the oldest, when
-    /// the store has been sampled for less than a day but at least an hour). Negative when
-    /// checkpoints freed more than was written.
-    pub growth_bytes_per_day: Option<i64>,
-    /// The span the growth was measured over.
-    pub growth_span_ms: Option<u128>,
-    /// The WAL file's length beside the store.
-    pub wal_bytes: u64,
-    /// The main file's length. Pages committed to the WAL and not yet copied in are not in it.
-    pub main_file_bytes: u64,
-    /// What the store takes on disk: the main file's length and the WAL's. Page counts include
-    /// pages still in the WAL, so they are not added to it.
-    pub physical_bytes: u64,
-    /// How much `physical_bytes` grew since the sample nearest exactly a day ago, within half an
-    /// hour of it, scaled to a day. Never extrapolated: none until that baseline exists.
-    pub physical_growth_bytes_per_day: Option<i64>,
-    /// The span the physical growth was measured over, within half an hour of a day.
-    pub physical_growth_span_ms: Option<u128>,
 }
 
 /// The daily physical growth at `now` for `physical` bytes, from the sample with a measured WAL
