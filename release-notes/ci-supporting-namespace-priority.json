@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Queue optional Namespace cost checks at priority 5 while preserving required checks and owned routing.",
+  "replay": {
+    "status": "none",
+    "detail": "CI queue placement only; no deployed state, protocol or assertion change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI queue placement only; no deployed state, protocol or assertion change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI queue placement only; no deployed state, protocol or assertion change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI queue placement only; no deployed state, protocol or assertion change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI queue placement only; no deployed state, protocol or assertion change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI queue placement only; no deployed state, protocol or assertion change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI queue placement only; no deployed state, protocol or assertion change."
+  }
+}

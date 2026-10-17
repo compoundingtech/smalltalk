@@ -25,6 +25,7 @@ import {
   evidenceStepNames,
   evidenceStepSteps,
   linuxStageRunner,
+  lowPriorityStageRunner,
   linuxStageRunsOn,
   perfStoresCache,
   mailStageRunsOn,
@@ -307,7 +308,7 @@ export default githubWorkflow(withQueueWatch(readyPRJobs(auditCaches({
   // actionlint must know the Namespace shape label the stage jobs use.
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner, ...lowPriorityStageRunner],
   },
   jobs: wireEvidenceSkips({
     [pickRunnerJobId]: pickRunnerJob,
@@ -689,7 +690,7 @@ python3 "$RUNNER_TEMP/evidence-base/scripts/evidence-publish" --notes "$RUNNER_T
     'perf-cost': namespaceStageJob({
       name: 'perf-cost',
       stage: 'cost',
-      runsOn: linuxStageRunner,
+      runsOn: lowPriorityStageRunner,
       condition: "github.event_name != 'merge_group'",
       setup: commonSetupSteps,
       description: 'Run the cost check',

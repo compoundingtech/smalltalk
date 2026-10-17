@@ -35,10 +35,16 @@ export const performanceRunner = [
   `${linuxStageShape};job.priority=3`,
   'namespace-features:github.run-id=${{ github.run_id }}',
 ] as const
+// Optional cost work uses the last Namespace class. This changes queue
+// order only: running instances are not preempted and owned roles stay unchanged.
+export const lowPriorityStageRunner = [
+  `${linuxStageShape};job.priority=5`,
+  'namespace-features:github.run-id=${{ github.run_id }}',
+] as const
 export const macosRunner = [`${macosRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
 export const linuxActionlintConfig = {
   ...defaultActionlintConfig,
-  selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner, 'ci1-priority', 'ci2', 'ci2-merge', 'ci2-priority'],
+  selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner, ...lowPriorityStageRunner, 'ci1-priority', 'ci2', 'ci2-merge', 'ci2-priority'],
 } as const
 
 /** Merge groups use the shared owned priority role; the scheduler chooses the host.

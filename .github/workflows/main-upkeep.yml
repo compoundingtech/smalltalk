@@ -986,7 +986,7 @@ jobs:
     name: perf-cost
     runs-on:
       [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 3 }}",
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=5,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120

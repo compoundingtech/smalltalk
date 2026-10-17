@@ -11,6 +11,7 @@ import {
   linuxRunner,
   linuxStageJob,
   linuxStageRunner,
+  lowPriorityStageRunner,
   nixCacheStep,
   perfStoresCache,
   pnpmStoreEnv,
@@ -78,7 +79,7 @@ export default githubWorkflow(auditCaches({
   },
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner, ...lowPriorityStageRunner],
   },
   jobs: {
     'main-checks': {
@@ -153,6 +154,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     // This check never ran in merge_group; keep its main measurements and generated-store cache.
     'perf-cost': linuxStageJob({
       name: 'perf-cost', stage: 'cost', setup: commonSetupSteps,
+      runsOn: lowPriorityStageRunner,
       description: 'Run the cost check', command: ['bash', 'scripts/ci-perf', 'cost'],
       env: { CARGO_PROFILE_DEV_OPT_LEVEL: '1' }, extraLogs: '${{ runner.temp }}/perf/',
       before: [perfStoresCache('cost')],
