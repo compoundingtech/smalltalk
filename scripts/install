@@ -63,6 +63,7 @@ for name in "${binaries[@]}" st stui; do
 done
 
 mkdir -p "$bin_dir"
+bin_dir=$(cd "$bin_dir" && pwd)
 macos=false
 if [[ $(uname -s) == Darwin ]]; then
   python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$from" --bin-dir "$bin_dir"
@@ -77,6 +78,7 @@ for binary in "${binaries[@]}"; do
   chmod 0755 "$staged"
   mv -f "$staged" "$bin_dir/$binary"
 done
+# LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
 link=$(mktemp -u "$bin_dir/.st.install.XXXXXX")
 ln -s st3 "$link"
 mv -f "$link" "$bin_dir/st"
@@ -85,6 +87,28 @@ mv -f "$link" "$bin_dir/st"
   echo "install: $bin_dir/st does not link to st3" >&2
   exit 1
 }
+# LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
 # Retire the old executable; no alias or shim remains.
 rm -f -- "$bin_dir/stui"
+if ! $macos; then
+  foreign_path=false
+  IFS=: read -ra path_dirs <<< "${PATH:-}"
+  for path_dir in "${path_dirs[@]}"; do
+    path_dir=${path_dir:-.}
+    [[ -d $path_dir ]] || continue
+    path_dir=$(cd "$path_dir" && pwd)
+    [[ $path_dir != "$bin_dir" ]] || continue
+    if [[ -e $path_dir/fractal || -L $path_dir/fractal ]]; then
+      [[ -L $path_dir/fractal && $(readlink "$path_dir/fractal") == "$bin_dir/st3" ]] || foreign_path=true
+    fi
+  done
+  # Only these exact targets identify a link installed by Smalltalk.
+  if [[ -L $bin_dir/fractal && ( $(readlink "$bin_dir/fractal") == st3 || $(readlink "$bin_dir/fractal") == "$bin_dir/st3" ) ]]; then
+    link=$(mktemp -u "$bin_dir/.fractal.install.XXXXXX")
+    ln -s st3 "$link"
+    mv -f "$link" "$bin_dir/fractal"
+  elif $foreign_path || [[ -e $bin_dir/fractal || -L $bin_dir/fractal ]] || ! ln -s st3 "$bin_dir/fractal" 2>/dev/null; then
+    printf 'install: leaving fractal unchanged: destination %s/fractal or PATH contains a foreign command; use st, or move the foreign fractal and reinstall to enable the alias.\n' "$bin_dir" >&2
+  fi
+fi
 printf 'installed %s and st -> st3 in %s\n' "${binaries[*]}" "$bin_dir"

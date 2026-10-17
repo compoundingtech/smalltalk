@@ -11,7 +11,7 @@ last one (see [Daily releases](#daily-releases)). A rolling `edge` pre-release f
 - One `.sha256` checksum per archive, combined `SHA256SUMS`, and `RELEASE.json` with the exact
   source commit, target, Rust compiler version, and PTY runtime revision.
 
-Each archive has `bin/st3`, `bin/st` (a relative symlink to `st3`), `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. Native builds pin Rust1.97.0 in `scripts/release-rust-version`; the workflow and local builder use that same version. PTY is built from the exact
+Each archive has `bin/st3`, `bin/fractal` and `bin/st` (relative symlinks to `st3`), `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. Native builds pin Rust1.97.0 in `scripts/release-rust-version`; the workflow and local builder use that same version. PTY is built from the exact
 `flake.lock` runtime revision; this is distinct from the `pty-core` library dependency. Linux builds link against glibc 2.35 with pinned Zig 0.15.2, so optional newer
 libc functions do not add GLIBC_2.39 requirements or loader noise. These
 archives need neither Nix nor Rust installed. Harness CLIs and their logins remain separate.
@@ -49,8 +49,26 @@ sh install.sh --edge --no-run
 
 An extracted archive can also be installed with `./install.sh --bin-dir
 "$HOME/.local/bin"`; add `--quiet` to suppress installer notices. The archive's
-command payload is `st3`, the relative `st` link, and `pty`. The source migration
+command payload is `st3`, the relative `fractal` and `st` links, and `pty`. The source migration
 tool remains available as the separate `st3-migrate` Cargo package.
+
+`fractal` opens the same terminal interface; `fractal tui` opens it explicitly, and
+`fractal web` opens the web interface. Other arguments behave like `st`. Release and
+source installers add `fractal -> st3` only when the destination is free or already
+links to this installation's `st3`. They leave foreign files, directories and links
+intact, and do not introduce the alias when a foreign `fractal` exists elsewhere on
+`PATH`; collision guidance stays visible even with `--quiet`. Use `st` in that case,
+or move the foreign command and reinstall. Named instances place the alias in their
+own `~/.st-instance/NAME/bin`, not the default command directory. Default Nix and
+Home Manager installations do not expose `fractal`; those paths require explicit opt-in.
+
+Bare `fractal` follows bare `st`'s first-run setup and terminal/agent guards;
+`fractal tui` follows explicit `st ui`. Setup records an owned `fractal` symlink
+in its uninstall manifest. Uninstall also discovers that alias beside a recorded
+`st3` when upgrading an older manifest, and preserves a foreign replacement of
+`fractal`, including inside a named instance. The ownership check applies only to
+identified executable aliases; state, config and data directories named `fractal`
+remain subject to normal uninstall removal and remaining-file reporting.
 
 Put the chosen bin directory on `PATH`. The installer serializes installations in that directory,
 stages both tools and the `st` link, preserves the previous files, then replaces each by atomic

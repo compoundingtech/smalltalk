@@ -17,6 +17,7 @@ with tempfile.TemporaryDirectory() as d:
         p = payload / 'bin' / name
         p.write_text('#!/bin/sh\nprintf "' + name + '-fixture\\n"\n'); p.chmod(0o755)
     (payload / 'bin/st').symlink_to('st3')
+    (payload / 'bin/fractal').symlink_to('st3')
     shutil.copy(repo / 'scripts/install-release', payload / 'install.sh')
     archive = root / (payload.name + '.tar.gz')
     with tarfile.open(archive, 'w:gz') as t: t.add(payload, arcname=payload.name)
@@ -44,9 +45,25 @@ cp "$FIXTURES/${url##*/}" "$out"
     assert result.returncode == 0 and result.stdout == '' and result.stderr == '', result
     installed = root / 'home/.local/bin'
     assert (installed / 'st').readlink() == Path('st3')
-    assert sorted(p.name for p in installed.iterdir()) == ['pty', 'st', 'st3']
+    assert (installed / 'fractal').readlink() == Path('st3')
+    assert sorted(p.name for p in installed.iterdir()) == ['fractal', 'pty', 'st', 'st3']
     result = install('--tag', 'v0.3.18')
     assert result.returncode == 0 and result.stdout == 'st3-fixture\n' and result.stderr == '', result
+    (installed / 'fractal').unlink()
+    (installed / 'fractal').write_text('foreign command')
+    result = install('--no-run')
+    assert result.returncode == 0 and result.stdout == '', result
+    assert 'leaving fractal unchanged:' in result.stderr, result
+    assert (installed / 'fractal').read_text() == 'foreign command'
+    assert (installed / 'st').readlink() == Path('st3')
+    (installed / 'fractal').unlink()
+    foreign_path = root / 'foreign-path'
+    foreign_path.mkdir()
+    (foreign_path / 'fractal').write_text('foreign PATH command')
+    result = install('--no-run', extra={'PATH': str(foreign_path) + ':' + env['PATH']})
+    assert result.returncode == 0 and 'PATH contains a foreign command' in result.stderr, result
+    assert not (installed / 'fractal').exists() and not (installed / 'fractal').is_symlink()
+    assert (foreign_path / 'fractal').read_text() == 'foreign PATH command'
     requests = (root / 'requests').read_text()
     assert '/latest/download/' in requests and '/download/v0.3.18/' in requests
     result = install('--edge', '--no-run')
