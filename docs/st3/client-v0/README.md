@@ -6,6 +6,7 @@ in [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire exampl
 clients consume the same JSON; no client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
 
+Proposed composer and workbench extensions (not implemented): [exact-turn queue/steer/cancel, input dispositions, commands, model/effort selection, and agent-associated terminals](composer-design.md).
 Proposed changes extensions (not implemented): [per-turn files, patches, and branch Changes scope](turn-diff-design.md).
 
 The reusable Rust package is [`crates/st3-client`](../../../crates/st3-client) and supports both the
