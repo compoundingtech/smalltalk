@@ -1073,7 +1073,10 @@ mod retry_tests {
         // transport or Fabric process participates; only in-process loopback listeners.
         let fleet_id = "d706eab5-433c-474b-ae43-fd2a7891d85d";
         let auth = FleetAuth::test(fleet_id, &[42; 32]);
-        let local = Arc::new(plain_memory("harbor").unwrap());
+        // Concurrent status reads need the file-backed WAL model, not SQLite's shared-cache
+        // in-memory table locks while the worker commits an exchange.
+        let root = tempfile::tempdir().unwrap();
+        let local = Arc::new(plain_open(&root.path().join("harbor.sqlite3"), "harbor").unwrap());
         let remote = Arc::new(plain_memory("beacon").unwrap());
         for store in [&local, &remote] {
             store.bind_fleet(fleet_id).unwrap();
