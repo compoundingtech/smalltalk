@@ -32,6 +32,32 @@ class FixturePathCheck(unittest.TestCase):
             self.assertEqual(actual, os.pathsep.join([str(private), str(tools)]))
             self.assertFalse(list(launch_findings("provider", ["PATH=" + actual])))
 
+    def test_random_st2_substring_in_parent_keeps_inherited_tools(self):
+        for prefix in ("nix-shell.Cst2Ln", "fixture-st2x"):
+            with self.subTest(prefix=prefix):
+                with tempfile.TemporaryDirectory(prefix=prefix) as temporary:
+                    root = Path(temporary)
+                    private, tools = root / "private", root / "tools"
+                    private.mkdir()
+                    tools.mkdir()
+                    with patch.dict(os.environ, {"PATH": str(tools)}):
+                        actual = isolated_path(private)
+                    self.assertEqual(actual, os.pathsep.join([str(private), str(tools)]))
+                    self.assertFalse(list(launch_findings("provider", ["PATH=" + actual])))
+
+    def test_legacy_install_components_are_dropped_without_a_binary(self):
+        with tempfile.TemporaryDirectory(prefix="fixture-path-") as temporary:
+            root = Path(temporary)
+            private = root / "private"
+            private.mkdir()
+            for name in ("st2", "ST2-tools", "st2_tools", "cache.st2", "hash-st2-tools"):
+                with self.subTest(name=name):
+                    tools = root / name / "bin"
+                    tools.mkdir(parents=True)
+                    with patch.dict(os.environ, {"PATH": str(tools)}):
+                        self.assertEqual(isolated_path(private), str(private))
+                    self.assertTrue(list(launch_findings("provider", ["PATH=" + str(tools)])))
+
     def test_fixture_profiles_preserve_apostrophes_in_inherited_path(self):
         bash = shutil.which("bash")
         self.assertIsNotNone(bash, "the fixture profile regression needs Bash")
