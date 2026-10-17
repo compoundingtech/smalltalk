@@ -417,7 +417,7 @@ export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool
 /** Roster filter in the live sidebar. */
 export function LiveSidebarSearch({ value, onChange }: { readonly value: string; readonly onChange: (value: string) => void }) {
   return <Aria.SearchField aria-label="Search agents" value={value} onChange={onChange} {...stylex.props(styles.search)}>
-    <Aria.Input aria-description="Use machine:synthetic-138/1 or host:synthetic-138/1,synthetic-138/2 to filter host prefixes, ignoring case. Comma-separated values match any host; separate tokens must all match. Combine with search text." placeholder="Search agents" {...stylex.props(styles.searchInput)} />
+    <Aria.Input aria-description="Use machine:build-1 or host:build-1,build-2 to filter host prefixes, ignoring case. Comma-separated values match any host; separate tokens must all match. Combine with search text." placeholder="Search agents" {...stylex.props(styles.searchInput)} />
   </Aria.SearchField>
 }
 

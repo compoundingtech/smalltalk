@@ -142,7 +142,7 @@ describe('shipped live sidebar machine query', () => {
     registry.set(agents, observed({ value: candidates }))
     await mount(1440)
     const input = sidebar().querySelector<HTMLInputElement>('input')!
-    expect(input.getAttribute('aria-description')).toMatch(/machine:.*host:/)
+    expect(input.getAttribute('aria-description')).toBe('Use machine:build-1 or host:build-1,build-2 to filter host prefixes, ignoring case. Comma-separated values match any host; separate tokens must all match. Combine with search text.')
     const search = async (value: string) => {
       await act(async () => {
         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value)

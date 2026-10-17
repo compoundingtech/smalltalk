@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Use simple host names in fractal-web sidebar search hints so the examples read more clearly with a screen reader. Search behavior is unchanged.",
+  "replay": { "status": "none", "detail": "No claims or replay behavior change." },
+  "schema": { "status": "none", "detail": "No database, index, trigger, or schema-version changes." },
+  "rules": { "status": "none", "detail": "No checkpoint, retention, authority, admission, or rules-version changes." },
+  "compatibility": { "status": "none", "detail": "Only accessible search examples change; host-filter semantics and protocols are unchanged." },
+  "downtime": { "status": "none", "detail": "No startup work or interruption is required." },
+  "manual": { "status": "none", "detail": "No operator actions or configuration changes are required." },
+  "recovery": { "status": "none", "detail": "No persistent state changes; rollback restores the previous search examples." }
+}

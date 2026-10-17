@@ -24,6 +24,7 @@ it('ANDs the host menu with typed facets, counts them, and resets facets while p
   const row: SidebarRow = { workspace: { id: 'agent/compiler', title: 'Compiler', host: 'synthetic-138/1', layout: dailyDriver, unread: [], notifications: [] }, agent: undefined, status: 'idle', needsMe: false }
   try {
     await act(async () => render())
+    expect(host.querySelector('input[aria-label="Search agents and folders"]')?.getAttribute('aria-description')).toBe('Use machine:build-1 or host:build-1,build-2 to filter by host; combine with search text.')
     const filterButton = host.querySelector<HTMLButtonElement>('button[aria-label="Filter agents · 2 active"]')!
     expect(filterButton).not.toBeNull()
     await act(async () => filterButton.click())
