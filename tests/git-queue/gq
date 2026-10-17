@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""gq: a git-native merge queue PROTOTYPE.
+
+Branches are changes in flight. A *bundle* is what a publisher offers the queue: a ref under
+refs/queue/ready/<tree>/<publisher> that points at a commit, or at a small blob holding
+`TIP` or `BASE..TIP`. The <tree> in the name is the content hash of the tip commit's tree; it
+is the only identity. Nothing is added to commits.
+
+  refs/queue/ready/<tree>/<publisher>   the advertisement (commit, or blob "[BASE..]TIP")
+  refs/queue/keep/<tree>/<publisher>    keeps a blob bundle's commits reachable
+  refs/queue/claim/<tree>               "I am landing this": created atomically, expires
+  refs/queue/landed/<tree>              tombstone: this tree went onto main
+
+Every machine mirrors the remotes' refs/queue/* into refs/queue-seen/<remote>/*, picks the
+first ready bundle, and arbitrates only with compare-and-swap ref updates on the target remote
+(the one holding main). No locks, no global view, no GitHub API. See docs/st3/git-queue-design.md
+or the st document fleet/factory/git-queue/design.
+"""
+import argparse
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+ZERO = '0' * 40
+SHA = re.compile(r'^[0-9a-f]{40}$')
+EXIT_LOST, EXIT_REFUSED, EXIT_DONE, EXIT_NONE = 10, 11, 12, 13
+
+
+class GqError(Exception):
+    pass
+
+
+def now():
+    return int(os.environ.get('GQ_NOW') or time.time())
+
+
+class Repo:
+    def __init__(self, path):
+        self.path = path
+
+    def git(self, *args, input=None, check=True, env=None):
+        full = dict(os.environ)
+        full.update(env or {})
+        p = subprocess.run(['git', '-C', self.path, *args], input=input, text=True,
+                           capture_output=True, env=full)
+        if check and p.returncode != 0:
+            raise GqError(f'git {" ".join(args)}: {p.stderr.strip() or p.stdout.strip()}')
+        return p
+
+    def out(self, *args, **kw):
+        return self.git(*args, **kw).stdout.strip()
+
+    def resolve(self, rev):
+        p = self.git('rev-parse', '--verify', '--quiet', rev + '^{commit}', check=False)
+        return p.stdout.strip() if p.returncode == 0 else None
+
+    def has_commit(self, sha):
+        return self.git('cat-file', '-e', sha + '^{commit}', check=False).returncode == 0
+
+    def tree_of(self, commit):
+        return self.out('rev-parse', commit + '^{tree}')
+
+    def blob(self, text):
+        return self.out('hash-object', '-w', '--stdin', input=text)
+
+
+class Bundle:
+    def __init__(self, tree, publisher, source, form, tip, base, ref_sha):
+        self.tree, self.publisher, self.source = tree, publisher, source
+        self.form, self.tip, self.base, self.ref_sha = form, tip, base, ref_sha
+        self.state = 'ok'      # ok | changed | gone | malformed
+        self.detail = ''
+        self.when = 0
+
+    def describe(self):
+        span = f'{self.base[:8]}..{self.tip[:8]}' if self.base else self.tip[:8]
+        return f'{self.form}:{span}'
+
+
+class Queue:
+    def __init__(self, repo, target='origin', sources=None, main='main', who=None, ttl=300,
+                 evidence_cmd=None, check_cmd=None):
+        self.r = Repo(repo)
+        self.target = target
+        self.sources = list(dict.fromkeys([target] + list(sources or [])))
+        self.main = main
+        self.who = who or f'{socket.gethostname()}:{os.getpid()}'
+        self.ttl = ttl
+        self.evidence_cmd = evidence_cmd
+        self.check_cmd = check_cmd
+
+    # ---- mirror -------------------------------------------------------------------------
+    def seen(self, remote):
+        return f'refs/queue-seen/{remote}/'
+
+    def refresh(self, remote):
+        self.r.git('fetch', '--prune', '--no-tags', '--quiet', remote,
+                   f'+refs/queue/*:{self.seen(remote)}*')
+
+    def refresh_all(self):
+        for s in self.sources:
+            self.refresh(s)
+
+    def seen_refs(self, remote, kind):
+        prefix = self.seen(remote) + kind + '/'
+        out = self.r.out('for-each-ref', '--format=%(refname) %(objecttype) %(objectname)', prefix)
+        for line in out.splitlines():
+            name, typ, sha = line.split()
+            yield name[len(prefix):], typ, sha
+
+    def read_blob(self, sha):
+        return self.r.out('cat-file', 'blob', sha)
+
+    # ---- bundles ------------------------------------------------------------------------
+    def bundles(self):
+        found = []
+        for src in self.sources:
+            for rest, typ, sha in self.seen_refs(src, 'ready'):
+                if '/' not in rest:
+                    continue
+                tree, publisher = rest.split('/', 1)
+                found.append(self.load(src, tree, publisher, typ, sha))
+        found.sort(key=lambda b: (b.state != 'ok', b.when, b.tree, b.publisher, b.source))
+        return found
+
+    def load(self, src, tree, publisher, typ, sha):
+        if typ == 'commit':
+            b = Bundle(tree, publisher, src, 'commit', sha, None, sha)
+        elif typ == 'blob':
+            text = self.read_blob(sha).strip()
+            m = re.fullmatch(r'(?:([0-9a-f]{40})\.\.)?([0-9a-f]{40})', text)
+            if not m:
+                b = Bundle(tree, publisher, src, 'range', '', None, sha)
+                b.state, b.detail = 'malformed', 'blob is not [BASE..]TIP'
+                return b
+            b = Bundle(tree, publisher, src, 'range', m.group(2), m.group(1), sha)
+        else:
+            b = Bundle(tree, publisher, src, typ, '', None, sha)
+            b.state, b.detail = 'malformed', f'ref points at a {typ}'
+            return b
+        if not self.r.has_commit(b.tip):
+            b.state, b.detail = 'gone', 'tip commit is not available from the remote'
+        elif self.r.tree_of(b.tip) != tree:
+            b.state = 'changed'
+            b.detail = f'advertised as tree {tree[:12]} but the tip now has tree {self.r.tree_of(b.tip)[:12]}'
+        else:
+            b.when = int(self.r.out('log', '-1', '--format=%ct', b.tip))
+        return b
+
+    def claim_info(self, tree):
+        for rest, typ, sha in self.seen_refs(self.target, 'claim'):
+            if rest == tree and typ == 'blob':
+                kv = dict(l.split('=', 1) for l in self.read_blob(sha).splitlines() if '=' in l)
+                return sha, kv
+        return None
+
+    def landed_info(self, tree):
+        for rest, typ, sha in self.seen_refs(self.target, 'landed'):
+            if rest == tree and typ == 'blob':
+                kv = dict(l.split('=', 1) for l in self.read_blob(sha).splitlines() if '=' in l)
+                return kv or {'tombstone': 'unreadable'}   # the ref's existence is what counts
+        return None
+
+    def state_of(self, b):
+        if self.landed_info(b.tree):
+            return 'landed'
+        if b.state != 'ok':
+            return b.state
+        c = self.claim_info(b.tree)
+        if c:
+            return 'claimed' if int(c[1].get('expires', 0)) > now() else 'claim-expired'
+        return 'ready'
+
+    # ---- publish ------------------------------------------------------------------------
+    def publish(self, remote, tip_rev, base_rev=None, publisher=None, form='commit'):
+        tip = self.r.resolve(tip_rev)
+        if not tip:
+            raise GqError(f'no such commit: {tip_rev}')
+        base = self.r.resolve(base_rev) if base_rev else None
+        tree = self.r.tree_of(tip)
+        publisher = publisher or self.who.replace(':', '-')
+        ref = f'refs/queue/ready/{tree}/{publisher}'
+        if form == 'commit':
+            if base:
+                raise GqError('a commit bundle has no base; use --form range')
+            self.r.git('push', '--quiet', remote, f'+{tip}:{ref}')
+        else:
+            blob = self.r.blob(f'{base}..{tip}\n' if base else f'{tip}\n')
+            self.r.git('push', '--quiet', '--atomic', remote, f'+{blob}:{ref}',
+                       f'+{tip}:refs/queue/keep/{tree}/{publisher}')
+        return tree, ref
+
+    def withdraw(self, remote, tree, publisher):
+        self.r.git('push', '--quiet', remote, f':refs/queue/ready/{tree}/{publisher}',
+                   f':refs/queue/keep/{tree}/{publisher}', check=False)
+
+    # ---- claim --------------------------------------------------------------------------
+    def claim(self, tree):
+        """Try to become the one machine landing `tree`. Returns (blob_sha, None) or (None, why)."""
+        self.refresh(self.target)
+        if self.landed_info(tree):
+            return None, 'landed'
+        ref = f'refs/queue/claim/{tree}'
+        mine = self.r.blob(f'who={self.who}\nnonce={secrets.token_hex(8)}\n'
+                           f'claimed={now()}\nexpires={now() + self.ttl}\n')
+        existing = self.claim_info(tree)
+        if existing:
+            sha, kv = existing
+            if int(kv.get('expires', 0)) > now():
+                return None, f'claimed by {kv.get("who")} until {kv.get("expires")}'
+            expect = sha          # the holder vanished: take over, compare-and-swap on its claim
+        else:
+            expect = ''           # must not exist
+        p = self.r.git('push', '--quiet', self.target, f'--force-with-lease={ref}:{expect}',
+                       f'{mine}:{ref}', check=False)
+        if p.returncode != 0:
+            return None, 'another machine claimed it first'
+        return mine, None
+
+    def release(self, tree, mine):
+        ref = f'refs/queue/claim/{tree}'
+        self.r.git('push', '--quiet', self.target, f'--force-with-lease={ref}:{mine}', f':{ref}',
+                   check=False)
+
+    # ---- land ---------------------------------------------------------------------------
+    def pick(self, tree):
+        good = [b for b in self.bundles() if b.tree == tree and b.state == 'ok']
+        if good:
+            return good[0], None
+        bad = [b for b in self.bundles() if b.tree == tree]
+        if bad:
+            return None, f'{bad[0].state}: {bad[0].detail}'
+        return None, 'gone: no bundle advertises that tree'
+
+    def main_tip(self):
+        self.r.git('fetch', '--quiet', '--no-tags', self.target,
+                   f'+refs/heads/{self.main}:refs/queue-main/{self.target}')
+        return self.r.out('rev-parse', f'refs/queue-main/{self.target}')
+
+    def land(self, tree):
+        """Returns (exit_code, message)."""
+        self.refresh_all()
+        if self.landed_info(tree):
+            return EXIT_DONE, f'already landed {tree}'
+        b, why = self.pick(tree)
+        if not b:
+            return EXIT_REFUSED, f'refused {tree}: {why}'
+        mine, why = self.claim(tree)
+        if not mine:
+            return (EXIT_DONE, f'already landed {tree}') if why == 'landed' else \
+                (EXIT_LOST, f'lost {tree}: {why}')
+        try:
+            # What we hold now may differ from what we listed: look again after the claim.
+            self.refresh_all()
+            if self.landed_info(tree):
+                return EXIT_DONE, f'already landed {tree}'
+            b, why = self.pick(tree)
+            if not b:
+                return EXIT_REFUSED, f'refused {tree}: {why}'
+            return self.land_claimed(b, mine)
+        except GqError as e:
+            return EXIT_REFUSED, f'refused {tree}: {e}'
+        finally:
+            self.release(tree, mine)      # a no-op after a successful land (claim already gone)
+
+    def land_claimed(self, b, mine):
+        tree = b.tree
+        for _ in range(8):
+            main = self.main_tip()
+            if self.r.git('merge-base', '--is-ancestor', b.tip, main, check=False).returncode == 0:
+                candidate = main          # nothing to add; main already has these commits
+            elif self.r.git('merge-base', '--is-ancestor', main, b.tip, check=False).returncode == 0:
+                candidate = b.tip         # fast-forward: main ends up with exactly the advertised tree
+            else:
+                candidate = self.replay(main, b)
+            cand_tree = self.r.tree_of(candidate)
+            if not self.evidence_covers(cand_tree):
+                self.run_check(candidate, cand_tree)
+            landed = self.r.blob(f'main={candidate}\nby={self.who}\ntree={cand_tree}\nbundle={tree}\n'
+                                 f'at={now()}\n')
+            pushes = [f'--force-with-lease=refs/heads/{self.main}:{main}',
+                      f'--force-with-lease=refs/queue/claim/{tree}:{mine}',
+                      f'--force-with-lease=refs/queue/landed/{tree}:',
+                      f'{candidate}:refs/heads/{self.main}',
+                      f':refs/queue/claim/{tree}',
+                      f'{landed}:refs/queue/landed/{tree}']
+            p = self.r.git('push', '--quiet', '--atomic', self.target, *pushes, check=False)
+            if p.returncode == 0:
+                self.cleanup(b)
+                note = '' if cand_tree == tree else f' (rebased; landed tree {cand_tree[:12]})'
+                return 0, f'landed {tree} as {candidate[:12]}{note}'
+            # Main moved, or our claim was taken over. Look again; only the first is retryable.
+            self.refresh(self.target)
+            if self.landed_info(tree):
+                return EXIT_DONE, f'already landed {tree}'
+            held = self.claim_info(tree)
+            if not held or held[0] != mine:
+                return EXIT_LOST, f'lost {tree}: our claim was replaced before landing'
+        raise GqError('main kept moving; gave up after 8 attempts')
+
+    def replay(self, main, b):
+        """Cherry-pick the bundle's commits onto main without a work tree."""
+        rng = f'{b.base}..{b.tip}' if b.base else f'{main}..{b.tip}'
+        commits = self.r.out('rev-list', '--reverse', '--topo-order', rng).split()
+        if not commits:
+            raise GqError('bundle range is empty')
+        cur = main
+        for c in commits:
+            parents = self.r.out('rev-list', '--parents', '-n1', c).split()[1:]
+            if len(parents) != 1:
+                raise GqError(f'commit {c[:8]} is a merge or a root; prototype replays linear history')
+            p = self.r.git('merge-tree', '--write-tree', f'--merge-base={parents[0]}', cur, c,
+                           check=False)
+            if p.returncode != 0:
+                raise GqError(f'conflict replaying {c[:8]} onto {cur[:8]}')
+            new_tree = p.stdout.splitlines()[0]
+            fmt = self.r.out('log', '-1', '--format=%an%n%ae%n%aI', c).splitlines()
+            msg = self.r.out('log', '-1', '--format=%B', c)
+            env = dict(GIT_AUTHOR_NAME=fmt[0], GIT_AUTHOR_EMAIL=fmt[1], GIT_AUTHOR_DATE=fmt[2],
+                       GIT_COMMITTER_NAME='git-queue', GIT_COMMITTER_EMAIL='git-queue@localhost')
+            cur = self.r.out('commit-tree', new_tree, '-p', cur, input=msg + '\n', env=env)
+        return cur
+
+    def evidence_covers(self, tree):
+        if not self.evidence_cmd:
+            return False
+        return subprocess.run([*self.evidence_cmd, tree], capture_output=True).returncode == 0
+
+    def run_check(self, candidate, cand_tree):
+        if not self.check_cmd:
+            return
+        d = tempfile.mkdtemp(prefix='gq-check-')
+        try:
+            tar = subprocess.run(['git', '-C', self.r.path, 'archive', candidate],
+                                 capture_output=True, check=True).stdout
+            subprocess.run(['tar', '-x', '-C', d], input=tar, check=True)
+            env = dict(os.environ, GQ_TREE=cand_tree, GQ_CANDIDATE=candidate)
+            p = subprocess.run(self.check_cmd, cwd=d, env=env, capture_output=True, text=True)
+            if p.returncode != 0:
+                raise GqError('check failed: ' + (p.stdout + p.stderr).strip()[-200:])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def cleanup(self, b):
+        for s in self.sources:
+            self.r.git('push', '--quiet', s, *[f':refs/queue/{k}/{b.tree}/{b.publisher}'
+                       for k in ('ready', 'keep')], check=False)
+
+    def next_ready(self):
+        self.refresh_all()
+        seen = set()
+        for b in self.bundles():
+            if b.tree in seen:
+                continue
+            seen.add(b.tree)
+            if self.state_of(b) in ('ready', 'claim-expired'):
+                yield b.tree
+
+
+def make_queue(a):
+    check = a.check.split() if getattr(a, 'check', None) else None
+    ev = a.evidence_cmd.split() if getattr(a, 'evidence_cmd', None) else None
+    return Queue(a.repo, target=a.target, sources=a.source, main=a.main, who=a.who, ttl=a.ttl,
+                 evidence_cmd=ev, check_cmd=check)
+
+
+def cmd_publish(a):
+    q = make_queue(a)
+    tree, ref = q.publish(a.remote or a.target, a.tip, a.base, a.publisher, a.form)
+    print(f'published {tree} as {ref}')
+
+
+def cmd_ls(a):
+    q = make_queue(a)
+    q.refresh_all()
+    for b in q.bundles():
+        st = q.state_of(b)
+        extra = ''
+        if st == 'claimed':
+            extra = ' by ' + q.claim_info(b.tree)[1].get('who', '?')
+        if b.state != 'ok':
+            extra = f' ({b.detail})'
+        print(f'{st:<13} {b.tree[:12]} {b.publisher:<14} {b.source:<8} {b.describe()}{extra}')
+
+
+def cmd_claim(a):
+    q = make_queue(a)
+    mine, why = q.claim(a.tree)
+    if not mine:
+        print(f'not claimed: {why}')
+        sys.exit(EXIT_LOST)
+    print(f'claimed {a.tree} as {q.who} for {q.ttl}s')
+
+
+def cmd_land(a):
+    q = make_queue(a)
+    code, msg = q.land(a.tree)
+    print(msg)
+    sys.exit(code)
+
+
+def cmd_run(a):
+    q = make_queue(a)
+    landed = 0
+    while True:
+        progressed = False
+        for tree in q.next_ready():
+            code, msg = q.land(tree)
+            print(msg, flush=True)
+            if code == 0:
+                landed += 1
+                progressed = True
+            if code in (0, EXIT_REFUSED):
+                break                     # main may have moved: look at the list again
+        if a.once and not progressed:
+            break
+        if not progressed:
+            time.sleep(a.interval)
+    print(f'done: landed {landed}')
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--repo', default='.', help='this machine\'s clone')
+    ap.add_argument('--target', default='origin', help='remote holding main; claims are decided here')
+    ap.add_argument('--source', action='append', default=[], help='more remotes to pull bundles from')
+    ap.add_argument('--main', default='main')
+    ap.add_argument('--who', help='claimer name (default host:pid)')
+    ap.add_argument('--ttl', type=int, default=300, help='claim lifetime in seconds')
+    ap.add_argument('--check', help='command run in an export of the candidate; nonzero refuses')
+    ap.add_argument('--evidence-cmd', help='command run with the candidate tree id; zero = a trusted '
+                                          'note covers it, so skip --check')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('publish'); p.set_defaults(fn=cmd_publish)
+    p.add_argument('tip'); p.add_argument('base', nargs='?')
+    p.add_argument('--remote'); p.add_argument('--publisher')
+    p.add_argument('--form', choices=['commit', 'range'], default='commit')
+    sub.add_parser('ls').set_defaults(fn=cmd_ls)
+    p = sub.add_parser('claim'); p.set_defaults(fn=cmd_claim); p.add_argument('tree')
+    p = sub.add_parser('land'); p.set_defaults(fn=cmd_land); p.add_argument('tree')
+    p = sub.add_parser('run'); p.set_defaults(fn=cmd_run)
+    p.add_argument('--once', action='store_true'); p.add_argument('--interval', type=float, default=2)
+    a = ap.parse_args(argv)
+    try:
+        a.fn(a)
+    except GqError as e:
+        print(f'error: {e}', file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
