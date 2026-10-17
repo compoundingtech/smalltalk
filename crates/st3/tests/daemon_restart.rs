@@ -247,12 +247,21 @@ impl Drop for Daemon {
     }
 }
 
-async fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
+async fn wait_until(what: &str, limit: Duration, condition: impl FnMut() -> bool) {
+    assert!(wait_until_for(limit, condition).await, "timed out waiting until {what}");
+}
+
+/// `wait_until`'s poll and limit, returning instead of panicking so the caller can print
+/// evidence that only exists after the wait has failed.
+async fn wait_until_for(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + limit;
     while !condition() {
-        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        if Instant::now() >= deadline {
+            return false;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    true
 }
 
 /// A seat process launched with the environment the reconciler gives it, but with every home
@@ -2546,18 +2555,20 @@ async fn claude_mcp_initializes_offline_then_attaches_and_reconnects_without_res
         root,
         json!({"type":"user","isMeta":true,"message":{"role":"user","content":envelope}}),
     );
-    wait_until(
-        "offline-start mail has native receipts",
-        Duration::from_secs(10),
-        || {
-            daemon
-                .store
-                .latest_claim("message/quartz-offline", Some("message.read"))
-                .unwrap()
-                .is_some()
-        },
-    )
-    .await;
+    if !wait_until_for(Duration::from_secs(10), || {
+        daemon
+            .store
+            .latest_claim("message/quartz-offline", Some("message.read"))
+            .unwrap()
+            .is_some()
+    })
+    .await
+    {
+        panic!(
+            "timed out waiting until offline-start mail has native receipts{}",
+            channel_evidence(&daemon, root, mark, channel)
+        );
+    }
     // A later daemon outage preserves the initialized stdio connection and its owner.
     let mark = daemon.store.index().unwrap();
     daemon.stop().await;
@@ -2585,18 +2596,20 @@ async fn claude_mcp_initializes_offline_then_attaches_and_reconnects_without_res
             .contains("message/quartz-reconnected")
     );
     fixture.append(root, json!({"type":"user","isMeta":true,"message":{"role":"user","content":notice["params"]["content"]}}));
-    wait_until(
-        "reconnected mail has native receipts",
-        Duration::from_secs(10),
-        || {
-            daemon
-                .store
-                .latest_claim("message/quartz-reconnected", Some("message.read"))
-                .unwrap()
-                .is_some()
-        },
-    )
-    .await;
+    if !wait_until_for(Duration::from_secs(10), || {
+        daemon
+            .store
+            .latest_claim("message/quartz-reconnected", Some("message.read"))
+            .unwrap()
+            .is_some()
+    })
+    .await
+    {
+        panic!(
+            "timed out waiting until reconnected mail has native receipts{}",
+            channel_evidence(&daemon, root, mark, channel)
+        );
+    }
     for message in ["message/quartz-offline", "message/quartz-reconnected"] {
         for kind in ["message.staged", "message.delivered", "message.read"] {
             assert_eq!(

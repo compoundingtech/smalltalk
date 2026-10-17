@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Test-only: the two native-receipt waits in the Claude MCP offline-start test print the channel evidence when they time out.",
+  "replay": {
+    "status": "none",
+    "detail": "No stored history or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, claim or configuration schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination version change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No change to the product or to any default; a test failure message gains evidence."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration and no restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "None."
+  }
+}
