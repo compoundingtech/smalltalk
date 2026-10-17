@@ -2741,13 +2741,15 @@ async fn worker_route_status_survives_phase_updates_and_clears_preferred_retry()
     record_worker(&backend, "cedar", "exchange", attempt, None, None).await;
     assert_eq!(status()["route_is_preferred"], false);
     assert_eq!(status()["preferred_retry_at_unix_ms"], retry);
+    // Failover can wrap to the first route before the existing cooldown expires.
+    // Its pending offset-reset timer must not be presented as another preferred-route retry.
     record_worker(
         &backend,
         "cedar",
         "exchange",
         attempt,
         None,
-        Some((true, None)),
+        Some((true, Some(deadline))),
     )
     .await;
     assert_eq!(status()["route_is_preferred"], true);

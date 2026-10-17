@@ -1446,14 +1446,14 @@ async fn record_worker<B: Backend>(
                 next_retry_at_unix_ms: delay
                     .map(|delay| crate::store::now_ms() + delay.as_millis()),
                 route_is_preferred: route.map(|(preferred, _)| preferred),
-                preferred_retry_at_unix_ms: route.and_then(|(_, deadline)| deadline).map(
-                    |deadline| {
+                preferred_retry_at_unix_ms: route
+                    .and_then(|(preferred, deadline)| if preferred { None } else { deadline })
+                    .map(|deadline| {
                         crate::store::now_ms()
                             + deadline
                                 .saturating_duration_since(tokio::time::Instant::now())
                                 .as_millis()
-                    },
-                ),
+                    }),
             },
         ),
     )
