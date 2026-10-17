@@ -79,3 +79,45 @@ fn renaming_the_production_cli_does_not_bypass_mutating_actor_checks() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("cannot act as `person/pat`"), "{error}");
 }
+
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+#[test]
+fn conflicting_agent_aliases_cannot_fall_back_to_native_driver_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st3"))
+        .env_clear()
+        .env("HOME", root.path())
+        .env("ST_AGENT", "agent/legacy")
+        .env("FRACTAL_AGENT", "agent/preferred")
+        .env("ST_DRIVER_IDENTITY", "agent/fallback")
+        .env("ST_DRIVER_ROOT", root.path())
+        .env("ST_DRIVER_AGENT_DIR", root.path().join("agent"))
+        .env("ST_DRIVER_SESSION_DIR", root.path().join("session"))
+        .args(["driver-hook", "claude-observe", "SessionStart"])
+        .stdin(std::process::Stdio::null())
+        .output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no agent identity"), "{stderr}");
+    assert!(stderr.contains("conflicting environment variables"), "{stderr}");
+    assert!(!stderr.contains("agent/legacy") && !stderr.contains("agent/preferred"), "{stderr}");
+}
+
+#[test]
+fn legacy_daemon_wait_preserves_invalid_empty_and_non_utf8_values() {
+    use std::os::unix::ffi::OsStringExt as _;
+    for value in [
+        std::ffi::OsString::new(),
+        std::ffi::OsString::from_vec(vec![0xff]),
+    ] {
+        let output = Command::new(test_env!("CARGO_BIN_EXE_st3"))
+            .env_clear()
+            .env("ST3_DAEMON_WAIT", value)
+            .args(["work", "start", "task", "--as", "person/explicit"])
+            .output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--daemon-wait"), "{stderr}");
+    }
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read

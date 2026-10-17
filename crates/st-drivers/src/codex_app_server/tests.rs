@@ -7096,6 +7096,33 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
 }
 
 #[test]
+fn fractal_mission_run_controls_unattended_codex_launch() {
+    for (old, new, expected) in [
+        (None, None, false),
+        (Some("mission-run/old"), None, true),
+        (None, Some("mission-run/new"), true),
+        (Some("mission-run/old"), Some("mission-run/new"), true),
+        (Some("mission-run/old"), Some(""), false),
+        (Some("mission-run/old"), Some("  \n"), false),
+        (Some(""), None, false),
+    ] {
+        let mission_run = crate::contracts::env_with("ST_MISSION_RUN", &|key| {
+            match key {
+                "ST_MISSION_RUN" => old,
+                "FRACTAL_MISSION_RUN" => new,
+                _ => None,
+            }
+            .map(str::to_owned)
+        });
+        assert_eq!(
+            mission_run_is_unattended(mission_run.as_deref()),
+            expected,
+            "old={old:?}, new={new:?}"
+        );
+    }
+}
+
+#[test]
 fn unattended_codex_defaults_only_after_provider_reports_no_policy() {
     assert!(!mission_run_is_unattended(None));
     assert!(!mission_run_is_unattended(Some("")));

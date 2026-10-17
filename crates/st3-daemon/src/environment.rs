@@ -12,6 +12,99 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 type Environment = BTreeMap<String, String>;
 
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+/// Resolve one source layer before overlaying it: empty/conflicted values mask lower layers.
+/// ST3 suffixes are explicit because Fractal folds ST_ and ST3_ into one namespace.
+fn old_alias(name: &str) -> Option<String> {
+    let suffix = name.strip_prefix("FRACTAL_")?;
+    // The collision-free ST3 inventory recorded in #3233, including test/tool knobs.
+    let prefix = if matches!(suffix,
+        "ACCOUNT" | "AGENT_CORPUS" | "ATTACHMENT_TAG" | "ATTENTION_LIST" | "BIN"
+        | "BINARY" | "BLOB_RETENTION_HOURS" | "BODY_MAX_CHARS" | "BOOTSTRAP_TEST_BINARY" | "BRIDGE_NATIVE_TEST_BIN"
+        | "BUILD_REVISION" | "CHANNEL" | "CHANNEL_RESUME" | "CHECKPOINT_DAY" | "CHECKPOINT_ORIGIN"
+        | "CHECKPOINT_SKIP_PROOF" | "CHECKPOINT_STORE" | "CHECKPOINT_SUBJECT" | "CLEANUP_FIXTURE" | "CLEANUP_FIXTURE_MODE"
+        | "CLI_INVENTORY_CAPTURE_HELPER" | "CLI_INVENTORY_CAPTURE_MARKER" | "CLI_OTEL" | "COMPAT_BIN" | "COMPLETION_DEADLINE_MS"
+        | "CONTEXT_VARIABLES" | "CONVERGENCE_RUNS" | "CONVERGENCE_SEED" | "CONVERGENCE_STEPS" | "COVERAGE_BINARY"
+        | "COVERAGE_ROOT" | "DAEMON_WAIT" | "DIFFERENTIAL_FIRST" | "DIFFERENTIAL_SEEDS" | "DISABLED_DAEMON_METRICS_CHILD"
+        | "DIVERGENCE_CHECK_INTERVAL_MS" | "DRIVER_RESUME" | "DRIVER_STATE_DIR" | "ENDPOINT" | "ENV_BEGIN"
+        | "ENV_END" | "FIXTURE_BASH" | "FIXTURE_MODE" | "FIXTURE_PATH" | "FIXTURE_TERMINAL_COMPLETION"
+        | "FLEET_PORT_RESERVATION_PROBE" | "GITHUB_API_URL" | "GIT_EVIDENCE_ISOLATED_TEST" | "GIT_EVIDENCE_REAL_GIT" | "IDLE_PREFLIGHT_START_UNIX"
+        | "IDLE_REPORT_DURATION_SECONDS" | "IDLE_REPORT_LOG" | "IDLE_REPORT_MAX_GAP_SECONDS" | "IDLE_REPORT_MIN_QUIET" | "IDLE_REPORT_MIN_QUIET_SECONDS"
+        | "IDLE_REPORT_MIN_SAMPLES" | "IDLE_REPORT_NOW_UNIX" | "IDLE_REPORT_REMOTE" | "INCARNATION" | "INCREMENTAL"
+        | "KDL_VERSION" | "LAUNCH_DESIRED_TOKEN" | "MAILBOX_TRANSPORT" | "MALLOC_TRIM_INTERVAL_SECS" | "MALLOC_TRIM_TEST_CHILD"
+        | "MALLOC_TRIM_THRESHOLD_BYTES" | "MARKETPLACE" | "MARKETPLACE_MANIFEST" | "MCP_CONFIG" | "MESSAGE_BODIES_ACTOR_MAX_MB"
+        | "MESSAGE_BODIES_MAX_MB" | "MESSAGE_BODIES_RETENTION_DAYS" | "MESSAGE_KEY_HOUR" | "MESSAGE_ROOT" | "MESSAGING_COMPAT_BIN"
+        | "MESSAGING_FAULTS_EVIDENCE" | "MESSAGING_ROOT" | "MESSAGING_SCRATCH" | "MFE_TEST_BINARY" | "NATIVE_CONTINUE_PATH"
+        | "NATIVE_CONTINUE_SESSION" | "NATIVE_RESUME_PATH" | "NATIVE_RESUME_SESSION" | "NATIVE_SELECTOR_SCOPE" | "OMP_PENDING_ASK"
+        | "OP_AUDIT_BODY_BYTES" | "OP_AUDIT_CHILD_AUDIT" | "OP_AUDIT_CHILD_STORE" | "OP_AUDIT_DIR" | "OP_AUDIT_HUGE_CLAIMS"
+        | "OP_AUDIT_OPERATIONS" | "OP_AUDIT_RESULT" | "OP_AUDIT_TOMBSTONES" | "OTELITE_BIN" | "OTEL_REPLICATION_SCENARIO_ROOT"
+        | "OTEL_REQUIRE" | "OTEL_STORAGE_STAGE_CHILD" | "PACKAGE" | "PAIRING_PROOF_VECTOR_OUT" | "PERF_INCREMENTAL"
+        | "PERF_NODE" | "PERF_RUNTIMES" | "PERF_STORE" | "PERSON" | "PLUGIN"
+        | "PLUGIN_MANIFEST" | "POLICY_FILE" | "PRE_PIN_BIN" | "PROFILE_CANCELLATION_TEST_CHILD" | "PROFILE_DIR"
+        | "PROFILE_PTRACER" | "PROFILE_SLOW_MS" | "PROFILE_TRIM_PHASE_TEST_CHILD" | "PROVENANCE_COMPAT_BIN" | "PUBLISHED_LISTS"
+        | "QUIET_OWNED_PASS_BUDGET_CHILD" | "RECORDER_GH_DEPTH" | "RECORDER_GIT_DEPTH" | "REEXEC_TEST_SCRIPT" | "REEXEC_TEST_STATE"
+        | "RELAY_TRACE_ACTOR" | "RELAY_TRACE_CALLER" | "RELAY_TRACE_DIGEST" | "RELAY_TRACE_FORWARD_DIGEST" | "RELAY_TRACE_PATH"
+        | "RELAY_TRACE_PEER" | "REPLICATION_PAGE_LIMIT" | "ROLLOUT_OPERATION" | "ROLLOUT_PREDECESSOR" | "RUN_DIR"
+        | "SCENARIO_ENDPOINT" | "SCENARIO_OUTPUT" | "SCENARIO_SCRIPT" | "SCENARIO_STATE_DIR" | "SCHEMA_CRASH_MARKER"
+        | "SCHEMA_CRASH_PATH" | "SCHEMA_CRASH_PHASE" | "SERVER_NAME" | "SET_MARKER" | "SHA256_TAG"
+        | "SOAK_DEADLINE_SECONDS" | "SOAK_EXAMPLE_MAC_BIN" | "SOAK_HOST" | "SOAK_IDLE_STATE_DIR" | "SOAK_INTERVAL_SECONDS"
+        | "SOAK_JQ_BIN" | "SOAK_REPORT_LOG" | "SOAK_REPORT_MAX_GAP_SECONDS" | "SOAK_REPORT_MIN_DURATION_SECONDS" | "SOAK_REPORT_MIN_EACH_DIRECTION"
+        | "SOAK_REPORT_NOW_UNIX" | "SOAK_REPORT_SKIP_RUNTIME_CHECKS" | "SOAK_STATE_DIR" | "SOAK_TEST_REAL_FABRIC_BIN" | "SOAK_TEST_REAL_ST3_BIN"
+        | "SOAK_TEST_RESPONSE_MODE" | "SOAK_TIMEOUT_BIN" | "START_COST_DIR" | "START_OPERATION" | "STORAGE_PHASE_SPANS"
+        | "SUBAGENTS_EVAL_OLD_SETTINGS" | "SUBAGENT_LEASE_MS" | "SUBAGENT_SILENCE_MS" | "SUBJECT" | "TERMINALS_COMPAT_BIN"
+        | "TERMINAL_CAPABILITY" | "TEST_ADMITTED_REPORTS" | "TEST_DISABLE_ANCESTRY" | "TEST_DROP_JOIN_ANSWER" | "TEST_KEEP"
+        | "TEST_NATIVE_SEED_CONFLICT" | "TEST_NATIVE_SEED_ROOT" | "TEST_REMOVAL_WRITE_BARRIER" | "TEST_REPLICATION_EXPORT_DELAY_MS" | "TEST_STARTUP_REPLAY_BARRIER"
+        | "TOKEN_BUDGET" | "TO_TAG" | "WORKER_INTERVAL_MS" | "WRITE_FIXTURES")
+    { "ST3_" } else { "ST_" };
+    Some(format!("{prefix}{suffix}"))
+}
+
+pub(crate) fn normalize_aliases(environment: &mut Environment) {
+    let names: std::collections::BTreeSet<_> = environment.keys().filter_map(|name| {
+        if name.starts_with("ST_") || name.starts_with("ST3_") {
+            Some(name.clone())
+        } else {
+            old_alias(name)
+        }
+    }).collect();
+    for old in names {
+        let new = st_drivers::contracts::fractal_env_name(&old).unwrap();
+        if environment.get(&old).zip(environment.get(&new)).is_some_and(|(old, new)| old == new) {
+            continue;
+        }
+        let value = st_drivers::contracts::env_with(&old, &|name| environment.get(name).cloned())
+            .unwrap_or_default();
+        environment.insert(old, value.clone());
+        environment.insert(new, value);
+    }
+}
+
+/// A launcher-owned assignment overrides both spellings, independently of authored layers.
+pub(crate) fn set(environment: &mut Environment, name: &str, value: String) {
+    if let Some(new) = st_drivers::contracts::fractal_env_name(name) {
+        environment.insert(new, value.clone());
+    }
+    environment.insert(name.to_owned(), value);
+}
+
+/// Merge independently resolved layers, so a higher alias replaces either lower spelling.
+pub(crate) fn overlay(
+    mut inherited: Environment, declared: &Environment, executable: &std::path::Path,
+) -> Result<Environment> {
+    normalize_aliases(&mut inherited);
+    let mut declared = declared.clone();
+    normalize_aliases(&mut declared);
+    st_runtime::overlay_environment(inherited, &declared, executable)
+}
+
+pub(crate) fn remove_aliases(environment: &mut Environment, name: &str) {
+    environment.remove(name);
+    if let Some(new) = st_drivers::contracts::fractal_env_name(name) {
+        environment.remove(&new);
+    }
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
+
 #[derive(Default)]
 struct Cache {
     captured: Option<(Instant, Result<Environment, String>)>,
@@ -272,6 +365,46 @@ pub(crate) fn command_in(program: &str, environment: &Environment) -> Result<Com
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_assignments_and_removals_cover_both_spellings() {
+        let mut vars = Environment::from([
+            ("ST_AGENT".into(), "agent/seat".into()),
+            ("ST3_SUBJECT".into(), "agent/seat".into()),
+            ("ST_SUPERVISOR".into(), String::new()),
+        ]);
+        normalize_aliases(&mut vars);
+        assert_eq!(vars["FRACTAL_AGENT"], vars["ST_AGENT"]);
+        assert_eq!(vars["FRACTAL_SUBJECT"], vars["ST3_SUBJECT"]);
+        assert_eq!(vars["FRACTAL_SUPERVISOR"], "");
+        remove_aliases(&mut vars, "ST_AGENT");
+        assert!(!vars.contains_key("ST_AGENT") && !vars.contains_key("FRACTAL_AGENT"));
+    }
+
+    #[test]
+    fn declared_aliases_replace_inherited_families_and_keep_path_expansion() {
+        let inherited = Environment::from([
+            ("PATH".into(), "/shell".into()),
+            ("ST_SUPERVISOR".into(), "agent/old".into()),
+        ]);
+        for (new, expected) in [("agent/new", "agent/new"), ("", "")] {
+            let declared = Environment::from([
+                ("FRACTAL_SUPERVISOR".into(), new.into()),
+                ("PATH".into(), "/declared:${PATH}".into()),
+            ]);
+            let merged = overlay(inherited.clone(), &declared, std::path::Path::new("/bin/st3")).unwrap();
+            assert_eq!(merged["ST_SUPERVISOR"], expected);
+            assert_eq!(merged["FRACTAL_SUPERVISOR"], expected);
+            assert_eq!(merged["PATH"], "/bin:/declared:/shell");
+        }
+        let conflicting = Environment::from([
+            ("ST_SUPERVISOR".into(), "agent/left".into()),
+            ("FRACTAL_SUPERVISOR".into(), "agent/right".into()),
+        ]);
+        let merged = overlay(inherited, &conflicting, std::path::Path::new("/bin/st3")).unwrap();
+        assert_eq!(merged["ST_SUPERVISOR"], "");
+        assert_eq!(merged["FRACTAL_SUPERVISOR"], "");
+    }
 
     #[test]
     fn refreshes_success_and_failure_after_the_interval() {

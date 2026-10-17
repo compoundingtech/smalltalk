@@ -98,6 +98,9 @@ fn healing_command(
         if name.starts_with("ST3_")
             || name.starts_with("ST2_")
             || (name.starts_with("ST_") && name != "ST_AGENT")
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+            || (name.starts_with("FRACTAL_") && name != "FRACTAL_AGENT")
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
             || matches!(name.as_ref(), "PTY_SESSION" | "PTY_ROOT" | "PTY_SESSION_DIR")
         {
             command.env_remove(key);

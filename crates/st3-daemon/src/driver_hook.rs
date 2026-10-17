@@ -2,8 +2,8 @@
 //!
 //! Every script in st3's hook set execs this, hidden from `--help`, with the harness's payload on
 //! stdin. The arguments and environment are the ones the seat's driver exports: the event name in
-//! the first argument, resolved `ST_DRIVER_*` paths and identity, and the `ST_CLAUDE_*`
-//! wrapper-session fence. Already-running seats retain their catalog discovery fallback.
+//! the first argument, resolved `FRACTAL_DRIVER_*` (or legacy `ST_DRIVER_*`) paths and identity,
+//! and the Claude wrapper-session fence. Already-running seats retain their catalog discovery fallback.
 //!
 //! Observation fails open, since a hook the harness waits on must not stop it. One case is loud:
 //! a SessionStart that leaves no native-session binding for the current wrapper session, because
@@ -46,7 +46,7 @@ impl HookEnv for ProcessEnv {
         std::env::var(name).ok()
     }
     fn var(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok().filter(|value| !value.is_empty())
+        st_drivers::contracts::env_with(name, &|key| self.raw_var(key))
     }
 }
 
@@ -55,7 +55,7 @@ impl HookEnv for BTreeMap<String, String> {
         self.get(name).cloned()
     }
     fn var(&self, name: &str) -> Option<String> {
-        self.get(name).filter(|value| !value.is_empty()).cloned()
+        st_drivers::contracts::env_with(name, &|key| self.raw_var(key))
     }
 }
 
@@ -63,7 +63,14 @@ fn hook_var(env: &dyn HookEnv, name: &str) -> Option<String> {
     st_drivers::contracts::env_with(name, &|key| env.raw_var(key))
 }
 
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+pub(crate) fn identity_conflict(env: &dyn HookEnv) -> bool {
+    st_drivers::contracts::identity_conflict_with(&|name| env.raw_var(name))
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
+
 fn hook_identity(env: &dyn HookEnv) -> Option<String> {
+    if identity_conflict(env) { return None; }
     env.var(st_drivers::driver_paths::IDENTITY_ENV)
         .or_else(|| hook_var(env, "ST_CLAUDE_IDENTITY"))
         .or_else(|| {
@@ -76,11 +83,12 @@ fn hook_identity(env: &dyn HookEnv) -> Option<String> {
         })
 }
 
-fn hook_paths(env: &dyn HookEnv, identity: &str) -> Result<st_drivers::driver_paths::Paths> {
+/// Retain native provenance from the resolver so dispatch cannot diverge from path selection.
+fn hook_paths(env: &dyn HookEnv, identity: &str) -> Result<(st_drivers::driver_paths::Paths, bool)> {
     if let Some(paths) =
         st_drivers::driver_paths::Paths::from_environment(identity, &|name| env.raw_var(name))?
     {
-        return Ok(paths);
+        return Ok((paths, true));
     }
     // Compatibility for providers launched before explicit paths. Their immutable hook sets
     // still exec the replaced binary, and their declarations stay intact until restart.
@@ -97,11 +105,11 @@ fn hook_paths(env: &dyn HookEnv, identity: &str) -> Result<st_drivers::driver_pa
     )?
     .context("the old hook's identity is not declared")?;
     let session_dir = st_drivers::claude_session::state_dir(&root, identity);
-    Ok(st_drivers::driver_paths::Paths {
+    Ok((st_drivers::driver_paths::Paths {
         root,
         agent_dir,
         session_dir,
-    })
+    }, false))
 }
 
 /// Run hook `name` and return the process exit code.
@@ -124,8 +132,8 @@ pub fn run(
                 let _ = std::io::copy(stdin, &mut std::io::sink());
                 return 0;
             };
-            let paths = match hook_paths(env, &identity) {
-                Ok(paths) => paths,
+            let (paths, native) = match hook_paths(env, &identity) {
+                Ok(resolved) => resolved,
                 Err(error) => {
                     let _ = std::io::copy(stdin, &mut std::io::sink());
                     eprintln!("st: Claude status line paths are unavailable: {error:#}");
@@ -141,7 +149,7 @@ pub fn run(
                 }
             }
             // The tee records fail-open and chains to the operator's renderer itself.
-            let rendered = if env.raw_var(st_drivers::driver_paths::ROOT_ENV).is_some() {
+            let rendered = if native {
                 st_drivers::claude_session::run_statusline_paths(&paths.agent_dir, &identity)
             } else {
                 st_drivers::claude_session::run_statusline(&paths.root, &identity)
@@ -275,8 +283,8 @@ fn claude_observe(
         }
         return 0;
     };
-    let paths = match hook_paths(env, &identity) {
-        Ok(paths) => paths,
+    let (paths, native) = match hook_paths(env, &identity) {
+        Ok(resolved) => resolved,
         Err(error) => {
             if session_start || mandatory {
                 return unbound(
@@ -294,7 +302,7 @@ fn claude_observe(
     }
     let runtime_id = hook_var(env, st_drivers::claude_session::RUNTIME_ID_ENV)
         .unwrap_or_else(|| identity.clone());
-    let observed = if env.raw_var(st_drivers::driver_paths::ROOT_ENV).is_some() {
+    let observed = if native {
         st_drivers::claude_session::run_observe_payload_paths(
             &paths,
             &identity,
@@ -799,6 +807,7 @@ pub fn post_diagnostic(env: &dyn HookEnv, diagnostic: &Diagnostic) -> Result<()>
 mod tests {
     use super::*;
 
+
     fn seat(root: &Path) -> (PathBuf, BTreeMap<String, String>) {
         let catalog = root.join("catalog");
         let host = st_drivers::run::detect_host();
@@ -932,7 +941,9 @@ mod tests {
             agent_dir: root.path().join("observations"),
             session_dir: root.path().join("sessions/claude"),
         };
-        let mut env: BTreeMap<_, _> = paths.environment("example/seat").into_iter().collect();
+        let mut env: BTreeMap<_, _> = paths.environment("example/seat").into_iter()
+            .filter(|(name, _)| name.starts_with("ST_"))
+            .collect();
         env.extend([
             ("ST_CLAUDE_RUNTIME_ID".into(), "example/seat".into()),
             ("ST_CLAUDE_SESSION".into(), "current".into()),
@@ -989,6 +1000,72 @@ mod tests {
         assert_eq!(code, 1);
         // No reporting identity was supplied, but the hook still refuses the partial contract.
         assert!(reported.is_empty());
+    }
+
+    #[test]
+    fn fractal_only_native_hooks_bind_and_observe_without_catalog_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = st_drivers::driver_paths::Paths {
+            root: root.path().to_path_buf(),
+            agent_dir: root.path().join("observations"),
+            session_dir: root.path().join("sessions/claude"),
+        };
+        let mut env: BTreeMap<_, _> = paths.environment("example/seat").into_iter()
+            .filter(|(name, _)| name.starts_with("FRACTAL_"))
+            .collect();
+        let seq =
+            st_drivers::harness_state::claim(&paths.agent_dir, "example/seat", "claude", "current")
+                .unwrap();
+        env.extend([
+            ("FRACTAL_CLAUDE_RUNTIME_ID".into(), "example/seat".into()),
+            ("FRACTAL_CLAUDE_SESSION".into(), "current".into()),
+            ("FRACTAL_CLAUDE_SESSION_SEQ".into(), seq.to_string()),
+            ("FRACTAL_SUBJECT".into(), "agent/example/seat".into()),
+        ]);
+        let payload = r#"{"session_id":"native-1","transcript_path":"/nowhere.jsonl","source":"startup"}"#;
+        let (code, reported) = hook("claude-observe", &["SessionStart"], &env, payload);
+        assert_eq!(code, 0);
+        assert!(reported.is_empty(), "{reported:?}");
+        assert_eq!(
+            crate::hooks::claude_binding(&paths.agent_dir, "current").as_deref(),
+            Some("native-1")
+        );
+        let (code, reported) = hook(
+            "claude-observe",
+            &["UserPromptSubmit"],
+            &env,
+            r#"{"session_id":"native-1","prompt":"hello"}"#,
+        );
+        assert_eq!(code, 0);
+        assert!(reported.is_empty(), "{reported:?}");
+        let record_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
+        let observed = st_drivers::harness_state::read(&record_path, None).unwrap();
+        assert_eq!(observed.state, st_drivers::harness_state::Activity::Active);
+        assert_eq!(observed.evidence_incarnation.as_deref(), Some("current"));
+        assert!(!root.path().join("catalog.kdl").exists());
+        assert!(!paths.agent_dir.join("agent.kdl").exists());
+
+        // Malformed native contracts must still fail before catalog discovery.
+        for value in [None, Some("")] {
+            let mut invalid = env.clone();
+            invalid.remove("FRACTAL_DRIVER_SESSION_DIR");
+            if let Some(value) = value {
+                invalid.insert("FRACTAL_DRIVER_SESSION_DIR".into(), value.into());
+                invalid.insert(
+                    "ST_DRIVER_SESSION_DIR".into(),
+                    paths.session_dir.display().to_string(),
+                );
+            }
+            let (code, reported) = hook("claude-observe", &["SessionStart"], &invalid, payload);
+            assert_eq!(code, 1);
+            assert_eq!(reported.len(), 1);
+            assert!(reported[0].reason.contains("no valid driver paths"), "{reported:?}");
+        }
+        env.insert("ST_DRIVER_IDENTITY".into(), "another/seat".into());
+        let (code, reported) = hook("claude-observe", &["SessionStart"], &env, payload);
+        assert_eq!(code, 1);
+        assert_eq!(reported.len(), 1);
+        assert!(reported[0].reason.contains("no agent identity"), "{reported:?}");
     }
 
     #[test]

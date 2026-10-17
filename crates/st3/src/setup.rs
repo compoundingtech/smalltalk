@@ -69,14 +69,14 @@ pub struct PreparedSetup {
 }
 
 fn interactive() -> bool {
-    std::env::var_os("ST_AGENT").is_none()
+    !crate::agent_environment_present()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
 }
 
 fn require_person_process() -> Result<()> {
     anyhow::ensure!(
-        std::env::var_os("ST_AGENT").is_none(),
+        !crate::agent_environment_present(),
         "setup is a person command and is unavailable inside an agent seat"
     );
     Ok(())

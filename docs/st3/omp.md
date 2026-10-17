@@ -38,6 +38,9 @@ configuration; `ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION` and
 The provider wrapper also sets matching `FRACTAL_OMP_CHANNEL_*` names. Shared Rust
 channel readers prefer those names, retain the `ST_*` fallback, and reject conflicting
 ownership values. The existing `ST_*` names remain available to hooks and agent policy.
+Daemon-launched seats also receive matching `FRACTAL_*` aliases for the launch
+environment, including `FRACTAL_AGENT` and `FRACTAL_SUBJECT`. CLI identity defaults
+accept either spelling; shell and TypeScript hooks can continue to use the old names.
 <!-- LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read -->
 
 `session_start` sends the native OMP session ID before accepting Rust's hello.

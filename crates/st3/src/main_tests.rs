@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn cli_environment_aliases_are_normalized_before_parsing() {
+    const CHILD: &str = "ST_TEST_CLI_ENV_CHILD";
+    if let Ok(case) = std::env::var(CHILD) {
+        let expected = match case.as_str() {
+            "old" => Some("agent/old"),
+            "new" => Some("agent/new"),
+            "equal" => Some("agent/same"),
+            _ => None,
+        };
+        assert_eq!(agent_environment_present(), case != "instance");
+        let root_command = cli_command();
+        let command = root_command.find_subcommand("work").unwrap()
+            .find_subcommand("start").unwrap().clone();
+        let parsed = command.clone().try_get_matches_from(["start", "task"])
+            .and_then(|matches| WorkStartArgs::from_arg_matches(&matches));
+        assert_eq!(parsed.ok().map(|args| args.actor).as_deref(), expected);
+        let matches = command.try_get_matches_from([
+            "start", "task", "--as", "person/explicit",
+        ]).unwrap();
+        let explicit = WorkStartArgs::from_arg_matches(&matches).unwrap();
+        assert_eq!(explicit.actor, "person/explicit");
+        if case == "instance" {
+            let arguments = vec![std::ffi::OsString::from("st")];
+            assert_eq!(st3::instance::requested(&arguments).as_deref(), Some("alias-test"));
+            let matches = cli_command().try_get_matches_from([
+                "st", "--instance", "flag-test", "work", "start", "task", "--as", "person/explicit",
+            ]).unwrap();
+            let parsed = Cli::from_arg_matches(&matches).unwrap();
+            assert_eq!(parsed.instance.as_deref(), Some("flag-test"));
+        }
+        return;
+    }
+    for (case, old, new) in [
+        ("old", Some("agent/old"), None),
+        ("new", None, Some("agent/new")),
+        ("equal", Some("agent/same"), Some("agent/same")),
+        ("conflict", Some("agent/old"), Some("agent/new")),
+        ("empty", Some("agent/old"), Some("")),
+        ("instance", None, None),
+    ] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "tests::cli_environment_aliases_are_normalized_before_parsing", "--nocapture"])
+            .env(CHILD, case);
+        for (name, new) in CLI_ENVIRONMENT_NAMES {
+            command.env_remove(name).env_remove(new);
+            if let Some(legacy) = st_drivers::contracts::legacy_env_name(name) {
+                command.env_remove(legacy);
+            }
+        }
+        if let Some(value) = old { command.env("ST_AGENT", value); }
+        if let Some(value) = new { command.env("FRACTAL_AGENT", value); }
+        if case == "instance" { command.env("FRACTAL_INSTANCE", "alias-test"); }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{case}: {stderr}\n{}", String::from_utf8_lossy(&output.stdout));
+        assert_eq!(stderr.contains("conflicting environment variables"), case == "conflict", "{case}: {stderr}");
+        assert!(!stderr.contains("agent/old") && !stderr.contains("agent/new"), "{case}: {stderr}");
+    }
+}
+
+#[test]
 fn slo_list_groups_objectives_and_budgets_and_explain_prints_the_plain_words() {
     let rows = vec![
         json!({"id": "person-read", "kind": "objective", "status": "met", "target": "p99 ≤ 100 ms",

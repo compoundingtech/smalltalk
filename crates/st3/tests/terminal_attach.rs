@@ -238,8 +238,7 @@ async fn attach(root: &Path, endpoint: &str) -> (Output, u32) {
     let mut command = st3::test_support::command(binary);
     // An operator command: the harness running the suite must not lend its seat identity, and
     // its own PTY session must not trip the nested-attach guard.
-    command
-        .env_remove("ST_AGENT")
+    command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env_remove("PTY_SESSION")
         .env_remove("ST3_ENDPOINT")
@@ -265,8 +264,7 @@ async fn attach(root: &Path, endpoint: &str) -> (Output, u32) {
 async fn configured_attach(root: &Path, daemon_wait: &str) -> (Output, u32, Duration) {
     let binary = test_bin!("st3-fixture").to_path_buf();
     let mut command = st3::test_support::command(binary);
-    command
-        .env_remove("ST_AGENT")
+    command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env_remove("PTY_SESSION")
         .env_remove("ST3_ENDPOINT")
@@ -587,8 +585,7 @@ async fn waiting_on_a_daemon_that_does_not_answer_says_so() {
     // No PTY session of the subject runs on this host, so only the daemon can attach it.
     ConfiguredRegistry::new(root.path());
     let binary = test_bin!("st3-fixture").to_path_buf();
-    let mut child = st3::test_support::command(binary)
-        .env_remove("ST_AGENT")
+    let mut child = st3::test_support::command(binary).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env_remove("PTY_SESSION")
         .env_remove("ST3_ENDPOINT")
@@ -770,8 +767,7 @@ fn fabric_tunnel(
                 Some(std::process::id())
             }
             Exposure::Exec => {
-                let mut serve = st3::test_support::command(binary)
-                    .env_remove("ST_AGENT")
+                let mut serve = st3::test_support::command(binary).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
                     .env_remove("PTY_SESSION")
                     .args(["terminals", "serve-fabric", "--stdio", "--pty-root"])
                     .arg(&pty_root)
@@ -813,8 +809,7 @@ fn forward(tunnel: std::os::unix::net::UnixStream, service: std::os::unix::net::
 async fn remote_attach(root: &Path, endpoint: &str) -> Output {
     let binary = test_bin!("st3-fixture").to_path_buf();
     let mut command = st3::test_support::command(binary);
-    command
-        .env_remove("ST_AGENT")
+    command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env_remove("PTY_SESSION")
         .env_remove("ST3_ENDPOINT")
@@ -972,8 +967,7 @@ async fn expose_fabric_points_fabric_at_the_daemons_terminal_socket() {
     remote_terminal(root.path(), &incarnation(CREATED_AT));
     fabric_shim(root.path(), None);
     let mut command = st3::test_support::command(test_bin!("st3-fixture"));
-    command
-        .env_remove("ST_AGENT")
+    command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_STATE_HOME", root.path().join("state"))

@@ -692,9 +692,7 @@ impl Daemon {
                 "--json",
                 "--daemon-wait",
                 "0",
-            ])
-            .env_remove("ST_AGENT")
-            .env_remove("ST3_INCARNATION")
+            ]).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT").env_remove("ST3_INCARNATION").env_remove("FRACTAL_INCARNATION")
             .env_remove("ST_MISSION_RUN")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("GH_TOKEN")

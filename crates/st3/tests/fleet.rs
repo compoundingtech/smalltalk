@@ -2420,9 +2420,7 @@ fn supervise_leave_with_diagnostics() -> bool {
             .arg(root.path())
             .arg("--")
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture", "--include-ignored"])
-            .env_remove("ST_AGENT")
-            .env_remove("ST3_SUBJECT")
+            .args(["--exact", name, "--nocapture", "--include-ignored"]).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT").env_remove("ST3_SUBJECT").env_remove("FRACTAL_SUBJECT")
             .env("SMALLTALK_TEST_SUPERVISED", name)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .output().expect("launch bounded fleet leave guardian");

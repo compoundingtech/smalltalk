@@ -30,7 +30,12 @@ impl Paths {
             (IDENTITY_ENV, identity.to_owned()),
         ]
         .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+        .flat_map(|(key, value)| [
+            (key.to_owned(), value.clone()),
+            (crate::contracts::fractal_env_name(key).unwrap(), value),
+        ])
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
         .collect()
     }
 
@@ -41,7 +46,16 @@ impl Paths {
         var: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Option<Self>> {
         let names = [ROOT_ENV, AGENT_DIR_ENV, SESSION_DIR_ENV, IDENTITY_ENV];
-        let values = names.map(var);
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+        let values = names.map(|name| {
+            crate::contracts::env_with(name, var).or_else(|| {
+                // Presence is significant: an empty/conflicting native contract cannot
+                // masquerade as absent and fall back to another seat's catalog.
+                (var(name).is_some() || crate::contracts::fractal_env_name(name)
+                    .is_some_and(|new| var(&new).is_some())).then(String::new)
+            })
+        });
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
         if values.iter().all(Option::is_none) {
             return Ok(None);
         }
@@ -85,9 +99,22 @@ mod tests {
         env.insert("CATALOG".into(), "/tmp/predecessor-catalog".into());
         assert_eq!(
             Paths::from_environment("example/seat", &|key| env.get(key).cloned()).unwrap(),
-            Some(paths)
+            Some(paths.clone())
         );
         assert!(Paths::from_environment("another/seat", &|key| env.get(key).cloned()).is_err());
+        env.retain(|name, _| !name.starts_with("ST_"));
+        assert_eq!(
+            Paths::from_environment("example/seat", &|key| env.get(key).cloned()).unwrap(),
+            Some(paths.clone())
+        );
+        env.insert("ST_DRIVER_IDENTITY".into(), "another/seat".into());
+        assert!(Paths::from_environment("example/seat", &|key| env.get(key).cloned()).is_err());
+        env.remove("ST_DRIVER_IDENTITY");
+        env.insert("FRACTAL_DRIVER_SESSION_DIR".into(), String::new());
+        assert!(Paths::from_environment("example/seat", &|key| env.get(key).cloned()).is_err());
+        env.clear();
+        env.extend(paths.environment("example/seat").into_iter()
+            .filter(|(name, _)| name.starts_with("ST_")));
         env.remove(SESSION_DIR_ENV);
         assert!(Paths::from_environment("example/seat", &|key| env.get(key).cloned()).is_err());
         env.insert(SESSION_DIR_ENV.into(), "relative/sessions".into());

@@ -3,8 +3,7 @@ use std::{path::Path, process::Command};
 
 fn history(root: &Path) -> String {
     let output = Command::new(test_env!("CARGO_BIN_EXE_st3"))
-        .args(["ui", "--slo"])
-        .env_remove("ST_AGENT")
+        .args(["ui", "--slo"]).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env("HOME", root)
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_STATE_HOME", root.join("state"))

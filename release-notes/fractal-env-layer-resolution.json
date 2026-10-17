@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Resolve Fractal environment aliases within each source layer before launch defaults, native resume selection and instance activation",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No storage schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Declared aliases replace runtime defaults and inherited aliases as whole families. Explicit empty or conflicting identity values mask lower layers. Launcher-owned assignments still override both spellings. Fractal-only native paths dispatch to native hooks, authored resume selectors survive launch cleanup, and instance activation/current selection share Fractal-first resolution. Existing ST consumers keep equal launch aliases."},
+  "downtime": {"status": "none", "detail": "No service replacement or seat restart required."},
+  "manual": {"status": "none", "detail": "No action required for existing configurations. Resolve conflicting manually authored identity aliases before relaunching."},
+  "recovery": {"status": "none", "detail": "No durable state changes. Existing ST names remain readable and exported."}
+}

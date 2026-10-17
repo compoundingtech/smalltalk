@@ -363,8 +363,12 @@ fn management_request(command: SekretsCommand) -> Result<Request> {
 async fn identified_connection(endpoint: Option<&str>) -> Result<Connection> {
     let mut connection = Connection::open(&socket_path())?;
     if let CallerView::Unidentified { .. } = connection.caller
-        && std::env::var("ST_AGENT").is_ok_and(|agent| agent.starts_with("agent/"))
+        && ["ST_AGENT", "FRACTAL_AGENT"].iter().any(|name| std::env::var_os(name).is_some())
     {
+        anyhow::ensure!(
+            st_drivers::contracts::env("ST_AGENT").is_some_and(|agent| agent.starts_with("agent/")),
+            "seat identity is empty, invalid or has conflicting environment aliases"
+        );
         let client = daemon_client(endpoint)?;
         let attestation: Attestation = client
             .post("/v1/sekrets/attest", &json!({ "nonce": connection.nonce }))
@@ -382,7 +386,7 @@ async fn identified_connection(endpoint: Option<&str>) -> Result<Connection> {
 fn daemon_client(endpoint: Option<&str>) -> Result<crate::client::Client> {
     let endpoint = daemon_endpoint(
         endpoint.map(str::to_owned),
-        std::env::var("ST3_ENDPOINT").ok(),
+        st_drivers::contracts::env("ST3_ENDPOINT"),
         || {
             Ok(crate::config::Config::load_client_unvalidated(None)?
                 .0

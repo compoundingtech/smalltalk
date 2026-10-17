@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Explicitly empty Fractal environment values silently mask older spellings instead of reporting identity conflicts.",
+  "replay": { "status": "none", "detail": "No replay changes." },
+  "schema": { "status": "none", "detail": "No persisted schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "changed", "detail": "Empty FRACTAL values are masks, not conflicting identities. Unequal nonempty identity aliases remain rejected with redacted warnings. Restart regression coverage validates equal launch-token aliases before excluding the intentionally per-launch token from environment equivalence." },
+  "downtime": { "status": "none", "detail": "No service changes." },
+  "manual": { "status": "none", "detail": "No manual action required." },
+  "recovery": { "status": "none", "detail": "Legacy environment names remain supported." }
+}

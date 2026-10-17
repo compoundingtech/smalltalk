@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep native continuation path handling unchanged while normalizing launch aliases",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No storage schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Keep the existing native continuation reader and its OS-native path values. Launch normalization supplies both aliases; the resume-request reader uses the shared Fractal resolver. No new UTF-8 restriction is imposed on existing continuation paths."},
+  "downtime": {"status": "none", "detail": "No interruption."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No durable state changes."}
+}

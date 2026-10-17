@@ -1,7 +1,8 @@
 //! A named, fully separate st on one machine.
 //!
-//! `st --instance NAME` (or `ST_INSTANCE=NAME`) runs a second Smalltalk next to the default one for
-//! testing and for a clean first run. Everything the instance owns lives under one directory,
+//! `st --instance NAME` (or `FRACTAL_INSTANCE=NAME`, with `ST_INSTANCE` fallback) runs a second
+//! Smalltalk next to the default one for testing and for a clean first run. Everything it owns
+//! lives under one directory,
 //! `~/.st-instance/NAME`, so removing that directory (plus the service definitions that point into
 //! it) removes the instance and nothing else:
 //!
@@ -37,6 +38,15 @@ use anyhow::{Context as _, Result};
 
 /// Names the instance for this process and everything it starts.
 pub const ENV: &str = "ST_INSTANCE";
+
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+const FRACTAL_ENV: &str = "FRACTAL_INSTANCE";
+
+/// Resolve once at each instance boundary, including explicit empty Fractal masking.
+fn environment_name() -> Option<String> {
+    st_drivers::contracts::env(ENV)
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
 
 /// The directory below `HOME` that holds every instance.
 const ROOT_DIRECTORY: &str = ".st-instance";
@@ -174,10 +184,10 @@ impl Instance {
     }
 }
 
-/// The instance this process runs in, if any. `ST_INSTANCE` that is set but not a valid name ends
-/// the process: guessing would run the default install when a person asked for a separate one.
+/// The instance this process runs in, if any. A resolved name that is not valid ends the
+/// process: guessing would run the default install when a person asked for a separate one.
 pub fn current() -> Option<Instance> {
-    let name = env::var(ENV).ok().filter(|name| !name.is_empty())?;
+    let name = environment_name()?;
     let home = match env::var_os("HOME").map(PathBuf::from) {
         Some(home) => home,
         None => fail("HOME is not set, so the instance directory cannot be found"),
@@ -211,7 +221,7 @@ pub fn requested(arguments: &[std::ffi::OsString]) -> Option<String> {
             found = iterator.next().and_then(|value| value.to_str()).map(str::to_owned);
         }
     }
-    found
+    found.or_else(environment_name)
 }
 
 /// Put this process in the instance. Call once, first thing, before any thread starts.
@@ -221,8 +231,8 @@ pub fn requested(arguments: &[std::ffi::OsString]) -> Option<String> {
 /// Changes the process environment, so no other thread may be running.
 pub unsafe fn activate(name: &str) -> Result<Instance> {
     validate(name)?;
-    if let Ok(active) = env::var(ENV)
-        && !active.is_empty()
+    let active = environment_name();
+    if let Some(active) = active.as_deref()
         && active != name
     {
         anyhow::bail!("this process already runs in instance `{active}`, not `{name}`");
@@ -231,7 +241,7 @@ pub unsafe fn activate(name: &str) -> Result<Instance> {
         .map(PathBuf::from)
         .context("HOME is not set, so the instance directory cannot be found")?;
     let instance = Instance::new(&home, name)?;
-    let already_inside = env::var(ENV).is_ok_and(|active| active == name);
+    let already_inside = active.as_deref() == Some(name);
     for (variable, remembered) in XDG {
         // The host's own value is kept once, on the way in; a child started from inside the
         // instance carries it along rather than overwriting it with the instance's.
@@ -241,6 +251,10 @@ pub unsafe fn activate(name: &str) -> Result<Instance> {
         }
     }
     unsafe { env::set_var(ENV, name) };
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+    // Normalize both spellings so every child observes the instance we activated.
+    unsafe { env::set_var(FRACTAL_ENV, name) };
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
     for (variable, value) in instance.environment() {
         unsafe { env::set_var(variable, value) };
     }
@@ -284,7 +298,12 @@ pub fn service_environment() -> Vec<(String, String)> {
     let Some(instance) = current() else {
         return Vec::new();
     };
-    let mut variables = vec![(ENV.to_owned(), instance.name().to_owned())];
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+    let mut variables = vec![
+        (FRACTAL_ENV.to_owned(), instance.name().to_owned()),
+        (ENV.to_owned(), instance.name().to_owned()),
+    ];
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
     for (variable, value) in instance.environment() {
         variables.push((variable.to_owned(), value.display().to_string()));
     }
@@ -419,8 +438,94 @@ mod tests {
         assert_eq!(requested(&arguments(&["st", "--instance", "a", "agents", "ls"])), Some("a".into()));
         assert_eq!(requested(&arguments(&["st", "agents", "--instance=b"])), Some("b".into()));
         assert_eq!(requested(&arguments(&["st", "--instance", "a", "--instance=c"])), Some("c".into()));
-        assert_eq!(requested(&arguments(&["st", "sekrets", "--", "tool", "--instance", "x"])), None);
-        assert_eq!(requested(&arguments(&["st", "--instance"])), None);
-        assert_eq!(requested(&arguments(&["st", "ls"])), None);
+        let fallback = environment_name();
+        assert_eq!(requested(&arguments(&["st", "sekrets", "--", "tool", "--instance", "x"])), fallback);
+        assert_eq!(requested(&arguments(&["st", "--instance"])), fallback);
+        assert_eq!(requested(&arguments(&["st", "ls"])), fallback);
+    }
+
+    #[test]
+    fn instance_aliases_agree_at_every_boundary() {
+        const CHILD: &str = "SMALLTALK_INSTANCE_ALIAS_TEST";
+        if let Ok(case) = env::var(CHILD) {
+            let expected = match case.as_str() {
+                "preferred" => Some("new"),
+                "legacy" => Some("old"),
+                "masked" | "absent" => None,
+                _ => panic!("unknown instance alias case: {case}"),
+            };
+            assert_eq!(requested(&["st".into()]).as_deref(), expected);
+            if case == "masked" {
+                assert_eq!(env::var(ENV).as_deref(), Ok("old"));
+                assert!(requested(&["st".into()]).is_none(), "empty preferred alias must ignore legacy instance");
+            }
+            assert_eq!(current().as_ref().map(Instance::name), expected);
+            if expected.is_none() {
+                assert!(service_environment().is_empty());
+            }
+            let name = expected.unwrap_or("explicit");
+            // SAFETY: this is an isolated, single-test child with one test thread and no
+            // runtime or other environment readers. The parent never mutates its environment.
+            let activated = unsafe { activate(name) }.unwrap();
+            assert_eq!(current(), Some(activated));
+            assert_eq!(requested(&["st".into()]).as_deref(), Some(name));
+            assert_eq!(env::var(ENV).unwrap(), name);
+            assert_eq!(env::var(FRACTAL_ENV).unwrap(), name);
+            let service = service_environment();
+            for alias in [FRACTAL_ENV, ENV] {
+                assert!(service.iter().any(|(key, value)| key == alias && value == name));
+            }
+            // A second activation must retain the remembered host paths, not the instance's.
+            let remembered: Vec<_> = XDG.iter().map(|(_, key)| env::var_os(key)).collect();
+            assert_eq!(unsafe { activate(name) }.unwrap(), current().unwrap());
+            assert_eq!(
+                XDG.iter().map(|(_, key)| env::var_os(key)).collect::<Vec<_>>(),
+                remembered
+            );
+            assert!(unsafe { activate("different") }.is_err());
+            return;
+        }
+
+        for (case, preferred, legacy) in [
+            ("preferred", Some("new"), Some("old")),
+            ("legacy", None, Some("old")),
+            ("masked", Some(""), Some("old")),
+            ("absent", None, None),
+        ] {
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "instance::tests::instance_aliases_agree_at_every_boundary",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, case)
+                .env("HOME", "/home/example")
+                .env_remove(FRACTAL_ENV)
+                .env_remove(ENV);
+            if let Some(value) = preferred {
+                command.env(FRACTAL_ENV, value);
+            }
+            if let Some(value) = legacy {
+                command.env(ENV, value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expects_warning = preferred.zip(legacy).is_some_and(|(new, old)| {
+                !new.is_empty() && !old.is_empty() && new != old
+            });
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr).contains(
+                    "conflicting environment variables FRACTAL_INSTANCE and ST_INSTANCE; using the Fractal value"
+                ),
+                expects_warning,
+                "{case}: unexpected alias conflict warning outcome"
+            );
+        }
     }
 }

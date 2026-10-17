@@ -897,13 +897,10 @@ struct Record<'a> {
 }
 
 fn record<'a>(marker: &'a Marker, call: &Call<'a>) -> Record<'a> {
-    let variable = |name| {
-        std::env::var_os(name)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string_lossy().into_owned())
-    };
-    let subject = variable("ST3_SUBJECT");
-    let actor = variable("ST_AGENT")
+    let variable = st_drivers::contracts::env;
+    let conflict = st_drivers::contracts::identity_conflict_with(&|name| std::env::var(name).ok());
+    let subject = (!conflict).then(|| variable("ST3_SUBJECT")).flatten();
+    let actor = (!conflict).then(|| variable("ST_AGENT")).flatten()
         .or_else(|| subject.clone())
         .unwrap_or_else(|| "daemon".into());
     let (exit_code, signal) = match call.outcome {

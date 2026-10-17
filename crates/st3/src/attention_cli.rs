@@ -151,7 +151,7 @@ pub(super) async fn run_attention(
             // seat looking at the person's home reads nothing for them.
             if item.request.as_ref().is_some_and(|r| r["type"] == "update")
                 && item.person == actor
-                && std::env::var_os("ST_AGENT").is_none()
+                && !crate::agent_environment_present()
             {
                 let _: StepRunView = client
                     .post(

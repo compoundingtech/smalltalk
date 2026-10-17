@@ -78,6 +78,7 @@ pub fn clear_seat_environment(command: &mut Command) {
         if key == "ST_AGENT"
             || key.starts_with("ST3_")
             || key == "ST_HOOKS"
+            || key.starts_with("FRACTAL_")
             || key.starts_with("BASH_FUNC_")
         {
             command.env_remove(name);
@@ -123,6 +124,8 @@ pub fn supervise_test() -> bool {
             .args(["--exact", name, "--nocapture", "--include-ignored"])
             .env_remove("ST_AGENT")
             .env_remove("ST3_SUBJECT")
+            .env_remove("FRACTAL_AGENT")
+            .env_remove("FRACTAL_SUBJECT")
             .env("SMALLTALK_TEST_SUPERVISED", name)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()

@@ -187,14 +187,13 @@ impl LocalTarget {
     /// A non-Unix endpoint yields `None`: client-v0 lists need the trusted local socket.
     pub fn discover(words: &[String]) -> Option<Self> {
         let config = st3::config::Config::load_client_unvalidated(None).ok()?.0;
-        let endpoint = endpoint_word(words).or_else(|| std::env::var("ST3_ENDPOINT").ok());
+        let endpoint = endpoint_word(words).or_else(|| st_drivers::contracts::env("ST3_ENDPOINT"));
         let socket = match endpoint.map(st3::client::Endpoint::parse) {
             Some(st3::client::Endpoint::Unix(socket)) => socket,
             Some(_) => return None,
             None => config.socket,
         };
-        let agent = std::env::var("ST_AGENT")
-            .ok()
+        let agent = st_drivers::contracts::env("ST_AGENT")
             .filter(|agent| !agent.is_empty())
             .map(|agent| {
                 if agent.starts_with("agent/") {
@@ -203,6 +202,9 @@ impl LocalTarget {
                     format!("agent/{agent}")
                 }
             });
+        if agent.is_none() && crate::agent_environment_present() {
+            return None;
+        }
         Some(Self {
             socket,
             caller: agent.or_else(|| config.person.clone()),

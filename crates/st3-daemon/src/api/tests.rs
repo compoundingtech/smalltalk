@@ -1613,6 +1613,21 @@ fn native_title_subscriptions_recognize_the_outer_pi_and_omp_drivers() {
 }
 
 #[test]
+fn delivery_identity_accepts_new_names_and_rejects_masked_or_conflicting_aliases() {
+    let args = ["st3", "driver", "codex"].map(str::to_owned);
+    for (values, expected) in [
+        (vec!["ST_AGENT=agent/seat"], Some("agent/seat")),
+        (vec!["FRACTAL_AGENT=agent/seat"], Some("agent/seat")),
+        (vec!["ST_AGENT=agent/seat", "FRACTAL_AGENT=agent/seat"], Some("agent/seat")),
+        (vec!["ST_AGENT=agent/seat", "FRACTAL_AGENT=agent/other"], None),
+        (vec!["ST_AGENT=agent/seat", "FRACTAL_AGENT="], None),
+    ] {
+        let env: Vec<_> = values.into_iter().map(str::to_owned).collect();
+        assert_eq!(native_delivery_identity(37, &args, &env).map(|peer| peer.agent).as_deref(), expected);
+    }
+}
+
+#[test]
 fn legacy_claude_mcp_is_a_delivery_peer_but_ordinary_mailbox_queries_are_not() {
     let env = vec!["ST_AGENT=agent/example/legacy".into()];
     let args = ["st3", "driver", "claude-mcp"].map(str::to_owned);

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Normalize Fractal environment aliases before CLI parsing while preserving clap environment and flag behavior.",
+  "replay": { "status": "none", "detail": "No replay changes." },
+  "schema": { "status": "none", "detail": "No persisted schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "changed", "detail": "CLI environment aliases are resolved before instance selection, completion and clap parsing. Conflicting or explicitly masked seat identity remains fail-closed without allowing person-authority fallback; explicit flags retain precedence." },
+  "downtime": { "status": "none", "detail": "No service changes." },
+  "manual": { "status": "none", "detail": "No manual action required." },
+  "recovery": { "status": "none", "detail": "Legacy environment names remain supported." }
+}

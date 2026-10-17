@@ -470,8 +470,17 @@ pub(crate) fn member_environment(
     executable: &Path,
     recorder: Option<&Path>,
 ) -> Result<BTreeMap<String, String>> {
-    let mut environment =
-        st_runtime::overlay_environment(crate::environment::snapshot()?, declared, executable)?;
+    // Alias-family resolution lives in environment::{overlay,remove_aliases}.
+    let mut inherited = crate::environment::snapshot()?;
+    for name in ["ST_AGENT", "ST_SUPERVISOR", "ST3_SUBJECT"] {
+        if !declared.contains_key(name)
+            && !st_drivers::contracts::fractal_env_name(name)
+                .is_some_and(|new| declared.contains_key(&new))
+        {
+            crate::environment::remove_aliases(&mut inherited, name);
+        }
+    }
+    let mut environment = crate::environment::overlay(inherited, declared, executable)?;
     record_member_commands(&mut environment, recorder)?;
     Ok(environment)
 }
@@ -1252,18 +1261,21 @@ fn overlay_runtime_environment(
     member: &mut BTreeMap<String, String>,
     runtime: &BTreeMap<String, String>,
 ) {
+    crate::environment::normalize_aliases(member);
+    let mut runtime = runtime.clone();
+    crate::environment::normalize_aliases(&mut runtime);
     for (key, value) in runtime {
-        if key == st_drivers::access::MODE_ENV || key == st_drivers::access::CODEX_ASKS_ENV {
-            member.insert(key.clone(), value.clone());
+        if matches!(key.as_str(), "ST_ACCESS_MODE" | "FRACTAL_ACCESS_MODE"
+            | "ST_CODEX_ASKS" | "FRACTAL_CODEX_ASKS")
+        {
+            member.insert(key, value);
         } else {
-            member.entry(key.clone()).or_insert_with(|| value.clone());
+            member.entry(key).or_insert(value);
         }
     }
     if is_person_terminal(subject) {
-        member.insert(
-            st_runtime::PRIORITY_ENV.into(),
-            st_runtime::SeatPriority::Normal.as_str().into(),
-        );
+        crate::environment::set(member, st_runtime::PRIORITY_ENV,
+            st_runtime::SeatPriority::Normal.as_str().into());
     }
 }
 
@@ -6958,6 +6970,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 workspace.display()
             );
         }
+        // Resolve authored Fractal-only selectors before cleanup and native-session selection.
+        let normalized_member = member.environment.keys().any(|name| name.starts_with("FRACTAL_"))
+            .then(|| {
+                let mut member = member.clone();
+                crate::environment::normalize_aliases(&mut member.environment);
+                member
+            });
+        let member = normalized_member.as_ref().unwrap_or(member);
         let mut launch_member = member.clone();
         overlay_runtime_environment(
             &subject.subject,
@@ -6989,7 +7009,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             crate::rollout::RESUME_PATH_ENV,
         ] {
             if !member.environment.contains_key(variable) {
-                launch_member.environment.remove(variable);
+                crate::environment::remove_aliases(&mut launch_member.environment, variable);
             }
         }
         // Only a resume names a native session. A daemon started inside a resumed seat inherits
@@ -6998,9 +7018,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             .environment
             .contains_key(crate::suspension::RESUME_ENV)
         {
-            launch_member
-                .environment
-                .remove(crate::suspension::RESUME_ENV);
+            crate::environment::remove_aliases(
+                &mut launch_member.environment, crate::suspension::RESUME_ENV);
         }
         // The import claim has no incarnation: it is a bootstrap selector, not
         // evidence that a driver has bound the session. Once a driver binds, normal
@@ -7021,29 +7040,17 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &member.environment[crate::rollout::RESUME_PATH_ENV],
             )?;
         if import_bound {
-            launch_member
-                .environment
-                .remove(crate::suspension::RESUME_ENV);
-            launch_member
-                .environment
-                .remove(crate::rollout::RESUME_PATH_ENV);
+            crate::environment::remove_aliases(&mut launch_member.environment, crate::suspension::RESUME_ENV);
+            crate::environment::remove_aliases(&mut launch_member.environment, crate::rollout::RESUME_PATH_ENV);
         }
         // Every other relaunch of a seat continues the native session its harness last bound,
         // so a restart, a hangup or a changed declaration never loses the conversation.
-        launch_member
-            .environment
-            .remove(crate::suspension::CONTINUE_ENV);
-        launch_member
-            .environment
-            .remove(crate::suspension::CONTINUE_PATH_ENV);
+        crate::environment::remove_aliases(&mut launch_member.environment, crate::suspension::CONTINUE_ENV);
+        crate::environment::remove_aliases(&mut launch_member.environment, crate::suspension::CONTINUE_PATH_ENV);
         let selector_scope = crate::native_resume::selection_scope(member);
-        launch_member
-            .environment
-            .remove(crate::suspension::SELECTOR_SCOPE_ENV);
+        crate::environment::remove_aliases(&mut launch_member.environment, crate::suspension::SELECTOR_SCOPE_ENV);
         if let Some(scope) = &selector_scope {
-            launch_member
-                .environment
-                .insert(crate::suspension::SELECTOR_SCOPE_ENV.into(), scope.clone());
+            crate::environment::set(&mut launch_member.environment, crate::suspension::SELECTOR_SCOPE_ENV, scope.clone());
         }
         let continued = if subject.kind == "agent"
             && !launch_member
@@ -7065,45 +7072,27 @@ impl<R: RuntimeControl> Reconciler<R> {
             None
         };
         if let Some((session, path)) = continued {
-            launch_member
-                .environment
-                .insert(crate::suspension::CONTINUE_ENV.into(), session);
+            crate::environment::set(&mut launch_member.environment, crate::suspension::CONTINUE_ENV, session);
             if let Some(path) = path {
-                launch_member
-                    .environment
-                    .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path);
+                crate::environment::set(&mut launch_member.environment, crate::suspension::CONTINUE_PATH_ENV, path);
             }
         }
         crate::native_seed::omit_seed_for_native_resume(&mut launch_member);
-        launch_member
-            .environment
-            .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
-        launch_member.environment.insert(
-            "ST3_DRIVER_STATE_DIR".into(),
-            self.driver_state_dir.to_string_lossy().into_owned(),
-        );
-        launch_member
-            .environment
-            .insert("ST3_SUBJECT".into(), subject.subject.clone());
+        crate::environment::set(&mut launch_member.environment, "ST3_ENDPOINT", self.endpoint.clone());
+        crate::environment::set(&mut launch_member.environment, "ST3_DRIVER_STATE_DIR",
+            self.driver_state_dir.to_string_lossy().into_owned());
+        crate::environment::set(&mut launch_member.environment, "ST3_SUBJECT", subject.subject.clone());
         if subject.kind == "agent" {
-            launch_member
-                .environment
-                .insert("ST_AGENT".into(), subject.subject.clone());
-            launch_member
-                .environment
-                .insert("ST3_MAILBOX_TRANSPORT".into(), "push".into());
+            crate::environment::set(&mut launch_member.environment, "ST_AGENT", subject.subject.clone());
+            crate::environment::set(&mut launch_member.environment, "ST3_MAILBOX_TRANSPORT", "push".into());
         } else if let Some(owner) = member.tags.get("st3.agent") {
-            launch_member
-                .environment
-                .insert("ST_AGENT".into(), owner.clone());
+            crate::environment::set(&mut launch_member.environment, "ST_AGENT", owner.clone());
         } else {
-            launch_member.environment.remove("ST_AGENT");
+            crate::environment::remove_aliases(&mut launch_member.environment, "ST_AGENT");
         }
         let executable = launch_executable()?;
         let st_binary = self.st_binary.as_ref().unwrap_or(&executable);
-        launch_member
-            .environment
-            .insert("ST3_BIN".into(), st_binary.to_string_lossy().into_owned());
+        crate::environment::set(&mut launch_member.environment, "ST3_BIN", st_binary.to_string_lossy().into_owned());
         if let crate::model::LaunchSpec::Argv(argv) = &mut launch_member.launch
             && argv.first().map(String::as_str) == Some("st3")
         {
@@ -7138,10 +7127,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         // Capture the token before starting; a publication during start must not relabel the launch.
         let desired_token = self.launch_token(&subject.subject)?;
-        launch_member.environment.insert(
-            crate::suspension::LAUNCH_DESIRED_TOKEN_ENV.into(),
-            desired_token.clone(),
-        );
+        crate::environment::set(&mut launch_member.environment, crate::suspension::LAUNCH_DESIRED_TOKEN_ENV,
+            desired_token.clone());
         let guard = || -> Result<()> {
             self.store.owned_desired_guard(subject)?;
             if member
@@ -7356,7 +7343,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         launch: &mut MemberSpec,
     ) -> Result<()> {
-        launch.environment.remove("ST3_ACCOUNT");
+        crate::environment::remove_aliases(&mut launch.environment, "ST3_ACCOUNT");
         if subject.kind != "agent" {
             return Ok(());
         }
@@ -7364,7 +7351,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             // No binding: the harness keeps its login, but a login that is a declared account's
             // directory still belongs to that account.
             if let Some(name) = self.declared_login_account(subject, member, launch) {
-                launch.environment.insert("ST3_ACCOUNT".into(), name);
+                crate::environment::set(&mut launch.environment, "ST3_ACCOUNT", name);
             }
             return Ok(());
         };
@@ -7393,9 +7380,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         launch
             .environment
             .insert(variable.into(), directory.to_string_lossy().into_owned());
-        launch
-            .environment
-            .insert("ST3_ACCOUNT".into(), seat.account.name);
+        crate::environment::set(&mut launch.environment, "ST3_ACCOUNT", seat.account.name);
         Ok(())
     }
 
@@ -7649,7 +7634,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .insert(suspended::RESUME_ENV.into(), session);
                 if agent.starts_with("agent/import/omp/") {
                     // A cold resume names the suspension's session, not the import.
-                    resumed.environment.remove(crate::rollout::RESUME_PATH_ENV);
+                    crate::environment::remove_aliases(&mut resumed.environment, crate::rollout::RESUME_PATH_ENV);
                 }
                 if let Err(error) =
                     self.perform_start(subject, &resumed, "a suspended seat was resumed")
@@ -18109,6 +18094,12 @@ pub(crate) mod tests {
         let mut declared = std::collections::BTreeMap::from([(PRIORITY_ENV.to_string(), "normal".to_string())]);
         overlay_runtime_environment("agent/example/worker", &mut declared, &runtime);
         assert_eq!(declared[PRIORITY_ENV], "normal");
+        for value in ["normal", ""] {
+            let mut declared = BTreeMap::from([("FRACTAL_SEAT_PRIORITY".into(), value.into())]);
+            overlay_runtime_environment("agent/example/worker", &mut declared, &runtime);
+            assert_eq!(declared[PRIORITY_ENV], value);
+            assert_eq!(declared["FRACTAL_SEAT_PRIORITY"], value);
+        }
     }
 
     #[test]
@@ -22237,6 +22228,36 @@ mission "feedback-review" state="ready" {
             Some(std::env::current_exe().unwrap())
         );
         assert!(!members[0].environment.contains_key("PATH"));
+    }
+
+    #[test]
+    fn fractal_only_authored_resume_selectors_survive_launch_selection() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let transcript = workspace.path().join("native.jsonl");
+        apply_source(&store, &format!(r#"
+version 2
+agent "worker" {{
+  workspace {:?}
+  harness "omp" {{}}
+  env {{
+    FRACTAL_NATIVE_RESUME_SESSION "requested-session"
+    FRACTAL_NATIVE_RESUME_PATH {:?}
+  }}
+}}
+"#, workspace.path().to_str().unwrap(), transcript.to_str().unwrap()), "fractal-resume");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(store, runtime.clone(), "node".into(), Arc::new(Notify::new()));
+        reconciler.reconcile_once().unwrap();
+        let members = runtime.started_members.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(members.len(), 1);
+        let env = &members[0].environment;
+        assert_eq!(env[crate::suspension::RESUME_ENV], "requested-session");
+        assert_eq!(env["FRACTAL_NATIVE_RESUME_SESSION"], "requested-session");
+        assert_eq!(env[crate::rollout::RESUME_PATH_ENV], transcript.to_str().unwrap());
+        assert_eq!(env["FRACTAL_NATIVE_RESUME_PATH"], transcript.to_str().unwrap());
+        assert!(!env.contains_key(crate::suspension::CONTINUE_ENV));
+        assert!(!env.contains_key("FRACTAL_NATIVE_CONTINUE_SESSION"));
     }
 
     fn account_source(logins: &Path, workspace: &Path, harness_body: &str) -> String {

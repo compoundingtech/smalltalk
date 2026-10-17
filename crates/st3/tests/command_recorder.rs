@@ -128,9 +128,7 @@ fn a_real_programs_nested_git_call_uses_the_real_tool() {
 fn command(program: &str, path: OsString) -> Command {
     let mut command = Command::new(program);
     command
-        .env("PATH", path)
-        .env_remove("ST_AGENT")
-        .env_remove("ST3_SUBJECT")
+        .env("PATH", path).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT").env_remove("ST3_SUBJECT").env_remove("FRACTAL_SUBJECT")
         .env_remove("ST_STEP_RUN")
         .env_remove("ST_MISSION_RUN");
     command

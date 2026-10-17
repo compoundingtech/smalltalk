@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Daemon and CLI identity contracts accept FRACTAL aliases while launches retain matching ST names",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No storage schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Daemon launch assignments and identity removals cover matching FRACTAL and ST names. CLI defaults, daemon peer attribution, native driver paths and Codex app-server configuration use the shared preferred-FRACTAL resolver. Conflicting or masked identities cannot fall back to person authority or an ancestor identity. Existing flags and ST consumers remain supported; shell and TypeScript hook migration is separate."},
+  "downtime": {"status": "none", "detail": "No service replacement or seat restart required."},
+  "manual": {"status": "none", "detail": "No action required for existing ST-only consumers. Resolve conflicting manually authored identity aliases before launching a seat or CLI command."},
+  "recovery": {"status": "none", "detail": "No durable state changes. Existing ST names remain exported and readable."}
+}

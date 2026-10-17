@@ -345,8 +345,7 @@ async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
         let mut command = st3::test_support::command(binary);
         // These are operator commands. A harness running the suite must not lend its own seat
         // identity, which scopes `work ls` and fences agent actors.
-        command
-            .env_remove("ST_AGENT")
+        command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
             .env_remove("ST_MISSION_RUN")
             .arg("--endpoint")
             .arg(socket);
@@ -402,7 +401,7 @@ fn person_admission_exception_is_local_reversible_and_never_spawns_the_producer(
     std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
     let run = |action: &str, agent: bool| {
         let mut command = std::process::Command::new(test_bin!("st3"));
-        command.env_remove("ST_AGENT").env_remove("ST_MISSION_RUN")
+        command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT").env_remove("ST_MISSION_RUN")
             .arg("--json").args(["admission", action, "omp", "--binary"])
             .arg(&producer).arg("--state-dir").arg(root.path().join("state"));
         if action == "override" { command.args(["--reason", "local offline probe exception"]); }
@@ -2585,8 +2584,7 @@ async fn run_queue_cli(socket: &Path, config_home: &Path, json: bool, args: &[&s
     tokio::task::spawn_blocking(move || {
         let mut command = st3::test_support::command(binary);
         // Queue operator commands use the fixture's person, not the invoking harness seat.
-        command
-            .env_remove("ST_AGENT")
+        command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
             .env_remove("ST_MISSION_RUN")
             .env("XDG_CONFIG_HOME", config_home)
             .arg("--endpoint")
@@ -3231,8 +3229,7 @@ async fn run_lane_cli(
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
         let mut command = st3::test_support::command(binary);
-        command
-            .env_remove("ST_AGENT")
+        command.env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
             .env_remove("ST_MISSION_RUN")
             .env("XDG_CONFIG_HOME", config_home)
             .arg("--endpoint")
@@ -4779,8 +4776,7 @@ fn client_config_warns_once_on_stderr_and_doctor_lists_unknown_without_polluting
     std::fs::create_dir_all(config_root.join("st3")).unwrap();
     std::fs::write(config_root.join("st3/config.toml"),
         "node = 'fixture'\nseat_priority = 'normal'\nfuture_root = 'never-print-this'\n[github]\nfuture_nested = 'also-private'\n").unwrap();
-    let output = st3::test_support::command(test_bin!("st3-fixture"))
-        .env_remove("ST_AGENT")
+    let output = st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", &config_root)
@@ -4821,8 +4817,7 @@ fn client_config_warns_once_on_stderr_and_doctor_lists_unknown_without_polluting
         assert!(!text.contains("never-print-this"));
         assert!(!text.contains("also-private"));
     }
-    let strict = st3::test_support::command(test_bin!("st3-fixture"))
-        .env_remove("ST_AGENT")
+    let strict = st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", &config_root)
@@ -4849,8 +4844,7 @@ fn client_config_warns_once_on_stderr_and_doctor_lists_unknown_without_polluting
         "node = 'fixture'\nseat_priority = 'normal'\n",
     )
     .unwrap();
-    let valid = st3::test_support::command(test_bin!("st3-fixture"))
-        .env_remove("ST_AGENT")
+    let valid = st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", &config_root)
@@ -4878,8 +4872,7 @@ fn setup_rejects_unknown_config_before_any_rewrite() {
     let path = root.path().join("config.toml");
     let original = b"# retain this text\nnode = 'fixture'\nfuture_root = 'fixture-secret'\n[github]\nfuture_nested = true\n";
     std::fs::write(&path, original).unwrap();
-    let output = st3::test_support::command(test_bin!("st3-fixture"))
-        .env_remove("ST_AGENT")
+    let output = st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST_MISSION_RUN")
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -4940,8 +4933,7 @@ fn local_state_commands_reject_unknown_config_before_using_default_state() {
         vec!["service", "status"],
     ];
     for args in cases {
-        let output = st3::test_support::command(test_bin!("st3-fixture"))
-            .env_remove("ST_AGENT")
+        let output = st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
             .env_remove("ST_MISSION_RUN")
             .env("HOME", root.path())
             .env("XDG_CONFIG_HOME", &config_root)

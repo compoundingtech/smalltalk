@@ -2905,7 +2905,9 @@ pub fn run_controlled_paths(
     );
     let codex_argv = if let Some(mode) = crate::access::AccessMode::from_environment()? {
         let workspace = std::env::current_dir().context("reading managed Codex workspace")?;
-        let endpoint = std::env::var("ST3_ENDPOINT").ok();
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+        let endpoint = crate::contracts::env("ST3_ENDPOINT");
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
         let permissions = crate::access::Permissions::from_environment()?;
         managed_codex_argv_asking(mode, crate::access::codex_asks(), endpoint.as_deref(), &workspace, codex_argv, permissions)?
     } else {
@@ -3253,7 +3255,9 @@ fn run_controlled_owned(
     prepare_socket_for_launch(&socket_path)?;
 
     let endpoint = format!("unix://{}", socket_path.display());
-    let mission_run = std::env::var("ST_MISSION_RUN").ok();
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+    let mission_run = crate::contracts::env("ST_MISSION_RUN");
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
     let unattended = mission_run_is_unattended(mission_run.as_deref());
     let explicit_approval = authored_approval_policy(&codex_argv[1..])?;
     let prepared =

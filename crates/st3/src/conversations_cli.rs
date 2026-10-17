@@ -196,7 +196,7 @@ pub(super) async fn run_message(
         MessageCommand::Ls(args) => {
             let identity = message_list_identity(
                 args.identity.or(args.actor),
-                std::env::var("ST_AGENT").ok(),
+                st_drivers::contracts::env("ST_AGENT"),
             )?;
             reject_foreign_agent_actor(&identity)?;
             let sender = args.sender.map(|sender| normalize_message_subject(&sender));
@@ -354,7 +354,7 @@ pub(super) async fn run_message(
             print_message_receipt(&receipt, json_output)
         }
         MessageCommand::Wait(args) => {
-            let actor = message_list_identity(args.actor, std::env::var("ST_AGENT").ok())?;
+            let actor = message_list_identity(args.actor, st_drivers::contracts::env("ST_AGENT"))?;
             reject_foreign_agent_actor(&actor)?;
             let sender = normalize_message_subject(&args.sender);
             let timeout = parse_timeout(&args.timeout)?;

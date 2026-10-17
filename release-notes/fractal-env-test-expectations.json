@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Align environment-alias regression tests with silent empty masking and valid CLI command syntax.",
+  "replay": { "status": "none", "detail": "Test-only changes." },
+  "schema": { "status": "none", "detail": "Test-only changes." },
+  "rules": { "status": "none", "detail": "Test-only changes." },
+  "compatibility": { "status": "none", "detail": "Instance tests explicitly prove empty preferred values ignore legacy values without warning; CLI tests use the supported work start command rather than a nonexistent version subcommand." },
+  "downtime": { "status": "none", "detail": "Test-only changes." },
+  "manual": { "status": "none", "detail": "No manual action required." },
+  "recovery": { "status": "none", "detail": "No runtime changes." }
+}

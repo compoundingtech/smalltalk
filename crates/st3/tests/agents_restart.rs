@@ -334,8 +334,7 @@ async fn st(socket: &Path, args: &[&str]) -> std::process::Output {
     let socket = socket.to_owned();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        st3::test_support::command(test_bin!("st3-fixture"))
-            .env_remove("ST_AGENT")
+        st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args(["--endpoint", socket.to_str().unwrap()])
             .args(args)
@@ -351,8 +350,7 @@ async fn cli(socket: &Path, subject: &str, actor: &str, timeout: &str) -> std::p
     let actor = actor.to_owned();
     let timeout = timeout.to_owned();
     tokio::task::spawn_blocking(move || {
-        st3::test_support::command(test_bin!("st3-fixture"))
-            .env_remove("ST_AGENT")
+        st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
             .env_remove("ST_MISSION_RUN")
             .args([
                 "--endpoint",
@@ -712,8 +710,7 @@ fn restart_help_explains_seats_and_the_new_incarnation() {
     if st3::test_support::supervise_test() {
         return;
     }
-    let output = st3::test_support::command(test_bin!("st3-fixture"))
-        .env_remove("ST_AGENT")
+    let output = st3::test_support::command(test_bin!("st3-fixture")).env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .args(["agents", "--help"])
         .output()
         .unwrap();
@@ -1253,6 +1250,14 @@ async fn starts_a_stopped_mission_seat_on_its_own_declaration(shape: Shape) {
             let mut environment = member.environment.clone();
             let operation = environment.remove("ST3_START_OPERATION").unwrap();
             assert_eq!(member.tags.get("st3.start-operation"), Some(&operation));
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+            assert_eq!(
+                environment.get("FRACTAL_LAUNCH_DESIRED_TOKEN"),
+                environment.get(st3::suspension::LAUNCH_DESIRED_TOKEN_ENV),
+                "both environment spellings must report the same launch declaration"
+            );
+            environment.remove("FRACTAL_LAUNCH_DESIRED_TOKEN");
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
             assert_eq!(
                 environment.remove(st3::suspension::LAUNCH_DESIRED_TOKEN_ENV).as_ref(),
                 Some(token),

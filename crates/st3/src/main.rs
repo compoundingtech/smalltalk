@@ -139,6 +139,48 @@ struct Cli {
 /// failing an agent's step.
 const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+const CLI_ENVIRONMENT_NAMES: [(&str, &str); 5] = [
+    ("ST_INSTANCE", "FRACTAL_INSTANCE"),
+    ("ST3_DAEMON_WAIT", "FRACTAL_DAEMON_WAIT"),
+    ("ST3_TERMINAL_CAPABILITY", "FRACTAL_TERMINAL_CAPABILITY"),
+    ("ST_AGENT", "FRACTAL_AGENT"),
+    ("ST3_INCARNATION", "FRACTAL_INCARNATION"),
+];
+
+fn cli_command() -> clap::Command {
+    // Resolve each family once, not once per argument, to warn once per conflict.
+    // Leave legacy bindings untouched unless the preferred alias is actually present.
+    let bindings = CLI_ENVIRONMENT_NAMES.map(|(old, new)| {
+        std::env::var_os(new).map(|_| {
+            (old, st_drivers::contracts::env(old).map(|_| new))
+        })
+    });
+    cli_command_with_bindings(Cli::command(), &bindings)
+}
+
+fn cli_command_with_bindings(
+    command: clap::Command,
+    bindings: &[Option<(&'static str, Option<&'static str>)>],
+) -> clap::Command {
+    command
+        .mut_args(|mut arg| {
+            for &(old, new) in bindings.iter().flatten() {
+                if arg.get_env() == Some(std::ffi::OsStr::new(old)) {
+                    arg = arg.env(new);
+                    break;
+                }
+            }
+            arg
+        })
+        .mut_subcommands(|command| cli_command_with_bindings(command, bindings))
+}
+
+fn agent_environment_present() -> bool {
+    std::env::var_os("FRACTAL_AGENT").is_some() || std::env::var_os("ST_AGENT").is_some()
+}
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
+
 #[derive(Subcommand)]
 enum Command {
     /// Configure this machine and start st, with flags for unattended setup.
@@ -529,7 +571,7 @@ fn fleet_person(actor: Option<String>, config: &Config) -> Result<String> {
         return Ok(actor);
     }
     anyhow::ensure!(
-        std::env::var("ST_AGENT").is_err(),
+        !agent_environment_present(),
         "inside an agent seat, fleet commands need an explicit --as person/NAME"
     );
     config
@@ -4043,7 +4085,7 @@ struct AdmissionBuildArgs {
 
 fn run_admission(command: AdmissionCommand, json_output: bool) -> Result<()> {
     anyhow::ensure!(
-        std::env::var_os("ST_AGENT").is_none(),
+        !agent_environment_present(),
         "admission exceptions must be managed from a person's terminal, outside an agent seat"
     );
     let (build, reason) = match command {
@@ -4220,8 +4262,7 @@ fn cli_main() -> ExitCode {
         None => {}
     }
     // An instance changes where every path resolves, so it comes before anything reads one.
-    let instance_name = st3::instance::requested(&arguments)
-        .or_else(|| std::env::var(st3::instance::ENV).ok().filter(|name| !name.is_empty()));
+    let instance_name = st3::instance::requested(&arguments);
     if let Some(name) = instance_name {
         // SAFETY: no other thread exists yet; the async runtime starts after this returns.
         if let Err(error) = unsafe { st3::instance::activate(&name) } {
@@ -4231,7 +4272,7 @@ fn cli_main() -> ExitCode {
     }
     // A shell stub from `st completions` calls back with `COMPLETE=<shell>` on each TAB. Answer
     // before any config, runtime, or daemon work; this exits when the variable is set.
-    clap_complete::env::CompleteEnv::with_factory(Cli::command).complete();
+    clap_complete::env::CompleteEnv::with_factory(cli_command).complete();
     // A seat process asks a replacement binary which resume formats it reads before executing it.
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(st_drivers::reexec::PROBE_SUBCOMMAND))
@@ -4264,7 +4305,7 @@ fn cli_main() -> ExitCode {
         arguments.len(),
         std::io::stdin().is_terminal(),
         cli_output::stdout().is_terminal(),
-        std::env::var_os("ST_AGENT").is_some(),
+        crate::agent_environment_present(),
     ) {
         let subject = match crate::setup::prepare_plain_ui() {
             Ok(subject) => subject,
@@ -4284,7 +4325,7 @@ fn cli_main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let json_version = arguments.iter().any(|arg| arg == "--json");
-    let matches = match Cli::command()
+    let matches = match cli_command()
         .override_help(cli_help::root_help(false))
         .try_get_matches_from(arguments)
     {
@@ -4322,7 +4363,12 @@ fn cli_main() -> ExitCode {
         Ok(Some(incarnation)) => {
             // SAFETY: the single-threaded lookup runtime has been dropped; run_cli starts
             // the multi-threaded runtime only after this environment update.
-            unsafe { std::env::set_var("ST3_INCARNATION", incarnation) };
+            // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+            unsafe {
+                std::env::set_var("FRACTAL_INCARNATION", &incarnation);
+                std::env::set_var("ST3_INCARNATION", incarnation);
+            }
+            // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-env-fractal-dual-read
         }
         Ok(None) => {}
         Err(error) => {
@@ -4378,8 +4424,7 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
         let scoped = subject
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
-            || std::env::var("ST3_SUBJECT")
-                .ok()
+            || st_drivers::contracts::env("ST3_SUBJECT")
                 .is_some_and(|value| !value.trim().is_empty());
         anyhow::ensure!(
             scoped || args.identity.is_none(),
@@ -4421,7 +4466,7 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
     let endpoint = cli
         .endpoint
         .clone()
-        .or_else(|| std::env::var("ST3_ENDPOINT").ok())
+        .or_else(|| st_drivers::contracts::env("ST3_ENDPOINT"))
         .as_deref()
         .map(Endpoint::parse)
         .unwrap_or_else(|| Endpoint::Unix(config.client_socket()));
@@ -4632,8 +4677,12 @@ fn daemon_is_unreachable(error: &anyhow::Error) -> bool {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let own = std::env::var("ST_AGENT").ok();
-    let mission_run = std::env::var("ST_MISSION_RUN").ok();
+    let own = st_drivers::contracts::env("ST_AGENT");
+    anyhow::ensure!(
+        own.is_some() || !agent_environment_present(),
+        "agent identity is empty or conflicting; refusing to fall back to person authority"
+    );
+    let mission_run = st_drivers::contracts::env("ST_MISSION_RUN");
     guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
     if let Command::Setup(args) = cli.command {
         return crate::setup::run(args).await.map(|_| ());
@@ -4746,7 +4795,7 @@ async fn run(cli: Cli) -> Result<()> {
     let (config, unknown_config_keys) = Config::load_client_unvalidated(None)?;
     let endpoint = cli
         .endpoint
-        .or_else(|| std::env::var("ST3_ENDPOINT").ok())
+        .or_else(|| st_drivers::contracts::env("ST3_ENDPOINT"))
         .as_deref()
         .map(Endpoint::parse)
         .unwrap_or_else(|| Endpoint::Unix(config.client_socket()));
@@ -4815,8 +4864,7 @@ async fn run(cli: Cli) -> Result<()> {
             ) {
                 client
             } else {
-                let actor = match std::env::var("ST_AGENT")
-                    .ok()
+                let actor = match st_drivers::contracts::env("ST_AGENT")
                     .filter(|agent| agent.starts_with("agent/"))
                 {
                     Some(agent) => agent,
@@ -7940,8 +7988,7 @@ fn configured_actor(
     if let Some(explicit) = explicit {
         return parse_actor_subject(explicit).map_err(anyhow::Error::msg);
     }
-    if let Some(own) = std::env::var("ST_AGENT")
-        .ok()
+    if let Some(own) = st_drivers::contracts::env("ST_AGENT")
         .filter(|own| own.starts_with("agent/"))
     {
         return Ok(own);
@@ -10617,8 +10664,7 @@ fn normalize_member_subject(subject: &str, namespace: &str) -> String {
 fn blob_actor(named: Option<String>, configured_person: Option<&str>) -> Result<String> {
     let actor = named
         .or_else(|| {
-            std::env::var("ST_AGENT")
-                .ok()
+            st_drivers::contracts::env("ST_AGENT")
                 .filter(|agent| !agent.is_empty())
         })
         .or_else(|| configured_person.map(str::to_owned))
@@ -11395,8 +11441,7 @@ fn lane_actor(explicit: Option<&str>, configured_person: Option<&str>) -> Result
     if let Some(actor) = explicit {
         return Ok(actor.to_owned());
     }
-    if let Some(own) = std::env::var("ST_AGENT")
-        .ok()
+    if let Some(own) = st_drivers::contracts::env("ST_AGENT")
         .map(|own| own.trim().to_owned())
         .filter(|own| !own.is_empty())
     {
@@ -12339,9 +12384,8 @@ fn render_client_agents(
 /// names, so a model that inferred the wrong identity could otherwise read and send as a peer seat.
 /// The process may still act as a non-agent subject, such as its exec or a person its work names.
 fn reject_foreign_agent_actor(actor: &str) -> Result<()> {
-    let own = std::env::var("ST_AGENT").ok();
-    let mission_run = std::env::var("ST_MISSION_RUN")
-        .ok()
+    let own = st_drivers::contracts::env("ST_AGENT");
+    let mission_run = st_drivers::contracts::env("ST_MISSION_RUN")
         .filter(|value| !value.is_empty());
     match foreign_agent_actor(actor, own.as_deref(), mission_run.as_deref()) {
         Some(message) => anyhow::bail!(message),
@@ -12371,8 +12415,7 @@ fn foreign_agent_actor(
 }
 
 fn normalize_message_subject(value: &str) -> String {
-    let mission_run = std::env::var("ST_MISSION_RUN")
-        .ok()
+    let mission_run = st_drivers::contracts::env("ST_MISSION_RUN")
         .filter(|value| !value.is_empty());
     normalize_message_subject_in_run(value, mission_run.as_deref())
 }
@@ -12925,8 +12968,7 @@ async fn send_message(
     request.idempotency_key = match args.idempotency_key {
         Some(key) => key,
         None => {
-            let incarnation = std::env::var("ST3_INCARNATION")
-                .ok()
+            let incarnation = st_drivers::contracts::env("ST3_INCARNATION")
                 .filter(|incarnation| !incarnation.is_empty());
             let hour = message_key_hour();
             let key = derived_message_key(&request, incarnation.as_deref(), hour);

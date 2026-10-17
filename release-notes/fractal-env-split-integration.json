@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Preserve Fractal environment contracts across the kernel, telemetry and CLI module splits",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No storage schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "Environment alias behavior is unchanged by integration. The shared identity-conflict predicate and regression coverage move to st-drivers so daemon hooks and the split telemetry recorder reuse the same value-redacting warning without a dependency cycle. CLI and API regression tests follow their owning modules."},
+  "downtime": {"status": "none", "detail": "No interruption."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No durable state changes."}
+}

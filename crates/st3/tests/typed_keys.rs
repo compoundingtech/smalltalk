@@ -10,8 +10,7 @@ fn shifted_keys_are_typed_as_a_keyboard_protocol_terminal_sends_them() {
         .arg(test_env!("CARGO_BIN_EXE_st3"))
         .arg("--only-shifted-keys")
         .arg("--ui")
-        .env("ST3_PERSON", "person/alex")
-        .env_remove("ST_AGENT")
+        .env("ST3_PERSON", "person/alex").env_remove("ST_AGENT").env_remove("FRACTAL_AGENT")
         .env_remove("ST3_ENDPOINT")
         .output()
         .expect("python3 is required by the PTY smoke (provided by CI)");

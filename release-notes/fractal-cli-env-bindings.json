@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Resolve Fractal CLI aliases through clap bindings without rewriting the process environment.",
+  "replay": { "status": "none", "detail": "No replay changes." },
+  "schema": { "status": "none", "detail": "No persisted schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "changed", "detail": "Clap retains untouched legacy-only bindings, including invalid empty and non-UTF-8 input. Preferred aliases select the corresponding clap environment binding; masks and conflicting identity aliases disable only that binding. Hooks retain the original environment so identity conflicts cannot fall through to another identity family." },
+  "downtime": { "status": "none", "detail": "No service changes." },
+  "manual": { "status": "none", "detail": "No manual action required." },
+  "recovery": { "status": "none", "detail": "Legacy environment names remain supported." }
+}

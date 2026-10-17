@@ -298,8 +298,8 @@ fn spawn(
         }
     }
     // A gate acts as no agent, as the reconciler starts it.
-    declared.remove("ST_AGENT");
-    declared.remove(crate::suspension::RESUME_ENV);
+    crate::environment::remove_aliases(&mut declared, "ST_AGENT");
+    crate::environment::remove_aliases(&mut declared, crate::suspension::RESUME_ENV);
     declared.insert(
         crate::gate_report::ENV.into(),
         report.to_string_lossy().into_owned(),
@@ -382,8 +382,8 @@ fn stand_in_variables(
         ("ST_STEP_RUN".to_owned(), String::new()),
         ("PATH".to_owned(), "${PATH}".to_owned()),
     ]);
-    variables.remove("ST_AGENT");
-    variables.remove("ST_GATE");
+    crate::environment::remove_aliases(&mut variables, "ST_AGENT");
+    crate::environment::remove_aliases(&mut variables, "ST_GATE");
     variables
 }
 

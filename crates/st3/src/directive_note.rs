@@ -47,7 +47,7 @@ pub(super) async fn run(
     json_output: bool,
 ) -> Result<()> {
     let actor = super::configured_actor(args.actor.as_deref(), configured_person, "note")?;
-    if let Some(own) = std::env::var("ST_AGENT").ok().filter(|own| !own.is_empty()) {
+    if let Some(own) = st_drivers::contracts::env("ST_AGENT").filter(|own| !own.is_empty()) {
         anyhow::ensure!(actor == own, "an agent must read notes as its own harness identity");
         anyhow::ensure!(args.command.is_none(), "only a person outside an agent seat can set or clear a note");
     }

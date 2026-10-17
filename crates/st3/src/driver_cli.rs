@@ -65,7 +65,7 @@ pub(super) async fn run_driver(client: &Client, args: DriverArgs, catalog: Optio
             args.argv.is_empty(),
             "the Claude channel takes no provider argv"
         );
-        let fallback_subject = std::env::var("ST3_SUBJECT").ok();
+        let fallback_subject = st_drivers::contracts::env("ST3_SUBJECT");
         let Some(subject) = args
             .subject
             .as_deref()

@@ -37,8 +37,7 @@ impl Refusal {
 
 /// The native session this launch must resume, if the daemon named one.
 pub fn requested() -> Option<String> {
-    std::env::var(RESUME_ENV)
-        .ok()
+    st_drivers::contracts::env(RESUME_ENV)
         .filter(|id| !id.trim().is_empty())
 }
 
