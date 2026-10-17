@@ -13,13 +13,7 @@ use anyhow::Result;
 use crate::model::{MessageView, StepRunView};
 use crate::store::Store;
 
-/// The prefix of the reserved tag on a session-start message. The tag carries the incarnation the
-/// message was written for, so each fresh incarnation gets its own and a replay writes it once.
-pub const SESSION_START_TAG_PREFIX: &str = "st3-session-start:";
-
-/// The prefix of the reserved tag on a "prepare for restart" message, followed by the id of the
-/// claim that records the request and its deadline.
-pub const PREPARE_TAG_PREFIX: &str = "st3-restart-prepare:";
+pub use crate::silent::{PREPARE_TAG_PREFIX, SESSION_START_TAG_PREFIX};
 
 /// The `operation` of a restart request that asks for no handoff first.
 pub const RESTART_NOW_OPERATION: &str = "restart-now";

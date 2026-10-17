@@ -5474,6 +5474,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         st3::otel::Unit::Daemon,
         Some(if state_identity.is_ok() { &config.node } else { &configured_node }),
     );
+    if st3::otel::metrics_enabled() {
+        st3::reconcile::init_metrics();
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     st3::malloc_trim::spawn()?;
     let startup_telemetry =
@@ -5643,7 +5646,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         let _ = st3::sekrets::daemon::PERSON.set(person.clone());
     }
     // Long message bodies this machine owns that no claim names any longer are removed.
-    st3::message_body::spawn_reconciler(store.clone(), config.state_dir.clone());
+    st3::store::message_bodies::spawn_reconciler(store.clone(), config.state_dir.clone());
     // Sekrets is opt-in: this records a gateway's calls once one listens on this host.
     st3::sekrets::daemon::spawn_importer(
         store.clone(),

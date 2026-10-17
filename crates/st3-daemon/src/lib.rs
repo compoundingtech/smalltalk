@@ -12,6 +12,7 @@ mod ci_test_paths;
 pub use st3_kernel::accounts;
 pub mod api;
 pub use st3_kernel::archive;
+pub(crate) mod client_values;
 pub mod attach_image;
 pub mod backup;
 pub mod blobs;
