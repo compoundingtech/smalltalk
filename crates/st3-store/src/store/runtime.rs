@@ -34,6 +34,8 @@ pub struct SmalltalkRuntime {
     pub message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// One card per agent followed by an exact agent selector, apart from the roster's rows.
+    pub exact_agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Each agent's usage fold at the newest cut a read reached, so a card refold reads only
     /// the usage claims after it rather than the agent's whole usage history.
     pub usage_folds: Mutex<UsageFolds>,
@@ -450,6 +452,10 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
         self.agent_resources_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.exact_agent_resources_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();

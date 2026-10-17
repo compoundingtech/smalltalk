@@ -1390,7 +1390,7 @@ async fn daemon_collection_stream_without_export_delivers_first_frame() {
     let daemon = ExportDaemon::start_without_export(root.path());
     let client = st3_client::Client::unix_as(&daemon.socket, "person/ada");
     let mut stream = client.collection_stream().await.unwrap();
-    stream.subscribe("missions", "missions", 2, None, None).await.unwrap();
+    stream.subscribe("missions", "missions", 2, None, None, None).await.unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await.unwrap().unwrap().unwrap();
     assert_eq!(frame["kind"], "snapshot", "{frame}");

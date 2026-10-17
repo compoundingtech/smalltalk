@@ -61,7 +61,7 @@ impl Inventory {
             }
             _ => {
                 stream
-                    .subscribe(&self.id(), self.collection(), super::WINDOW, None, None)
+                    .subscribe(&self.id(), self.collection(), super::WINDOW, None, None, None)
                     .await
             }
         }

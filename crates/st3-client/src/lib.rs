@@ -415,7 +415,7 @@ impl Heard {
 
 impl CollectionStream {
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> {
-        self.subscribe(id, "glasses", 100, None, None).await
+        self.subscribe(id, "glasses", 100, None, None, None).await
     }
     /// Select the owner's fleet explicitly; agent identity is not an owner selector.
     pub async fn subscribe_arrangements(
@@ -438,8 +438,13 @@ impl CollectionStream {
         limit: usize,
         actor: Option<&str>,
         status: Option<&str>,
+        agent: Option<&str>,
     ) -> Result<(), ClientError> {
-        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status})).await
+        let mut command = serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status});
+        if let Some(agent) = agent {
+            command["agent"] = serde_json::json!(agent);
+        }
+        self.send(&command).await
     }
     /// Follow a usage report for a named period; an omitted end follows current usage.
     pub async fn subscribe_usage(

@@ -819,7 +819,16 @@ export type CollectionCommand = ({
   until_ms?: number;
 } | {
   actor?: string | null;
-  collection: "missions" | "attention" | "agents" | "work" | "glasses" | "summary";
+  collection: "missions" | "attention" | "work" | "glasses" | "summary";
+  id: string;
+  kind: "subscribe";
+  limit?: number;
+  person?: string | null;
+  status?: string | null;
+} | {
+  actor?: string | null;
+  agent?: (AgentId | null);
+  collection: "agents";
   id: string;
   kind: "subscribe";
   limit?: number;

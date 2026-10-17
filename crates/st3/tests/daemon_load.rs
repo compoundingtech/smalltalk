@@ -2202,12 +2202,12 @@ async fn roster_subscriber(
             };
             let subscribed = Instant::now();
             let sent = match collection {
-                "summary" => stream.subscribe(&id, collection, 1, None, None).await,
+                "summary" => stream.subscribe(&id, collection, 1, None, None, None).await,
                 "glasses" => stream.subscribe_glasses(&id).await,
                 "arrangements" => {
                     stream.subscribe_arrangements(&id, OPERATOR, ROSTER_LIMIT, None).await
                 }
-                _ => stream.subscribe(&id, collection, ROSTER_LIMIT, None, None).await,
+                _ => stream.subscribe(&id, collection, ROSTER_LIMIT, None, None, None).await,
             };
             sent.map_err(|error| format!("{collection}: {error}"))?;
             windows.insert(
@@ -2688,7 +2688,7 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                 readers.spawn(async move {
                     let mut stream = client.collection_stream().await.map_err(|e| e.to_string())?;
                     barrier.wait().await;
-                    stream.subscribe(&format!("load-{n}"), collection, 20, None, None)
+                    stream.subscribe(&format!("load-{n}"), collection, 20, None, None, None)
                         .await.map_err(|e| e.to_string())?;
                     let event = tokio::time::timeout(Duration::from_secs(10), stream.next_event())
                         .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;

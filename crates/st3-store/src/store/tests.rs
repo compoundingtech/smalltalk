@@ -244,6 +244,48 @@ fn a_covered_page_upgrade_reuses_the_pinned_roster_rows() {
     assert_eq!(store.agent_resources_builds_for_test(), 1);
 }
 
+/// An exact agent selector folds its own card: the complete roster at the same cut neither
+/// answers it nor loses its place in the roster cache to it.
+#[test]
+fn exact_agent_cards_neither_borrow_nor_evict_the_fleet_roster() {
+    let store = roster_cache_store();
+    let index = store.index().unwrap();
+    store
+        .cached_agent_resources(index, false, |_| Ok(vec![
+            json!({"id": "agent/node.amber", "name": "amber", "_fleet": true}),
+            json!({"id": "agent/node.cobalt", "name": "cobalt", "_fleet": true}),
+        ]))
+        .unwrap();
+    let fleet = store.agent_resources_cached_at(index, false, None).unwrap().unwrap();
+    assert!(store.exact_agent_resources_cached_at(index, false, "agent/node.amber").unwrap().is_none(),
+        "a fleet publication must not answer an exact agent read");
+    let card = |agent: &str| json!({"id": agent, "name": agent});
+    let amber = store
+        .cached_exact_agent_resources(index, false, "agent/node.amber", |changed| {
+            let (subjects, previous) = changed.expect("an exact read names its agent");
+            assert_eq!(subjects, &BTreeSet::from(["agent/node.amber".to_owned()]));
+            assert!(previous.is_empty(), "no fleet rows are borrowed as the delta source");
+            Ok(vec![card("agent/node.amber")])
+        })
+        .unwrap();
+    assert_eq!(amber, [card("agent/node.amber")]);
+    store
+        .cached_exact_agent_resources(index, false, "agent/node.amber", |changed| {
+            panic!("the exact card at this cut is already folded: {changed:?}")
+        })
+        .unwrap();
+    for n in 0..super::seats::EXACT_AGENT_RESOURCES_CACHE + 1 {
+        let agent = format!("agent/node.followed-{n}");
+        store.cached_exact_agent_resources(index, false, &agent, |_| Ok(vec![card(&agent)])).unwrap();
+    }
+    assert!(store.exact_agent_resources_cached_at(index, false, "agent/node.amber").unwrap().is_none(),
+        "the least recently folded agent leaves the exact cache first");
+    let still = store.agent_resources_cached_at(index, false, None).unwrap()
+        .expect("exact reads never evict the complete roster");
+    assert!(Arc::ptr_eq(&still, &fleet));
+    assert_eq!(store.agent_roster_valid_until(index, Some("agent/node.amber")), None);
+}
+
 /// The frontier answers an old cut exactly — its newest agent timeline row — from the
 /// partial frontier index, with VM work that newer heartbeats never grow; the pre-followup
 /// lookup read every newer local row of every kind. Focused fixture: run it explicitly and
@@ -13957,6 +13999,10 @@ version 2
         .unwrap()
         .remove("agent/node.worker")
         .unwrap();
+    let selected = store.agent_work_queues_for(Some("agent/node.worker")).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected["agent/node.worker"], queue);
+    assert!(store.agent_work_queues_for(Some("agent/absent")).unwrap().is_empty());
     assert_eq!(queue.active_work_count, 0);
     assert_eq!(queue.queued_work_count, 2);
     assert_eq!(
@@ -14073,6 +14119,7 @@ version 2
         .unwrap()
         .remove("agent/node.worker")
         .unwrap();
+    assert_eq!(store.agent_work_queues_for(Some("agent/node.worker")).unwrap()["agent/node.worker"], queue);
     assert_eq!(queue.current_work_ids, [subject.clone()]);
     assert_eq!(queue.active_work_count, 1);
     assert_eq!(queue.next_work_id.as_deref(), Some(other.as_str()));
@@ -14103,6 +14150,7 @@ version 2
         .unwrap()
         .remove("agent/node.worker")
         .unwrap();
+    assert_eq!(store.agent_work_queues_for(Some("agent/node.worker")).unwrap()["agent/node.worker"], queue);
     assert!(queue.current_work_ids.is_empty());
     assert_eq!(queue.active_work_count, 0);
     assert_eq!(queue.queued_work_count, 2);

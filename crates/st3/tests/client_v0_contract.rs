@@ -386,7 +386,7 @@ async fn emitted_person_ask_mission_list_and_detail_conform_and_decode() {
 }
 
 #[tokio::test]
-async fn outbound_rust_collection_commands_conform_with_none_options() {
+async fn outbound_rust_collection_commands_conform_with_none_and_exact_agent() {
     use axum::extract::ws::WebSocketUpgrade;
     use futures_util::StreamExt as _;
     let validator = contract_validator("CollectionCommand");
@@ -418,22 +418,36 @@ async fn outbound_rust_collection_commands_conform_with_none_options() {
     let client =
         st3_client::Client::fabric_loopback(format!("http://{address}"), "synthetic-token");
     let mut stream = client.collection_stream().await.unwrap();
-    stream
-        .subscribe("agents", "agents", 100, None, None)
+    stream.subscribe("agents", "agents", 100, None, None, None)
         .await
         .unwrap();
+    stream.subscribe("selected", "agents", 1, None, None, Some("agent/example/worker"))
+        .await.unwrap();
     stream.subscribe_glasses("glasses").await.unwrap();
     stream
         .subscribe_terminal("term", "terminal/example", None, "synthetic-capability")
         .await
         .unwrap();
-    for expected in ["agents", "glasses", "term"] {
+    for expected in ["agents", "selected", "glasses", "term"] {
         let command = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(command["id"], expected);
         assert_conforms(&validator, "actual Rust None command", &command);
+        if expected == "selected" {
+            assert_eq!(command["agent"], "agent/example/worker");
+            let mut wrong_collection = command.clone();
+            wrong_collection["collection"] = serde_json::json!("work");
+            assert!(!validator.is_valid(&wrong_collection));
+            for invalid in ["worker", "person/worker", "agent/", "agent/bad id"] {
+                let mut malformed = command.clone();
+                malformed["agent"] = serde_json::json!(invalid);
+                assert!(!validator.is_valid(&malformed));
+            }
+        } else {
+            assert!(command.get("agent").is_none());
+        }
         let mut omitted = command.clone();
         if expected == "term" {
             assert_eq!(command.get("incarnation"), Some(&Value::Null));
@@ -1129,12 +1143,10 @@ async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() 
     }
     let client = st3_client::Client::unix(&socket);
     let mut stream = client.collection_stream().await.unwrap();
-    stream
-        .subscribe("missions", "missions", 20, None, None)
+    stream.subscribe("missions", "missions", 20, None, None, None)
         .await
         .unwrap();
-    stream
-        .subscribe("agents", "agents", 20, None, None)
+    stream.subscribe("agents", "agents", 20, None, None, None)
         .await
         .unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
@@ -1197,8 +1209,7 @@ async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() 
 
     stream.close().await;
     let mut replacement = client.collection_stream().await.unwrap();
-    replacement
-        .subscribe("missions", "missions", 20, None, None)
+    replacement.subscribe("missions", "missions", 20, None, None, None)
         .await
         .unwrap();
     let fresh = tokio::time::timeout(std::time::Duration::from_secs(5), replacement.next())
@@ -1262,8 +1273,7 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
     }
     let client = st3_client::Client::unix(&socket);
     let mut stream = client.collection_stream().await.unwrap();
-    stream
-        .subscribe("attention", "attention", 20, None, None)
+    stream.subscribe("attention", "attention", 20, None, None, None)
         .await
         .unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
@@ -1285,7 +1295,7 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
     );
     // `alerts` is the same collection under the name a person reads.
     stream
-        .subscribe("alerts", "alerts", 20, None, None)
+        .subscribe("alerts", "alerts", 20, None, None, None)
         .await
         .unwrap();
     let alerts = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
@@ -1329,8 +1339,7 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
     assert_eq!(response["code"], "stale-fence");
     stream.close().await;
     let mut replacement = client.collection_stream().await.unwrap();
-    replacement
-        .subscribe("attention", "attention", 20, None, None)
+    replacement.subscribe("attention", "attention", 20, None, None, None)
         .await
         .unwrap();
     let fresh = tokio::time::timeout(std::time::Duration::from_secs(5), replacement.next())

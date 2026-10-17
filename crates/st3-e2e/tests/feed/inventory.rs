@@ -68,7 +68,7 @@ async fn inventories_follow_sources_switch_periods_leave_and_reconnect_over_a_re
     // A second presence source changes the client window without a graph write.
     let mut other = client.collection_stream().await.unwrap();
     other
-        .subscribe("other", "agents", WINDOW, None, None)
+        .subscribe("other", "agents", WINDOW, None, None, None)
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {

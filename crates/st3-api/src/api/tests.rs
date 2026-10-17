@@ -1263,7 +1263,7 @@ mission "expiring-work" state="ready" {
     assert_eq!(claimed["items"][1]["current_work_ids"], json!([step]));
     let full = client_agent_resources_cached(store, false, index).unwrap();
     assert_eq!(full[1]["current_work_ids"], json!([step]));
-    assert_eq!(store.agent_roster_valid_until(index), Some(expires));
+    assert_eq!(store.agent_roster_valid_until(index, None), Some(expires));
     let (status, first) = get_request(router(state.clone()), "/v1/client/agents?limit=1").await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(first["items"][0]["id"], "agent/node.amber");
@@ -1286,7 +1286,7 @@ mission "expiring-work" state="ready" {
     assert_eq!(status, StatusCode::OK, "{ready}");
     assert_eq!(ready["items"][1]["current_work_ids"], json!([]));
     assert_eq!(ready["items"][1]["next_work_id"], step.as_str());
-    assert_eq!(store.agent_roster_valid_until(index), None);
+    assert_eq!(store.agent_roster_valid_until(index, None), None);
 }
 
 #[test]
@@ -9202,7 +9202,7 @@ fn agent_roster_claim_fixture_refreshes_at_lease_expiry_without_new_claims() {
         let card = cards.iter().find(|card| card["id"] == fixture.subjects[0]).unwrap();
         assert_eq!(card["current_work_ids"], json!([step]));
     }
-    assert_eq!(store.agent_roster_valid_until(index), Some(expires));
+    assert_eq!(store.agent_roster_valid_until(index, None), Some(expires));
     roster_fixture_expire_leases(&fixture);
     assert_eq!(store.index().unwrap(), index);
     for history in [false, true] {
