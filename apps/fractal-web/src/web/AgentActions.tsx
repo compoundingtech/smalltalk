@@ -73,7 +73,7 @@ export const AgentActions = ({ agent }: { readonly agent: Pick<Agent, 'ref' | 'n
     <div {...stylex.props(styles.actions)}>
       {status ? <span role="status" {...stylex.props(styles.status)}>{status}</span> : null}
       <Aria.MenuTrigger>
-        <Aria.Button aria-label={`Actions for ${agent.name}`} isDisabled={busy} {...stylex.props(styles.button)}>Agent</Aria.Button>
+        <Aria.Button aria-label={`Agent actions for ${agent.name}`} isDisabled={busy} {...stylex.props(styles.button)}>Agent</Aria.Button>
         <Aria.Popover placement="bottom end" {...stylex.props(styles.popover)}>
           <Aria.Menu
             aria-label={`Actions for ${agent.name}`}

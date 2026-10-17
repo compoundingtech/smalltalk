@@ -7,8 +7,9 @@ import { useConversation, useDataSource, useFeedInterest } from '../data/react.t
 import type { Feed, ConversationPage } from '../data/source.ts'
 import { capturedChanges, capturedProvenance, selectedCapturedChange } from './capturedChanges.ts'
 
-/** Shares the retained public conversation feed and acquires demand while the inspector is visible. */
-export function ChangesInspector({ agentRef, width }: { readonly agentRef: string; readonly width: number }) {
+/** Shares the retained public conversation feed and acquires demand while the inspector is visible.
+ * A numeric `width` is a sized side panel that scrolls its own regions; `fill` flows at its container's width so the container scrolls it. */
+export function ChangesInspector({ agentRef, width }: { readonly agentRef: string; readonly width: number | 'fill' }) {
   const source = useDataSource()
   const interest = React.useMemo(() => source.conversationInterest?.(agentRef), [source, agentRef])
   useFeedInterest({ interest, visible: true })
@@ -17,22 +18,23 @@ export function ChangesInspector({ agentRef, width }: { readonly agentRef: strin
 }
 
 /** Local card/chip selection never fetches a private endpoint or implies current repository state. */
-export function CapturedChangesView({ feed, width }: { readonly feed: Feed<ConversationPage>; readonly width: number }) {
+export function CapturedChangesView({ feed, width }: { readonly feed: Feed<ConversationPage>; readonly width: number | 'fill' }) {
   const page = feed._tag === 'Observed' ? feed.value : undefined
   const changes = React.useMemo(() => page === undefined ? [] : capturedChanges(page), [page])
   const [selected, setSelected] = React.useState<string | undefined>()
   const choice = selectedCapturedChange({ changes, id: selected })
   const lines = choice?.resource.files[0]?.lines
-  return <aside aria-label="Changes" style={{ width }} {...stylex.props(styles.root)}>
+  const fill = width === 'fill'
+  return <aside aria-label="Changes" style={fill ? undefined : { width }} {...stylex.props(styles.root, fill && styles.fillRoot)}>
     <p role="status" {...stylex.props(styles.scope)}>{feed._tag === 'Waiting' ? 'Waiting for captured changes.' : feed._tag === 'Unavailable' ? 'Captured changes unavailable: ' + feed.detail : (feed.freshness === 'stale' ? 'Last verified captured changes · ' : '') + 'Successful-tool captures · loaded transcript window' + (page?.hasOlder ? ' · older history not shown' : '')}{feed._tag === 'Observed' && feed.error ? ' · ' + feed.error.detail : ''}</p>
     {choice === undefined ? <p {...stylex.props(styles.empty)}>{feed._tag === 'Observed' ? 'No successful captured change content in this transcript window. Failed tool results are outside this inspector; failure does not establish that files were unchanged.' : 'Changes appear only after verified transcript observations.'}</p> : <>
-      <section aria-label="Captured change resources" {...stylex.props(styles.cards)}>{changes.map(change => <div key={change.id} data-captured-change={change.id} aria-current={change.id === choice.id ? 'true' : undefined} {...stylex.props(styles.card)}>
+      <section aria-label="Captured change resources" {...stylex.props(styles.cards, fill && styles.fillRegion)}>{changes.map(change => <div key={change.id} data-captured-change={change.id} aria-current={change.id === choice.id ? 'true' : undefined} {...stylex.props(styles.card)}>
         <p {...stylex.props(styles.detail)}>{capturedProvenance(change)}</p>
         <p {...stylex.props(styles.detail)}>{change.resource.detail}</p>
         <ResourceCardV1 resource={change.resource} variant="RC-1" onOpen={() => setSelected(change.id)} />
         <ResourceChipV1 resource={change.resource} file={change.resource.files[0]!} onOpen={() => setSelected(change.id)} />
       </div>)}</section>
-      <div {...stylex.props(styles.diff)}><DiffPanel key={choice.id} open width={width} title="Captured change" diff={lines?._tag === 'Known' ? lines.value : undefined} path={choice.diff.path} added={choice.diff.added} removed={choice.diff.removed} /></div>
+      <div {...stylex.props(styles.diff, fill && styles.fillRegion)}><DiffPanel key={choice.id} open width={fill ? '100%' : width} title="Captured change" diff={lines?._tag === 'Known' ? lines.value : undefined} path={choice.diff.path} added={choice.diff.added} removed={choice.diff.removed} /></div>
     </>}
   </aside>
 }
@@ -45,4 +47,6 @@ const styles = stylex.create({
   card: { display: 'flex', flexDirection: 'column', gap: s.sm, minWidth: 0 },
   detail: { margin: 0, overflowWrap: 'anywhere', fontSize: t.denseSize, color: c.fgMuted },
   diff: { flexGrow: 1, minHeight: 0, overflow: 'hidden' },
+  fillRoot: { minWidth: 0, overflow: 'visible' },
+  fillRegion: { maxHeight: 'none', overflow: 'visible' },
 })

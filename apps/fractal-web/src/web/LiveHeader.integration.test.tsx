@@ -59,7 +59,7 @@ describe('live header parity', () => {
   it('renders named Resources and Conversation controls in the owning header', async () => {
     const header = host.querySelector('[data-testid="thread-header"]')!
     const names = [...header.querySelectorAll('button')].map(node => node.getAttribute('aria-label') ?? node.textContent?.trim())
-    expect(names).toEqual(['Actions for Example Agent', 'Resources', 'Conversation menu', 'Toggle terminal drawer', 'Toggle right panel'])
+    expect(names).toEqual(['Agent actions for Example Agent', 'Resources', 'Conversation menu', 'Toggle terminal drawer', 'Toggle right panel'])
     await click('Conversation menu')
     const setting = document.querySelector('[role="menuitemcheckbox"]')
     expect(setting?.textContent).toContain('Show all system events')
