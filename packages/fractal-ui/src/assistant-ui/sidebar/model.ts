@@ -51,6 +51,8 @@ export interface SidebarActions {
   readonly select?: (id: string, parentId?: string) => void
   /** Host-owned split placement; the row offers it only when the host supports it. */
   readonly split?: (ref: string, placement: 'right' | 'below') => void
+  /** Host-owned canonical declaration view for an agent or mission ref; the row offers it only when set. */
+  readonly declaration?: (ref: string) => void
 }
 
 export interface SidebarSubagent { readonly id: string; readonly subagent_type?: string; readonly work_id?: string; readonly session_id?: string; readonly started_at?: string; readonly lease_expires_at: string }

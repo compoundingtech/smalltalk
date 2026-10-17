@@ -12,6 +12,7 @@ import { useDataSource, useNow } from '../data/react.tsx'
 import { unavailable, waiting, type Feed } from '../data/source.ts'
 import { resourceState, resourceTitle, type ResourcePage } from '../resources/agent/model.ts'
 import { systemEventsPreference } from './conversationPreferences.ts'
+import { DeclarationDialog } from './DeclarationDialog.tsx'
 
 const unsupportedResources = Atom.make<Feed<ResourcePage>>(unavailable({ reason: 'unsupported', detail: '' }))
 const unopenedResources = Atom.make<Feed<ResourcePage>>(waiting)
@@ -43,6 +44,10 @@ export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: str
       </Aria.ModalOverlay>
     </Aria.DialogTrigger>
     {disabledReason === undefined ? null : <span id={reasonId} {...stylex.props(styles.reason)}>{disabledReason}</span>}
+    <Aria.DialogTrigger>
+      <Aria.Button {...stylex.props(styles.button)}>View KDL</Aria.Button>
+      <DeclarationDialog subject={agentRef} />
+    </Aria.DialogTrigger>
     <Aria.MenuTrigger>
       <Aria.Button aria-label="Conversation menu" {...stylex.props(styles.button)}><CompositionIcon name="gear" /></Aria.Button>
       <Aria.Popover {...stylex.props(styles.popover)}>

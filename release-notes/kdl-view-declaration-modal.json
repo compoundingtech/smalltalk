@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Fractal web shows an agent's canonical KDL declaration, with environment values redacted, in a modal opened from the conversation header or the agent row menu; a mission opens as a labelled, redacted structured definition because st serves no mission KDL.",
+  "replay": {"status": "none", "detail": "Web-only change. No startup replay or history rewrite."},
+  "schema": {"status": "none", "detail": "No table, index, stored format, API schema or migration changes."},
+  "rules": {"status": "none", "detail": "No claim vocabulary, admission, ordering, checkpoint or retention changes."},
+  "compatibility": {"status": "none", "detail": "Reads the existing agent-declarations endpoint with show_env_values=false and the existing publication-definition read; both need read.declarations, and connections without it see a refusal message. No server change."},
+  "manual": {"status": "none", "detail": "Normal web deploy; no operator step."},
+  "recovery": {"status": "none", "detail": "Read-only view; a failed read shows an error and changes nothing."},
+  "downtime": {"status": "none", "detail": "Static web asset update only."}
+}

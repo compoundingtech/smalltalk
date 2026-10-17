@@ -2,7 +2,7 @@
 import * as React from 'react'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { Agent, AgentQueue, ResourceObservation, decodeUnknownSync } from '@smalltalk/st3-client/schema'
+import { Agent, AgentDeclaration, AgentQueue, ResourceObservation, decodeUnknownSync } from '@smalltalk/st3-client/schema'
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -21,13 +21,15 @@ vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
 const queue = decodeUnknownSync(AgentQueue)({ agent_id: agent.id, current_work_ids: ['work/current'], kind: 'agent-queue', move_count: 0, moves: [], next_work_id: null, runs: [{ claimed_work_ids: [], joined_at: '2026-10-04T12:00:00.000Z', mission_run_id: 'mission-run/example', position: 1, ready_work_ids: ['work/ready'], run_state: 'running', state: 'ready', waiting_work_ids: [] }] })
 const resource = decodeUnknownSync(ResourceObservation)({ id: 'resource/example', kind: 'filesystem.file', facts: { title: 'Observed project notes', state: 'open' }, observed_at: '2026-10-04T12:00:00.000Z', opened_by: agent.id, opened_by_run: null })
+const kdl = 'version 2\nagent "example" {\n    workspace "/srv/example"\n    env {\n        GH_TOKEN "<redacted>"\n    }\n}\n'
+const declaration = decodeUnknownSync(AgentDeclaration)({ id: agent.id, kdl, revision: 'rev-1', revisions: ['rev-1'], tree: {} })
 const resources = Atom.make<Feed<ResourcePage>>(observed({ value: { items: [resource], nextCursor: null } }))
 const conversation = Atom.make<Feed<ConversationPage>>(observed<ConversationPage>({ value: { items: [
   { _tag: 'UnknownEvent', id: 'internal', eventType: 'credential_pin', data: { pin_hint: 'not-for-display' } },
   { _tag: 'UnknownEvent', id: 'future', eventType: 'future_kind', data: {} },
 ], hasOlder: false, observation: { empty: false } } }))
 const source = {
-  ...fixtureSource({ world: { now: Date.parse('2026-10-06T12:00:00.000Z'), agents: [agent], missions: [], attention: [], events: [], conversations: {}, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' }, subjectReads: { agentQueue: { [agent.id]: observed({ value: queue }) } } } }),
+  ...fixtureSource({ world: { now: Date.parse('2026-10-06T12:00:00.000Z'), agents: [agent], missions: [], attention: [], events: [], conversations: {}, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' }, subjectReads: { agentQueue: { [agent.id]: observed({ value: queue }) }, agentDeclaration: { [agent.id]: observed({ value: declaration }) } } } }),
   conversation: (_ref: string) => conversation,
   gateway: 'http://fixture.invalid',
   resources: { byAgent: () => resources, byId: () => Atom.make(observed({ value: resource })), subjects: Atom.make([]), loadMore: vi.fn(), refresh: vi.fn(), resolveFile: () => undefined },
@@ -59,7 +61,7 @@ describe('live header parity', () => {
   it('renders named Resources and Conversation controls in the owning header', async () => {
     const header = host.querySelector('[data-testid="thread-header"]')!
     const names = [...header.querySelectorAll('button')].map(node => node.getAttribute('aria-label') ?? node.textContent?.trim())
-    expect(names).toEqual(['Actions for Example Agent', 'Resources', 'Conversation menu', 'Toggle terminal drawer', 'Toggle right panel'])
+    expect(names).toEqual(['Actions for Example Agent', 'Resources', 'View KDL', 'Conversation menu', 'Toggle terminal drawer', 'Toggle right panel'])
     await click('Conversation menu')
     const setting = document.querySelector('[role="menuitemcheckbox"]')
     expect(setting?.textContent).toContain('Show all system events')
@@ -149,6 +151,31 @@ describe('live header parity', () => {
     const reason = document.getElementById(button('Resources')!.getAttribute('aria-describedby')!)
     expect(reason?.textContent).toBe('Read access to agent resources has not been granted.')
     expect(host.querySelector('[data-testid="thread-header"]')?.textContent).not.toMatch(/raw-denial-code|Unknown/)
+  })
+  it('opens the agent canonical KDL from the header in a labelled dialog that Escape closes', async () => {
+    await click('View KDL')
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"][data-testid="declaration-dialog"]')
+    expect(dialog).not.toBeNull()
+    const heading = dialog!.querySelector('h2')
+    expect(heading?.textContent).toBe(agent.id)
+    expect(dialog!.getAttribute('aria-labelledby')).toBe(heading?.id)
+    expect([...dialog!.querySelectorAll('[data-line] code')].map(line => line.textContent).join('\n')).toBe(kdl.trimEnd())
+    expect(dialog!.querySelector('[data-testid="declaration-language"]')?.textContent).toBe('KDL')
+    expect(dialog!.querySelector('[data-testid="declaration-source"]')?.textContent).toContain('revision rev-1')
+    expect(dialog!.contains(document.activeElement)).toBe(true)
+    await act(async () => document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    expect(document.querySelector('[data-testid="declaration-dialog"]')).toBeNull()
+  })
+  it('opens the same declaration from the agent row context menu', async () => {
+    await click('Actions for Example Agent')
+    const item = [...document.querySelectorAll('[role="menuitem"]')].find(node => node.textContent === 'View KDL')
+    expect(item).toBeDefined()
+    await act(async () => item!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    const dialog = document.querySelector('[role="dialog"][data-testid="declaration-dialog"]')
+    expect(dialog?.querySelector('h2')?.textContent).toBe(agent.id)
+    expect(dialog?.textContent).toContain('GH_TOKEN')
+    await click('Close declaration')
+    expect(document.querySelector('[data-testid="declaration-dialog"]')).toBeNull()
   })
 })
 

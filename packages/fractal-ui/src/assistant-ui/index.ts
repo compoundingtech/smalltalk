@@ -36,7 +36,10 @@ export { Button as CompositionButton, IconButton as CompositionIconButton } from
 /** Controlled sidebar row; the host owns clock and data. */
 export { SidebarAgentRow, AgentHoverCard, sidebarRowDescription, sidebarRowAccessibleName } from './sidebar/SidebarAgentRow.tsx'
 export { SidebarStatus } from './sidebar/SidebarStatus.tsx'
-export type { SidebarAgentRow as SidebarAgentRowData, SidebarUsage, SidebarDuration, SidebarLastTurn, AgentStatus as SidebarAgentStatus } from './sidebar/model.ts'
+export type { SidebarAgentRow as SidebarAgentRowData, SidebarActions, SidebarUsage, SidebarDuration, SidebarLastTurn, AgentStatus as SidebarAgentStatus } from './sidebar/model.ts'
+/** Read-only declaration source (KDL, or a labelled structured fallback) with copy-all. */
+export { DeclarationPanel } from './declaration/DeclarationPanel.tsx'
+export type { DeclarationPanelProps, DeclarationPanelState, DeclarationLanguage } from './declaration/DeclarationPanel.tsx'
 
 export { ResourceCardV1, ResourceChipV1 } from './resources/ResourceCardV1.tsx'
 export type { ResourceData, ResourceFile, ResourceMetadata } from './resources/resource-model.ts'
