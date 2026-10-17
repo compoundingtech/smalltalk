@@ -76,7 +76,7 @@ Reject missing owner configuration, remote, agent, non-owner, absent-consent, un
 
 ## B. Explicit proof-gated reads
 
-Use native snapshot/page envelope semantics and typed generated clients, never CLI output, KDL, arbitrary claim parsing, or prose scraping. The six scopes are closed and unrelated person scopes are not accepted:
+Use native snapshot/page envelope semantics and typed generated clients, never CLI output, KDL, arbitrary claim parsing, or prose scraping. Assistant read scopes are closed and unrelated person scopes are not accepted:
 The attention, missions, and agents pages retain the optional native `sync` notice during replication catch-up or divergence. Its closed `SyncNotice` contract is shared with ordinary pages and decoded by the generated SDKs.
 
 | GET route under `/v1/client/assistant/` | Scope | Allowed fields, in addition to snapshot/page metadata |
@@ -85,20 +85,26 @@ The attention, missions, and agents pages retain the optional native `sync` noti
 | `attention` | `read.assistant.attention` | ID, attention-kind enum, person fixed to the configured owner, agent/mission references, revision/episode, waiting-since; no title, body, options |
 | `missions` | `read.assistant.missions` | Mission/run/agent IDs, phase, step counts, blocked count, revision, updated-at; no authored goal or status prose |
 | `agents` | `read.assistant.agents` | Agent ID, lifecycle/runtime-state enums, current mission/run IDs, updated-at; no paths, environment, conversation previews |
+| `conversations`, `conversation-detail`, `conversation-timeline`, `conversation-search` | `read.assistant.conversation` | Bounded conversation metadata, timeline entries, and search results through dedicated assistant projections |
+| `mission-detail` | `read.assistant.missions` | Allowlisted mission operational detail |
+| `work`, `work-detail` | `read.assistant.work` | Bounded work metadata and allowlisted work operational detail |
+| `agent-detail`, `agent-queue` | `read.assistant.agents` | Allowlisted agent operational detail and bounded queue metadata |
 | `conversation-content` | `read.assistant.conversation` | Exact agent/session/reference/range, bounded text, revision, returned bytes, truncation/next-range |
 | `terminal-content` | `read.assistant.terminal` | Exact agent/terminal/incarnation/screen revision, bounded text, returned bytes, truncation |
 
-The baseline grant contains only the first four minimal scopes: `read.assistant.summary`, `read.assistant.attention`, `read.assistant.missions`, and `read.assistant.agents`. The configured owning person may explicitly add content scopes. `approval-once` grants require a proof for each read; explicitly sealed `caller-bound-allow` grants admit reads within the exact grant scopes, expiry, consent, caller binding, and response budget. The adapter's rich projections remain bounded and do not grant unrelated person authority.
+The baseline grant contains only the four minimal scopes: `read.assistant.summary`, `read.assistant.attention`, `read.assistant.missions`, and `read.assistant.agents`. The configured owning person may explicitly add conversation, work, and terminal scopes; registering a tool does not expand an existing grant. `approval-once` grants require a proof for each read; explicitly sealed `caller-bound-allow` grants admit reads within the exact grant scopes, expiry, consent, caller binding, and response budget. The adapter's rich projections remain bounded and do not grant unrelated person authority. New detail projections disclose allowlisted operational fields only: no environment, secrets, workspace paths, or terminal content. The exact-range `conversation-content` contract remains unchanged.
+
+Disclosure filtering is structural, not word-based redaction of authorized conversation prose. Conversation search snippets resolve the matched entry's safe plain native text, never raw tool payloads; workspace, declaration, and tool metadata remain excluded. Authorized conversation prose may itself mention paths or other sensitive information. The conversation scope and bounded reads govern that disclosure; they do not promise to scrub path-like strings from the text.
 
 `ScgReadAuthorization` must bind verified issuer/key and identity `chatgpt`, assistant principal, grant and policy revision, approval/execution IDs, exact projection/filter/cursor or content resource/revision/range, response-byte maximum, request digest, expiry, and a one-use nonce. st verifies a separately pinned attestor key and consumes the authorization atomically. A new page or range needs a new approval. Exact retries may recover the same bounded receipt inside the protected executor, but cached/status/private-result re-delivery to the external model requires fresh authorization.
 
-Pagination binds the exact projection class as well as its snapshot and cache: metadata pages use `assistant.<route>`, while rich pages use `assistant.<route>-rich`. A rich cursor cannot continue a metadata request, including one authorized by another grant or after a read-mode change. Fresh metadata authorization never authorizes release of cached rich rows.
+Pagination binds the authenticated issuing grant ID and effective policy revision, exact projection class, snapshot and cache. Metadata and rich pages use distinct `assistant.<route>` classes, further namespaced by an opaque grant-policy digest. Queue handles also bind the selected agent. Timeline handles and the assistant-only search cache/cursors carry the same grant-policy binding; native non-assistant paging is unchanged. A cursor cannot continue under another grant, after any policy revision change, or through another projection. Revoking a grant does not transfer its handles to another active grant. Fresh authorization never authorizes release of another grant's cached rows.
 
-Content responses default to 4 KiB and have a hard maximum of 16 KiB UTF-8 including envelope overhead; configuration may lower these limits. Content reads do not stream, follow attachments, or silently fetch entire bodies. Over-budget requests fail rather than automatically paginate.
+Assistant read responses default to 4 KiB and have a hard maximum of 16 KiB UTF-8 including envelope overhead; configuration may lower these limits. Content reads do not stream, follow attachments, or silently fetch entire bodies. Over-budget requests fail rather than automatically paginate.
 
 Assistant principals are denied every route and stream outside the assistant surface, including generic messages, timelines, search, declarations, documents, history, events, and terminal WebSockets. Ordinary `observations.report`, `prompt.respond`, and message lifecycle mutations remain denied. The explicitly scoped native writes described above use the assistant proposal route; native/legacy alternate routes cannot bypass their authority checks.
 
-B adds typed projection/content/proof schemas, the six operations with exact scope/budget metadata, and advertised assistant response ceilings. Acceptance must cover unrelated-route/mutation denial, field-only projection despite secrets/injected text in source bodies, absent/wrong/expired/reused authorization, stale revisions, changed ranges or grants, Unicode/envelope ceilings, and no private bytes in unapproved, denied, expired, foreign-handle, cached, or replayed status results.
+B provides typed projection/content/proof schemas, operations with exact scope/budget metadata, and advertised assistant response ceilings. Acceptance must cover unrelated-route/mutation denial, field-only projection despite secrets/injected text in source bodies, absent/wrong/expired/reused authorization, stale revisions, changed ranges or grants, Unicode/envelope ceilings, and no private bytes in unapproved, denied, expired, foreign-handle, cached, or replayed status results.
 
 ### Read wire contract
 
@@ -108,8 +114,19 @@ Query parameters are scalar strings; duplicates, unknown names, and any `person`
 | --- | --- | --- |
 | `summary` | `max_response_bytes` | `AssistantSummary`: `kind`, `as_of`, `counts` only |
 | `attention`, `missions`, `agents` | `cursor`, `limit`, `max_response_bytes` | `AssistantAttentionPage`, `AssistantMissionPage`, `AssistantAgentPage`: the native page shape with collection `assistant.<route>` and empty `filters` |
+| `conversations`, `work` | `cursor`, `limit`, `max_response_bytes` | Existing assistant envelope with an `items` / `next_cursor` page |
+| `conversation-detail`, `agent-detail` | Required `agent_id`; optional `max_response_bytes` | Existing assistant envelope with allowlisted operational detail |
+| `conversation-timeline` | Required `agent_id`; optional `session_id`, `cursor`, `limit`, `max_response_bytes` | Existing assistant envelope with an `items` / `next_cursor` page |
+| `conversation-search` | Required `text`; optional `agent_id`, `cursor`, `limit`, `max_response_bytes` | Existing assistant envelope with an `items` / `next_cursor` page |
+| `mission-detail` | Required `mission_id`; optional `max_response_bytes` | Existing assistant envelope with allowlisted operational detail |
+| `work-detail` | Required `work_id`; optional `max_response_bytes` | Existing assistant envelope with allowlisted operational detail |
+| `agent-queue` | Required `agent_id`; optional `cursor`, `limit`, `max_response_bytes` | Existing assistant envelope with an `items` / `next_cursor` page |
 | `conversation-content` | `agent_id`, `session_id`, `reference`, `revision`, `start`, `end`, `max_response_bytes` | `AssistantContentPage` with `kind: "assistant-conversation-content"` |
 | `terminal-content` | `agent_id`, `terminal_id`, `incarnation_id`, `screen_revision`, `max_response_bytes` | `AssistantContentPage` with `kind: "assistant-terminal-content"` |
+
+The ChatGPT adapter exposes `summary` as `st_status_summary`; the new projections map respectively to `st_conversations_list`, `st_conversation_detail`, `st_conversation_timeline`, `st_conversation_search`, `st_mission_detail`, `st_work_list`, `st_work_detail`, `st_agent_detail`, and `st_agent_queue`. Each tool publishes a closed input schema and is read-only. All accept optional integer `max_response_bytes` from 1 through 16384; paginated tools accept optional positive integer `limit` and opaque string `cursor`. Results preserve the daemon envelope, including pagination; the adapter never follows a cursor automatically. Its standalone caller-bound mode holds only a scoped bearer, not a proof-signing key.
+
+The following proof-header contract applies to `approval-once` grants only; the standalone adapter's `caller-bound-allow` mode instead uses the scoped bearer and sealed disclosure consent described above.
 
 Every read carries `x-st3-scg-read-authorization`: unpadded base64url JSON `ScgReadAuthorization { payload, signature }`. The closed payload contains `issuer`, `identity: "chatgpt"`, `assistant_id: "assistant/chatgpt"`, `grant_id`, `policy_revision`, `key_id`, `approval_id`, `execution_id`, `projection` (the route suffix), `parameters` (every decoded query parameter, cursor and range included), `max_response_bytes`, `request_digest`, `expires_at_unix_ms`, and `nonce`. `signature` is unpadded base64url Ed25519 over the UTF-8 bytes `st3.scg-read.v1\n` followed by the canonical JSON payload: recursively sorted object keys, compact, integers only. `request_digest` is lowercase hexadecimal SHA-256 of canonical `{"method":"GET","path":<exact path>,"parameters":<decoded map>}`. st consumes the nonce atomically before returning private bytes; a replayed, expired, mismatched, or attestor-unverifiable proof is denied and discloses nothing. Generated clients never sign, retry, or widen the budget: they send exactly one request and reject a proof whose projection, parameters, or budget differ from the call.
 

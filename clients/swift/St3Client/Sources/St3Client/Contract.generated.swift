@@ -130,6 +130,15 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case assistantAttention = "assistant.attention"
     case assistantMissions = "assistant.missions"
     case assistantAgents = "assistant.agents"
+    case assistantConversations = "assistant.conversations"
+    case assistantConversationDetail = "assistant.conversation-detail"
+    case assistantConversationTimeline = "assistant.conversation-timeline"
+    case assistantConversationSearch = "assistant.conversation-search"
+    case assistantMissionDetail = "assistant.mission-detail"
+    case assistantWork = "assistant.work"
+    case assistantWorkDetail = "assistant.work-detail"
+    case assistantAgentDetail = "assistant.agent-detail"
+    case assistantAgentQueue = "assistant.agent-queue"
     case assistantConversationContent = "assistant.conversation-content"
     case assistantTerminalContent = "assistant.terminal-content"
 }
@@ -203,6 +212,15 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .assistantAttention: "/v1/client/assistant/attention",
     .assistantMissions: "/v1/client/assistant/missions",
     .assistantAgents: "/v1/client/assistant/agents",
+    .assistantConversations: "/v1/client/assistant/conversations",
+    .assistantConversationDetail: "/v1/client/assistant/conversation-detail",
+    .assistantConversationTimeline: "/v1/client/assistant/conversation-timeline",
+    .assistantConversationSearch: "/v1/client/assistant/conversation-search",
+    .assistantMissionDetail: "/v1/client/assistant/mission-detail",
+    .assistantWork: "/v1/client/assistant/work",
+    .assistantWorkDetail: "/v1/client/assistant/work-detail",
+    .assistantAgentDetail: "/v1/client/assistant/agent-detail",
+    .assistantAgentQueue: "/v1/client/assistant/agent-queue",
     .assistantConversationContent: "/v1/client/assistant/conversation-content",
     .assistantTerminalContent: "/v1/client/assistant/terminal-content",
 ]

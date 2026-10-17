@@ -23,6 +23,55 @@ const capabilityFixture = require('../../../docs/st3/client-v0/fixtures/capabili
 const cursorGapFixture = require('../../../docs/st3/client-v0/fixtures/cursor-gap-error.json');
 const capabilities = { ...capabilityFixture.value, limits: { ...capabilityFixture.value.limits, max_page_items: 2, max_event_items: 3, max_wait_ms: 10 } };
 
+const assistantReadRequests = require('../../../docs/st3/client-v0/fixtures/assistant-read-requests.json');
+for (const { projection, method, parameters } of assistantReadRequests) {
+    test(`${method} sends one proof-bound GET with lossless scalar query encoding`, async () => {
+        const calls = [];
+        const proof = structuredClone(require('../../../docs/st3/client-v0/fixtures/assistant-read-authorization.json'));
+        proof.payload.projection = projection;
+        proof.payload.parameters = Object.fromEntries(Object.entries(parameters).map(([key, value]) => [key, String(value)]));
+        proof.payload.max_response_bytes = parameters.max_response_bytes;
+        const wire = envelope({ kind: `assistant-${projection}` });
+        const client = new St3Client({
+            baseUrl: 'https://example.test',
+            credential: () => 'assistant-credential',
+            fetchImpl: async (url, init) => { calls.push([String(url), init]); return Response.json(wire); },
+        });
+        assert.deepEqual(await client[method](parameters, proof), wire);
+        assert.equal(calls.length, 1);
+        const [url, init] = calls[0];
+        const parsed = new URL(url);
+        assert.equal(parsed.pathname, `/v1/client/assistant/${projection}`);
+        assert.deepEqual(Object.fromEntries(parsed.searchParams), proof.payload.parameters);
+        assert.equal(init.method, 'GET');
+        assert.equal(init.body, undefined);
+        assert.equal(init.headers.Authorization, 'Bearer assistant-credential');
+        assert.deepEqual(JSON.parse(Buffer.from(init.headers['x-st3-scg-read-authorization'], 'base64url')), proof);
+        const mismatched = { ...parameters, max_response_bytes: 2048 };
+        await assert.rejects(client[method](mismatched, proof), /parameters differ/);
+        assert.equal(calls.length, 1);
+    });
+}
+
+test('assistant search and timeline preserve omitted optional query fields', async () => {
+    for (const [projection, method, parameters] of [
+        ['conversation-search', 'assistantConversationSearch', { text: 'exact + text' }],
+        ['conversation-timeline', 'assistantConversationTimeline', { agent_id: 'agent/example' }],
+    ]) {
+        const proof = structuredClone(require('../../../docs/st3/client-v0/fixtures/assistant-read-authorization.json'));
+        proof.payload.projection = projection;
+        proof.payload.parameters = parameters;
+        const client = new St3Client({
+            baseUrl: 'https://example.test',
+            fetchImpl: async (url) => {
+                assert.deepEqual(Object.fromEntries(new URL(url).searchParams), parameters);
+                return Response.json(envelope({}));
+            },
+        });
+        await client[method](parameters, proof);
+    }
+});
+
 test('notesList reads the typed advisory current notes endpoint', async () => {
     const wire = require('../../../docs/st3/client-v0/fixtures/directive-notes.json');
     const calls = [];

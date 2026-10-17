@@ -48,6 +48,16 @@ const TOOLS: &[(&str, &str, bool)] = &[
     ("st_alert_answer", "Execute one typed person-ask answer under write.assistant.answers using the alert's current episode and fence.", false),
     ("st_missions_list", "List mission metadata.", true),
     ("st_agents_list", "List agent metadata.", true),
+    ("st_status_summary", "Read bounded operational status counts.", true),
+    ("st_conversations_list", "List bounded conversation metadata without conversation content.", true),
+    ("st_conversation_detail", "Read one agent's current conversation with bounded chat excerpts and revision-pinned content references. Content may be sensitive.", true),
+    ("st_conversation_timeline", "Page bounded chat excerpts and content references for one agent's current conversation. Content may be sensitive.", true),
+    ("st_conversation_search", "Search bounded plain conversation text snippets. Content may be sensitive.", true),
+    ("st_mission_detail", "Read allowlisted operational fields for one mission.", true),
+    ("st_work_list", "List bounded work metadata.", true),
+    ("st_work_detail", "Read allowlisted operational fields for one work item.", true),
+    ("st_agent_detail", "Read allowlisted operational fields for one agent.", true),
+    ("st_agent_queue", "List bounded queue metadata for one agent.", true),
     ("st_conversation_read", "Read one bounded conversation content range. Content may contain sensitive material.", true),
     ("st_message_send", "Send one exact message to any existing agent, authorized by write.assistant.messages and the ChatGPT confirmation card. Person recipients are refused.", false),
 ];
@@ -63,6 +73,13 @@ fn schema(name: &str) -> Value {
         "st_alert_answer" => json!({"action_id":{"type":"string"},"idempotency_key":{"type":"string"},"fence":fence_schema(),"alert_id":{"type":"string"},"episode":{"type":"string"},"option":{"type":"string"},"summary":{"type":"string"}}),
         "st_message_send" => json!({"action_id":{"type":"string"},"idempotency_key":{"type":"string"},"fence":fence_schema(),"to":{"type":"string"},"title":{"type":"string"},"content":{"type":"string"}}),
         "st_alert_get" => json!({"alert_id":{"type":"string"},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
+        "st_status_summary" => json!({"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
+        "st_conversation_detail" | "st_agent_detail" => json!({"agent_id":{"type":"string"},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
+        "st_mission_detail" => json!({"mission_id":{"type":"string"},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
+        "st_work_detail" => json!({"work_id":{"type":"string"},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
+        "st_conversation_timeline" => json!({"agent_id":{"type":"string"},"session_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
+        "st_conversation_search" => json!({"text":{"type":"string"},"agent_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
+        "st_agent_queue" => json!({"agent_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
         "st_conversation_read" => json!({"agent_id":{"type":"string"},"session_id":{"type":"string"},"reference":{"type":"string"},"revision":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
         _ => json!({"limit":{"type":"integer","minimum":1},"cursor":{"type":"string"},"max_response_bytes":{"type":"integer","minimum":1,"maximum":16384}}),
     };
@@ -70,6 +87,10 @@ fn schema(name: &str) -> Value {
         "st_alert_answer" => vec!["action_id","idempotency_key","fence","alert_id","episode","option","summary"],
         "st_message_send" => vec!["action_id","idempotency_key","fence","to","title","content"],
         "st_alert_get" => vec!["alert_id"],
+        "st_conversation_detail" | "st_conversation_timeline" | "st_agent_detail" | "st_agent_queue" => vec!["agent_id"],
+        "st_conversation_search" => vec!["text"],
+        "st_mission_detail" => vec!["mission_id"],
+        "st_work_detail" => vec!["work_id"],
         "st_conversation_read" => vec!["agent_id","session_id","reference","revision","start","end"],
         _ => vec![],
     };
@@ -123,7 +144,24 @@ async fn call(adapter: &Adapter, name: &str, args: &Value) -> Result<Value,Value
     validate_arguments(name, args)?;
     let object = args.as_object().expect("validated tool object");
     let write = matches!(name,"st_alert_answer"|"st_message_send");
-    let route = match name {"st_alerts_list"=>"attention-rich","st_alert_get"=>"attention-content","st_missions_list"=>"missions-rich","st_agents_list"=>"agents-rich","st_conversation_read"=>"conversation-content",_=>"propose"};
+    let route = match name {
+        "st_alerts_list" => "attention-rich",
+        "st_alert_get" => "attention-content",
+        "st_missions_list" => "missions-rich",
+        "st_agents_list" => "agents-rich",
+        "st_status_summary" => "summary",
+        "st_conversations_list" => "conversations",
+        "st_conversation_detail" => "conversation-detail",
+        "st_conversation_timeline" => "conversation-timeline",
+        "st_conversation_search" => "conversation-search",
+        "st_mission_detail" => "mission-detail",
+        "st_work_list" => "work",
+        "st_work_detail" => "work-detail",
+        "st_agent_detail" => "agent-detail",
+        "st_agent_queue" => "agent-queue",
+        "st_conversation_read" => "conversation-content",
+        _ => "propose",
+    };
     let url = format!("http://localhost/v1/client/assistant/{route}");
     let request = if write {
         let parameters = if name == "st_alert_answer" {

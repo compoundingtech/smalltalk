@@ -2514,7 +2514,7 @@
     },
     "AssistantPrincipal": { "enum": ["assistant/chatgpt"] },
     "AssistantSenderClass": { "enum": ["external-assistant"] },
-    "AssistantScope": { "enum": ["read.assistant.summary", "read.assistant.attention", "read.assistant.missions", "read.assistant.agents", "read.assistant.conversation", "read.assistant.terminal", "write.assistant.messages", "write.assistant.custom-reply", "write.assistant.answers"] },
+    "AssistantScope": { "enum": ["read.assistant.summary", "read.assistant.attention", "read.assistant.missions", "read.assistant.agents", "read.assistant.work", "read.assistant.conversation", "read.assistant.terminal", "write.assistant.messages", "write.assistant.custom-reply", "write.assistant.answers"] },
     "AssistantMinimalReadMode": { "enum": ["approval-once", "caller-bound-allow"] },
     "AssistantGrant": {
       "type": "object",
@@ -2603,6 +2603,43 @@
         "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
       }
     },
+    "AssistantAgentDetailRequest": {
+      "type": "object", "additionalProperties": false, "required": ["agent_id"],
+      "properties": { "agent_id": { "$ref": "#/$defs/AgentId" }, "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" } }
+    },
+    "AssistantMissionDetailRequest": {
+      "type": "object", "additionalProperties": false, "required": ["mission_id"],
+      "properties": { "mission_id": { "$ref": "#/$defs/MissionId" }, "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" } }
+    },
+    "AssistantWorkDetailRequest": {
+      "type": "object", "additionalProperties": false, "required": ["work_id"],
+      "properties": { "work_id": { "$ref": "#/$defs/Id" }, "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" } }
+    },
+    "AssistantConversationTimelineRequest": {
+      "type": "object", "additionalProperties": false, "required": ["agent_id"],
+      "properties": {
+        "agent_id": { "$ref": "#/$defs/AgentId" }, "session_id": { "$ref": "#/$defs/Id" },
+        "cursor": { "$ref": "#/$defs/Cursor" }, "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
+      }
+    },
+    "AssistantConversationSearchRequest": {
+      "type": "object", "additionalProperties": false, "required": ["text"],
+      "properties": {
+        "text": { "type": "string", "minLength": 1 }, "agent_id": { "$ref": "#/$defs/AgentId" },
+        "cursor": { "$ref": "#/$defs/Cursor" }, "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
+      }
+    },
+    "AssistantAgentQueueRequest": {
+      "type": "object", "additionalProperties": false, "required": ["agent_id"],
+      "properties": {
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "cursor": { "$ref": "#/$defs/Cursor" }, "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
+      }
+    },
+    "Value": { "description": "Bounded assistant operational projection; the daemon allowlists the disclosed fields." },
     "AssistantConversationContentRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -2633,7 +2670,7 @@
       "description": "Disjoint content queries: conversation range or terminal screen; mixing their fields is denied.",
       "oneOf": [{ "$ref": "#/$defs/AssistantConversationContentRequest" }, { "$ref": "#/$defs/AssistantTerminalContentRequest" }]
     },
-    "AssistantProjection": { "enum": ["summary", "attention", "missions", "agents", "conversation-content", "terminal-content"] },
+    "AssistantProjection": { "enum": ["summary", "attention", "missions", "agents", "conversation-content", "terminal-content", "conversations", "conversation-detail", "conversation-timeline", "conversation-search", "mission-detail", "work", "work-detail", "agent-detail", "agent-queue"] },
     "ScgReadAuthorizationPayload": {
       "type": "object",
       "additionalProperties": false,

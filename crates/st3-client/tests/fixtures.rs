@@ -741,6 +741,36 @@ fn assistant_read_contract_decodes_fixtures_and_rejects_malformed_shapes() {
 }
 
 #[test]
+fn assistant_bounded_read_requests_match_shared_fixtures() {
+    let cases: Vec<serde_json::Value> = decode("assistant-read-requests.json");
+    for case in cases {
+        let parameters = case["parameters"].clone();
+        let encoded = match case["projection"].as_str().unwrap() {
+            "conversations" | "work" => serde_json::to_value(serde_json::from_value::<AssistantPageRequest>(parameters.clone()).unwrap()).unwrap(),
+            "conversation-detail" | "agent-detail" => serde_json::to_value(serde_json::from_value::<AssistantAgentDetailRequest>(parameters.clone()).unwrap()).unwrap(),
+            "conversation-timeline" => serde_json::to_value(serde_json::from_value::<AssistantConversationTimelineRequest>(parameters.clone()).unwrap()).unwrap(),
+            "conversation-search" => serde_json::to_value(serde_json::from_value::<AssistantConversationSearchRequest>(parameters.clone()).unwrap()).unwrap(),
+            "mission-detail" => serde_json::to_value(serde_json::from_value::<AssistantMissionDetailRequest>(parameters.clone()).unwrap()).unwrap(),
+            "work-detail" => serde_json::to_value(serde_json::from_value::<AssistantWorkDetailRequest>(parameters.clone()).unwrap()).unwrap(),
+            "agent-queue" => serde_json::to_value(serde_json::from_value::<AssistantAgentQueueRequest>(parameters.clone()).unwrap()).unwrap(),
+            projection => panic!("unexpected assistant projection: {projection}"),
+        };
+        assert_eq!(encoded, parameters);
+        let projection: AssistantProjection = serde_json::from_value(case["projection"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(projection).unwrap(), case["projection"]);
+    }
+    assert!(serde_json::from_value::<AssistantAgentDetailRequest>(serde_json::json!({})).is_err());
+    assert!(serde_json::from_value::<AssistantMissionDetailRequest>(serde_json::json!({"agent_id":"agent/example"})).is_err());
+    assert!(serde_json::from_value::<AssistantWorkDetailRequest>(serde_json::json!({"work_id":"work/example","person":"person/example"})).is_err());
+    assert!(serde_json::from_value::<AssistantConversationTimelineRequest>(serde_json::json!({"session_id":"session/example"})).is_err());
+    assert!(serde_json::from_value::<AssistantConversationSearchRequest>(serde_json::json!({"agent_id":"agent/example"})).is_err());
+    assert!(serde_json::from_value::<AssistantAgentQueueRequest>(serde_json::json!({"agent_id":"agent/example","session_id":"session/example"})).is_err());
+    let search: AssistantConversationSearchRequest = serde_json::from_value(serde_json::json!({"text":"exact + text"})).unwrap();
+    assert_eq!(serde_json::to_value(search).unwrap(), serde_json::json!({"text":"exact + text"}));
+    assert_eq!(serde_json::to_value(AssistantScope::Work).unwrap(), "read.assistant.work");
+}
+
+#[test]
 fn queued_mission_deadlines_decode_for_stui() {
     let mut wire: serde_json::Value =
         serde_json::from_slice(&fixture("person-ask-mission.json")).unwrap();

@@ -652,6 +652,7 @@ public enum AssistantSenderClass: String, Codable, Sendable { case externalAssis
 public enum AssistantMinimalReadMode: String, Codable, Sendable { case approvalOnce = "approval-once", callerBoundAllow = "caller-bound-allow" }
 public enum AssistantScope: String, Codable, Sendable {
     case summary = "read.assistant.summary", attention = "read.assistant.attention", missions = "read.assistant.missions", agents = "read.assistant.agents", conversation = "read.assistant.conversation", terminal = "read.assistant.terminal"
+    case work = "read.assistant.work"
     case messages = "write.assistant.messages", customReply = "write.assistant.custom-reply", answers = "write.assistant.answers"
 }
 public struct AssistantPairingBegin: Codable, Sendable {
@@ -695,6 +696,36 @@ public struct AssistantPageRequest: Codable, Sendable, Equatable {
     public init(cursor: String? = nil, limit: Int? = nil, maxResponseBytes: Int? = nil) { self.cursor = cursor; self.limit = limit; self.maxResponseBytes = maxResponseBytes }
     enum CodingKeys: String, CodingKey { case cursor, limit, maxResponseBytes = "max_response_bytes" }
 }
+public struct AssistantAgentDetailRequest: Codable, Sendable, Equatable {
+    public let agentID: String; public let maxResponseBytes: Int?
+    public init(agentID: String, maxResponseBytes: Int? = nil) { self.agentID = agentID; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case agentID = "agent_id", maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantMissionDetailRequest: Codable, Sendable, Equatable {
+    public let missionID: String; public let maxResponseBytes: Int?
+    public init(missionID: String, maxResponseBytes: Int? = nil) { self.missionID = missionID; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case missionID = "mission_id", maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantWorkDetailRequest: Codable, Sendable, Equatable {
+    public let workID: String; public let maxResponseBytes: Int?
+    public init(workID: String, maxResponseBytes: Int? = nil) { self.workID = workID; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case workID = "work_id", maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantConversationTimelineRequest: Codable, Sendable, Equatable {
+    public let agentID: String; public let sessionID, cursor: String?; public let limit, maxResponseBytes: Int?
+    public init(agentID: String, sessionID: String? = nil, cursor: String? = nil, limit: Int? = nil, maxResponseBytes: Int? = nil) { self.agentID = agentID; self.sessionID = sessionID; self.cursor = cursor; self.limit = limit; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case agentID = "agent_id", sessionID = "session_id", cursor, limit, maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantConversationSearchRequest: Codable, Sendable, Equatable {
+    public let text: String; public let agentID, cursor: String?; public let limit, maxResponseBytes: Int?
+    public init(text: String, agentID: String? = nil, cursor: String? = nil, limit: Int? = nil, maxResponseBytes: Int? = nil) { self.text = text; self.agentID = agentID; self.cursor = cursor; self.limit = limit; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case text, agentID = "agent_id", cursor, limit, maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantAgentQueueRequest: Codable, Sendable, Equatable {
+    public let agentID: String; public let cursor: String?; public let limit, maxResponseBytes: Int?
+    public init(agentID: String, cursor: String? = nil, limit: Int? = nil, maxResponseBytes: Int? = nil) { self.agentID = agentID; self.cursor = cursor; self.limit = limit; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case agentID = "agent_id", cursor, limit, maxResponseBytes = "max_response_bytes" }
+}
 public struct AssistantConversationContentRequest: Codable, Sendable, Equatable {
     public let agentID, sessionID, reference, revision: String; public let start, end: UInt64; public let maxResponseBytes: Int?
     public init(agentID: String, sessionID: String, reference: String, revision: String, start: UInt64, end: UInt64, maxResponseBytes: Int? = nil) { self.agentID = agentID; self.sessionID = sessionID; self.reference = reference; self.revision = revision; self.start = start; self.end = end; self.maxResponseBytes = maxResponseBytes }
@@ -720,7 +751,7 @@ public enum AssistantContentRequest: Codable, Sendable, Equatable {
         switch self { case .conversation(let value): try value.encode(to: encoder); case .terminal(let value): try value.encode(to: encoder) }
     }
 }
-public enum AssistantProjection: String, Codable, Sendable { case summary, attention, missions, agents, conversationContent = "conversation-content", terminalContent = "terminal-content" }
+public enum AssistantProjection: String, Codable, Sendable { case summary, attention, missions, agents, conversationContent = "conversation-content", terminalContent = "terminal-content", conversations, conversationDetail = "conversation-detail", conversationTimeline = "conversation-timeline", conversationSearch = "conversation-search", missionDetail = "mission-detail", work, workDetail = "work-detail", agentDetail = "agent-detail", agentQueue = "agent-queue" }
 public enum ScgReadIdentity: String, Codable, Sendable { case chatgpt }
 /// Signed by the pinned attestor (Ed25519) over UTF-8 `st3.scg-read.v1\n` + canonical JSON of this payload.
 public struct ScgReadAuthorizationPayload: Codable, Sendable, Equatable {

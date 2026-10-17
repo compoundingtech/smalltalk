@@ -1836,6 +1836,7 @@ struct AssistantGrantTerms {
     /// Add write.assistant.answers to answer supported owner alerts immediately;
     /// read.assistant.attention only permits reads. write.assistant.messages permits
     /// messages to any existing agent, never a person.
+    /// read.assistant.work permits bounded work lists and work details.
     #[arg(long = "scope", value_parser = parse_assistant_scope)]
     scopes: Vec<AssistantScope>,
     /// Consent that every assistant read is disclosed to OpenAI.

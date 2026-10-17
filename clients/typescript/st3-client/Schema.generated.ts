@@ -1103,6 +1103,18 @@ export const ArrangementPage = /*#__PURE__*/ (() => Schema.Struct({
 export type ArrangementPage = typeof ArrangementPage.Type
 export type ArrangementPageEncoded = typeof ArrangementPage.Encoded
 
+/** Inclusive bound on the entire JSON envelope. Omitted means the grant pin's default_response_bytes; an explicit value must not exceed the pin's max_response_bytes. */
+export const AssistantResponseBytes = /*#__PURE__*/ (() => Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(16384)).annotate({ identifier: "AssistantResponseBytes", description: "Inclusive bound on the entire JSON envelope. Omitted means the grant pin's default_response_bytes; an explicit value must not exceed the pin's max_response_bytes." }))()
+export type AssistantResponseBytes = typeof AssistantResponseBytes.Type
+export type AssistantResponseBytesEncoded = typeof AssistantResponseBytes.Encoded
+
+export const AssistantAgentDetailRequest = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": AgentId,
+  "max_response_bytes": optionalKey(AssistantResponseBytes)
+}).annotate({ identifier: "AssistantAgentDetailRequest" }))()
+export type AssistantAgentDetailRequest = typeof AssistantAgentDetailRequest.Type
+export type AssistantAgentDetailRequestEncoded = typeof AssistantAgentDetailRequest.Encoded
+
 export const AssistantAgentItem = /*#__PURE__*/ (() => Schema.Struct({
   "current_mission_id": Schema.OptionFromNullOr(Schema.String),
   "current_run_id": Schema.OptionFromNullOr(Schema.String),
@@ -1126,6 +1138,20 @@ export const AssistantAgentPage = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "AssistantAgentPage" }))()
 export type AssistantAgentPage = typeof AssistantAgentPage.Type
 export type AssistantAgentPageEncoded = typeof AssistantAgentPage.Encoded
+
+/** Opaque, snapshot-bound page/event cursor. */
+export const Cursor = /*#__PURE__*/ (() => Schema.String.check(Schema.isMinLength(8)).check(Schema.isMaxLength(2048)).pipe(Schema.brand("st3/Cursor")).annotate({ identifier: "Cursor", description: "Opaque, snapshot-bound page/event cursor." }))()
+export type Cursor = typeof Cursor.Type
+export type CursorEncoded = typeof Cursor.Encoded
+
+export const AssistantAgentQueueRequest = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": AgentId,
+  "cursor": optionalKey(Cursor),
+  "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))),
+  "max_response_bytes": optionalKey(AssistantResponseBytes)
+}).annotate({ identifier: "AssistantAgentQueueRequest" }))()
+export type AssistantAgentQueueRequest = typeof AssistantAgentQueueRequest.Type
+export type AssistantAgentQueueRequestEncoded = typeof AssistantAgentQueueRequest.Encoded
 
 /** Concrete person identity, never a session actor or a deployment-specific fixed person. */
 export const PersonId = /*#__PURE__*/ (() => Schema.String.check(Schema.isPattern(new RegExp("^person/[^/\\s]+$", "u"))).annotate({ identifier: "PersonId", description: "Concrete person identity, never a session actor or a deployment-specific fixed person." }))()
@@ -1205,11 +1231,6 @@ export const AssistantContentPage = /*#__PURE__*/ (() => Schema.Union([
 export type AssistantContentPage = typeof AssistantContentPage.Type
 export type AssistantContentPageEncoded = typeof AssistantContentPage.Encoded
 
-/** Inclusive bound on the entire JSON envelope. Omitted means the grant pin's default_response_bytes; an explicit value must not exceed the pin's max_response_bytes. */
-export const AssistantResponseBytes = /*#__PURE__*/ (() => Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(16384)).annotate({ identifier: "AssistantResponseBytes", description: "Inclusive bound on the entire JSON envelope. Omitted means the grant pin's default_response_bytes; an explicit value must not exceed the pin's max_response_bytes." }))()
-export type AssistantResponseBytes = typeof AssistantResponseBytes.Type
-export type AssistantResponseBytesEncoded = typeof AssistantResponseBytes.Encoded
-
 export const AssistantConversationContentRequest = /*#__PURE__*/ (() => Schema.Struct({
   "agent_id": AgentId,
   "end": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -1240,6 +1261,26 @@ export const AssistantContentRequest = /*#__PURE__*/ (() => Schema.Union([
 export type AssistantContentRequest = typeof AssistantContentRequest.Type
 export type AssistantContentRequestEncoded = typeof AssistantContentRequest.Encoded
 
+export const AssistantConversationSearchRequest = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": optionalKey(AgentId),
+  "cursor": optionalKey(Cursor),
+  "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))),
+  "max_response_bytes": optionalKey(AssistantResponseBytes),
+  "text": Schema.String.check(Schema.isMinLength(1))
+}).annotate({ identifier: "AssistantConversationSearchRequest" }))()
+export type AssistantConversationSearchRequest = typeof AssistantConversationSearchRequest.Type
+export type AssistantConversationSearchRequestEncoded = typeof AssistantConversationSearchRequest.Encoded
+
+export const AssistantConversationTimelineRequest = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": AgentId,
+  "cursor": optionalKey(Cursor),
+  "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))),
+  "max_response_bytes": optionalKey(AssistantResponseBytes),
+  "session_id": optionalKey(Id)
+}).annotate({ identifier: "AssistantConversationTimelineRequest" }))()
+export type AssistantConversationTimelineRequest = typeof AssistantConversationTimelineRequest.Type
+export type AssistantConversationTimelineRequestEncoded = typeof AssistantConversationTimelineRequest.Encoded
+
 export const AssistantMinimalReadMode = /*#__PURE__*/ (() => Schema.Literals(["approval-once","caller-bound-allow"]).annotate({ identifier: "AssistantMinimalReadMode" }))()
 export type AssistantMinimalReadMode = typeof AssistantMinimalReadMode.Type
 export type AssistantMinimalReadModeEncoded = typeof AssistantMinimalReadMode.Encoded
@@ -1268,7 +1309,7 @@ export const AssistantReadTrust = /*#__PURE__*/ (() => Schema.Struct({
 export type AssistantReadTrust = typeof AssistantReadTrust.Type
 export type AssistantReadTrustEncoded = typeof AssistantReadTrust.Encoded
 
-export const AssistantScope = /*#__PURE__*/ (() => Schema.Literals(["read.assistant.summary","read.assistant.attention","read.assistant.missions","read.assistant.agents","read.assistant.conversation","read.assistant.terminal","write.assistant.messages","write.assistant.custom-reply","write.assistant.answers"]).annotate({ identifier: "AssistantScope" }))()
+export const AssistantScope = /*#__PURE__*/ (() => Schema.Literals(["read.assistant.summary","read.assistant.attention","read.assistant.missions","read.assistant.agents","read.assistant.work","read.assistant.conversation","read.assistant.terminal","write.assistant.messages","write.assistant.custom-reply","write.assistant.answers"]).annotate({ identifier: "AssistantScope" }))()
 export type AssistantScope = typeof AssistantScope.Type
 export type AssistantScopeEncoded = typeof AssistantScope.Encoded
 
@@ -1315,6 +1356,13 @@ export const AssistantGrantPolicy = /*#__PURE__*/ (() => Schema.Struct({
 export type AssistantGrantPolicy = typeof AssistantGrantPolicy.Type
 export type AssistantGrantPolicyEncoded = typeof AssistantGrantPolicy.Encoded
 
+export const AssistantMissionDetailRequest = /*#__PURE__*/ (() => Schema.Struct({
+  "max_response_bytes": optionalKey(AssistantResponseBytes),
+  "mission_id": MissionId
+}).annotate({ identifier: "AssistantMissionDetailRequest" }))()
+export type AssistantMissionDetailRequest = typeof AssistantMissionDetailRequest.Type
+export type AssistantMissionDetailRequestEncoded = typeof AssistantMissionDetailRequest.Encoded
+
 export const AssistantMissionItem = /*#__PURE__*/ (() => Schema.Struct({
   "agent_ids": Schema.Array(Schema.String),
   "blocked_count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -1339,11 +1387,6 @@ export const AssistantMissionPage = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "AssistantMissionPage" }))()
 export type AssistantMissionPage = typeof AssistantMissionPage.Type
 export type AssistantMissionPageEncoded = typeof AssistantMissionPage.Encoded
-
-/** Opaque, snapshot-bound page/event cursor. */
-export const Cursor = /*#__PURE__*/ (() => Schema.String.check(Schema.isMinLength(8)).check(Schema.isMaxLength(2048)).pipe(Schema.brand("st3/Cursor")).annotate({ identifier: "Cursor", description: "Opaque, snapshot-bound page/event cursor." }))()
-export type Cursor = typeof Cursor.Type
-export type CursorEncoded = typeof Cursor.Encoded
 
 /** Metadata query. Every value travels as one scalar query string; duplicates and unknown fields are denied; no person parameter exists. */
 export const AssistantPageRequest = /*#__PURE__*/ (() => Schema.Struct({
@@ -1382,7 +1425,7 @@ export const AssistantPairingBegin = /*#__PURE__*/ (() => Schema.Struct({
 export type AssistantPairingBegin = typeof AssistantPairingBegin.Type
 export type AssistantPairingBeginEncoded = typeof AssistantPairingBegin.Encoded
 
-export const AssistantProjection = /*#__PURE__*/ (() => Schema.Literals(["summary","attention","missions","agents","conversation-content","terminal-content"]).annotate({ identifier: "AssistantProjection" }))()
+export const AssistantProjection = /*#__PURE__*/ (() => Schema.Literals(["summary","attention","missions","agents","conversation-content","terminal-content","conversations","conversation-detail","conversation-timeline","conversation-search","mission-detail","work","work-detail","agent-detail","agent-queue"]).annotate({ identifier: "AssistantProjection" }))()
 export type AssistantProjection = typeof AssistantProjection.Type
 export type AssistantProjectionEncoded = typeof AssistantProjection.Encoded
 
@@ -1413,6 +1456,13 @@ export const AssistantSummaryRequest = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "AssistantSummaryRequest", description: "Summary query: only the response budget; the person is always the grant issuer." }))()
 export type AssistantSummaryRequest = typeof AssistantSummaryRequest.Type
 export type AssistantSummaryRequestEncoded = typeof AssistantSummaryRequest.Encoded
+
+export const AssistantWorkDetailRequest = /*#__PURE__*/ (() => Schema.Struct({
+  "max_response_bytes": optionalKey(AssistantResponseBytes),
+  "work_id": Id
+}).annotate({ identifier: "AssistantWorkDetailRequest" }))()
+export type AssistantWorkDetailRequest = typeof AssistantWorkDetailRequest.Type
+export type AssistantWorkDetailRequestEncoded = typeof AssistantWorkDetailRequest.Encoded
 
 export const AttentionBlocked = /*#__PURE__*/ (() => Schema.Struct({
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -3741,3 +3791,8 @@ export const ScgReadAuthorization = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "ScgReadAuthorization", description: "Sent as unpadded base64url JSON in the `x-st3-scg-read-authorization` header." }))()
 export type ScgReadAuthorization = typeof ScgReadAuthorization.Type
 export type ScgReadAuthorizationEncoded = typeof ScgReadAuthorization.Encoded
+
+/** Bounded assistant operational projection; the daemon allowlists the disclosed fields. */
+export const Value = /*#__PURE__*/ (() => Schema.Unknown.annotate({ identifier: "Value", description: "Bounded assistant operational projection; the daemon allowlists the disclosed fields." }))()
+export type Value = typeof Value.Type
+export type ValueEncoded = typeof Value.Encoded

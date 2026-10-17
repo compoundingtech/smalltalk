@@ -2227,6 +2227,72 @@ impl Client {
     ) -> Result<Envelope<AssistantAgentPage>, ClientError> {
         self.assistant_read("agents", params, proof).await
     }
+    pub async fn assistant_conversations(
+        &self,
+        params: &AssistantPageRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("conversations", params, proof).await
+    }
+    pub async fn assistant_conversation_detail(
+        &self,
+        params: &AssistantAgentDetailRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("conversation-detail", params, proof)
+            .await
+    }
+    pub async fn assistant_conversation_timeline(
+        &self,
+        params: &AssistantConversationTimelineRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("conversation-timeline", params, proof)
+            .await
+    }
+    pub async fn assistant_conversation_search(
+        &self,
+        params: &AssistantConversationSearchRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("conversation-search", params, proof)
+            .await
+    }
+    pub async fn assistant_mission_detail(
+        &self,
+        params: &AssistantMissionDetailRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("mission-detail", params, proof).await
+    }
+    pub async fn assistant_work(
+        &self,
+        params: &AssistantPageRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("work", params, proof).await
+    }
+    pub async fn assistant_work_detail(
+        &self,
+        params: &AssistantWorkDetailRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("work-detail", params, proof).await
+    }
+    pub async fn assistant_agent_detail(
+        &self,
+        params: &AssistantAgentDetailRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("agent-detail", params, proof).await
+    }
+    pub async fn assistant_agent_queue(
+        &self,
+        params: &AssistantAgentQueueRequest,
+        proof: &ScgReadAuthorization,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        self.assistant_read("agent-queue", params, proof).await
+    }
     pub async fn assistant_conversation_content(
         &self,
         params: &AssistantConversationContentRequest,

@@ -1,0 +1,11 @@
+[
+  {"projection":"conversations","method":"assistantConversations","parameters":{"cursor":"next/+?&=雪","limit":2,"max_response_bytes":4096}},
+  {"projection":"conversation-detail","method":"assistantConversationDetail","parameters":{"agent_id":"agent/example","max_response_bytes":4096}},
+  {"projection":"conversation-timeline","method":"assistantConversationTimeline","parameters":{"agent_id":"agent/example","session_id":"session/example +?&","cursor":"next/+?&=雪","limit":2,"max_response_bytes":4096}},
+  {"projection":"conversation-search","method":"assistantConversationSearch","parameters":{"text":"space + & / ? # 雪","agent_id":"agent/example","cursor":"next/+?&=雪","limit":2,"max_response_bytes":4096}},
+  {"projection":"mission-detail","method":"assistantMissionDetail","parameters":{"mission_id":"mission/example","max_response_bytes":4096}},
+  {"projection":"work","method":"assistantWork","parameters":{"cursor":"next/+?&=雪","limit":2,"max_response_bytes":4096}},
+  {"projection":"work-detail","method":"assistantWorkDetail","parameters":{"work_id":"work/example","max_response_bytes":4096}},
+  {"projection":"agent-detail","method":"assistantAgentDetail","parameters":{"agent_id":"agent/example","max_response_bytes":4096}},
+  {"projection":"agent-queue","method":"assistantAgentQueue","parameters":{"agent_id":"agent/example","cursor":"next/+?&=雪","limit":2,"max_response_bytes":4096}}
+]

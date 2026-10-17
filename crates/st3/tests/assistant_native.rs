@@ -12,6 +12,9 @@ use st3_client::{ActionRequest, AssistantGrant, AssistantGrantPolicy, AssistantM
     PersonStepParameters};
 use tower::ServiceExt as _;
 
+#[path = "assistant_cursor_grants.rs"]
+mod cursor_grants;
+
 const OWNER: &str = "person/ada";
 const AGENT: &str = "agent/native.worker";
 const POLICY: &str = "custom.client.assistant.v1.policy";
@@ -135,6 +138,20 @@ impl Harness {
             fields: serde_json::from_value(fields).unwrap(), evidence: vec![previous.id.clone()],
             expected_subject: Some(Some(previous.id)), idempotency_key: None }).unwrap();
     }
+
+    // Pairing requires the four baseline scopes; inject a narrower authoritative policy
+    // to exercise each route's independent scope guard without weakening pairing policy.
+    fn remove_read_scope(&self, paired: &AssistantPairedSession, scope: AssistantScope) {
+        let subject = grant_subject(paired);
+        let previous = self.state.store.claims_for_subject_kind_at(&subject, POLICY, None, true, 1).unwrap().claims.pop().unwrap();
+        let mut fields = previous.body["fields"].clone();
+        let removed = serde_json::to_value(scope).unwrap();
+        fields["scopes"].as_array_mut().unwrap().retain(|candidate| candidate != &removed);
+        fields["policy_revision"] = json!(fields["policy_revision"].as_u64().unwrap() + 1);
+        self.state.store.append_claim(&ClaimInput { subject, kind: POLICY.into(), actor: Some(OWNER.into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: vec![previous.id.clone()],
+            expected_subject: Some(Some(previous.id)), idempotency_key: None }).unwrap();
+    }
 }
 
 async fn request(app: &Router, method: &str, path: &str, bearer: Option<&str>, person: Option<&str>, body: &impl Serialize) -> (StatusCode, Value) {
@@ -149,7 +166,7 @@ async fn request(app: &Router, method: &str, path: &str, bearer: Option<&str>, p
 
 fn scopes() -> Vec<AssistantScope> {
     vec![AssistantScope::Summary, AssistantScope::Attention, AssistantScope::Missions,
-        AssistantScope::Agents, AssistantScope::Conversation, AssistantScope::Messages, AssistantScope::Answers]
+        AssistantScope::Agents, AssistantScope::Conversation, AssistantScope::Work, AssistantScope::Messages, AssistantScope::Answers]
 }
 fn grant_path(paired: &AssistantPairedSession, suffix: &str) -> String {
     format!("/v1/client/assistant/grants/{}{suffix}", paired.grant.id.trim_start_matches("assistant-grant/"))
@@ -179,6 +196,125 @@ async fn pairing_caller_bound_rich_reads_and_budget_do_not_silently_truncate() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
     assert_eq!(value["code"], "response-budget-exceeded");
     assert!(value.get("value").is_none(), "A failed bounded read must not masquerade as a complete page");
+}
+
+#[tokio::test]
+async fn work_cursor_cannot_release_cached_rows_through_another_projection_or_grant() {
+    let h = Harness::new();
+    h.ask("cursor-first", "Private work first");
+    h.ask("cursor-second", "Private work second");
+    let paired = h.pair().await;
+    let other = h.pair().await;
+    let (status, first) = h.assistant(&paired, "GET", "/v1/client/assistant/work?limit=1&max_response_bytes=16384", &()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let cursor = first["value"]["page"]["next_cursor"].as_str().expect("two work rows have a continuation");
+    for grant in [&paired, &other] {
+        let path = format!("/v1/client/assistant/agents?limit=1&cursor={}", urlencoding::encode(cursor));
+        let (status, denied) = h.assistant(grant, "GET", &path, &()).await;
+        assert!(!status.is_success(), "{denied}");
+        assert!(denied.get("value").is_none());
+        assert!(!denied.to_string().contains("Private work"));
+    }
+}
+
+#[tokio::test]
+async fn operational_reads_are_scoped_bounded_and_exclude_declaration_material() {
+    let h = Harness::new();
+    let work = h.ask("operational-work", "Owner work");
+    let paired = h.pair().await;
+    let (_, missions) = h.assistant(&paired, "GET", "/v1/client/assistant/missions?limit=1", &()).await;
+    let mission = missions["value"]["items"][0]["id"].as_str().unwrap();
+    let routes = [
+        ("/v1/client/assistant/summary".to_owned(), AssistantScope::Summary),
+        ("/v1/client/assistant/conversations?limit=1".to_owned(), AssistantScope::Conversation),
+        (format!("/v1/client/assistant/mission-detail?mission_id={}", urlencoding::encode(mission)), AssistantScope::Missions),
+        ("/v1/client/assistant/work?limit=1".to_owned(), AssistantScope::Work),
+        (format!("/v1/client/assistant/work-detail?work_id={}", urlencoding::encode(&work)), AssistantScope::Work),
+        (format!("/v1/client/assistant/agent-detail?agent_id={}", urlencoding::encode(AGENT)), AssistantScope::Agents),
+        (format!("/v1/client/assistant/agent-queue?agent_id={}&limit=1", urlencoding::encode(AGENT)), AssistantScope::Agents),
+    ];
+    for (path, scope) in routes {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        let bounded = format!("{path}{separator}max_response_bytes=16384");
+        let (status, value) = h.assistant(&paired, "GET", &bounded, &()).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {value}");
+        assert!(serde_json::to_vec(&value).unwrap().len() <= 16384);
+        if let Some(items) = value["value"]["items"].as_array() {
+            assert!(items.len() <= 1, "{path}: {value}");
+        }
+        assert_no_operational_secrets(&value["value"]);
+        assert!(!value.to_string().contains(h.root.path().to_str().unwrap()), "{path}: leaked workspace");
+        h.remove_read_scope(&paired, scope);
+        let (status, denied) = h.assistant(&paired, "GET", &path, &()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {denied}");
+        assert!(denied.get("value").is_none());
+        h.policy(&paired, scopes()).await;
+        let (status, value) = h.assistant(&paired, "GET", &format!("{path}{separator}max_response_bytes=1"), &()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {value}");
+    }
+    for path in [
+        "/v1/client/assistant/conversations?limit=999999",
+        "/v1/client/assistant/work?limit=999999",
+        "/v1/client/assistant/agent-queue?agent_id=agent%2Fnative.worker&limit=999999",
+    ] {
+        let (status, value) = h.assistant(&paired, "GET", path, &()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {value}");
+    }
+}
+
+fn assert_no_operational_secrets(value: &Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                assert!(!["environment", "env", "secrets", "workspace", "workspace_path",
+                    "checkout", "command", "terminal", "terminal_content", "screen", "declaration"].contains(&key.as_str()),
+                    "forbidden operational field {key}");
+                assert_no_operational_secrets(value);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(assert_no_operational_secrets),
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn conversation_discovery_history_search_and_detail_require_conversation_scope() {
+    let h = Harness::new();
+    h.state.store.append_claim(&ClaimInput {
+        subject: AGENT.into(), kind: "runtime.observed".into(), actor: Some(AGENT.into()),
+        fields: serde_json::from_value(json!({"status":"running","runtime_id":"native.worker",
+            "incarnation_id":"q22-conversation","terminal":true})).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let paired = h.pair().await;
+    for suffix in [
+        "conversations?limit=1",
+        "conversation-detail?agent_id=agent%2Fnative.worker",
+        "conversation-timeline?agent_id=agent%2Fnative.worker&limit=1",
+        "conversation-search?text=orchid&agent_id=agent%2Fnative.worker&limit=1",
+    ] {
+        let path = format!("/v1/client/assistant/{suffix}&max_response_bytes=16384");
+        let (status, value) = h.assistant(&paired, "GET", &path, &()).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {value}");
+        assert!(serde_json::to_vec(&value).unwrap().len() <= 16384);
+        if let Some(items) = value["value"]["items"].as_array() { assert!(items.len() <= 1); }
+        assert_no_operational_secrets(&value["value"]);
+        assert!(!value.to_string().contains(h.root.path().to_str().unwrap()));
+        h.policy(&paired, scopes().into_iter().filter(|scope| *scope != AssistantScope::Conversation).collect()).await;
+        let (status, denied) = h.assistant(&paired, "GET", &path, &()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {denied}");
+        h.policy(&paired, scopes()).await;
+    }
+    let (status, value) = h.assistant(&paired, "GET",
+        "/v1/client/assistant/conversation-timeline?agent_id=agent%2Fnative.worker&session_id=session%2Fforeign&limit=1", &()).await;
+    assert!(!status.is_success(), "{value}");
+    for suffix in [
+        "conversation-timeline?agent_id=agent%2Fnative.worker&limit=999999",
+        "conversation-search?text=orchid&limit=999999",
+    ] {
+        let (status, value) = h.assistant(&paired, "GET", &format!("/v1/client/assistant/{suffix}"), &()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    }
 }
 
 #[tokio::test]

@@ -15,6 +15,7 @@ const REVOKED: &str = "custom.client.assistant.v1.revoked";
 const SCOPES: &[&str] = &[
     "read.assistant.summary", "read.assistant.attention", "read.assistant.missions",
     "read.assistant.agents", "read.assistant.conversation", "read.assistant.terminal",
+    "read.assistant.work",
     "write.assistant.messages", "write.assistant.custom-reply", "write.assistant.answers",
 ];
 // Serializes code consumption and grant policy transitions. Subject fences also protect

@@ -78,7 +78,7 @@ fn page_items<'a>(page: &'a Value, collection: &str) -> &'a Vec<Value> {
     let allowed = BTreeSet::from(["kind", "collection", "filters", "items", "page", "sync"]);
     assert!(keys(page).is_subset(&allowed), "{page}");
     assert_eq!(page["kind"], "page");
-    assert_eq!(page["collection"], collection);
+    assert_eq!(page["collection"], format!("{collection}:test-grant-policy"));
     assert_eq!(page["filters"], json!({}));
     page["items"].as_array().unwrap()
 }
@@ -216,7 +216,7 @@ async fn reads_without_a_configured_owner_are_forbidden() {
 
 /// A managed Codex agent whose transcript holds one long assistant answer: secrets,
 /// injected text and multi-byte characters past the 8 KiB reference threshold.
-fn managed_conversation(root: &std::path::Path, text: &str) -> (AppState, String, String, String) {
+pub(super) fn managed_conversation(root: &std::path::Path, text: &str) -> (AppState, String, String, String) {
     managed_record(root, json!({
         "type":"message", "role":"assistant", "id":"answer",
         "content":[{"type":"output_text","text":text}],

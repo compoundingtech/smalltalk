@@ -1298,7 +1298,7 @@ and does not substitute ordinary person grants on older servers.
 
 The original slice-B proof-gated mode remains a legacy branch capability; the standalone
 adapter does not use it, does not send its proof header, and has no SCG dependency.
-In consent-at-grant mode, the same six scoped reads authorize against the current grant on
+In consent-at-grant mode, the same scoped assistant reads authorize against the current grant on
 every request and revalidate it immediately before returning the response. Envelope budgets
 default to 4096 bytes with a 16384-byte ceiling. Over-budget responses return an explicit
 `response-budget-exceeded` error, mapped by MCP to `incomplete`, never silently clipped data.
@@ -1324,12 +1324,50 @@ binding. Revocation between handler preflight and the writer transaction denies 
 write. Agent recipient existence remains required; allowlist membership is not checked.
 
 `crates/st-chatgpt` uses official `rmcp` 3.5.1 for both stateless Streamable HTTP and stdio.
-Both transports use the same seven closed tools and paired-only `st3-client.sock` gateway.
+Both transports use the same seventeen closed tools and paired-only `st3-client.sock` gateway.
 The adapter holds only a scoped bearer, never an approval key. The current HTTP frontend is
 loopback/no-auth for the recorded personal-tunnel dogfood exception; OAuth is the next
 frontend-auth boundary and does not alter tool arguments or daemon grants. No generic command
 runner, daemon-control socket, or terminal scraping is exposed. `GET /mcp` is 405; unknown
 paths return an empty 404.
+
+### ChatGPT read tools
+
+All routes below are GETs under `/v1/client/assistant/`; none uses an ordinary person route.
+Every input schema is closed (`additionalProperties: false`). All reads accept optional
+`max_response_bytes` (integer 1–16384); the 4096-byte default and 16384-byte ceiling cover the
+entire response envelope, and deployment policy may lower them. Paginated reads accept optional
+`cursor` and positive integer `limit`, preserve `items` / `next_cursor`, and never auto-fetch.
+
+| MCP tool | Route | Required fields | Other optional fields | Scope |
+| --- | --- | --- | --- | --- |
+| `st_status_summary` | `summary` | — | — | `read.assistant.summary` |
+| `st_alerts_list` | `attention-rich` | — | `cursor`, `limit` | `read.assistant.attention` |
+| `st_alert_get` | `attention-content` | `alert_id` | — | `read.assistant.attention` |
+| `st_missions_list` | `missions-rich` | — | `cursor`, `limit` | `read.assistant.missions` |
+| `st_agents_list` | `agents-rich` | — | `cursor`, `limit` | `read.assistant.agents` |
+| `st_conversations_list` | `conversations` | — | `cursor`, `limit` | `read.assistant.conversation` |
+| `st_conversation_detail` | `conversation-detail` | `agent_id` | — | `read.assistant.conversation` |
+| `st_conversation_timeline` | `conversation-timeline` | `agent_id` | `session_id`, `cursor`, `limit` | `read.assistant.conversation` |
+| `st_conversation_search` | `conversation-search` | `text` | `agent_id`, `cursor`, `limit` | `read.assistant.conversation` |
+| `st_mission_detail` | `mission-detail` | `mission_id` | — | `read.assistant.missions` |
+| `st_work_list` | `work` | — | `cursor`, `limit` | `read.assistant.work` |
+| `st_work_detail` | `work-detail` | `work_id` | — | `read.assistant.work` |
+| `st_agent_detail` | `agent-detail` | `agent_id` | — | `read.assistant.agents` |
+| `st_agent_queue` | `agent-queue` | `agent_id` | `cursor`, `limit` | `read.assistant.agents` |
+| `st_conversation_read` | `conversation-content` | `agent_id`, `session_id`, `reference`, `revision`, `start`, `end` | — | `read.assistant.conversation` |
+
+The remaining two tools are the explicitly scoped writes `st_alert_answer` and `st_message_send`.
+Registering a tool never expands the sealed grant: baseline grants do not include
+`read.assistant.conversation` or `read.assistant.work`; the owning person must add them explicitly.
+New detail projections return only allowlisted operational fields, never environment, secrets,
+workspace paths, or terminal content. The existing exact-range `st_conversation_read` contract is
+unchanged, and approved conversation disclosure can contain sensitive material. Exclusions are
+structural: workspace/declaration/tool metadata and raw tool payloads are not disclosed, while
+authorized prose may itself mention paths. Search snippets use the matched entry's safe plain
+native text, not raw tool payloads; no path-string redaction is promised. Read-only MCP
+annotations are not additional authority and do not authorize writes. See
+[External assistants](../external-assistants.md) for disclosure and proof-mode requirements.
 
 The flake's `packages.st-chatgpt` builds only the adapter executable with the shared locked
 Cargo dependencies. Run `nix build .#st-chatgpt` from a checkout, or

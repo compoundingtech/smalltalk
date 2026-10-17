@@ -17,6 +17,13 @@ const ROUTES: &[(&str, &str)] = &[
     ("agents-rich", "read.assistant.agents"),
     ("missions", "read.assistant.missions"), ("agents", "read.assistant.agents"),
     ("conversation-content", "read.assistant.conversation"),
+    ("conversations", "read.assistant.conversation"),
+    ("conversation-detail", "read.assistant.conversation"),
+    ("conversation-timeline", "read.assistant.conversation"),
+    ("conversation-search", "read.assistant.conversation"),
+    ("mission-detail", "read.assistant.missions"),
+    ("work", "read.assistant.work"), ("work-detail", "read.assistant.work"),
+    ("agent-detail", "read.assistant.agents"), ("agent-queue", "read.assistant.agents"),
     ("terminal-content", "read.assistant.terminal"),
 ];
 
@@ -253,6 +260,11 @@ async fn read_inner(State(state): State<AppState>, Extension(session): Extension
     let grant_subject = session.pairing_grant.as_deref().ok_or_else(|| forbidden("assistant grant absent"))?;
     let granted = latest(&state, grant_subject, GRANTED)?.ok_or_else(|| forbidden("assistant grant absent"))?;
     let policy = effective(&state, &granted)?;
+    // Handles belong to one authenticated grant at one effective policy revision.
+    let binding = credential_digest(&serde_json::to_string(&(
+        fields(&policy)?["grant_id"].as_str().ok_or_else(|| forbidden("assistant grant id absent"))?,
+        fields(&policy)?["policy_revision"].as_u64().unwrap_or(0),
+    )).map_err(ApiError::internal)?);
     if fields(&policy)?["minimal_read_mode"] == "caller-bound-allow" {
         let parameters = parameters(&uri)?;
         let requested = parameters.get("max_response_bytes").map(|v| v.parse::<usize>())
@@ -272,7 +284,7 @@ async fn read_inner(State(state): State<AppState>, Extension(session): Extension
             grant_subject:grant_subject.into(), actor:current.actor, transport:session.transport,
             policy_revision:fields(&policy)?["policy_revision"].as_u64().unwrap_or(0),
             proof_expiry:fields(&policy)?["expires_at_unix_ms"].as_u64().unwrap_or(0), max_response_bytes:requested };
-        let (snapshot,value) = super::reads::project(&state,&snapshot,projection,&parameters,requested).await?;
+        let (snapshot,value) = super::reads::project_bound(&state,&snapshot,projection,&parameters,requested,&binding).await?;
         return Ok((Extension(receipt),Extension(snapshot),Json(value)));
     }
     let authorization = proof(&headers)?;
@@ -290,7 +302,7 @@ async fn read_inner(State(state): State<AppState>, Extension(session): Extension
     }),None).map_err(|error| if error.code=="stale-subject" {
         forbidden("the SCG read approval has already been consumed") } else {error})?;
     receipt.consumed_claim=consumed.id.clone();
-    let (snapshot,value) = match super::reads::project(&state,&snapshot,&authorization.payload.projection,&parameters,receipt.max_response_bytes).await {
+    let (snapshot,value) = match super::reads::project_bound(&state,&snapshot,&authorization.payload.projection,&parameters,receipt.max_response_bytes,&binding).await {
         Ok(result) => result,
         Err(error) => {
             append(&state,receipt.subject.clone(),OUTCOME,&receipt.actor,json!({"version":1,

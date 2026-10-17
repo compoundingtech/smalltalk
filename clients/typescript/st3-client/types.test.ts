@@ -1,5 +1,22 @@
 import type { ActionOf, ConversationSearchHit, TimelineMessageBody } from './Models.generated.ts';
 import type { ClientOptions, TraceContext } from './Client.generated.ts';
+import type { St3Client } from './Client.generated.ts';
+import type { EnvelopeOf, ScgReadAuthorization, Value } from './Models.generated.ts';
+
+const boundedAssistantReads = (client: St3Client, proof: ScgReadAuthorization): Promise<EnvelopeOf<Value>>[] => [
+    client.assistantConversations({ cursor: 'next/+?', limit: 2, max_response_bytes: 4096 }, proof),
+    client.assistantConversationDetail({ agent_id: 'agent/example' }, proof),
+    client.assistantConversationTimeline({ agent_id: 'agent/example', session_id: 'session/example', limit: 2 }, proof),
+    client.assistantConversationTimeline({ agent_id: 'agent/example' }, proof),
+    client.assistantConversationSearch({ text: 'exact + text', agent_id: 'agent/example', cursor: 'next/+?' }, proof),
+    client.assistantConversationSearch({ text: 'exact + text' }, proof),
+    client.assistantMissionDetail({ mission_id: 'mission/example' }, proof),
+    client.assistantWork({ limit: 2 }, proof),
+    client.assistantWorkDetail({ work_id: 'work/example' }, proof),
+    client.assistantAgentDetail({ agent_id: 'agent/example' }, proof),
+    client.assistantAgentQueue({ agent_id: 'agent/example', cursor: 'next/+?', limit: 2 }, proof),
+];
+void boundedAssistantReads;
 
 const traceContext: TraceContext = {
     traceparent: '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01',

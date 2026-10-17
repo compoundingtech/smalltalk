@@ -220,6 +220,7 @@ fn rust_operation_methods(
             continue;
         }
         if let Some((projection, request, response)) = assistant_read(read)? {
+            let response = if response == "Value" { "serde_json::Value" } else { response };
             writeln!(out, "    pub async fn {method}(&self, params: &{request}, proof: &ScgReadAuthorization) -> Result<Envelope<{response}>, ClientError> {{ self.assistant_read(\"{projection}\", params, proof).await }}")?;
         } else if id == "capabilities.get" {
             writeln!(
@@ -389,6 +390,7 @@ fn swift_operation_methods(
             continue;
         }
         if let Some((projection, request, response)) = assistant_read(read)? {
+            let response = if response == "Value" { "JSONValue" } else { response };
             writeln!(out, "    public func {method}(_ params: {request}, proof: ScgReadAuthorization) async throws -> Envelope<{response}> {{ try await assistantRead(\"{projection}\", params, proof: proof) }}")?;
         } else if matches!(
             id,
@@ -755,6 +757,12 @@ fn validate_surfaces(
         "AssistantReadTrustRequest",
         "AssistantSummaryRequest",
         "AssistantPageRequest",
+        "AssistantAgentDetailRequest",
+        "AssistantMissionDetailRequest",
+        "AssistantWorkDetailRequest",
+        "AssistantConversationTimelineRequest",
+        "AssistantConversationSearchRequest",
+        "AssistantAgentQueueRequest",
         "AssistantContentRequest",
         "ScgReadAuthorization",
         "ScgReadAuthorizationPayload",
