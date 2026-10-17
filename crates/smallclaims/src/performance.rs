@@ -1,12 +1,111 @@
-//! Always-on, bounded five-minute operational accounting. No graph claims or disk writes.
+//! Always-on, bounded operational accounting: rolling windows and lifetime route counters.
+//! No graph claims or disk writes.
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WINDOW: Duration = Duration::from_secs(300);
 const LABEL_LIMIT: usize = 256;
+/// Keep interval deltas independent of the rolling report without retaining an unbounded roster.
+const REQUEST_COUNTER_LABEL_LIMIT: usize = 1024;
+const REQUEST_COUNTER_LABEL_BYTES: usize = 256;
+const REQUEST_COUNTER_TOTAL_LABEL_BYTES: usize = 64 * 1024;
+static COUNTER_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+struct RequestCounters {
+    epoch: u64,
+    started: Instant,
+    // Meter creation (first use or test reset), not the OS process birth time.
+    started_unix_ms: Option<u64>,
+    completed: u64,
+    unattributed: u64,
+    overflow: u64,
+    saturated: bool,
+    by_client_route: BTreeMap<(Option<String>, String), u64>,
+    retained_label_bytes: usize,
+}
+impl Default for RequestCounters {
+    fn default() -> Self {
+        Self {
+            epoch: COUNTER_EPOCH.fetch_add(1, Ordering::Relaxed),
+            started: Instant::now(),
+            started_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+            completed: 0,
+            unattributed: 0,
+            overflow: 0,
+            saturated: false,
+            by_client_route: BTreeMap::new(),
+            retained_label_bytes: 0,
+        }
+    }
+}
+impl RequestCounters {
+    fn increment(count: &mut u64, saturated: &mut bool) {
+        match count.checked_add(1) {
+            Some(next) => *count = next,
+            None => *saturated = true,
+        }
+    }
+    fn record(&mut self, kind: &str, client: Option<&str>) {
+        // Match request_count's route scope; record_request also records internal roster events.
+        if !kind.starts_with('/') {
+            return;
+        }
+        Self::increment(&mut self.completed, &mut self.saturated);
+        if client.is_none_or(|client| client.is_empty() || client == "(tcp)") {
+            Self::increment(&mut self.unattributed, &mut self.saturated);
+        }
+        let label_bytes = kind.len().saturating_add(client.map_or(0, str::len));
+        if label_bytes > REQUEST_COUNTER_LABEL_BYTES {
+            Self::increment(&mut self.overflow, &mut self.saturated);
+            return;
+        }
+        let key = (client.map(str::to_owned), kind.to_owned());
+        let at_limit = self.by_client_route.len() >= REQUEST_COUNTER_LABEL_LIMIT
+            || self.retained_label_bytes.saturating_add(label_bytes)
+                > REQUEST_COUNTER_TOTAL_LABEL_BYTES;
+        match self.by_client_route.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut row) => {
+                Self::increment(row.get_mut(), &mut self.saturated);
+            }
+            std::collections::btree_map::Entry::Vacant(row) if !at_limit => {
+                self.retained_label_bytes += label_bytes;
+                row.insert(1);
+            }
+            std::collections::btree_map::Entry::Vacant(_) => {
+                Self::increment(&mut self.overflow, &mut self.saturated);
+            }
+        }
+    }
+    fn snapshot(&self, now: Instant) -> Value {
+        let rows = self
+            .by_client_route
+            .iter()
+            .map(|((client, kind), count)| json!({"client":client,"kind":kind,"count":count}))
+            .collect::<Vec<_>>();
+        json!({
+            "process_id":std::process::id(), "epoch":self.epoch,
+            "started_unix_ms":self.started_unix_ms,
+            "elapsed_seconds":now.duration_since(self.started).as_secs_f64(),
+            "scope":"completed route requests (kind starts with '/'); includes observation requests; excludes internal events and background tasks",
+            "elapsed_scope":"since meter creation (first use or test reset), not process uptime",
+            "completed":self.completed, "unattributed":self.unattributed,
+            "overflow":self.overflow, "saturated":self.saturated,
+            "attribution_complete_since_epoch":self.unattributed == 0 && self.overflow == 0 && !self.saturated,
+            "label_limit":REQUEST_COUNTER_LABEL_LIMIT,
+            "label_bytes_limit":REQUEST_COUNTER_LABEL_BYTES,
+            "total_label_bytes_limit":REQUEST_COUNTER_TOTAL_LABEL_BYTES,
+            "retained_label_bytes":self.retained_label_bytes,
+            "rows":rows,
+        })
+    }
+}
 
 #[derive(Clone, Default)]
 struct Sample {
@@ -68,6 +167,7 @@ const CLIENT_KIND: char = '\u{1f}';
 #[derive(Default)]
 struct Meter {
     buckets: VecDeque<(Instant, Bucket)>,
+    request_counters: RequestCounters,
 }
 static METER: OnceLock<Mutex<Meter>> = OnceLock::new();
 
@@ -75,10 +175,14 @@ static METER: OnceLock<Mutex<Meter>> = OnceLock::new();
 /// Callers must not run alongside other tests that rely on the meter's contents.
 #[cfg(feature = "test-support")]
 pub fn reset_for_test() {
-    *METER.get_or_init(Mutex::default).lock().unwrap() = Meter::default();
+    METER.get_or_init(Mutex::default).lock().unwrap().reset();
 }
 
 impl Meter {
+    #[cfg(any(test, feature = "test-support"))]
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
     fn prune(&mut self, now: Instant) {
         while self
             .buckets
@@ -121,6 +225,7 @@ impl Meter {
         client: Option<&str>,
         duration: Duration,
     ) {
+        self.request_counters.record(kind, client);
         self.record(now, Table::Requests, kind.into(), duration, 0);
         if let Some(client) = client {
             self.record(now, Table::Clients, client.into(), duration, 0);
@@ -211,7 +316,8 @@ impl Meter {
             .into_iter()
             .map(|(item, s)| json!({"item": item, "count": s.count, "cpu_ms": s.cpu_us as f64 / 1000.0}))
             .collect::<Vec<_>>();
-        json!({"window_seconds":300,"requests":by_time(Table::Requests),"queries":by_time(Table::Queries),
+        json!({"request_counters":self.request_counters.snapshot(now),
+            "window_seconds":300,"requests":by_time(Table::Requests),"queries":by_time(Table::Queries),
             "request_count":request_count,"sampled_seconds":window_seconds,
             "clients":by_count(Table::Clients),"client_requests":by_count(Table::ClientRequests),
             "reconciler_wakes":wakes,"incremental_corrections":corrections,"incremental_evaluations":evaluations,
@@ -452,6 +558,16 @@ fn thread_cpu_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn report_request_counter_payload_size(fixture: &str, counters: &Value) {
+        println!(
+            "request-counter-payload {}",
+            json!({
+                "fixture": fixture,
+                "rows": counters["rows"].as_array().unwrap().len(),
+                "serialized_json_bytes": serde_json::to_vec(counters).unwrap().len(),
+            })
+        );
+    }
     #[test]
     fn performance_window_is_bounded_ranked_and_expires() {
         let mut meter = Meter::default();
@@ -512,6 +628,244 @@ mod tests {
         assert_eq!(report["client_requests"][0]["count"], 30);
         assert_eq!(report["clients"].as_array().unwrap().len(), 2);
     }
+    #[test]
+    fn request_deltas_survive_expiry_and_include_clients_outside_the_top_twenty() {
+        let mut meter = Meter::default();
+        let now = Instant::now();
+        for client in 0..25 {
+            meter.record_request(
+                now,
+                "/v1/health",
+                Some(&format!("client-{client}")),
+                Duration::ZERO,
+            );
+        }
+        let first = meter.snapshot(now);
+        report_request_counter_payload_size("25-client fixture", &first["request_counters"]);
+        assert_eq!(first["client_requests"].as_array().unwrap().len(), 20);
+        assert_eq!(
+            first["request_counters"]["rows"].as_array().unwrap().len(),
+            25
+        );
+        let later = now + WINDOW * 2;
+        meter.record_request(later, "/v1/health", Some("client-24"), Duration::ZERO);
+        meter.record(
+            later,
+            Table::Requests,
+            "task reconcile-pass".into(),
+            Duration::ZERO,
+            0,
+        );
+        let second = meter.snapshot(later);
+        assert!(
+            second["request_counters"]["elapsed_seconds"]
+                .as_f64()
+                .unwrap()
+                >= 600.0
+        );
+        assert_eq!(second["request_count"], 1);
+        assert_eq!(second["request_counters"]["completed"], 26);
+        assert_eq!(
+            first["request_counters"]["epoch"],
+            second["request_counters"]["epoch"]
+        );
+        assert_eq!(second["request_counters"]["unattributed"], 0);
+        assert_eq!(second["request_counters"]["overflow"], 0);
+        let row = second["request_counters"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["client"] == "client-24")
+            .unwrap();
+        assert_eq!(row["count"], 2);
+    }
+
+    #[test]
+    fn request_counter_gaps_and_resets_are_explicit_and_bounded() {
+        let mut counts = RequestCounters::default();
+        counts.record("/v1/health", None);
+        for client in 0..REQUEST_COUNTER_LABEL_LIMIT - 1 {
+            counts.record("/v1/health", Some(&format!("client-{client}")));
+        }
+        counts.record("/v1/health", Some("overflow-client"));
+        // A retained label still advances after the distinct-label limit is reached.
+        counts.record("/v1/health", Some("client-0"));
+        counts.record("/v1/health", Some(&"x".repeat(REQUEST_COUNTER_LABEL_BYTES)));
+        let report = counts.snapshot(Instant::now());
+        report_request_counter_payload_size("1024-pair fixture", &report);
+        assert_eq!(report["completed"], REQUEST_COUNTER_LABEL_LIMIT as u64 + 3);
+        assert_eq!(report["unattributed"], 1);
+        assert_eq!(report["overflow"], 2);
+        assert_eq!(
+            report["rows"].as_array().unwrap().len(),
+            REQUEST_COUNTER_LABEL_LIMIT
+        );
+        assert_eq!(
+            counts.by_client_route[&(Some("client-0".into()), "/v1/health".into())],
+            2
+        );
+        assert_ne!(counts.epoch, RequestCounters::default().epoch);
+        counts.completed = u64::MAX;
+        counts.record("/v1/health", Some("client-0"));
+        assert_eq!(counts.completed, u64::MAX);
+        assert!(counts.saturated);
+        assert_eq!(
+            counts.snapshot(Instant::now())["attribution_complete_since_epoch"],
+            false
+        );
+        // Saturation of a retained pair or a loss counter is equally visible.
+        let mut counts = RequestCounters::default();
+        counts
+            .by_client_route
+            .insert((None, "/v1/health".into()), u64::MAX);
+        counts.unattributed = u64::MAX;
+        counts.record("/v1/health", None);
+        assert!(counts.saturated);
+        assert_eq!(counts.unattributed, u64::MAX);
+        assert_eq!(
+            counts.by_client_route[&(None, "/v1/health".into())],
+            u64::MAX
+        );
+        let mut counts = RequestCounters {
+            overflow: u64::MAX,
+            ..Default::default()
+        };
+        counts.record("/v1/health", Some(&"x".repeat(REQUEST_COUNTER_LABEL_BYTES)));
+        assert!(counts.saturated);
+        assert_eq!(counts.overflow, u64::MAX);
+    }
+
+    #[test]
+    fn request_counter_payload_is_bounded_with_escaping_heavy_labels() {
+        let mut counts = RequestCounters::default();
+        let route = "/v1/health";
+        let padding = "\u{1}".repeat(REQUEST_COUNTER_LABEL_BYTES - route.len() - 4);
+        let pairs = REQUEST_COUNTER_TOTAL_LABEL_BYTES / REQUEST_COUNTER_LABEL_BYTES;
+        let first_client = format!("{padding}0000");
+        for client in 0..pairs {
+            counts.record(route, Some(&format!("{padding}{client:04}")));
+        }
+        assert_eq!(counts.retained_label_bytes, REQUEST_COUNTER_TOTAL_LABEL_BYTES);
+        assert_eq!(counts.by_client_route.len(), pairs);
+        // The total-byte budget refuses another row without evicting any retained label.
+        counts.record(route, Some("new-client"));
+        assert_eq!(counts.overflow, 1);
+        assert_eq!(counts.by_client_route.len(), pairs);
+        assert_eq!(counts.retained_label_bytes, REQUEST_COUNTER_TOTAL_LABEL_BYTES);
+        // Retained rows still count when the byte budget is full.
+        counts.record(route, Some(&first_client));
+        assert_eq!(counts.by_client_route[&(Some(first_client), route.into())], 2);
+        let report = counts.snapshot(Instant::now());
+        report_request_counter_payload_size("64KiB escaping-heavy fixture", &report);
+        assert_eq!(report["attribution_complete_since_epoch"], false);
+        assert!(serde_json::to_vec(&report).unwrap().len() <= 512 * 1024);
+    }
+
+    #[test]
+    fn internal_roster_events_preserve_route_counter_attribution() {
+        let mut meter = Meter::default();
+        let now = Instant::now();
+        let before = meter.snapshot(now);
+        for kind in ["roster/admission-wait", "roster/chunked-assembly"] {
+            meter.record_request(now, kind, None, Duration::ZERO);
+        }
+        let after = meter.snapshot(now);
+        assert_eq!(before["request_counters"], after["request_counters"]);
+        assert_eq!(after["request_count"], 0);
+        assert_eq!(after["requests"].as_array().unwrap().len(), 2);
+        for row in after["requests"].as_array().unwrap() {
+            assert_eq!(row["count"], 1);
+        }
+        // A subsequent attributed HTTP route remains complete despite the internal events.
+        meter.record_request(now, "/v1/health", Some("client-a"), Duration::ZERO);
+        let after = meter.snapshot(now);
+        assert_eq!(after["request_count"], 1);
+        assert_eq!(after["request_counters"]["completed"], 1);
+        assert_eq!(after["request_counters"]["unattributed"], 0);
+        assert_eq!(after["request_counters"]["overflow"], 0);
+        assert_eq!(
+            after["request_counters"]["rows"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            after["request_counters"]["attribution_complete_since_epoch"],
+            true
+        );
+    }
+
+    #[test]
+    fn reset_changes_request_counter_epoch_and_missing_clients_are_not_complete() {
+        let mut meter = Meter::default();
+        meter.record_request(Instant::now(), "/v1/health", Some("(tcp)"), Duration::ZERO);
+        meter.record_request(Instant::now(), "/v1/health", Some(""), Duration::ZERO);
+        let before = meter.snapshot(Instant::now());
+        assert_eq!(before["request_counters"]["unattributed"], 2);
+        assert_eq!(
+            before["request_counters"]["attribution_complete_since_epoch"],
+            false
+        );
+        // This is also the operation reset_for_test invokes under the process-wide lock.
+        meter.reset();
+        let after = meter.snapshot(Instant::now());
+        assert_ne!(
+            before["request_counters"]["epoch"],
+            after["request_counters"]["epoch"]
+        );
+        assert_eq!(after["request_counters"]["completed"], 0);
+        assert_eq!(after["request_counters"]["process_id"], std::process::id());
+        assert_eq!(
+            after["request_counters"]["started_unix_ms"],
+            json!(meter.request_counters.started_unix_ms)
+        );
+        assert!(
+            after["request_counters"]["started_unix_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(
+            after["request_counters"]["attribution_complete_since_epoch"],
+            true
+        );
+    }
+
+    #[test]
+    fn request_counter_identity_distinguishes_a_fresh_process() {
+        const CHILD: &str = "SMALLCLAIMS_REQUEST_COUNTER_IDENTITY_CHILD";
+        let report = Meter::default().snapshot(Instant::now());
+        if std::env::var_os(CHILD).is_some() {
+            println!("request counter identity: {}", report["request_counters"]);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "performance::tests::request_counter_identity_distinguishes_a_fresh_process",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let child: Value = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("request counter identity: ")
+                    .map(|(_, raw)| serde_json::from_str(raw).unwrap())
+            })
+            .expect("the selected child control did not report its identity");
+        assert_ne!(
+            child["process_id"],
+            report["request_counters"]["process_id"]
+        );
+        assert_eq!(child["completed"], 0);
+        assert!(child["process_id"].as_u64().unwrap() > 0);
+    }
+
     #[test]
     fn reconciler_wakes_are_counted_by_the_request_that_caused_them() {
         let before = snapshot();

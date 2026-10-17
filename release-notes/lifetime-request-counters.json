@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Expose bounded lifetime completed-request counts alongside the existing rolling performance report.",
+  "replay": {
+    "status": "none",
+    "detail": "In-memory accounting only; no replay or rebuild change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority, projection or checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "An additive request_counters field on the existing performance report, bounded to 1024 pairs, 256 combined label bytes per pair and 64 KiB total retained label bytes, with explicit overflow. Existing fields, labels and ranking stay unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No extra downtime beyond the ordinary Operations-owned rollout."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual production or collection step; live idle collection still needs a finite Operations admission."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Process/reset identity and explicit loss counters make incomparable or incomplete request deltas detectable."
+  }
+}

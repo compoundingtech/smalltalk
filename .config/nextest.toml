@@ -158,3 +158,9 @@ retries = 0
 [[profile.ci.overrides]]
 filter = 'package(=st3) and binary(=integration) and kind(test) and (test(=daemon_restart::stop_escalation::claude_stop_escalation_records_ended_before_its_group_sigkill) or test(=daemon_restart::stop_escalation::opencode_stop_escalation_records_cover_before_its_group_sigkill) or test(=daemon_restart::stop_escalation::opencode_graceful_stop_rewrites_cover_with_the_reaped_signal))'
 retries = 0
+
+# Preserve actual compact counter payload sizes on successful controls.
+# Output only: existing selection, retries, threads and assertions remain unchanged.
+[[profile.ci.overrides]]
+filter = 'package(=smallclaims) and (test(/^performance::tests::request_deltas_survive_expiry_and_include_clients_outside_the_top_twenty$/) or test(/^performance::tests::request_counter_gaps_and_resets_are_explicit_and_bounded$/) or test(/^performance::tests::request_counter_payload_is_bounded_with_escaping_heavy_labels$/))'
+success-output = "immediate"
