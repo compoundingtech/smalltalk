@@ -27,9 +27,6 @@ export const workspaceView = (pane: { readonly ref: string } | undefined): Works
           ? { _tag: 'Document', ref: pane.ref }
         : { _tag: 'ViewUnavailable', ref: pane.ref, reason: 'This web client does not render this view yet.' }
 
-export const workspaceViewNotice = (view: Extract<WorkspaceView, { _tag: 'ViewUnavailable' }>): string =>
-  `View unavailable. ${view.reason}`
-
 /** A conversation pane kept mounted after it was opened; `used` is its logical recency. */
 export interface RetainedPane {
   readonly ref: string

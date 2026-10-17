@@ -68,7 +68,7 @@ const mount = async (width: number) => {
 }
 const sidebar = () => host.querySelector('aside[aria-label="Agents"]')!
 const roster = () => sidebar().querySelector('nav[aria-label="Agent roster"]')!
-const footerStatus = () => sidebar().querySelector('footer [role="status"]')!
+const band = () => host.querySelector('[data-connection-state]')
 
 // Both the real data derivation and the kit's SidebarAgentRow DOM participate.
 describe.each([1280, 1440, 2980])('sidebar footer at %ipx', width => {
@@ -94,40 +94,42 @@ describe.each([1280, 1440, 2980])('sidebar footer at %ipx', width => {
     expect(roster().textContent).toContain(agent.name)
     expect(roster().textContent).toContain(other.name)
   })
-  it('shows connection wording instead of the raw gateway host while live or connecting', async () => {
+  it('keeps the connection out of the sidebar and shows a band only once the connection is lost', async () => {
     registry.set(agents, observed({ value: [agent] }))
     await mount(width)
     expect(roster().querySelectorAll('[data-testid="taste-agent-row"]')).toHaveLength(1)
     expect(roster().textContent).toContain(agent.name)
-    expect(footerStatus().textContent).not.toContain(gateway)
-    expect(footerStatus().textContent).toBe('Connected')
+    expect(band()).toBeNull()
+    expect(sidebar().querySelector('footer [role="status"]')).toBeNull()
     await act(async () => registry.set(gatewaySync, { status: { _tag: 'Connecting', attempt: 1, since: 0 }, observedAt: 0 }))
-    expect(footerStatus().textContent).toBe('Connecting · 5s')
-    expect(sidebar().textContent).not.toContain(gateway)
+    expect(band()).toBeNull()
+    await act(async () => registry.set(gatewaySync, { status: { _tag: 'Stale', reason: { _tag: 'Reconnecting', attempt: 2, nextAt: 7000, issue: 'socket closed' } }, observedAt: 0 }))
+    expect(band()?.getAttribute('data-connection-state')).toBe('reconnecting')
+    expect(sidebar().contains(band())).toBe(false)
+    expect(host.textContent).not.toContain(gateway)
   })
 
   it('removes the waiting notice and skeleton as soon as roster rows are published', async () => {
     await mount(width)
-    expect(sidebar().textContent).toContain('Waiting for the agent roster.')
+    expect(sidebar().querySelector('[data-system-state="loading"]')?.textContent).toBe('Loading agents')
     expect(roster().querySelectorAll('[data-testid="taste-agent-row"]')).toHaveLength(0)
     expect(roster().querySelector('[data-wf-roster-skeleton]')).not.toBeNull()
     await act(async () => registry.set(agents, { _tag: 'Observed', value: [agent], freshness: 'stale', coverage: { _tag: 'Partial' } }))
     expect(roster().querySelectorAll('[data-testid="taste-agent-row"]')).toHaveLength(1)
     expect(roster().textContent).toContain(agent.name)
-    expect(sidebar().textContent).not.toContain('Waiting for the agent roster.')
+    expect(sidebar().querySelector('[data-system-state="loading"]')).toBeNull()
     for (const node of host.querySelectorAll('[role="status"], [aria-live], [aria-label], [aria-description]')) {
-      expect(node.textContent).not.toContain('Waiting for the agent roster.')
-      expect(node.getAttribute('aria-label') ?? '').not.toContain('Waiting for the agent roster.')
-      expect(node.getAttribute('aria-description') ?? '').not.toContain('Waiting for the agent roster.')
+      expect(node.textContent).not.toContain('Loading agents')
+      expect(node.getAttribute('aria-label') ?? '').not.toContain('Loading agents')
+      expect(node.getAttribute('aria-description') ?? '').not.toContain('Loading agents')
     }
     expect(roster().querySelector('[data-wf-roster-skeleton]')).toBeNull()
-    expect(sidebar().textContent).toContain('Showing a partial roster · live updates pending')
+    expect(sidebar().querySelector('[data-system-state="stale"]')?.textContent).toBe('Partial roster')
     await act(async () => registry.set(agents, observed({ value: [agent] })))
-    expect(sidebar().textContent).not.toContain('Waiting for the agent roster.')
-    expect(sidebar().textContent).not.toContain('live updates pending')
+    expect(sidebar().querySelector('[data-system-state]')).toBeNull()
     await act(async () => registry.set(agents, observed({ value: [] })))
     expect(roster().querySelectorAll('[data-testid="taste-agent-row"]')).toHaveLength(0)
-    expect(sidebar().textContent).not.toContain('Waiting for the agent roster.')
+    expect(sidebar().querySelector('[data-system-state]')).toBeNull()
   })
 })
 

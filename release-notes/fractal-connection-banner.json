@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-ui gains SystemNotice (one quiet system-state row) and ConnectionStatus (one connection band). The web app shows the gateway connection once, under the thread header, and renders the roster, Missions and pane loading/unavailable states with SystemNotice.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No storage changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "changed", "detail": "New kit exports SystemNotice, ConnectionStatus, SystemStateKind and ConnectionState from @smalltalk/fractal-ui/assistant-ui and /shell. The sidebar footer no longer shows connection text or 'Reconnect now'; the band (data-connection-state) renders nothing while live or first connecting. Notice copy changed (e.g. 'Loading agents', 'Last observed roster', 'View not available here') and rows carry data-system-state; data-wf-roster-reason is kept. workspaceViewNotice is removed." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}

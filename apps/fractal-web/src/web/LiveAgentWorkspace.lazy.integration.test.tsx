@@ -132,27 +132,33 @@ const renderShell = async (ux?: UxTelemetry) => {
 }
 
 
-describe('gateway footer honesty', () => {
-  it('uses user-facing connection wording rather than a raw host or Live tag', async () => {
+describe('gateway connection banner', () => {
+  it('shows nothing while live and keeps connection wording out of the footer', async () => {
     await renderShell()
+    expect(container.querySelector('[data-connection-state]')).toBeNull()
     const footer = container.querySelector('footer')
-    expect(footer?.textContent).toContain('Connected')
+    expect(footer?.textContent).not.toContain('Connected')
     expect(footer?.textContent).not.toContain('alpha.example')
-    expect(footer?.textContent).not.toContain('Live')
   })
 
-  it('places one explicit reconnect action next to the countdown', async () => {
+  it('places one band under the thread header with the countdown and one reconnect action', async () => {
     gatewayObservation = {
       status: { _tag: 'Stale', reason: { _tag: 'Reconnecting', attempt: 2, nextAt: 3000, issue: 'Private diagnostic' } },
       observedAt: -2000,
     }
     await renderShell()
-    const footer = container.querySelector('footer')
-    expect(footer?.textContent).toContain('Reconnecting in 3s · attempt 2')
-    expect(footer?.textContent).not.toContain('Private diagnostic')
-    const button = [...(footer?.querySelectorAll('button') ?? [])].find(button => button.textContent === 'Reconnect now')
-    expect(button).toBeDefined()
-    await act(async () => button?.click())
+    const bands = container.querySelectorAll('[data-connection-state]')
+    expect(bands).toHaveLength(1)
+    const band = bands[0]
+    expect(band?.getAttribute('data-connection-state')).toBe('reconnecting')
+    expect(band?.closest('section[aria-label="Agent workspace"]')).not.toBeNull()
+    expect(band?.textContent).toContain('Next try in 3s · attempt 2')
+    expect(band?.textContent).not.toContain('Reconnecting in')
+    expect(band?.textContent).not.toContain('Private diagnostic')
+    expect(container.querySelector('footer')?.querySelector('[data-connection-state]')).toBeNull()
+    const buttons = band?.querySelectorAll('button') ?? []
+    expect(buttons).toHaveLength(1)
+    await act(async () => (buttons[0] as HTMLButtonElement | undefined)?.click())
     expect(reconnect).toHaveBeenCalledTimes(1)
   })
 })
@@ -166,29 +172,29 @@ describe('conversation import boundary', () => {
     expect(skeleton?.querySelectorAll('[data-wf-skeleton-row]')).toHaveLength(8)
     expect(skeleton?.querySelectorAll('[data-wf-skeleton-line]')).toHaveLength(16)
     expect(skeleton?.querySelectorAll('button, a, input, [tabindex]')).toHaveLength(0)
-    expect(container.textContent).toContain('Waiting for the agent roster.')
+    expect(container.querySelector('[data-system-state="loading"]')?.textContent).toBe('Loading agents')
   })
 
   it('removes skeletons for observed empty rosters and read refusals rather than inventing rows', async () => {
     rosterFeed = { _tag: 'Observed', freshness: 'live', value: { agents: [], hosts: [] } }
     await renderShell()
     expect(container.querySelector('[data-wf-roster-skeleton]')).toBeNull()
-    expect(container.textContent).not.toContain('Waiting for the agent roster.')
+    expect(container.querySelector('[data-system-state]')).toBeNull()
     rosterFeed = { _tag: 'Unavailable', reason: 'ungranted', detail: 'not-for-display' }
     await renderShell()
     expect(container.querySelector('[data-wf-roster-skeleton]')).toBeNull()
-    expect(container.textContent).toContain('Read access to the agent roster has not been granted.')
+    expect(container.querySelector('[data-wf-roster-reason="ungranted"]')?.textContent).toBe('No access to the agent roster. Read access has not been granted')
     expect(container.textContent).not.toContain('not-for-display')
   })
 
   it('discloses partial published roster coverage without disguising it as an empty roster', async () => {
     rosterFeed = { _tag: 'Observed', freshness: 'stale', coverage: { _tag: 'Partial' }, value: { agents: [], hosts: [] } }
     await renderShell()
-    expect(container.textContent).toContain('Showing a partial roster · live updates pending')
+    expect(container.querySelector('[data-system-state="stale"]')?.textContent).toBe('Partial roster')
     expect(container.querySelector('[data-wf-roster-skeleton]')).toBeNull()
     rosterFeed = { _tag: 'Observed', freshness: 'live', value: { agents: [], hosts: [] } }
     await renderShell()
-    expect(container.textContent).not.toContain('Showing a partial roster')
+    expect(container.querySelector('[data-system-state="stale"]')).toBeNull()
   })
 
   it('does not evaluate pane code when the shell module is imported', () => {

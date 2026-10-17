@@ -59,7 +59,7 @@ try {
     await page.locator('[data-testid="transcript-turn"]').first().waitFor().catch(async error => { throw new Error(error.message + '\\n' + errors.join('\\n') + '\\n' + await page.locator('body').innerText()) })
     const regression = ${JSON.stringify(regression) ?? 'undefined'}
     if (regression === 'notice') {
-      for (const [target, text] of [['monitor/quota', 'View unavailable.'], ['terminal/example', 'Terminal unavailable.']]) {
+      for (const [target, text] of [['monitor/quota', 'View not available here'], ['terminal/example', 'Terminal unavailable.']]) {
         await page.evaluate(target => {
           history.pushState(null, '', '/w/agent/switch-alpha?open=' + encodeURIComponent(target + ':detail'))
           dispatchEvent(new PopStateEvent('popstate'))

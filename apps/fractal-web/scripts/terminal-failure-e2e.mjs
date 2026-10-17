@@ -32,6 +32,7 @@ const terminalUrl = `${threadPath}?open=${encodeURIComponent(terminalPane)}`
 const GENERIC = [
   'The terminal could not be opened. Return to the thread and open it again.',
   'Loading terminal…',
+  'Loading terminal',
   'Terminal unavailable',
 ]
 
@@ -183,7 +184,7 @@ const drawerOutcome = async () => {
   for (const start = Date.now(); Date.now() - start < 45_000; await page.waitForTimeout(250)) {
     if (await grid.isVisible().catch(() => false)) return { kind: 'grid' }
     const text = (await drawer.innerText().catch(() => '')).trim()
-    if (text !== '' && text !== 'Loading terminal…') {
+    if (text !== '' && text !== 'Loading terminal…' && text !== 'Loading terminal') {
       // Hold briefly so a transient reason that the attach immediately replaces is not counted.
       await page.waitForTimeout(1500)
       if (await grid.isVisible().catch(() => false)) return { kind: 'grid' }
