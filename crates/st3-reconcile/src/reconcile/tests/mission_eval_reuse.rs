@@ -1,5 +1,27 @@
 use super::*;
 
+// Exercise the production timing decisions under a runtime so a missing wake is observable.
+pub fn assert_clock_decisions(actual: &MissionRunView, full: &MissionRunView, mission: &MissionSpec) {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    let _entered = runtime.enter();
+    let reconciler = Reconciler::new(
+        Arc::new(Store::open_memory("node").unwrap()),
+        Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    );
+    assert_eq!(crate::incremental::run_due(actual, now_ms()), crate::incremental::run_due(full, now_ms()));
+    for step in flatten_mission_steps(mission) {
+        let actual = actual.steps.iter().find(|view| view.step == step.spec.path).unwrap();
+        let full = full.steps.iter().find(|view| view.step == step.spec.path).unwrap();
+        let expected_timeout = reconciler.step_timed_out(full, &step).unwrap();
+        let expected_wakes = reconciler.step_deadlines.lock().unwrap().clone();
+        reconciler.step_deadlines.lock().unwrap().clear();
+        assert_eq!(reconciler.step_timed_out(actual, &step).unwrap(), expected_timeout);
+        assert_eq!(*reconciler.step_deadlines.lock().unwrap(), expected_wakes);
+        reconciler.step_deadlines.lock().unwrap().clear();
+        assert_eq!(crate::incremental::step_due(actual, now_ms()), crate::incremental::step_due(full, now_ms()));
+    }
+}
+
 pub fn fixture() -> (Arc<Store>, String) {
     let store = Arc::new(Store::open_memory("node").unwrap());
     let steps = (0..20)

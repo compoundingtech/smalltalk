@@ -26,10 +26,12 @@ use super::*;
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for step in &mut view.steps {
         enrich_step_queue_for_reconcile_at(connection, step, snapshot)?;
-        let (started, elapsed) = step_execution_timing_at(connection, &step.subject, step.attempt, snapshot,
+        let timing = step_execution_clock_at(connection, &step.subject, step.attempt, snapshot,
             matches!(step.status.as_str(), "claimed" | "working"))?;
-        step.execution_started_at_unix_ms = started;
-        step.execution_elapsed_ms = elapsed;
+        step.execution_started_at_unix_ms = timing.started;
+        step.execution_elapsed_ms = timing.elapsed;
+        step.execution_paused_until_unix_ms = timing.paused_until;
+        step.execution_waited_ms = timing.waited;
         step.timeout_extension_ms = step_timeout_extension_at(connection, &step.subject, step.attempt, snapshot)?;
     }
     view.provenance = crate::provenance::read(connection, &view.mission, &view.revision)
@@ -102,4 +104,57 @@ mission "reuse-child" state="ready" {
         [&child.steps[0].subject],
     ).unwrap();
     assert_equivalent(&store, &child.id, snapshot);
+}
+
+fn untimed_fixture() -> (Store, String) {
+    let store = Store::open_memory("node").unwrap();
+    publish_mission(&store, r#"version 2
+mission "untimed-history" state="ready" {
+ goal "Evaluate untimed history without replaying unused clocks."
+ step "work" { agentless }
+}"#, "untimed-history-definition");
+    let run = store.create_mission_run(&MissionRunRequest {
+        mission: "untimed-history".into(), revision: None, workspace: "/tmp".into(),
+        requester: None, mode: None, inputs: BTreeMap::new(),
+        idempotency_key: "untimed-history-run".into(),
+    }).unwrap();
+    (store, run.id)
+}
+
+// Insert history independently of projection order, as replicated canonical claims may arrive
+// after newer claims. The projection's status/attempt is controlled separately by the test.
+fn timing_claim(store: &Store, subject: &str, id: usize, kind: &str, at: u128, fields: Value) {
+    store.connection.write().execute(
+        "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+         VALUES(?1,(SELECT id FROM batches LIMIT 1),?2,?3,'node',NULL,?4,'[]',?5)",
+        params![format!("timing-fixture-{id}"), subject, kind,
+            json!({"fields": fields}).to_string(), at.to_string()],
+    ).unwrap();
+}
+
+#[test]
+fn evaluation_clock_elision_long_history_avoids_timing_queries() {
+    const T: u128 = 1_800_000_000_000;
+    let _clock = Clock::at(T);
+    let (store, id) = untimed_fixture();
+    let subject = store.mission_run_for_reconcile(&id).unwrap().steps[0].subject.clone();
+    for index in 0..10_000 {
+        timing_claim(&store, &subject, index, "work.progress", T, json!({"attempt":1,"summary":"history"}));
+    }
+    STEP_TIMING_FOLD_CALLS.with(|calls| calls.set(0));
+    STEP_TIMING_ROWS_PARSED.with(|rows| rows.set(0));
+    let before = legacy_run(&store.readers.get(), &id, T).unwrap();
+    let before_queries = STEP_TIMING_FOLD_CALLS.with(std::cell::Cell::get);
+    let before_rows = STEP_TIMING_ROWS_PARSED.with(std::cell::Cell::get);
+    STEP_TIMING_ROWS_PARSED.with(|rows| rows.set(0));
+    STEP_TIMING_FOLD_CALLS.with(|calls| calls.set(0));
+    let (after, _) = store.mission_run_for_evaluation(&id).unwrap();
+    let after_queries = STEP_TIMING_FOLD_CALLS.with(std::cell::Cell::get);
+    let after_rows = STEP_TIMING_ROWS_PARSED.with(std::cell::Cell::get);
+    assert!(before_rows >= 10_000);
+    assert_eq!(after_rows, 0);
+    assert_eq!(before_queries, 1);
+    assert_eq!(after_queries, 0);
+    assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(after).unwrap());
+    println!("untimed inactive step: history=10000 timing_queries_before={before_queries} timing_queries_after={after_queries} timing_rows_parsed_before={before_rows} timing_rows_parsed_after={after_rows}");
 }

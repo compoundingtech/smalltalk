@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Mission evaluation no longer queries, parses and folds the entire timing history of inactive steps without timeouts; active steps, timed steps and public views retain full clocks",
+  "replay": {"status": "none", "detail": "Evaluation read optimization only; canonical replay and persisted projections are unchanged."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "Public presentation and reconcile views are unchanged. Internal evaluation views omit unused timing fields only when a known definition has no timeout and the effective step is neither claimed nor working. Active untimed steps retain declared-wait deadlines for the incremental scheduler. Missing definitions retain full timing."},
+  "downtime": {"status": "none", "detail": "No downtime or operator intervention required."},
+  "manual": {"status": "none", "detail": "No operator step."},
+  "recovery": {"status": "none", "detail": "Revert the commit; no data migration."}
+}

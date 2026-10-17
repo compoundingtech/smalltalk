@@ -3059,12 +3059,15 @@ impl Store {
 
     /// Hydrate the reconcile view and retain its pinned definition for evaluation.
     /// Empty runs load the definition lazily in the evaluator, after cleanup checks.
+    /// Skip clocks only for untimed, inactive steps: neither timeout evaluation nor the
+    /// incremental scheduler reads their timing. Public views still include every clock.
     pub fn mission_run_for_evaluation(
         &self,
         id: &str,
     ) -> Result<(MissionRunView, Option<MissionSpec>)> {
         let connection = self.readers.get();
-        let (view, mission) = mission_run_view_and_definition_tx(&connection, id, false)?;
+        let (view, mission) =
+            mission_run_view_and_definition_tx(&connection, id, MissionRunEnrichment::Evaluation)?;
         note_run_view_reads(&view);
         Ok((view, mission))
     }
