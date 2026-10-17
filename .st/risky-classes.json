@@ -4,9 +4,9 @@
   "classes": [
     {
       "name": "schema",
-      "globs": ["crates/smallclaims/src/store.rs", "crates/smallclaims/src/**/migrat*", "crates/st3-schema/**", "crates/st-storage-version/**", "crates/st3-migrate/**", "crates/st3-daemon/src/store/checkpoint_rules.rs", "docs/st3/schema.md"],
+      "globs": ["crates/smallclaims/src/store.rs", "crates/smallclaims/src/**/migrat*", "crates/st3-schema/**", "crates/st-storage-version/**", "crates/st3-migrate/**", "crates/st3-store/src/store/checkpoint_rules.rs", "docs/st3/schema.md"],
       "content": [
-        {"globs": ["crates/st3-daemon/src/store.rs", "crates/st3-daemon/src/store/**", "crates/smallclaims/src/**"], "pattern": "(?i)\\b(CREATE\\s+(UNIQUE\\s+)?(TABLE|INDEX|TRIGGER|VIEW)|ALTER\\s+TABLE|DROP\\s+(TABLE|INDEX|TRIGGER|VIEW)|PRAGMA\\s+user_version|user_version\\s*=)"}
+        {"globs": ["crates/st3-store/src/store.rs", "crates/st3-store/src/store/**", "crates/smallclaims/src/**"], "pattern": "(?i)\\b(CREATE\\s+(UNIQUE\\s+)?(TABLE|INDEX|TRIGGER|VIEW)|ALTER\\s+TABLE|DROP\\s+(TABLE|INDEX|TRIGGER|VIEW)|PRAGMA\\s+user_version|user_version\\s*=)"}
       ],
       "forces": ["integration", "store and smallclaims suites", "release-notes upgrade fragment"]
     },
@@ -25,7 +25,7 @@
     },
     {
       "name": "authorization",
-      "globs": ["crates/st3-daemon/src/api/client_v0*", "crates/st3-daemon/src/api/client_web*", "crates/st3-daemon/src/sekrets/**", "crates/st3-daemon/src/sekrets.rs", "crates/st3-kernel/src/accounts.rs", "crates/st3-daemon/src/store/accounts.rs", "crates/st3-daemon/src/store/roster_admission.rs", "crates/st3-daemon/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
+      "globs": ["crates/st3-daemon/src/api/client_v0*", "crates/st3-daemon/src/api/client_web*", "crates/st3-store/src/sekrets/**", "crates/st3-store/src/sekrets.rs", "crates/st3-kernel/src/accounts.rs", "crates/st3-store/src/store/accounts.rs", "crates/st3-store/src/store/roster_admission.rs", "crates/st3-store/src/store/delegation.rs", "docs/st3/device-signing.md", ".st/**"],
       "content": [
         {"globs": ["crates/**"], "pattern": "(?i)\\b(trusted[_ ]keys?|pairing|device[_ ]key|signing[_ ]key|verify_signature)\\b"}
       ],
@@ -33,7 +33,7 @@
     },
     {
       "name": "claim-folding-and-replay",
-      "globs": ["crates/st3-daemon/src/store/card_fold.rs", "crates/st3-daemon/src/store/*_ivm.rs", "crates/st3-daemon/src/store/*_ivm/**", "crates/st3-daemon/src/store/checkpoint*", "crates/st3-kernel/src/projection.rs", "crates/smallclaims/src/**/replay*", "crates/smallclaims/src/ivm*", "crates/smallclaims/src/ivm/**"],
+      "globs": ["crates/st3-store/src/store/card_fold.rs", "crates/st3-store/src/store/*_ivm.rs", "crates/st3-store/src/store/*_ivm/**", "crates/st3-store/src/store/checkpoint*", "crates/st3-kernel/src/projection.rs", "crates/smallclaims/src/**/replay*", "crates/smallclaims/src/ivm*", "crates/smallclaims/src/ivm/**"],
       "forces": ["integration", "purity and convergence suites"]
     },
     {
@@ -43,7 +43,7 @@
     },
     {
       "name": "routing-and-delivery",
-      "globs": ["crates/st3-daemon/src/mailbox.rs", "crates/st3-daemon/src/api/mailbox*", "crates/st3-daemon/src/store/mailbox_*", "crates/st3-daemon/src/placement.rs", "crates/st3-daemon/src/suspension.rs", "crates/st3-daemon/src/rollout.rs", "crates/st3-daemon/src/reconcile.rs", "crates/st3-daemon/src/reconcile/**"],
+      "globs": ["crates/st3-store/src/mailbox.rs", "crates/st3-daemon/src/api/mailbox*", "crates/st3-store/src/store/mailbox_*", "crates/st3-daemon/src/placement.rs", "crates/st3-store/src/suspension.rs", "crates/st3-store/src/rollout.rs", "crates/st3-daemon/src/reconcile.rs", "crates/st3-daemon/src/reconcile/**"],
       "content": [
         {"globs": ["crates/st3-daemon/src/api.rs"], "pattern": "\\.(route|nest|merge|fallback)\\("}
       ],
