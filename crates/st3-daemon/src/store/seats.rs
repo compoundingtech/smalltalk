@@ -1868,8 +1868,8 @@ impl Store {
     pub(crate) fn cached_placement_fence(
         &self,
         token: &str,
-        build: impl FnOnce() -> Result<Option<crate::placement::Fence>>,
-    ) -> Result<Option<Arc<crate::placement::Fence>>> {
+        build: impl FnOnce() -> Result<Option<crate::model::PlacementFence>>,
+    ) -> Result<Option<Arc<crate::model::PlacementFence>>> {
         if let Some(fence) = self.smalltalk.placement_cache.lock()
             .unwrap_or_else(PoisonError::into_inner).get(token) {
             return Ok(fence.clone());

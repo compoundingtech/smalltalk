@@ -10,6 +10,7 @@ anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+getrandom = "0.3"
 hex = "0.4"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
