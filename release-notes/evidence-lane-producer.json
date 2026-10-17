@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Evidence producers record the lane definition digest and refuse a tree that edits its own lane (opt-in; shadow only)",
+  "replay": {"status": "none", "detail": "No daemon replay change."},
+  "schema": {"status": "none", "detail": "No daemon claim or portable record change. A note may carry one more named input, lane_definition_sha256, which the signer already accepts."},
+  "rules": {"status": "changed", "detail": "scripts/evidence-wrap gains --lanes-from BASE, and scripts/st-test passes its base for every check the base's .st/required-lanes.json defines: the command must be the lane's argv, a tree whose lane definition differs from the base is not signed, and the note records lane_definition_sha256. Nothing reads the digest yet, no committed policy changes and every enforce stays false, so no job is skipped or rejected by this change."},
+  "compatibility": {"status": "none", "detail": "Without a lane file at the base, or without the flag, the producers behave exactly as before."},
+  "downtime": {"status": "none", "detail": "No daemon downtime required."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Reverting restores the previous producers; no state is written."}
+}

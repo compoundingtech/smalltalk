@@ -110,6 +110,18 @@ def target_commit(base):
     return text(git('rev-parse', 'HEAD'))
 
 
+def lane_names(base):
+    """The lanes the accepted base defines in .st/required-lanes.json (none when the file is absent or unreadable: then nothing changes)."""
+    done = git('show', f'{base}:.st/required-lanes.json', check=False)
+    if done.returncode != 0:
+        return set()
+    try:
+        lanes = json.loads(done.stdout.decode())['lanes']
+        return set(lanes) if isinstance(lanes, dict) else set()
+    except (ValueError, KeyError, UnicodeDecodeError, TypeError):
+        return set()
+
+
 def behind(base):
     """How many commits of the base this branch lacks (0 when it holds the base's tip)."""
     done = git('rev-list', '--count', f'HEAD..{base}', check=False)
@@ -230,9 +242,13 @@ def main(argv):
             repository = args.repository or repository_of(remote or 'origin')
             signer = os.environ.get('EVIDENCE_SIGNER') or json.dumps([sys.executable, tools['evidence-sign']])
             rows, failed = [], False
+            lanes = lane_names(args.base)
             for name in checks:
                 wrap = [sys.executable, tools['evidence-wrap'], '--check', name, '--attempt', args.attempt,
                         '--signer', signer, '--verifier', tools['evidence-verify'], '--keys-from', args.base]
+                if name in lanes:
+                    # The base defines this lane: the note carries the digest of its definition, and a tree that edits the lane is not signed.
+                    wrap += ['--lanes-from', args.base]
                 if args.toolchain_sha256:
                     wrap += ['--toolchain-sha256', args.toolchain_sha256]
                 if args.push:

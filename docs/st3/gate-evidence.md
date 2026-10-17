@@ -758,6 +758,13 @@ The committed file lists the two lanes `scripts/st-test` can run today, with the
 only with a read trace of the lane (a later change). No producer writes the digest yet, nothing passes `--lanes-from`, and no gate reads the file, so
 this changes no behaviour; when a gate does read it, `.st/required-lanes.json` must join that gate's protected paths.
 
+Producer half: `scripts/evidence-wrap --lanes-from BASE` (and `scripts/st-test`, which passes its base for every check the base's lane file defines)
+refuses any command that is not the lane's argv, refuses a tree whose lane definition differs from BASE (nothing is signed; CI runs the check, and the
+message names the paths), and records `lane_definition_sha256`, the digest the verifier recomputes from the same base. Without a lane file at the base
+nothing changes. Until the read-trace closure control exists a lane's `definition_paths` are a hand-declared list: a helper script it reads but the
+list omits is not covered. So this alone must never let a signed note skip a queue lane; shadow reporting and the pull-request signing path are the only
+uses until the trace and a mutation test per lane have passed (typescript-client's paths are narrow by design and need it first).
+
 ### Which tree a pull request run asks about
 
 A `pull_request` run checks out GitHub's merge of the head into the CURRENT base, a new tree whenever main moved, so a note for the tree an agent

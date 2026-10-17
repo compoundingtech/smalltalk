@@ -314,6 +314,58 @@ def main(argv):
 
         print('passed: the signer accepts extra named inputs, and refuses extra keys, a wrong flake.lock hash, an unknown commit and malformed fields')
 
+        # --lanes-from: the producer half of the lane definition (the verifier recomputes the digest from the same base).
+        lane_repo = tmp / 'lane-repo'
+        git(tmp, 'init', '-q', str(lane_repo))
+        (lane_repo / 'flake.lock').write_text('{"nodes":{}}\n')
+        (lane_repo / 'scripts').mkdir()
+        (lane_repo / 'scripts/lane.sh').write_text('lane\n')
+        (lane_repo / 'a').write_text('one\n')
+        git(lane_repo, 'add', '.')
+        git(lane_repo, 'commit', '-q', '-m', 'before the lane file')
+        no_lane_file = git(lane_repo, 'rev-parse', 'HEAD')
+        (lane_repo / '.st').mkdir()
+        lane_argv = ['sh', '-c', 'echo lane']
+        (lane_repo / '.st/required-lanes.json').write_text(json.dumps(
+            {'version': 1, 'lanes': {'linux-gate': {'argv': lane_argv, 'definition_paths': ['scripts/lane.sh']}}}))
+        git(lane_repo, 'add', '.')
+        git(lane_repo, 'commit', '-q', '-m', 'base')
+        base = git(lane_repo, 'rev-parse', 'HEAD')
+
+        def lane_wrap(command, *extra, check='linux-gate'):
+            return run([sys.executable, str(WRAP), '--check', check, '--toolchain-sha256', toolchain, '--signer', signer,
+                        *extra, '--', *command], lane_repo, home)
+
+        (lane_repo / 'a').write_text('two\n')
+        git(lane_repo, 'commit', '-qam', 'a change that touches no definition path')
+        done = lane_wrap(lane_argv, '--lanes-from', base)
+        assert done.returncode == 0, done.stderr.decode()
+        noted = json.loads(done.stderr.decode()[done.stderr.decode().index('{'):])
+        lane_inputs = json.loads(git(tmp / 'scratch.git', 'cat-file', 'blob', git(tmp / 'scratch.git', 'ls-tree', '-r', noted['record']).split()[2])
+                                 )['predicate']['observed']['inputs']
+        verifier = __import__('importlib.machinery').machinery.SourceFileLoader('ev', str(ROOT / 'scripts/evidence-verify')).load_module()
+        expected_digest = verifier.lane_definition(
+            str(lane_repo), git(lane_repo, 'rev-parse', base + '^{tree}'), git(lane_repo, 'rev-parse', 'HEAD^{tree}'),
+            verifier.lane_rules(git(lane_repo, 'show', base + ':.st/required-lanes.json'), 'linux-gate'))['sha256']
+        assert lane_inputs['lane_definition_sha256'] == expected_digest, lane_inputs
+        for refusal, command, extra, check in (
+                ('another argv', ['sh', '-c', 'echo fewer'], ('--lanes-from', base), 'linux-gate'),
+                ('no lane entry', lane_argv, ('--lanes-from', base), 'other-check'),
+                ('no lane file at that base', lane_argv, ('--lanes-from', no_lane_file), 'linux-gate')):
+            before = git(tmp / 'scratch.git', 'for-each-ref', 'refs')
+            refused = lane_wrap(command, *extra, check=check)
+            assert refused.returncode == 1, (refusal, refused.stderr.decode())
+            assert git(tmp / 'scratch.git', 'for-each-ref', 'refs') == before, 'a refusal must sign nothing'
+        (lane_repo / 'scripts/lane.sh').write_text('lane, but fewer tests\n')
+        git(lane_repo, 'commit', '-qam', 'edit the lane')
+        before = git(tmp / 'scratch.git', 'for-each-ref', 'refs')
+        edited = lane_wrap(lane_argv, '--lanes-from', base)
+        assert edited.returncode == 1 and b'changes the definition of lane linux-gate' in edited.stderr and b'scripts/lane.sh' in edited.stderr, edited.stderr
+        assert git(tmp / 'scratch.git', 'for-each-ref', 'refs') == before
+        plain = lane_wrap(lane_argv)  # without the flag nothing about lanes is recorded
+        assert plain.returncode == 0
+        print('passed: --lanes-from records the base\'s lane digest, and refuses another argv, a missing lane or lane file, and a tree that edits its own lane, signing nothing')
+
         if write_fixture:
             write_fixture.mkdir(parents=True, exist_ok=True)
             fixture_home = tmp / 'fixture-home'

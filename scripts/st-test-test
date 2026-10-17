@@ -120,6 +120,42 @@ class StTest(unittest.TestCase):
         self.assertNotIn('behind', out)  # the branch holds the base's tip: nothing to report
         self.assertIn('clean worktree', out)
 
+    def lane_file(self, definition=('scripts/lane.sh',)):
+        lanes = {'version': 1, 'lanes': {'demo': {'argv': ['sh', '-c', 'echo ran'], 'definition_paths': list(definition)}}}
+        (self.work / 'scripts/lane.sh').write_text('lane\n')
+        (self.work / '.st/required-lanes.json').write_text(json.dumps(lanes))
+        git(self.work, 'add', '.')
+        git(self.work, 'commit', '-q', '-m', 'lane file')
+        git(self.work, 'push', '-q', 'origin', 'HEAD:main')
+        git(self.work, 'fetch', '-q', 'origin')
+
+    def test_a_lane_defined_at_the_base_puts_its_definition_digest_in_the_note(self):
+        self.lane_file()
+        self.commit('b.txt', 'two')  # the change touches no definition path
+        code, out, err = self.run_st_test('--check', 'demo')
+        self.assertEqual(code, 0, err)
+        statement, = self.statements()
+        digest = statement['predicate']['observed']['inputs']['lane_definition_sha256']
+        verifier = importlib.machinery.SourceFileLoader('ev', str(ROOT / 'scripts/evidence-verify')).load_module()
+        rules = verifier.lane_rules(git(self.work, 'show', 'origin/main:.st/required-lanes.json'), 'demo')
+        base_tree = git(self.work, 'rev-parse', 'origin/main^{tree}')
+        self.assertEqual(digest, verifier.lane_definition(str(self.work), base_tree, git(self.work, 'rev-parse', 'HEAD^{tree}'), rules)['sha256'])
+
+    def test_a_tree_that_edits_its_own_lane_is_not_signed(self):
+        self.lane_file()
+        self.commit('scripts/lane.sh', 'lane, but fewer tests\n')
+        code, out, err = self.run_st_test('--check', 'demo')
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.statements(), [])
+        self.assertIn('FAILED', out)  # the wrapper's own message goes to the child's stderr, not to this capture
+
+    def test_without_a_lane_file_at_the_base_the_note_carries_no_digest_as_before(self):
+        self.commit('b.txt', 'two')
+        code, out, err = self.run_st_test('--check', 'demo')
+        self.assertEqual(code, 0, err)
+        statement, = self.statements()
+        self.assertNotIn('lane_definition_sha256', statement['predicate']['observed']['inputs'])
+
     def test_untracked_and_ignored_files_in_the_checkout_cannot_change_the_result(self):
         self.commit('b.txt', 'two')
         (self.work / 'stray.txt').write_text('untracked')

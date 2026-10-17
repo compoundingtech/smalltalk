@@ -29,11 +29,18 @@ tests); it is recorded as the input workspace_clean instead.
 
 With EVIDENCE_PUSH_TOKEN set, --push uses it as an HTTP authorization header (never printed).
 
+With --lanes-from BASE the check is held to its lane in .st/required-lanes.json at BASE (the accepted base): the command must be the
+lane's argv, every file at or below the lane's definition paths must be identical in this tree and at BASE (otherwise nothing is signed:
+the change edits the scripts that decide what the check runs, so CI runs the check), and the note records lane_definition_sha256, the
+digest the verifier recomputes from BASE. It is the producer half of `evidence-verify --lanes-from`.
+
 Take this script from the accepted base (main), not from the change under test.
 """
 import argparse
 import base64
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -101,6 +108,28 @@ def run_command(command):
     return process.wait(), digest.hexdigest()
 
 
+def lane_inputs(verifier_path, base, check, tree, command):
+    """The lane definition digest for `check`, after refusing a command that is not the lane's argv and a tree that edits its own lane."""
+    loader = importlib.machinery.SourceFileLoader('evidence_verify_for_wrap', verifier_path)
+    verifier = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(verifier)
+    try:
+        shown = git('show', f'{base}:{verifier.LANES_PATH}', check=False)
+        if shown.returncode != 0:
+            raise Failure(f'no lane file at {base}:{verifier.LANES_PATH}; nothing was signed')
+        rules = verifier.lane_rules(shown.stdout.decode(), check)
+        base_tree = git('rev-parse', '--verify', '--end-of-options', base + '^{tree}').stdout.decode().strip()
+        definition = verifier.lane_definition('.', base_tree, tree, rules)
+    except verifier.Failure as failure:
+        raise Failure(f'lane {check}: {failure.reason}: {failure.detail}; nothing was signed')
+    if command != rules['argv']:
+        raise Failure(f'the command is not the argv of lane {check} at {base}; nothing was signed')
+    if definition['changed']:
+        raise Failure(f'this tree changes the definition of lane {check} relative to {base} ({", ".join(definition["changed"][:5])}); '
+                      'nothing was signed and CI will run the check')
+    return definition['sha256']
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--check', required=True, help='the required check this command stands for')
@@ -113,6 +142,8 @@ def main(argv):
     parser.add_argument('--keys-from', default='origin/main')
     parser.add_argument('--verifier', default=str(HERE / 'evidence-verify'))
     parser.add_argument('--push', metavar='REMOTE')
+    parser.add_argument('--lanes-from', metavar='COMMIT',
+                        help='hold the check to its lane in .st/required-lanes.json at this accepted base and record the lane definition digest')
     parser.add_argument('--aggregate', metavar='FILE', help='record the facts in FILE instead of running a command')
     parser.add_argument('--out', metavar='DIR', help='write the pack and a summary here instead of importing and pushing')
     parser.add_argument('command', nargs=argparse.REMAINDER)
@@ -120,6 +151,8 @@ def main(argv):
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if bool(command) == bool(args.aggregate):
         parser.error('give either the command after -- or --aggregate FILE')
+    if args.lanes_from and args.aggregate:
+        parser.error('--lanes-from is for a command this script runs, not --aggregate')
 
     try:
         top = git('rev-parse', '--show-toplevel').stdout.decode().strip()
@@ -156,6 +189,8 @@ def main(argv):
             inputs['workspace_clean'] = 'true'  # tracked files are exactly the commit's
             inputs['untracked_files'] = 'false' if clean else 'true'
         else:
+            if args.lanes_from:
+                inputs['lane_definition_sha256'] = lane_inputs(args.verifier, args.lanes_from, args.check, tree, command)
             exit_code, output_sha256 = run_command(command)
         if git('rev-parse', 'HEAD').stdout.decode().strip() != commit or (tracked_dirty() if args.aggregate else dirty()):
             raise Failure('the checkout changed while the command ran; nothing was signed')
