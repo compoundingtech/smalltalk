@@ -437,11 +437,13 @@ checkout, non-API background reads, and the cross-pool nested fallback remain un
 32 is a top-level worker-admission bound, not a global physical connection count or a
 process memory limit.
 
-Each reader requests a fixed 8 MiB page-cache target by default. Set
+Each reader requests a fixed 2 MiB page-cache target by default. Set
 `SMALLCLAIMS_READ_CACHE_KIB` in the **daemon's** environment to override it in KiB; positive
 integers through 2,147,483,647 are accepted, and invalid or zero values use the default.
-The value is read once per process. Retention defaults to 128, preserving schema and prepared-statement reuse.
-Profiling counts fresh connections as
+The value is read once per process; running daemons keep their cache target until restarted.
+Set `SMALLCLAIMS_READ_CACHE_KIB=8192` to restore the previous 8 MiB target. Smaller read
+caches can cause more disk I/O on very large stores. Retention defaults to 128, preserving
+schema and prepared-statement reuse. Profiling counts fresh connections as
 `read connection opened`.
 
 Each reader keeps up to 128 prepared statements. Mailbox changed-since, owner/binding,
@@ -620,12 +622,12 @@ background reads and retained idle connections can exceed the admitted-worker co
 
 The doctor planning envelope uses the larger of current open readers and idle retention,
 multiplied by the per-reader target, plus the writer's 32 MiB target and a 512 MiB reserve for
-schema/statements, projections, tasks and allocator overhead. At defaults this is 1,568 MiB:
-1 GiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve.
+schema/statements, projections, tasks and allocator overhead. At defaults this is 800 MiB:
+256 MiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve.
 The 1 GiB cap used in diagnostic examples is illustrative, not the service default:
 the Home Manager module defaults `memoryMax` to `"8G"` and installations can override it.
-For an installation limited to 1 GiB, set `SMALLCLAIMS_READ_CACHE_KIB=2048` to restore
-the 800 MiB planning envelope, or adjust its service limit.
+With `SMALLCLAIMS_READ_CACHE_KIB=8192`, the planning envelope is 1,568 MiB; an installation
+limited to 1 GiB can use the default 2 MiB reader target or adjust its service limit.
 The reserve is a planning allowance, not an enforced limit or a guarantee for every graph
 or workload. On Linux, doctor
 locates the daemon's own cgroup v2 mount and checks `memory.max` and `memory.events` in that

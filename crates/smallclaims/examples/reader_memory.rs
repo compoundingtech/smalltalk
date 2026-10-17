@@ -50,7 +50,10 @@ fn main() -> Result<()> {
         .skip(1)
         .map(|n| n.parse::<usize>())
         .collect::<Result<Vec<_>, _>>()?;
-    let cache_kib = args.first().copied().unwrap_or(8192);
+    let cache_kib = args
+        .first()
+        .copied()
+        .unwrap_or(smallclaims::sqlite::READ_CACHE_KIB);
     let readers = args.get(1).copied().unwrap_or(32);
     let waves = args.get(2).copied().unwrap_or(3);
     ensure!(
