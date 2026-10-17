@@ -54,6 +54,7 @@
     "@types/node": "26.6.4",
     "@types/hast": "3.0.5",
     "@types/react": "19.2.18",
+    "jsdom": "26.1.0",
     "@types/react-dom": "19.2.7",
     "vite": "8.0.5"
   },
