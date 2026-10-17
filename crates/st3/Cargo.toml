@@ -153,6 +153,11 @@ path = "tests/checkpoint_memory.rs"
 [[test]]
 name = "scenario_recorder"
 path = "tests/scenario_recorder.rs"
+
+[[test]]
+name = "split_host_delivery"
+path = "tests/split_host_delivery.rs"
+
 [[test]]
 name = "assistant_native"
 path = "tests/assistant_native.rs"
