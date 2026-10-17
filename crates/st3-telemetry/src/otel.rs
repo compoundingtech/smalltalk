@@ -562,7 +562,7 @@ const HTTP_SERVER_DURATION_INSTRUMENT: &str = "http.server.request.duration";
 
 /// O11Y-R14 active-series budget for the request-duration histogram. The raw label
 /// product is 237 real (route, method) pairs from the router x 12 client classes x
-/// 5 status classes = 14,220, above the 2,000-series per-daemon budget, so the SDK view
+/// 5 outcomes = 14,220, above the 2,000-series per-daemon budget, so the SDK view
 /// caps this stream and folds anything beyond into the `otel.metric.overflow` series.
 const HTTP_SERVER_DURATION_CARDINALITY_LIMIT: usize = 1_500;
 
@@ -592,15 +592,42 @@ pub fn extract_remote_context(headers: &axum::http::HeaderMap) -> opentelemetry:
 
 static HTTP_DURATION: OnceLock<opentelemetry::metrics::Histogram<f64>> = OnceLock::new();
 
-/// The five status classes the request-duration histogram labels; 101 WebSocket upgrades
-/// count as `1xx`.
-fn status_class(status: axum::http::StatusCode) -> &'static str {
-    match status.as_u16() / 100 {
-        1 => "1xx",
-        2 => "2xx",
-        3 => "3xx",
-        4 => "4xx",
-        _ => "5xx",
+/// Explicit marker for a read-deadline response, not an arbitrary upstream 504.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadDeadline;
+
+/// Closed request-duration label vocabulary, including requests without a response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestOutcome {
+    Ok,
+    ClientError,
+    ServerError,
+    Deadline,
+    Cancelled,
+}
+
+impl RequestOutcome {
+    pub fn from_response(response: Option<&axum::response::Response>) -> Self {
+        let Some(response) = response else { return Self::Cancelled };
+        if response.extensions().get::<ReadDeadline>().is_some() {
+            Self::Deadline
+        } else if response.status().is_client_error() {
+            Self::ClientError
+        } else if response.status().is_server_error() {
+            Self::ServerError
+        } else {
+            Self::Ok
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::ClientError => "client_error",
+            Self::ServerError => "server_error",
+            Self::Deadline => "deadline",
+            Self::Cancelled => "cancelled",
+        }
     }
 }
 
@@ -611,7 +638,7 @@ pub fn record_http_request_duration(
     method: &str,
     route: &str,
     client_class: crate::otel_client_class::ClientClass,
-    status: axum::http::StatusCode,
+    outcome: RequestOutcome,
     elapsed: Duration,
 ) {
     if !metrics_enabled() {
@@ -622,7 +649,7 @@ pub fn record_http_request_duration(
             .f64_histogram(HTTP_SERVER_DURATION_INSTRUMENT)
             .with_unit("s")
             .with_description(
-                "st3 HTTP server request duration by route, method, client class and status class",
+                "st3 HTTP server request duration by route, method, client class and request outcome",
             )
             .build()
     });
@@ -632,7 +659,7 @@ pub fn record_http_request_duration(
             KeyValue::new("http.request.method", method.to_owned()),
             KeyValue::new("http.route", route.to_owned()),
             KeyValue::new("st3.client.class", client_class.as_str()),
-            KeyValue::new("http.response.status_class", status_class(status)),
+            KeyValue::new("st3.request.outcome", outcome.as_str()),
         ],
     );
 }
@@ -1035,6 +1062,30 @@ impl Drop for Telemetry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_outcomes_distinguish_deadlines_from_upstream_timeouts_and_cancellation() {
+        use super::{ReadDeadline, RequestOutcome};
+        for code in 100..600 {
+            let mut response = axum::response::Response::new(axum::body::Body::empty());
+            *response.status_mut() = axum::http::StatusCode::from_u16(code).unwrap();
+            let expected = match code {
+                100..=399 => RequestOutcome::Ok,
+                400..=499 => RequestOutcome::ClientError,
+                _ => RequestOutcome::ServerError,
+            };
+            assert_eq!(RequestOutcome::from_response(Some(&response)), expected, "{code}");
+            if code == 504 {
+                response.extensions_mut().insert(ReadDeadline);
+                assert_eq!(RequestOutcome::from_response(Some(&response)), RequestOutcome::Deadline);
+            }
+        }
+        assert_eq!(RequestOutcome::from_response(None), RequestOutcome::Cancelled);
+        assert_eq!([
+            RequestOutcome::Ok, RequestOutcome::ClientError, RequestOutcome::ServerError,
+            RequestOutcome::Deadline, RequestOutcome::Cancelled,
+        ].map(RequestOutcome::as_str), ["ok", "client_error", "server_error", "deadline", "cancelled"]);
+    }
+
     use super::{
         SignalChoice, Unit, build_resource, cli_backoff_active, record_cli_failure,
         shutdown_providers, signal_enabled, span_batch_config,

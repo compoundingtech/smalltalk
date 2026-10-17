@@ -292,12 +292,48 @@ static READ: LazyLock<[KeyValue; 2]> = LazyLock::new(|| {
         KeyValue::new("db.operation.name", "read"),
     ]
 });
-static CHECKPOINT: LazyLock<[KeyValue; 2]> = LazyLock::new(|| {
+/// Bounded physical checkpoint operations.
+#[derive(Clone, Copy)]
+pub enum CheckpointOperation {
+    Truncate,
+    Passive,
+}
+
+/// Bounded outcomes shared by backup checkpoints and the idle-WAL worker.
+#[derive(Clone, Copy)]
+pub enum CheckpointOutcome {
+    Recycled,
+    Empty,
+    Deferred,
+    Error,
+}
+
+impl CheckpointOutcome {
+    pub fn from_report(report: Option<&super::WalCheckpointReport>) -> Self {
+        match report {
+            None => Self::Error,
+            Some(report) if report.frames == 0 => Self::Empty,
+            Some(report) if report.recycled => Self::Recycled,
+            Some(_) => Self::Deferred,
+        }
+    }
+}
+
+fn checkpoint_attributes(operation: CheckpointOperation, outcome: CheckpointOutcome) -> [KeyValue; 3] {
     [
         KeyValue::new("db.system.name", "sqlite"),
-        KeyValue::new("db.operation.name", "checkpoint.truncate"),
+        KeyValue::new("db.operation.name", match operation {
+            CheckpointOperation::Truncate => "checkpoint.truncate",
+            CheckpointOperation::Passive => "checkpoint.passive",
+        }),
+        KeyValue::new("st.db.wal.checkpoint.outcome", match outcome {
+            CheckpointOutcome::Recycled => "recycled",
+            CheckpointOutcome::Empty => "empty",
+            CheckpointOutcome::Deferred => "deferred",
+            CheckpointOutcome::Error => "error",
+        }),
     ]
-});
+}
 
 pub(super) struct Instruments {
     operation: Histogram<f64>,
@@ -392,11 +428,9 @@ pub(super) fn read_waited(wait: Duration) {
         .record(wait.as_secs_f64(), READ.as_slice());
 }
 
-/// Record the explicit backup checkpoint, including failed attempts.
-pub fn checkpoint_finished(elapsed: Duration) {
-    METRICS
-        .checkpoint
-        .record(elapsed.as_secs_f64(), CHECKPOINT.as_slice());
+/// Record one checkpoint attempt, including failed attempts.
+pub fn checkpoint_finished(elapsed: Duration, operation: CheckpointOperation, outcome: CheckpointOutcome) {
+    METRICS.checkpoint.record(elapsed.as_secs_f64(), &checkpoint_attributes(operation, outcome));
 }
 
 /// Shared only across blocking sections belonging to one request. Writes allocate nothing.
@@ -589,6 +623,51 @@ mod tests {
     use super::*;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    #[test]
+    fn checkpoint_histogram_exports_operation_and_report_outcome() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build()).build();
+        let instruments = Instruments::new(&provider.meter("checkpoint-test"));
+        let report = |frames: i32, recycled: bool| super::super::WalCheckpointReport {
+            frames, backfilled: frames, passive_ms: 2, writer_wait_ms: 0,
+            truncate_ms: recycled.then_some(1), recycled,
+        };
+        let reports = [Some(report(0, false)), Some(report(8, true)), Some(report(8, false)), None];
+        for operation in [CheckpointOperation::Truncate, CheckpointOperation::Passive] {
+            for report in &reports {
+                instruments.checkpoint.record(0.25,
+                    &checkpoint_attributes(operation, CheckpointOutcome::from_report(report.as_ref())));
+            }
+        }
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        let metric = finished.iter().flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "st.db.wal.checkpoint.duration").unwrap();
+        assert_eq!(metric.unit(), "s");
+        let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+            panic!("checkpoint duration must be an f64 histogram");
+        };
+        let mut labels = std::collections::BTreeSet::new();
+        for point in histogram.data_points() {
+            assert_eq!(point.count(), 1);
+            assert_eq!(point.sum(), 0.25);
+            let attributes: Vec<_> = point.attributes().collect();
+            assert_eq!(attributes.len(), 3);
+            let value = |key| attributes.iter().find(|attribute| attribute.key.as_str() == key)
+                .unwrap().value.to_string();
+            assert_eq!(value("db.system.name"), "sqlite");
+            labels.insert((value("db.operation.name"), value("st.db.wal.checkpoint.outcome")));
+        }
+        let expected: std::collections::BTreeSet<_> = ["checkpoint.truncate", "checkpoint.passive"]
+            .into_iter().flat_map(|operation| ["empty", "recycled", "deferred", "error"]
+                .map(|outcome| (operation.to_owned(), outcome.to_owned()))).collect();
+        assert_eq!(labels, expected);
+        provider.shutdown().unwrap();
+    }
 
     #[test]
     fn trace_only_origin_follows_request_scopes() {

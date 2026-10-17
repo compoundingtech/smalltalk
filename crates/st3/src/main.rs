@@ -17639,6 +17639,11 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                 let duration_ms = started.elapsed().as_millis();
                 let report = result.as_ref().ok();
                 smallclaims::sqlite::telemetry::wal_checkpoint_observed(&store.readers, report);
+                smallclaims::sqlite::telemetry::checkpoint_finished(
+                    started.elapsed(),
+                    smallclaims::sqlite::telemetry::CheckpointOperation::Passive,
+                    smallclaims::sqlite::telemetry::CheckpointOutcome::from_report(report),
+                );
                 let stuck = pin.observe(report);
                 let abnormal = abnormal_wal_checkpoint(report) || stuck >= WAL_PIN_REPORT_AFTER;
                 st3::otel::record_wal_checkpoint(trace_started, report, abnormal);

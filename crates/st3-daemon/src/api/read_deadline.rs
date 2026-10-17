@@ -217,7 +217,8 @@ fn construct_timeout_response(construct: impl FnOnce() -> Response) -> Response 
     let trace = crate::relay_trace::current();
     let _root = trace.as_ref().map(crate::relay_trace::Trace::guard);
     crate::relay_trace::span(Phase::Deadline).finish(Outcome::TimedOut);
-    let response = crate::relay_trace::work(Phase::TimeoutEnvelope, construct);
+    let mut response = crate::relay_trace::work(Phase::TimeoutEnvelope, construct);
+    response.extensions_mut().insert(crate::otel::ReadDeadline);
     if let Some(trace) = trace {
         trace.finish(Outcome::TimedOut);
     }

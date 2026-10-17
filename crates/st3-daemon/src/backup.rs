@@ -310,7 +310,15 @@ pub fn restore(source: &Path, destination: &Path) -> Result<RestoreReport> {
     let connection = rusqlite::Connection::open(&staged_path)?;
     let checkpoint_started = std::time::Instant::now();
     let checkpoint = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-    smallclaims::sqlite::telemetry::checkpoint_finished(checkpoint_started.elapsed());
+    smallclaims::sqlite::telemetry::checkpoint_finished(
+        checkpoint_started.elapsed(),
+        smallclaims::sqlite::telemetry::CheckpointOperation::Truncate,
+        if checkpoint.is_ok() {
+            smallclaims::sqlite::telemetry::CheckpointOutcome::Recycled
+        } else {
+            smallclaims::sqlite::telemetry::CheckpointOutcome::Error
+        },
+    );
     checkpoint?;
     drop(connection);
     #[cfg(unix)]

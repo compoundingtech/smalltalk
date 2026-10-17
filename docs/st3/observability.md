@@ -358,10 +358,16 @@ The class is observational only; it does not grant identity or authority.
 | `other` | Any other present value; `curl` maps here on purpose, not to `cli` |
 | `unknown` | Header absent or blank after trimming |
 
-`http.server.request.duration` records request duration in seconds at the same point as
-the in-memory meter, independent of trace sampling. Its labels are `http.request.method`,
-`http.route`, `st3.client.class`, and `http.response.status_class`. An SDK cardinality limit
-caps this instrument at 1,500 series; excess combinations go to the
+`http.server.request.duration` records request duration in seconds, independent of trace
+sampling, outside the read-deadline envelope. Its labels are `http.request.method`,
+`http.route`, `st3.client.class`, and `st3.request.outcome`. The outcome is a closed enum:
+`ok` for 1xx/2xx/3xx (including WebSocket upgrades), `client_error` for 4xx,
+`server_error` for other 5xx, `deadline` for an explicitly marked read-deadline response,
+and `cancelled` when the request future is dropped before producing a response.
+An upstream 504 without the read-deadline marker is `server_error`. A drop guard
+records exactly once, including cancellation; the in-process meter and slow logs
+retain their completion-only behavior. The outcome has five values. An SDK cardinality
+limit caps this instrument at 1,500 series; excess combinations go to the
 `otel.metric.overflow=true` series. This runtime cap enforces O11Y-R14's 2,000 active-series
 budget rather than the theoretical label product.
 
@@ -386,10 +392,17 @@ Duration buckets are
 | `st.db.readers.opened` | Counter | `{connection}` | —; readers opened |
 | `st.db.read.loan.oldest_age` | Observable gauge | `s` | `origin`; oldest live pooled connection loan per bounded route/task origin, not confirmed transaction age |
 | `st.db.wal.size` | Observable gauge | `By` | —; stat the main database's `-wal` file |
-| `st.db.wal.checkpoint.duration` | Histogram | `s` | `db.operation.name=checkpoint.truncate`; truncate checkpoint duration |
+| `st.db.wal.checkpoint.duration` | Histogram | `s` | `db.operation.name=checkpoint.truncate\|checkpoint.passive`, `st.db.wal.checkpoint.outcome=recycled\|empty\|deferred\|error`; checkpoint attempt duration |
 | `st.db.wal.checkpoint.deferred` | Counter | `{attempt}` | —; physical checkpoint attempts with nonempty WAL not recycled |
 | `st.db.wal.checkpoint.lag` | Observable gauge | `{frame}` | —; last known WAL frames minus backfilled frames, summed across live pools |
 | `st.db.wal.checkpoint.deferred_age` | Observable gauge | `s` | —; age since the first consecutive deferred attempt, maximum across live pools |
+
+Checkpoint duration records backup TRUNCATE attempts as `checkpoint.truncate` with
+`recycled` or `error`. Each idle-WAL worker attempt records `checkpoint.passive`,
+including any follow-on truncate and writer wait, with `empty` for zero frames,
+`recycled` for a recycled nonempty WAL, `deferred` for a nonempty WAL not recycled,
+or `error` for a failed attempt. These two operations and four outcomes add at most
+eight attribute sets, without a separate outcome counter.
 
 Every storage metric carries `db.system.name=sqlite`. Writer hold, queue, and oldest-loan origins reuse
 the bounded writer-span vocabulary: normalized router `MatchedPath` templates prefixed
@@ -449,8 +462,9 @@ when TRUNCATE was attempted or the result is abnormal. It uses the OTel API with
 an explicit empty parent context, retaining the attempt's start time without constructing
 a span for ordinary idle passes. `span.label` and `db.operation.name` are
 `checkpoint.truncate` for TRUNCATE attempts, otherwise `checkpoint.passive`;
-`db.system.name=sqlite`. A TRUNCATE result records `st.db.wal.checkpoint.duration`
-in seconds, reusing the existing instrument vocabulary without adding a metric.
+`db.system.name=sqlite`. A TRUNCATE span carries its duration in the
+`st.db.wal.checkpoint.duration` span attribute; the histogram independently records
+every worker attempt as described above, regardless of span sampling.
 Failures, PASSIVE durations at least 1000 ms, writer waits or TRUNCATE durations
 at least 100 ms, and at least three consecutive no-progress pinned-WAL samples
 mark the root ERROR. Successful ordinary TRUNCATE leaves status UNSET.

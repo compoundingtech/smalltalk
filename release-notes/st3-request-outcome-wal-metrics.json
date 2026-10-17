@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Replace HTTP status-class histogram labels with request outcomes and add WAL checkpoint operation/outcome attributes",
+  "commits": ["e3f93cf80944fd6197f2098137c3dc95d2d7f6f9"],
+  "replay": { "status": "none", "detail": "Telemetry only; no replay or projection changes." },
+  "schema": { "status": "none", "detail": "No persisted schema or migration changes." },
+  "rules": { "status": "none", "detail": "Checkpoint coordination rules and fleet protocols are unchanged." },
+  "compatibility": { "status": "changed", "detail": "Dashboard/alert-breaking metric label change: http.server.request.duration replaces http.response.status_class with st3.request.outcome=ok|client_error|server_error|deadline|cancelled. Explicit read deadlines are distinguished from other 504 responses, and dropped requests now contribute cancelled samples. Method, route and client-class labels, histogram buckets and the 1500-series cap are unchanged. st.db.wal.checkpoint.duration gains db.operation.name=checkpoint.truncate|checkpoint.passive and st.db.wal.checkpoint.outcome=recycled|empty|deferred|error. The histogram now includes idle-WAL worker attempts, including writer wait and follow-on truncation; backup TRUNCATE attempts report recycled or error. WAL adds at most eight attribute sets and no separate counter." },
+  "downtime": { "status": "none", "detail": "Normal binary rollout; no backfill or additional interruption is required." },
+  "manual": { "status": "changed", "detail": "Update dashboards, alerts and recording rules that filter or group by http.response.status_class (Prometheus http_response_status_class) to use st3.request.outcome (Prometheus st3_request_outcome) and the new outcome values. Update WAL duration queries to select or aggregate across db.operation.name and st.db.wal.checkpoint.outcome as appropriate; checkpoint.passive measures the complete idle-worker attempt. During a mixed-version rollout, account for both old and new request-label series." },
+  "recovery": { "status": "changed", "detail": "Ordinary binary rollback restores the prior metric labels and completion-only request sampling without changing durable state. Restore compatible dashboard, alert and recording-rule queries if rolling back; outcome-labelled queries alone do not cover older binaries." }
+}

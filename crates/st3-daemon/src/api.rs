@@ -432,7 +432,11 @@ impl IntoResponse for ApiError {
         if let Some(applied) = body["details"].get("applied").cloned() {
             body["applied"] = applied;
         }
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if self.code == "read-deadline" {
+            response.extensions_mut().insert(crate::otel::ReadDeadline);
+        }
+        response
     }
 }
 
@@ -942,12 +946,44 @@ async fn schema() -> Json<Value> {
     }))
 }
 
+/// Lives outside the deadline future, so timeout responses finish the same sample
+/// and dropping the request records cancellation exactly once.
+struct RequestDuration<'a> {
+    method: &'a str,
+    route: &'a str,
+    client_class: crate::otel_client_class::ClientClass,
+    started: Instant,
+    outcome: crate::otel::RequestOutcome,
+}
+
+impl Drop for RequestDuration<'_> {
+    fn drop(&mut self) {
+        crate::otel::record_http_request_duration(
+            self.method, self.route, self.client_class, self.outcome, self.started.elapsed(),
+        );
+    }
+}
+
 async fn response_envelope(
     State(state): State<(AppState, ClientTransportBoundary)>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    read_deadline::envelope(state, request, next).await
+    let method = request.method().clone();
+    let route = request.extensions().get::<axum::extract::MatchedPath>().cloned();
+    let client_class = crate::otel_client_class::ClientClass::from_header(
+        request.headers().get(client_presence::CLIENT_HEADER).and_then(|value| value.to_str().ok()),
+    );
+    let mut duration = RequestDuration {
+        method: method.as_str(),
+        route: route.as_ref().map_or("/unmatched", axum::extract::MatchedPath::as_str),
+        client_class,
+        started: Instant::now(),
+        outcome: crate::otel::RequestOutcome::Cancelled,
+    };
+    let response = read_deadline::envelope(state, request, next).await;
+    duration.outcome = crate::otel::RequestOutcome::from_response(Some(&response));
+    response
 }
 
 async fn response_envelope_unbounded(
@@ -1315,13 +1351,6 @@ async fn response_envelope_unbounded(
             long_poll,
             remote: served_remote.load(std::sync::atomic::Ordering::Relaxed),
         },
-    );
-    crate::otel::record_http_request_duration(
-        request_method.as_str(),
-        &request_route,
-        client_class,
-        status,
-        started.elapsed(),
     );
     finish_request_trace(otel, status);
     if let Some(profile) = profile {
