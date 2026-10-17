@@ -3947,7 +3947,7 @@ mod tests {
             .request_headers_for(CLIENT_READ_PATH, "source", &body)
             .unwrap();
         use tracing::instrument::WithSubscriber as _;
-        let diagnostic = relay_trace::tests::Capture::default();
+        let diagnostic = relay_trace::test_capture::Capture::default();
         let response = relay_trace::test_peer_selector(
             FleetAuth::body_digest(&body),
             "source".into(),
@@ -4009,7 +4009,7 @@ mod tests {
         *rejected.headers_mut() = auth
             .request_headers_for(CLIENT_READ_PATH, "unconfigured", &body)
             .unwrap();
-        let refusal = relay_trace::tests::Capture::default();
+        let refusal = relay_trace::test_capture::Capture::default();
         let response = relay_trace::test_peer_selector(
             FleetAuth::body_digest(&body),
             "unconfigured".into(),

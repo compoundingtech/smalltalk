@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Split the st3 library's store-free telemetry modules (otel, recorder, relay_trace, startup and wake telemetry and 4 more) into the st3-telemetry crate; st3-daemon re-exports them at their old paths.",
+  "replay": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  }
+}

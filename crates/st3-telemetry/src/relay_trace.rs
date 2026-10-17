@@ -47,7 +47,7 @@ struct Selector {
 }
 
 impl Selector {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn parse(
         path: Option<String>,
         actor: Option<String>,
@@ -150,7 +150,7 @@ fn valid_digest(value: &str) -> bool {
 }
 
 /// Router construction only: no lazy configuration/cache initialization in a read.
-pub(crate) fn init() {
+pub fn init() {
     SELECTOR.get_or_init(|| {
         Selector::parse_forward(
             std::env::var("ST3_RELAY_TRACE_PATH").ok(),
@@ -163,7 +163,7 @@ pub(crate) fn init() {
     });
 }
 
-pub(crate) fn gateway(
+pub fn gateway(
     path: &str,
     actor: Option<&str>,
     caller: &str,
@@ -175,7 +175,7 @@ pub(crate) fn gateway(
         return None;
     }
     (unix_get && selector.gateway(path, actor, caller)).then(|| {
-        let trace = Trace::new(format!("request/{}", crate::model::new_request_id()));
+        let trace = Trace::new(format!("request/{}", st3_kernel::model::new_request_id()));
         if let Some(connection) = connection {
             connection.record(&trace);
         }
@@ -185,7 +185,7 @@ pub(crate) fn gateway(
 
 /// Selection uses the original, already bounded body and existing Unix caller trust.
 /// It creates no signature/authority fact; only the worker verifies the peer's signature.
-pub(crate) fn forwarded(
+pub fn forwarded(
     body: &[u8],
     caller: &str,
     unix: bool,
@@ -207,7 +207,7 @@ pub(crate) fn forwarded(
 /// These precede request selection and are connection scope (including possible reuse),
 /// not a claimed per-request queue interval. The trace records them only if that request wins.
 #[derive(Clone, Copy)]
-pub(crate) struct Connection {
+pub struct Connection {
     accepted: Instant,
     dispatched: Option<Instant>,
     queued: Option<Instant>,
@@ -215,7 +215,7 @@ pub(crate) struct Connection {
     finished: Option<Instant>,
 }
 impl Connection {
-    pub(crate) fn capture() -> Option<Self> {
+    pub fn capture() -> Option<Self> {
         let selector = SELECTOR.get()?.as_ref()?;
         (matches!(
             selector.selected,
@@ -230,16 +230,16 @@ impl Connection {
             finished: None,
         })
     }
-    pub(crate) fn dispatched(&mut self) {
+    pub fn dispatched(&mut self) {
         self.dispatched = Some(Instant::now());
     }
-    pub(crate) fn queued(&mut self) {
+    pub fn queued(&mut self) {
         self.queued = Some(Instant::now());
     }
-    pub(crate) fn started(&mut self) {
+    pub fn started(&mut self) {
         self.started = Some(Instant::now());
     }
-    pub(crate) fn finished(&mut self) {
+    pub fn finished(&mut self) {
         self.finished = Some(Instant::now());
     }
     fn record(&self, trace: &Trace) {
@@ -275,11 +275,11 @@ impl Connection {
 }
 
 /// One monotonic clock while a peer selector is pending. No event is emitted before trust.
-pub(crate) fn peer_authentication_clock() -> Option<Instant> {
+pub fn peer_authentication_clock() -> Option<Instant> {
     if !tracing::enabled!(target: TARGET, tracing::Level::DEBUG) {
         return None;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Ok(pending) = TEST_SELECTOR.try_with(|selector| {
         matches!(selector.selected, Match::Peer { .. }) && !selector.used.load(Ordering::Relaxed)
     }) {
@@ -291,8 +291,8 @@ pub(crate) fn peer_authentication_clock() -> Option<Instant> {
 }
 
 /// Call only after existing signature verification AND fleet acceptance succeeded.
-pub(crate) fn authenticated_peer(digest: &str, sender: &str) -> Option<Trace> {
-    #[cfg(test)]
+pub fn authenticated_peer(digest: &str, sender: &str) -> Option<Trace> {
+    #[cfg(any(test, feature = "test-support"))]
     if let Ok(selected) = TEST_SELECTOR.try_with(|selector| {
         tracing::enabled!(target: TARGET, tracing::Level::DEBUG) && selector.peer(digest, sender)
     }) {
@@ -308,7 +308,7 @@ pub(crate) fn authenticated_peer(digest: &str, sender: &str) -> Option<Trace> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     Completed,
     Failed,
     TimedOut,
@@ -317,7 +317,7 @@ pub(crate) enum Outcome {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Phase {
+pub enum Phase {
     Request,
     ConnectionDispatch,
     CallerQueue,
@@ -415,7 +415,7 @@ fn micros(started: Instant) -> u64 {
 }
 
 #[derive(Clone)]
-pub(crate) struct Trace(Arc<Inner>, u8, &'static str);
+pub struct Trace(Arc<Inner>, u8, &'static str);
 
 impl Trace {
     fn new(id: String) -> Self {
@@ -433,26 +433,26 @@ impl Trace {
         )
     }
 
-    pub(crate) fn id(&self) -> &str {
+    pub fn id(&self) -> &str {
         &self.0.id
     }
-    pub(crate) fn finish(&self, outcome: Outcome) {
+    pub fn finish(&self, outcome: Outcome) {
         self.0.finish(outcome);
     }
 
-    pub(crate) fn guard(&self) -> Root {
+    pub fn guard(&self) -> Root {
         Root(self.clone())
     }
 
-    pub(crate) fn attempt(&self, attempt: u8, transport: &'static str) -> Self {
+    pub fn attempt(&self, attempt: u8, transport: &'static str) -> Self {
         Self(self.0.clone(), attempt, transport)
     }
 
-    pub(crate) fn selected_peer(&self, name: &str) {
+    pub fn selected_peer(&self, name: &str) {
         self.routing_identity(Phase::PeerSelection, "peer", name);
     }
 
-    pub(crate) fn fabric_target(&self, node: &str, protocol: &str) {
+    pub fn fabric_target(&self, node: &str, protocol: &str) {
         self.routing_identity(Phase::FabricTarget, "node", node);
         self.routing_identity(Phase::FabricTarget, "protocol", protocol);
     }
@@ -474,7 +474,7 @@ impl Trace {
         );
     }
 
-    pub(crate) fn authenticated_after(&self, elapsed: std::time::Duration) {
+    pub fn authenticated_after(&self, elapsed: std::time::Duration) {
         let elapsed = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         self.0.emit(
             Phase::Authenticate,
@@ -486,12 +486,12 @@ impl Trace {
         );
     }
 
-    pub(crate) fn http_status(&self, status: u16) {
+    pub fn http_status(&self, status: u16) {
         self.0
             .emit(Phase::Headers, "status", 0, (self.1, self.2), "", status);
     }
 
-    pub(crate) fn bind(&self, digest: &str) {
+    pub fn bind(&self, digest: &str) {
         if valid_digest(digest) {
             self.0.emit(
                 Phase::RequestBinding,
@@ -504,7 +504,7 @@ impl Trace {
         }
     }
 
-    pub(crate) fn response(&self, id: &str) {
+    pub fn response(&self, id: &str) {
         // A peer-controlled field is never arbitrary log text. Only the existing UUID form.
         let uuid = id.strip_prefix("request/").unwrap_or(id);
         if id.len() <= 64 && uuid::Uuid::parse_str(uuid).is_ok() {
@@ -519,7 +519,7 @@ impl Trace {
         }
     }
 
-    pub(crate) fn span(&self, phase: Phase) -> Span {
+    pub fn span(&self, phase: Phase) -> Span {
         self.0.emit(phase, "started", 0, (self.1, self.2), "", 0);
         Span {
             trace: Some(self.clone()),
@@ -531,7 +531,7 @@ impl Trace {
 }
 
 /// The owning request's drop records cancellation even if a blocking child is still alive.
-pub(crate) struct Root(Trace);
+pub struct Root(Trace);
 impl Drop for Root {
     fn drop(&mut self) {
         self.0.finish(if std::thread::panicking() {
@@ -545,14 +545,14 @@ impl Drop for Root {
 tokio::task_local! { static ASYNC_TRACE: Option<Trace>; }
 thread_local! { static BLOCKING_TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) }; }
 
-pub(crate) fn current() -> Option<Trace> {
+pub fn current() -> Option<Trace> {
     match ASYNC_TRACE.try_with(Clone::clone) {
         Ok(trace) => trace, // Explicit None masks any enclosing blocking context.
         Err(_) => BLOCKING_TRACE.with(|slot| slot.borrow().clone()),
     }
 }
 
-pub(crate) async fn scope<T>(trace: Option<Trace>, work: impl Future<Output = T>) -> T {
+pub async fn scope<T>(trace: Option<Trace>, work: impl Future<Output = T>) -> T {
     if trace.is_none()
         && ASYNC_TRACE.try_with(|_| ()).is_err()
         && BLOCKING_TRACE.with(|slot| slot.borrow().is_none())
@@ -564,7 +564,7 @@ pub(crate) async fn scope<T>(trace: Option<Trace>, work: impl Future<Output = T>
     }
 }
 
-pub(crate) fn blocking<T>(trace: Option<Trace>, work: impl FnOnce() -> T) -> T {
+pub fn blocking<T>(trace: Option<Trace>, work: impl FnOnce() -> T) -> T {
     struct Restore(Option<Trace>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -575,14 +575,14 @@ pub(crate) fn blocking<T>(trace: Option<Trace>, work: impl FnOnce() -> T) -> T {
     work()
 }
 
-pub(crate) struct Span {
+pub struct Span {
     trace: Option<Trace>,
     phase: Phase,
     started: Option<Instant>,
     done: bool,
 }
 
-pub(crate) fn span(phase: Phase) -> Span {
+pub fn span(phase: Phase) -> Span {
     current().map_or(
         Span {
             trace: None,
@@ -595,7 +595,7 @@ pub(crate) fn span(phase: Phase) -> Span {
 }
 
 impl Span {
-    pub(crate) fn finish(&mut self, outcome: Outcome) {
+    pub fn finish(&mut self, outcome: Outcome) {
         if self.done {
             return;
         }
@@ -629,14 +629,14 @@ impl Drop for Span {
     }
 }
 
-pub(crate) fn work<T>(phase: Phase, work: impl FnOnce() -> T) -> T {
+pub fn work<T>(phase: Phase, work: impl FnOnce() -> T) -> T {
     let mut span = span(phase);
     let value = work();
     span.finish(Outcome::Completed);
     value
 }
 
-pub(crate) fn result<T, E>(phase: Phase, work: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+pub fn result<T, E>(phase: Phase, work: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     let mut span = span(phase);
     let value = work();
     span.finish(if value.is_ok() {
@@ -647,7 +647,7 @@ pub(crate) fn result<T, E>(phase: Phase, work: impl FnOnce() -> Result<T, E>) ->
     value
 }
 
-pub(crate) async fn future<T, E>(
+pub async fn future<T, E>(
     phase: Phase,
     work: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
@@ -661,12 +661,12 @@ pub(crate) async fn future<T, E>(
     value
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 tokio::task_local! { static TEST_SELECTOR: Arc<Selector>; }
 
 /// Test-only per-task selector: never changes process environment or production enablement.
-#[cfg(test)]
-pub(crate) async fn test_peer_selector<T>(
+#[cfg(any(test, feature = "test-support"))]
+pub async fn test_peer_selector<T>(
     digest: String,
     sender: String,
     work: impl Future<Output = T>,
@@ -675,8 +675,8 @@ pub(crate) async fn test_peer_selector<T>(
     TEST_SELECTOR.scope(Arc::new(selector), work).await
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_capture {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -684,7 +684,7 @@ pub(crate) mod tests {
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
 
     #[derive(Clone, Default)]
-    pub(crate) struct Capture(pub(crate) Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+    pub struct Capture(pub Arc<Mutex<Vec<BTreeMap<String, String>>>>);
 
     struct Fields(BTreeMap<String, String>);
     impl Visit for Fields {
@@ -707,16 +707,22 @@ pub(crate) mod tests {
         }
     }
     impl Capture {
-        pub(crate) fn dispatch(&self) -> tracing::Dispatch {
+        pub fn dispatch(&self) -> tracing::Dispatch {
             tracing::Dispatch::new(tracing_subscriber::registry().with(self.clone()))
         }
-        pub(crate) fn events(&self) -> Vec<BTreeMap<String, String>> {
+        pub fn events(&self) -> Vec<BTreeMap<String, String>> {
             self.0.lock().unwrap().clone()
         }
     }
-    pub(crate) fn trace() -> Trace {
+    pub fn trace() -> Trace {
         Trace::new(format!("request/{}", uuid::Uuid::nil()))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_capture::{Capture, trace};
+    use super::*;
 
     #[test]
     fn selectors_are_exact_bounded_and_consumed_only_once() {

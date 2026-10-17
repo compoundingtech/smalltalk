@@ -206,7 +206,7 @@ impl StartupTelemetry {
             .as_ref()
             .map(|phase| phase.span.clone())
             .unwrap_or_else(tracing::Span::none);
-        span.in_scope(|| crate::profile::task(name, task))
+        span.in_scope(|| smallclaims::profile::task(name, task))
     }
     pub fn progress(&self, progress: smallclaims::store::ProjectionProgress) {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
