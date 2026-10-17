@@ -1190,6 +1190,8 @@ fn targets_come_from_the_targets_file_and_describe_without_gating() {
         ("seat work", "GET /v1/work"),
         ("person read /v1/client/now", "GET /v1/client/now"),
         ("person read /v1/client/agents", "GET /v1/client/agents"),
+        ("person read /v1/client/missions", "GET /v1/client/missions"),
+        ("missions snapshot", "stream missions"),
         (ROSTER_SNAPSHOT, "stream agents"),
         (ROSTER_CONNECT_SNAPSHOT, "stream agents"),
         ("work snapshot", "stream work"),
@@ -1200,24 +1202,19 @@ fn targets_come_from_the_targets_file_and_describe_without_gating() {
             .unwrap_or_else(|| panic!("{path} has no target in slo/targets.toml"));
         assert_eq!(descriptive_target(name), Some(target.target(false)), "{name}");
     }
-    for name in [
-        "claim",
-        "replication exchange",
-        "person read /v1/client/missions",
-        "missions snapshot",
-        LONG_POLL,
-    ] {
+    for name in ["claim", "replication exchange", LONG_POLL] {
         assert_eq!(descriptive_target(name), None, "{name}");
     }
-    // Every path over its descriptive target but within its budget fails nothing.
+    // Include the existing measured fresh read: its 1000 ms budget is independent
+    // of its 300 ms target. A descriptive miss within that budget fails nothing.
     let mut report = Report {
         daemon_cores: cpu_budget(),
         long_poll_seats: SEATS,
         roster_subscribers: ROSTER_SUBSCRIBERS,
         ..Report::default()
     };
-    for (name, budget, count) in MIX
-        .iter()
+    for (name, budget, count) in mix(Conditions { measured: true, ..Conditions::default() })
+        .into_iter()
         .map(|load| (load.name, load.budget, 100))
         .chain([
             (ROSTER_SNAPSHOT, ROSTER_BUDGET, ROSTER_SUBSCRIBERS),

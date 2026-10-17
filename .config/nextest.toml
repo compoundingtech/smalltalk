@@ -40,7 +40,8 @@ final-status-level = "flaky"
 # supervisor tests, and st-drivers' catalog, resync and resource-profile supervisor modules.
 # `transport_isolation` needs real systemd user scopes; the isolation-vm job runs it in a
 # NixOS VM. The cost check and the load test (`daemon_cost`, `daemon_load`) run in their own
-# perf jobs, so they never lengthen this one (scripts/ci-perf). See docs/ci.md.
+# perf jobs (scripts/ci-perf). Only the in-memory targets-file linkage unit also runs here;
+# it starts no daemon or load. See docs/ci.md.
 # The outbound-only real-network timing check also runs once in perf-cost. Its strict
 # convergence and redundant-connection windows stay separate from required deterministic
 # backoff and inbound/route interruption controls.
@@ -56,7 +57,8 @@ not (
   ))
   or (package(=st-drivers) and kind(lib)
     and test(/^(catalog[^:]*|resync|resource_profile_supervisor)::/))
-  or ((package(=st3) or package(=st3-daemon) or package(=st3-api) or package(=st3-reconcile) or package(=st3-peer) or package(=st3-store)) and test(/^daemon_(cost|load)::/))
+  or ((package(=st3) or package(=st3-daemon) or package(=st3-api) or package(=st3-reconcile) or package(=st3-peer) or package(=st3-store)) and test(/^daemon_(cost|load)::/)
+    and not test(=daemon_load::targets_come_from_the_targets_file_and_describe_without_gating))
   or (package(=smallclaims) and test(/^sync::worker::tests::retry_tests::isolated_outbound_only_node_converges_after_two_minutes_and_four_hours$/))
 )
 '''
