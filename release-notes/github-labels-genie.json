@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Declare repository labels as generated configuration, preserving existing labels and proposing design-feedback and top-priority signals",
+  "replay": {"status": "none", "detail": "Only repository label configuration changes; no runtime replay behavior changes."},
+  "schema": {"status": "none", "detail": "No database schema or migration changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordinated runtime upgrade changes."},
+  "compatibility": {"status": "none", "detail": "No client, protocol, provider, or harness contracts change."},
+  "downtime": {"status": "none", "detail": "No service restart or interruption is needed for repository label configuration."},
+  "manual": {"status": "changed", "detail": "After maintainer agreement and merge, a repository maintainer must apply the generated label configuration through the label reconciler or equivalent GitHub API updates. Existing labels are retained; no label migrations or deletions are declared. Runtime installations need no action."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery behavior changes."}
+}
