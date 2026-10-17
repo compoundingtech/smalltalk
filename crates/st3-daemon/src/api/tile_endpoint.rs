@@ -23,7 +23,7 @@ use super::{
     normalize_message_party,
 };
 use crate::model::{MessageSendReceipt, MessageSendRequest, MessageView};
-use crate::tiles::registry::{DEFAULT_REGISTRY, Registry, Tile};
+use crate::tile_registry::{DEFAULT_REGISTRY, Registry, Tile};
 
 /// The socket's name in the tile's endpoint directory.
 pub const SOCKET: &str = "st.sock";
@@ -749,7 +749,7 @@ mod tests {
         let whoami =
             |socket: PathBuf| tokio::task::spawn_blocking(move || get(&socket, "/v1/tile/whoami"));
 
-        set(crate::tiles::registry::tools_cgroup("atlas"));
+        set(crate::tile_registry::tools_cgroup("atlas"));
         let response = whoami(socket.clone()).await.unwrap().unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("agent/fleet/fixture-example/atlas"));
@@ -757,7 +757,7 @@ mod tests {
         // This user outside the tile's slice, in another tile's slice, or in its login session
         // is no one: the connection closes unanswered.
         for cgroup in [
-            crate::tiles::registry::tools_cgroup("birch"),
+            crate::tile_registry::tools_cgroup("birch"),
             format!("/user.slice/user-{uid}.slice/session-1.scope"),
             format!("/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/x.scope"),
         ] {
@@ -809,7 +809,7 @@ mod tests {
         let state_root = root.path().join("state");
         let registry_path = root.path().join("etc").join("tiles.toml");
         let kernel = Arc::new(FakeKernel(Mutex::new(
-            crate::tiles::registry::tools_cgroup("atlas"),
+            crate::tile_registry::tools_cgroup("atlas"),
         )));
         let load = {
             let path = registry_path.clone();

@@ -27,7 +27,7 @@ pub struct SmalltalkRuntime {
     pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
     pub(crate) actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
-    pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
+    pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::model::PlacementFence>>>>,
     /// Per-subject status reductions and current-view answers, until their claims change.
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,

@@ -119,21 +119,8 @@ pub struct GatewayStore {
     db: Connection,
 }
 
-/// `person/ada` → `ada`.
-pub fn person_name(person: &str) -> Option<&str> {
-    person
-        .strip_prefix("person/")
-        .filter(|name| valid_word(name))
-}
-
-fn valid_word(word: &str) -> bool {
-    !word.is_empty()
-        && word.len() <= 64
-        && !word.starts_with(['.', '-'])
-        && word.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
-        })
-}
+pub use crate::model::person_name;
+use crate::model::valid_word;
 
 /// A profile ID is `OWNER/NAME`, where OWNER is the owning person's name.
 pub fn check_profile_id(id: &str, owner: &str) -> Result<()> {

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::registry::DEFAULT_REGISTRY;
+use crate::tile_registry::DEFAULT_REGISTRY;
 
 #[derive(Args, Debug)]
 pub struct TilesArgs {
