@@ -48,6 +48,53 @@ const CONVERSATION_CHANGED: &str = "SELECT
     OR EXISTS(SELECT 1 FROM local_observations INDEXED BY local_observations_subject_id_index
       WHERE subject=?1 AND id>?4 AND id<=?5)";
 
+/// SQL text is fixed by the schema registry, not by the conversation or its history.
+static IDENTITY_FIELD_READS: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+    ["runtime_id", "incarnation_id"].map(|field| {
+        let predicate = identity_field_predicate(field);
+        let path = format!("CASE WHEN json_type(claims.body,'$.fields') IS NULL
+            THEN '$.{field}' ELSE '$.fields.{field}' END");
+        format!(
+            "SELECT CASE WHEN json_type(claims.body,{path})='text'
+                    THEN json_extract(claims.body,{path}) END FROM claims
+             INDEXED BY claims_identity_{field}_accepted_index
+             JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND +claims.store_index<=?2
+               AND {ACTUAL_STATE_CLAIM} AND {predicate} AND {UNREPAIRED_CLAIM}
+               AND claims.kind NOT LIKE 'harness.%'
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        )
+    })
+});
+
+/// Both exact-subject and fleet-map routing share these bounded identity seeks.
+fn conversation_owner_from_connection(
+    connection: &Connection,
+    subject: &str,
+    through: u64,
+) -> Result<Option<Owner>> {
+    let exists: bool = connection.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND store_index<=?2)",
+    )?.query_row(params![subject, through], |row| row.get(0))?;
+    if !exists {
+        return Ok(None);
+    }
+    let read = |query: &str| -> Result<Option<String>> {
+        Ok(connection.prepare_cached(query)?
+            .query_row(params![subject, through], |row| row.get::<_, Option<String>>(0))
+            .optional()?.flatten())
+    };
+    let runtime = read(&IDENTITY_FIELD_READS[0])?;
+    let incarnation = read(&IDENTITY_FIELD_READS[1])?;
+    let (_, origin, _) = identity_actual_source_at(connection, subject, through)?;
+    Ok(Some(Owner {
+        subject: subject.into(),
+        incarnation,
+        runtime,
+        origin,
+    }))
+}
+
 impl Store {
     pub fn conversation_local_position(&self) -> Result<u64> {
         Ok(self.readers.get().prepare_cached(
@@ -65,6 +112,14 @@ impl Store {
         }
         Ok(self.readers.get().prepare_cached(CONVERSATION_CHANGED)?
             .query_row(params![owner, after, through, local_after, local_through], |row| row.get(0))?)
+    }
+
+    /// One subject at the captured logical frontier, without building the fleet owner map.
+    /// Sparse identity fields use partial accepted-time indexes, not scans over heartbeats.
+    pub fn conversation_owner_at(&self, subject: &str, through: u64) -> Result<Option<Owner>> {
+        selected_index(self.index()?, Some(through)).map_err(anyhow::Error::new)?;
+        let connection = self.readers.get();
+        conversation_owner_from_connection(&connection, subject, through)
     }
 
     /// A volatile, rebuildable identity map at a logical claim frontier. Only changed agents
@@ -142,52 +197,9 @@ impl Store {
         };
         for subject in names {
             let connection = self.readers.get();
-            // The fast path inherits absent runtime fields, retains explicit null, and only
-            // applies to one runtime origin. Rival origins and other actual kinds retain the
-            // existing canonical fold and desired-host authority selection.
-            let (actual, origin) = match runtime_only_authority(
-                &connection,
-                &subject,
-                through,
-                &["runtime_id", "incarnation_id"],
-            )? {
-                Some((actual, origin)) => (Some(actual), Some(origin)),
-                None => {
-                    let desired = desired_row_at(&connection, &subject, Some(through))?;
-                    let member = desired
-                        .as_ref()
-                        .and_then(|row| row.member.as_deref())
-                        .and_then(|value| {
-                            serde_json::from_str::<crate::model::MemberSpec>(value).ok()
-                        });
-                    let actual = latest_actual_at(&connection, &subject, Some(through))?;
-                    let (_, origin, _) = selected_actual_source_at(
-                        &connection,
-                        &subject,
-                        Some(through),
-                        member.as_ref().map(|member| member.host.as_str()),
-                    )?;
-                    (actual, origin)
-                }
-            };
-            let fields = actual
-                .as_ref()
-                .map(|value| value.get("fields").unwrap_or(value));
-            let incarnation = fields
-                .and_then(|fields| fields["incarnation_id"].as_str())
-                .map(str::to_owned);
-            let runtime = fields
-                .and_then(|fields| fields["runtime_id"].as_str())
-                .map(str::to_owned);
-            owners.insert(
-                subject.clone(),
-                Owner {
-                    subject,
-                    incarnation,
-                    runtime,
-                    origin,
-                },
-            );
+            if let Some(owner) = conversation_owner_from_connection(&connection, &subject, through)? {
+                owners.insert(subject, owner);
+            }
         }
         let owners = Arc::new(owners);
         #[cfg(any(test, feature = "test-support"))]
@@ -426,6 +438,207 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Synthetic historical SQL rows exercise legacy kinds/shapes that current admission
+    /// correctly rejects. The admitted scaffold supplies real batch/replica ordering metadata;
+    /// rewriting this fixture is not evidence that these rows can be admitted or replicated.
+    fn synthetic_owner_history_row(
+        tx: &Transaction<'_>,
+        origin: &str,
+        subject: &str,
+        kind: &str,
+        body: &Value,
+        predecessors: &[String],
+    ) -> Result<ClaimRecord> {
+        let mut claim = append_claim_tx(tx, origin, subject, "runtime.observed", None,
+            &json!({"fields":{"status":"running","runtime_id":"pty/ada",
+                "incarnation_id":"ada-fixture"}}), predecessors, None)?;
+        tx.execute("UPDATE claims SET kind=?1,body=?2 WHERE id=?3",
+            params![kind, body.to_string(), claim.id])?;
+        claim.kind = kind.into();
+        claim.body = body.clone();
+        Ok(claim)
+    }
+
+    #[test]
+    fn conversation_subject_owner_resource_attribution_does_not_replace_identity() {
+        let store = Store::open_memory("tester").unwrap();
+        append(&store, "agent/ada", "runtime.observed",
+            json!({"runtime_id":"pty/ada","incarnation_id":"ada-1","status":"running"}));
+        for opener_kind in RESOURCE_OPENER_KINDS {
+            for attribution in [json!(true), json!(false), json!(1), Value::Null] {
+                for wrapped in [false, true] {
+                    store.connection.batched(|tx| -> Result<()> {
+                        let fields = json!({"kind":opener_kind,"attribution_only":attribution,
+                            "runtime_id":"pty/reviewer","incarnation_id":null,
+                            "facts":{"opened_by":"person/alex","number":1}});
+                        let body = if wrapped { json!({"fields":fields}) } else { fields };
+                        synthetic_owner_history_row(tx, "reviewer", "agent/ada",
+                            "resource.observed", &body, &[])?;
+                        Ok(())
+                    }).unwrap().unwrap();
+                    let through = store.index().unwrap();
+                    let connection = store.readers.get();
+                    let actual = latest_actual_at(&connection, "agent/ada", Some(through)).unwrap().unwrap();
+                    let expected_runtime = actual["runtime_id"].as_str().map(str::to_owned);
+                    let expected_incarnation = actual["incarnation_id"].as_str().map(str::to_owned);
+                    drop(connection);
+                    let owner = store.conversation_owner_at("agent/ada", through).unwrap().unwrap();
+                    assert_eq!(owner.runtime, expected_runtime);
+                    assert_eq!(owner.incarnation, expected_incarnation);
+                    assert_eq!(owner.origin.as_deref(), Some("tester"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_subject_owner_rival_ancestry_crosses_checkpoint_tombstone() {
+        let store = Store::open_memory("tester").unwrap();
+        store.connection.batched(|tx| -> Result<()> {
+            let rival = append_claim_tx(tx, "reviewer", "agent/ada", "runtime.observed",
+                None, &json!({"fields":{"status":"running","runtime_id":"pty/reviewer"}}), &[], None)?;
+            let bridge = append_claim_tx(tx, "tester", "agent/ada", "harness.observed",
+                None, &json!({"fields":{"state":"working"}}), &[rival.id], None)?;
+            append_claim_tx(tx, "tester", "agent/ada", "runtime.observed",
+                None, &json!({"fields":{"status":"running","runtime_id":"pty/ada",
+                    "incarnation_id":"ada-1"}}), std::slice::from_ref(&bridge.id), None)?;
+            tx.execute("INSERT INTO checkpoint_claims
+                (id,writer,sequence,envelope_hash,subject,kind,actor,predecessors,
+                 operation_id,request_digest,accepted_at_unix_ms,checkpoint)
+                SELECT id,'tester',1,'fixture',subject,kind,actor,predecessors,
+                       NULL,NULL,accepted_at_unix_ms,'checkpoint/tester'
+                FROM claims WHERE id=?1", [&bridge.id])?;
+            tx.execute("DELETE FROM claims WHERE id=?1", [&bridge.id])?;
+            Ok(())
+        }).unwrap().unwrap();
+        let through = store.index().unwrap();
+        let connection = store.readers.get();
+        let source = identity_actual_source_at(&connection, "agent/ada", through).unwrap();
+        assert!(!source.2, "the checkpoint tombstone preserves rival descent");
+        assert_eq!(source, selected_actual_source_at(&connection, "agent/ada", Some(through), None).unwrap());
+        drop(connection);
+        assert_eq!(store.conversation_owner_at("agent/ada", through).unwrap().unwrap().runtime.as_deref(),
+            Some("pty/ada"));
+    }
+
+    #[test]
+    fn conversation_transport_pair_seeks_match_full_window_ranking() {
+        let store = Store::open_memory("tester").unwrap();
+        store.connection.batched(|tx| -> Result<()> {
+            for number in 0..120_u64 {
+                let origin = ["tester", "reviewer", "operator"][(number % 3) as usize];
+                let subject = ["host/alex", "host/ada"][(number % 2) as usize];
+                let claim = append_claim_tx(tx, origin, subject, "transport.observed", None,
+                    &json!({"fields":{"status":if number % 5 == 0 { "unknown" } else { "up" },
+                        "last_success_at":900 + number}}), &[], None)?;
+                tx.execute("UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                    params![(900 + (number * 17) % 100).to_string(), claim.id])?;
+            }
+            Ok(())
+        }).unwrap().unwrap();
+        let connection = store.readers.get();
+        let ranked = connection.prepare_cached(&smallclaims::store::canonical_sql(
+            "SELECT origin, subject, json_extract(body,'$.fields.status'),
+                    json_extract(body,'$.fields.last_success_at') FROM (
+                SELECT origin,subject,body,
+                    ROW_NUMBER() OVER (PARTITION BY origin,subject
+                        ORDER BY CANONICAL_DESC(claims)) AS rank
+                FROM claims WHERE kind='transport.observed'
+             ) WHERE rank=1 ORDER BY origin,subject",
+        )).unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u64>(3)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        drop(connection);
+        for now in [0, 1_000, 1_020, 1_000 + TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS] {
+            let expected = ranked.iter().filter(|(_, _, status, at)| status == "up"
+                && u128::from(*at) <= now.saturating_add(TRANSPORT_LINK_CLOCK_SKEW_MS)
+                && now.saturating_sub(u128::from(*at))
+                    < TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS)
+                .map(|(origin, subject, _, _)| (origin.clone(), subject.strip_prefix("host/").unwrap().into()))
+                .collect::<Vec<_>>();
+            assert_eq!(store.transport_links_at(now).unwrap(), expected, "now={now}");
+        }
+    }
+
+    #[test]
+    fn conversation_subject_owner_generated_histories_match_full_fold_and_sources() {
+        for seed in 0_u64..16 {
+            let store = Store::open_memory("tester").unwrap();
+            let subject = "agent/ada";
+            let mut random = seed + 1;
+            let mut frontiers = Vec::new();
+            let mut ids = Vec::new();
+            store.connection.batched(|tx| -> Result<()> {
+                for number in 0..40 {
+                    random = random.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let kind = match random % 8 {
+                        0 | 1 => "runtime.observed",
+                        2 => "runtime.reconcile-decision",
+                        3 => "custom.tester.identity",
+                        4 => "harness.observed",
+                        5 => "runtime.readiness-deadline-reached",
+                        6 => "reconcile.fault",
+                        _ if seed % 2 == 1 => "resource.observed",
+                        _ => "custom.tester.identity",
+                    };
+                    let mut fields = match (random >> 8) % 6 {
+                        0 => json!({"status":"running","host":"tester","runtime_id":"pty/ada",
+                            "incarnation_id":format!("ada-{number}")}),
+                        1 => json!({"status":"idle"}),
+                        2 => json!({"runtime_id":null,"incarnation_id":null}),
+                        3 => json!({"runtime_id":7,"incarnation_id":false}),
+                        4 => json!({"incarnation_id":format!("ada-{number}")}),
+                        _ => json!({"status":"stopped","runtime_id":"pty/reviewer"}),
+                    };
+                    if kind == "resource.observed" {
+                        fields["kind"] = json!(match (random >> 24) % 3 {
+                            0 => "vcs.issue", 1 => "vcs.pull-request", _ => "custom.tester",
+                        });
+                        fields["attribution_only"] = match (random >> 28) % 4 {
+                            0 => json!(true), 1 => json!(false), 2 => json!(1), _ => Value::Null,
+                        };
+                        fields["facts"] = json!({"opened_by":"person/alex","number":number});
+                    }
+                    let body = if random & 16 == 0 { json!({"fields":fields}) } else { fields };
+                    let origin = if (seed % 4 == 0 && kind == "runtime.observed")
+                        || random & 32 == 0 { "tester" } else { "reviewer" };
+                    let predecessors = if random & 64 == 0 { ids.clone() } else { Vec::new() };
+                    let claim = synthetic_owner_history_row(tx, origin, subject, kind,
+                        &body, &predecessors)?;
+                    // Numeric boundaries, equal-time canonical ties, and arrival/canonical
+                    // disagreement are deliberate; none may change a pinned answer.
+                    let accepted = [9, 10, 99, 100][((random >> 16) % 4) as usize];
+                    tx.execute("UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                        params![accepted.to_string(), claim.id])?;
+                    if number % 11 == 0 {
+                        tx.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES(?1)",
+                            [&claim.id])?;
+                    }
+                    ids.push(claim.id);
+                    frontiers.push(claim.store_index);
+                }
+                Ok(())
+            }).unwrap().unwrap();
+            for through in frontiers {
+                let connection = store.readers.get();
+                let actual = latest_actual_at(&connection, subject, Some(through)).unwrap();
+                let source = selected_actual_source_at(&connection, subject, Some(through), None).unwrap();
+                assert_eq!(identity_actual_source_at(&connection, subject, through).unwrap(), source,
+                    "source seed={seed}, through={through}");
+                let field = |name| actual.as_ref().and_then(|v| v.get(name))
+                    .and_then(Value::as_str).map(str::to_owned);
+                let expected = Owner { subject: subject.into(), incarnation: field("incarnation_id"),
+                    runtime: field("runtime_id"), origin: source.1 };
+                drop(connection);
+                assert_eq!(store.conversation_owners_at(through).unwrap().get(subject), Some(&expected),
+                    "fleet identity seed={seed}, through={through}");
+                assert_eq!(store.conversation_owner_at(subject, through).unwrap(), Some(expected),
+                    "identity seed={seed}, through={through}");
+            }
+            assert!(store.conversation_owner_at("agent/alex", store.index().unwrap()).unwrap().is_none());
+        }
+    }
 
     fn append(store: &Store, subject: &str, kind: &str, fields: Value) -> ClaimRecord {
         store
