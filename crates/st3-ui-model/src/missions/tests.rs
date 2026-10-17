@@ -16,19 +16,135 @@ fn window<T: DeserializeOwned>(items: Vec<Value>) -> Vec<T> {
         .collect()
 }
 
+/// st's agents as the fleet a presentation reads, as the daemon's roster serves them.
+struct Agents<'a>(&'a Inputs);
+
+fn seat(agent: &st3_client::Agent) -> Seat {
+    Seat {
+        id: agent.header.id.clone(),
+        label: agent.name.clone(),
+        state: agent.state.clone(),
+        fault: agent.fault.is_some(),
+        busy_with: agent
+            .current_work
+            .first()
+            .map(|work| (work.mission_id.clone(), work.path.clone())),
+    }
+}
+
+impl Fleet for Agents<'_> {
+    fn seat(&self, id: &str) -> Option<Seat> {
+        self.0
+            .agents
+            .iter()
+            .find(|agent| agent.header.id == id)
+            .map(seat)
+    }
+    fn queued_for(&self, step: &str) -> Option<Seat> {
+        self.0
+            .agents
+            .iter()
+            .find(|agent| {
+                agent.next_work_id.as_deref() == Some(step)
+                    || agent.upcoming_work_ids.iter().any(|id| id == step)
+            })
+            .map(seat)
+    }
+    fn mission_label(&self, mission: &str) -> String {
+        self.0
+            .missions
+            .iter()
+            .find(|shown| shown.header.id == mission)
+            .map(|shown| shown.header.id.clone())
+            .unwrap_or_else(|| mission.trim_start_matches("mission/").to_owned())
+    }
+    fn person_label(&self, person: &str) -> String {
+        person.to_owned()
+    }
+}
+
+/// Each mission as st serves it, with the presentation st computes for it.
+fn serve(input: &Inputs) -> Vec<st3_client::Mission> {
+    let gates = input
+        .attention
+        .iter()
+        .filter(|item| item.attention_kind == "human-gate")
+        .filter_map(|item| {
+            Some(Gate {
+                mission: item.mission_id.clone()?,
+                step: Some(item.source_id.clone()),
+                person: item.person_id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    input
+        .missions
+        .iter()
+        .map(|mission| {
+            let mut served = mission.clone();
+            served.presentation =
+                Some(serde_json::to_value(present(mission, &gates, &Agents(input))).unwrap());
+            served
+        })
+        .collect()
+}
+
+/// Serve each mission with its presentation, then read the rows as a client.
 fn project(input: &Inputs) -> Vec<Mission> {
+    read(input, &serve(input))
+}
+
+/// Read mission rows as a client does, exactly as st served them.
+fn read(input: &Inputs, missions: &[st3_client::Mission]) -> Vec<Mission> {
     adapt(
-        input.missions.iter(),
+        missions.iter(),
         input.agents.iter(),
         input.attention.iter(),
+        "person/avery",
         "2026-09-29T10:00:00Z",
         &Display {
             mission_label: &|mission| mission.header.id.clone(),
-            agent_label: &|agent| agent.name.clone(),
             age_label: &|_, _| "2m ago".into(),
             clean_text: &str::to_owned,
         },
     )
+}
+
+#[test]
+fn a_row_without_a_presentation_reads_unknown_and_derives_nothing() {
+    let model = Inputs {
+        missions: window(vec![json!({
+        "id": "mission/fleet/harbor/ship", "kind": "mission", "revision": "r1",
+        "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/ship",
+        "state": "running", "mission_revision": "r1", "runs": ["mission-run/ship-1"],
+        "run_details": [{
+            "id": "mission-run/ship-1", "requester": "person/avery", "status": "running",
+            "phase": "normal", "progress": {"done": 0, "total": 1}, "current_steps": [],
+            "must_act": "agent", "state_since": "2026-09-29T09:58:00Z",
+            "steps": [{
+                "id": "step-run/ship-1/build", "path": "build", "state": "working",
+                "claimant": "agent/keeper", "attempt": 1, "since": "2026-09-29T09:50:00Z",
+                "goals": [], "constraints": [], "blockers": [],
+            }],
+        }],
+        })]),
+        ..Default::default()
+    };
+    // An older st serves no presentation.
+    let missions = read(&model, &model.missions);
+    assert_eq!(missions[0].word, Word::Unknown);
+    assert_eq!(missions[0].label(), "running · st does not say");
+    assert_eq!(
+        (missions[0].steps[0].state, &missions[0].steps[0].owner),
+        (StepState::Unknown, &None)
+    );
+    // A word this client does not know reads unknown too, rather than a guess: the presentation
+    // st serves, complete but for its word.
+    let mut served = serve(&model);
+    served[0].presentation.as_mut().unwrap()["word"] = json!("becalmed");
+    assert_eq!(read(&model, &served)[0].word, Word::Unknown);
+    // The one st serves is the one it reads.
+    assert_eq!(project(&model)[0].word, Word::Working);
 }
 
 #[test]
@@ -296,14 +412,15 @@ fn metadata_case(
     };
     let mut model = input(vec![run("mission-run/audit-1", run_state, vec![raw_step])]);
     model.missions[0].state = run_state.into();
+    let served = serve(&model);
     let missions = adapt(
-        model.missions.iter(),
+        served.iter(),
         model.agents.iter(),
         model.attention.iter(),
+        "person/avery",
         "2026-09-29T10:00:00Z",
         &Display {
             mission_label: &|mission| mission.header.id.clone(),
-            agent_label: &|agent| agent.name.clone(),
             age_label: &|_, _| "2m ago".into(),
             // Metadata must bypass even a display policy that rewrites text.
             clean_text: &|_| "normalized".into(),

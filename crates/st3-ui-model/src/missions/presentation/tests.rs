@@ -156,7 +156,7 @@ fn a_ready_step_reads_from_the_queue_that_holds_it() {
     let offers = unstaffed
         .actions
         .iter()
-        .map(|action| (action.id, action.action))
+        .map(|action| (action.id, action.action.as_str()))
         .collect::<Vec<_>>();
     assert_eq!(
         offers,

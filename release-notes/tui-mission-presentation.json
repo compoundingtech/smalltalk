@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The terminal UI reads each mission's word, step states, owners and notes from st's presentation instead of deriving them",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites. words.json gains the mission word unknown, which a client shows for a row st serves no presentation on."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Upgrade daemons first. Against an st that serves no mission presentation, the terminal UI shows each mission's raw state with 'st does not say' and its steps as unknown, rather than a guessed word. The daemon summary's active-mission count is unchanged."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or swap-back restrictions."}
+}

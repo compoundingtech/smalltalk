@@ -1,10 +1,12 @@
 //! stui's mission semantics, independent of its collection model and terminal UI.
 
 use st3_client::MissionStep;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// One word naming who has to move, shared by every mission surface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Word {
     Decision,
@@ -26,6 +28,9 @@ pub enum Word {
     Cancelled,
     /// Published, and nobody has started a run of it.
     NotStarted,
+    /// st serves no presentation this client reads: an older st, one that has not read its agents
+    /// yet, or a word this client does not know. A client keeps no derivation of its own.
+    Unknown,
 }
 
 impl Word {
@@ -56,6 +61,7 @@ impl Word {
             Word::Failed => "failed",
             Word::Cancelled => "cancelled",
             Word::NotStarted => "not started",
+            Word::Unknown => "unknown",
         }
     }
     pub fn explain(self) -> &'static str {
@@ -73,11 +79,12 @@ impl Word {
             Word::Failed => "a step failed and nothing retried it",
             Word::Cancelled => "it was stopped before it finished",
             Word::NotStarted => "published, and never started",
+            Word::Unknown => "st does not say: an older st, or one that has not read its agents yet",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepState {
     Done,
@@ -88,6 +95,8 @@ pub enum StepState {
     NeedsYou,
     Failed,
     Pending,
+    /// st serves no presentation this client reads.
+    Unknown,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -145,9 +154,21 @@ pub struct Mission {
     /// When st last changed the mission (RFC 3339), so a list can age out what ended long ago.
     /// Empty when unknown.
     pub updated_at: String,
+    /// The mission's own state as st stores it, shown only when st serves no presentation.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub state: String,
 }
 
 impl Mission {
+    /// What a list calls the mission: its word, or, when st serves none (an older st, or one
+    /// that has not read its agents yet), its raw state and that st does not say.
+    pub fn label(&self) -> String {
+        match self.word {
+            Word::Unknown if !self.state.is_empty() => format!("{} · st does not say", self.state),
+            word => word.name().into(),
+        }
+    }
+
     pub fn progress(&self) -> (usize, usize) {
         (
             self.steps
@@ -162,7 +183,6 @@ impl Mission {
 /// Caller-owned display policies; none reads a clock or requires a renderer.
 pub struct Display<'a> {
     pub mission_label: &'a dyn Fn(&st3_client::Mission) -> String,
-    pub agent_label: &'a dyn Fn(&st3_client::Agent) -> String,
     /// Format an RFC3339 timestamp relative to the explicitly supplied RFC3339 `now`.
     pub age_label: &'a dyn Fn(&str, &str) -> String,
     /// Normalize goals, constraints and outcome reasons for display.
@@ -175,24 +195,6 @@ impl Display<'_> {
         label.truncate(label.trim_end_matches(" ago").len());
         label
     }
-}
-
-fn label_text<'a>(
-    mut missions: impl Iterator<Item = &'a st3_client::Mission>,
-    label: &st3_client::WorkLabel,
-    display: &Display<'_>,
-) -> String {
-    let mission = missions
-        .find(|mission| mission.header.id == label.mission_id)
-        .map(display.mission_label)
-        .unwrap_or_else(|| {
-            label
-                .mission_id
-                .trim_start_matches("mission/")
-                .trim_start_matches("agent/")
-                .to_owned()
-        });
-    format!("{mission} › {}", label.path)
 }
 
 /// The steps st sent with a mission: its open runs' steps, or its latest run's when none is open.
@@ -299,59 +301,45 @@ pub(crate) fn word(
     }
 }
 
+/// The mission word from its row and open gates alone, reading no agent queue: a ready step
+/// nobody holds reads unclaimed. A count of active missions reads this, so it never depends on
+/// which agent owns a ready queue.
+pub fn row_word(mission: &st3_client::Mission, gates: &[Gate]) -> Word {
+    let decision = gates.iter().any(|gate| gate.mission == mission.header.id);
+    word(mission, &mission_steps(mission), decision, |_| None)
+}
+
 /// Whether a step state means an agent (or st) has it in hand.
 pub(crate) fn in_hand(state: &str) -> bool {
     matches!(state, "claimed" | "working" | "running" | "verifying")
 }
 
-/// The agent whose queue holds this work, if st says.
-fn queued_for<'a>(
-    mut agents: impl Iterator<Item = &'a st3_client::Agent>,
-    work: &str,
-) -> Option<&'a st3_client::Agent> {
-    agents.find(|agent| {
-        agent.next_work_id.as_deref() == Some(work)
-            || agent.upcoming_work_ids.iter().any(|id| id == work)
-    })
-}
-
-/// Who holds or will take a step: its claimant, else its assignee, named.
-fn step_owner<'a>(
-    mut agents: impl Iterator<Item = &'a st3_client::Agent>,
-    step: &MissionStep,
-    display: &Display<'_>,
-) -> Option<String> {
-    if step.agentless {
-        return Some("st".into());
+/// How a client names who holds a step: "you" for its reader, else the name st serves.
+fn owner_text(owner: &Actor, reader: &str) -> Option<String> {
+    match owner {
+        Actor::Person { person, .. } if person == reader => Some("you".into()),
+        Actor::Person { label, .. } => Some(label.clone()),
+        Actor::Agent { agent, label } => Some(format!("{label} · {agent}")),
+        Actor::St => Some("st".into()),
+        Actor::Nobody => None,
     }
-    let id = step.claimant.as_deref().or(step.assignee.as_deref())?;
-    Some(
-        agents
-            .find(|agent| agent.header.id == id)
-            .map(|agent| format!("{} · {id}", (display.agent_label)(agent)))
-            .unwrap_or_else(|| id.to_owned()),
-    )
 }
 
-/// Derive mission semantics from typed borrowed projections.
+/// Mission rows for a client, from typed borrowed projections.
 ///
-/// `attention` must already be unresolved and filtered to the caller's actor. Collection loading,
+/// What each mission and step reads as comes from the presentation st serves on the mission row
+/// (`Mission.presentation`); a row without one reads `unknown`, and this keeps no derivation of
+/// its own. `attention` must already be unresolved and filtered to `reader`. Collection loading,
 /// clocks, naming policy and text normalization remain owned by the application.
 pub fn adapt<'a>(
     missions: impl Iterator<Item = &'a st3_client::Mission> + Clone,
     agents: impl Iterator<Item = &'a st3_client::Agent> + Clone,
     attention: impl Iterator<Item = &'a st3_client::Attention> + Clone,
+    reader: &str,
     now: &str,
     display: &Display<'_>,
 ) -> Vec<Mission> {
-    // A step a person's gate holds: its attention item is about the step itself.
-    let gated = attention
-        .clone()
-        .filter(|item| item.attention_kind == "human-gate")
-        .map(|item| item.source_id.as_str())
-        .collect::<BTreeSet<_>>();
     missions
-        .clone()
         .map(|mission| {
             let work = mission_steps(mission);
             let step_metadata = work
@@ -374,62 +362,25 @@ pub fn adapt<'a>(
                         && item.mission_id.as_deref() == Some(mission.header.id.as_str())
                 })
                 .map(|item| item.header.id.clone());
-            let word = word(mission, &work, decision.is_some(), |step| {
-                queued_for(agents.clone(), step).map(|agent| QueueOwner {
-                    down: matches!(agent.state.as_str(), "failed" | "stopped")
-                        || agent.fault.is_some(),
-                })
-            });
+            let presented = mission
+                .presentation
+                .as_ref()
+                .and_then(|value| <Presentation as serde::Deserialize>::deserialize(value).ok());
             let steps = work
                 .iter()
                 .map(|step| {
-                    let state = match step.state.as_str() {
-                        _ if gated.contains(step.id.as_str()) => StepState::NeedsYou,
-                        "completed" => StepState::Done,
-                        "claimed" | "working" | "running" | "verifying" => StepState::Working,
-                        "ready" => StepState::Ready,
-                        "waiting" | "pending" | "blocked" => StepState::Waiting,
-                        "cancelled" => StepState::Cancelled,
-                        "failed" => StepState::Failed,
-                        _ => StepState::Pending,
-                    };
-                    let note = if step.state == "ready" && step.claimant.is_none() {
-                        queued_for(agents.clone(), &step.id).map(|agent| {
-                            let label = (display.agent_label)(agent);
-                            match agent.current_work.first() {
-                                Some(current)
-                                    if !matches!(agent.state.as_str(), "failed" | "stopped") =>
-                                {
-                                    format!(
-                                        "queued for {label}, which is busy with {}",
-                                        label_text(missions.clone(), current, display)
-                                    )
-                                }
-                                _ => format!("queued for {label}, which is {}", agent.state),
-                            }
-                        })
-                    } else {
-                        None
-                    };
+                    let shown = presented.as_ref().and_then(|presented| {
+                        presented.steps.iter().find(|shown| shown.id == step.id)
+                    });
                     Step {
                         id: step.id.clone(),
                         seat: (!step.agentless)
                             .then(|| step.claimant.clone().or_else(|| step.assignee.clone()))
                             .flatten(),
                         name: step.path.clone(),
-                        state,
-                        owner: if state == StepState::NeedsYou {
-                            Some("you".into())
-                        } else {
-                            step_owner(agents.clone(), step, display)
-                        },
-                        // st keeps a step's last reason after it moves on; only a step still
-                        // waiting is held up by it.
-                        note: note.or_else(|| {
-                            matches!(step.state.as_str(), "waiting" | "blocked")
-                                .then(|| step.blocked_reason.clone())
-                                .flatten()
-                        }),
+                        state: shown.map_or(StepState::Unknown, |shown| shown.word),
+                        owner: shown.and_then(|shown| owner_text(&shown.owner, reader)),
+                        note: shown.and_then(|shown| shown.note.clone()),
                         after: vec![],
                         age: display.age(&step.since, now),
                         goals: step
@@ -459,6 +410,7 @@ pub fn adapt<'a>(
                 StepState::Ready => 3,
                 StepState::Waiting => 4,
                 StepState::Pending => 5,
+                StepState::Unknown => 6,
             });
             let active_agents = agents
                 .clone()
@@ -473,7 +425,9 @@ pub fn adapt<'a>(
             Mission {
                 id: mission.header.id.clone(),
                 title: (display.mission_label)(mission),
-                word,
+                word: presented
+                    .as_ref()
+                    .map_or(Word::Unknown, |presented| presented.word),
                 age: display.age(&mission.header.updated_at, now),
                 host: String::new(),
                 goals: vec![],
@@ -483,6 +437,7 @@ pub fn adapt<'a>(
                 kdl: None,
                 outcome: run_outcome(mission, now, display),
                 updated_at: mission.header.updated_at.clone(),
+                state: mission.state.clone(),
                 decision,
                 worktree: None,
                 parent: None,

@@ -171,22 +171,10 @@ fn native_lean_mission_membership_matches_full_cards() {
                 .collect::<Result<_, _>>()?;
             let (lean, _) = store.client_summary_missions(now)?;
             let project = |rows: &Vec<st3_client::Mission>| {
-                st3_ui_model::missions::adapt(
-                    rows.iter(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                    "",
-                    &Display {
-                        mission_label: &|m| m.header.id.clone(),
-                        agent_label: &|a| a.name.clone(),
-                        age_label: &|_, _| String::new(),
-                        clean_text: &str::to_owned,
-                    },
-                )
-                .into_iter()
-                .filter(active)
-                .map(|m| m.id)
-                .collect::<BTreeSet<_>>()
+                rows.iter()
+                    .filter(|m| active(m))
+                    .map(|m| m.header.id.clone())
+                    .collect::<BTreeSet<_>>()
             };
             assert_eq!(project(&full), project(&lean));
             assert_eq!(
@@ -590,7 +578,7 @@ fn summary_gate_does_not_reintroduce_an_out_of_grace_native_mission() {
     state
         .store
         .read_snapshot(|_| {
-            // Inject the hypothetical stale gate only into the presentation adapter:
+            // Inject the hypothetical stale gate only into the mission word:
             // current native attention normally fences terminal owning work itself.
             let gate: st3_client::Attention = serde_json::from_value(json!({
                 "id":"attention/summary-ended","kind":"attention","revision":"fixture",
@@ -599,23 +587,21 @@ fn summary_gate_does_not_reintroduce_an_out_of_grace_native_mission() {
                 "mission_id":"mission/summary-ended","title":"Fixture gate","detail":"Fixture",
                 "priority":"normal","state":"open","requested_at":client_timestamp(at)
             }))?;
+            let gates = [st3_ui_model::missions::Gate {
+                mission: gate.mission_id.clone().unwrap_or_default(),
+                step: Some(gate.source_id.clone()),
+                person: gate.person_id.clone(),
+            }];
             let project = |missions: &[st3_client::Mission]| {
-                st3_ui_model::missions::adapt(
-                    missions.iter(),
-                    std::iter::empty(),
-                    std::iter::once(&gate),
-                    "",
-                    &Display {
-                        mission_label: &|m| m.header.id.clone(),
-                        agent_label: &|a| a.name.clone(),
-                        age_label: &|_, _| String::new(),
-                        clean_text: &str::to_owned,
-                    },
-                )
-                .into_iter()
-                .filter(|m| !m.system && (active(m) || m.word == st3_ui_model::missions::Word::Decision))
-                .map(|m| m.id)
-                .collect::<BTreeSet<_>>()
+                missions
+                    .iter()
+                    .filter(|m| {
+                        let word = st3_ui_model::missions::row_word(m, &gates);
+                        !m.system
+                            && (word.is_active() || word == st3_ui_model::missions::Word::Decision)
+                    })
+                    .map(|m| m.header.id.clone())
+                    .collect::<BTreeSet<_>>()
             };
             let current_ids = state.store.mission_collection_ids(false, 0, 1000)?;
             assert!(!current_ids.iter().any(|id| id == "mission/summary-ended"));

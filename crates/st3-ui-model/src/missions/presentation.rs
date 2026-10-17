@@ -3,7 +3,7 @@
 //! instead of deriving their own (docs/clients/ui-contract.md, Mission).
 
 use super::{MissionStep, QueueOwner, StepState, Word, in_hand, mission_steps, word};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// What st says of an agent a mission reads: the seat that holds or queues one of its steps.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub trait Fleet {
 }
 
 /// Who must act on a mission, or holds a step.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Actor {
     /// A person must decide. A client says "you" when the person is its reader.
@@ -61,7 +61,7 @@ pub enum Actor {
     Nobody,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepPresentation {
     pub id: String,
     pub path: String,
@@ -75,14 +75,14 @@ pub struct StepPresentation {
     pub keep_open: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatRef {
     pub id: String,
     pub label: String,
     pub state: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stuck {
     pub step: String,
     pub word: StepState,
@@ -92,14 +92,14 @@ pub struct Stuck {
     pub agent: Option<SeatRef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Work {
     pub mission: String,
     pub path: String,
     pub label: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedBehind {
     pub agent: String,
     pub label: String,
@@ -109,14 +109,14 @@ pub struct QueuedBehind {
     pub state: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Card {
     WhatYouCanDo,
     NothingToDo,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Offer {
     RetryStep,
@@ -126,22 +126,22 @@ pub enum Offer {
 }
 
 /// Something a person can do, as the client-v0 action that does it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Action {
     pub id: Offer,
-    pub action: &'static str,
+    pub action: String,
     pub target: String,
     /// Binding: the client asks for a second tap first.
     pub confirm: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
     pub done: usize,
     pub total: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presentation {
     pub word: Word,
     pub system: bool,
@@ -179,6 +179,7 @@ fn rank(state: StepState) -> u8 {
         StepState::Ready => 3,
         StepState::Waiting => 4,
         StepState::Pending => 5,
+        StepState::Unknown => 6,
     }
 }
 
@@ -361,7 +362,7 @@ pub fn present(mission: &st3_client::Mission, gates: &[Gate], fleet: &dyn Fleet)
         if stuck.word == StepState::Failed {
             actions.push(Action {
                 id: Offer::RetryStep,
-                action: "work.retry",
+                action: "work.retry".into(),
                 target: stuck.step.clone(),
                 confirm: false,
             });
@@ -379,14 +380,15 @@ pub fn present(mission: &st3_client::Mission, gates: &[Gate], fleet: &dyn Fleet)
                         "agent.start"
                     } else {
                         "runtime.restart"
-                    },
+                    }
+                    .into(),
                     target: seat.id.clone(),
                     confirm: true,
                 });
             }
             actions.push(Action {
                 id: Offer::Chat,
-                action: "message.send",
+                action: "message.send".into(),
                 target: seat.id.clone(),
                 confirm: false,
             });
@@ -398,7 +400,7 @@ pub fn present(mission: &st3_client::Mission, gates: &[Gate], fleet: &dyn Fleet)
         {
             actions.push(Action {
                 id: Offer::CancelRun,
-                action: "mission.cancel",
+                action: "mission.cancel".into(),
                 target: run.id.clone(),
                 confirm: true,
             });
