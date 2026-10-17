@@ -50,15 +50,6 @@ impl HookEnv for ProcessEnv {
     }
 }
 
-impl HookEnv for BTreeMap<String, String> {
-    fn raw_var(&self, name: &str) -> Option<String> {
-        self.get(name).cloned()
-    }
-    fn var(&self, name: &str) -> Option<String> {
-        self.get(name).filter(|value| !value.is_empty()).cloned()
-    }
-}
-
 fn hook_var(env: &dyn HookEnv, name: &str) -> Option<String> {
     st_drivers::contracts::env_with(name, &|key| env.raw_var(key))
 }

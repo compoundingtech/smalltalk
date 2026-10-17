@@ -24,7 +24,7 @@ const WINDOWS: [&str; 3] = ["1m", "5m", "1h"];
 
 /// Gauges for the live windows in `report` (the request-latency read's `targets`), or `None`
 /// when it holds nothing to send.
-pub(super) fn metrics(node: &str, report: &Value, now_unix_ms: u64) -> Option<Value> {
+pub fn metrics(node: &str, report: &Value, now_unix_ms: u64) -> Option<Value> {
     let time = (now_unix_ms * 1_000_000).to_string();
     let mut latency = Vec::new();
     let mut over = Vec::new();
@@ -371,31 +371,6 @@ mod tests {
     fn a_report_with_nothing_in_it_sends_nothing() {
         assert!(metrics("node-a", &Value::Null, 1).is_none());
         assert!(metrics("node-a", &json!({"targets": []}), 1).is_none());
-    }
-
-    #[test]
-    fn the_live_report_names_every_target_in_the_targets_file() {
-        let report = crate::api::request_latency_target_windows();
-        assert!(report.get("paths").is_none(), "the collector's read skips every path");
-        let body = metrics("node-a", &report, 1).unwrap();
-        let samples = points(&body, "st_slo_samples");
-        for latency in &crate::slo::targets().latency {
-            assert!(
-                samples.iter().any(|point| label(point, "target") == Some(latency.name.as_str())),
-                "{} is missing",
-                latency.name
-            );
-        }
-        // A share target is a minimum on its own gauge, never a sample count.
-        let minimums = points(&body, "st_slo_min_share_percent");
-        for share in &crate::slo::targets().share {
-            assert!(minimums.iter().any(|point| label(point, "target") == Some(share.name.as_str())));
-            assert!(!samples.iter().any(|point| label(point, "target") == Some(share.name.as_str())));
-        }
-        for store in ["sql-statement", "transaction"] {
-            assert!(samples.iter().any(|point| label(point, "target") == Some(store)), "{store}");
-        }
-        assert!(!points(&body, "st_slo_cpu_cores").is_empty());
     }
 
     #[tokio::test]

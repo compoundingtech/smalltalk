@@ -10,13 +10,22 @@ use serde_json::{Value, json};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-use crate::model::ClaimInput;
+use st3_kernel::model::ClaimInput;
 
 /// What a hook sees of its process environment.
 pub trait HookEnv {
     fn var(&self, name: &str) -> Option<String>;
     fn raw_var(&self, name: &str) -> Option<String> {
         self.var(name)
+    }
+}
+
+impl HookEnv for BTreeMap<String, String> {
+    fn raw_var(&self, name: &str) -> Option<String> {
+        self.get(name).cloned()
+    }
+    fn var(&self, name: &str) -> Option<String> {
+        self.get(name).filter(|value| !value.is_empty()).cloned()
     }
 }
 

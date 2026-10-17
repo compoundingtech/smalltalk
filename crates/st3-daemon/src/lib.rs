@@ -52,7 +52,7 @@ pub mod handoff;
 pub(crate) mod graph_watch_ivm;
 pub use st3_kernel::harness_events;
 pub use st3_kernel::hooks;
-pub mod incremental;
+pub use st3_telemetry::incremental;
 pub use st3_kernel::instance;
 pub use st3_kernel::lane;
 pub mod mailbox;
@@ -76,7 +76,7 @@ pub mod omp_ask_resume;
 // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 pub use st3_telemetry::otel;
 pub use st3_telemetry::otel_client_class;
-pub mod otlp;
+pub use st3_telemetry::otlp;
 pub mod peer;
 pub mod placement;
 pub mod person_request;
@@ -105,7 +105,7 @@ pub mod sekrets;
 pub mod sekrets_daemon;
 pub mod service;
 pub use st3_kernel::skill;
-pub mod slo;
+pub use st3_telemetry::slo;
 pub use st3_telemetry::slo_history;
 pub mod startup;
 pub use st3_telemetry::startup_telemetry;
@@ -115,11 +115,13 @@ pub mod subagents;
 pub mod suspension;
 pub(crate) use st3_kernel::publication;
 pub mod seat_snapshot;
-pub mod telemetry;
+pub use st3_telemetry::telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 #[cfg(test)]
 mod kernel_tests;
+#[cfg(test)]
+mod telemetry_tests;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
 pub use st3_kernel::terminal_binding;

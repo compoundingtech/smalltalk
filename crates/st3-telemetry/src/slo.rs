@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn every_route_path_in_the_targets_file_is_a_route_the_daemon_serves() {
-        let source = include_str!("api.rs");
+        let source = include_str!("../../st3-daemon/src/api.rs");
         for latency in &targets().latency {
             for path in &latency.paths {
                 let Some(route) = path.strip_prefix("GET ").or(path.strip_prefix("POST ")) else {
