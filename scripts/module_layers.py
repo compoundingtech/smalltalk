@@ -16,7 +16,7 @@ import os
 import re
 import tomllib
 
-SOURCE_DIRS = ("crates/st3-core/src", "crates/st3-kernel/src", "crates/st3-telemetry/src", "crates/st3-daemon/src", "crates/st3/src")
+SOURCE_DIRS = ("crates/st3-core/src", "crates/st3-kernel/src", "crates/st3-telemetry/src", "crates/st3-store/src", "crates/st3-daemon/src", "crates/st3/src")
 ENTRY_FILES = {"lib", "main", "fixture"}
 TEST_ONLY_MODULES = {"test_support"}
 REEXPORTS = {
@@ -30,7 +30,7 @@ REEXPORTS = {
 LAYERS_FILE = ".st/module-layers.json"
 _TEST_PATH = re.compile(r"(_tests?\.rs$|/tests?\.rs$|/tests/)")
 _CFG_TEST = re.compile(
-    r"#\[cfg\(\s*(?:test|all\(test[^)]*\))\s*\)\]\s*(?:#\[[^\]]*\]\s*)*"
+    r"#\[cfg\(\s*(?:test|all\(test[^)]*\)|any\(test,\s*feature\s*=\s*\"test-support\"\))\s*\)\]\s*(?:#\[[^\]]*\]\s*)*"
     r"(?:pub(?:\([^)]*\))?\s+)?(?:mod\s+\w+\s*\{|fn\s|use\s|impl|const|static|struct|enum|mod\s+\w+;|async fn|type|trait)"
 )
 

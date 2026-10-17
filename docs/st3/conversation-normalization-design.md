@@ -40,7 +40,7 @@ A torn prefix can produce both a raw block and a recovered typed record.
 ### Native record visibility audit
 
 The sole omission table is `omission_reason` in
-`crates/st3-daemon/src/external_sessions.rs`: one named match arm per permitted type with
+`crates/st3-store/src/external_sessions.rs`: one named match arm per permitted type with
 an explicit reason. It omits only the four categories below. Nothing else may be
 dropped by a parser branch: an otherwise empty projection falls back to raw JSON.
 The coverage test uses harness-specific native record fixtures, the redacted OMP
@@ -72,7 +72,7 @@ OpenCode items whose native rows fit the input bound receive bounded display stu
 and full owner continuations. Rows exceeding that bound produce explicit
 not-fetchable notices, rather than disappearing or acquiring unusable refs.
 
-The normalizer in `crates/st3-daemon/src/external_sessions.rs` retains exposed reasoning and
+The normalizer in `crates/st3-store/src/external_sessions.rs` retains exposed reasoning and
 image references. A 512-character unknown excerpt is a UI preference only. Native
 transcript formats remain authoritative.
 

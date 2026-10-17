@@ -29,8 +29,8 @@ class Classify(unittest.TestCase):
         self.git("config", "user.name", "t")
         (self.repo / ".st").mkdir()
         (self.repo / ".st/risky-classes.json").write_text((HERE.parent / ".st/risky-classes.json").read_text())
-        self.write("crates/st3-daemon/src/store/mailbox_x.rs", "fn a() {}\n")
-        self.write("crates/st3-daemon/src/store/plain.rs", "fn a() {}\n")
+        self.write("crates/st3-store/src/store/mailbox_x.rs", "fn a() {}\n")
+        self.write("crates/st3-store/src/store/plain.rs", "fn a() {}\n")
         self.write("docs/readme.md", "x\n")
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "start")
@@ -61,28 +61,28 @@ class Classify(unittest.TestCase):
         self.assertEqual((result["full"], result["classes"]), (False, []))
 
     def test_an_added_index_in_an_ordinary_store_file_is_schema(self):
-        result = self.change({"crates/st3-daemon/src/store/plain.rs": 'fn a() {}\nconst DDL: &str = "CREATE INDEX idx ON t(c)";\n'})
+        result = self.change({"crates/st3-store/src/store/plain.rs": 'fn a() {}\nconst DDL: &str = "CREATE INDEX idx ON t(c)";\n'})
         self.assertEqual(self.names(result), ["schema"])
         self.assertIn("CREATE INDEX", result["classes"][0]["lines"][0])
 
     def test_an_ordinary_change_to_the_same_file_is_not(self):
-        self.assertEqual(self.change({"crates/st3-daemon/src/store/plain.rs": "fn a() { 1; }\n"})["classes"], [])
+        self.assertEqual(self.change({"crates/st3-store/src/store/plain.rs": "fn a() { 1; }\n"})["classes"], [])
 
     def test_removing_a_trigger_counts_too(self):
-        self.write("crates/st3-daemon/src/store/plain.rs", 'const T: &str = "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END";\n')
+        self.write("crates/st3-store/src/store/plain.rs", 'const T: &str = "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END";\n')
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "trigger")
-        self.assertEqual(self.names(self.change({"crates/st3-daemon/src/store/plain.rs": "fn a() {}\n"})), ["schema"])
+        self.assertEqual(self.names(self.change({"crates/st3-store/src/store/plain.rs": "fn a() {}\n"})), ["schema"])
 
     def test_path_classes(self):
-        result = self.change({"Cargo.lock": "x\n", "crates/st3-daemon/src/store/mailbox_x.rs": "fn b() {}\n", "release-notes/n.json": "{}\n"})
+        result = self.change({"Cargo.lock": "x\n", "crates/st3-store/src/store/mailbox_x.rs": "fn b() {}\n", "release-notes/n.json": "{}\n"})
         self.assertEqual(self.names(result), ["config-and-build", "release-notes", "routing-and-delivery"])
 
     def test_double_star_crosses_directories_and_star_does_not(self):
         self.assertTrue(classify_risk.matches(["clients/**/generated/**"], "clients/typescript/st3-client/generated/a.ts"))
         self.assertTrue(classify_risk.matches(["**/Cargo.toml"], "Cargo.toml"))
         self.assertTrue(classify_risk.matches(["**/Cargo.toml"], "crates/a/b/Cargo.toml"))
-        self.assertFalse(classify_risk.matches(["crates/st3/src/*.rs"], "crates/st3-daemon/src/store/x.rs"))
+        self.assertFalse(classify_risk.matches(["crates/st3/src/*.rs"], "crates/st3-store/src/store/x.rs"))
 
     # Globs that matched no tracked file when the rules were written. They guard paths that do not
     # exist yet (or no longer do); every other glob must match a tracked file, so moving code without
@@ -92,7 +92,7 @@ class Classify(unittest.TestCase):
         "crates/smallclaims/src/**/migrat*",
         "crates/smallclaims/src/**/replay*",
         "crates/st3-daemon/src/api/client_web*",
-        "crates/st3-daemon/src/sekrets.rs",
+        "crates/st3-store/src/sekrets.rs",
     }
 
     def test_every_glob_matches_a_tracked_file_or_is_listed(self):
