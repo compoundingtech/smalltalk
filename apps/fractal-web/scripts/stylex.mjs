@@ -32,6 +32,104 @@ const pendingCssPlaceholder = '#--overeng-stylex--{compiled:pending}'
  */
 const stylexRuntimePackage = '@stylexjs/stylex'
 
+
+/**
+ * Enables every deferred `link[data-wf-stylex-bootstrap]` together once all have loaded, and
+ * publishes that as `window.__wfStylexReady`. Delay or failure keeps the themed shell and adds a
+ * reload action. Classic inline script: the HTML CSP hashes it, so it needs no inline handlers.
+ */
+const stylesheetBootstrap = `;(() => {
+      const sheets = [...document.querySelectorAll('link[data-wf-stylex-bootstrap]')]
+      if (sheets.length === 0) return
+      // Capture readiness before StyleX's runtime disables the loaded link in favor of its style node.
+      let resolveReady
+      window.__wfStylexReady = new Promise(resolve => { resolveReady = resolve })
+      let observer
+      let timer
+      const show = (message) => {
+        const host = document.querySelector('[data-wf-workspace-skeleton]')
+        if (!host) { document.addEventListener('DOMContentLoaded', () => show(message), { once: true }); return }
+        host.removeAttribute('aria-hidden')
+        document.querySelector('[data-wf-shell-skeleton]')?.setAttribute('aria-busy', 'false')
+        let notice = host.querySelector('[data-wf-style-failure]')
+        if (!notice) {
+          notice = document.createElement('div')
+          notice.dataset.wfStyleFailure = ''
+          notice.setAttribute('role', 'status')
+          const text = document.createElement('p')
+          const retry = document.createElement('button')
+          retry.type = 'button'; retry.textContent = 'Reload workspace'; retry.onclick = () => location.reload()
+          notice.append(text, retry); host.append(notice)
+        }
+        notice.querySelector('p').textContent = message
+      }
+      const ready = () => {
+        clearTimeout(timer)
+        for (const sheet of sheets) sheet.media = 'all'
+        observer?.disconnect()
+        document.querySelector('[data-wf-style-failure]')?.remove()
+        document.querySelector('[data-wf-workspace-skeleton]')?.setAttribute('aria-hidden', 'true')
+        document.querySelector('[data-wf-shell-skeleton]')?.setAttribute('aria-busy', 'true')
+        resolveReady()
+      }
+      // Enable the sheets together: a partly applied cascade would paint unstyled workspace chrome.
+      const pending = new Set(sheets.filter(sheet => !sheet.sheet))
+      if (pending.size === 0) ready()
+      else {
+        for (const sheet of pending) {
+          sheet.addEventListener('load', () => { pending.delete(sheet); if (pending.size === 0) ready() }, { once: true })
+          sheet.addEventListener('error', () => { clearTimeout(timer); show('Workspace styles could not load. Your saved drafts are unchanged.') }, { once: true })
+        }
+        timer = setTimeout(() => show('Workspace styles are taking longer to load. Your saved drafts are unchanged.'), 5000)
+        // The development runtime can win the transfer race and disable the link before its load event.
+        const runtimeReady = () => {
+          const style = document.getElementById('__stylex_virtual__')
+          if (style?.sheet && style.textContent) ready()
+        }
+        observer = new MutationObserver(runtimeReady)
+        observer.observe(document.head, { childList: true, subtree: true, characterData: true })
+        runtimeReady()
+      }
+    })()`
+
+/** Keep the inline first-paint shell independent of the development CSS transfer. */
+export const deferStylexDevTags = (tags) => {
+  if (!Array.isArray(tags)) return tags
+  const deferred = tags.map((tag) => tag.tag === 'link' && tag.attrs?.rel === 'stylesheet'
+    ? { ...tag, attrs: { ...tag.attrs, media: 'print', 'data-wf-stylex-bootstrap': '' } }
+    : tag)
+  if (!deferred.some((tag) => tag.attrs?.['data-wf-stylex-bootstrap'] !== undefined)) return deferred
+  return [...deferred, { tag: 'script', injectTo: 'head', children: stylesheetBootstrap }]
+}
+
+/** A stylesheet link exactly as `vite:build-html` serializes the bundle's CSS tags. */
+const builtStylesheetLink = /<link rel="stylesheet"(?: crossorigin)? href="[^"]+">/g
+
+/**
+ * Production counterpart of `deferStylexDevTags`. The entry's processed CSS (StyleX rules and
+ * every stylesheet the entry imports) reaches the page only as links Vite appends to the head;
+ * those would block the inline themed shell. Runs after Vite injected them, defers each one, and
+ * appends the same readiness bootstrap. The source document carries no stylesheet link of its
+ * own: Vite copies a `media` link verbatim instead of processing it.
+ *
+ * @returns {Plugin}
+ */
+export const deferBuiltStylesheets = () => ({
+  name: 'fractal:defer-built-stylesheets',
+  apply: 'build',
+  transformIndexHtml: {
+    order: 'post',
+    handler(html) {
+      let deferred = 0
+      const rewritten = html.replace(builtStylesheetLink, (link) => {
+        deferred++
+        return link.replace(/>$/, ' media="print" data-wf-stylex-bootstrap>')
+      })
+      if (deferred === 0) return html
+      return { html: rewritten, tags: [{ tag: 'script', injectTo: 'head', children: stylesheetBootstrap }] }
+    },
+  },
+})
 /** @param {string} id */
 const stripQuery = (id) => id.split('?')[0] ?? id
 
@@ -129,8 +227,12 @@ export const createStylexVitePlugins = ({
   const {
     generateBundle: _pickAssetInGenerateBundle,
     writeBundle: _appendToDisk,
+    transformIndexHtml: injectDevTags,
     ...compiler
   } = upstream
+  compiler.transformIndexHtml = function (...args) {
+    return deferStylexDevTags(injectDevTags?.apply(this, args))
+  }
   /**
    * Keeps StyleX runtime pre-bundling inside dev-server start-up.
    *

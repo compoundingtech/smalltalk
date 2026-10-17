@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Paint the Fractal workspace shell in the saved dark or light scheme before hydration, with a navigation skeleton and explicit application readiness milestones.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Web shell presentation and readiness measurements only. No client protocol or persisted-state migration. Cold-open story plays cover both schemes and reject injected white-page and missing-skeleton regressions."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

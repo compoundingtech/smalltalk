@@ -11,6 +11,16 @@ it('hashes only inline scripts, normalizing HTML line endings and deduplicating 
   expect(policy('app.example')).not.toContain("'unsafe-eval'")
   expect(policy('app.example')).toContain("connect-src 'self' ws://app.example wss://app.example;")
 })
+it("hashes the document's inline stylesheets without admitting inline or data: styles", () => {
+  const css = '\nhtml { background: var(--wf-boot-canvas, #0a0a0a); }\n'
+  const hash = createHash('sha256').update(css).digest('base64')
+  const policy = createContentSecurityPolicy(`<style data-wf-shell-bootstrap>${css.replaceAll('\n', '\r\n')}</style><style></style>`)('app.example')
+  expect(policy).toContain(`style-src 'self' 'sha256-38RhXrc7EdReTKsOm23ZPOCUgniTUUcjky8QOOrQx6o=' 'sha256-gYiS/BvZvRcK27JIXTuwhZ3hs2+VJ1X+2gUlE+farlg=' 'sha256-${hash}';`)
+  const styleSrc = policy.split('; ').find(directive => directive.startsWith('style-src '))
+  expect(styleSrc).not.toContain("'unsafe-inline'")
+  expect(styleSrc).not.toContain('data:')
+  expect(policy).not.toContain('style-src-elem')
+})
 it('allows only explicitly configured connection origins, never arbitrary CSP source expressions', () => {
   const policy = createContentSecurityPolicy('', ['https://collector.example', 'https://collector.example'])
   expect(policy('app.example')).toContain("connect-src 'self' ws://app.example wss://app.example https://collector.example;")

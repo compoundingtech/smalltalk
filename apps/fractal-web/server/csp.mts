@@ -32,11 +32,16 @@ export const createContentSecurityPolicy = (
   html = '', connectOrigins: readonly string[] = [], { development = false }: { readonly development?: boolean } = {},
 ): ((authority?: string) => string) => {
   const hashes = new Set<string>()
+  const styleHashes = new Set<string>()
+  // HTML parsing normalizes CR/CRLF before the browser checks a script or style hash.
+  const hash = (source: string) => `'sha256-${createHash('sha256').update(source.replace(/\r\n?/g, '\n')).digest('base64')}'`
   for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
     if (/\bsrc\s*=/i.test(match[1]!) || match[2] === '') continue
-    // HTML parsing normalizes CR/CRLF before the browser checks a script hash.
-    const code = match[2]!.replace(/\r\n?/g, '\n')
-    hashes.add(`'sha256-${createHash('sha256').update(code).digest('base64')}'`)
+    hashes.add(hash(match[2]!))
+  }
+  // The themed first-paint shell is an inline stylesheet; it must apply before any bundle CSS loads.
+  for (const match of html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)) {
+    if (match[1] !== '') styleHashes.add(hash(match[1]!))
   }
   const origins = [...new Set(connectOrigins.map(connectionOrigin))]
   const beforeConnections = [
@@ -44,8 +49,8 @@ export const createContentSecurityPolicy = (
     // The terminal key encoder compiles WebAssembly; 'wasm-unsafe-eval' allows that without allowing eval().
     ["script-src 'self' 'wasm-unsafe-eval'", ...hashes].join(' '),
     // Runtime StyleX variables and React Aria geometry need style attributes.
-    // Fixed React Aria stylesheet elements use hashes; only Vite dev is unbounded.
-    ["style-src 'self'", ...reactAriaStyleSources].join(' '),
+    // Fixed React Aria stylesheet elements and the document's own inline styles use hashes; only Vite dev is unbounded.
+    ["style-src 'self'", ...reactAriaStyleSources, ...styleHashes].join(' '),
     "style-src-attr 'unsafe-inline'",
     ...(development ? ["style-src-elem 'self' 'unsafe-inline'"] : []),
     "img-src 'self' data: blob:",

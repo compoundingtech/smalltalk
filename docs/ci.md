@@ -552,10 +552,13 @@ workflow-level path filters. `linux-gate` does not depend on them.
   into a fresh temporary output directory, removed on exit. Build errors fail the
   execution job; build output is not cached. The config's `fractalCssAssets` plugin
   (`apps/fractal-web/scripts/vite-css-assets.mjs`) fails every production build that
-  emits a stylesheet without rules, or a chunk that loads a font file no `@font-face`
-  in its loaded stylesheets declares. The preceding CSS asset guard lane builds
-  fixtures that must trip both failures, and controls (quoted URLs with parentheses,
-  faces declared by the entry's stylesheet) that must pass.
+  emits a stylesheet without rules or with an unprocessed `@import`, a chunk that
+  loads a font file no `@font-face` in its loaded stylesheets declares, or a page
+  linking a stylesheet that is not a CSS asset of the bundle (such as the `data:` URL
+  Vite makes of a copied `<link media>`). The preceding CSS asset guard lane builds
+  fixtures that must trip these failures, and controls (quoted URLs with parentheses,
+  faces declared by the entry's stylesheet, the deferred processed app stylesheet)
+  that must pass.
   App, UI kit, Storybook, browser and performance lanes join the script with the
   packages that add them. The detector separately emits `kit-inputs`: app-only changes
   skip kit play-index contracts, Storybook and strict browser plays; kit source,

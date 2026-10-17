@@ -5,6 +5,37 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>webfractal</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzE4MTgxYiIvPjxwYXRoIGQ9Ik05IDhoMTV2NEgxM3Y0aDl2NGgtOXY2SDl6IiBmaWxsPSIjZmFmYWZhIi8+PC9zdmc+" />
+    <script data-wf-theme-bootstrap>
+      ;(() => {
+        let scheme = 'dark'
+        try {
+          const saved = JSON.parse(localStorage.getItem('wf.ui@1') ?? 'null')
+          const entry = saved?.version === 1 ? saved.entries?.['round2.scheme'] : undefined
+          if (entry?.version === 1 && (entry.value === 'dark' || entry.value === 'light')) scheme = entry.value
+        } catch {}
+        const root = document.documentElement
+        root.dataset.scheme = scheme
+        root.style.colorScheme = scheme
+        root.style.setProperty('--wf-boot-canvas', scheme === 'dark' ? '#0a0a0a' : '#fcfcfc')
+        root.style.setProperty('--wf-boot-sidebar', scheme === 'dark' ? '#000000' : '#ffffff')
+        root.style.setProperty('--wf-boot-line', scheme === 'dark' ? '#242424' : '#e4e4e7')
+      })()
+    </script>
+    <style data-wf-shell-bootstrap>
+      html { background: var(--wf-boot-canvas, #0a0a0a); color-scheme: dark; }
+      html, body, #root { height: 100%; margin: 0; }
+      body { background: var(--wf-boot-canvas, #0a0a0a); }
+      [data-wf-shell-skeleton] { display: flex; height: 100dvh; background: var(--wf-boot-canvas, #0a0a0a); }
+      [data-wf-sidebar-skeleton] { width: 256px; max-width: 40vw; padding: 8px; box-sizing: border-box; background: var(--wf-boot-sidebar, #000000); border-right: 1px solid var(--wf-boot-line, #242424); }
+      [data-wf-sidebar-skeleton] > div { height: 40px; display: flex; align-items: center; gap: 8px; }
+      [data-wf-sidebar-skeleton] i { width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0; background: var(--wf-boot-line, #242424); }
+      [data-wf-sidebar-skeleton] span { height: 8px; width: 65%; border-radius: 4px; background: var(--wf-boot-line, #242424); }
+      [data-wf-workspace-skeleton] { flex: 1; }
+      [data-wf-header-skeleton] { height: 52px; box-sizing: border-box; border-bottom: 1px solid var(--wf-boot-line, #242424); display: flex; align-items: center; padding-inline: 16px; }
+      [data-wf-header-skeleton] span { width: 140px; height: 8px; border-radius: 4px; background: var(--wf-boot-line, #242424); }
+      [data-wf-style-failure] { padding: 16px; font: 12px/1.5 system-ui, sans-serif; color: CanvasText; }
+      [data-wf-style-failure] p { margin-block: 0 8px; }
+    </style>
     <script data-wf-early-connect>
       // Early roster connect: open the collections socket and subscribe to the fleet roster while
       // the main bundle loads. The SDK (`@st3/sdk/effect` early.ts) takes this handle, adopts the
@@ -79,11 +110,19 @@
         globalThis[key] = handle
       })()
     </script>
-    <!-- After the early script: a pending stylesheet would block that classic script. -->
-    <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div data-wf-shell-skeleton role="status" aria-label="Loading workspace" aria-busy="true">
+        <aside data-wf-sidebar-skeleton aria-label="Loading sidebar">
+          <div><i></i><span></span></div><div><i></i><span></span></div>
+          <div><i></i><span></span></div><div><i></i><span></span></div>
+          <div><i></i><span></span></div><div><i></i><span></span></div>
+          <div><i></i><span></span></div><div><i></i><span></span></div>
+        </aside>
+        <div data-wf-workspace-skeleton aria-hidden="true"><div data-wf-header-skeleton><span></span></div></div>
+      </div>
+    </div>
     <script type="module" src="/main.tsx"></script>
   </body>
 </html>

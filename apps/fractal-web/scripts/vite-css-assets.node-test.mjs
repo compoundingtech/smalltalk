@@ -5,11 +5,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { build } from 'vite'
+import { deferBuiltStylesheets } from './stylex.mjs'
 import { fractalCssAssets } from './vite-css-assets.mjs'
 
 // The terminal's shape: the entry lazily loads a chunk that imports its face stylesheet
 // and loads the font file by URL, as terminalFonts.ts does.
-const buildFixture = async (files) => {
+const buildFixture = async (files, plugins = []) => {
   const root = await mkdtemp(join(tmpdir(), 'fractal-css-assets-'))
   try {
     const fixture = {
@@ -22,7 +23,7 @@ const buildFixture = async (files) => {
       root,
       configFile: false,
       logLevel: 'silent',
-      plugins: [fractalCssAssets()],
+      plugins: [...plugins, fractalCssAssets()],
       build: { write: false },
     })
     return (Array.isArray(result) ? result : [result]).flatMap((output) => output.output)
@@ -83,5 +84,54 @@ test('negative: a preloaded font without a declared face fails even when other r
       'Mono.woff2': font(),
     }),
     /assets\/terminal-[\w-]+\.js loads assets\/Mono-[\w-]+\.woff2, but no @font-face in its stylesheets \(assets\/terminal-[\w-]+\.css\) declares it/,
+  )
+})
+
+// The app document's shape: an inline themed shell, then the application stylesheet,
+// whose first rule imports the kit's tokens.
+const page = (link = '') => `<!doctype html><html><head><style data-wf-shell-bootstrap>html { background: #0a0a0a; }</style>${link}</head><body><script type="module" src="./main.js"></script></body></html>\n`
+const appCss = (padding = '') => `@import './tokens.css';\nhtml { height: 100%; }\n${padding}`
+const tokens = ':root { --canvas: #0a0a0a; }\n'
+
+test('control: the imported app stylesheet is processed and deferred behind the shell', async () => {
+  const output = await buildFixture({
+    'index.html': page(),
+    'main.js': "import './app.css'\n",
+    'app.css': appCss(),
+    'tokens.css': tokens,
+  }, [deferBuiltStylesheets()])
+  const html = String(output.find((asset) => asset.fileName === 'index.html')?.source)
+  const stylesheet = output.find((asset) => asset.fileName.endsWith('.css'))
+  assert.ok(stylesheet)
+  assert.ok(!String(stylesheet.source).includes('@import'))
+  assert.ok(String(stylesheet.source).includes('--canvas'))
+  assert.ok(html.includes(`<link rel="stylesheet" crossorigin href="/${stylesheet.fileName}" media="print" data-wf-stylex-bootstrap>`))
+  assert.ok(!html.includes('data:text/css'))
+  // The shell's inline style precedes the deferred link, and the readiness bootstrap follows it.
+  assert.ok(html.indexOf('data-wf-shell-bootstrap') < html.indexOf('data-wf-stylex-bootstrap'))
+  assert.ok(html.indexOf('data-wf-stylex-bootstrap>') < html.indexOf("querySelectorAll('link[data-wf-stylex-bootstrap]')"))
+})
+
+test('negative: a media stylesheet link ships the raw stylesheet as a data: URL and fails the build', async () => {
+  await assert.rejects(
+    buildFixture({
+      'index.html': page('<link rel="stylesheet" href="/app.css" media="print" />'),
+      'main.js': 'export {}\n',
+      'app.css': appCss(),
+      'tokens.css': tokens,
+    }),
+    /\[fractal:css-assets\]\nindex\.html links a data: stylesheet \(data:text\/css;base64,[^)]*\), which is not a processed stylesheet of this bundle/,
+  )
+})
+
+test('negative: a media stylesheet link above the inline limit ships an unprocessed @import and fails the build', async () => {
+  await assert.rejects(
+    buildFixture({
+      'index.html': page('<link rel="stylesheet" href="/app.css" media="print" />'),
+      'main.js': 'export {}\n',
+      'app.css': appCss(`/* ${'x'.repeat(8192)} */\n`),
+      'tokens.css': tokens,
+    }),
+    /assets\/app-[\w-]+\.css keeps an unprocessed @import/,
   )
 })
