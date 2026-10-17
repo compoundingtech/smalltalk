@@ -12,7 +12,7 @@ const store = makePnpmStoreProjection({ metadata, sidecar })
 
 // The renderer targets the rules' own dependency package; this root loads the same rules and
 // store runtime from the `rules` cell instead.
-const producerPreamble = `load(":defs.bzl", "pnpm_platform_configurations", "pnpm_store_entry", "pnpm_store_scc", "pnpm_store_view")
+const producerPreamble = `load(":defs.bzl", "pnpm_directory_package", "pnpm_platform_configurations", "pnpm_store_entry", "pnpm_store_scc", "pnpm_store_view")
 
 pnpm_platform_configurations()
 
@@ -22,7 +22,7 @@ export_file(
     visibility = ["PUBLIC"],
 )
 `
-const consumerPreamble = `load("@rules//buck2/dependencies:defs.bzl", "pnpm_platform_configurations", "pnpm_store_entry", "pnpm_store_scc", "pnpm_store_view")
+const consumerPreamble = `load("@rules//buck2/dependencies:defs.bzl", "pnpm_directory_package", "pnpm_platform_configurations", "pnpm_store_entry", "pnpm_store_scc", "pnpm_store_view")
 
 pnpm_platform_configurations()
 

@@ -2,7 +2,7 @@
 # Source: BUCK.genie.ts
 
 # Projected from pnpm-lock.yaml for the Buck importers in lock.ts.
-# Store fingerprint: sha256:f880343580f6d9ce77ab1511648efab1bede69abf370508b41ffbc4140ee1226
+# Store fingerprint: sha256:1cafc25bab89b8b1b1b22aa3f9ffbcc18784ad3355ed0c30efe9a542f2d15b03
 
 load("@rules//buck2/dependencies:defs.bzl", "pnpm_package", "pnpm_platform_gated_packages")
 
@@ -37,7 +37,7 @@ pnpm_package(
     },
 )
 
-load("@rules//buck2/dependencies:defs.bzl", "pnpm_platform_configurations", "pnpm_store_entry", "pnpm_store_scc", "pnpm_store_view")
+load("@rules//buck2/dependencies:defs.bzl", "pnpm_directory_package", "pnpm_platform_configurations", "pnpm_store_entry", "pnpm_store_scc", "pnpm_store_view")
 
 pnpm_platform_configurations()
 
@@ -90,6 +90,50 @@ pnpm_store_view(
 )
 
 pnpm_store_view(
+    name = "product_view_clients_typescript_st3_client_418fd70e574e",
+    runtime = ":assemble-store.ts",
+    direct = {
+        "effect": "effect@4.0.0",
+        "typescript": "typescript@6.0.3",
+    },
+    closure = {
+        "effect@4.0.0": ":entry_effect_4_0_0_c059cf710fc3",
+        "typescript@6.0.3": ":entry_typescript_6_0_3_e500ed061b70",
+    },
+    bins = {
+        "tsc": "typescript@6.0.3\tbin/tsc",
+        "tsserver": "typescript@6.0.3\tbin/tsserver",
+    },
+    workspace_trees = {
+    },
+    workspace_dependencies = {
+    },
+    visibility = ["PUBLIC"],
+)
+
+pnpm_store_view(
+    name = "external_view_clients_typescript_st3_client_418fd70e574e",
+    runtime = ":assemble-store.ts",
+    direct = {
+        "effect": "effect@4.0.0",
+        "typescript": "typescript@6.0.3",
+    },
+    closure = {
+        "effect@4.0.0": ":entry_effect_4_0_0_c059cf710fc3",
+        "typescript@6.0.3": ":entry_typescript_6_0_3_e500ed061b70",
+    },
+    bins = {
+        "tsc": "typescript@6.0.3\tbin/tsc",
+        "tsserver": "typescript@6.0.3\tbin/tsserver",
+    },
+    workspace_trees = {
+    },
+    workspace_dependencies = {
+    },
+    visibility = ["PUBLIC"],
+)
+
+pnpm_store_view(
     name = "view_clients_typescript_st3_views_4839e64c8727",
     runtime = ":assemble-store.ts",
     direct = {
@@ -107,6 +151,48 @@ pnpm_store_view(
     },
     workspace_dependencies = {
         "@smalltalk/st3-client": "workspace_clients_typescript_st3_client_2de42fb899eb",
+    },
+    visibility = ["PUBLIC"],
+)
+
+pnpm_store_view(
+    name = "product_view_clients_typescript_st3_views_4839e64c8727",
+    runtime = ":assemble-store.ts",
+    direct = {
+        "typescript": "typescript@6.0.3",
+    },
+    closure = {
+        "typescript@6.0.3": ":entry_typescript_6_0_3_e500ed061b70",
+    },
+    bins = {
+        "tsc": "typescript@6.0.3\tbin/tsc",
+        "tsserver": "typescript@6.0.3\tbin/tsserver",
+    },
+    workspace_trees = {
+        "workspace_clients_typescript_st3_client_2de42fb899eb": "//clients/typescript/st3-client:product_package_tree",
+    },
+    workspace_dependencies = {
+        "@smalltalk/st3-client": "workspace_clients_typescript_st3_client_2de42fb899eb",
+    },
+    visibility = ["PUBLIC"],
+)
+
+pnpm_store_view(
+    name = "external_view_clients_typescript_st3_views_4839e64c8727",
+    runtime = ":assemble-store.ts",
+    direct = {
+        "typescript": "typescript@6.0.3",
+    },
+    closure = {
+        "typescript@6.0.3": ":entry_typescript_6_0_3_e500ed061b70",
+    },
+    bins = {
+        "tsc": "typescript@6.0.3\tbin/tsc",
+        "tsserver": "typescript@6.0.3\tbin/tsserver",
+    },
+    workspace_trees = {
+    },
+    workspace_dependencies = {
     },
     visibility = ["PUBLIC"],
 )

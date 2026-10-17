@@ -16,3 +16,5 @@ fixtures/scenarios/huge/** -diff
 # either side and regenerate. The wasm hash is pinned in the provenance json.
 apps/fractal-web/src/terminal/ghosttyKeyCodes.generated.ts linguist-generated=true
 apps/fractal-web/src/terminal/assets/ghostty-key-encoder.generated.* linguist-generated=true
+# Written by Genie from the diagnostics package composition.
+pnpm-source-inputs.json linguist-generated=true

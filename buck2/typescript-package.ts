@@ -7,9 +7,9 @@ import { buckImporters } from './dependencies/lock.ts'
 const quote = (value: string) => JSON.stringify(value)
 
 /**
- * One flat TypeScript workspace package (sources beside its package.json): a package tree over
- * its lock-derived dependency view, then one `tsgo_typecheck` per project file. The tree stages
- * package.json, every root-level `.ts` source and every `tsconfig*.json`.
+ * One flat TypeScript workspace package (sources beside its package.json): ordinary and product
+ * source trees over their corresponding lock-derived dependency views, then one `tsgo_typecheck`
+ * per project file over the ordinary tree. Both trees declare the same package-local inputs.
  */
 export const typescriptPackageBuck = ({
   packagePath,
@@ -32,22 +32,28 @@ export const typescriptPackageBuck = ({
   for (const project of Object.values(projects)) {
     if (files.includes(project) === false) throw new Error(`${packagePath} has no ${project}`)
   }
-  const view = pnpmTargetName({ prefix: 'view', identity: packagePath })
+  const trees = [
+    ['package_tree', 'view'],
+    ['product_package_tree', 'product_view'],
+  ] as const
   const text = [
     'load("@rules//buck2:materialization.bzl", "package_view")',
     'load("@rules//buck2:typescript.bzl", "tsgo_typecheck")',
     '',
-    'package_view(',
-    '    name = "package_tree",',
-    `    dependency_view = ${quote(`//buck2/dependencies:${view}`)},`,
-    '    files = {',
-    ...files.map((file) => `        ${quote(file)}: ${quote(file)},`),
-    '    },',
-    '    strip_project_references = True,',
-    '    runtime = "//:package_tree_runtime",',
-    '    runtime_entry = "package-tree.ts",',
-    '    visibility = ["PUBLIC"],',
-    ')',
+    ...trees.flatMap(([name, prefix]) => [
+      'package_view(',
+      `    name = ${quote(name)},`,
+      `    dependency_view = ${quote(`//buck2/dependencies:${pnpmTargetName({ prefix, identity: packagePath })}`)},`,
+      '    files = {',
+      ...files.map((file) => `        ${quote(file)}: ${quote(file)},`),
+      '    },',
+      '    strip_project_references = True,',
+      '    runtime = "//:package_tree_runtime",',
+      '    runtime_entry = "package-tree.ts",',
+      '    visibility = ["PUBLIC"],',
+      ')',
+      '',
+    ]),
     ...Object.entries(projects).flatMap(([name, project]) => [
       '',
       'tsgo_typecheck(',

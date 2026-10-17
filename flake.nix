@@ -10,9 +10,9 @@
     pty.url = "github:compoundingtech/pty/f8388fe7a8617d973e720e29107e68ac5ea95987";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared CI generators and the `otelite` collector used by release-integration.
-    # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
+    # Keep the build toolchain aligned with the source member in megarepo.kdl.
     effect-utils.url =
-      "github:overengineeringstudio/effect-utils/3089f7e1faa82d7a4cb4de0e8d485164f837708b";
+      "github:overengineeringstudio/effect-utils/8cb2135bd4a852b99ca3f677c0815d0268766ff5";
     # The messaging fixture must not invoke Nix or fetch a historical build in the sandbox.
     messaging-baseline.url = "github:compoundingtech/smalltalk/678103d3e8ae873a158bb2cb951d3ffefdf698c4";
   };
@@ -1379,8 +1379,7 @@
         devShells.genie = pkgs.mkShell {
           packages = [ effect-utils.packages.${system}.genie ];
           shellHook = ''
-            mkdir -p repos
-            ln -sfn ${effect-utils} repos/effect-utils
+            [ -e repos/effect-utils ] || echo 'repos/effect-utils is missing: run `mr apply` first' >&2
           '';
         };
         # The web workspace's toolchain comes from effect-utils' own nixpkgs pin, not the root
@@ -1420,6 +1419,7 @@
               webPkgs.corepack
               webPkgs.nodejs_24
               webPkgs.bun
+              webPkgs.watchman
               effectUtilsPackages.buck2
               effectUtilsPackages.genie
             ];
@@ -1428,10 +1428,20 @@
             PLAYWRIGHT_MODULE = "${webPkgs.playwright-driver}/index.mjs";
             CHROMIUM_PATH = webPkgs.lib.optionalString webPkgs.stdenv.hostPlatform.isLinux "${webPkgs.chromium}/bin/chromium";
             shellHook = ''
-              mkdir -p repos .buck2
-              ln -sfn ${effect-utils} repos/effect-utils
+              mkdir -p .buck2
+              [ -e repos/effect-utils ] || echo 'repos/effect-utils is missing: run `mr apply` first' >&2
               ln -sfn ${buckRoot}/.buck2/rules .buck2/rules
               ln -sfn ${buckRoot}/.buck2/capabilities .buck2/capabilities
+              # Publish root-owned source inputs; pnpm must not mutate the canonical member.
+              node -e '
+                const { readFileSync } = require("node:fs");
+                const { spawnSync } = require("node:child_process");
+                const paths = JSON.parse(readFileSync("pnpm-source-inputs.json", "utf8")).sourceInputPaths;
+                const result = spawnSync(process.execPath, [
+                  process.argv[1], "publish", process.cwd(), ".devenv/pnpm-source-inputs", ...paths,
+                ], { stdio: "inherit" });
+                process.exit(result.status ?? 1);
+              ' ${effect-utils}/nix/devenv-modules/tasks/shared/stage-pnpm-source-inputs.mjs
             '';
           };
         # The isolation-vm CI job's NixOS VMs; see each file for how it runs.

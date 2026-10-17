@@ -6,34 +6,6 @@ import type { DebugBag } from './measurement/index.ts'
 export { getDebug, incrDebug, incrDebugRuntime, setDebug }
 export type { DebugBag }
 
-type SharedMeasurementEngine = ReturnType<NonNullable<typeof developmentMeasurements>['createMeasurementEngine']>
-let sharedMeasurementEngine: SharedMeasurementEngine | undefined
-let measurementEngineUsers = 0
-
-/** Acquire the app's single public engine and publish it for browser measurement clients. */
-export const acquireMeasurementEngine = (): (() => void) | undefined => {
-  if (developmentMeasurements === undefined) return undefined
-  if (sharedMeasurementEngine === undefined) {
-    sharedMeasurementEngine = developmentMeasurements.createMeasurementEngine()
-    const global = globalThis as typeof globalThis & { __metersEngine?: SharedMeasurementEngine }
-    global.__metersEngine = sharedMeasurementEngine
-  }
-  const engine = sharedMeasurementEngine
-  measurementEngineUsers += 1
-  let released = false
-  return () => {
-    if (released) return
-    released = true
-    measurementEngineUsers -= 1
-    if (measurementEngineUsers === 0 && sharedMeasurementEngine === engine) {
-      const global = globalThis as typeof globalThis & { __metersEngine?: SharedMeasurementEngine }
-      if (global.__metersEngine === engine) delete global.__metersEngine
-      engine.dispose()
-      sharedMeasurementEngine = undefined
-    }
-  }
-}
-
 /** One Profiler callback corresponds to one committed subtree update. */
 export const RenderProfiler = ({ id, children }: { readonly id: string; readonly children: React.ReactNode }) => (
   <React.Profiler id={id} onRender={(profiledId) => developmentMeasurements?.recordCommit(profiledId)}>
@@ -98,18 +70,12 @@ export const makeValueMeterBlock = ({
 
 /** Simple text diagnostics: values come from the app's measurement counters and rAF clock. */
 export const AppVitals = ({
-  blocks, gap = 4, orientation = 'horizontal', exposeGlobally = false,
+  blocks, gap = 4, orientation = 'horizontal',
 }: {
   readonly blocks: readonly VitalBlock[]
   readonly gap?: number
   readonly orientation?: 'horizontal' | 'vertical'
-  readonly exposeGlobally?: boolean
 }) => {
-  React.useEffect(() => {
-    if (!exposeGlobally) return undefined
-    return acquireMeasurementEngine()
-  }, [exposeGlobally])
-
   return (
     <div
       aria-label="Application measurements"

@@ -12,6 +12,12 @@
     "start": "node server/main.mts"
   },
   "dependencies": {
+    "@effect/opentelemetry": "4.0.0",
+    "@effect/platform-node": "4.0.0",
+    "@effect/platform-node-shared": "4.0.0",
+    "@overeng/devbar": "workspace:^",
+    "@overeng/meters": "workspace:^",
+    "@overeng/utils": "workspace:^",
     "@smalltalk/st3-client": "file:../../clients/typescript/st3-client",
     "effect": "4.0.0",
     "fractional-indexing": "3.2.0",

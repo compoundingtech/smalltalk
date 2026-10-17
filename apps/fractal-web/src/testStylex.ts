@@ -13,6 +13,7 @@ const relation = (name: string) => (pseudo?: Pseudo, marker: Marker = defaultMar
 
 export const create = <Styles>(styles: Styles): Styles => styles
 export const defineVars = <Vars>(variables: Vars): Vars => variables
+export const defineConsts = <Constants>(constants: Constants): Constants => constants
 export const createTheme = () => ({})
 export const keyframes = () => 'test-animation'
 export const props = (..._styles: readonly unknown[]) => ({})

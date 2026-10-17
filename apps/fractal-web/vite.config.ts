@@ -1,5 +1,5 @@
 import { defineConfig } from 'vite'
-import { execFileSync } from 'node:child_process'
+import { createBuildIdentityPlugin } from '@overeng/utils/node/vite-build-identity'
 import react from '@vitejs/plugin-react'
 import { createStylexVitePlugins } from './scripts/stylex.mjs'
 import { webfractalGateway } from './scripts/vite-gateway.mjs'
@@ -7,39 +7,14 @@ import { extensionBuild } from './scripts/extensions-build.mjs'
 import { fractalContentSecurityPolicy } from './scripts/vite-csp.mjs'
 import { fractalCssAssets } from './scripts/vite-css-assets.mjs'
 
-// One identity per build: the bundle embeds it and the host serves it as /build-identity.json.
-const git = (...args: string[]) => execFileSync('git', args, { encoding: 'utf8' }).trim()
-const buildIdentity = (() => {
-  const rev = git('rev-parse', 'HEAD')
-  const dirty = git('status', '--porcelain', '--untracked-files=no') !== ''
-  const machineVersion = '0.1.0+' + rev.slice(0, 12)
-  return {
-    baseVersion: '0.1.0', displayVersion: dirty ? machineVersion + '-dirty' : machineVersion, machineVersion,
-    sourceKind: 'local', rev, gitRev: rev, dirty, commitTs: Number(git('show', '-s', '--format=%ct', 'HEAD')), buildTs: Math.floor(Date.now() / 1000),
-  } as const
-})()
 export default defineConfig({
   root: 'src/web',
   plugins: [
     fractalContentSecurityPolicy(),
-    {
-      name: 'fractal-build-identity',
-      resolveId(id) {
-        if (id === 'virtual:build-identity') return '\0fractal-build-identity'
-      },
-      load(id) {
-        if (id !== '\0fractal-build-identity') return
-        return 'export const buildIdentity=' + JSON.stringify(buildIdentity) + ';export const deploymentId=undefined;'
-      },
-      generateBundle() {
-        // Read by server/host.mts; the server answers /build-identity.json itself, so this file is never served.
-        const { gitRev: _, ...served } = buildIdentity
-        this.emitFile({ type: 'asset', fileName: 'build-identity.json', source: JSON.stringify(served) + '\n' })
-      },
-    },
+    createBuildIdentityPlugin({ baseVersion: '0.1.0', buildStamp: '__CLI_BUILD_STAMP__' }),
     extensionBuild({ entry: '../src/extensions/app-public.ts', privateBuild: false }),
     ...createStylexVitePlugins({
-      externalPackages: ['@smalltalk/fractal-ui'],
+      externalPackages: ['@smalltalk/fractal-ui', '@overeng/devbar', '@overeng/meters', '@overeng/stylex-tokens'],
       entries: [new URL('./src/web/main.tsx', import.meta.url).pathname],
     }),
     react(),
@@ -47,7 +22,7 @@ export default defineConfig({
     fractalCssAssets(),
   ],
   server: { strictPort: true, host: '127.0.0.1', allowedHosts: (process.env.WF_ALLOWED_HOSTS ?? '127.0.0.1,localhost').split(',') },
-  resolve: { dedupe: ['effect', 'react', 'react-dom'] },
+  resolve: { dedupe: ['effect', 'react', 'react-dom', '@stylexjs/stylex'] },
   build: {
     outDir: '../../dist/web',
     emptyOutDir: true,

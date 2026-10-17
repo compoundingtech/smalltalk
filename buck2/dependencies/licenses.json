@@ -2,7 +2,7 @@
   "generated": "Do not edit; run nix develop .#web -c python3 scripts/ci-fractal-web-licenses",
   "source": "pnpm-lock.yaml packages; installed package.json license (legacy licenses fallback); missing manifests from lock-integrity-verified npm archives",
   "schemaVersion": 1,
-  "lockfileSha256": "6328225ae0297574934f029769793dbcdef5515b9b36e3a709f6c51bbe99e0ee",
+  "lockfileSha256": "71e5f9fea2d1e24b545ac32c370a55210fd264f1c0f060927d455b72a83725f7",
   "packages": [
     {
       "name": "@adobe/css-tools",
@@ -396,6 +396,21 @@
     },
     {
       "name": "@effect/atom-react",
+      "version": "4.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@effect/opentelemetry",
+      "version": "4.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@effect/platform-node",
+      "version": "4.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@effect/platform-node-shared",
       "version": "4.0.0",
       "license": "MIT"
     },
@@ -820,6 +835,21 @@
       "license": "MIT"
     },
     {
+      "name": "@noble/hashes",
+      "version": "2.4.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@opentelemetry/api",
+      "version": "1.9.1",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "@opentelemetry/semantic-conventions",
+      "version": "1.43.0",
+      "license": "Apache-2.0"
+    },
+    {
       "name": "@oxc-parser/binding-android-arm-eabi",
       "version": "0.127.0",
       "license": "MIT"
@@ -1028,6 +1058,11 @@
       "name": "@oxc-resolver/binding-win32-x64-msvc",
       "version": "11.21.2",
       "license": "MIT"
+    },
+    {
+      "name": "@playwright/test",
+      "version": "1.64.0",
+      "license": "Apache-2.0"
     },
     {
       "name": "@radix-ui/number",
@@ -1433,6 +1468,31 @@
       "name": "@react-types/shared",
       "version": "3.36.1",
       "license": "Apache-2.0"
+    },
+    {
+      "name": "@redis/bloom",
+      "version": "6.3.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@redis/client",
+      "version": "6.3.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@redis/json",
+      "version": "6.3.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@redis/search",
+      "version": "6.3.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@redis/time-series",
+      "version": "6.3.0",
+      "license": "MIT"
     },
     {
       "name": "@rolldown/binding-android-arm-eabi",
@@ -1905,6 +1965,11 @@
       "license": "MIT"
     },
     {
+      "name": "@types/ws",
+      "version": "8.18.2",
+      "license": "MIT"
+    },
+    {
       "name": "@types/yargs",
       "version": "17.0.35",
       "license": "MIT"
@@ -1940,6 +2005,11 @@
       "license": "MIT"
     },
     {
+      "name": "@vitest/mocker",
+      "version": "5.0.3",
+      "license": "MIT"
+    },
+    {
       "name": "@vitest/pretty-format",
       "version": "3.2.4",
       "license": "MIT"
@@ -1967,6 +2037,11 @@
     {
       "name": "@vitest/spy",
       "version": "4.1.9",
+      "license": "MIT"
+    },
+    {
+      "name": "@vitest/spy",
+      "version": "5.0.3",
       "license": "MIT"
     },
     {
@@ -4005,6 +4080,16 @@
       "license": "MIT"
     },
     {
+      "name": "playwright",
+      "version": "1.64.0",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "playwright-core",
+      "version": "1.64.0",
+      "license": "Apache-2.0"
+    },
+    {
       "name": "plist",
       "version": "3.1.1",
       "license": "MIT"
@@ -4012,6 +4097,11 @@
     {
       "name": "pngjs",
       "version": "3.4.0",
+      "license": "MIT"
+    },
+    {
+      "name": "postcss",
+      "version": "8.5.26",
       "license": "MIT"
     },
     {
@@ -4192,6 +4282,11 @@
     {
       "name": "redent",
       "version": "3.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "redis",
+      "version": "6.3.0",
       "license": "MIT"
     },
     {
@@ -4605,6 +4700,11 @@
       "license": "MIT"
     },
     {
+      "name": "tinybench",
+      "version": "6.2.2",
+      "license": "MIT"
+    },
+    {
       "name": "tinyexec",
       "version": "1.3.1",
       "license": "MIT"
@@ -4710,6 +4810,11 @@
       "license": "Apache-2.0"
     },
     {
+      "name": "undici",
+      "version": "8.11.2",
+      "license": "MIT"
+    },
+    {
       "name": "undici-types",
       "version": "7.16.0",
       "license": "MIT"
@@ -4777,6 +4882,11 @@
     {
       "name": "unplugin",
       "version": "2.3.11",
+      "license": "MIT"
+    },
+    {
+      "name": "unplugin",
+      "version": "3.3.0",
       "license": "MIT"
     },
     {
@@ -4870,6 +4980,11 @@
       "license": "MIT"
     },
     {
+      "name": "vitest",
+      "version": "5.0.3",
+      "license": "MIT"
+    },
+    {
       "name": "vlq",
       "version": "1.0.1",
       "license": "MIT"
@@ -4937,6 +5052,11 @@
     {
       "name": "why-is-node-running",
       "version": "2.3.0",
+      "license": "MIT"
+    },
+    {
+      "name": "why-is-node-running",
+      "version": "3.2.1",
       "license": "MIT"
     },
     {

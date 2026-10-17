@@ -25,6 +25,28 @@ package_view(
     visibility = ["PUBLIC"],
 )
 
+package_view(
+    name = "product_package_tree",
+    dependency_view = "//buck2/dependencies:product_view_clients_typescript_st3_client_418fd70e574e",
+    files = {
+        "Client.generated.ts": "Client.generated.ts",
+        "Models.generated.ts": "Models.generated.ts",
+        "Schema.generated.ts": "Schema.generated.ts",
+        "errors.ts": "errors.ts",
+        "fetch-receiver.test.ts": "fetch-receiver.test.ts",
+        "index.ts": "index.ts",
+        "package.json": "package.json",
+        "tsconfig.json": "tsconfig.json",
+        "tsconfig.schema.json": "tsconfig.schema.json",
+        "types.test.ts": "types.test.ts",
+    },
+    strip_project_references = True,
+    runtime = "//:package_tree_runtime",
+    runtime_entry = "package-tree.ts",
+    visibility = ["PUBLIC"],
+)
+
+
 tsgo_typecheck(
     name = "typecheck",
     package_tree = ":package_tree",

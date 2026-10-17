@@ -521,6 +521,17 @@ export const perfStoresCache = (stage: string) => ({
 /** pnpm's store under the runner's temporary directory, which only step-level env can name. */
 export const pnpmStoreEnv = { pnpm_config_store_dir: '${{ runner.temp }}/pnpm-store' } as const
 
+/**
+ * Materializes megarepo.lock's members under repos/ before any shell that reads them. `mr`
+ * comes from the flake's effect-utils pin; later steps resolve locks in the same job-local store.
+ */
+export const megarepoApplyStep = {
+  name: 'Materialize megarepo members',
+  env: { MEGAREPO_STORE: '${{ runner.temp }}/megarepo' },
+  run: `nix run "github:overengineeringstudio/effect-utils/$(jq -r '.nodes["effect-utils"].locked.rev' flake.lock)#megarepo" -- apply --worktree-mode commit --git-protocol https
+printf 'MEGAREPO_STORE=%s\\n' "$MEGAREPO_STORE" >> "$GITHUB_ENV"`,
+} as const
+
 /** The web lane's pnpm store, keyed by its lock and toolchain; only main upkeep fills it. */
 export const fractalWebStoreCache = {
   path: pnpmStoreEnv.pnpm_config_store_dir,
@@ -570,7 +581,12 @@ export const fractalWebJobs = {
     steps: [
       { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
       ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+      megarepoApplyStep,
       { name: 'Restore the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: fractalWebStoreCache },
+      // GitHub-hosted Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
+      // effect-utils Buck TypeScript actions need them for bwrap (effect-utils #1784).
+      // This runner VM is ephemeral; the bwrap sandbox itself is unchanged.
+      { name: 'Enable user namespaces for Buck TypeScript sandbox', run: 'sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' },
       {
         ...nixDevelopStep({ name: 'Run the fractal-web lanes and dependency license check', flake: '.#web', command: ['bash', 'scripts/ci-fractal-web'] }),
         env: {

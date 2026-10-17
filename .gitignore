@@ -12,6 +12,7 @@ __pycache__/
 
 # Agent work state and temporary artifacts.
 /tmp/
+/.devenv/
 
 # Per-agent runtime overlay (materialized per clone; machine-specific, never product).
 .st2/
@@ -29,7 +30,7 @@ clients/typescript/st3-client/node_modules/
 clients/typescript/st3-views/node_modules/
 clients/typescript/st3-scenarios/node_modules/
 
-# Pinned flake input made available to the CI generators by the devShell.
+# Pinned megarepo members materialized by `mr apply`.
 /repos/
 
 # Buck2: the web devShell links the rules and capabilities cells; build output.

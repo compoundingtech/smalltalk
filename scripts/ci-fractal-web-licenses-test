@@ -38,6 +38,20 @@ class LicenseTests(unittest.TestCase):
     def test_complete_lock_package_set_not_snapshots_or_importers(self):
         self.assertEqual(lock_packages(LOCK), {("@fixture/font", "1.0.0"): INTEGRITY, ("binary", "2.0.0"): INTEGRITY})
 
+    def test_staged_sources_are_not_registry_packages(self):
+        directory = ".devenv/pnpm-source-inputs/current/repos/effect-utils/packages/@overeng/devbar"
+        source = f"  '@overeng/devbar@file:{directory}':\n    resolution: {{directory: {directory}, type: directory}}\n    peerDependencies:\n      react: ^19.2.3\n"
+        text = LOCK.replace("snapshots:", source + "snapshots:")
+        self.assertEqual(lock_packages(text), lock_packages(LOCK))
+        for invalid in (
+            source.replace("file:" + directory, "file:../outside"),
+            source.replace("directory: " + directory, "directory: ../outside"),
+            source.replace(f"    resolution: {{directory: {directory}, type: directory}}\n", ""),
+            source + source,
+        ):
+            with self.subTest(source=invalid), self.assertRaises(ValueError):
+                lock_packages(LOCK.replace("snapshots:", invalid + "snapshots:"))
+
     def test_fail_closed_lock_formats(self):
         for text in (
             LOCK.replace("'9.0'", "'8.0'"),

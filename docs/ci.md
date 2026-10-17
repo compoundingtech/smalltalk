@@ -498,16 +498,17 @@ records the KVM probe and each phase's elapsed time.
 ### TypeScript client
 
 `typescript-client` runs on every PR and merge-group entry. Main retains the queue check;
-Main upkeep's `warm-typescript` fills the pnpm store with `pnpm fetch`. The job installs
-Node 24.18.0 through `actions/setup-node`, runs `corepack enable`, then installs the root
-workspace with `pnpm install --frozen-lockfile`. The client, shared views and iOS app share
-one root `pnpm-lock.yaml`; install scripts are disabled by the workspace configuration.
+Main upkeep's `warm-typescript` fills the pnpm store with `pnpm fetch`. The job materializes
+the pinned megarepo member, then runs both the frozen root install and the client checks
+inside `nix develop .#web`, using its Node and pnpm toolchain without Corepack shims.
+The client, shared views and iOS app share one root `pnpm-lock.yaml`; install scripts
+are disabled by the workspace configuration.
 The store cache key is
 `typescript-client-<os>-node24.18.0-pnpm12.7.0-<sha256 of pnpm-lock.yaml>`.
 The lockfile fingerprint uses `sha256sum` in Bash so the Nix runner needs no Node 20
 `hashFiles` helper when it evaluates the cache key.
 
-After the root frozen install, `bash scripts/ci-typescript-client` runs the client's
+After the root frozen install, `nix develop .#web -c bash scripts/ci-typescript-client` runs the client's
 contract/schema tests and both compiler projects, the views' tests and typecheck,
 `tsc --noEmit -p .` in `apps/ios`, and the iOS tests. The client packages pin TypeScript
 6.0.3 and Effect 4.0.0 stable. The iOS project allows explicit TypeScript import extensions
@@ -517,6 +518,11 @@ for generated-client consumers. The main ruleset requires `typescript-client`.
 
 The non-required Fractal web jobs run on GitHub-hosted `ubuntu-latest` without
 workflow-level path filters. `linux-gate` does not depend on them.
+Only `fractal-web-execution` enables unprivileged user namespaces with
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` on its ephemeral
+Ubuntu runner VM before entering the web lanes. The effect-utils Buck TypeScript
+actions require those namespaces for Bubblewrap containment (effect-utils #1784);
+their sandbox flags and declared-input boundary remain unchanged.
 
 - `fractal-web-changes` always runs, with a one-minute timeout and no checkout. Its
   embedded `scripts/ci-fractal-web-changes` fetches both commits explicitly without
