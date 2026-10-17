@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Rebind a revisited native session within one incarnation, and accept an incarnation-bearing session binding only from the running incarnation",
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay, projection rebuild or claim rewrite. Existing harness.session-file claims stay as they are and are read as before. The change applies only to new binding reports: the lifetime idempotency key per (seat, incarnation, session) is gone, so A -> B -> A appends a fresh binding for A, and only a report identical to the current latest binding (same actor and fields) is deduplicated inside the writer transaction."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, trigger or column change and no migration. No new claim kind or field."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest change and no RULES_VERSION bump. The new authority check runs in the local writer when a harness.session-file claim is appended; replicated claims are imported as before, so members on mixed builds stay compatible."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New rule enforced by the daemon: a harness.session-file report that names an incarnation_id is accepted only while the seat's latest runtime.observed claim records that incarnation as running; otherwise the daemon refuses it with the existing error code stale-harness-event-session (HTTP 422 on POST /v1/agents/native-session). This is checked before idempotency replay and before deduplication. Effects: (1) a driver, older or current, that reports its native session before the daemon has recorded its runtime is refused until it has; the drivers keep the session pending and report it again on their next tick (driver_cli for Claude, Codex and OpenCode, the pi-family report for OMP), so the binding lands once the runtime is recorded; (2) a retry from an ended or replaced incarnation is refused permanently and cannot replace its successor's binding; (3) a report that omits incarnation_id keeps its earlier acceptance. Rollout verification already records the replacement's runtime authority before it waits for the native binding, so verification does not deadlock. No new error code, API field, client-v0 or peer wire change; generated clients are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work. A restart takes as long as before."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator step. Seats keep their identity and bindings. A driver log may show native_session_report_failed or a tick failure with stale-harness-event-session for a report sent just before its runtime was recorded; the next tick binds it."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swapping back to an older build is supported: nothing was migrated, the bindings written under this rule are ordinary harness.session-file claims, and the older build reads them. It restores the old lifetime deduplication and accepts predecessor reports again."
+  }
+}

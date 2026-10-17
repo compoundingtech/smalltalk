@@ -658,6 +658,16 @@ fn first_native_launch_receipt_binding_and_acknowledgement_survive_checkpoint_tr
     );
     acknowledgement_input.evidence.push(receipt.id.clone());
     let acknowledgement = store.append_claim(&acknowledgement_input).unwrap();
+    // A driver's binding is accepted only while its incarnation is the running one.
+    store
+        .append_claim(&input(
+            AGENT,
+            "runtime.observed",
+            Some(AGENT),
+            json!({"status": "running", "incarnation_id": "inc-2"}),
+            "native-runtime",
+        ))
+        .unwrap();
     let binding = store
         .append_claim(&input(
             AGENT,

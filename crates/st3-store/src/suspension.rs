@@ -638,7 +638,13 @@ mod tests {
     fn continuation_refusal_scope_repairs_legacy_and_keeps_later_failure_permanent() {
         for legacy in [false, true] {
             let store = Store::open_memory("node").unwrap();
-            continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native","account_ref":"one"}), None);
+            // Each rebinding is a new running incarnation; an unchanged current binding is
+            // deduplicated by the writer and would not be a newer binding.
+            let bind = |incarnation: &str| {
+                continuation_claim(&store, "runtime.observed", json!({"status":"running","incarnation_id":incarnation}), None);
+                continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native","account_ref":"one","incarnation_id":incarnation}), None);
+            };
+            bind("inc-1");
             let key = if legacy { continue_unavailable_key("agent/example", "native") } else {
                 typed_continue_unavailable_key("agent/example", "native", "authored-session-selection", Some("selector"))
             };
@@ -648,13 +654,13 @@ mod tests {
             assert!(continue_session(&store, "agent/example", "omp", Some("one"), Some("selector")).unwrap().is_none());
             assert_eq!(continue_session(&store, "agent/example", "omp", Some("one"), None).unwrap().unwrap().0, "native");
             assert!(continue_session(&store, "agent/example", "omp", Some("two"), None).unwrap().is_none());
-            continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native","account_ref":"one"}), None);
+            bind("inc-2");
             assert_eq!(continue_session(&store, "agent/example", "omp", Some("one"), Some("selector")).unwrap().unwrap().0, "native");
             let permanent = typed_continue_unavailable_key("agent/example", "native", "transcript-missing", None);
             continuation_claim(&store, "harness.diagnostic", json!({"code":CONTINUE_UNAVAILABLE_CODE,"status":"transcript-missing","session_id":"native"}), Some(permanent.clone()));
             assert!(store.operation_claim(&permanent).unwrap().is_some());
             assert!(continue_session(&store, "agent/example", "omp", Some("one"), None).unwrap().is_none());
-            continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native","account_ref":"one"}), None);
+            bind("inc-3");
             assert!(continue_session(&store, "agent/example", "omp", Some("one"), None).unwrap().is_none());
             assert!(continue_session(&store, "agent/example", "omp", Some("one"), Some("selector")).unwrap().is_none());
         }

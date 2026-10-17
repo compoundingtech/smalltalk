@@ -196,6 +196,51 @@ fn terminal_state_can_be_followed_by_its_final_timeline_before_runtime_exit() {
     assert!(store.append_harness_event(&timeline).is_err());
 }
 #[test]
+fn a_session_binding_naming_an_incarnation_waits_for_that_incarnation_to_run() {
+    let store = Store::open_memory("amber").unwrap();
+    let bind = |incarnation: Option<&str>, session: &str| {
+        let mut fields = BTreeMap::from([
+            ("harness".into(), json!("omp")),
+            ("session_id".into(), json!(session)),
+        ]);
+        if let Some(incarnation) = incarnation {
+            fields.insert("incarnation_id".into(), json!(incarnation));
+        }
+        store.append_claim(&ClaimInput {
+            subject: SEAT.into(),
+            kind: "harness.session-file".into(),
+            actor: Some(SEAT.into()),
+            fields,
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+    };
+    // A driver that reports before the daemon records its runtime is refused until it has.
+    assert_eq!(
+        bind(Some("runtime-a"), "native-a").unwrap_err().code,
+        "stale-harness-event-session"
+    );
+    // A binding that names no incarnation keeps its earlier acceptance.
+    bind(None, "legacy").unwrap();
+    runtime(&store, "runtime-a", "running");
+    let bound = bind(Some("runtime-a"), "native-a").unwrap();
+    runtime(&store, "runtime-b", "running");
+    assert_eq!(
+        bind(Some("runtime-a"), "native-a").unwrap_err().code,
+        "stale-harness-event-session"
+    );
+    runtime(&store, "runtime-b", "exited");
+    assert_eq!(
+        bind(Some("runtime-b"), "native-b").unwrap_err().code,
+        "stale-harness-event-session"
+    );
+    assert_eq!(
+        store.latest_claim(SEAT, Some("harness.session-file")).unwrap().unwrap().id,
+        bound.id
+    );
+}
+#[test]
 fn event_envelopes_cannot_publish_foreign_or_non_harness_claims() {
     let store = Store::open_memory("amber").unwrap();
     runtime(&store, "runtime-a", "running");

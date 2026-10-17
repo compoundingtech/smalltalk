@@ -375,10 +375,9 @@ pub async fn report_native_session(
             fields,
             evidence: Vec::new(),
             expected_subject: None,
-            idempotency_key: Some(format!(
-                "native-session:{subject}:{}:{}",
-                request.incarnation_id, request.session_id
-            )),
+            // Binding observations may revisit a session within one incarnation. The writer
+            // deduplicates only an unchanged current binding, not every prior use of its ID.
+            idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
