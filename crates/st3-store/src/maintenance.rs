@@ -32,7 +32,7 @@ pub async fn migrate_event_payloads(store: Arc<Store>) -> Result<EventMigrationR
     loop {
         let store = store.clone();
         let result = store.connection.write_workers().spawn_blocking(move || {
-            crate::profile::task("task migrate-event-payloads", || {
+            crate::task_cpu::profiled_blocking("maintenance.event_payloads", || {
                 let pending = store.event_payload_migration_pending()?;
                 let chunk_started = Instant::now();
                 let result = store.migrate_event_payloads();

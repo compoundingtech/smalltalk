@@ -106,6 +106,7 @@ pub mod subagents;
 pub use st3_store::suspension;
 pub use st3_reconcile::seat_snapshot;
 pub use st3_telemetry::telemetry;
+pub use smallclaims::task_cpu;
 #[cfg(any(test, feature = "test-support"))]
 pub use st3_api::test_support;
 #[cfg(test)]

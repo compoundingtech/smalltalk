@@ -213,7 +213,7 @@ pub async fn run(exporter: OtlpExporter, windows: fn() -> Value) {
     let mut failing = false;
     loop {
         tokio::time::sleep(INTERVAL).await;
-        let report = match tokio::task::spawn_blocking(windows).await {
+        let report = match tokio::task::spawn_blocking(move || smallclaims::task_cpu::blocking("slo.export", windows)).await {
             Ok(report) => report,
             Err(error) => {
                 if !failing {

@@ -5687,7 +5687,7 @@ pub fn start_agent_roster(state: &AppState) {
         return;
     };
     let store = state.store.clone();
-    tokio::spawn(async move {
+    tokio::spawn(crate::task_cpu::account("published_list.agents", async move {
         let mut head = true;
         loop {
             let started = tokio::time::Instant::now();
@@ -5705,7 +5705,7 @@ pub fn start_agent_roster(state: &AppState) {
                 let submitted = crate::otel::export_enabled().then(Instant::now);
                 match tokio::task::spawn_blocking(move || crate::otel::roster_collect_warm(|| {
                     roster_worker(true, submitted, None, || {
-                        let result = crate::performance::task("roster/warm", || warm_agent_roster(&reader));
+                        let result = crate::task_cpu::performance_blocking("startup.warmup", || warm_agent_roster(&reader));
                         (result, crate::otel::take_roster_attributes())
                     })
                 })).await {
@@ -5725,7 +5725,7 @@ pub fn start_agent_roster(state: &AppState) {
                 _admission.enter_worker();
                 // The first fold publishes only what windows and first pages show; the rest
                 // follows at once.
-                crate::performance::task("roster/refresh", || if first {
+                crate::task_cpu::performance_blocking("published_list.agents", || if first {
                     reader.answer_agent_roster_requests(|| {
                         reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
                     })
@@ -5776,7 +5776,7 @@ pub fn start_agent_roster(state: &AppState) {
             }
             wake.notified().await;
         }
-    });
+    }));
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of

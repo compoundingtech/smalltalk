@@ -880,6 +880,7 @@ impl Telemetry {
                     }
                     opentelemetry::global::set_meter_provider(provider.clone());
                     METRICS_ENABLED.store(true, Ordering::Relaxed);
+                    smallclaims::task_cpu::init(true);
                     telemetry.meter_provider = Some(provider);
                 }
                 Err(error) => {

@@ -143,14 +143,14 @@ impl TerminalSocket {
         std::thread::Builder::new()
             .name("st3-terminal-socket".into())
             .spawn(move || {
-                runtime.block_on(async move {
+                runtime.block_on(crate::task_cpu::account("terminal.socket", async move {
                     match tokio::net::UnixListener::from_std(listener) {
                         Ok(listener) => {
                             serve_terminal_socket(listener, pty_root, route_timeout, counted).await
                         }
                         Err(error) => eprintln!("st3: serve the terminal socket: {error}"),
                     }
-                });
+                }));
             })
             .context("start the terminal socket thread")?;
         Ok(Self { live })
@@ -207,10 +207,10 @@ async fn serve_terminal_socket(
         };
         let (pty_root, live) = (pty_root.clone(), live.clone());
         live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tokio::spawn(async move {
+        tokio::spawn(crate::task_cpu::account("terminal.tunnel", async move {
             serve_tunnel(tunnel, &pty_root, route_timeout).await;
             live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        });
+        }));
     }
 }
 

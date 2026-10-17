@@ -174,9 +174,9 @@ impl Store {
                 }
             };
             let routed = wakes.clone();
-            tokio::spawn(async move {
+            tokio::spawn(crate::task_cpu::account("mailbox.wake_dispatch", async move {
                 dispatch(weak, routed, events, cursor).await;
-            });
+            }));
             wakes
         });
         wakes.subscribe(fence)
@@ -292,7 +292,7 @@ async fn dispatch(
             let Some(store) = store.upgrade() else {
                 return;
             };
-            match tokio::task::spawn_blocking(move || store.mailbox_wake_cursor()).await {
+            match tokio::task::spawn_blocking(move || crate::task_cpu::blocking("mailbox.wake_dispatch", || store.mailbox_wake_cursor())).await {
                 Ok(Ok(at)) => {
                     // Start at the current head, never at zero. Re-read every subscriber once
                     // to cover writes skipped while initial cursor acquisition was unavailable.
@@ -315,7 +315,7 @@ async fn dispatch(
             };
             let at = cursor.expect("cursor acquired before dispatch");
             let result = tokio::task::spawn_blocking(move || {
-                crate::profile::task("task mailbox-wake-dispatch", || {
+                crate::task_cpu::profiled_blocking("mailbox.wake_dispatch", || {
                     store.mailbox_wake_batch(at)
                 })
             })

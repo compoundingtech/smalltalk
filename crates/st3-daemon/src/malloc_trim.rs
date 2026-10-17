@@ -51,13 +51,13 @@ pub fn spawn() -> anyhow::Result<()> {
         .with_description("Observed decrease across malloc_trim, by source; not causal attribution")
         .with_unit("By")
         .build();
-    tokio::spawn(async move {
+    tokio::spawn(crate::task_cpu::account("allocator.trim", async move {
         let mut interval = tokio::time::interval_at(first_tick, period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             // Sample on the same blocking thread as trim: mallinfo2 also takes arena locks.
-            match tokio::task::spawn_blocking(move || trim_once(threshold)).await {
+            match tokio::task::spawn_blocking(move || crate::task_cpu::blocking("allocator.trim", || trim_once(threshold))).await {
                 Ok(Some(sample)) => {
                     duration.record(sample.elapsed.as_secs_f64(), &[]);
                     released.record(
@@ -84,7 +84,7 @@ pub fn spawn() -> anyhow::Result<()> {
                 Err(error) => tracing::warn!(%error, "glibc heap trim worker failed"),
             }
         }
-    });
+    }));
     Ok(())
 }
 

@@ -353,16 +353,38 @@ pub fn snapshot() -> Value {
 }
 /// Background tasks are charged their own thread's CPU, including when file profiling is off.
 pub fn task<T>(kind: &'static str, work: impl FnOnce() -> T) -> T {
+    let _scope = task_scope(kind);
+    work()
+}
+
+/// Synchronous lexical equivalent of `task`; never move its thread-local charge.
+pub(crate) struct TaskScope {
+    kind: &'static str,
+    started: Instant,
+    charge: Option<Charge>,
+    panicking_on_entry: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(crate) fn task_scope(kind: &'static str) -> TaskScope {
     let started = Instant::now();
-    let result = with_cpu(Some(kind), None, work);
-    METER.get_or_init(Mutex::default).lock().unwrap().record(
-        Instant::now(),
-        Table::Requests,
-        kind.into(),
-        started.elapsed(),
-        0,
-    );
-    result
+    TaskScope {
+        kind,
+        started,
+        charge: enter_cpu(Some(kind), None),
+        panicking_on_entry: std::thread::panicking(),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for TaskScope {
+    fn drop(&mut self) {
+        drop(self.charge.take());
+        // `task` did not record a completed invocation when its callback unwound.
+        if !std::thread::panicking() || self.panicking_on_entry {
+            record_request(self.kind, None, self.started.elapsed());
+        }
+    }
 }
 /// The request kind and client a thread works for, so CPU spent on its behalf is charged to both.
 #[derive(Clone)]
@@ -392,47 +414,45 @@ pub fn with_charged<T>(charged: Option<Charged>, work: impl FnOnce() -> T) -> T 
     }
 }
 pub fn with_cpu<T>(kind: Option<&str>, client: Option<&str>, work: impl FnOnce() -> T) -> T {
-    let Some(kind) = kind else {
-        return work();
-    };
+    let _charge = enter_cpu(kind, client);
+    work()
+}
+
+fn enter_cpu(kind: Option<&str>, client: Option<&str>) -> Option<Charge> {
+    let kind = kind?;
     if current().is_some() {
-        return work();
+        return None;
     }
     let charged = Charged {
         kind: kind.into(),
         client: client.map(Into::into),
     };
     CURRENT.with(|label| *label.borrow_mut() = Some(charged.clone()));
-    struct Charge {
-        charged: Charged,
-        started: u64,
-    }
-    impl Drop for Charge {
-        fn drop(&mut self) {
-            CURRENT.with(|label| label.borrow_mut().take());
-            let cpu_us = thread_cpu_ns().saturating_sub(self.started) / 1000;
-            let now = Instant::now();
-            let Charged { kind, client } = &self.charged;
-            let mut meter = METER.get_or_init(Mutex::default).lock().unwrap();
-            let mut charge = |table, label| {
-                let entry = meter.sample(now, table, label);
-                entry.cpu_us = entry.cpu_us.saturating_add(cpu_us);
-            };
-            charge(Table::Requests, kind.clone());
-            if let Some(client) = client {
-                charge(Table::Clients, client.clone());
-                charge(
-                    Table::ClientRequests,
-                    format!("{client}{CLIENT_KIND}{kind}"),
-                );
-            }
+    Some(Charge { charged, started: thread_cpu_ns() })
+}
+
+struct Charge {
+    charged: Charged,
+    started: u64,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        CURRENT.with(|label| label.borrow_mut().take());
+        let cpu_us = thread_cpu_ns().saturating_sub(self.started) / 1000;
+        let now = Instant::now();
+        let Charged { kind, client } = &self.charged;
+        let mut meter = METER.get_or_init(Mutex::default).lock().unwrap();
+        let mut charge = |table, label| {
+            let entry = meter.sample(now, table, label);
+            entry.cpu_us = entry.cpu_us.saturating_add(cpu_us);
+        };
+        charge(Table::Requests, kind.clone());
+        if let Some(client) = client {
+            charge(Table::Clients, client.clone());
+            charge(Table::ClientRequests, format!("{client}{CLIENT_KIND}{kind}"));
         }
     }
-    let _charge = Charge {
-        charged,
-        started: thread_cpu_ns(),
-    };
-    work()
 }
 fn thread_cpu_ns() -> u64 {
     let mut time = libc::timespec {

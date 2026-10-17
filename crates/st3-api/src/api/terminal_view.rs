@@ -158,12 +158,12 @@ static EMULATION: LazyLock<(tokio::sync::mpsc::UnboundedSender<WatchJob>, Arc<Qu
                 return;
             };
             let local = tokio::task::LocalSet::new();
-            local.block_on(&runtime, async move {
+            local.block_on(&runtime, crate::task_cpu::account("terminal.view_dispatch", async move {
                 while let Some(job) = incoming.recv().await {
                     incoming_queue.dequeued();
-                    tokio::task::spawn_local(run_watcher(job));
+                    tokio::task::spawn_local(crate::task_cpu::account("terminal.view_watch", run_watcher(job)));
                 }
-            });
+            }));
         });
     if let Err(error) = started {
         tracing::error!(%error, "start the terminal emulation thread");

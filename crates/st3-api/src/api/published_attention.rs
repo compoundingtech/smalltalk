@@ -39,7 +39,7 @@ pub fn start_attention_list(state: &AppState) {
     let state = state.clone();
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
-    tokio::spawn(async move {
+    tokio::spawn(crate::task_cpu::account("publication.attention", async move {
         // However this task ends, its views stop being served: windows read for themselves.
         struct Stopped(Arc<Store>);
         impl Drop for Stopped {
@@ -62,7 +62,7 @@ pub fn start_attention_list(state: &AppState) {
             // summary rows windows read. One view's failure leaves the others refreshing. A
             // summary selection a window waits for is computed before each view, so the window
             // waits for at most one other view's refresh.
-            let refreshed = tokio::task::spawn_blocking(move || {
+            let refreshed = tokio::task::spawn_blocking(move || crate::task_cpu::blocking("publication.attention", || {
                 // A pairing completed or revoked since the last pass changes which windows a
                 // session may hold; their windows reread to recheck it, as before.
                 if let Err(error) = reader.recheck_pairings() {
@@ -97,7 +97,7 @@ pub fn start_attention_list(state: &AppState) {
                     .map(|_| ())
                 })));
                 results
-            })
+            }))
             .await;
             match refreshed {
                 Ok(results) => {
@@ -126,7 +126,7 @@ pub fn start_attention_list(state: &AppState) {
                     // A complete roster arrived while no summary could be counted: count every
                     // selection now, not after the pause.
                     roster_arrived = false;
-                    tokio::task::spawn_blocking(move || {
+                    tokio::task::spawn_blocking(move || crate::task_cpu::blocking("publication.summary", || {
                         Some(crate::performance::task("summary/refresh", || {
                             super::client_v0::summary::refresh_published(
                                 &summary_state,
@@ -134,10 +134,10 @@ pub fn start_attention_list(state: &AppState) {
                                 false,
                             )
                         }))
-                    })
+                    }))
                     .await
                 } else if store.summary_selection_waiting() {
-                    tokio::task::spawn_blocking(move || refresh_waiting_summary(&summary_state, false)).await
+                    tokio::task::spawn_blocking(move || crate::task_cpu::blocking("publication.summary", || refresh_waiting_summary(&summary_state, false))).await
                 } else {
                     Ok(None)
                 };
@@ -197,7 +197,7 @@ pub fn start_attention_list(state: &AppState) {
                 () = tokio::time::sleep(due) => {}
             }
         }
-    });
+    }));
 }
 
 /// Publish the summary selections windows are waiting for, if any: a window that opens a new

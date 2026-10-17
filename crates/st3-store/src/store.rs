@@ -11027,7 +11027,11 @@ impl crate::otlp::ObservationSource for Store {
             let store = self.clone();
             self.connection
                 .write_workers()
-                .spawn_blocking(move || store.set_otlp_export_cursor(cursor))
+                .spawn_blocking(move || {
+                    smallclaims::task_cpu::blocking("observations.export", || {
+                        store.set_otlp_export_cursor(cursor)
+                    })
+                })
                 .await??;
             Ok(())
         })

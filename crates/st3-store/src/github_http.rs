@@ -182,7 +182,7 @@ impl TokenCache {
         // overwrite a newer credential. The environment itself is cached by its provider.
         let environment = environment().await?;
         let for_metadata = environment.clone();
-        let version = tokio::task::spawn_blocking(move || default_version(&for_metadata)).await??;
+        let version = tokio::task::spawn_blocking(move || crate::task_cpu::blocking("github.auth", || default_version(&for_metadata))).await??;
         if state.default_version.as_ref() != Some(&version) {
             state.token = None;
             state.retry_at = None;
@@ -230,7 +230,7 @@ impl TokenCache {
     async fn acquire_file(self: &Arc<Self>, path: &Path) -> Result<GithubAuth> {
         let mut state = self.0.lock().await;
         let path = path.to_owned();
-        let (file, version) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (file, version) = tokio::task::spawn_blocking(move || crate::task_cpu::blocking("github.auth", || -> Result<_> {
             let file = open_token_file(&path)?;
             let metadata = file.metadata().context("inspect GitHub token file")?;
             let version = FileVersion {
@@ -242,7 +242,7 @@ impl TokenCache {
                 length: metadata.len(),
             };
             Ok((file, version))
-        })
+        }))
         .await??;
         if state.file_version.as_ref() != Some(&version) {
             state.token = None;
@@ -250,7 +250,7 @@ impl TokenCache {
             state.file_version = Some(version);
         }
         self.resolve(&mut state, || async {
-            tokio::task::spawn_blocking(move || read_token_file(file)).await?
+            tokio::task::spawn_blocking(move || crate::task_cpu::blocking("github.auth", || read_token_file(file))).await?
         })
         .await
     }
@@ -348,7 +348,7 @@ where
 pub async fn github_auth() -> Result<GithubAuth> {
     let config = configured_source(&SOURCE)?;
     auth_for_config(config.clone(), token_cache(), || async {
-        tokio::task::spawn_blocking(crate::environment::snapshot).await?
+        tokio::task::spawn_blocking(|| crate::task_cpu::blocking("github.auth", crate::environment::snapshot)).await?
     })
     .await
 }
@@ -499,7 +499,7 @@ where
     };
     let profile = profile.to_owned();
     let response =
-        tokio::task::spawn_blocking(move || transport(&config, &profile, &wire)).await??;
+        tokio::task::spawn_blocking(move || crate::task_cpu::blocking("github.request", || transport(&config, &profile, &wire))).await??;
     anyhow::ensure!(
         response.body.len() <= MAX_RESPONSE_BODY,
         "GitHub authorized response body exceeds 64 MiB"

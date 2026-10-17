@@ -701,11 +701,45 @@ pub fn enter(op: Option<&Op>) -> Option<Entered> {
 
 /// Run `work` as its own operation, unless this thread already works for one.
 pub fn task<T>(label: &'static str, work: impl FnOnce() -> T) -> T {
-    let _origin = crate::sqlite::telemetry::enter_task_origin(label);
-    crate::performance::task(label, || profiled_task(label, work))
+    let _scope = task_scope(label);
+    work()
 }
 
-fn profiled_task<T>(label: &'static str, work: impl FnOnce() -> T) -> T {
+/// A synchronous task scope. Field order leaves profiling before performance/origin.
+pub(crate) struct TaskScope {
+    entered: Option<Entered>,
+    op: Option<Op>,
+    panicking_on_entry: bool,
+    _performance: crate::performance::TaskScope,
+    _origin: Option<crate::sqlite::telemetry::OriginScope>,
+}
+
+pub(crate) fn task_scope(label: &'static str) -> TaskScope {
+    let origin = crate::sqlite::telemetry::enter_task_origin(label);
+    let performance = crate::performance::task_scope(label);
+    let op = if enabled() && CURRENT.with(|current| current.borrow().is_none()) {
+        Op::start(label, None)
+    } else {
+        None
+    };
+    let entered = enter(op.as_ref());
+    TaskScope { entered, op, panicking_on_entry: std::thread::panicking(),
+        _performance: performance, _origin: origin }
+}
+
+impl Drop for TaskScope {
+    fn drop(&mut self) {
+        drop(self.entered.take());
+        if let Some(op) = self.op.take() {
+            // Preserve profiled_task's completion versus unwound/abandoned outcome.
+            if !std::thread::panicking() || self.panicking_on_entry {
+                op.finish();
+            }
+        }
+    }
+}
+
+pub(crate) fn profiled_task<T>(label: &'static str, work: impl FnOnce() -> T) -> T {
     if !enabled() || CURRENT.with(|current| current.borrow().is_some()) {
         return work();
     }
