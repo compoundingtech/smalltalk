@@ -113,6 +113,18 @@ ten-second read gate. The runner refuses a short outage below two seconds, a lon
 outage below two minutes, or an observation tail below 25 seconds. It exits nonzero
 for a failed gate or fixture error and writes partial results after each case.
 
+Readiness waits use one outer deadline, including an in-flight observation. A CLI
+probe's five-second timeout is an incomplete sample, not the end of readiness.
+Non-timeout errors still fail immediately. Each wait writes a
+`messaging_faults.wait` JSON event to stderr with `condition`, `ended_by`
+(`ready`, `outer-deadline`, or `error`), `elapsed_ms`, `outer_timeout_ms`, and
+`probe_timeouts`. Cancellation still allows the existing subprocess cleanup to
+finish. These setup budgets do not change the ten-second delivery gate.
+
+The runtime regressions inject a probe timeout followed by readiness and expire
+an outer deadline while a probe is blocked. They use explicit async coordination,
+not sleeps to order events.
+
 The oracle's negative controls run with:
 
 ```sh

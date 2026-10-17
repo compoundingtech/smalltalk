@@ -3,6 +3,8 @@ import asyncio
 import importlib.machinery
 import importlib.util
 import os
+import io
+import json
 from pathlib import Path
 import socket
 import tempfile
@@ -146,6 +148,51 @@ class ChannelReadinessTests(unittest.IsolatedAsyncioTestCase):
         node.cli.return_value = '{"value":null}'
         self.assertEqual(await runner.agent(node), {})
         self.assertIsNone(await runner.current_channel(node))
+
+
+class WaitDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_probe_timeout_does_not_abort_outer_readiness_wait(self):
+        # The first CLI communicate() deadline used to escape until() immediately.
+        ready = {"harness_state": "idle"}
+        probe = AsyncMock(side_effect=[TimeoutError(), ready])
+        signal = io.StringIO()
+        with patch.object(runner.asyncio, "sleep", AsyncMock()), \
+             patch.object(runner.sys, "stderr", signal):
+            self.assertIs(await runner.until(probe, 30), ready)
+        self.assertEqual(probe.await_count, 2)
+        event = json.loads(signal.getvalue())
+        self.assertEqual(event["ended_by"], "ready")
+        self.assertEqual(event["probe_timeouts"], 1)
+        self.assertEqual(event["outer_timeout_ms"], 30000)
+        self.assertGreaterEqual(event["elapsed_ms"], 0)
+
+    async def test_outer_deadline_cancels_an_in_flight_probe(self):
+        # Expire the actual timeout after the probe enters, without wall-clock sleeps.
+        scope = asyncio.timeout(3600)
+        cancelled = asyncio.Event()
+        async def blocked():
+            scope.reschedule(asyncio.get_running_loop().time() - 1)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        signal = io.StringIO()
+        with patch.object(runner.asyncio, "timeout", return_value=scope), \
+             patch.object(runner.sys, "stderr", signal):
+            with self.assertRaisesRegex(TimeoutError, "outer deadline"):
+                await runner.until(blocked, 3600)
+        self.assertTrue(cancelled.is_set())
+        event = json.loads(signal.getvalue())
+        self.assertEqual(event["ended_by"], "outer-deadline")
+        self.assertEqual(event["probe_timeouts"], 0)
+        self.assertGreaterEqual(event["elapsed_ms"], 0)
+
+    async def test_non_timeout_probe_failure_is_not_retried(self):
+        probe = AsyncMock(side_effect=RuntimeError("daemon exited"))
+        with patch.object(runner.sys, "stderr", io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "daemon exited"):
+                await runner.until(probe)
+        probe.assert_awaited_once()
 
 
 if __name__ == "__main__":
