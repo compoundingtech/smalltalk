@@ -1,1 +1,1 @@
-{"st3-daemon": "st3", "st3-e2e": "st3-client", "st3-store": "st3-daemon", "st3-peer": "st3-daemon", "st3-reconcile": "st3-daemon", "st3-api": "st3-daemon", "st3-secrets": "st3-daemon"}
+{"st3-daemon": "st3", "st3-e2e": "st3-client", "st3-store": "st3-daemon", "st3-peer": "st3-daemon", "st3-reconcile": "st3-daemon", "st3-api": "st3-daemon", "st3-secrets": "st3-daemon", "st3-github-base": "st3-daemon", "st3-missions-base": "st3-daemon", "st3-delivery-base": "st3-daemon", "st3-seats-base": "st3-daemon"}

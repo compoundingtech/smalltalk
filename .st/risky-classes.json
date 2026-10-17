@@ -43,7 +43,7 @@
     },
     {
       "name": "routing-and-delivery",
-      "globs": ["crates/st3-store/src/mailbox.rs", "crates/st3-api/src/api/mailbox*", "crates/st3-store/src/store/mailbox_*", "crates/st3-reconcile/src/placement.rs", "crates/st3-store/src/suspension.rs", "crates/st3-store/src/rollout.rs", "crates/st3-reconcile/src/reconcile.rs", "crates/st3-reconcile/src/reconcile/**"],
+      "globs": ["crates/st3-delivery-base/src/mailbox.rs", "crates/st3-api/src/api/mailbox*", "crates/st3-store/src/store/mailbox_*", "crates/st3-reconcile/src/placement.rs", "crates/st3-store/src/suspension.rs", "crates/st3-store/src/rollout.rs", "crates/st3-reconcile/src/reconcile.rs", "crates/st3-reconcile/src/reconcile/**"],
       "content": [
         {"globs": ["crates/st3-api/src/api.rs"], "pattern": "\\.(route|nest|merge|fallback)\\("}
       ],

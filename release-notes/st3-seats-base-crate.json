@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Moved the seat leaf modules (native session resume, remote terminal attach and node identity) into the st3-seats-base crate below st3-store.",
+  "replay": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Source files moved between crates of this workspace; same code, same binary behaviour, protocol, schema and CLI output."
+  }
+}

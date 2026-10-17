@@ -574,7 +574,7 @@ mod tests {
             "unrelated declaration",
         ] {
             let store = Store::open_memory("node").unwrap();
-            crate::mailbox::tests::ready(&store, "boot");
+            crate::store::mailbox_tests::ready(&store, "boot");
             let fence = store
                 .bind_mailbox(&Fence::new("agent/eval.worker", "boot", "delivery"))
                 .unwrap();

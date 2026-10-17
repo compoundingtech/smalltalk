@@ -154,7 +154,7 @@ fn native_mailbox_ownership_changes_no_shared_projection_digest() {
         "version 2\nagent \"eval.worker\" { host \"alder\"; workspace \"/tmp\"; harness \"claude\" {} }", "alder",
     ).unwrap();
     store.apply_internal(&intent, "mailbox-audit").unwrap();
-    crate::mailbox::tests::ready(&store, "session-1");
+    crate::store::mailbox_tests::ready(&store, "session-1");
     let before = graph_digest(&store.readers.get()).unwrap();
     let before_tables = projection_digest::tables(&store.readers.get()).unwrap();
     let first = crate::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");

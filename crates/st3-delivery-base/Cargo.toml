@@ -1,0 +1,31 @@
+[package]
+name = "st3-delivery-base"
+version = "0.1.0"
+edition = "2024"
+description = "the message-delivery leaf modules: blobs, message bodies, person requests and the mailbox fence, which name no store code"
+license = "MIT"
+
+[features]
+# Forwarded by st3-daemon's feature of the same name; never enabled by a production build.
+test-support = ["st3-secrets/test-support"]
+
+[dependencies]
+st3-secrets = { path = "../st3-secrets" }
+anyhow = "1"
+axum = { version = "0.8", features = ["json", "ws"] }
+futures-util = "0.3"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+smallclaims = { path = "../smallclaims" }
+st3-client = { path = "../st3-client", features = ["trace-propagation"] }
+st-drivers = { path = "../st-drivers" }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+
+[dev-dependencies]
+st3_delivery_base_self = { package = "st3-delivery-base", path = ".", features = ["test-support"] }
+smallclaims = { path = "../smallclaims", features = ["test-support"] }
+tokio = { version = "1", features = ["test-util"] }

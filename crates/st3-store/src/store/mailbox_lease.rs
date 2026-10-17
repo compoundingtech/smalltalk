@@ -159,7 +159,7 @@ mod tests {
     fn fixture() -> Store {
         let store = Store::open_memory("node").unwrap();
         declare(&store);
-        crate::mailbox::tests::ready(&store, "current");
+        crate::store::mailbox_tests::ready(&store, "current");
         store
     }
 
@@ -290,7 +290,7 @@ mod tests {
         let second_cut = store.index().unwrap();
         assert_eq!(store.mailbox_faults_for(&subjects, second_cut).unwrap()[subject], "second loss",
             "an old recovery must not quiet a new interruption");
-        crate::mailbox::tests::ready(&store, "replacement");
+        crate::store::mailbox_tests::ready(&store, "replacement");
         assert!(store.mailbox_faults_for(&subjects, store.index().unwrap()).unwrap().is_empty());
         assert_eq!(store.mailbox_faults_for(&subjects, second_cut).unwrap()[subject], "second loss");
         assert!(store.mailbox_faults_for(&[], second_cut).unwrap().is_empty());
@@ -597,7 +597,7 @@ mod tests {
         let bound = {
             let store = Store::open(&path, "node").unwrap();
             declare(&store);
-            crate::mailbox::tests::ready(&store, "current");
+            crate::store::mailbox_tests::ready(&store, "current");
             store
                 .bind_mailbox_with_lease(&request(), Some(&authority(1)))
                 .unwrap()
@@ -1015,7 +1015,7 @@ mod tests {
         let path = root.path().join("argv.db");
         let store = Store::open(&path,"node").unwrap();
         declare(&store);
-        crate::mailbox::tests::ready(&store,"current");
+        crate::store::mailbox_tests::ready(&store,"current");
         let member = declare_argv(&store,"node");
         let bound = store.bind_argv_mailbox_checked(&request(), &member, &|| Ok(())).unwrap();
         drop(store);

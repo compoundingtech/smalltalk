@@ -1,0 +1,31 @@
+[package]
+name = "st3-seats-base"
+version = "0.1.0"
+edition = "2024"
+description = "the seat leaf modules: native session resume, remote terminal attach and node identity, which name no store code"
+license = "MIT"
+
+[features]
+# Forwarded by st3-daemon's feature of the same name; never enabled by a production build.
+test-support = ["st3-secrets/test-support"]
+
+[dependencies]
+st3-secrets = { path = "../st3-secrets" }
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+libc = "0.2"
+pty-client = { git = "https://github.com/compoundingtech/pty", rev = "f8388fe7a8617d973e720e29107e68ac5ea95987" }
+pty-core = { git = "https://github.com/compoundingtech/pty", rev = "f8388fe7a8617d973e720e29107e68ac5ea95987" }
+rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
+serde_json = "1"
+sha2 = "0.10"
+st3-client = { path = "../st3-client", features = ["trace-propagation"] }
+st-drivers = { path = "../st-drivers" }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+
+[dev-dependencies]
+st3_seats_base_self = { package = "st3-seats-base", path = ".", features = ["test-support"] }
+tokio = { version = "1", features = ["test-util"] }

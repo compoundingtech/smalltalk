@@ -851,7 +851,7 @@ mod tests {
             store
                 .apply_internal(&intent, "bootstrap-witness-fixture")
                 .unwrap();
-            crate::mailbox::tests::ready(&store, "current");
+            crate::store::mailbox_tests::ready(&store, "current");
             let owner = Authority {
                 provider: "codex".into(),
                 session: "runtime:current".into(),
@@ -1023,7 +1023,7 @@ mod tests {
         store
             .apply_internal(&intent, "raw-terminal-fixture")
             .unwrap();
-        crate::mailbox::tests::ready(&store, "current");
+        crate::store::mailbox_tests::ready(&store, "current");
         let state = AppState {
             owning_person: None,
             store: store.clone(),

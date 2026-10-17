@@ -15,7 +15,7 @@ struct Mailbox {
 impl Mailbox {
     fn new() -> Self {
         let store = Store::open_memory("node").unwrap();
-        crate::mailbox::tests::ready(&store, "session-1");
+        crate::store::mailbox_tests::ready(&store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();

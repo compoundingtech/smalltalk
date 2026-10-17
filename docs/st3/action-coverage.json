@@ -1143,7 +1143,7 @@
       "description": "Whether the check run or commit status named CHECK passed on a commit or branch head",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart",
-        "crates/st3-store/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
+        "crates/st3-github-base/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
       ],
       "verification": "real CLI with private HTTP fixture covers pass/wait/broken and obsolete refs across daemon restarts"
     },
@@ -1152,7 +1152,7 @@
       "description": "Whether a pull request has merged; one that closed unmerged cannot pass",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_github_gates_pass_wait_and_refuse_over_private_http_across_restart",
-        "crates/st3-store/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
+        "crates/st3-github-base/src/resource/github_gates.rs::lookups_pass_wait_or_break_as_github_answers"
       ],
       "verification": "real CLI with private HTTP fixture covers pass/wait/broken and obsolete refs across daemon restarts"
     },

@@ -228,6 +228,14 @@ pub mod terminal_gate_evidence;
 #[cfg(test)]
 pub mod checkpoint_tests;
 #[cfg(test)]
+pub mod provenance_tests;
+#[cfg(test)]
+pub mod mission_model_tests;
+#[cfg(test)]
+pub mod native_resume_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod mailbox_tests;
+#[cfg(test)]
 pub mod checkpoint_capture_epoch_tests;
 #[cfg(test)]
 pub mod checkpoint_replication_capture_tests;

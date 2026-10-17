@@ -46,6 +46,9 @@
       "clippy::if_same_then_else": 1,
       "clippy::too_many_arguments": 1
     },
+    "st3-github-base": {
+      "clippy::type_complexity": 3
+    },
     "st3-reconcile": {
       "clippy::collapsible_if": 3,
       "clippy::empty_line_after_doc_comments": 2,
@@ -61,7 +64,7 @@
       "clippy::needless_question_mark": 1,
       "clippy::redundant_closure": 1,
       "clippy::too_many_arguments": 1,
-      "clippy::type_complexity": 5
+      "clippy::type_complexity": 2
     },
     "st3-ui-model": {
       "clippy::field_reassign_with_default": 4

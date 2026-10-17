@@ -186,7 +186,7 @@ mod tests {
     fn a_pinned_mailbox_cursor_cannot_skip_a_concurrent_commit() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(&root.path().join("graph.db"), "node").unwrap();
-        crate::mailbox::tests::ready(&store, "session-1");
+        crate::store::mailbox_tests::ready(&store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();

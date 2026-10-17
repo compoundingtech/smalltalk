@@ -16,7 +16,7 @@ import os
 import re
 import tomllib
 
-SOURCE_DIRS = ("crates/st3-core/src", "crates/st3-kernel/src", "crates/st3-telemetry/src", "crates/st3-secrets/src", "crates/st3-store/src", "crates/st3-peer/src", "crates/st3-reconcile/src", "crates/st3-api/src", "crates/st3-daemon/src", "crates/st3/src")
+SOURCE_DIRS = ("crates/st3-core/src", "crates/st3-kernel/src", "crates/st3-telemetry/src", "crates/st3-secrets/src", "crates/st3-seats-base/src", "crates/st3-delivery-base/src", "crates/st3-missions-base/src", "crates/st3-github-base/src", "crates/st3-store/src", "crates/st3-peer/src", "crates/st3-reconcile/src", "crates/st3-api/src", "crates/st3-daemon/src", "crates/st3/src")
 ENTRY_FILES = {"lib", "main", "fixture"}
 TEST_ONLY_MODULES = {"test_support"}
 REEXPORTS = {

@@ -1339,7 +1339,7 @@ mod tests {
             }
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let peer = NativeDeliveryPeer {
             agent: seat.into(),
             transport,
@@ -1518,7 +1518,7 @@ mod tests {
                         .unwrap();
                 }
             }
-            crate::mailbox::tests::ready(&store, "first-boot");
+            crate::store::mailbox_tests::ready(&store, "first-boot");
             let mut messages = store.messages(Some(seat), false).unwrap();
             hold_pre_boot_mail(&store, Some(&peer), Some(seat), &mut messages).unwrap();
             assert!(messages.iter().all(|m| m.status
@@ -1549,7 +1549,7 @@ mod tests {
                     "{transport} removed recovery during current {phase}"
                 );
             }
-            crate::mailbox::tests::ready(&store, "second-boot");
+            crate::store::mailbox_tests::ready(&store, "second-boot");
             let mut messages = store.messages(Some(seat), false).unwrap();
             hold_pre_boot_mail(&store, Some(&peer), Some(seat), &mut messages).unwrap();
             assert!(messages.iter().all(|m| m.status == "closed"));
@@ -1711,7 +1711,7 @@ mod tests {
         let database = root.path().join("graph.db");
         state.store = Arc::new(Store::open(&database, "node").unwrap());
         let seat = "agent/eval.worker";
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let send = |id: &str| {
             state
                 .store
@@ -1934,7 +1934,7 @@ mod tests {
                 .unwrap();
         };
         apply(source, "declare");
-        crate::mailbox::tests::ready(&state.store, "before-stop");
+        crate::store::mailbox_tests::ready(&state.store, "before-stop");
         let thread = crate::github_watch::ThreadRef::parse("acme/garden#12").unwrap();
         state.store.declare_watch(&thread, seat, None).unwrap();
         let observe = |comments: Value| {
@@ -1981,7 +1981,7 @@ mod tests {
             &queued[0].subject,
         );
         apply(source, "start");
-        crate::mailbox::tests::ready(&state.store, "after-start");
+        crate::store::mailbox_tests::ready(&state.store, "after-start");
         reconcile();
         assert_eq!(
             state
@@ -2089,7 +2089,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let kdl =
             "version 2\nagent \"eval.worker\" { workspace \"/work\"; command \"sleep 60\"; }\n";
         let intent = crate::graph::parse_test_intent(kdl, "node").unwrap();
@@ -2327,7 +2327,7 @@ mod tests {
             // Exercise the daemon's WAL database, rather than SQLite's shared-cache
             // in-memory fixture, whose concurrent reads can reject a writer immediately.
             state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-            crate::mailbox::tests::ready(&state.store, "session-1");
+            crate::store::mailbox_tests::ready(&state.store, "session-1");
             let kdl = "version 2\nagent \"eval.worker\" { workspace \"/work\"; command \"sleep 60\"; name \"Quartz\"; }\n";
             let intent = crate::graph::parse_test_intent(kdl, "node").unwrap();
             let planned = state
@@ -2567,7 +2567,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let input = ClaimInput {
             subject: "message/transient".into(),
             kind: "message.sent".into(),
@@ -2659,7 +2659,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let fence = state
             .store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
@@ -3076,7 +3076,7 @@ mod tests {
         state.store.bind_fleet(FLEET).unwrap();
         let source = Store::open_memory("source").unwrap();
         source.bind_fleet(FLEET).unwrap();
-        crate::mailbox::tests::ready(&source, "session-1");
+        crate::store::mailbox_tests::ready(&source, "session-1");
         let request = || ReplicationReceiveRequest {
             carrier: Default::default(),
             peer: "source".into(),
@@ -3130,7 +3130,7 @@ mod tests {
         assert_eq!(stream.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
         // Binding epochs/tokens are daemon-local and never replicated. A replicated live
         // incarnation replacement must instead wake the seat dependency and fence this boot.
-        crate::mailbox::tests::ready(&source, "session-2");
+        crate::store::mailbox_tests::ready(&source, "session-2");
         let replacement: ReplicationReceiveResponse = client
             .post("/v1/internal/replication/receive", &request())
             .await
@@ -3179,7 +3179,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let fence = state
             .store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
@@ -3246,7 +3246,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let old = state
             .store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
@@ -3274,7 +3274,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let old = state
             .store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
@@ -3312,7 +3312,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let store = Store::open_memory("node").unwrap();
-        crate::mailbox::tests::ready(&store, "session-1");
+        crate::store::mailbox_tests::ready(&store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();
@@ -3437,7 +3437,7 @@ mod tests {
     #[test]
     fn incremental_mailbox_matches_full_oracle_across_coalesced_lifecycle_changes() {
         let store = Store::open_memory("node").unwrap();
-        crate::mailbox::tests::ready(&store, "session-1");
+        crate::store::mailbox_tests::ready(&store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();
@@ -3603,7 +3603,7 @@ mod tests {
     #[test]
     fn held_watch_wake_resumes_after_a_local_post_guard_without_a_graph_write() {
         let store = Store::open_memory("node").unwrap();
-        crate::mailbox::tests::ready(&store, "session-1");
+        crate::store::mailbox_tests::ready(&store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();
@@ -3698,7 +3698,7 @@ mod tests {
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open_memory("node").unwrap());
         let store = &state.store;
-        crate::mailbox::tests::ready(store, "session-1");
+        crate::store::mailbox_tests::ready(store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();
@@ -3805,7 +3805,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
-        crate::mailbox::tests::ready(&state.store, "session-1");
+        crate::store::mailbox_tests::ready(&state.store, "session-1");
         let fence = state
             .store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
@@ -3884,7 +3884,7 @@ mod tests {
     #[test]
     fn a_mailbox_stream_reads_again_only_for_what_its_snapshot_depends_on() {
         let store = Store::open_memory("node").unwrap();
-        crate::mailbox::tests::ready(&store, "session-1");
+        crate::store::mailbox_tests::ready(&store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
             .unwrap();
@@ -3934,7 +3934,7 @@ mod tests {
         assert!(store.mailbox_changed_since(&fence, &mark, &mine).unwrap());
         // And a newer channel taking the seat over.
         let mark = store.mailbox_watermark(&fence).unwrap();
-        crate::mailbox::tests::ready(&store, "session-2");
+        crate::store::mailbox_tests::ready(&store, "session-2");
         let _newer = store.bind_mailbox(&Fence::new("agent/eval.worker", "session-2", "delivery"));
         assert!(store.mailbox_changed_since(&fence, &mark, &mine).unwrap());
     }

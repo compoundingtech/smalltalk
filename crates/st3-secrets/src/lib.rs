@@ -13,7 +13,10 @@ mod ci_test_paths;
 
 pub use st3_kernel::*;
 pub use st3_telemetry::*;
-pub use smallclaims::{performance, profile};
+pub use smallclaims::{performance, profile, task_cpu};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub mod client;
 pub mod sekrets;
