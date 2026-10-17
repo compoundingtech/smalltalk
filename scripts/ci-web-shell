@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# The fractal-web devShell (`.#web`) as a cached closure, so the execution job neither fetches and
+# evaluates the flake's inputs (~45 s) nor builds the shell's locally built tools (~30 s) on every run.
+#
+# `nix develop .#web` on a fresh GitHub-hosted runner evaluates the whole flake input graph, builds
+# the Buck root, capability projection and Genie import, and substitutes ~1.5 GB from public caches.
+# `fill` records what that produces: the shell's `print-dev-env` script, which is what `nix develop`
+# itself evaluates, and the shell's complete closure as a local file:// binary cache. `run` copies
+# that closure into the Nix store and runs a command in the sourced script, never evaluating the
+# flake. Any problem on the way falls back to `nix develop .#web`, so a miss only costs time.
+#
+# The cache entry is keyed by the files the shell is built from (see fractalWebShellCache in
+# .github/workflows/workspace-ci.ts); main upkeep fills it, and a run that misses fills its own ref.
+set -euo pipefail
+cmd=${1:?usage: scripts/ci-web-shell fill|run COMMAND...}
+shift
+dir=${CI_WEB_SHELL_DIR:?CI_WEB_SHELL_DIR is not set}
+cache="$dir/cache"
+key="$dir/key"
+shell_file="$dir/shell-path"
+env_file="$dir/env.sh"
+
+case "$cmd" in
+  fill)
+    start=$SECONDS
+    rm -f "$shell_file" "$env_file"
+    mkdir -p "$cache"
+    [ -s "$key.sec" ] || nix key generate-secret --key-name st-ci-web-shell-1 > "$key.sec"
+    # The profile roots the closure while it is copied; its target is the shell environment path.
+    nix print-dev-env .#web --profile "$dir/profile" > "$env_file.tmp"
+    shell=$(readlink -f "$dir/profile")
+    nix copy --to "file://$cache?secret-key=$key.sec&compression=zstd" --no-check-sigs "$shell"
+    # Written last: a directory without these two files is an incomplete fill and counts as a miss.
+    mv "$env_file.tmp" "$env_file"
+    rm -f "$dir"/profile "$dir"/profile-*-link
+    printf '%s\n' "$shell" > "$shell_file"
+    paths=$(nix path-info --recursive "$shell" | wc -l)
+    printf 'Web shell cache: %s store paths, %s MiB, filled in %ss\n' "$paths" \
+      "$(( $(du -sk "$cache" | cut -f1) / 1024 ))" "$((SECONDS - start))"
+    ;;
+  run)
+    [ "$#" -gt 0 ] || { echo "usage: scripts/ci-web-shell run COMMAND..." >&2; exit 2; }
+    start=$SECONDS
+    # The cache is only usable when it is complete and its closure lands in the store.
+    if [ -s "$shell_file" ] && [ -s "$env_file" ] \
+      && nix copy --from "file://$cache" --no-check-sigs "$(cat "$shell_file")"; then
+      printf 'Web shell: restored from the cache in %ss\n' "$((SECONDS - start))"
+      if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        printf 'Web shell: **cache hit**, %ss to realize\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      fi
+      # `nix develop -c` runs the command in exactly this environment and shell hook.
+      exec bash -c 'source "$1" && shift && exec "$@"' bash "$env_file" "$@"
+    fi
+    printf '::notice::the web shell cache is unavailable; evaluating the flake (%ss lost)\n' "$((SECONDS - start))"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      printf 'Web shell: **cache miss**, evaluating `.#web`\n' >> "$GITHUB_STEP_SUMMARY"
+    fi
+    exec nix develop .#web -c "$@"
+    ;;
+  *) echo "unknown command: $cmd" >&2; exit 2 ;;
+esac

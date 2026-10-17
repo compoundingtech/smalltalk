@@ -5,6 +5,8 @@ import {
   buildEnv,
   cargoCacheStep,
   commonSetupSteps,
+  fractalWebShellCache,
+  fractalWebShellEnv,
   fractalWebStoreCache,
   genieNixCacheStep,
   genieSetupSteps,
@@ -143,11 +145,18 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       steps: [
         { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
         { name: 'Probe the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: { ...fractalWebStoreCache, 'lookup-only': true } },
+        { name: 'Probe the web shell closure', id: 'web-shell', uses: 'actions/cache/restore@v4', with: { ...fractalWebShellCache, 'lookup-only': true } },
         ...[
           ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+        ].map((step) => ({ ...step, if: "steps.pnpm-store.outputs.cache-hit != 'true' || steps.web-shell.outputs.cache-hit != 'true'" })),
+        ...[
           { ...nixDevelopStep({ name: 'Fetch the locked packages', flake: '.#web', command: ['pnpm', 'fetch'] }), env: pnpmStoreEnv },
           { name: 'Save the pnpm store', uses: 'actions/cache/save@v4', with: fractalWebStoreCache },
         ].map((step) => ({ ...step, if: "steps.pnpm-store.outputs.cache-hit != 'true'" })),
+        ...[
+          { name: 'Fill the web shell closure', shell: 'bash', run: 'bash scripts/ci-web-shell fill', env: fractalWebShellEnv },
+          { name: 'Save the web shell closure', uses: 'actions/cache/save@v4', with: fractalWebShellCache },
+        ].map((step) => ({ ...step, if: "steps.web-shell.outputs.cache-hit != 'true'" })),
       ],
     },
     // This check never ran in merge_group; keep its main measurements and generated-store cache.

@@ -527,6 +527,17 @@ export const fractalWebStoreCache = {
   key: "fractal-web-pnpm-${{ runner.os }}-pnpm12.7.0-node24.20.0-${{ hashFiles('pnpm-lock.yaml') }}",
 } as const
 
+/**
+ * The web lane's devShell closure and `print-dev-env` script (scripts/ci-web-shell), so the job
+ * neither fetches and evaluates the flake's inputs nor builds the shell's local tools. The key names
+ * every file `.#web` is built from; main upkeep fills it and a pull request that misses fills its own.
+ */
+export const fractalWebShellEnv = { CI_WEB_SHELL_DIR: '${{ runner.temp }}/web-shell' } as const
+export const fractalWebShellCache = {
+  path: fractalWebShellEnv.CI_WEB_SHELL_DIR,
+  key: "fractal-web-shell1-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'nix/**/*.nix', 'scripts/ci-web-shell') }}",
+} as const
+
 const embeddedPython = (script: string) =>
   `python3 - <<'PY'\n${readFileSync(new URL(`../../scripts/${script}`, import.meta.url), 'utf8')}\nPY`
 
@@ -571,10 +582,15 @@ export const fractalWebJobs = {
       { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
       ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
       { name: 'Restore the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: fractalWebStoreCache },
+      { name: 'Restore the web shell closure', id: 'web-shell', uses: 'actions/cache/restore@v4', with: fractalWebShellCache },
       {
-        ...nixDevelopStep({ name: 'Run the fractal-web lanes and dependency license check', flake: '.#web', command: ['bash', 'scripts/ci-fractal-web'] }),
+        name: 'Run the fractal-web lanes and dependency license check',
+        shell: 'bash',
+        // Falls back to `nix develop .#web` when the closure is not cached.
+        run: 'bash scripts/ci-web-shell run bash scripts/ci-fractal-web',
         env: {
           ...pnpmStoreEnv,
+          ...fractalWebShellEnv,
           KIT_INPUTS: '${{ needs.fractal-web-changes.outputs.kit-inputs }}',
           // Pull requests run the stories tagged critical without axe, within the 7-minute budget;
           // merge groups (observed and signed) and manual runs keep every story with axe.
@@ -585,6 +601,11 @@ export const fractalWebJobs = {
           HEAD_SHA: '${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}',
         },
       },
+      // Only a pull request can read what it saves; merge groups wait for main upkeep's entry.
+      ...[
+        { name: 'Fill the web shell closure', shell: 'bash', run: 'bash scripts/ci-web-shell fill', env: fractalWebShellEnv },
+        { name: 'Save the web shell closure', uses: 'actions/cache/save@v4', with: fractalWebShellCache },
+      ].map((step) => ({ ...step, 'continue-on-error': true, if: "${{ !cancelled() && github.event_name == 'pull_request' && steps.web-shell.outputs.cache-hit != 'true' }}" })),
     ],
   },
   'fractal-web': {

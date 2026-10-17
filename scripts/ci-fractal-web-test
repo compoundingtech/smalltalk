@@ -262,8 +262,15 @@ assert "github.event.pull_request.draft == false" in changes and "(success())" i
 assert "needs: [fractal-web-changes, genie-freshness]" in execution
 assert "needs.fractal-web-changes.outputs.relevant == 'true'" in execution
 assert "needs.genie-freshness.result == 'success'" in execution
-assert "nix develop '.#web' -c bash scripts/ci-fractal-web" in execution
-assert "actions/cache/restore@" in execution and "actions/cache/save@" not in execution, "only main upkeep publishes caches"
+assert "bash scripts/ci-web-shell run bash scripts/ci-fractal-web" in execution, "the lanes run in the cached web shell"
+assert "nix develop .#web -c" in (root / "scripts/ci-web-shell").read_text(), "a missing shell cache falls back to evaluating the flake"
+assert "actions/cache/restore@" in execution
+# Main upkeep publishes the shared caches. The one save here fills the web shell closure for a pull
+# request whose flake inputs changed, so that its own later runs hit; it is scoped to that pull request.
+saves = re.findall(r"(?ms)^      - name: ([^\n]*)\n(?:(?!^      - ).)*?uses: actions/cache/save@(?:(?!^      - ).)*", execution)
+assert saves == ["Save the web shell closure"], saves
+save = execution[execution.index("      - name: Save the web shell closure"):]
+assert "github.event_name == 'pull_request'" in save and "steps.web-shell.outputs.cache-hit != 'true'" in save
 assert "(always())" in gate_job and "needs: [fractal-web-changes, fractal-web-execution]" in gate_job
 assert "fractal-web" not in blocks["linux-gate"], "Rust-only gates never wait for web execution"
 settings = (root / ".github/repo-settings.json").read_text()

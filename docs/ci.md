@@ -543,7 +543,9 @@ workflow-level path filters. `linux-gate` does not depend on them.
   and `.github/repo-settings.json*`.
 - `fractal-web-execution` runs only for relevant changes after successful detection
   and `genie-freshness`, with a 25-minute timeout and no retries. It runs
-  `nix develop .#web -c bash scripts/ci-fractal-web`. Timed lanes check toolchain/Buck-root
+  `scripts/ci-web-shell run bash scripts/ci-fractal-web`, which is
+  `nix develop .#web -c bash scripts/ci-fractal-web` without evaluating the flake when the
+  shell closure is cached (below). Timed lanes check toolchain/Buck-root
   identity, run `pnpm install --frozen-lockfile`, then `buck2 build //:typecheck`.
   It restores the pnpm store with key
   `fractal-web-pnpm-<os>-pnpm12.7.0-node24.20.0-<hashFiles pnpm-lock.yaml>`;
@@ -570,6 +572,25 @@ workflow-level path filters. `linux-gate` does not depend on them.
   render it.
   This selection is the same for PRs, merge groups and pushes. Main pushes currently
   run Main upkeep's dependency-cache warmer, not a duplicate Workspace CI execution.
+- The web shell closure. A fresh GitHub-hosted runner needs about 120 s to fetch and evaluate
+  the flake inputs, build the Buck root, capability projection and Genie import (none is in a
+  public cache) and substitute ~1.5 GB for `nix develop .#web`. `scripts/ci-web-shell fill`
+  stores `nix print-dev-env .#web` and the shell's complete closure as a local `file://`
+  binary cache in the Actions cache entry
+  `fractal-web-shell1-<os>-<hashFiles flake.nix, flake.lock, nix/**/*.nix, scripts/ci-web-shell>`.
+  `run` copies the closure into the store (`--no-check-sigs`) and runs the lanes in the sourced
+  `print-dev-env` script, which is the environment `nix develop -c` builds; the flake is not
+  evaluated (about 36 s including the cache download). The script writes `env.sh` and
+  `shell-path` last, so a partial fill is a miss; a miss, a failed copy or a closure that is
+  incomplete after an eviction makes `run` exec `nix develop .#web -c ...` instead, which only
+  costs time. A change to any keyed file gives a new key, so a pull request that edits one never
+  reads main's entry.
+  Trust: the restored entry supplies store paths and a shell script that the job executes.
+  Main upkeep's `warm-fractal-web` fills the main-scoped entry. A pull request that misses saves
+  the entry under its own ref, only for `pull_request` events; this is a deliberate exception
+  to "only Main upkeep saves caches". GitHub scopes an entry to its ref, so a pull request's own
+  entry is only ever read by that pull request: no other pull request, merge group or main reads
+  it. Merge groups never save and wait for Main upkeep's entry.
 - `fractal-web` is always emitted (`if: always()`), with a one-minute timeout. Its
   embedded `scripts/ci-fractal-web-gate` passes only when detection succeeded and
   either no relevant paths changed and execution was skipped, or execution succeeded.

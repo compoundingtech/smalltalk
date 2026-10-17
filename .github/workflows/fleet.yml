@@ -3487,22 +3487,43 @@ jobs:
         with:
           path: "${{ runner.temp }}/pnpm-store"
           key: "fractal-web-pnpm-${{ runner.os }}-pnpm12.7.0-node24.20.0-${{ hashFiles('pnpm-lock.yaml') }}"
+      - name: Restore the web shell closure
+        id: web-shell
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.temp }}/web-shell"
+          key: "fractal-web-shell1-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'nix/**/*.nix', 'scripts/ci-web-shell') }}"
       - name: Run the fractal-web lanes and dependency license check
         shell: bash
-        run: "nix develop '.#web' -c bash scripts/ci-fractal-web"
+        run: bash scripts/ci-web-shell run bash scripts/ci-fractal-web
         env:
           pnpm_config_store_dir: "${{ runner.temp }}/pnpm-store"
+          CI_WEB_SHELL_DIR: "${{ runner.temp }}/web-shell"
           KIT_INPUTS: ${{ needs.fractal-web-changes.outputs.kit-inputs }}
           KIT_PLAY_SET: ${{ github.event_name == 'pull_request' && 'critical' || 'all' }}
           KIT_PLAY_A11Y: ${{ github.event_name == 'pull_request' && 'off' || 'on' }}
           KIT_PLAY_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '420' || '' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+      - name: Fill the web shell closure
+        shell: bash
+        run: bash scripts/ci-web-shell fill
+        env:
+          CI_WEB_SHELL_DIR: "${{ runner.temp }}/web-shell"
+        continue-on-error: true
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.web-shell.outputs.cache-hit != 'true' }}
+      - name: Save the web shell closure
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.temp }}/web-shell"
+          key: "fractal-web-shell1-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'nix/**/*.nix', 'scripts/ci-web-shell') }}"
+        continue-on-error: true
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.web-shell.outputs.cache-hit != 'true' }}
       - name: Report job cache coverage
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the pnpm store","outcome":"${{ steps.pnpm-store.outcome }}","hit":"${{ steps.pnpm-store.outputs.cache-hit }}","matched":"${{ steps.pnpm-store.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the pnpm store","outcome":"${{ steps.pnpm-store.outcome }}","hit":"${{ steps.pnpm-store.outputs.cache-hit }}","matched":"${{ steps.pnpm-store.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the web shell closure","outcome":"${{ steps.web-shell.outcome }}","hit":"${{ steps.web-shell.outputs.cache-hit }}","matched":"${{ steps.web-shell.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   fractal-web:
     name: fractal-web
