@@ -18,7 +18,7 @@ module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
 
 run = dict(head_sha='a' * 40, event='merge_group', path='.github/workflows/fleet.yml',
-           conclusion='success', head_branch='gh-readonly-queue/main/pr-1-example',
+           status='completed', conclusion='success', head_branch='gh-readonly-queue/main/pr-1-example',
            check_suite_id=1, html_url='https://github.com/example/project/actions/runs/1')
 checks = [dict(name=name, conclusion='success') for name in module.REQUIRED]
 
@@ -40,17 +40,24 @@ def check(name, runs, results, expected):
 
 check('exact SHA with successful checks across pages', [run], checks, 0)
 check('no queue run', [], checks, 1)
+for status, conclusion in [('in_progress', None), ('completed', 'failure'), ('completed', 'cancelled')]:
+    optional_pending_or_failed = {**run, 'status': status, 'conclusion': conclusion}
+    optional_check = dict(name='fractal-web-execution', conclusion=conclusion)
+    check('required checks suffice with optional jobs ' + str(conclusion),
+          [optional_pending_or_failed], checks + [optional_check], 0)
+    check('pending or failed optional jobs do not excuse missing required checks ' + str(conclusion),
+          [optional_pending_or_failed], checks[:-1] + [optional_check], 1)
 for field, value in [('head_sha', 'b' * 40), ('event', 'pull_request'),
-                     ('path', '.github/workflows/other.yml'), ('conclusion', 'failure'),
+                     ('path', '.github/workflows/other.yml'),
                      ('head_branch', 'gh-readonly-queue/other/pr-1-example')]:
     check('reject ' + field, [{**run, field: value}], checks, 1)
-for status in ['failure', 'skipped', 'cancelled', None]:
+for status in ['failure', 'skipped', 'neutral', 'cancelled', None]:
     failed = copy.deepcopy(checks)
     failed[0]['conclusion'] = status
     check('reject required check ' + str(status), [run], failed, 1)
 check('missing required check', [run], checks[:-1], 1)
 
-# This check is tied to successful merge-group runs, never a PR workflow_run with elevated secrets.
+# This check is tied to the exact merge-group required checks, never a PR workflow_run with elevated secrets.
 fleet = (ROOT / '.github/workflows/fleet.yml').read_text()
 trigger = fleet.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
 assert 'push:' not in trigger and 'merge_group:' in trigger and 'pull_request:' in trigger
