@@ -412,8 +412,9 @@ the native bridge boundary; it does not claim an iOS simulator was driven.
 The stui consumer is covered by `crates/st3-e2e/tests/feed/inventory.rs` over an isolated
 Unix daemon: all six windows, typed client/usage adaptation, period replacement,
 unsubscription and authoritative reconnect snapshots.
-`stui/tests/client_only.rs::inventory_screens_send_no_request_after_their_first_frames_for_more_than_a_minute`
-drives the actual binary with `scripts/stui-test-client` and `STUI_TIMING_LOG`.
+`stui/tests/client_only.rs::the_fleet_inventory_screen_sends_no_request_after_its_first_frames_for_more_than_a_minute`
+and `…::the_usage_inventory_screen_sends_no_request_after_its_first_frames_for_more_than_a_minute`
+drive the actual binary with `scripts/stui-test-client` and `STUI_TIMING_LOG`.
 Fleet and Usage each remain idle for 72 seconds; their first snapshots must occur
 once, every inventory HTTP read is forbidden, and no request follows ready frames
 for longer than the old 60-second interval.

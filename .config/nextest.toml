@@ -13,7 +13,7 @@ filter = '''
 ((package(=st3) or package(=st3-daemon)) and (
     test(/^convergence::(seed_1_converges_on_a_real_disk|the_checks_catch_a_partial_adoption)$/)
     or test(/^delivery_probe::native_delivery_probe_alerts_and_recovers_without_model_turns$/)
-    or test(/^client_only::inventory_screens_send_no_request_after_their_first_frames_for_more_than_a_minute$/)
+    or test(/^client_only::the_(fleet|usage)_inventory_screen_sends_no_request_after_its_first_frames_for_more_than_a_minute$/)
     or test(/^daemon_restart::a_quiet_idle_seat_ages_stale_and_recovers_new_evidence_after_daemon_restart$/)
     or test(/^subagents_seat::a_seats_subagents_appear_renew_and_end$/)
     or test(/^revision_seats::isolated_revision_preserves_completed_builder_declarations_and_cleanup$/)
