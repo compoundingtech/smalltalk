@@ -2154,7 +2154,10 @@ async fn delayed_channel_initialization_preserves_activity(activity: &str, legac
 }
 
 // Exercise the real provider wrapper, local hook spool, channel, API and Store.
-// The provider initializes MCP but deliberately has no SessionStart/Stop hooks.
+// The provider initializes MCP but deliberately has no SessionStart/Stop hooks. The driver's 15 s
+// readiness grace is shortened through its shorten-only override: the ordering is the property.
+const HOOKLESS_GRACE_MS: u64 = 5_000;
+
 async fn channel_readiness_without_start_hook(native_activity: Option<bool>, late: bool) {
     use sha2::{Digest as _, Sha256};
     use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
@@ -2181,6 +2184,7 @@ time.sleep(300)
         seat_command(root, &daemon.socket)
             .env("ST_AGENT", seat)
             .env("ST3_MAILBOX_TRANSPORT", "push")
+            .env("ST3_CLAUDE_READINESS_GRACE_MS", HOOKLESS_GRACE_MS.to_string())
             .args([
                 "driver",
                 "claude",
@@ -2237,7 +2241,7 @@ time.sleep(300)
     if late || native_activity.is_none() {
         wait_until(
             "hookless channel becomes ready after the grace",
-            Duration::from_secs(22),
+            Duration::from_millis(HOOKLESS_GRACE_MS + 7_000),
             || {
                 daemon
                     .store
@@ -2276,7 +2280,7 @@ time.sleep(300)
         .await;
         // Cross the entire fallback grace for an early hook; late hooks only need
         // subsequent driver ticks to demonstrate there is no recurring readiness POST.
-        tokio::time::sleep(Duration::from_secs(if late { 3 } else { 16 })).await;
+        tokio::time::sleep(Duration::from_millis(if late { 3_000 } else { HOOKLESS_GRACE_MS + 1_000 })).await;
         assert_eq!(
             daemon.store.current_harness(seat).unwrap().unwrap().state,
             state

@@ -16090,7 +16090,9 @@ async fn publish_claude_readiness_fallback(
         || !state
             .claude_readiness_fallback
             .initialized_at_ms
-            .is_some_and(|started| now_ms.saturating_sub(started) >= 15_000)
+            .is_some_and(|started| {
+                now_ms.saturating_sub(started) >= claude_readiness_grace_ms()
+            })
     {
         return Ok(false);
     }
@@ -16263,6 +16265,18 @@ fn claude_attachment_window() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|cap| *cap > 0);
     Duration::from_millis(cap.map_or(DEFAULT_MS, |cap| cap.min(DEFAULT_MS)))
+}
+
+/// How long an initialized Claude channel waits for a native hook before the driver publishes
+/// readiness without one. `ST3_CLAUDE_READINESS_GRACE_MS` can only shorten it, as
+/// `ST3_SUBAGENT_LEASE_MS` does a lease, so tests of the fallback need not wait out 15 s.
+fn claude_readiness_grace_ms() -> u64 {
+    const DEFAULT_MS: u64 = 15_000;
+    std::env::var("ST3_CLAUDE_READINESS_GRACE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .map_or(DEFAULT_MS, |cap| cap.min(DEFAULT_MS))
 }
 
 fn same_claude_attachment_binding(a: &st3::mailbox::Fence, b: &st3::mailbox::Fence) -> bool {
