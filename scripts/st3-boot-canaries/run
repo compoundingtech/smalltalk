@@ -50,7 +50,7 @@ from st3_test_evidence import register, capture, write_json
 from st3_events import Events, claim, fields
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
-SCENARIOS = ("claim-socket-denied", "access-auto", "access-bypass", "fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8", "idle-hold", "channel-missing", "channel-uninitialized", "channel-parked", "import")
+SCENARIOS = ("claim-socket-denied", "access-auto", "access-bypass", "fresh", "restart", "daemon-restart", "ask-sigterm", "ask-sigkill", "reexec", "concurrent", "suspend", "utf8", "idle-hold", "channel-missing", "channel-uninitialized", "channel-parked", "import")
 MISSION = "canary/boot"
 RUN_ID = f"{MISSION}/c1"
 LETTERS = "abcde"
@@ -1108,6 +1108,40 @@ def prove_claim_socket_denied(node, seats, evidence):
     }, indent=2) + "\n")
 
 
+def prove_pending_ask_restart(node, seats, name, evidence):
+    """No person input or model handoff is allowed from interruption to the live picker."""
+    assert node.harness == "omp"
+    ask = {"toolName": "ask", "toolCallId": "canary-pending-ask",
+           "input": {"questions": [{"question": "Which restart policy?",
+                                  "options": [{"label": "Keep"}, {"label": "Replace"}]}]}}
+    (node.root / "ws/pending-ask.json").write_text(json.dumps(ask))
+    before = until(lambda: next((row for row in receipts(node, "a")
+                                 if row.get("event") == "picker-live"), None),
+                   seats.bound, "the initial ask picker did not open")
+    assert before["ask"] == ask and not before["reopening"]
+    calls = sum(row.get("event") == "turn" for row in receipts(node, "a"))
+    signum = signal.SIGTERM if name == "ask-sigterm" else signal.SIGKILL
+    # Same boundary as daemon-restart: lose the daemon and its PTY seats, as on host shutdown.
+    # Do not use agents restart, a prompt, an answer, or a manual retry to recover the picker.
+    os.killpg(node.daemon.pid, signum)
+    node.daemon.wait(30)
+    for row in json.loads(node.pty("list", "--json").stdout or "[]"):
+        node.pty("kill", row["name"])
+    node.start()
+    after = until(lambda: next((row for row in receipts(node, "a")
+                                if row.get("event") == "picker-live"
+                                and row.get("pid") != before["pid"]), None),
+                  seats.bound, "the interrupted ask picker did not reopen automatically")
+    assert after["reopening"] and after["ask"] == ask, (before, after)
+    assert after["sessionId"] == before["sessionId"], (before, after)
+    assert sum(row.get("event") == "turn" for row in receipts(node, "a")) == calls, \
+        "restart called the provider before the picker became live"
+    (evidence / "pending-ask-restart.json").write_text(json.dumps({
+        "signal": signal.Signals(signum).name, "before": before, "after": after,
+        "provider_calls_during_restart": 0, "person_actions_during_restart": 0,
+    }, indent=2) + "\n")
+
+
 def run(args, root, evidence):
     register(root, evidence)
     node = Node(root, args.binary, args.harness)
@@ -1142,7 +1176,7 @@ def run(args, root, evidence):
         else:
             node.start()
         source = root / "mission.kdl"
-        source.write_text(mission_source(node, count, args.harness, hold=args.scenario in ("suspend", "claim-socket-denied")))
+        source.write_text(mission_source(node, count, args.harness, hold=args.scenario in ("suspend", "claim-socket-denied", "ask-sigterm", "ask-sigkill")))
         node.cli("apply", str(source), "--as", "person/eval")
         node.cli("missions", "start", MISSION, "--id", RUN_ID, "--workspace", str(root / "ws"),
                  "--as", "person/eval")
@@ -1151,6 +1185,10 @@ def run(args, root, evidence):
             return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
                     "cause": "connect EPERM", "same_seat_recovered": True}
         seats.prove("boot")
+        if args.scenario in ("ask-sigterm", "ask-sigkill"):
+            prove_pending_ask_restart(node, seats, args.scenario, evidence)
+            return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
+                    "same_pending_ask": True, "provider_calls_during_restart": 0}
         catalogs_before = {str(path): path.read_bytes() for pattern in ("catalog.kdl", "agent.kdl")
                            for path in (root / "state/drivers").rglob(pattern)}
         scenario(node, seats, args.scenario, args.scratch, args.replacement_binary)

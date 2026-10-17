@@ -86,6 +86,11 @@ if (harness === 'omp' && option('--resume')) {
   fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
   fs.writeFileSync(sessionFile, JSON.stringify({ type: 'session', id: sessionId, cwd: process.cwd() }) + '\n');
 }
+// The heal opens the saved session with stdin at EOF and no extension. It does not call a model.
+if (option('--mode') === 'rpc') {
+  record('heal', { sessionId });
+  process.exit(0);
+}
 const resumed = fs.readFileSync(sessionFile, 'utf8').split('\n').length > 2;
 fs.appendFileSync(sessionFile, JSON.stringify({ type: 'launch', at: Date.now() }) + '\n');
 record('session', { sessionId, sessionFile, resumed });
@@ -116,6 +121,41 @@ const { default: extension } = await import(pathToFileURL(process.argv[index + 1
 extension(api);
 await events.get('session_start')?.({}, ctx);
 record('ready');
+// Fault fixture: persist an unanswered native ask, then require the driver's actual F5 retry
+// before exposing its picker on resume. Never reopen it just because ST3_OMP_PENDING_ASK is set.
+const askTrigger = path.join(process.cwd(), 'pending-ask.json');
+let liveAsk;
+const savedAsk = fs.readFileSync(sessionFile, 'utf8').split('\n').filter(Boolean)
+  .map(line => JSON.parse(line)).find(row => row.customType === 'tool_execution_start'
+    && row.data?.toolName === 'ask')?.data;
+const openAsk = async (ask, reopening) => {
+  liveAsk = ask;
+  await events.get('tool_call')?.(ask, ctx);
+  await events.get('tool_execution_start')?.(ask, ctx);
+  record('picker-live', { sessionId, ask, reopening });
+};
+if (savedAsk) {
+  // Match the terminal input contract used by the Rust bridge, including split reads.
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  let input = '';
+  process.stdin.on('data', chunk => {
+    input += chunk.toString();
+    if (!liveAsk && input.includes('\x1b[15~')) void openAsk(savedAsk, true);
+  });
+  process.stdin.resume();
+} else {
+  const trigger = setInterval(() => {
+    if (!fs.existsSync(askTrigger) || liveAsk) return;
+    const ask = JSON.parse(fs.readFileSync(askTrigger, 'utf8'));
+    record('turn', { text: 'fixture model opens ask' });
+    fs.appendFileSync(sessionFile, JSON.stringify({
+      type: 'custom', customType: 'tool_execution_start', data: ask,
+    }) + '\n');
+    void openAsk(ask, false);
+    clearInterval(trigger);
+  }, 50);
+  trigger.unref();
+}
 const keepalive = setInterval(() => {}, 1000);
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(signal, async () => {
