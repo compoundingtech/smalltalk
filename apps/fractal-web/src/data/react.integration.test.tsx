@@ -6,6 +6,7 @@ import {
   decodeUnknownSync,
   type AgentEncoded,
 } from '@smalltalk/st3-client/schema'
+import { openAgent, type DecodedAgent } from '@st3/sdk/effect'
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import * as React from 'react'
@@ -24,7 +25,7 @@ import { createProjections } from './projections.ts'
 import { DataSourceProvider, useAgent, useFleetSelection, useTerminalConnected } from './react.tsx'
 import { type Feed, type Fleet, observed } from './source.ts'
 
-const first = decodeUnknownSync(
+const firstRow = decodeUnknownSync(
   Agent,
   'strict',
 )({
@@ -41,7 +42,9 @@ const first = decodeUnknownSync(
   revision: '1',
   updated_at: '2026-10-04T12:00:00.000Z',
 } satisfies AgentEncoded)
-const second: Agent = { ...first, id: 'agent/second', name: 'Second' }
+const secondRow: Agent = { ...firstRow, id: 'agent/second', name: 'Second' }
+const first = openAgent(firstRow)
+const second = openAgent(secondRow)
 const card = decodeUnknownSync(Attention)({
   kind: 'attention',
   id: 'attention/second',
@@ -60,7 +63,7 @@ const card = decodeUnknownSync(Attention)({
 const world: FixtureProjections = {
   now: 0,
   events: [],
-  agents: [first, second],
+  agents: [firstRow, secondRow],
   missions: [],
   attention: [],
   conversations: {},
@@ -74,7 +77,7 @@ const equalManualFleet = (left: Feed<Fleet>, right: Feed<Fleet>) =>
 
 it('updates only the changed row, not the manual collection, opened agent or terminal', () => {
   const registry = AtomRegistry.make()
-  const agents = Atom.make<Feed<readonly Agent[]>>(observed({ value: world.agents })).pipe(
+  const agents = Atom.make<Feed<readonly DecodedAgent[]>>(observed({ value: [first, second] })).pipe(
     Atom.keepAlive,
   )
   const attention = Atom.make<Feed<readonly Attention[]>>(observed({ value: [] })).pipe(
@@ -127,7 +130,7 @@ it('updates only the changed row, not the manual collection, opened agent or ter
   try {
     render(first.id)
     const before = { ...renders }
-    const changed: Agent = {
+    const changed: DecodedAgent = {
       ...second,
       name: 'Renamed second',
       revision: decodeUnknownSync(Revision)('2'),
@@ -138,8 +141,8 @@ it('updates only the changed row, not the manual collection, opened agent or ter
     flushSync(() => registry.set(attention, observed({ value: [card] })))
     expect(renders).toEqual({ ...afterAgent, second: afterAgent.second + 1 })
     const beforeMetadata = { ...renders }
-    const freshFirst: Agent = { ...first, revision: decodeUnknownSync(Revision)('3') }
-    const freshSecond: Agent = { ...changed, revision: decodeUnknownSync(Revision)('3') }
+    const freshFirst: DecodedAgent = { ...first, revision: decodeUnknownSync(Revision)('3') }
+    const freshSecond: DecodedAgent = { ...changed, revision: decodeUnknownSync(Revision)('3') }
     flushSync(() => registry.set(agents, observed({ value: [freshFirst, freshSecond] })))
     flushSync(() =>
       registry.set(

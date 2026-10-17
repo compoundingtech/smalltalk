@@ -1,0 +1,51 @@
+{
+  "source": "Synthetic agent snapshot exercising the old aggregation literal; all identities, observations, and usage figures are invented",
+  "snapshot": {
+    "id": "snapshot/build-host-a/example-1", "host_id": "host/build-host-a", "store_index": 1,
+    "projection_version": "client-projection.v0",
+    "created_at": "2026-01-15T12:00:00.000Z", "published_at": "2026-01-15T12:00:01.000Z"
+  },
+  "items": [{
+    "id": "agent/example/alpha", "kind": "agent", "revision": "example-revision-1",
+    "updated_at": "2026-01-15T12:00:00.000Z", "name": "Example alpha", "state": "running",
+    "reachability": "reachable", "runtime_ids": ["runtime/example.alpha"], "owner_run_id": null,
+    "driver": "omp", "harness_state": "working", "harness_error_state": null,
+    "since": "2026-01-15T11:00:00.000Z",
+    "todo": {
+      "snapshot": {
+        "harness": "omp", "session_id": "example-session-alpha", "incarnation_id": "example-incarnation-1",
+        "observed_at": "2026-01-15T11:00:00.000Z", "source_op": "hydrate", "phases": [],
+        "totals": { "pending": 0, "in_progress": 0, "completed": 0, "blocked": 0, "abandoned": 0 },
+        "truncated": false
+      },
+      "claim_id": "example-claim-1", "accepted_at": "2026-01-15T11:00:01.000Z", "stale": false
+    },
+    "upcoming_work": [], "blocked_on": "none", "ask": "none", "reason": null, "activity": null,
+    "host_id": "host/workstation-a", "workspace": "/workspace/example/alpha", "checkout": null,
+    "last_activity_at": "2026-01-15T11:59:00.000Z", "silent_since": "2026-01-15T11:59:00.000Z",
+    "fault": null, "incarnation_id": "example-incarnation-1", "current_session_id": "session/example-alpha",
+    "usage": {
+      "total_tokens": 1200, "input_tokens": 700, "output_tokens": 500, "cached_tokens": 200,
+      "cache_write_tokens": 100, "incarnation_count": 2,
+      "aggregation": "cumulative-per-incarnation-else-response-deltas",
+      "context": {
+        "used_tokens": 1200, "window_tokens": 10000, "used_percent": 12, "model": "example-model",
+        "compactions": 1, "last_compaction_ms": 1768474800000, "last_compaction_trigger": "unknown",
+        "observed_at_unix_ms": 1768478400000
+      }
+    },
+    "under": [{ "agent_id": "agent/example/manager", "reason": "Example supervision relationship" }],
+    "operational": { "layer": "current", "actionable": true, "runtime_incarnation": "example-incarnation-1" },
+    "suspension": null, "handoff": null, "rollout": null, "current_work_ids": [], "active_work_count": 0,
+    "next_work_id": null, "upcoming_work_ids": [], "queued_work_count": 0, "current_work": [], "next_work": null,
+    "observation": "stale", "delivery": { "state": "current", "reason": null, "polled_seconds_ago": 0, "transport": "omp-channel" },
+    "subagents": [
+      { "id": "ExampleWorkerA", "subagent_type": "task", "description": null, "driver": "omp",
+        "session_id": "example-session-alpha", "work_id": null,
+        "started_at": "2026-01-15T11:30:00.000Z", "lease_expires_at": "2026-01-15T12:30:00.000Z" },
+      { "id": "ExampleWorkerB", "subagent_type": "task", "description": null, "driver": "omp",
+        "session_id": "example-session-alpha", "work_id": null,
+        "started_at": "2026-01-15T11:45:00.000Z", "lease_expires_at": "2026-01-15T12:45:00.000Z" }
+    ]
+  }]
+}

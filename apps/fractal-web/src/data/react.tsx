@@ -1,6 +1,7 @@
 import { RegistryContext, useAtomValue } from '@effect/atom-react'
-/** Shared derivations over generated rows, installed once per data source. */
-import type { Agent as AgentRow, Attention, Mission } from '@smalltalk/st3-client/schema'
+/** Shared derivations over SDK-decoded and generated rows, installed once per data source. */
+import type { Attention, Mission } from '@smalltalk/st3-client/schema'
+import type { DecodedAgent as AgentRow } from '@st3/sdk/effect'
 import * as Atom from 'effect/reactivity/Atom'
 import type * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { createContext, type ReactNode, useContext } from 'react'
@@ -9,7 +10,7 @@ import * as React from 'react'
 import type { MissionView } from '../missions/model.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
 import { createProjections } from './projections.ts'
-import { type Agent, type DataSource, type Feed, type Fleet, observed } from './source.ts'
+import { type Agent, type DataSource, type Feed, type Fleet, type RosterDecode, decodedRoster, observed } from './source.ts'
 import type { FeedSync, FeedSyncObservation } from './feedSync.ts'
 
 /** Navigable observations plus the actual availability of each independently followed family. */
@@ -252,6 +253,10 @@ export const useTerminalSync = (ref: string): FeedSyncObservation | undefined =>
 export const useGrants = () => useAtomValue(useDataSource().grants)
 /** Observe the fleet projected from agent rows. */
 export const useFleet = () => useAtomValue(useData().fleet)
+const noRosterDecode = Atom.make<RosterDecode>(decodedRoster)
+/** SDK decode evidence for the roster; a source without it decodes every row. */
+export const useRosterDecode = (): RosterDecode =>
+  useAtomValue(useDataSource().rosterDecode ?? noRosterDecode)
 /** Select only fleet fields that affect a collection's membership/order, not row presentation. */
 export const useFleetSelection = <T,>({
   select,

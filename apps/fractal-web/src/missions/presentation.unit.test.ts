@@ -1,4 +1,5 @@
 import type * as St3 from '@smalltalk/st3-client/schema'
+import type { DecodedAgent } from '@st3/sdk/effect'
 import { DateTime, Option } from 'effect'
 import { describe, expect, it } from 'vitest'
 
@@ -32,10 +33,10 @@ const mission = (steps: readonly ReturnType<typeof step>[], fields: Record<strin
     ...fields,
   }) as unknown as St3.Mission
 
-const agent = (fields: Record<string, unknown> = {}): St3.Agent =>
-  ({ id: 'agent/example/builder', name: 'builder', state: 'running', fault: Option.none(), next_work_id: Option.none(), upcoming_work_ids: [], current_work: [], ...fields }) as unknown as St3.Agent
+const agent = (fields: Record<string, unknown> = {}): DecodedAgent =>
+  ({ id: 'agent/example/builder', name: 'builder', state: 'running', fault: Option.none(), next_work_id: Option.none(), upcoming_work_ids: [], current_work: [], ...fields }) as unknown as DecodedAgent
 
-const word = (m: St3.Mission, agents: readonly St3.Agent[] = [agent()], attention: readonly St3.Attention[] = []) =>
+const word = (m: St3.Mission, agents: readonly DecodedAgent[] = [agent()], attention: readonly St3.Attention[] = []) =>
   presentMission({ mission: m, agents, attention }).word
 
 describe('presentMission', () => {

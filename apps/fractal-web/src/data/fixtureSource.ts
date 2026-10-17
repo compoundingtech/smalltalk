@@ -1,6 +1,6 @@
 /** Constant generated rows over the deterministic fixture world. */
 import type { Agent, Attention, Mission, TerminalScreen } from '@smalltalk/st3-client/schema'
-import type { ConnectionState } from '@st3/sdk/effect'
+import { openAgent, type ConnectionState, type DecodedAgent } from '@st3/sdk/effect'
 import * as Atom from 'effect/reactivity/Atom'
 
 import type { ProposedMissionFields } from '../missions/model.ts'
@@ -36,6 +36,7 @@ export interface FixtureProjections {
 export interface FixtureOverrides {
   readonly connection?: ConnectionState
   readonly grants?: Grants
+  /** Generated rows; the source opens them like the live SDK decode does. */
   readonly agents?: Feed<readonly Agent[]>
   readonly missions?: Feed<readonly Mission[]>
   readonly attention?: Feed<readonly Attention[]>
@@ -81,7 +82,13 @@ export const fixtureSource = ({
     overrides.grants ?? { actions: 'granted', messageSend: 'ungranted', terminalInput: 'granted' },
   ),
   connection: Atom.make<ConnectionState>(overrides.connection ?? { _tag: 'Live' }),
-  agents: Atom.make(overrides.agents ?? observed({ value: world.agents })),
+  agents: Atom.make<Feed<readonly DecodedAgent[]>>(
+    overrides.agents === undefined
+      ? observed({ value: world.agents.map(openAgent) })
+      : overrides.agents._tag === 'Observed'
+        ? { ...overrides.agents, value: overrides.agents.value.map(openAgent) }
+        : overrides.agents,
+  ),
   missions: Atom.make(overrides.missions ?? observed({ value: world.missions })),
   attention: Atom.make(overrides.attention ?? observed({ value: world.attention })),
   events: Atom.make(overrides.events ?? observed({ value: world.events })),

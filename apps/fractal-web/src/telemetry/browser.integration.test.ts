@@ -176,6 +176,86 @@ it.live('exports early first-frame roots and open reload roots with their origin
   yield* Scope.close(scope, Exit.void)
 }))
 
+for (const phase of ['early', 'ready'] as const) {
+  it.live(`exports only schema-safe decode diagnostics in production (${phase})`, () => Effect.gen(function* () {
+    const telemetry = make()
+    const { scope, tracer } = yield* open(telemetry)
+    const paint = () => {
+      telemetry.ux.shellCommitted()
+      beforePaint()
+      afterPaint()
+    }
+    if (phase === 'ready') {
+      paint()
+      yield* settle
+    }
+    const startTime = BigInt(Math.round(performance.timeOrigin * 1e6))
+    const spanOptions = {
+      parent: Option.none(), annotations: Context.empty(), links: [],
+      startTime, kind: 'client' as const, root: true, sampled: true,
+    }
+    const decode = tracer.span({ ...spanOptions, name: 'st3.resource.decode' })
+    const safe = {
+      resource: 'agents', path: 'usage.aggregation', tag: 'Degraded',
+      count: 3, rejectedCount: 1, degradedCount: 2,
+    }
+    for (const [key, value] of Object.entries(safe)) decode.attribute(key, value)
+    // Invalid values must not overwrite the safe dimensions, even under allowlisted keys.
+    const privateAttributes = {
+      resource: 'private-resource-id', path: 'usage.private-row-id', tag: 'private-reason',
+      count: 'private-count', rejectedCount: -1, degradedCount: Number.POSITIVE_INFINITY,
+      id: 'private-row-id', reason: 'private-reason', raw: { body: 'private-body' },
+      'span.label': 'private-label',
+    }
+    for (const [key, value] of Object.entries(privateAttributes)) decode.attribute(key, value)
+    decode.event('st3.resource.decode_failure', startTime, {
+      ...safe, tag: 'Rejected', id: 'private-row-id', reason: 'private-reason', raw: 'private-body',
+    })
+    decode.event('st3.resource.decode_failure', startTime + 1n, privateAttributes)
+    decode.event('private-event', startTime, safe)
+    decode.end(startTime + 2n, Exit.fail('private-failure'))
+    const other = tracer.span({ ...spanOptions, name: 'st3.socket.probe' })
+    other.attribute('resource', 'agents')
+    other.event('st3.resource.decode_failure', startTime, safe)
+    other.end(startTime + 2n, Exit.void)
+    if (phase === 'early') {
+      expect(fetch).not.toHaveBeenCalled()
+      paint()
+      yield* settle
+    }
+    telemetry.ux.dispose()
+    yield* Scope.close(scope, Exit.void)
+    const exported = spans().find((span) => span.spanId === decode.spanId)
+    expect(exported).toMatchObject({
+      name: 'st3.resource.decode', status: { code: 2 },
+      attributes: expect.arrayContaining([
+        { key: 'span.label', value: { stringValue: 'resource.decode' } },
+        { key: 'resource', value: { stringValue: 'agents' } },
+        { key: 'path', value: { stringValue: 'usage.aggregation' } },
+        { key: 'tag', value: { stringValue: 'Degraded' } },
+      ]),
+    })
+    expect(exported?.attributes.map(({ key }) => key).sort()).toEqual(['span.label', ...Object.keys(safe)].sort())
+    // OTLP also emits an exception event for the sanitized failed exit; inspect SDK events
+    // separately while the payload-wide assertion below rejects original failure details.
+    const diagnostics = exported?.events.filter((event) => event.name === 'st3.resource.decode_failure')
+    expect(diagnostics).toHaveLength(2)
+    expect(exported?.events.some((event) => event.name === 'private-event')).toBe(false)
+    expect(diagnostics?.[0]).toMatchObject({
+      name: 'st3.resource.decode_failure', timeUnixNano: String(startTime),
+      attributes: expect.arrayContaining([{ key: 'tag', value: { stringValue: 'Rejected' } }]),
+    })
+    expect(diagnostics?.[0]?.attributes.map(({ key }) => key).sort()).toEqual(Object.keys(safe).sort())
+    expect(diagnostics?.[1]?.attributes).toEqual([])
+    expect(spans().find((span) => span.spanId === other.spanId)?.events).toEqual([])
+    // Ring snapshots publish on their independent 250 ms notification cadence.
+    yield* Effect.promise(() => vi.advanceTimersByTimeAsync(250))
+    expect(telemetry.ring.getSnapshot().spans.find((span) => span.name === 'st3.resource.decode')?.attributes)
+      .toEqual({ 'span.label': 'resource.decode', ...safe })
+    expect(JSON.stringify(payloads)).not.toContain('private-')
+  }))
+}
+
 it.live('replays bounded development events through the public event API for completed and still-open early spans', () => Effect.gen(function* () {
   const telemetry = makeTelemetry({ otlpTracesUrl: endpoint, resourceAttributes: {}, production: false })
   const { scope, tracer } = yield* open(telemetry)

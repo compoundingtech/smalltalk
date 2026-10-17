@@ -6,6 +6,7 @@ import { Agent, decodeUnknownSync, type Attention, type Mission, type TerminalSc
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import * as Option from 'effect/Option'
+import { openAgent, type DecodedAgent } from '@st3/sdk/effect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DataSourceProvider } from '../data/react.tsx'
 import { fixtureSource } from '../data/fixtureSource.ts'
@@ -16,11 +17,11 @@ import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
 vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
 const gateway = 'gateway.example.invalid'
-const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
+const agent = openAgent(decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' }))
 let registry: AtomRegistry.AtomRegistry
 let root: Root
 let host: HTMLDivElement
-let agents: Atom.Writable<Feed<readonly Agent[]>>
+let agents: Atom.Writable<Feed<readonly DecodedAgent[]>>
 let gatewaySync: Atom.Writable<FeedSyncObservation>
 let source: DataSource
 
@@ -35,14 +36,14 @@ beforeEach(() => {
   window.localStorage.clear()
   window.history.replaceState(null, '', '/?open=resource/example:detail')
   registry = AtomRegistry.make()
-  agents = Atom.make<Feed<readonly Agent[]>>(waiting)
+  agents = Atom.make<Feed<readonly DecodedAgent[]>>(waiting)
   gatewaySync = Atom.make<FeedSyncObservation>({ status: { _tag: 'Live', since: 0 }, observedAt: 0 })
   source = {
     ...fixtureSource({ world: { now: 5000, gateway, agents: [], missions: [], attention: [], events: [], conversations: {}, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' } } }),
     agents,
     sync: {
       gateway: gatewaySync,
-      agents: Atom.make(initialFeedSync<readonly Agent[]>(0)),
+      agents: Atom.make(initialFeedSync<readonly DecodedAgent[]>(0)),
       missions: Atom.make(initialFeedSync<readonly Mission[]>(0)),
       attention: Atom.make(initialFeedSync<readonly Attention[]>(0)),
       conversation: () => Atom.make(initialFeedSync<ConversationPage>(0)),
@@ -73,7 +74,7 @@ const footerStatus = () => sidebar().querySelector('footer [role="status"]')!
 // Both the real data derivation and the kit's SidebarAgentRow DOM participate.
 describe.each([1280, 1440, 2980])('sidebar footer at %ipx', width => {
   it('dismisses the hovered row on navigation while preserving every roster node', async () => {
-    const other: Agent = { ...agent, id: 'agent/other', name: 'Other Agent' }
+    const other: DecodedAgent = { ...agent, id: 'agent/other', name: 'Other Agent' }
     registry.set(agents, observed({ value: [agent, other] }))
     await mount(width)
     const before = [...roster().querySelectorAll('[data-testid="taste-agent-row"]')]
@@ -133,7 +134,7 @@ describe.each([1280, 1440, 2980])('sidebar footer at %ipx', width => {
 
 describe('shipped live sidebar machine query', () => {
   it('applies typed hosts to the real roster and preserves substring text and stripped highlights', async () => {
-    const candidates: readonly Agent[] = [
+    const candidates: readonly DecodedAgent[] = [
       { ...agent, id: 'agent/compiler', name: 'Compiler Alpha', host_id: Option.some('host/synthetic-138/1') },
       { ...agent, id: 'agent/sidebar', name: 'Sidebar Beta', host_id: Option.some('host/SYNTHETIC-138/2') },
       // Text looks like a matching host but must not satisfy a machine facet.

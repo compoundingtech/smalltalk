@@ -1,4 +1,5 @@
 import type { CollectionFrame, Resource, Snapshot } from '@smalltalk/st3-client'
+import type { Undecodable } from './resourceDecode.ts'
 
 /** A decoded window and its exact wire rows (the roster snapshot boundary needs both). */
 export interface ProcessedWindow<A> {
@@ -6,6 +7,8 @@ export interface ProcessedWindow<A> {
   readonly rawItems: readonly Resource[]
   readonly hasMore: boolean
   readonly snapshot: Snapshot
+  readonly undecodable: readonly Undecodable[]
+  readonly decodeStale: boolean
 }
 
 type WindowFrame = Extract<CollectionFrame, { kind: 'snapshot' | 'changes' }>
@@ -41,6 +44,7 @@ const sameWireValue = (left: unknown, right: unknown): boolean => {
  */
 export const makeWindowIngest = <A>({
   decode,
+  decodeDetailed,
   publish,
   onSlice,
   onRejected,
@@ -52,6 +56,7 @@ export const makeWindowIngest = <A>({
   sliceMs = 4,
 }: {
   readonly decode: (row: Resource) => A | undefined
+  readonly decodeDetailed?: (row: Resource) => { readonly value?: A; readonly undecodable: readonly Undecodable[] }
   readonly publish: (window: ProcessedWindow<A>) => void
   readonly onSlice?: (elapsedMs: number) => void
   readonly onRejected?: (row: Resource) => void
@@ -59,8 +64,10 @@ export const makeWindowIngest = <A>({
   readonly now?: () => number
   readonly sliceMs?: number
 }) => {
-  type Entry = { readonly raw: Resource; readonly value: A | undefined }
+  type Entry = { readonly raw: Resource; readonly value: A | undefined; readonly undecodable: readonly Undecodable[] }
   let rows: Map<string, Entry> | undefined
+  // Rows without a usable identity cannot be repaired by an unrelated keyed delta.
+  let unidentified: Entry[] = []
   let previous: ProcessedWindow<A> | undefined
   let frames: WindowFrame[] = []
   let offset = 0
@@ -69,20 +76,26 @@ export const makeWindowIngest = <A>({
   let running = false
   // At most one rejected revision per currently present row, not lifetime history.
   const rejected = new Map<string, string>()
-  const decodeRow = (raw: Resource): A | undefined => {
-    const value = decode(raw)
+  const decodeRow = (raw: Resource): Entry => {
+    const result = decodeDetailed?.(raw)
+    const value = result === undefined ? decode(raw) : result.value
     if (value !== undefined) {
-      rejected.delete(raw.id)
-    } else if (onRejected !== undefined && rejected.get(raw.id) !== raw.revision) {
+      rejected.delete(raw?.id)
+    } else if (onRejected !== undefined && typeof raw?.id === 'string' && typeof raw.revision === 'string'
+      && rejected.get(raw.id) !== raw.revision) {
       rejected.set(raw.id, raw.revision)
       onRejected(raw)
     }
-    return value
+    return { raw, value, undecodable: result?.undecodable ?? (value === undefined
+      ? [{ _tag: 'Rejected', ...(typeof raw?.id === 'string' ? { id: raw.id } : {}), path: '$', reason: 'Resource row did not decode' }]
+      : []) }
   }
 
   const apply = function* (frame: WindowFrame): Generator<void, void> {
     if (frame.kind === 'changes' && rows === undefined) return
     const next = frame.kind === 'snapshot' ? new Map<string, Entry>() : rows!
+    const orderedIds = new Set(frame.order)
+    const nextUnidentified = frame.kind === 'snapshot' ? [] : [...unidentified]
     if (frame.kind === 'changes') {
       for (const id of frame.removes) {
         next.delete(id)
@@ -90,36 +103,56 @@ export const makeWindowIngest = <A>({
       }
     }
     for (const raw of frame.kind === 'snapshot' ? frame.items : frame.upserts) {
-      const retained = rows?.get(raw.id)
-      next.set(
-        raw.id,
-        retained !== undefined && sameWireValue(retained.raw, raw)
-          ? retained
-          : { raw, value: decodeRow(raw) },
-      )
+      const id = raw?.id
+      const retained = typeof id === 'string' ? rows?.get(id) : undefined
+      const entry = retained !== undefined && sameWireValue(retained.raw, raw)
+        ? retained : decodeRow(raw)
+      if (typeof id === 'string') next.set(id, entry)
+      else if (entry.value === undefined && entry.undecodable.length > 0
+        && !nextUnidentified.some((existing) => sameWireValue(existing.raw, raw)))
+        nextUnidentified.push(entry)
       yield
     }
     const items: A[] = []
     const rawItems: Resource[] = []
+    const undecodable: Undecodable[] = []
     for (const id of frame.order) {
       const entry = next.get(id)
       if (entry !== undefined) {
         rawItems.push(entry.raw)
+        undecodable.push(...entry.undecodable)
         if (entry.value !== undefined) items.push(entry.value)
       }
       yield
     }
-    rows = next
-    for (const id of rejected.keys()) {
-      if (!next.has(id) || !frame.order.includes(id)) rejected.delete(id)
+    // Keep unresolved malformed rows for the window lifetime. Identifiable rows are
+    // replaced/removed through next; identity-less rows require a replacement snapshot.
+    const unorderedFailures = [...nextUnidentified]
+    for (const [id, entry] of next) {
+      if (!orderedIds.has(id) && entry.value === undefined && entry.undecodable.length > 0) {
+        unorderedFailures.push(entry)
+        yield
+      }
     }
+    for (const entry of unorderedFailures) {
+      rawItems.push(entry.raw)
+      undecodable.push(...entry.undecodable)
+    }
+    rows = next
+    unidentified = nextUnidentified
+    for (const id of rejected.keys()) {
+      if (!next.has(id) || !orderedIds.has(id)) rejected.delete(id)
+    }
+    const decodeStale = (rawItems.length > 0 && items.length === 0 && undecodable.length > 0)
+      || (frame.kind === 'changes' && previous?.decodeStale === true && unorderedFailures.length > 0)
+    const currentItems = decodeStale && items.length === 0 && previous !== undefined ? previous.items : items
     const retainedItems =
       previous !== undefined &&
-      previous.items.length === items.length &&
-      previous.items.every((item, i) => item === items[i])
+      previous.items.length === currentItems.length &&
+      previous.items.every((item, i) => item === currentItems[i])
         ? previous.items
-        : items
-    previous = { items: retainedItems, rawItems, hasMore: frame.has_more, snapshot: frame.snapshot }
+        : currentItems
+    previous = { items: retainedItems, rawItems, hasMore: frame.has_more, snapshot: frame.snapshot, undecodable, decodeStale }
     publish(previous)
   }
 
@@ -165,7 +198,8 @@ export const makeWindowIngest = <A>({
       frames = []
       offset = 0
       rows = undefined
-      previous = undefined
+      unidentified = []
+      // Keep the last good compatibility view across transport resubscription.
     },
   }
 }

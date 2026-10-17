@@ -33,6 +33,7 @@ let gatewayObservation: FeedSyncObservation | undefined
 const reconnect = vi.fn()
 vi.mock('../data/react.tsx', () => ({
   useFleet: () => rosterFeed,
+  useRosterDecode: () => ({ undecodable: [], decodeStale: false }),
   useSubjectList: () => [],
   useConnection: () => ({ _tag: 'Live' }),
   useNow: () => 0,
