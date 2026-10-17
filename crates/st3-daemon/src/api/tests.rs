@@ -2323,21 +2323,25 @@ async fn control_reads_answer_during_a_long_write_and_busy_query_pool() {
     // deliberately make readers wait for an uncommitted writer.
     state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
     let store = state.store.clone();
+    // Each holder keeps its connections until the test has asked its three questions and says
+    // so (or drops the sender by panicking), rather than for a fixed 30 s.
+    let (release_reads, read_released) = std::sync::mpsc::channel::<()>();
     let (read_ready_tx, read_ready_rx) = std::sync::mpsc::channel();
     let read_holder = std::thread::spawn(move || {
         store.hold_read_connections_for_test(|| {
             read_ready_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_secs(30));
+            let _ = read_released.recv();
         });
     });
     read_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
     let store = state.store.clone();
+    let (release_write, write_released) = std::sync::mpsc::channel::<()>();
     let (write_ready_tx, write_ready_rx) = std::sync::mpsc::channel();
     let write_holder = std::thread::spawn(move || {
         store.hold_write_transaction_for_test(|| {
             write_ready_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_secs(30));
+            let _ = write_released.recv();
         });
     });
     write_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -2355,6 +2359,8 @@ async fn control_reads_answer_during_a_long_write_and_busy_query_pool() {
         );
         assert_eq!(response.unwrap().0, StatusCode::OK);
     }
+    release_reads.send(()).unwrap();
+    release_write.send(()).unwrap();
     read_holder.join().unwrap();
     write_holder.join().unwrap();
 }
