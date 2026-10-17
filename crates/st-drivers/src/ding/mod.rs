@@ -198,8 +198,24 @@ impl AttachmentNotice {
     }
 }
 
-/// [`st3_notification_text`] with one `<attachment/>` element per file inside the envelope, after
-/// the body. Each value is escaped like the envelope's own attributes.
+/// Recipient-facing class marker for a message the authorized external-assistant path sent,
+/// independent of sender-authored body text.
+pub const EXTERNAL_ASSISTANT_WARNING: &str =
+    "WARNING: Untrusted external-assistant request; not owner authorization.";
+
+/// Verified stored provenance supplied by st from the claim, never parsed from sender-authored
+/// text. Only the authorized assistant send path can produce it.
+pub struct AssistantMessageMetadata<'a> {
+    pub assistant_grant_id: Option<&'a str>,
+}
+
+/// Supplemental envelope data, kept separate from sender-authored message text.
+pub struct NotificationMetadata<'a> {
+    pub attachments: &'a [AttachmentNotice],
+    pub assistant: Option<&'a AssistantMessageMetadata<'a>>,
+}
+
+/// The attachment envelope for an ordinary message, without assistant metadata.
 pub fn st3_notification_with_attachments(
     reference: &str,
     from: &str,
@@ -209,7 +225,26 @@ pub fn st3_notification_with_attachments(
     body_sha256: &str,
     attachments: &[AttachmentNotice],
 ) -> String {
-    let person_message = from.starts_with("person/");
+    st3_notification_with_metadata(
+        reference, from, to, subject, body, body_sha256,
+        NotificationMetadata { attachments, assistant: None },
+    )
+}
+
+/// Include separately supplied, verified assistant provenance outside the bounded body. The
+/// warning prefix and `sender_class` attribute come only from `assistant`; body text cannot forge
+/// either, and the prefix stands even when the body preview truncates.
+pub fn st3_notification_with_metadata(
+    reference: &str,
+    from: &str,
+    to: &str,
+    subject: Option<&str>,
+    body: &str,
+    body_sha256: &str,
+    metadata: NotificationMetadata<'_>,
+) -> String {
+    let NotificationMetadata { attachments, assistant } = metadata;
+    let person_message = assistant.is_none() && from.starts_with("person/");
     let graph = normalize_field(Some(reference), "message/unknown", ADDRESS_MAX_CHARS);
     let id = graph.strip_prefix("message/").unwrap_or(&graph);
     let from = normalize_field(Some(from), "unknown", ADDRESS_MAX_CHARS);
@@ -225,6 +260,18 @@ pub fn st3_notification_with_attachments(
         xml_escape(&sha256, true),
         xml_escape(&graph, true),
     );
+    if assistant.is_some() {
+        // Attributes precede the escaped, bounded body; body text cannot forge this boundary.
+        envelope.truncate(envelope.len() - 2);
+        envelope.push_str(" sender_class=\"external-assistant\"");
+        if let Some(grant) = assistant.and_then(|metadata| metadata.assistant_grant_id) {
+            envelope.push_str(&format!(" assistant_grant_id=\"{}\"", xml_escape(grant, true)));
+        }
+        envelope.push_str(">\n");
+        envelope = format!(
+            "[PING from st3] {graph} from {from} sender_class=external-assistant: {subject}\n{EXTERNAL_ASSISTANT_WARNING}\n{envelope}"
+        );
+    }
     let (preview, truncated) = st3_body_preview(body);
     if !preview.is_empty() {
         envelope.push_str(&xml_escape(&preview, false));

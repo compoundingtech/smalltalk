@@ -46,7 +46,9 @@ use st3_client::{
     API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient,
     ClientError as GeneratedClientError, Envelope as ClientEnvelope, ErrorCode as ClientErrorCode,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
-    Page as ClientPage, PairingBegin, Resource as ClientResource,
+    Page as ClientPage, PairingBegin, PersonPairingBegin, AssistantGrantPolicy, AssistantReadTrustRequest,
+    AssistantMinimalReadMode, AssistantPairingBegin, AssistantPrincipal, AssistantScope,
+    Resource as ClientResource,
     TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
     TerminalInputParameters as ClientTerminalInputParameters,
     TerminalScreen as ClientTerminalScreen, TimelineBody as ClientTimelineBody,
@@ -1753,19 +1755,36 @@ struct ActivityArgs {
 /// Observation-only device grant requested by `st devices pair --read-only`.
 const READ_ONLY_PAIRING_SCOPES: &[&str] = &["read.projections", "read.glasses", "terminal.read"];
 
+/// Grant lifetime when `--expires-in` is omitted; never renewed automatically.
+const ASSISTANT_GRANT_DEFAULT_SECONDS: u64 = 3_600;
+/// Hard maximum grant lifetime.
+const ASSISTANT_GRANT_MAX_SECONDS: u64 = 2_592_000;
+
 #[derive(Subcommand)]
 enum DevicesCommand {
     /// List paired devices visible to the authenticated person.
     Ls,
-    /// Begin local pairing for one named person and device.
+    /// Begin local pairing for one named person and device, or one assistant grant.
     Pair {
-        device_name: String,
+        /// Device name; optional only for `--assistant`, which defaults to the assistant name.
+        #[arg(required_unless_present = "assistant")]
+        device_name: Option<String>,
         /// Delegate every current client scope to this trusted device.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "assistant")]
         full_control: bool,
         /// Delegate only observation: projections, glasses frames, and terminal output.
-        #[arg(long, conflicts_with = "full_control")]
+        #[arg(long, conflicts_with_all = ["full_control", "assistant"])]
         read_only: bool,
+        /// Begin a revocable external-assistant grant instead of a person device.
+        #[arg(long, value_parser = parse_assistant_principal)]
+        assistant: Option<AssistantPrincipal>,
+        #[command(flatten)]
+        grant: AssistantGrantTerms,
+    },
+    /// Inspect, revoke, or change one assistant grant; trusted local Unix person only.
+    Grant {
+        #[command(subcommand)]
+        command: AssistantGrantCommand,
     },
     /// Complete a single-use pairing on this device; read the code privately from stdin.
     Complete {
@@ -1778,9 +1797,14 @@ enum DevicesCommand {
         /// Import a private mode-0600 DER PKCS#8 file; otherwise generate a key.
         #[arg(long)]
         key_file: Option<PathBuf>,
-        /// Credential and private-key profile, shared with stui by default.
+        /// Credential and private-key profile; person devices share stui's profile by default,
+        /// assistant grants use a separate assistant profile.
         #[arg(long)]
         profile: Option<PathBuf>,
+        /// Complete an assistant grant begun with `st devices pair --assistant`. Assistant
+        /// sessions carry no person-root proof and are stored apart from person devices.
+        #[arg(long, conflicts_with_all = ["fingerprint", "unpinned"])]
+        assistant: bool,
         /// Allow a public HTTP address only when it is already an encrypted path.
         #[arg(long)]
         allow_public_http: bool,
@@ -1797,6 +1821,67 @@ enum DevicesCommand {
         device: String,
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+/// Grant terms sealed when the configured owning person begins or changes an assistant grant.
+#[derive(Args)]
+struct AssistantGrantTerms {
+    /// Positive grant lifetime such as 30m or 1h; at most 30d. Defaults to 1h.
+    #[arg(long, value_parser = parse_assistant_grant_expiry)]
+    expires_in: Option<u64>,
+    /// One exact assistant scope; repeat for each scope. Nothing is granted implicitly.
+    #[arg(long = "scope", value_parser = parse_assistant_scope)]
+    scopes: Vec<AssistantScope>,
+    /// Consent that every assistant read is disclosed to OpenAI.
+    #[arg(long)]
+    disclose_to_openai: bool,
+    /// Durable record of that consent decision, such as an axe decision ID.
+    #[arg(long)]
+    consent_evidence: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum AssistantGrantCommand {
+    /// Show one assistant grant: scopes, expiry, policy revision, consent; never the credential.
+    Inspect { grant: String },
+    /// Revoke exactly this grant; its session is denied from the next request.
+    Revoke { grant: String },
+    /// Replace the grant's scopes, expiry and consent; increments the policy revision.
+    Policy {
+        grant: String,
+        #[command(flatten)]
+        terms: AssistantGrantTerms,
+        /// Exact agent IDs permitted as low-risk assistant message recipients.
+        #[arg(long = "allow-recipient")]
+        recipients: Vec<String>,
+    },
+    /// Extend the grant with its current scopes; requires consent again and increments revision.
+    Renew {
+        grant: String,
+        /// Positive lifetime from now such as 1h; at most 30d. Defaults to 1h.
+        #[arg(long, value_parser = parse_assistant_grant_expiry)]
+        expires_in: Option<u64>,
+        #[arg(long)]
+        disclose_to_openai: bool,
+        #[arg(long)]
+        consent_evidence: Option<String>,
+    },
+    /// Pin an approval attestor independently from the shim signing key.
+    ReadTrust {
+        grant: String,
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        attestor_public_key: String,
+        #[arg(long)]
+        shim_public_key: String,
+        #[arg(long, default_value_t = 4096)]
+        default_response_bytes: usize,
+        #[arg(long, default_value_t = 16384)]
+        max_response_bytes: usize,
     },
 }
 
@@ -4563,10 +4648,23 @@ async fn run(cli: Cli) -> Result<()> {
                 allow_public_http,
                 fingerprint,
                 unpinned,
+                assistant,
             }),
         ..
     }) = &cli.command
     {
+        if *assistant {
+            return run_devices_complete_assistant(
+                member_url,
+                pairing_id,
+                algorithm,
+                key_file.as_deref(),
+                profile.as_deref(),
+                *allow_public_http,
+                cli.json,
+            )
+            .await;
+        }
         return run_devices_complete(
             member_url,
             pairing_id,
@@ -5015,6 +5113,11 @@ fn guard_mutating_cli_actor(
             GhCommand::Comment(args) => Some(args.actor.as_str()),
             GhCommand::Own(args) => Some(args.actor.as_str()),
             GhCommand::Ls(_) => None,
+        },
+        Command::Devices(args) => match args.command.as_ref() {
+            Some(DevicesCommand::Pair { assistant: Some(_), .. })
+            | Some(DevicesCommand::Grant { .. }) => Some(args.person.as_deref().unwrap_or("requester")),
+            _ => None,
         },
         _ => None,
     };
@@ -5656,6 +5759,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     );
     store.install_git_change_registry(Arc::new(st3::changes::service::Registry::new(&config.changes, &config.node)?))?;
     let state = AppState {
+        owning_person: config.person.clone(),
         store: store.clone(),
         notify: notify.clone(),
         event_notify: event_notify.clone(),
@@ -7367,11 +7471,46 @@ async fn run_devices(
         }
         DevicesCommand::Pair {
             device_name,
+            assistant: Some(assistant),
+            grant,
+            // clap rejects --full-control and --read-only alongside --assistant.
+            ..
+        } => {
+            let terms = SealedAssistantGrantTerms::from_cli(&person, configured_person, grant)?;
+            let response = client
+                .pairing_begin(&PairingBegin::Assistant(AssistantPairingBegin {
+                    api_version: CLIENT_V0_API_VERSION.into(),
+                    device_name: device_name.unwrap_or_else(|| "ChatGPT".into()),
+                    assistant_id: assistant,
+                    scopes: terms.scopes,
+                    expires_in_seconds: Some(terms.expires_in_seconds),
+                    disclosure_consent: true,
+                    consent_evidence: terms.consent_evidence,
+                    minimal_read_mode: Some(AssistantMinimalReadMode::CallerBoundAllow),
+                }))
+                .await?;
+            print_client_value(&response, json_output)?;
+            if !json_output {
+                println!(
+                    "Complete on the assistant host before the code expires: `st devices complete MEMBER_URL PAIRING_ID --assistant`, then enter the code. Grant scopes and expiry are sealed; change them with `st devices --as {person} grant policy <grant>`."
+                );
+            }
+            Ok(())
+        }
+        DevicesCommand::Pair {
+            device_name,
             full_control,
             read_only,
+            assistant: None,
+            grant,
         } => {
+            anyhow::ensure!(
+                grant.is_empty(),
+                "--expires-in, --scope, --disclose-to-openai and --consent-evidence apply only to --assistant pairing"
+            );
+            let device_name = device_name.context("name the device to pair")?;
             let response = client
-                .pairing_begin(&PairingBegin {
+                .pairing_begin_person(&PersonPairingBegin {
                     api_version: CLIENT_V0_API_VERSION.into(),
                     device_name,
                     person_id: person.clone(),
@@ -7399,6 +7538,56 @@ async fn run_devices(
             }
             Ok(())
         }
+        DevicesCommand::Grant { command } => {
+            require_assistant_grant_owner(&person, configured_person)?;
+            let response = match command {
+                AssistantGrantCommand::Inspect { grant } => client.assistant_grant(&grant).await?,
+                AssistantGrantCommand::Revoke { grant } => {
+                    client.assistant_grant_revoke(&grant).await?
+                }
+                AssistantGrantCommand::Policy { grant, terms, recipients } => {
+                    let terms = SealedAssistantGrantTerms::from_cli(&person, configured_person, terms)?;
+                    let mut policy = terms.into_policy();
+                    policy.recipient_allowlist = Some(recipients);
+                    client.assistant_grant_policy(&grant, &policy).await?
+                }
+                AssistantGrantCommand::Renew {
+                    grant,
+                    expires_in,
+                    disclose_to_openai,
+                    consent_evidence,
+                } => {
+                    // Renewal keeps the exact current scopes; changing them is `grant policy`.
+                    let current = client.assistant_grant(&grant).await?;
+                    anyhow::ensure!(
+                        !current.value.revoked,
+                        "{grant} is revoked; begin a new grant with `st devices --as {person} pair --assistant`"
+                    );
+                    let terms = SealedAssistantGrantTerms::from_cli(
+                        &person,
+                        configured_person,
+                        AssistantGrantTerms {
+                            expires_in,
+                            scopes: current.value.scopes,
+                            disclose_to_openai,
+                            consent_evidence,
+                        },
+                    )?;
+                    let mut policy = terms.into_policy();
+                    policy.recipient_allowlist = Some(current.value.recipient_allowlist);
+                    client.assistant_grant_policy(&grant, &policy).await?
+                }
+                AssistantGrantCommand::ReadTrust { grant, issuer, key_id, attestor_public_key, shim_public_key, default_response_bytes, max_response_bytes } => {
+                    client.assistant_grant_read_trust(&grant, &AssistantReadTrustRequest {
+                        api_version: CLIENT_V0_API_VERSION.into(), issuer, key_id,
+                        attestor_public_key, shim_public_key,
+                        default_response_bytes: Some(default_response_bytes),
+                        max_response_bytes: Some(max_response_bytes),
+                    }).await?
+                }
+            };
+            print_client_value(&response, json_output)
+        }
         DevicesCommand::Revoke { device, reason } => {
             let capabilities = client.capabilities().await?;
             let nonce = uuid::Uuid::now_v7().simple().to_string();
@@ -7422,6 +7611,180 @@ async fn run_devices(
     }
 }
 
+impl AssistantGrantTerms {
+    fn is_empty(&self) -> bool {
+        self.expires_in.is_none()
+            && self.scopes.is_empty()
+            && !self.disclose_to_openai
+            && self.consent_evidence.is_none()
+    }
+}
+
+/// Assistant grant terms after local validation: issuer, explicit scopes, bounded expiry, and
+/// recorded OpenAI-disclosure consent. The daemon rechecks every term.
+struct SealedAssistantGrantTerms {
+    scopes: Vec<AssistantScope>,
+    expires_in_seconds: u64,
+    consent_evidence: String,
+}
+
+/// The selected local person must be the configured owner. The daemon independently checks
+/// its own owner configuration; a CLI `--as` flag cannot change the daemon's grant authority.
+fn require_assistant_grant_owner(person: &str, configured_person: Option<&str>) -> Result<()> {
+    let owner = configured_person.context(
+        "assistant grant management requires a configured owning person in the st config",
+    )?;
+    let owner = parse_person_subject(owner).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        person == owner,
+        "only the configured owning person {owner} may create or manage assistant grants"
+    );
+    Ok(())
+}
+
+impl SealedAssistantGrantTerms {
+    fn from_cli(
+        person: &str,
+        configured_person: Option<&str>,
+        terms: AssistantGrantTerms,
+    ) -> Result<Self> {
+        require_assistant_grant_owner(person, configured_person)?;
+        anyhow::ensure!(
+            !terms.scopes.is_empty(),
+            "name every assistant scope explicitly with --scope; nothing is granted by default"
+        );
+        anyhow::ensure!(
+            terms.disclose_to_openai,
+            "assistant reads are disclosed to OpenAI; pass --disclose-to-openai to consent"
+        );
+        let consent_evidence = terms
+            .consent_evidence
+            .filter(|evidence| !evidence.trim().is_empty())
+            .context("record the consent decision with --consent-evidence")?;
+        Ok(Self {
+            scopes: terms.scopes,
+            expires_in_seconds: terms.expires_in.unwrap_or(ASSISTANT_GRANT_DEFAULT_SECONDS),
+            consent_evidence,
+        })
+    }
+
+    fn into_policy(self) -> AssistantGrantPolicy {
+        AssistantGrantPolicy {
+            api_version: CLIENT_V0_API_VERSION.into(),
+            scopes: self.scopes,
+            expires_in_seconds: Some(self.expires_in_seconds),
+            disclosure_consent: true,
+            consent_evidence: self.consent_evidence,
+            minimal_read_mode: AssistantMinimalReadMode::CallerBoundAllow,
+            recipient_allowlist: None,
+        }
+    }
+}
+
+/// Decode one wire value of a generated string enum, rejecting values it would only accept as
+/// an unknown-variant fallback.
+fn parse_wire_enum<T: serde::Serialize + serde::de::DeserializeOwned>(
+    value: &str,
+    what: &str,
+) -> std::result::Result<T, String> {
+    let wire = Value::String(value.to_owned());
+    serde_json::from_value::<T>(wire.clone())
+        .ok()
+        .filter(|parsed| serde_json::to_value(parsed).ok().as_ref() == Some(&wire))
+        .ok_or_else(|| format!("unknown {what} `{value}`"))
+}
+
+fn parse_assistant_principal(value: &str) -> std::result::Result<AssistantPrincipal, String> {
+    parse_wire_enum(value, "assistant principal")
+}
+
+fn parse_assistant_scope(value: &str) -> std::result::Result<AssistantScope, String> {
+    parse_wire_enum(value, "assistant scope")
+}
+
+fn parse_assistant_grant_expiry(value: &str) -> std::result::Result<u64, String> {
+    let duration = parse_timeout(value).map_err(|error| error.to_string())?;
+    let seconds = duration.as_secs();
+    if duration.is_zero() || duration.subsec_nanos() != 0 {
+        return Err("a grant lifetime must be a positive whole number of seconds".into());
+    }
+    if seconds > ASSISTANT_GRANT_MAX_SECONDS {
+        return Err("a grant lifetime must be at most 30d".into());
+    }
+    Ok(seconds)
+}
+
+/// The completing device's private key: imported from a mode-0600 file or freshly generated.
+fn completion_signing_key(
+    algorithm: &str,
+    key_file: Option<&Path>,
+) -> Result<st3_client::device::SigningKey> {
+    use st3_client::device::{KeyAlgorithm, SigningKey};
+    let algorithm = match algorithm {
+        "ed25519" => KeyAlgorithm::Ed25519,
+        "p256" => KeyAlgorithm::P256,
+        _ => anyhow::bail!("Choose ed25519 or p256"),
+    };
+    match key_file {
+        Some(path) => SigningKey::import(algorithm, path),
+        None => SigningKey::generate(algorithm),
+    }
+}
+
+/// Complete an assistant grant. The session authenticates as the assistant principal, carries
+/// no person-root proof, and is saved only to the separate assistant profile.
+async fn run_devices_complete_assistant(
+    member_url: &str,
+    pairing_id: &str,
+    algorithm: &str,
+    key_file: Option<&Path>,
+    profile: Option<&Path>,
+    allow_public_http: bool,
+    json_output: bool,
+) -> Result<()> {
+    let key = completion_signing_key(algorithm, key_file)?;
+    let path = profile
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(st3_client::device::assistant_profile_path)?;
+    let code = st3_client::device::read_pairing_code()?;
+    let device = st3_client::device::complete_assistant(
+        &path,
+        member_url,
+        pairing_id,
+        &code,
+        key,
+        allow_public_http,
+    )
+    .await?;
+    let session = &device.session;
+    // Explicit safe fields only, including --json: the session contains a bearer credential.
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "kind": "assistant-paired", "device_id": session.device_id,
+                "principal": session.principal, "sender_class": session.sender_class,
+                "session_actor": session.session_actor, "grant_id": session.grant.id,
+                "scopes": session.scopes, "expires_at": session.expires_at,
+                "policy_revision": session.grant.policy_revision,
+                "minimal_read_mode": session.grant.minimal_read_mode,
+                "profile": path, "signing_key": device.signing_key.public_key()?,
+            }))?
+        );
+    } else {
+        println!(
+            "Paired {} as {} under grant {} until {}. Saved assistant credentials and signing key to {}.",
+            session.device_id,
+            session.session_actor,
+            session.grant.id,
+            session.expires_at,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 async fn run_devices_complete(
     member_url: &str,
     pairing_id: &str,
@@ -7431,17 +7794,8 @@ async fn run_devices_complete(
     options: st3_client::device::CompletionOptions<'_>,
     json_output: bool,
 ) -> Result<()> {
-    use st3_client::device::{KeyAlgorithm, SigningKey};
     options.validate()?;
-    let algorithm = match algorithm {
-        "ed25519" => KeyAlgorithm::Ed25519,
-        "p256" => KeyAlgorithm::P256,
-        _ => anyhow::bail!("Choose ed25519 or p256"),
-    };
-    let key = match key_file {
-        Some(path) => SigningKey::import(algorithm, path)?,
-        None => SigningKey::generate(algorithm)?,
-    };
+    let key = completion_signing_key(algorithm, key_file)?;
     let path = profile
         .map(Path::to_path_buf)
         .map(Ok)
@@ -7459,7 +7813,7 @@ async fn run_devices_complete(
                 "kind": "device-paired", "device_id": device.session.device_id,
                 "person_id": device.session.person_id, "scopes": device.session.scopes,
                 "expires_at": device.session.expires_at, "profile": path,
-                "signing_key": device.signing_key.as_ref().map(SigningKey::public_key).transpose()?,
+                "signing_key": device.signing_key.as_ref().map(st3_client::device::SigningKey::public_key).transpose()?,
                 "person_root_fingerprint": device.person_root_fingerprint,
             }))?
         );
@@ -8122,11 +8476,14 @@ fn render_product_page_headed(
                     item.session_actor,
                     item.scopes.len()
                 );
-                let _ = writeln!(
-                    output,
-                    "  action: st devices --as {} revoke {}",
-                    item.person_id, item.header.id
-                );
+                if let Some(person) = &item.person_id {
+                    let _ = writeln!(
+                        output, "  action: st devices --as {} revoke {}",
+                        person, item.header.id
+                    );
+                } else if let Some(grant) = &item.grant_id {
+                    let _ = writeln!(output, "  action: st devices grant revoke {grant}");
+                }
             }
             ClientResource::Session(item) => {
                 let _ = writeln!(
@@ -14459,14 +14816,17 @@ fn pi_family_message_frame(
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st_drivers::ding::with_tag_notices(st_drivers::ding::st3_notification_with_attachments(
+        "content": st_drivers::ding::with_tag_notices(st_drivers::ding::st3_notification_with_metadata(
             &message.subject,
             &message.from,
             &message.to,
             message.title.as_deref(),
             body,
             &st_drivers::ding::st3_body_sha256(body),
-            attachments,
+            st_drivers::ding::NotificationMetadata {
+                attachments,
+                assistant: message.assistant_metadata().as_ref(),
+            },
         ), &message.tags.iter().filter(|tag| tag.as_str() != st3::silent::SILENT_TAG || st3::silent::is_held(message)).cloned().collect::<Vec<_>>()),
         "meta": {
             "from": message.from,

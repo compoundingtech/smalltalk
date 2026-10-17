@@ -97,6 +97,10 @@ name = "reader_cache"
 required-features = ["test-support"]
 
 [[example]]
+name = "chatgpt_fixture"
+required-features = ["test-support"]
+
+[[example]]
 name = "collection_fixture"
 required-features = ["test-support"]
 
@@ -149,3 +153,6 @@ path = "tests/checkpoint_memory.rs"
 [[test]]
 name = "scenario_recorder"
 path = "tests/scenario_recorder.rs"
+[[test]]
+name = "assistant_native"
+path = "tests/assistant_native.rs"

@@ -13,6 +13,7 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
         store.pin_fleet_anchor(keys[0].public()).unwrap();
         store.set_member_key(Some(keys[i].clone())).unwrap();
         crate::api::AppState {
+            owning_person: None,
             store,
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,

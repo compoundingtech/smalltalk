@@ -15,7 +15,7 @@ use st3::model::ClaimInput;
 use st3::store::Store;
 use st3_client::{
     Capabilities, Client, ClientError, CollectionEvent, Envelope, ErrorCode, Fence,
-    LaunchVariantParameters, PairingBegin, PairingComplete, PersonStepParameters, RawTerminalMode,
+    LaunchVariantParameters, PersonPairingBegin, PairingComplete, PersonStepParameters, RawTerminalMode,
     Resource, TargetParameters, TerminalAttachment, TerminalColor, TerminalInputMode,
     TerminalInputParameters, TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream,
     TimelineBody, TimelineUsageSemantics,
@@ -25,6 +25,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 fn state(root: &Path, name: &str) -> AppState {
     AppState {
+        owning_person: None,
         store: Arc::new(Store::open_memory(name).unwrap()),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,
@@ -433,26 +434,22 @@ async fn raw_terminal_bytes_capability_replay_and_close_over_paired_gateways() {
         serve_terminal_state("raw-client-paired", 24, 80).await;
     let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
     publish_terminal(&state, &incarnation);
-    let challenge = local.pairing_begin(&PairingBegin {
-        api_version: st3_client::API_VERSION.into(),
-        device_name: "Raw terminal device".into(),
-        person_id: "person/avery".into(),
-        full_control: Some(true),
-        scopes: None,
-    }).await.unwrap();
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Raw terminal device".into(),
+    person_id: "person/avery".into(),
+    full_control: Some(true),
+    scopes: None, }).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = st3::api::fabric_router(state.clone());
     let http_server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let paired = Client::fabric_pairing(&base).pairing_complete(
-        &challenge.value.pairing_id,
-        &PairingComplete {
-            api_version: st3_client::API_VERSION.into(),
-            code: challenge.value.code,
-            device_public_key: "raw-terminal-public-key-000000000000000000000".into(),
-            key_storage: None,
-        },
-    ).await.unwrap();
+    let paired = Client::fabric_pairing(&base).pairing_complete_person(&challenge.value.pairing_id,
+    &PairingComplete {
+        api_version: st3_client::API_VERSION.into(),
+        code: challenge.value.code,
+        device_public_key: "raw-terminal-public-key-000000000000000000000".into(),
+        key_storage: None,
+    },).await.unwrap();
     let gateway_socket = state.state_dir.join("raw-client-gateway.sock");
     let server_socket = gateway_socket.clone();
     let app = st3::api::fabric_router(state);
@@ -1167,7 +1164,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     );
     assert!(
         read_only
-            .pairing_begin(&PairingBegin {
+            .pairing_begin_person(&PersonPairingBegin {
                 api_version: st3_client::API_VERSION.into(),
                 device_name: "Unattributed device".into(),
                 person_id: "person/ada".into(),
@@ -1542,14 +1539,11 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
         tokio::spawn(async move { st3::api::serve_unix(&server_socket, unix_app).await });
     wait_for_socket(&socket).await;
     let local = Client::unix_as(&socket, "person/ada");
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Conformance phone".into(),
-            person_id: "person/ada".into(),
-            full_control: None,
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Conformance phone".into(),
+    person_id: "person/ada".into(),
+    full_control: None,
+    scopes: None, })
         .await
         .unwrap();
 
@@ -1558,16 +1552,13 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     let app = st3::api::fabric_router(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base = format!("http://{address}");
-    let paired = Client::fabric_pairing(&base)
-        .pairing_complete(
-            &challenge.value.pairing_id,
-            &PairingComplete {
-                api_version: st3_client::API_VERSION.into(),
-                code: challenge.value.code,
-                device_public_key: "conformance-public-key-000000000000000000000000".into(),
-                key_storage: None,
-            },
-        )
+    let paired = Client::fabric_pairing(&base).pairing_complete_person(&challenge.value.pairing_id,
+    &PairingComplete {
+        api_version: st3_client::API_VERSION.into(),
+        code: challenge.value.code,
+        device_public_key: "conformance-public-key-000000000000000000000000".into(),
+        key_storage: None,
+    },)
         .await
         .unwrap();
 

@@ -1796,6 +1796,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let app_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -1967,6 +1968,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let app_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -2181,6 +2183,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let app_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -2273,6 +2276,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let app_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -2456,6 +2460,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let app_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -2693,6 +2698,7 @@ mod tests {
         // replicated transport observation.
         let roots = [(); 3].map(|()| tempfile::tempdir().unwrap());
         let make_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -2941,6 +2947,7 @@ mod tests {
     async fn a_gateway_lists_a_remote_agents_messages_from_its_owner_and_says_when_it_cannot() {
         let roots = [(); 2].map(|()| tempfile::tempdir().unwrap());
         let make_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -3122,6 +3129,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("st3.sock");
         let main = crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open_memory("middle").unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -3323,6 +3331,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let make_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -3430,6 +3439,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let make_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -3619,6 +3629,7 @@ mod tests {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let make_state = |root: &Path, node: &str| crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -3833,6 +3844,7 @@ mod tests {
             .unwrap();
         let socket = root.path().join("st3.sock");
         let main = crate::api::AppState {
+            owning_person: None,
             store: Arc::new(Store::open_memory("owner").unwrap()),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -4287,6 +4299,7 @@ mod tests {
         let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "target").unwrap());
         store.bind_fleet(fleet).unwrap();
         let app = crate::api::router(crate::api::AppState {
+            owning_person: None,
             store: store.clone(),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -4439,6 +4452,7 @@ mod tests {
             store.bind_fleet(fleet).unwrap();
             let socket = root.join("main.sock");
             let app = crate::api::router(crate::api::AppState {
+                owning_person: None,
                 store: store.clone(),
                 notify: Arc::new(tokio::sync::Notify::new()),
                 event_notify: watch::channel(0_u64).0,

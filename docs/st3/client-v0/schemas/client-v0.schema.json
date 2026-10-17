@@ -59,6 +59,7 @@
     "RunGenerationId": {"type": "string", "pattern": "^(?:run-generation)/[^\\s]+$", "x-st-ref": "run-generation"},
     "StepRunId": {"type": "string", "pattern": "^(?:step-run)/[^\\s]+$", "x-st-ref": "step-run"},
     "AgentId": {"type": "string", "pattern": "^(?:agent)/[^\\s]+$", "x-st-ref": "agent"},
+    "PersonId": {"type": "string", "pattern": "^person/[^/\\s]+$", "description": "Concrete person identity, never a session actor or a deployment-specific fixed person."},
     "HostId": {"type": "string", "pattern": "^(?:host)/[^\\s]+$", "x-st-ref": "host"},
     "RuntimeId": {"type": "string", "pattern": "^(?:runtime)/[^\\s]+$", "x-st-ref": "runtime"},
     "TerminalId": {"type": "string", "pattern": "^(?:terminal)/[^\\s]+$", "x-st-ref": "terminal"},
@@ -74,7 +75,7 @@
     "AgentLifecycle": {"anyOf": [{"enum": ["standing", "owner", "bounded"]}, {"type": "string"}], "description": "Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown."},
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
-    "ErrorCode": {"anyOf": [{"enum": ["recipient-retired", "lifecycle-unavailable", "retirement-upgrade-required", "attention-migrated", "arrangement-exists", "arrangement-folder-exists", "arrangement-retired", "arrangement-limit", "arrangement-folder-deleted", "arrangement-cycle", "arrangement-body-too-large", "arrangement-owner-forbidden", "invalid-arrangement-subject", "invalid-arrangement-action", "invalid-arrangement-operations", "invalid-arrangement-folder", "invalid-arrangement-name", "invalid-arrangement-key", "invalid-subject-reference", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "issuer-required", "suspend-authored-session-selection", "stale-fence", "cursor-gap", "page-cursor-expired", "agent-roster-cut-not-ready", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "projection-detail-too-large", "projection-detail-invalid-source", "conversation-content-invalidated", "transcript-unavailable", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "message-too-large", "message-store-full", "long-message-signature-unsupported", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. suspend-authored-session-selection is a non-retryable HTTP 422 refusal before any suspend write; details.selector names the declared native session selector. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer."},
+    "ErrorCode": {"anyOf": [{"enum": ["recipient-retired", "lifecycle-unavailable", "retirement-upgrade-required", "attention-migrated", "arrangement-exists", "arrangement-folder-exists", "arrangement-retired", "arrangement-limit", "arrangement-folder-deleted", "arrangement-cycle", "arrangement-body-too-large", "arrangement-owner-forbidden", "invalid-arrangement-subject", "invalid-arrangement-action", "invalid-arrangement-operations", "invalid-arrangement-folder", "invalid-arrangement-name", "invalid-arrangement-key", "invalid-subject-reference", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "issuer-required", "suspend-authored-session-selection", "stale-fence", "cursor-gap", "page-cursor-expired", "agent-roster-cut-not-ready", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "projection-detail-too-large", "projection-detail-invalid-source", "conversation-content-invalidated", "transcript-unavailable", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "message-too-large", "message-store-full", "long-message-signature-unsupported", "response-budget-exceeded", "content-not-text", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. suspend-authored-session-selection is a non-retryable HTTP 422 refusal before any suspend write; details.selector names the declared native session selector. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer. Assistant reads: response-budget-exceeded is non-retryable HTTP 413 (page, text or one bounded source record exceeds max_response_bytes); content-not-text is non-retryable HTTP 422 for attachments, images or structured payloads."},
     "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement", "owned-set", "summary", "connected-client", "usage"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
@@ -184,6 +185,12 @@
             { "$ref": "#/$defs/ActionResult" },
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
+            { "$ref": "#/$defs/AssistantGrant" },
+            { "$ref": "#/$defs/AssistantSummary" },
+            { "$ref": "#/$defs/AssistantAttentionPage" },
+            { "$ref": "#/$defs/AssistantMissionPage" },
+            { "$ref": "#/$defs/AssistantAgentPage" },
+            { "$ref": "#/$defs/AssistantContentPage" },
             { "$ref": "#/$defs/TerminalScreen" },
             { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
@@ -225,6 +232,8 @@
             "max_response_bytes": { "type": "integer", "minimum": 1024 },
             "max_wait_ms": { "type": "integer", "minimum": 0 },
             "max_message_bytes": { "type": "integer", "minimum": 1, "description": "The longest message body in UTF-8 bytes this daemon takes; absent on older daemons, which take 4096." },
+            "max_assistant_response_bytes": { "type": "integer", "minimum": 1, "maximum": 16384 },
+            "default_assistant_response_bytes": { "type": "integer", "minimum": 1, "maximum": 4096 },
             "max_glass_body_bytes": { "type": "integer", "minimum": 1 },
             "max_glasses": { "type": "integer", "minimum": 1 },
             "max_glass_depth": { "type": "integer", "minimum": 1 },
@@ -241,7 +250,14 @@
         },
         "event_cursor": { "$ref": "#/$defs/Cursor" },
         "oldest_event_cursor": { "$ref": "#/$defs/Cursor" },
-        "schemas": { "type": "array", "items": { "type": "string", "format": "uri-reference" }, "minItems": 1 }
+        "schemas": { "type": "array", "items": { "type": "string", "format": "uri-reference" }, "minItems": 1 },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+        "grant_kind": { "enum": ["person", "assistant"] },
+        "grant_id": { "$ref": "#/$defs/Id" },
+        "grant_expires_at": { "$ref": "#/$defs/Timestamp" },
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
       }
     },
     "Operational": {
@@ -1690,11 +1706,15 @@
       ]
     },
     "Device": {
+      "oneOf": [
+        { "required": ["person_id"], "properties": { "person_id": { "$ref": "#/$defs/Id" }, "grant_kind": { "const": "person" }, "principal": false, "sender_class": false, "grant_id": false } },
+        { "required": ["principal", "sender_class", "grant_kind", "grant_id", "policy_revision", "minimal_read_mode"], "properties": { "grant_kind": { "const": "assistant" }, "person_id": false } }
+      ],
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
         {
           "type": "object",
-          "required": ["kind", "person_id", "session_actor", "state", "scopes", "expires_at"],
+          "required": ["kind", "session_actor", "state", "scopes", "expires_at"],
           "properties": {
             "kind": { "const": "device" },
             "person_id": { "$ref": "#/$defs/Id" },
@@ -1702,7 +1722,14 @@
             "session_actor": { "$ref": "#/$defs/Id" },
             "state": { "enum": ["active", "expired", "revoked"] },
             "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-            "expires_at": { "$ref": "#/$defs/Timestamp" }
+            "expires_at": { "$ref": "#/$defs/Timestamp" },
+            "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+            "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+            "grant_kind": { "enum": ["person", "assistant"] },
+            "grant_id": { "$ref": "#/$defs/Id" },
+            "grant_expires_at": { "$ref": "#/$defs/Timestamp" },
+            "policy_revision": { "type": "integer", "minimum": 1 },
+            "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
           }
         }
       ]
@@ -1849,7 +1876,7 @@
       "required": ["kind", "collection", "filters", "items", "page"],
       "properties": {
         "kind": { "const": "page" },
-        "collection": { "type": "string", "not": { "const": "resources" } },
+        "collection": { "type": "string", "not": { "pattern": "^(?:resources|assistant\\.(?:attention|missions|agents))$" } },
         "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" },
@@ -1994,7 +2021,7 @@
         { "if": { "properties": { "type": { "const": "truncation" } } }, "then": { "properties": { "body": { "$ref": "#/$defs/TimelineTruncationBody" } } } }
       ]
     },
-    "TimelineMessageBody": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "string"}, "reply_to": {"type": ["string", "null"]}, "from": {"$ref": "#/$defs/ParticipantRef"}, "to": {"$ref": "#/$defs/ParticipantRef"}, "title": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "attachments": {"type": "array", "items": {"$ref": "#/$defs/Attachment"}}, "body_bytes": {"type": "integer", "minimum": 0}, "provenance": {"$ref": "#/$defs/MessageProvenance"}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
+    "TimelineMessageBody": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "string"}, "reply_to": {"type": ["string", "null"]}, "from": {"$ref": "#/$defs/ParticipantRef"}, "to": {"$ref": "#/$defs/ParticipantRef"}, "title": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "attachments": {"type": "array", "items": {"$ref": "#/$defs/Attachment"}}, "body_bytes": {"type": "integer", "minimum": 0}, "provenance": {"$ref": "#/$defs/MessageProvenance"}, "sender_class": {"type": "string", "enum": ["external-assistant"], "description": "Trusted sender class stamped only by the authorized external-assistant send path; never derived from body text."}, "assistant_grant_id": {"type": "string", "description": "The assistant grant that authorized the send, with sender_class."}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
     "MessageProvenance": {
       "type": "object", "additionalProperties": false, "required": ["verdict"],
       "description": "Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not.",
@@ -2480,7 +2507,297 @@
         "arrangement_revision": { "$ref": "#/$defs/Revision" }
       }
     },
+    "AssistantPrincipal": { "enum": ["assistant/chatgpt"] },
+    "AssistantSenderClass": { "enum": ["external-assistant"] },
+    "AssistantScope": { "enum": ["read.assistant.summary", "read.assistant.attention", "read.assistant.missions", "read.assistant.agents", "read.assistant.conversation", "read.assistant.terminal", "write.assistant.messages", "write.assistant.custom-reply"] },
+    "AssistantMinimalReadMode": { "enum": ["approval-once", "caller-bound-allow"] },
+    "AssistantGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "principal", "sender_class", "session_actor", "device_id", "key_id", "issuer", "scopes", "expires_at", "policy_revision", "minimal_read_mode", "recipient_allowlist", "disclosure_consent", "consent_evidence", "revoked"],
+      "properties": {
+        "kind": { "const": "assistant-grant" },
+        "id": { "$ref": "#/$defs/Id" },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+        "session_actor": { "type": "string", "pattern": "^assistant/chatgpt/session/.+$" },
+        "device_id": { "$ref": "#/$defs/Id" },
+        "key_id": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the canonical device public-key string; never a credential digest." },
+        "issuer": { "$ref": "#/$defs/PersonId", "description": "Daemon-configured owning person, sealed by the authoritative grant-issuer member at trusted-local begin." },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" },
+        "recipient_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^agent/.+$" } },
+        "disclosure_consent": { "type": "boolean" },
+        "consent_evidence": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "revoked": { "type": "boolean" },
+        "read_trust": { "$ref": "#/$defs/AssistantReadTrust", "description": "Owner-provisioned public pins for SCG read proofs. Absent means every assistant read is denied." }
+      }
+    },
+    "AssistantGrantPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "scopes", "disclosure_consent", "consent_evidence", "minimal_read_mode"],
+      "properties": {
+        "api_version": { "const": "st3.client.v0" },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_in_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "default": 3600 },
+        "disclosure_consent": { "const": true },
+        "consent_evidence": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "recipient_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^agent/.+$" } },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
+      }
+    },
+    "Ed25519PublicKey": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$", "description": "Unpadded base64url encoding of a raw 32-byte Ed25519 public key." },
+    "AssistantReadTrust": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Public pins only. The attestor key signs SCG read proofs and is pinned independently of the shim key; the two MUST differ. Budgets only lower the contract defaults; default_response_bytes <= max_response_bytes.",
+      "required": ["issuer", "key_id", "attestor_public_key", "shim_public_key", "default_response_bytes", "max_response_bytes"],
+      "properties": {
+        "issuer": { "$ref": "#/$defs/PersonId", "description": "Equals the grant issuer: the daemon-configured owning person." },
+        "key_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "attestor_public_key": { "$ref": "#/$defs/Ed25519PublicKey" },
+        "shim_public_key": { "$ref": "#/$defs/Ed25519PublicKey" },
+        "default_response_bytes": { "type": "integer", "minimum": 1, "maximum": 4096, "description": "Budget for a read that sends no max_response_bytes." },
+        "max_response_bytes": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Ceiling for an explicit max_response_bytes." }
+      }
+    },
+    "AssistantReadTrustRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Owner-only trusted-local provisioning at the grant's authoritative origin; accepting it increments policy_revision. Omitted budgets pin 4096 and 16384; default_response_bytes <= max_response_bytes.",
+      "required": ["api_version", "issuer", "key_id", "attestor_public_key", "shim_public_key"],
+      "properties": {
+        "api_version": { "const": "st3.client.v0" },
+        "issuer": { "$ref": "#/$defs/PersonId" },
+        "key_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "attestor_public_key": { "$ref": "#/$defs/Ed25519PublicKey" },
+        "shim_public_key": { "$ref": "#/$defs/Ed25519PublicKey" },
+        "default_response_bytes": { "type": "integer", "minimum": 1, "maximum": 4096, "default": 4096 },
+        "max_response_bytes": { "type": "integer", "minimum": 1, "maximum": 16384, "default": 16384 }
+      }
+    },
+    "AssistantResponseBytes": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Inclusive bound on the entire JSON envelope. Omitted means the grant pin's default_response_bytes; an explicit value must not exceed the pin's max_response_bytes." },
+    "AssistantSummaryRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Summary query: only the response budget; the person is always the grant issuer.",
+      "properties": {
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
+      }
+    },
+    "AssistantPageRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Metadata query. Every value travels as one scalar query string; duplicates and unknown fields are denied; no person parameter exists.",
+      "properties": {
+        "cursor": { "$ref": "#/$defs/Cursor" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
+      }
+    },
+    "AssistantConversationContentRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_id", "session_id", "reference", "revision", "start", "end"],
+      "properties": {
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "session_id": { "$ref": "#/$defs/Id" },
+        "reference": { "type": "string", "minLength": 1 },
+        "revision": { "$ref": "#/$defs/Revision" },
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 },
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
+      }
+    },
+    "AssistantTerminalContentRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_id", "terminal_id", "incarnation_id", "screen_revision"],
+      "properties": {
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "terminal_id": { "$ref": "#/$defs/TerminalId" },
+        "incarnation_id": { "type": "string", "minLength": 1 },
+        "screen_revision": { "$ref": "#/$defs/Revision" },
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" }
+      }
+    },
+    "AssistantContentRequest": {
+      "description": "Disjoint content queries: conversation range or terminal screen; mixing their fields is denied.",
+      "oneOf": [{ "$ref": "#/$defs/AssistantConversationContentRequest" }, { "$ref": "#/$defs/AssistantTerminalContentRequest" }]
+    },
+    "AssistantProjection": { "enum": ["summary", "attention", "missions", "agents", "conversation-content", "terminal-content"] },
+    "ScgReadAuthorizationPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Signed with Ed25519 by the pinned attestor over UTF-8 `st3.scg-read.v1\\n` followed by the canonical JSON of this payload (recursively sorted object keys, compact, integers only).",
+      "required": ["issuer", "identity", "assistant_id", "grant_id", "policy_revision", "key_id", "approval_id", "execution_id", "projection", "parameters", "max_response_bytes", "request_digest", "expires_at_unix_ms", "nonce"],
+      "properties": {
+        "issuer": { "$ref": "#/$defs/PersonId" },
+        "identity": { "const": "chatgpt" },
+        "assistant_id": { "$ref": "#/$defs/AssistantPrincipal" },
+        "grant_id": { "$ref": "#/$defs/Id" },
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "key_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "approval_id": { "type": "string", "minLength": 1 },
+        "execution_id": { "type": "string", "minLength": 1 },
+        "projection": { "$ref": "#/$defs/AssistantProjection" },
+        "parameters": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Every exact decoded query parameter, including cursor, range and max_response_bytes when sent." },
+        "max_response_bytes": { "$ref": "#/$defs/AssistantResponseBytes" },
+        "request_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Lowercase hex SHA-256 of canonical JSON {\"method\":\"GET\",\"parameters\":<decoded map>,\"path\":<exact path>}." },
+        "expires_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "nonce": { "type": "string", "minLength": 16, "maxLength": 128, "description": "Persisted atomically on first acceptance; any replay is denied." }
+      }
+    },
+    "ScgReadAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Sent as unpadded base64url JSON in the `x-st3-scg-read-authorization` header.",
+      "required": ["payload", "signature"],
+      "properties": {
+        "payload": { "$ref": "#/$defs/ScgReadAuthorizationPayload" },
+        "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$", "description": "Unpadded base64url Ed25519 signature (64 bytes)." }
+      }
+    },
+    "AssistantSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "as_of", "counts"],
+      "properties": {
+        "kind": { "const": "assistant-summary" },
+        "as_of": { "$ref": "#/$defs/Timestamp" },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attention", "agent_states", "mission_states"],
+          "properties": {
+            "attention": { "type": "integer", "minimum": 0 },
+            "agent_states": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+            "mission_states": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+          }
+        }
+      }
+    },
+    "AssistantAttentionItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "attention_kind", "person_id", "agent_id", "mission_id", "mission_run_id", "revision", "episode", "waiting_since"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "attention_kind": { "enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault", "harness-login", "harness-prompt", "custom", "unknown"], "description": "Every custom.* kind collapses to custom; any other unrecognized source kind is unknown." },
+        "person_id": { "$ref": "#/$defs/PersonId" },
+        "agent_id": { "type": ["string", "null"] },
+        "mission_id": { "type": ["string", "null"] },
+        "mission_run_id": { "type": ["string", "null"] },
+        "revision": { "$ref": "#/$defs/Revision" },
+        "episode": { "type": "string" },
+        "waiting_since": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "AssistantMissionItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "run_id", "agent_ids", "phase", "step_counts", "blocked_count", "revision", "updated_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "run_id": { "type": ["string", "null"] },
+        "agent_ids": { "type": "array", "items": { "type": "string" } },
+        "phase": { "enum": ["draft", "ready", "running", "standing", "blocked", "completed", "failed", "cancelled", "retired", "unknown"] },
+        "step_counts": {
+          "type": "object", "additionalProperties": false, "required": ["total", "completed"],
+          "properties": { "total": { "type": "integer", "minimum": 0 }, "completed": { "type": "integer", "minimum": 0 } }
+        },
+        "blocked_count": { "type": "integer", "minimum": 0 },
+        "revision": { "type": ["string", "null"], "minLength": 1, "maxLength": 256, "description": "Null when the source revision is not identifier-shaped." },
+        "updated_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "AssistantAgentItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "lifecycle", "runtime_state", "current_mission_id", "current_run_id", "updated_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "lifecycle": { "oneOf": [{ "enum": ["standing", "owner", "bounded", "unknown"] }, { "type": "null" }], "description": "Null when undeclared." },
+        "runtime_state": { "enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended", "unknown"] },
+        "current_mission_id": { "type": ["string", "null"] },
+        "current_run_id": { "type": ["string", "null"] },
+        "updated_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Null when the agent has not been observed." }
+      }
+    },
+    "AssistantAttentionPage": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "collection", "filters", "items", "page"],
+      "properties": { "kind": { "const": "page" }, "collection": { "const": "assistant.attention" }, "filters": { "type": "object", "additionalProperties": false, "properties": {} }, "items": { "type": "array", "items": { "$ref": "#/$defs/AssistantAttentionItem" } }, "page": { "$ref": "#/$defs/PageInfo" }, "sync": { "$ref": "#/$defs/SyncNotice" } }
+    },
+    "AssistantMissionPage": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "collection", "filters", "items", "page"],
+      "properties": { "kind": { "const": "page" }, "collection": { "const": "assistant.missions" }, "filters": { "type": "object", "additionalProperties": false, "properties": {} }, "items": { "type": "array", "items": { "$ref": "#/$defs/AssistantMissionItem" } }, "page": { "$ref": "#/$defs/PageInfo" }, "sync": { "$ref": "#/$defs/SyncNotice" } }
+    },
+    "AssistantAgentPage": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "collection", "filters", "items", "page"],
+      "properties": { "kind": { "const": "page" }, "collection": { "const": "assistant.agents" }, "filters": { "type": "object", "additionalProperties": false, "properties": {} }, "items": { "type": "array", "items": { "$ref": "#/$defs/AssistantAgentItem" } }, "page": { "$ref": "#/$defs/PageInfo" }, "sync": { "$ref": "#/$defs/SyncNotice" } }
+    },
+    "AssistantContentRange": {
+      "type": "object", "additionalProperties": false, "required": ["start", "end"],
+      "properties": { "start": { "type": "integer", "minimum": 0 }, "end": { "type": "integer", "minimum": 0 } }
+    },
+    "AssistantConversationContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "agent_id", "session_id", "reference", "revision", "start", "end", "text", "returned_bytes", "truncated", "next_range"],
+      "properties": {
+        "kind": { "const": "assistant-conversation-content" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "session_id": { "$ref": "#/$defs/Id" },
+        "reference": { "type": "string" },
+        "revision": { "$ref": "#/$defs/Revision" },
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string" },
+        "returned_bytes": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "next_range": { "oneOf": [{ "$ref": "#/$defs/AssistantContentRange" }, { "type": "null" }] }
+      }
+    },
+    "AssistantTerminalContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "agent_id", "terminal_id", "incarnation_id", "screen_revision", "text", "returned_bytes", "truncated"],
+      "properties": {
+        "kind": { "const": "assistant-terminal-content" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "terminal_id": { "$ref": "#/$defs/TerminalId" },
+        "incarnation_id": { "type": "string" },
+        "screen_revision": { "$ref": "#/$defs/Revision" },
+        "text": { "type": "string" },
+        "returned_bytes": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "AssistantContentPage": {
+      "oneOf": [{ "$ref": "#/$defs/AssistantConversationContent" }, { "$ref": "#/$defs/AssistantTerminalContent" }]
+    },
+    "AssistantPairingBegin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "device_name", "assistant_id", "scopes", "disclosure_consent", "consent_evidence"],
+      "properties": {
+        "api_version": { "const": "st3.client.v0" },
+        "device_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "assistant_id": { "$ref": "#/$defs/AssistantPrincipal" },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_in_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "default": 3600 },
+        "disclosure_consent": { "const": true },
+        "consent_evidence": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
+      }
+    },
     "PairingBegin": {
+      "oneOf": [{ "$ref": "#/$defs/PersonPairingBegin" }, { "$ref": "#/$defs/AssistantPairingBegin" }]
+    },
+    "PersonPairingBegin": {
       "type": "object",
       "additionalProperties": false,
       "required": ["api_version", "device_name", "person_id"],
@@ -2499,6 +2816,10 @@
       }
     },
     "PairingChallenge": {
+      "oneOf": [
+        { "properties": { "grant_kind": { "const": "person" }, "principal": false, "grant_id": false, "grant_expires_at": false, "policy_revision": false, "minimal_read_mode": false } },
+        { "required": ["principal", "grant_kind", "grant_id", "grant_expires_at", "policy_revision", "minimal_read_mode"], "properties": { "principal": { "$ref": "#/$defs/AssistantPrincipal" }, "grant_kind": { "const": "assistant" }, "grant_id": { "$ref": "#/$defs/Id" }, "grant_expires_at": { "$ref": "#/$defs/Timestamp" }, "policy_revision": { "type": "integer", "minimum": 1 }, "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }, "person_root_fingerprint": false } }
+      ],
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "pairing_id", "code", "expires_at"],
@@ -2507,7 +2828,13 @@
         "pairing_id": { "$ref": "#/$defs/Id" },
         "code": { "type": "string", "pattern": "^[A-Z2-9]{8}$" },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
-        "person_root_fingerprint": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" }
+        "person_root_fingerprint": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "grant_kind": { "enum": ["person", "assistant"] },
+        "grant_id": { "$ref": "#/$defs/Id" },
+        "grant_expires_at": { "$ref": "#/$defs/Timestamp" },
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
       }
     },
     "PairingComplete": {
@@ -2521,7 +2848,27 @@
         "key_storage": { "enum": ["secure-enclave", "software"] }
       }
     },
+    "AssistantPairedSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "api_version", "principal", "sender_class", "device_id", "session_actor", "credential", "scopes", "expires_at", "grant"],
+      "properties": {
+        "kind": { "const": "assistant-paired-session" },
+        "api_version": { "const": "st3.client.v0" },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+        "device_id": { "$ref": "#/$defs/Id" },
+        "session_actor": { "type": "string", "pattern": "^assistant/chatgpt/session/.+$" },
+        "credential": { "x-st-codec": "redacted", "type": "string", "minLength": 32 },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "grant": { "$ref": "#/$defs/AssistantGrant" }
+      }
+    },
     "PairedSession": {
+      "oneOf": [{ "$ref": "#/$defs/PersonPairedSession" }, { "$ref": "#/$defs/AssistantPairedSession" }]
+    },
+    "PersonPairedSession": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "device_id", "person_id", "session_actor", "credential", "scopes", "expires_at"],

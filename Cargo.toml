@@ -19,6 +19,7 @@ members = [
   "crates/st2-resource-wasip2",
   "crates/st-wire",
   "crates/st3",
+  "crates/st-chatgpt",
   "crates/st3-daemon",
   "crates/st3-kernel",
   "crates/st3-client",

@@ -804,6 +804,19 @@ pub(super) fn prepare_one(
             }
         }
     }
+    // Plain Codex content also carries internal source-record blocks. Preserve a
+    // separate continuation to its text body rather than exposing the raw record.
+    if session.conversation_blocks && original["body"]["media_type"] == "text/plain"
+        && original["body"]["text"].as_str().is_some_and(|text| text.len() > VALUE_BYTES)
+        && body.get("blocks").and_then(Value::as_array)
+            .is_none_or(|blocks| blocks.iter().all(|block| block["kind"] == "source_record"))
+    {
+        let blocks = body.entry("blocks").or_insert_with(|| json!([])).as_array_mut().expect("blocks array");
+        blocks.push(json!({"id":format!("{}/text",original["id"].as_str().unwrap_or("content")),
+            "kind":"raw_text","source_type":"content","payload":{"body_ref":true},
+            "continuation":continuation(reference(source,basis,session_id,&original,"/body"),
+                "application/json",None,"size-limit")}));
+    }
     // Error/status fallback fields use the same clipped display convention as
     // text/arguments/content. A negotiated body_ref continuation fetches the
     // complete original body; legacy clients receive the visible marker only.
@@ -1008,6 +1021,69 @@ pub(super) async fn chunk_local(
         "offset":offset,"size":bytes.len(),"data":STANDARD.encode(&bytes[start..end]),
         "next_offset":(end<bytes.len()).then_some(end)}),
     )
+}
+
+/// One authenticated plain-text payload for an assistant content read, with the entry
+/// revision its reference pins. The native record is read within `record_bytes`: a larger
+/// record is refused, never read whole. Attachments, images, tool payloads and other
+/// structured bodies are refused rather than rendered.
+pub(super) fn assistant_text(
+    state: &AppState,
+    session_id: &str,
+    wanted: &str,
+    record_bytes: usize,
+) -> Result<(String, Value), ApiError> {
+    let locator = locator(wanted, session_id)?;
+    if locator.image {
+        return Err(not_text());
+    }
+    let native: crate::external_sessions::NativeLocator =
+        serde_json::from_value(locator.native.clone()).map_err(|_| invalidated())?;
+    let slots = read_slots(&locator.source.transcript);
+    let _slot = read_slot(slots)?;
+    let found = source(state, session_id)?;
+    if basis(&found)? != locator.basis {
+        return Err(invalidated());
+    }
+    let value = crate::external_sessions::normalized_record_bounded(&found, &native, record_bytes)
+        .map_err(|error| {
+            if error.chain().any(|cause| cause.is::<crate::external_sessions::RecordBudgetExceeded>()) {
+                ApiError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "response-budget-exceeded".into(),
+                    message: "the referenced native record exceeds the assistant read budget".into(),
+                    details: Box::default(),
+                }
+            } else {
+                invalidated()
+            }
+        })?
+        .into_iter()
+        .find(|item| item["id"] == locator.entry && item["revision"] == locator.revision)
+        .and_then(|mut item| item.pointer_mut(&locator.pointer).map(Value::take))
+        .ok_or_else(invalidated)?;
+    if basis(&source(state, session_id)?)? != locator.basis {
+        return Err(invalidated());
+    }
+    let Value::Object(mut body) = value else {
+        return Err(not_text());
+    };
+    if body.get("media_type").and_then(Value::as_str) != Some("text/plain") {
+        return Err(not_text());
+    }
+    match body.remove("text") {
+        Some(Value::String(text)) => Ok((text, locator.revision)),
+        _ => Err(not_text()),
+    }
+}
+
+fn not_text() -> ApiError {
+    ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "content-not-text".into(),
+        message: "assistant content reads return plain text only, never attachments or structured payloads".into(),
+        details: Box::default(),
+    }
 }
 
 fn image_bytes(source: &ExternalSession, value: &Value) -> Result<(Vec<u8>, String), ApiError> {

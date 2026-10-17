@@ -428,6 +428,7 @@ impl Node {
         let reconciler =
             Reconciler::new(store.clone(), runtime.clone(), name.into(), notify.clone());
         let state = AppState {
+            owning_person: None,
             store: store.clone(),
             notify,
             event_notify: watch::channel(0).0,

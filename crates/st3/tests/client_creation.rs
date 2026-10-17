@@ -10,6 +10,7 @@ use tower::ServiceExt as _;
 
 fn state(root: &Path) -> AppState {
     AppState {
+        owning_person: None,
         store: Arc::new(Store::open_memory("creation-test").unwrap()),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,

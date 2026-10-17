@@ -1,6 +1,12 @@
 {
   "contract": "st3.client.v0",
   "schema": "./client-v0.schema.json",
+  "constants": {
+    "sidebar_arrangement_uuid": {
+      "value": "00000000-0000-7000-8000-000000000001",
+      "about": "Each person's one Sidebar arrangement is arrangement/person/NAME/<this UUID> (#2043)."
+    }
+  },
   "transport": {
     "local": "unix",
     "remote": "fabric-loopback",
@@ -74,13 +80,23 @@
     {"id": "arrangements.list", "method": "GET", "path": "/v1/client/arrangements", "response": "ArrangementPage", "scope": "read.arrangements", "max_response_bytes": 1048576},
     {"id": "arrangements.get", "method": "GET", "path": "/v1/client/arrangements/{person_name}/{uuid}", "response": "Arrangement", "scope": "read.arrangements", "max_response_bytes": 1048576},
     {"id": "glasses.list", "method": "GET", "path": "/v1/client/glasses", "response": "Page", "scope": "read.glasses"},
-    {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
+    {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"},
+    {"id": "assistant.summary", "method": "GET", "path": "/v1/client/assistant/summary", "query_model": "AssistantSummaryRequest", "response": "AssistantSummary", "scope": "read.assistant.summary", "principal": "assistant/chatgpt", "proof_header": "x-st3-scg-read-authorization", "proof": "ScgReadAuthorization", "minimal_read_mode": "approval-once", "default_response_bytes": 4096, "max_response_bytes": 16384},
+    {"id": "assistant.attention", "method": "GET", "path": "/v1/client/assistant/attention", "query_model": "AssistantPageRequest", "response": "AssistantAttentionPage", "scope": "read.assistant.attention", "principal": "assistant/chatgpt", "proof_header": "x-st3-scg-read-authorization", "proof": "ScgReadAuthorization", "minimal_read_mode": "approval-once", "default_response_bytes": 4096, "max_response_bytes": 16384},
+    {"id": "assistant.missions", "method": "GET", "path": "/v1/client/assistant/missions", "query_model": "AssistantPageRequest", "response": "AssistantMissionPage", "scope": "read.assistant.missions", "principal": "assistant/chatgpt", "proof_header": "x-st3-scg-read-authorization", "proof": "ScgReadAuthorization", "minimal_read_mode": "approval-once", "default_response_bytes": 4096, "max_response_bytes": 16384},
+    {"id": "assistant.agents", "method": "GET", "path": "/v1/client/assistant/agents", "query_model": "AssistantPageRequest", "response": "AssistantAgentPage", "scope": "read.assistant.agents", "principal": "assistant/chatgpt", "proof_header": "x-st3-scg-read-authorization", "proof": "ScgReadAuthorization", "minimal_read_mode": "approval-once", "default_response_bytes": 4096, "max_response_bytes": 16384},
+    {"id": "assistant.conversation-content", "method": "GET", "path": "/v1/client/assistant/conversation-content", "query_model": "AssistantConversationContentRequest", "response": "AssistantContentPage", "scope": "read.assistant.conversation", "principal": "assistant/chatgpt", "proof_header": "x-st3-scg-read-authorization", "proof": "ScgReadAuthorization", "minimal_read_mode": "approval-once", "default_response_bytes": 4096, "max_response_bytes": 16384},
+    {"id": "assistant.terminal-content", "method": "GET", "path": "/v1/client/assistant/terminal-content", "query_model": "AssistantTerminalContentRequest", "response": "AssistantContentPage", "scope": "read.assistant.terminal", "principal": "assistant/chatgpt", "proof_header": "x-st3-scg-read-authorization", "proof": "ScgReadAuthorization", "minimal_read_mode": "approval-once", "default_response_bytes": 4096, "max_response_bytes": 16384}
   ],
   "commands": [
     {"id": "observations.report", "method": "POST", "path": "/v1/client/observations", "request": "ObservationReport", "response": "ObservationResponse", "authentication": "paired-session", "max_request_bytes": 65536, "durable_receipt": false, "replicated": false, "snapshot_fence": false},
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },
+    { "id": "assistant.grant.get", "method": "GET", "path": "/v1/client/assistant/grants/{id}", "response": "AssistantGrant", "local_only": true, "actor": "daemon-configured-owner", "capability": "assistant.grants.v1" },
+    { "id": "assistant.grant.revoke", "method": "POST", "path": "/v1/client/assistant/grants/{id}/revoke", "response": "AssistantGrant", "local_only": true, "actor": "daemon-configured-owner", "capability": "assistant.grants.v1" },
+    { "id": "assistant.grant.policy", "method": "POST", "path": "/v1/client/assistant/grants/{id}/policy", "request": "AssistantGrantPolicy", "response": "AssistantGrant", "local_only": true, "actor": "daemon-configured-owner", "capability": "assistant.grants.v1" },
+    { "id": "assistant.grant.read-trust", "method": "POST", "path": "/v1/client/assistant/grants/{id}/read-trust", "request": "AssistantReadTrustRequest", "response": "AssistantGrant", "local_only": true, "actor": "daemon-configured-owner", "capability": "assistant.grants.v1", "increments_policy_revision": true },
     { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalScreen", "websocket_protocol": "st3.client.terminal.v0" },
     { "id": "conversation.stream", "method": "GET", "path": "/v1/client/conversations/{id}/stream", "response": "ConversationChanges", "websocket_protocol": "st3.client.conversation.v0" },
     {"id": "glasses.put", "method": "PUT", "path": "/v1/client/glasses/{id}", "request": "GlassPut", "response": "Glass", "scope": "control.glasses", "idempotency_header": "Idempotency-Key"},
@@ -160,12 +176,11 @@
     "max_arrangement_operations": 1024,
     "max_arrangement_folders": 1024,
     "max_arrangement_placements": 4096,
-    "pairing_ttl_seconds": 300  },
-  "constants": {
-    "sidebar_arrangement_uuid": {
-      "value": "00000000-0000-7000-8000-000000000001",
-      "about": "Each person's one Sidebar arrangement is arrangement/person/NAME/<this UUID> (#2043)."
-    }
+    "pairing_ttl_seconds": 300,
+    "assistant_grant_default_ttl_seconds": 3600,
+    "assistant_grant_max_ttl_seconds": 2592000,
+    "default_assistant_response_bytes": 4096,
+    "max_assistant_response_bytes": 16384
   },
   "idempotency_contract": {
     "storage": "local-sqlite-completed-response-rows",

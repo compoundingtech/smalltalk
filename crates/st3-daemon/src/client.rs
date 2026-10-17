@@ -1860,6 +1860,7 @@ mod tests {
         let socket = directory.path().join("st3.sock");
         let store = Arc::new(crate::store::Store::open_memory("message-retry").unwrap());
         let state = crate::api::AppState {
+            owning_person: None,
             store: store.clone(),
             notify: Arc::new(tokio::sync::Notify::new()),
             event_notify: tokio::sync::watch::channel(0).0,

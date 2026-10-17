@@ -70,6 +70,12 @@ fn write_message(path: &Path, message: &MessageView) -> Result<()> {
     let mut text = String::new();
     text.push_str(&format!("from: {}\n", message.from));
     text.push_str(&format!("to: {}\n", message.to));
+    if message.sender_class.as_deref() == Some("external-assistant") {
+        text.push_str("sender_class: external-assistant\n");
+    }
+    if let Some(grant) = &message.assistant_grant_id {
+        text.push_str(&format!("assistant_grant_id: {grant}\n"));
+    }
     if let Some(title) = &message.title {
         text.push_str(&format!("subject: {title}\n"));
     }
@@ -148,6 +154,8 @@ mod tests {
             body_ref: None,
             body_bytes: None,
             body_origin: None,
+            sender_class: None,
+            assistant_grant_id: None,
             created_index: 7,
             attachments: Vec::new(),
         };
@@ -190,6 +198,8 @@ mod tests {
             body_ref: None,
             body_bytes: None,
             body_origin: None,
+            sender_class: None,
+            assistant_grant_id: None,
             created_index: 8,
             attachments: Vec::new(),
         };
@@ -200,5 +210,52 @@ mod tests {
                 .join("receiver/inbox/00000000000000000008-kickoff%2Frun-1.md")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn projection_carries_trusted_assistant_provenance_lines() {
+        let directory = tempdir().unwrap();
+        let mut message = MessageView {
+            subject: "message/abc".into(),
+            from: "assistant/example".into(),
+            to: "agent/receiver".into(),
+            content: "request".into(),
+            status: "sent".into(),
+            title: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            body_ref: None,
+            body_bytes: None,
+            body_origin: None,
+            sender_class: Some("external-assistant".into()),
+            assistant_grant_id: Some("assistant-grant/one".into()),
+            created_index: 9,
+            attachments: Vec::new(),
+        };
+        export_messages(directory.path(), &[message.clone()]).unwrap();
+        let projected = std::fs::read_to_string(
+            directory
+                .path()
+                .join("receiver/inbox/00000000000000000009-abc.md"),
+        )
+        .unwrap();
+        assert!(projected.starts_with(
+            "from: assistant/example\n\
+             to: agent/receiver\n\
+             sender_class: external-assistant\n\
+             assistant_grant_id: assistant-grant/one\n"
+        ));
+        // An ordinary send projects no provenance lines.
+        message.sender_class = None;
+        message.assistant_grant_id = None;
+        export_messages(directory.path(), &[message]).unwrap();
+        let projected = std::fs::read_to_string(
+            directory
+                .path()
+                .join("receiver/inbox/00000000000000000009-abc.md"),
+        )
+        .unwrap();
+        assert!(projected.starts_with("from: assistant/example\nto: agent/receiver\n"));
+        assert!(!projected.contains("sender_class"));
     }
 }

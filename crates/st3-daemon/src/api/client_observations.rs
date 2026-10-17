@@ -632,6 +632,7 @@ mod tests {
     async fn observation_paired_session_transport_reader_doctor_and_body_limits() {
         let root = tempfile::tempdir().unwrap();
         let state = AppState {
+            owning_person: None,
             store: Arc::new(
                 Store::open(&root.path().join("graph.db"), "observations-test").unwrap(),
             ),

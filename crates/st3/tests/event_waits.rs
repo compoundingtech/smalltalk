@@ -55,6 +55,7 @@ impl Daemon {
             configured_peers: Vec::new(),
             client_relay: None,
             native_session_home: None,
+            owning_person: None,
             planner_default: st3::model::PlannerSpec::default(),
         };
         let socket = daemon.socket();

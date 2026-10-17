@@ -1,0 +1,9 @@
+{
+  "api_version": "st3.client.v0",
+  "device_name": "External assistant executor",
+  "assistant_id": "assistant/chatgpt",
+  "scopes": ["read.assistant.summary", "read.assistant.attention", "read.assistant.missions", "read.assistant.agents"],
+  "expires_in_seconds": 3600,
+  "disclosure_consent": true,
+  "consent_evidence": "axe decision ask recorded by the owning person"
+}

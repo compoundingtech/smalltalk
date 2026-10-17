@@ -511,6 +511,37 @@ pub(super) fn enrich_responses(
 }
 
 impl Store {
+    /// A daemon-owned approval ask, projected in the same transaction as its durable claim.
+    pub(crate) fn ask_daemon_approval(&self, person: &str, key: &str, proposal: Value) -> Result<StepRunView, St3Error> {
+        let subject = format!("step-run/chatgpt-{key}/ask");
+        let mission_id = format!("chatgpt/{key}");
+        let kdl = format!("version 2\nmission {mission_id:?} state=\"ready\" {{ goal \"Approve ChatGPT proposal\"; step \"ask\" {{ assigned-to {person:?}; goal \"Approve exact proposed action\"; }} }}");
+        let mut intent = crate::graph::parse_internal_intent(&kdl, &self.origin)?;
+        let mission = intent.missions.remove(&mission_id).ok_or_else(|| St3Error::new("internal","approval mission absent"))?;
+        let input = PersonAskRequest { legacy_request:None, person:person.into(), actor:"daemon/chatgpt-approval".into(),
+            title:"Approve ChatGPT proposal".into(), reason:serde_json::to_string(&proposal).map_err(internal)?,
+            step:None, new_run:Some(mission_id), incarnation:None, idempotency_key:key.into(),
+            request:Some(json!({"version":1,"type":"decision","question":"Execute this exact ChatGPT proposal?",
+                "why_person":"Only the owner authorizes assistant writes.","summary":"Approve the exact typed action in the alert detail; original fences remain mandatory.",
+                "answers":[{"id":"approve","label":"Approve","consequence":"Execute this exact action once, subject to its original fence.","outcome":"accept"},
+                    {"id":"deny","label":"Deny","consequence":"Do not execute the action.","outcome":"decline"}]})) };
+        let structured = canonical_request(&input)?;
+        self.connection.batched(|tx| {
+            if let Some(existing) = request(tx,&subject).map_err(internal)? {
+                if existing.body["fields"]["person"] != person || existing.body["fields"]["request"] != structured {
+                    return Err(St3Error::new("idempotency-conflict","approval key already names another request"));
+                }
+                return step(tx,&subject).map_err(internal)?.ok_or_else(|| St3Error::new("internal","approval ask absent"));
+            }
+            let claim = append_claim_tx(tx,&self.origin,&subject,"work.person-asked",Some("daemon/chatgpt-approval"),
+                &with_request(json!({"fields":{"run":format!("mission-run/chatgpt/{key}"),
+                    "generation":format!("run-generation/chatgpt-{key}"),"person":person,"title":input.title,"reason":input.reason,
+                    "key":key,"attempt":1,"status":"ready","mission_spec":mission}}),&structured),&[],None).map_err(claim_append_error)?;
+            project(tx,&claim)?;
+            step(tx,&subject).map_err(internal)?.ok_or_else(|| St3Error::new("internal","approval ask absent"))
+        }).map_err(internal)?
+    }
+
     pub fn ask_person(&self, input: &PersonAskRequest) -> Result<StepRunView, St3Error> {
         if !input.person.starts_with("person/")
             || input.person.matches('/').count() != 1
@@ -603,7 +634,30 @@ impl Store {
         input: &PersonStepResponse,
         cancel: bool,
     ) -> Result<StepRunView, St3Error> {
+        self.finish_person_step_authorized(input, cancel, None)
+    }
+
+    pub(crate) fn finish_person_step_authorized(
+        &self,
+        input: &PersonStepResponse,
+        cancel: bool,
+        authorization: Option<&super::assistant_write::AssistantWriteAuthorization>,
+    ) -> Result<StepRunView, St3Error> {
+        if let Some(authorization) = authorization
+            && (authorization.scope != "read.assistant.attention" || authorization.approval_subject.is_none()
+                || authorization.owner != input.actor || cancel)
+        {
+            return Err(St3Error::new("forbidden", "assistant authorization does not bind this person answer"));
+        }
+        #[cfg(feature = "test-support")]
+        let _gate = match authorization {
+            Some(authorization) => super::assistant_write_gate::pause(&authorization.grant_subject)?,
+            None => None,
+        };
         self.connection.batched(|tx| {
+            if let Some(authorization) = authorization {
+                super::assistant_write::authorize(tx, &self.origin, authorization)?;
+            }
             let subject = normalize_step_run(&input.subject);
             let mut view = step(tx, &subject).map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-step-run", "the person step does not exist"))?;

@@ -2179,6 +2179,13 @@ pub struct MessageView {
     /// The member holding the body's file, such as `host/laptop`, with `body_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_origin: Option<String>,
+    /// Trusted sender class stamped only by the authorized external-assistant send path; absent on
+    /// ordinary sends and never derived from body text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_class: Option<String>,
+    /// The assistant grant that authorized the send, with `sender_class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_grant_id: Option<String>,
     pub created_index: u64,
 }
 
@@ -2226,6 +2233,18 @@ impl MessageSendRefusal {
     }
 }
 
+impl MessageView {
+    /// Verified assistant provenance for notification rendering, from stored claim fields rather
+    /// than sender-authored text. `None` for every ordinary send.
+    pub fn assistant_metadata(&self) -> Option<st_drivers::ding::AssistantMessageMetadata<'_>> {
+        (self.sender_class.as_deref() == Some("external-assistant")).then_some(
+            st_drivers::ding::AssistantMessageMetadata {
+                assistant_grant_id: self.assistant_grant_id.as_deref(),
+            },
+        )
+    }
+
+}
 /// The daemon's answer to a message send, and what a send's idempotency key landed as. Older
 /// daemons answer a send with the bare message, which reads as a new send with no time.
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -78,6 +78,7 @@ impl Daemon {
     }
     async fn start(&mut self) {
         let state = AppState {
+            owning_person: None,
             store: self.store.clone(),
             notify: Arc::new(Notify::new()),
             event_notify: watch::channel(0_u64).0,
