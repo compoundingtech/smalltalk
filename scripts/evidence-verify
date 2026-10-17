@@ -33,6 +33,7 @@ STATEMENT_TYPE = 'https://in-toto.io/Statement/v1'
 PREDICATE_TYPE = 'https://smalltalk.dev/evidence/gate/v1'
 KEYS_PATH = '.st/evidence-keys'
 POLICY_PATH = '.st/evidence-skip-policy.json'
+LANES_PATH = '.st/required-lanes.json'
 KINDS = ('nix', 'wrapper', 'sekrets', 'observed')
 FUTURE_SKEW = timedelta(minutes=2)
 
@@ -166,6 +167,65 @@ def policy_rules(text, check, repository):
                        'by_level': by_level}
     return {'kinds': kinds, 'trust_levels': tuple(levels), 'max_age_s': max_age, 'enforce': enforce,
             'inputs': inputs, 'sample_one_in': sample, 'require': require}
+
+
+LANES_KEYS = {'version', 'lanes'}
+LANE_KEYS = {'argv', 'definition_paths', 'tree_inputs'}
+
+
+def lane_rules(text, lane):
+    """One lane from `.st/required-lanes.json` (read from the accepted base), strictly validated.
+
+    `argv` is what a producer runs, `definition_paths` the files whose bytes define what that argv does (a directory means
+    everything below it), `tree_inputs` the sources the lane is meant to test (informational: they may differ between the
+    signed tree and the base). Unknown keys are refused, like the skip policy."""
+    try:
+        doc = json.loads(text)
+    except ValueError as error:
+        raise Failure('error', f'lane file is not valid JSON: {error}')
+    if not isinstance(doc, dict) or set(doc) != LANES_KEYS or doc['version'] != 1 or not isinstance(doc['lanes'], dict):
+        raise Failure('error', 'lane file must be {"version": 1, "lanes": {...}}')
+    if lane not in doc['lanes']:
+        raise Failure('no_lane', f'the lane file has no entry for {lane}')
+    entry = doc['lanes'][lane]
+    if not isinstance(entry, dict) or set(entry) - LANE_KEYS or not {'argv', 'definition_paths'} <= set(entry):
+        raise Failure('error', f'lane {lane} needs argv and definition_paths, and nothing unknown')
+    argv = entry['argv']
+    if not (isinstance(argv, list) and argv and all(isinstance(v, str) and v for v in argv)):
+        raise Failure('error', f'lane {lane}: argv must be a nonempty list of strings')
+    paths = declared_paths(entry['definition_paths'], f'lane {lane} definition_paths')
+    if '.' in paths:
+        raise Failure('error', f'lane {lane}: definition_paths must name files or directories, not the whole tree')
+    inputs = entry.get('tree_inputs', [])
+    if inputs:
+        inputs = declared_paths(inputs, f'lane {lane} tree_inputs')
+    return {'argv': argv, 'definition_paths': paths, 'tree_inputs': tuple(inputs)}
+
+
+def definition_entries(repo, tree, paths):
+    """(mode, blob, path) of every file at or below the paths in `tree`."""
+    found = set()
+    for path in paths:
+        out = git(repo, 'ls-tree', '-r', '-z', '--full-tree', '--end-of-options', tree, '--', path)
+        for record in out.split(b'\0'):
+            if record:
+                meta, _, name = record.partition(b'\t')
+                mode, _, oid = meta.decode().split(' ')
+                found.add((mode, oid, name.decode('utf-8', 'surrogateescape')))
+    return found
+
+
+def lane_definition(repo, base_tree, tree, rules):
+    """The digest of a lane's definition at the accepted base and the paths whose bytes differ between the base and `tree`."""
+    base = definition_entries(repo, base_tree, rules['definition_paths'])
+    for path in rules['definition_paths']:
+        if not any(name == path or name.startswith(path + '/') for _, _, name in base):
+            raise Failure('error', f'lane definition path {path} does not exist at the accepted base')
+    lines = ''.join(f'{mode} {oid} {name}\n' for mode, oid, name in sorted(base, key=lambda e: e[2]))
+    digest = hashlib.sha256((lines + 'argv:' + json.dumps(rules['argv'])).encode('utf-8', 'surrogateescape')).hexdigest()
+    other = definition_entries(repo, tree, rules['definition_paths'])
+    changed = sorted({name for _, _, name in base ^ other})
+    return {'sha256': digest, 'changed': changed}
 
 
 def declared_paths(value, where):
@@ -340,7 +400,7 @@ def signature(repo, commit, keys, revocations):
 
 
 def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None, runner_prefix=None,
-           trust_levels=None, now=None, rules=None):
+           trust_levels=None, now=None, rules=None, lane=None):
     with tempfile.NamedTemporaryFile() as revocations:
         everything = note_refs(repo)
         hits = with_note_for(repo, everything, tree)
@@ -443,6 +503,16 @@ def verify(repo, tree, check, keys, command, kinds=KINDS, bind=(), max_age=None,
     if command is not None and result['command'] != command:
         raise Failure('wrong_command', f'latest record for check {check} ran a different command',
                       attempts=attempts)
+    if lane is not None:
+        # The scripts that decide what the lane runs must be the accepted base's, byte for byte, in the tree that was signed; and the
+        # note must carry the digest of that definition, so a note made against other scripts or another argv is not this lane's.
+        if lane['changed']:
+            raise Failure('definition_changed', 'the lane definition differs between the signed tree and the accepted base: '
+                          + ', '.join(lane['changed'][:5]) + (' ...' if len(lane['changed']) > 5 else ''), attempts=attempts)
+        recorded_definition = observed.get('inputs', {}).get('lane_definition_sha256')
+        if recorded_definition != lane['sha256']:
+            raise Failure('wrong_definition', 'the record does not carry the digest of the lane definition at the accepted base',
+                          attempts=attempts)
     inputs = observed.get('inputs', {})
     for key, path in bind:
         actual = blob_sha256(repo, tree, path)
@@ -472,7 +542,23 @@ def read_policy(repo, commit):
         raise Failure('no_policy', f'no readable skip policy at {commit}:{POLICY_PATH}')
 
 
-def require_all(repo, tree, keys, policy_text, repository):
+def read_lanes(repo, commit):
+    try:
+        return git(repo, 'show', '--end-of-options', f'{commit}:{LANES_PATH}').decode()
+    except (Failure, UnicodeDecodeError):
+        raise Failure('error', f'no readable lane file at {commit}:{LANES_PATH}')
+
+
+def lane_for(repo, tree, lanes, check):
+    """The lane check of `check` for the verified tree, from (lane file text, accepted base commit); None without a lane file."""
+    if lanes is None:
+        return None
+    text, base = lanes
+    base_tree = git(repo, 'rev-parse', '--verify', '--end-of-options', base + '^{tree}').decode().strip()
+    return lane_definition(repo, base_tree, tree, lane_rules(text, check))
+
+
+def require_all(repo, tree, keys, policy_text, repository, lane_file=None):
     """Every check whose policy says `require` (shadow or reject), judged by the same rules as a single check.
 
     One entry per such check with its own reason, so a missing lane is named, not folded into one boolean. The overall
@@ -492,7 +578,16 @@ def require_all(repo, tree, keys, policy_text, repository):
         if mode == 'off':
             continue
         try:
-            result = verify(repo, tree, check, keys, None, rules=rules)
+            # A broken lane file or a missing definition path is a verifier error (it propagates); only a check without a lane entry is a lane refusal.
+            definition = lane_for(repo, tree, lane_file, check)
+        except Failure as failure:
+            if failure.reason != 'no_lane':
+                raise
+            lanes[check] = {'require': mode, 'satisfied': False, 'reason': failure.reason, 'detail': failure.detail,
+                            'decision': 'reject' if mode == 'reject' else 'would-reject'}
+            continue
+        try:
+            result = verify(repo, tree, check, keys, None, rules=rules, lane=definition)
             lane = {'require': mode, 'satisfied': True, 'decision': 'ok', 'record': result.get('record'),
                     'signer': result.get('signer'), 'tier': result.get('tier')}
         except Failure as failure:
@@ -562,6 +657,9 @@ def main(argv):
     target.add_argument('--tree')
     target.add_argument('--revision')
     parser.add_argument('--check')
+    parser.add_argument('--lanes-from', metavar='COMMIT',
+                        help=f'also hold the check to its lane definition in {LANES_PATH} at this accepted base: the lane\'s script blobs must be '
+                             'identical in the verified tree and the base (definition_changed) and the note must carry the base\'s digest (wrong_definition)')
     parser.add_argument('--require-all', action='store_true',
                         help='judge every check whose policy says `require` (needs --policy-from, --repository and keys); '
                              'exit 1 only when a check in mode reject is not satisfied, exit 2 (decision error) when it could not decide')
@@ -675,7 +773,8 @@ def main(argv):
             if not os.path.isfile(keys):
                 raise Failure('error', f'key list {args.keys} not found')
         if args.require_all:
-            result = require_all(args.repo, tree, keys, read_policy(args.repo, args.policy_from), args.repository)
+            lane_file = (read_lanes(args.repo, args.lanes_from), args.lanes_from) if args.lanes_from else None
+            result = require_all(args.repo, tree, keys, read_policy(args.repo, args.policy_from), args.repository, lane_file)
             print(json.dumps(result, indent=2))
             return 1 if result['decision'] == 'reject' else 0
         rules = None
@@ -685,8 +784,9 @@ def main(argv):
             except (Failure, UnicodeDecodeError):
                 raise Failure('no_policy', f'no readable skip policy at {args.policy_from}:{POLICY_PATH}')
             rules = policy_rules(text, args.check, args.repository)
+        lanes = (read_lanes(args.repo, args.lanes_from), args.lanes_from) if args.lanes_from else None
         result = verify(args.repo, tree, args.check, keys, command, kinds, bind, args.max_age, args.runner_prefix,
-                        trust_levels, rules=rules)
+                        trust_levels, rules=rules, lane=lane_for(args.repo, tree, lanes, args.check))
         print(json.dumps(result, indent=2))
         return 0
     except Failure as failure:

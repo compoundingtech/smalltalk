@@ -865,12 +865,183 @@ class RequireAll(unittest.TestCase):
         return self.f.git('rev-parse', 'HEAD')
 
 
+LANES = {'version': 1, 'lanes': {'unit': {'argv': ['make', 'test'], 'definition_paths': ['config/x.json', 'scripts'], 'tree_inputs': ['src']}}}
+
+
+class LaneDefinitions(unittest.TestCase):
+    """A lane is the argv plus the bytes of the scripts that decide what it runs, as they are at the accepted base."""
+
+    def setUp(self):
+        self.f = Fixture()
+        self.addCleanup(self.f.tmp.cleanup)
+        self.ci = self.f.key('ci', 'machine/ci1')
+        self.base_commit, self.base_tree = self.files({'scripts/run.sh': 'run\n', 'scripts/sub/more.sh': 'more\n',
+                                                       'config/x.json': '{}\n', 'src/code.rs': 'one\n',
+                                                       '.st/required-lanes.json': json.dumps(LANES)})
+
+    def files(self, changes):
+        for name, content in changes.items():
+            path = self.f.repo / name
+            if content is None:
+                path.unlink(missing_ok=True)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        self.f.git('add', '-A')
+        self.f.git('commit', '-q', '--allow-empty', '-m', 'step')
+        return self.f.git('rev-parse', 'HEAD'), self.f.git('rev-parse', 'HEAD^{tree}')
+
+    def rules(self, text=None, lane='unit'):
+        return evidence_verify.lane_rules(text or json.dumps(LANES), lane)
+
+    def definition(self, tree):
+        return evidence_verify.lane_definition(str(self.f.repo), self.base_tree, tree, self.rules())
+
+    def note(self, commit, tree, digest, **kwargs):
+        inputs = {} if digest is None else {'lane_definition_sha256': digest}
+        return self.f.note(commit, tree, self.ci, 'machine/ci1', command=('make', 'test'), inputs=inputs, **kwargs)
+
+    def verdict(self, tree, lane):
+        return self.f.verify(tree, command=['make', 'test'], lane=lane)
+
+    def test_the_lane_file_is_validated_strictly(self):
+        def broken(edit, lane='unit'):
+            doc = json.loads(json.dumps(LANES))
+            edit(doc)
+            with self.assertRaises(evidence_verify.Failure) as caught:
+                evidence_verify.lane_rules(json.dumps(doc), lane)
+            return caught.exception.reason
+        entry = lambda d: d['lanes']['unit']
+        self.assertEqual(broken(lambda d: d.update(surprise=1)), 'error')
+        self.assertEqual(broken(lambda d: d.update(version=2)), 'error')
+        self.assertEqual(broken(lambda d: entry(d).update(typo=1)), 'error')
+        self.assertEqual(broken(lambda d: entry(d).pop('argv')), 'error')
+        self.assertEqual(broken(lambda d: entry(d).update(argv=[])), 'error')
+        self.assertEqual(broken(lambda d: entry(d).update(argv=['make', 1])), 'error')
+        self.assertEqual(broken(lambda d: entry(d).pop('definition_paths')), 'error')
+        self.assertEqual(broken(lambda d: entry(d).update(definition_paths=[])), 'error')
+        self.assertEqual(broken(lambda d: entry(d).update(definition_paths=['.'])), 'error')  # the whole tree is not a definition
+        self.assertEqual(broken(lambda d: entry(d).update(definition_paths=['../x'])), 'error')
+        self.assertEqual(broken(lambda d: entry(d).update(tree_inputs=['/abs'])), 'error')
+        self.assertEqual(broken(lambda d: None, lane='absent'), 'no_lane')
+        with self.assertRaises(evidence_verify.Failure) as caught:
+            evidence_verify.lane_rules('not json', 'unit')
+        self.assertEqual(caught.exception.reason, 'error')
+
+    def test_the_digest_covers_the_argv_and_every_byte_and_mode_below_the_listed_paths(self):
+        first = self.definition(self.base_tree)
+        self.assertEqual(first['changed'], [])
+        self.assertEqual(first['sha256'], self.definition(self.base_tree)['sha256'])
+        rules = self.rules()
+        again = evidence_verify.lane_definition(str(self.f.repo), self.base_tree, self.base_tree, dict(rules, argv=['make', 'less']))
+        self.assertNotEqual(first['sha256'], again['sha256'])  # another argv is another lane
+        for change in ({'scripts/run.sh': 'run!\n'}, {'scripts/sub/more.sh': 'more!\n'}, {'config/x.json': '[]\n'},
+                       {'scripts/new.sh': 'new\n'}, {'scripts/sub/more.sh': None}):
+            _, tree = self.files(change)
+            moved = evidence_verify.lane_definition(str(self.f.repo), tree, tree, self.rules())
+            self.assertNotEqual(first['sha256'], moved['sha256'], change)
+            self.files({k: v for k, v in {'scripts/run.sh': 'run\n', 'scripts/sub/more.sh': 'more\n', 'config/x.json': '{}\n'}.items()})
+            self.files({'scripts/new.sh': None} if (self.f.repo / 'scripts/new.sh').exists() else {})
+        _, tree = self.files({'src/code.rs': 'two\n'})  # a tree input is not part of the definition
+        self.assertEqual(self.definition(tree)['changed'], [])
+        self.assertEqual(self.definition(tree)['sha256'], first['sha256'])
+        _, tree = self.files({'scripts-other/x.sh': 'x\n'})  # a sibling with the same prefix is not below scripts
+        self.assertEqual(self.definition(tree)['changed'], [])
+        with self.assertRaises(evidence_verify.Failure) as caught:
+            evidence_verify.lane_definition(str(self.f.repo), self.base_tree, self.base_tree, dict(rules, definition_paths=('absent.sh',)))
+        self.assertEqual(caught.exception.reason, 'error')  # a listed path missing at the base is a lane-file error
+
+    def test_a_note_that_carries_the_base_digest_for_an_unchanged_definition_satisfies_the_lane(self):
+        digest = self.definition(self.base_tree)
+        commit, tree = self.files({'src/code.rs': 'three\n'})  # the change under test touches only a tree input
+        self.note(commit, tree, digest['sha256'])
+        code, result = self.verdict(tree, self.definition(tree))
+        self.assertEqual((code, result['satisfied']), (0, True), result)
+
+    def test_wrong_definition_when_the_note_has_no_digest_or_another_one(self):
+        commit, tree = self.files({'src/code.rs': 'four\n'})
+        lane = self.definition(tree)
+        self.note(commit, tree, None)
+        self.assertEqual(self.verdict(tree, lane)[1]['reason'], 'wrong_definition')  # an old note without the input
+        self.note(commit, tree, 'f' * 64)
+        self.assertEqual(self.verdict(tree, lane)[1]['reason'], 'wrong_definition')
+        # a digest made against other scripts (an older base) is not this lane's either
+        older = self.definition(self.base_tree)['sha256']
+        self.files({'scripts/run.sh': 'changed at the base\n'})
+        newer_base = self.f.git('rev-parse', 'HEAD^{tree}')
+        commit, tree = self.files({'src/code.rs': 'five\n'})
+        lane = evidence_verify.lane_definition(str(self.f.repo), newer_base, tree, self.rules())
+        self.note(commit, tree, older)
+        self.assertEqual(self.verdict(tree, lane)[1]['reason'], 'wrong_definition')
+
+    def test_definition_changed_when_the_signed_tree_edits_adds_or_deletes_a_listed_blob(self):
+        digest = self.definition(self.base_tree)['sha256']
+        for change in ({'scripts/run.sh': 'run, but fewer tests\n'}, {'scripts/extra.sh': 'x\n'}, {'config/x.json': None},
+                       {'scripts/sub/more.sh': None}):
+            commit, tree = self.files(change)
+            self.note(commit, tree, digest)  # the note even carries the base's digest: it still must not count
+            lane = self.definition(tree)
+            self.assertTrue(lane['changed'], change)
+            code, result = self.verdict(tree, lane)
+            self.assertEqual((code, result['reason']), (1, 'definition_changed'), (change, result))
+            self.assertIn(sorted(change)[0], result['detail'])
+            self.base_tree = self.base_tree  # the base stays fixed; restore the files for the next case
+            self.files({'scripts/run.sh': 'run\n', 'scripts/sub/more.sh': 'more\n', 'config/x.json': '{}\n', 'scripts/extra.sh': None})
+
+    def test_a_check_without_a_lane_is_unsatisfied_under_require_all_when_a_lane_file_is_given(self):
+        policy = two_check_policy('reject', 'reject')
+        self.f.key('x')
+        commit, tree = self.files({'src/code.rs': 'six\n'})
+        result = evidence_verify.require_all(str(self.f.repo), tree, str(self.f.keys), policy, 'org/repo',
+                                             (json.dumps(LANES), self.base_commit))
+        self.assertEqual({k: (v['decision'], v['reason']) for k, v in result['lanes'].items()},
+                         {'other': ('reject', 'no_lane'), 'unit': ('reject', 'no_record')})  # `other` has no lane entry; `unit` has one and no note yet
+        broken = json.dumps({'version': 1, 'lanes': {'unit': {'argv': []}}})
+        with self.assertRaises(evidence_verify.Failure) as caught:
+            evidence_verify.require_all(str(self.f.repo), tree, str(self.f.keys), policy, 'org/repo', (broken, self.base_commit))
+        self.assertEqual(caught.exception.reason, 'error')  # a broken lane file is an error, not a reject
+
+    def test_the_cli_takes_the_lane_file_from_the_accepted_base(self):
+        digest = self.definition(self.base_tree)['sha256']
+        commit, tree = self.files({'src/code.rs': 'seven\n'})
+        self.note(commit, tree, digest)
+        keys = self.f.root / 'allowed-signers'
+        args = ('--tree', tree, '--check', 'unit', '--keys', str(keys), '--command', '["make","test"]')
+        code, out, _ = self.f.cli(*args, '--lanes-from', self.base_commit)
+        self.assertEqual((code, json.loads(out)['satisfied']), (0, True), out)
+        code, out, _ = self.f.cli(*args)  # without the flag nothing about the lane is checked (the old behaviour)
+        self.assertEqual(code, 0, out)
+        code, out, _ = self.f.cli(*args[:3], 'absent', *args[4:], '--lanes-from', self.base_commit)
+        self.assertEqual(json.loads(out)['reason'], 'no_lane')
+        code, out, _ = self.f.cli(*args, '--lanes-from', commit.replace(commit[:4], 'ffff', 1))  # not a commit
+        self.assertEqual((code, json.loads(out)['reason']), (1, 'error'))
+        bad = self.files({'.st/required-lanes.json': 'not json'})[0]
+        code, out, _ = self.f.cli(*args, '--lanes-from', bad)
+        self.assertEqual((code, json.loads(out)['reason']), (1, 'error'))
+
+
 class CommittedPolicy(unittest.TestCase):
     """The policy file in this repository, parsed by the same code the gate runs."""
 
     def rules(self, check):
         text = (ROOT / '.st/evidence-skip-policy.json').read_text()
         return evidence_verify.policy_rules(text, check, 'compoundingtech/smalltalk')
+
+    def test_the_committed_lane_file_is_valid_exists_at_head_and_matches_what_st_test_runs(self):
+        text = (ROOT / '.st/required-lanes.json').read_text()
+        loader = importlib.machinery.SourceFileLoader('st_test_script', str(ROOT / 'scripts/st-test'))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        policy = (ROOT / '.st/evidence-skip-policy.json').read_text()
+        for lane, command in module.LOCAL.items():
+            rules = evidence_verify.lane_rules(text, lane)
+            self.assertEqual(rules['argv'], command, lane)  # the lane is what the local producer runs
+            for path in rules['definition_paths']:
+                self.assertTrue((ROOT / path).exists(), path)
+            declared = evidence_verify.policy_rules(policy, lane, 'compoundingtech/smalltalk')['inputs']
+            if declared is not None:
+                self.assertEqual(rules['tree_inputs'], declared, lane)  # what the lane tests is what the policy declares as inputs
+        self.assertEqual(set(json.loads(text)['lanes']), set(module.LOCAL))
 
     def test_no_committed_check_requires_a_signed_note_yet(self):
         text = (ROOT / '.st/evidence-skip-policy.json').read_text()

@@ -736,6 +736,20 @@ accepted base like everything else here. Nothing calls it yet and no check sets 
 asserts that every committed check is `off`. Making any check `reject` is a separate reviewed change, and making it a required status
 check is a repository ruleset change that is not made here. A pass for a tree is never evidence for the combined tree the merge queue tests.
 
+### Lane definitions (`.st/required-lanes.json`, nothing reads it yet)
+
+A note says a check passed; what the check RAN is decided by scripts that live in the tree under test, so an agent could change them and still hold a
+valid note. `.st/required-lanes.json` (read from the accepted base, strictly validated) names, per lane, the exact `argv`, the `definition_paths`
+(files or directories whose bytes decide what that argv does) and, for information, the `tree_inputs` the lane is meant to test. With
+`--lanes-from BASE` the verifier (single check or `--require-all`) holds a check to its lane: every blob at or below a definition path must be
+IDENTICAL in the verified tree and at BASE, otherwise `definition_changed` (the change edits its own checker, so the signed path is refused and CI
+runs); and the note must carry `lane_definition_sha256`, the digest of those blobs at BASE plus the argv, otherwise `wrong_definition`. A check with
+no lane entry is `no_lane`; a broken lane file or a definition path missing at the base is an error (exit 2 under `--require-all`), never a reject.
+The committed file lists the two lanes `scripts/st-test` can run today, with the same argv (a test pins that) and deliberately wide definition paths
+(all of `scripts/`, `.st/`, `flake.nix`, `flake.lock` for genie-freshness): a change to any script then always runs in CI. They are to be tightened
+only with a read trace of the lane (a later change). No producer writes the digest yet, nothing passes `--lanes-from`, and no gate reads the file, so
+this changes no behaviour; when a gate does read it, `.st/required-lanes.json` must join that gate's protected paths.
+
 ### Which tree a pull request run asks about
 
 A `pull_request` run checks out GitHub's merge of the head into the CURRENT base, a new tree whenever main moved, so a note for the tree an agent
