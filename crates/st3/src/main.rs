@@ -15836,7 +15836,7 @@ async fn check_claude_attachment(
     let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
     let phase = if attached {
         "attached"
-    } else if started.elapsed() >= Duration::from_secs(20)
+    } else if started.elapsed() >= claude_attachment_window()
         || state.claude_attachment_phase == "blocked"
     {
         "blocked"
@@ -15885,6 +15885,18 @@ fn finish_claude_attachment_publication(
         }
     }
     published
+}
+
+/// How long a Claude seat may start before an unattached channel is reported as blocked.
+/// `ST3_CLAUDE_ATTACH_WINDOW_MS` can only shorten it, as `ST3_SUBAGENT_LEASE_MS` does a lease, so
+/// the boot canaries need not wait out the production window.
+fn claude_attachment_window() -> Duration {
+    const DEFAULT_MS: u64 = 20_000;
+    let cap = std::env::var("ST3_CLAUDE_ATTACH_WINDOW_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|cap| *cap > 0);
+    Duration::from_millis(cap.map_or(DEFAULT_MS, |cap| cap.min(DEFAULT_MS)))
 }
 
 fn same_claude_attachment_binding(a: &st3::mailbox::Fence, b: &st3::mailbox::Fence) -> bool {
