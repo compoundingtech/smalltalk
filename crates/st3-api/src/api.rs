@@ -3537,8 +3537,8 @@ fn managed_session_owner_for_subject_at(
     owner: &str,
 ) -> anyhow::Result<Option<ManagedSessionOwner>> {
     crate::performance::task("conversation/owner", || {
-        let owners = store.conversation_owners_at(snapshot_index)?;
-        let Some(owner) = owners.get(owner) else {
+        let owner = store.conversation_owner_at(owner, snapshot_index)?;
+        let Some(owner) = owner else {
             return Ok(None);
         };
         let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
@@ -3547,7 +3547,7 @@ fn managed_session_owner_for_subject_at(
         if managed_session_id(&owner.subject, identity) != session_id {
             return Ok(None);
         }
-        Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())))
+        Ok(Some((owner.subject, owner.incarnation, owner.origin)))
     })
 }
 
