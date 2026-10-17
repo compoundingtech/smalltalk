@@ -101,7 +101,7 @@ pub(crate) fn record(recipient: &str, report: &str) {
 
 /// Title updates cannot establish delivery readiness. They can report the outer driver's
 /// attachment check, including a missing plugin for which no delivery process exists.
-pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) -> bool {
+pub(crate) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) -> bool {
     let Ok(report) = serde_json::from_str::<Report>(raw) else {
         return false;
     };
@@ -131,7 +131,7 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) -> bool {
     false
 }
 
-pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
+pub(crate) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
     let beats = presence().beats.lock().ok()?;
     let beat = beats.get(recipient)?;
     let fence = beat.fence.as_ref()?;
@@ -390,6 +390,12 @@ fn assess_beat(
         polled_seconds_ago: Some(age.as_secs()),
         transport: report.transport,
     }
+}
+
+/// Recheck the initialized live delivery owner before replacing an unattached seat.
+pub(crate) fn claude_channel_attached(store: &crate::store::Store, subject: &str, incarnation: &str) -> bool {
+    attachment(subject, incarnation)
+        .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 
-use st3::tiles::registry::{self, Registry};
+use st3::tile_registry::{self as registry, Registry};
 
 fn enabled() -> bool {
     if std::env::var_os("ST_TILES_ROOT_TEST").as_deref() != Some("1".as_ref()) {

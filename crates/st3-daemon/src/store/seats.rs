@@ -684,13 +684,13 @@ impl Store {
                     let names = previous.items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
                         .chain(changed.iter().cloned()).collect::<BTreeSet<_>>();
                     let metadata = crate::performance::task("roster/queue-diff",
-                        || crate::api::agent_queue_metadata(self, &names))?;
+                        || agent_queue_values::agent_queue_metadata(self, &names))?;
                     let by_id = metadata.iter().map(|item| (item["id"].as_str().unwrap_or_default(), item))
                         .collect::<BTreeMap<_, _>>();
                     for old in previous.items.iter() {
                         let name = old["id"].as_str().unwrap_or_default();
                         if let Some(new) = by_id.get(name)
-                            && crate::api::AGENT_QUEUE_FIELDS.iter().any(|field| old[*field] != new[*field]) {
+                            && agent_queue_values::AGENT_QUEUE_FIELDS.iter().any(|field| old[*field] != new[*field]) {
                             changed.insert(name.to_owned());
                         }
                     }
@@ -1868,8 +1868,8 @@ impl Store {
     pub(crate) fn cached_placement_fence(
         &self,
         token: &str,
-        build: impl FnOnce() -> Result<Option<crate::placement::Fence>>,
-    ) -> Result<Option<Arc<crate::placement::Fence>>> {
+        build: impl FnOnce() -> Result<Option<crate::model::PlacementFence>>,
+    ) -> Result<Option<Arc<crate::model::PlacementFence>>> {
         if let Some(fence) = self.smalltalk.placement_cache.lock()
             .unwrap_or_else(PoisonError::into_inner).get(token) {
             return Ok(fence.clone());

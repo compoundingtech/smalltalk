@@ -36,6 +36,14 @@ pub const REMAINING_PREFIX: &str = "st3-silent-remaining:";
 /// How long a held message may stay unread before `st doctor` lists it for its seat.
 pub const HELD_TOO_LONG_MS: u128 = 24 * 60 * 60 * 1000;
 
+/// The prefix of the reserved tag on a session-start (`handoff`) message. The tag carries the incarnation the
+/// message was written for, so each fresh incarnation gets its own and a replay writes it once.
+pub const SESSION_START_TAG_PREFIX: &str = "st3-session-start:";
+
+/// The prefix of the reserved tag on a "prepare for restart" message, followed by the id of the
+/// claim that records the request and its deadline.
+pub const PREPARE_TAG_PREFIX: &str = "st3-restart-prepare:";
+
 /// Closed daemon event families reserved by conversation admission.
 pub fn reserved_event_tag(tag: &str) -> bool {
     tag.starts_with("st3-work:")
@@ -45,8 +53,8 @@ pub fn reserved_event_tag(tag: &str) -> bool {
         || tag.starts_with("st3-run-report:")
         || tag == "st3-provider-capacity-retry"
         || tag.starts_with("st3-product-wait:")
-        || tag.starts_with(crate::handoff::SESSION_START_TAG_PREFIX)
-        || tag.starts_with(crate::handoff::PREPARE_TAG_PREFIX)
+        || tag.starts_with(SESSION_START_TAG_PREFIX)
+        || tag.starts_with(PREPARE_TAG_PREFIX)
 }
 
 /// A person's message (including one an adapter imports, such as from a chat bridge), anything
