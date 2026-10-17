@@ -74,7 +74,9 @@ lane "Folders core" node --test apps/fractal-web/src/folders/core.node-test.mjs
 lane "App typecheck" pnpm --filter fractal-web typecheck
 lane "CSS asset guard" node --test apps/fractal-web/scripts/vite-css-assets.node-test.mjs
 lane "App production build" production_build
-lane "App unit tests" pnpm --filter fractal-web test
+lane "App unit test selection" node --test apps/fractal-web/scripts/ci/unit-tests.node-test.mjs
+# Pull requests run the tests that import a changed file; other events run all of them.
+lane "App unit tests" node apps/fractal-web/scripts/ci/unit-tests.mjs
 lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts
 lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts
 lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck

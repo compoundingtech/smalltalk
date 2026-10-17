@@ -582,6 +582,9 @@ export const fractalWebJobs = {
           KIT_PLAY_SET: "${{ github.event_name == 'pull_request' && 'commit' || 'all' }}",
           KIT_PLAY_A11Y: "${{ github.event_name == 'pull_request' && 'off' || 'on' }}",
           KIT_PLAY_MAX_SECONDS: "${{ github.event_name == 'pull_request' && '100' || '' }}",
+          // Pull requests run the app unit tests that import a changed file (all of them when a change cannot be
+          // placed in the import graph); merge groups and manual runs run every test file.
+          APP_TEST_SET: "${{ github.event_name == 'pull_request' && 'related' || 'all' }}",
           BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}',
           HEAD_SHA: '${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}',
         },

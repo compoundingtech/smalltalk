@@ -258,6 +258,7 @@ assert "KIT_INPUTS: ${{ needs.fractal-web-changes.outputs.kit-inputs }}" in exec
 assert "KIT_PLAY_SET: ${{ github.event_name == 'pull_request' && 'commit' || 'all' }}" in execution, "PRs run the per-commit set"
 assert "KIT_PLAY_A11Y: ${{ github.event_name == 'pull_request' && 'off' || 'on' }}" in execution, "merge groups keep axe"
 assert "KIT_PLAY_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '100' || '' }}" in execution, "the per-commit budget"
+assert "APP_TEST_SET: ${{ github.event_name == 'pull_request' && 'related' || 'all' }}" in execution, "PRs run the related app tests, merge groups all"
 assert "github.event.pull_request.draft == false" in changes and "(success())" in changes and "actions/checkout" not in changes, "ready PR detection runs on embedded source"
 assert "needs: [fractal-web-changes, genie-freshness]" in execution
 assert "needs.fractal-web-changes.outputs.relevant == 'true'" in execution
