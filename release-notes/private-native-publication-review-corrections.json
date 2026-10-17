@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct the private native publication outcome and control contracts after source review",
+  "replay": {
+    "status": "none",
+    "detail": "Private unqualified source corrections only: typed COMMIT-attempt and rollback disposition, bounded unrun controls, formatter and token construction. No production adapter, stored evidence, native event certificate or recovery protocol; legacy managed commit behavior unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Private unqualified source corrections only: typed COMMIT-attempt and rollback disposition, bounded unrun controls, formatter and token construction. No production adapter, stored evidence, native event certificate or recovery protocol; legacy managed commit behavior unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Private unqualified source corrections only: typed COMMIT-attempt and rollback disposition, bounded unrun controls, formatter and token construction. No production adapter, stored evidence, native event certificate or recovery protocol; legacy managed commit behavior unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Private unqualified source corrections only: typed COMMIT-attempt and rollback disposition, bounded unrun controls, formatter and token construction. No production adapter, stored evidence, native event certificate or recovery protocol; legacy managed commit behavior unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Private unqualified source corrections only: typed COMMIT-attempt and rollback disposition, bounded unrun controls, formatter and token construction. No production adapter, stored evidence, native event certificate or recovery protocol; legacy managed commit behavior unchanged."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Private unqualified source corrections only: typed COMMIT-attempt and rollback disposition, bounded unrun controls, formatter and token construction. No production adapter, stored evidence, native event certificate or recovery protocol; legacy managed commit behavior unchanged."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Private unqualified source corrections only: typed COMMIT-attempt and rollback disposition, bounded unrun controls, formatter and token construction. No production adapter, stored evidence, native event certificate or recovery protocol; legacy managed commit behavior unchanged."
+  }
+}

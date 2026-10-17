@@ -17,6 +17,7 @@ use crate::read_budget::ReadBudget;
 mod read_lifetime;
 pub mod writer_budget;
 mod transaction_finalizer;
+pub(crate) mod publication_contract;
 #[cfg(test)]
 mod managed_commit_counter_tests;
 mod writer_queue;

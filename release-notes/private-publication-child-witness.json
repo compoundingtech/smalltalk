@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Require an owned completion witness from the private observer-panic control",
+  "replay": {
+    "status": "none",
+    "detail": "Private unrun control correction only: parent-owned nonce witness after exact child assertions and native teardown; no runtime producer, schema, API, limit or recovery change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Private unrun control correction only: parent-owned nonce witness after exact child assertions and native teardown; no runtime producer, schema, API, limit or recovery change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Private unrun control correction only: parent-owned nonce witness after exact child assertions and native teardown; no runtime producer, schema, API, limit or recovery change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Private unrun control correction only: parent-owned nonce witness after exact child assertions and native teardown; no runtime producer, schema, API, limit or recovery change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Private unrun control correction only: parent-owned nonce witness after exact child assertions and native teardown; no runtime producer, schema, API, limit or recovery change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Private unrun control correction only: parent-owned nonce witness after exact child assertions and native teardown; no runtime producer, schema, API, limit or recovery change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Private unrun control correction only: parent-owned nonce witness after exact child assertions and native teardown; no runtime producer, schema, API, limit or recovery change."
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add a private native prepared-publication contract checkpoint and unrun controls",
+  "replay": {
+    "status": "none",
+    "detail": "Private source contract and managed precommit validation seam only; no production producer activation, certificate, persisted identity, protocol or recovery policy change. Controls are unrun."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Private source contract and managed precommit validation seam only; no production producer activation, certificate, persisted identity, protocol or recovery policy change. Controls are unrun."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Private source contract and managed precommit validation seam only; no production producer activation, certificate, persisted identity, protocol or recovery policy change. Controls are unrun."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Private source contract and managed precommit validation seam only; no production producer activation, certificate, persisted identity, protocol or recovery policy change. Controls are unrun."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Private source contract and managed precommit validation seam only; no production producer activation, certificate, persisted identity, protocol or recovery policy change. Controls are unrun."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Private source contract and managed precommit validation seam only; no production producer activation, certificate, persisted identity, protocol or recovery policy change. Controls are unrun."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Private source contract and managed precommit validation seam only; no production producer activation, certificate, persisted identity, protocol or recovery policy change. Controls are unrun."
+  }
+}

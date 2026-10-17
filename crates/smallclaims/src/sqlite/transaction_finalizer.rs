@@ -99,6 +99,48 @@ pub struct WriterTransaction<'connection> {
     _timer: crate::windows::Timer,
 }
 
+/// Wrapper phase and current-transaction resolution are independent. Raw SQL may have
+/// committed/replaced a transaction: even a successful rollback here is not a certificate
+/// that an unsupported command had no earlier durable effects.
+#[derive(Debug)]
+pub(crate) enum RollbackResolution {
+    CurrentTransactionRolledBack,
+    TransactionAlreadyEnded,
+    Failed(rusqlite::Error),
+}
+
+#[derive(Debug)]
+pub(crate) enum ValidatedCommitOutcome {
+    Committed,
+    CommitNotAttempted {
+        cause: anyhow::Error,
+        rollback: RollbackResolution,
+    },
+    CommitOutcomeUnknown {
+        cause: anyhow::Error,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolutionKnowledge {
+    Committed,
+    CurrentTransactionRolledBack,
+    Unknown,
+}
+
+impl ValidatedCommitOutcome {
+    pub(crate) fn resolution(&self) -> ResolutionKnowledge {
+        match self {
+            Self::Committed => ResolutionKnowledge::Committed,
+            Self::CommitNotAttempted {
+                rollback: RollbackResolution::CurrentTransactionRolledBack,
+                ..
+            } => ResolutionKnowledge::CurrentTransactionRolledBack,
+            _ => ResolutionKnowledge::Unknown,
+        }
+    }
+}
+
 impl<'connection> WriterTransaction<'connection> {
     pub(super) fn new(
         transaction: Transaction<'connection>,
@@ -120,6 +162,7 @@ impl<'connection> WriterTransaction<'connection> {
     /// A writer-owned scope may refuse immediately before COMMIT, after managed finalizers.
     /// A check error drops/rolls back the transaction. It cannot cancel a completed COMMIT.
     pub(super) fn commit_checked(self, check: impl FnOnce() -> Result<()>) -> Result<()> {
+        // Preserve the existing Result/error and drop-on-error behavior for current callers.
         ensure!(
             !self.transaction.is_autocommit(),
             "writer transaction was ended through raw SQL"
@@ -129,6 +172,56 @@ impl<'connection> WriterTransaction<'connection> {
         self.transaction.commit()?;
         crate::profile::managed_commit_succeeded();
         Ok(())
+    }
+
+    /// Private publication seam: recheck prepared predicates after managed maintenance,
+    /// using this same transaction immediately before COMMIT. This supplies ordering, not
+    /// source coverage or a bound on the callback's cost. No producer is certified by it.
+    /// An error after entering SQLite COMMIT must not be interpreted as a proven rollback.
+    pub(super) fn commit_validated(
+        self,
+        check: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> ValidatedCommitOutcome {
+        if self.transaction.is_autocommit() {
+            return self.reject_before_commit(anyhow::anyhow!(
+                "writer transaction was ended through raw SQL"
+            ));
+        }
+        if let Err(cause) = self.finalizers.run(&self.transaction) {
+            return self.reject_before_commit(cause);
+        }
+        if let Err(cause) = check(&self.transaction) {
+            return self.reject_before_commit(cause);
+        }
+        if self.transaction.is_autocommit() {
+            return self.reject_before_commit(anyhow::anyhow!(
+                "validation ended the writer transaction through raw SQL"
+            ));
+        }
+        match self.transaction.commit() {
+            Ok(()) => {
+                crate::profile::managed_commit_succeeded();
+                ValidatedCommitOutcome::Committed
+            }
+            Err(cause) => ValidatedCommitOutcome::CommitOutcomeUnknown {
+                cause: cause.into(),
+            },
+        }
+    }
+
+    /// Preserve the original refusal AND explicit rollback disposition. Dropping a transaction
+    /// suppresses rollback errors; it is not a rollback receipt. No generic resubmit capability
+    /// follows, especially if raw SQL could have committed and begun another transaction.
+    pub(super) fn reject_before_commit(self, cause: anyhow::Error) -> ValidatedCommitOutcome {
+        let rollback = if self.transaction.is_autocommit() {
+            RollbackResolution::TransactionAlreadyEnded
+        } else {
+            match self.transaction.rollback() {
+                Ok(()) => RollbackResolution::CurrentTransactionRolledBack,
+                Err(error) => RollbackResolution::Failed(error),
+            }
+        };
+        ValidatedCommitOutcome::CommitNotAttempted { cause, rollback }
     }
 
     pub fn rollback(self) -> rusqlite::Result<()> {
