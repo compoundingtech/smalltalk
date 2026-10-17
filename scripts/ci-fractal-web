@@ -56,43 +56,91 @@ kit_plays() (
   trap 'rm -rf "$receipt_dir"' EXIT
   node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook-static "$receipt_dir"
 )
+# Lanes after the install do not depend on one another, so they run in four streams on the runner's four
+# vCPUs, each stream a sequence of mostly single-threaded lanes. Each stream's output is printed whole
+# once all have finished. The play gate saturates every vCPU and the frame CPU budgets measure CPU time,
+# so both run alone afterwards.
+run_streams() {
+  local logs name pid status=0 stream_started=$SECONDS
+  logs=$(mktemp -d "${TMPDIR:-/tmp}/fractal-web-streams.XXXXXX")
+  local -a names=() pids=()
+  for name in "$@"; do
+    ( set -e; "$name" ) > "$logs/$name.log" 2>&1 &
+    names+=("$name") pids+=($!)
+  done
+  for index in "${!pids[@]}"; do
+    pid=${pids[$index]}
+    wait "$pid" || { status=1; echo "::error::stream ${names[$index]} failed"; }
+  done
+  for name in "${names[@]}"; do
+    echo "::group::stream $name"
+    cat "$logs/$name.log"
+    echo "::endgroup::"
+  done
+  rm -rf "$logs"
+  printf '| streams %s | %ss |\n' "${names[*]}" "$((SECONDS - stream_started))" >> "$summary"
+  return "$status"
+}
+
+stream_scenarios() {
+  lane "Scenario typecheck" pnpm --filter @smalltalk/st3-scenarios typecheck
+  lane "Scenario tests" pnpm --filter @smalltalk/st3-scenarios test
+  lane "Scenario freshness" pnpm --filter @smalltalk/st3-scenarios emit:check
+  lane "Scenario privacy" pnpm --filter @smalltalk/st3-scenarios scan
+}
+
+stream_checks() {
+  lane "Dependency licenses" python3 scripts/ci-fractal-web-licenses --check
+  lane "Buck typecheck" buck2 build //:typecheck
+  lane "Scenario decode" pnpm --filter @smalltalk/st3-scenarios decode
+  lane "Measurement contracts" node --experimental-strip-types --test apps/fractal-web/src/telemetry/measurement/measurement.node-test.ts
+  lane "Measurement bundle exclusion" bun apps/fractal-web/src/telemetry/measurement/check-bundles.mjs
+  lane "Synthetic fixtures" bash apps/fractal-web/scripts/ci/fixtures-gate.sh
+  lane "Extension registry" node --experimental-strip-types --test apps/fractal-web/src/extensions/registry.unit.test.ts
+  lane "Folders core" node --test apps/fractal-web/src/folders/core.node-test.mjs
+  lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts
+}
+
+stream_app() {
+  lane "App typecheck" pnpm --filter fractal-web typecheck
+  lane "CSS asset guard" node --test apps/fractal-web/scripts/vite-css-assets.node-test.mjs
+  lane "App production build" production_build
+  lane "App unit test selection" node --test apps/fractal-web/scripts/ci/unit-tests.node-test.mjs
+  # Pull requests run the tests that import a changed file; other events run all of them.
+  lane "App unit tests" node apps/fractal-web/scripts/ci/unit-tests.mjs
+}
+
+# --- kit lane selection
+stream_kit() {
+  lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck
+  case "${KIT_INPUTS:-true}" in
+    true)
+      lane "UI kit play index contracts" node --test packages/fractal-ui/scripts/kit-play-index.node-test.mjs
+      lane "UI kit context isolation controls" node packages/fractal-ui/scripts/kit-play-isolation.browser-test.mjs
+      lane "UI kit gate set, a11y and budget controls" node --test packages/fractal-ui/scripts/kit-play-gate.browser-test.mjs
+      lane "UI kit Storybook and module graph" kit_storybook
+      ;;
+    false)
+      printf 'UI kit plays skipped: no kit inputs changed (%s..%s)\n' "${BASE_SHA:?}" "${HEAD_SHA:?}" | tee -a "$summary"
+      ;;
+    *)
+      echo "::error::KIT_INPUTS must be true or false" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# The strict plays need the Storybook build and run alone, after the streams.
+exclusive_lanes() {
+  lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts
+  if [ "${KIT_INPUTS:-true}" = true ]; then
+    lane "UI kit strict plays (440/1440 × dark/light)" kit_plays
+  fi
+}
+# --- end kit lane selection
+
 lane "Toolchain and Buck root" toolchain
 lane "Frozen install" pnpm install --frozen-lockfile
 lane "Changelog registry derives from its directory" bash -c 'node apps/fractal-web/scripts/changelog-registry.mjs && node apps/fractal-web/scripts/changelog-registry.mjs --check'
-lane "Dependency licenses" python3 scripts/ci-fractal-web-licenses --check
-lane "Buck typecheck" buck2 build //:typecheck
-lane "Scenario typecheck" pnpm --filter @smalltalk/st3-scenarios typecheck
-lane "Scenario tests" pnpm --filter @smalltalk/st3-scenarios test
-lane "Scenario freshness" pnpm --filter @smalltalk/st3-scenarios emit:check
-lane "Scenario decode" pnpm --filter @smalltalk/st3-scenarios decode
-lane "Scenario privacy" pnpm --filter @smalltalk/st3-scenarios scan
-lane "Measurement contracts" node --experimental-strip-types --test apps/fractal-web/src/telemetry/measurement/measurement.node-test.ts
-lane "Measurement bundle exclusion" bun apps/fractal-web/src/telemetry/measurement/check-bundles.mjs
-lane "Synthetic fixtures" bash apps/fractal-web/scripts/ci/fixtures-gate.sh
-lane "Extension registry" node --experimental-strip-types --test apps/fractal-web/src/extensions/registry.unit.test.ts
-lane "Folders core" node --test apps/fractal-web/src/folders/core.node-test.mjs
-lane "App typecheck" pnpm --filter fractal-web typecheck
-lane "CSS asset guard" node --test apps/fractal-web/scripts/vite-css-assets.node-test.mjs
-lane "App production build" production_build
-lane "App unit test selection" node --test apps/fractal-web/scripts/ci/unit-tests.node-test.mjs
-# Pull requests run the tests that import a changed file; other events run all of them.
-lane "App unit tests" node apps/fractal-web/scripts/ci/unit-tests.mjs
-lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts
-lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts
-lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck
-case "${KIT_INPUTS:-true}" in
-  true)
-    lane "UI kit play index contracts" node --test packages/fractal-ui/scripts/kit-play-index.node-test.mjs
-    lane "UI kit context isolation controls" node packages/fractal-ui/scripts/kit-play-isolation.browser-test.mjs
-    lane "UI kit gate set, a11y and budget controls" node --test packages/fractal-ui/scripts/kit-play-gate.browser-test.mjs
-    lane "UI kit Storybook and module graph" kit_storybook
-    lane "UI kit strict plays (440/1440 × dark/light)" kit_plays
-    ;;
-  false)
-    printf 'UI kit plays skipped: no kit inputs changed (%s..%s)\n' "${BASE_SHA:?}" "${HEAD_SHA:?}" | tee -a "$summary"
-    ;;
-  *)
-    echo "::error::KIT_INPUTS must be true or false" >&2
-    exit 1
-    ;;
-esac
+run_streams stream_scenarios stream_checks stream_app stream_kit
+exclusive_lanes

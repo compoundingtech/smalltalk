@@ -278,7 +278,8 @@ assert "python3 scripts/ci-fractal-web-licenses --check-lockfile" in guard
 assert "python3 scripts/ci-fractal-web-licenses-test" in guard
 assert "ci-fractal-web-test" in guard and "genie --check" in guard
 lanes = (root / "scripts/ci-fractal-web").read_text()
-assert lanes.index("pnpm install --frozen-lockfile") < lanes.index("python3 scripts/ci-fractal-web-licenses --check") < lanes.index("buck2 build //:typecheck")
+assert lanes.index("lane \"Frozen install\" pnpm install --frozen-lockfile") < lanes.index("\nrun_streams stream_scenarios"), "the install runs before the parallel streams"
+assert lanes.index("python3 scripts/ci-fractal-web-licenses --check") < lanes.index("buck2 build //:typecheck") < lanes.index("\nlane \"Toolchain and Buck root\"")
 print("passed: license coverage and manifest guards are wired into the generated CI lanes")
 assert 'lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts' in lanes
 assert 'lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts' in lanes
@@ -291,11 +292,11 @@ assert "fractalCssAssets()" in (root / "apps/fractal-web/vite.config.ts").read_t
 print("passed: the CSS asset guard proves its negatives before guarding the app production build")
 
 # Exercise the actual conditional lane wiring without launching browsers or installing dependencies.
-kit_lanes = lanes[lanes.index('case "${KIT_INPUTS:-true}" in'):]
+kit_lanes = lanes[lanes.index("# --- kit lane selection"):lanes.index("# --- end kit lane selection")]
 for required in (False, True):
     with tempfile.TemporaryDirectory() as scratch:
         summary = Path(scratch, "summary")
-        harness = 'set -eu\nlane() { printf "%s\\n" "$1"; }\nsummary=$GITHUB_STEP_SUMMARY\n' + kit_lanes
+        harness = 'set -eu\nkit_storybook() { :; }\nkit_plays() { :; }\nlane() { printf "%s\\n" "$1"; }\nsummary=$GITHUB_STEP_SUMMARY\n' + kit_lanes + "\nstream_kit\nexclusive_lanes\n"
         result = subprocess.run(["bash", "-c", harness], check=True, capture_output=True, text=True,
                                 env={**os.environ, "KIT_INPUTS": str(required).lower(),
                                      "BASE_SHA": "base", "HEAD_SHA": "head", "GITHUB_STEP_SUMMARY": str(summary)})
