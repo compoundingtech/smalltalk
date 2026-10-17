@@ -917,7 +917,7 @@ pub fn configure_github(config: &crate::config::Config) -> Result<()> {
 }
 
 /// An st agent on this host and the workspace it works in.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct AgentWorkspace {
     pub agent: String,
     pub run: Option<String>,

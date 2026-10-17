@@ -4346,11 +4346,11 @@ impl Store {
         input: &ClaimInput,
         desired_revision: &str,
         current: &(dyn Fn() -> bool + Sync),
-    ) -> Result<ClaimRecord, St3Error> {
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         append_claim_with_subject_fences(
             &self.graph, input, None, None, None,
             Some((&input.subject, desired_revision, current)),
-        ).map(|(claim, _)| claim)
+        )
     }
 
     pub fn append_claim_outcome(

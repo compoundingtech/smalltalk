@@ -108,6 +108,58 @@ fn quiet_preparation_and_two_stale_attempts_report_separate_writer_work() {
     );
 }
 
+fn observe_outcome(store: &Store, revision: &str, state: &str, next: u128) -> (ResourceObservationOutcome, bool) {
+    store
+        .record_resource_observation_outcome(
+            "observer/fixture",
+            revision,
+            None,
+            "resource/fixture",
+            None,
+            &json!({"state": state}),
+            next,
+            &[],
+            None,
+        )
+        .unwrap()
+}
+
+#[test]
+fn the_write_flag_follows_the_fast_path_the_stale_retries_and_the_fallback() {
+    let (_store_directory, store, revision) = fixture();
+    assert!(observe_outcome(&store, &revision, "open", 1).1, "a first observation writes");
+    take_counts();
+    let (outcome, wrote) = observe_outcome(&store, &revision, "open", 2);
+    let quiet = take_counts();
+    assert_eq!((quiet.fast, quiet.invalidated, quiet.fallback), (1, 0, 0));
+    assert!(!wrote && outcome.observation_claim.is_none(), "an unchanged fast path writes nothing");
+
+    let _reset = ResetHook;
+    BEFORE_VALIDATE.with(|hook| *hook.borrow_mut() = Some(Box::new(|store, pass| {
+        store.connection.batched(|tx| -> Result<()> {
+            tx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('invented-unrelated-write',?1)",
+                [pass.to_string()])?;
+            Ok(())
+        }).unwrap().unwrap();
+    })));
+    let index = store.index().unwrap();
+    let (outcome, wrote) = observe_outcome(&store, &revision, "open", 3);
+    let busy = take_counts();
+    assert_eq!((busy.fast, busy.invalidated, busy.fallback), (0, 2, 1));
+    assert!(!wrote && outcome.observation_claim.is_none(), "an unchanged fallback writes nothing");
+    assert_eq!(store.index().unwrap(), index);
+
+    let (outcome, wrote) = observe_outcome(&store, &revision, "closed", 4);
+    let changed = take_counts();
+    assert_eq!((changed.fast, changed.invalidated, changed.fallback), (0, 2, 1));
+    assert!(wrote && outcome.observation_claim.is_some(), "a changed fallback writes");
+
+    BEFORE_VALIDATE.with(|hook| hook.borrow_mut().take());
+    let (replay, wrote) = observe_outcome(&store, &revision, "closed", 4);
+    assert!(!wrote, "an idempotency hit is not a durable change");
+    assert_eq!(replay.observation_claim, outcome.observation_claim);
+}
+
 #[test]
 fn the_native_counter_fences_trigger_without_rowid_replace_delete_and_rollback() {
     let (_store_directory, store, _) = fixture();
@@ -547,7 +599,8 @@ fn changed_and_attempt_outcomes_match_the_canonical_path_and_retry_receipts() {
                 None,
             )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(actual.baseline, expected.baseline);
         assert_eq!(actual.changed_fields, expected.changed_fields);
         assert_eq!(
@@ -697,7 +750,8 @@ fn no_change_fast_writer_work_does_not_grow_with_resource_history() {
                 None,
             )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(
             serde_json::to_value(outcome).unwrap(),
             serde_json::to_value(old).unwrap()
@@ -1228,7 +1282,8 @@ fn shared_memory_observations_keep_canonical_outcomes_and_two_plus_one_progress(
             None,
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(
         serde_json::to_value(actual).unwrap(),
         serde_json::to_value(canonical).unwrap()

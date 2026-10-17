@@ -1528,6 +1528,29 @@ impl Store {
         subscriptions: &[(String, SubscriptionSpec)],
         current: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Result<ResourceObservationOutcome, St3Error> {
+        self.record_resource_observation_outcome(
+            observer, desired_revision, attempt, resource, cursor, facts,
+            next_check_unix_ms, subscriptions, current,
+        ).map(|(outcome, _)| outcome)
+    }
+
+    /// The observation response and whether this transaction wrote durable state, through
+    /// the same preparation fence, retries and canonical fallback. An idempotency hit or an
+    /// unchanged observation writes nothing. Keep this scheduler-only flag out of the stored
+    /// and public response format.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_resource_observation_outcome(
+        &self,
+        observer: &str,
+        desired_revision: &str,
+        attempt: Option<&str>,
+        resource: &str,
+        cursor: Option<&str>,
+        facts: &Value,
+        next_check_unix_ms: u128,
+        subscriptions: &[(String, SubscriptionSpec)],
+        current: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> Result<(ResourceObservationOutcome, bool), St3Error> {
         let fence = resource_preparation::Fence::new(self);
         for pass in 0..2 {
             let prepared = fence.prepare_with_actuals(self, |connection, serial| {

@@ -3902,7 +3902,9 @@ observer "fenced/file" {
                 let receipt = store.append_observer_state(&input, &revision, &|| true).unwrap();
                 assert_eq!(store.latest_actual_value(observer).unwrap().unwrap()["state"], "unreachable");
                 let retry = store.append_observer_state(&input, &revision, &|| true).unwrap();
-                assert_eq!(retry.id, receipt.id);
+                assert_eq!(retry.0.id, receipt.0.id);
+                assert!(receipt.1);
+                assert!(!retry.1);
             } else {
                 let outcome = store.record_resource_observation(
                     observer, &revision, Some("fenced-attempt"), resource, Some("cursor"),
@@ -3946,12 +3948,17 @@ observer "quiet/file" {
     store.apply_internal(&intent, "quiet-observer").unwrap();
     let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
     let facts = json!({"status": "ready"});
-    store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
+    let (_, wrote) = store.record_resource_observation_outcome(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
         .unwrap();
+    assert!(wrote);
+    let (_, wrote) = store.record_resource_observation_outcome(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
+        .unwrap();
+    assert!(!wrote, "an idempotency hit is not a durable change");
     let before = store.index().unwrap();
 
-    let outcome = store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 2, &[], None)
+    let (outcome, wrote) = store.record_resource_observation_outcome(&observer, &revision, None, &resource, None, &facts, 2, &[], None)
         .unwrap();
+    assert!(!wrote);
 
     assert_eq!(store.index().unwrap(), before);
     assert!(outcome.observation_claim.is_none());
