@@ -1,1 +1,0 @@
-argv st2 --catalog $CATALOG driver omp-session --identity host.worker --runtime-id host.worker -- omp --model "opencode-go/gpt-5.6-luna" --thinking high --tools read,bash,edit,write "Start the assigned work."
