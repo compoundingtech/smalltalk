@@ -9,6 +9,7 @@ import * as React from 'react'
 import type { MissionView } from '../missions/model.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
 import { createProjections } from './projections.ts'
+import { askingAgentRefs, attentionAboutAgent, currentMissionIds } from './asking.ts'
 import { type Agent, type DataSource, type Feed, type Fleet, observed } from './source.ts'
 import type { FeedSync, FeedSyncObservation } from './feedSync.ts'
 
@@ -33,6 +34,7 @@ interface DerivedData {
   readonly agent: (ref: string) => Atom.Atom<Feed<Agent | undefined>>
   readonly agentRow: (ref: string) => Atom.Atom<Feed<AgentRow | undefined>>
   readonly agentAttention: (ref: string) => Atom.Atom<Feed<readonly Attention[]>>
+  readonly askingAgents: Atom.Atom<ReadonlySet<string>>
   readonly terminalConnected: (ref: string) => Atom.Atom<boolean | undefined>
 }
 const derive = (source: DataSource) => {
@@ -118,22 +120,22 @@ const derive = (source: DataSource) => {
   const agentAttention = Atom.family((ref: string) =>
     Atom.make((get) => {
       const row = get(agentRow(ref))
-      const missionIds = new Set<string>(
-        row._tag === 'Observed' ? row.value?.current_work?.map((work) => work.mission_id) : [],
-      )
+      const missionIds = currentMissionIds(row._tag === 'Observed' ? row.value : undefined)
       return mapFeed({
         feed: get(source.attention),
-        map: (cards) =>
-          cards.filter(
-            (card) =>
-              card.state === 'open' &&
-              (card.source_id === ref ||
-                card.requester_id === ref ||
-                (card.mission_id !== undefined && missionIds.has(card.mission_id))),
-          ),
+        map: (cards) => cards.filter((card) => attentionAboutAgent({ card, ref, missionIds })),
       })
     }).pipe(Atom.withEquality<Feed<readonly Attention[]>>((a, b) => sameFeed(a, b, sameItems))),
   )
+  // One roster-wide pass; an absent family contributes nothing rather than inventing asks.
+  const askingAgents = Atom.make((get) => {
+    const rows = get(source.agents)
+    const cards = get(source.attention)
+    return askingAgentRefs({
+      rows: rows._tag === 'Observed' ? rows.value : [],
+      attention: cards._tag === 'Observed' ? cards.value : [],
+    })
+  }).pipe(Atom.withEquality<ReadonlySet<string>>((a, b) => a.size === b.size && [...a].every((ref) => b.has(ref))))
   const terminalConnected = Atom.family((ref: string) =>
     Atom.make((get) => {
       const feed = get(fleet)
@@ -152,6 +154,7 @@ const derive = (source: DataSource) => {
     agent,
     agentRow,
     agentAttention,
+    askingAgents,
     terminalConnected,
   }
 }
@@ -283,6 +286,8 @@ export const useAgentRowSelection = <T,>({
 /** Only open cards about this agent or its current missions notify its information surfaces. */
 export const useAgentAttention = (ref: string): Feed<readonly Attention[]> =>
   useAtomValue(useData().agentAttention(ref))
+/** Agent refs st reports as waiting for an answer: an ask-tool question or open attention. */
+export const useAskingAgents = (): ReadonlySet<string> => useAtomValue(useData().askingAgents)
 /** Badge/count projections ignore unrelated card metadata while detail readers keep native cards. */
 export const useAgentAttentionSelection = <T,>({
   ref,

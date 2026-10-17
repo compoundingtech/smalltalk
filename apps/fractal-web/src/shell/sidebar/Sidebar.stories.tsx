@@ -160,7 +160,7 @@ export default meta
 type Story = StoryObj<typeof meta>
 export const RealFolderTree: Story = {}
 export const NarrowFolderTree: Story = { args: { narrow: true } }
-export const NeedsMe: Story = { args: { filters: { ...defaultFilters, needsMe: true } } }
+export const WaitingForAnswer: Story = { args: { filters: { ...defaultFilters, query: 'is:asking' } } }
 export const FuzzySearch: Story = { args: { filters: { ...defaultFilters, query: 'web' } } }
 export const EmptyResults: Story = {
   args: { filters: { ...defaultFilters, query: 'no-such-agent' } },

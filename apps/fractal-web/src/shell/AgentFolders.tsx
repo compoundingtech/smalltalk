@@ -23,6 +23,7 @@ import { RenderProfiler } from '../telemetry/meters.tsx'
 import { matchPositions } from '../command-palette/fuzzy.ts'
 import {
   useAgent,
+  useAskingAgents,
   useDataSource,
   useFleetSelection,
   useNow,
@@ -38,6 +39,7 @@ import { SubjectAddress } from '../resources/contract.ts'
 import { AgentUsageRow, AgentUsageSignals, openAgentUsage } from './AgentUsage.tsx'
 import { filterFolders, matchesRow, parseSidebarQuery, sortMembers, type SidebarRow } from './sidebar/filter.ts'
 import { fixtureSidebarState, sidebarState } from './sidebar/state.ts'
+import { useMachineMemory, withRememberedMachines } from './sidebar/show.ts'
 import type { SidebarFilters } from './sidebar/state.ts'
 import { StatusIcon, agentStatus, compactTime, type AgentStatus } from './sidebar/StatusIcon.tsx'
 import { SidebarToolbar } from './sidebar/Toolbar.tsx'
@@ -207,6 +209,15 @@ export const AgentFolders = React.memo(
       source.gateway ?? source.mode,
     )
     const [filters, setFilters] = useAtom(stateAtoms.filters)
+    const machineMemory = useMachineMemory()
+    // Live gateways start from this browser's remembered machines; every other filter setting stays.
+    React.useLayoutEffect(() => {
+      if (source.mode === 'fixtures') return
+      const query = withRememberedMachines({ query: filters.query, remembered: machineMemory.remembered })
+      if (query !== filters.query) setFilters({ ...filters, query })
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- seed once per gateway's filters, not on every edit.
+    }, [stateAtoms.filters])
+    const asking = useAskingAgents()
     const [collapsedIds, setCollapsedIds] = useAtom(stateAtoms.collapsed)
     // Collection membership/order depends only on active filters. Presentation updates belong
     // to the keyed row below; feeding them through Tree rebuilds React Aria's entire collection.
@@ -217,12 +228,12 @@ export const AgentFolders = React.memo(
     const fleet = useFleetSelection({ select: identityFleet, equal: equalFleet })
     const selectAttention = React.useCallback(
       (subjects: readonly { readonly ref: string; readonly attention?: boolean }[]) =>
-        filters.needsMe || filters.sort === 'status'
+        filters.sort === 'status'
           ? subjects
               .filter((subject) => subject.ref.startsWith('agent/') && subject.attention === true)
               .map((subject) => subject.ref)
           : noAttention,
-      [filters.needsMe, filters.sort],
+      [filters.sort],
     )
     const attention = useSubjectSelection({ select: selectAttention, equal: sameRefs })
     const needsYou = new Set(attention)
@@ -264,6 +275,7 @@ export const AgentFolders = React.memo(
             agent,
             status,
             needsMe: needsYou.has(workspace.id),
+            asking: asking.has(workspace.id),
           },
         ]
       }),
@@ -283,6 +295,25 @@ export const AgentFolders = React.memo(
       rows: rows,
       sort: filters.sort,
     })
+    // Faceted Show counts: visibility under every other filter, folder-context text matches included.
+    const othersQuery = { ...parsedQuery, asking: false, machines: [] }
+    const othersVisible = new Set(
+      view.unfiled.filter((id) =>
+        matchesRow({ row: rows.get(id)!, filters: filters, context: 'Unfiled', parsedQuery: othersQuery }),
+      ),
+    )
+    const collectVisible = (items: readonly ProjectedFolder[]) => {
+      for (const folder of items) {
+        for (const id of folder.members) othersVisible.add(id)
+        collectVisible(folder.folders)
+      }
+    }
+    collectVisible(filterFolders({ folders: view.folders, rows: rows, filters: filters, sort: 'manual', parsedQuery: othersQuery }))
+    const showRows = workspaces.map((workspace) => ({
+      host: workspace.host,
+      asking: asking.has(workspace.id),
+      others: othersVisible.has(workspace.id),
+    }))
     const searching = parsedQuery.query !== ''
     const highlight = (text: string) => {
       if (!searching) return text
@@ -517,8 +548,13 @@ export const AgentFolders = React.memo(
         </div>
         <SidebarToolbar
           filters={filters}
-          update={setFilters}
+          update={(value) => {
+            setFilters(value)
+            // Fixture registries never write live browser state.
+            if (source.mode !== 'fixtures') machineMemory.remember(value.query, workspaces.map((workspace) => workspace.host))
+          }}
           hosts={[...new Set(workspaces.map((workspace) => workspace.host))].toSorted()}
+          showRows={showRows}
         />
         {(snapshot.sidebarCandidates?.length ?? 0) > 1 ? (
           <div role="note" aria-label="Multiple legacy Sidebars" {...stylex.props(styles.notice)}>
@@ -626,7 +662,6 @@ export const sameFolderFleet = (
 ): boolean => {
   if (left._tag !== 'Observed' || right._tag !== 'Observed') return left._tag === right._tag
   const status =
-    filters.needsMe ||
     filters.hideEnded ||
     filters.hideRetired ||
     filters.statuses.length > 0 ||

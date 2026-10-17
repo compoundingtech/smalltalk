@@ -35,7 +35,8 @@ beforeEach(() => {
   window.localStorage.clear()
   window.history.replaceState(null, '', '/?open=resource/example:detail')
   registry = AtomRegistry.make()
-  agents = Atom.make<Feed<readonly Agent[]>>(waiting)
+  // Live gateway feeds are keepAlive and outlive the roster's subscription; an autoDispose fixture would reset on unmount.
+  agents = Atom.make<Feed<readonly Agent[]>>(waiting).pipe(Atom.keepAlive)
   gatewaySync = Atom.make<FeedSyncObservation>({ status: { _tag: 'Live', since: 0 }, observedAt: 0 })
   source = {
     ...fixtureSource({ world: { now: 5000, gateway, agents: [], missions: [], attention: [], events: [], conversations: {}, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' } } }),
@@ -173,5 +174,70 @@ describe('shipped live sidebar machine query', () => {
     await search('Alpha machine:synthetic-138/1')
     expect([...roster().querySelectorAll('mark')].map(mark => mark.textContent).join('')).toContain('Alpha')
     expect([...roster().querySelectorAll('mark')].some(mark => mark.textContent?.includes('machine:'))).toBe(false)
+  })
+
+  it('filters Waiting for answer from st questions only and restores remembered machines, not other tokens, on mount', async () => {
+    registry.set(agents, observed({ value: [
+      { ...agent, id: 'agent/asker', name: 'Asker', host_id: Option.some('host/host-b'), blocked_on: Option.some('human'), ask: Option.some('question') },
+      { ...agent, id: 'agent/permission', name: 'Permission', host_id: Option.some('host/host-b'), blocked_on: Option.some('human'), ask: Option.some('permission') },
+      { ...agent, id: 'agent/elsewhere', name: 'Elsewhere', host_id: Option.some('host/host-a'), blocked_on: Option.some('human'), ask: Option.some('question') },
+    ] }))
+    await mount(1440)
+    const input = () => sidebar().querySelector<HTMLInputElement>('input')!
+    const names = () => [...roster().querySelectorAll('[data-testid="taste-agent-row"]')].map(row => row.textContent ?? '')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input(), 'is:asking machine:host-b')
+      input().dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(names()).toHaveLength(1)
+    expect(names()[0]).toContain('Asker')
+    const trigger = [...sidebar().querySelectorAll('button')].find(button => button.textContent?.startsWith('Show'))
+    expect(trigger?.textContent).toContain(', 2 active')
+    await act(async () => root.unmount())
+    root = createRoot(host)
+    await mount(1440)
+    expect(input().value).toBe('machine:host-b')
+    expect(names()).toHaveLength(2)
+  })
+
+  it('keeps complete remembered machine groups when a partial prefix is typed before remount', async () => {
+    registry.set(agents, observed({ value: [
+      { ...agent, id: 'agent/a', host_id: Option.some('host/host-a') },
+      { ...agent, id: 'agent/b', host_id: Option.some('host/host-b') },
+    ] }))
+    await mount(1440)
+    const input = () => sidebar().querySelector<HTMLInputElement>('input')!
+    for (const query of ['machine:host-a machine:host-b', 'machine:h']) {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input(), query)
+        input().dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      expect(input().value).toBe(query)
+    }
+    await act(async () => root.unmount())
+    root = createRoot(host)
+    await mount(1440)
+    expect(input().value).toBe('machine:host-a machine:host-b')
+    expect(roster().querySelectorAll('[data-testid="taste-agent-row"]')).toHaveLength(0)
+  })
+
+  it('updates remembered machines after a token with duplicate values changes', async () => {
+    registry.set(agents, observed({ value: [
+      { ...agent, id: 'agent/a', host_id: Option.some('host/host-a') },
+      { ...agent, id: 'agent/b', host_id: Option.some('host/host-b') },
+    ] }))
+    await mount(1440)
+    const input = () => sidebar().querySelector<HTMLInputElement>('input')!
+    for (const query of ['machine:host-a,host-a', 'machine:host-a,host-b']) {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input(), query)
+        input().dispatchEvent(new Event('input', { bubbles: true }))
+      })
+    }
+    await act(async () => root.unmount())
+    root = createRoot(host)
+    await mount(1440)
+    expect(input().value).toBe('machine:host-a,host-b')
+    expect(roster().querySelectorAll('[data-testid="taste-agent-row"]')).toHaveLength(2)
   })
 })

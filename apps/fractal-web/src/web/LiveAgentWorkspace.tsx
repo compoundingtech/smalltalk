@@ -19,14 +19,16 @@ import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, live
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { ViewportStore, ViewportStoreContext } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx'
 import { terminalSubjectForAgent } from '../data/projections.ts'
-import { useFleet, useSubjectList, useConnection, useNow, useFeedInterest, useDataSource } from '../data/react.tsx'
+import { useFleet, useSubjectList, useConnection, useNow, useFeedInterest, useDataSource, useAskingAgents } from '../data/react.tsx'
 import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
 import type { ResourcePanelState } from '../shell/state.ts'
 import { afterNextPaint, type UxTelemetry } from '../telemetry/ux.ts'
 import { syncLine } from '../../../../packages/fractal-ui/src/assistant-ui/st3-views/sync-line.ts'
 import { useGatewaySync } from '../data/react.tsx'
-import { matchesSidebarHost, parseSidebarQuery } from '../shell/sidebar/filter.ts'
+import { matchesShow, parseSidebarQuery } from '../shell/sidebar/filter.ts'
+import { useMachineMemory, withRememberedMachines } from '../shell/sidebar/show.ts'
+import { SidebarShowMenu } from '../shell/sidebar/ShowMenu.tsx'
 
 // A static import would evaluate the kit Transcript/Markdown/refractor before the shell paints.
 // Demand and speculative prefetch share one in-flight request; rejection releases it for retry.
@@ -161,7 +163,14 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const terminalRef = terminalDisabledReason === undefined ? agent?.terminal : undefined
   const [headerSlot, setHeaderSlot] = React.useState<HTMLDivElement | null>(null)
   const [paneHost, setPaneHost] = React.useState<HTMLDivElement | null>(null)
-  const [search, setSearch] = React.useState('')
+  const machineMemory = useMachineMemory()
+  const asking = useAskingAgents()
+  // The query is the only Show state; remembered machines seed it once per mount.
+  const [search, setSearchText] = React.useState(() => withRememberedMachines({ query: '', remembered: machineMemory.remembered }))
+  const setSearch = (value: string) => {
+    setSearchText(value)
+    machineMemory.remember(value, fleet._tag === 'Observed' ? fleet.value.hosts.map((row) => row.id) : [])
+  }
   const [panes, setPanes] = useAtom(workspacePanes(current))
   const query = new URLSearchParams(location.split('?')[1])
   const selectedPane = query.get('open') ?? 'thread'
@@ -199,9 +208,9 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const headerRow = agent === undefined ? undefined : sidebarRow({ agent, stale, now })
   const parsedSearch = parseSidebarQuery(search)
   const textSearch = parsedSearch.query.toLowerCase()
+  const matchesText = (row: (typeof agents)[number]) => `${row.name} ${row.ref} ${row.host}`.toLowerCase().includes(textSearch)
   const filtered = agents.filter((row) =>
-    matchesSidebarHost(row.host, parsedSearch.machines) &&
-    `${row.name} ${row.ref} ${row.host}`.toLowerCase().includes(textSearch))
+    matchesShow({ host: row.host, asking: asking.has(row.ref), parsedQuery: parsedSearch }) && matchesText(row))
   const byRef = React.useMemo(() => new Map(subjects.map((subject) => [subject.ref, subject])), [subjects])
   const separator = selectedPane.lastIndexOf(':')
   const urlPresentation = selectedPane.slice(separator + 1)
@@ -235,7 +244,16 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                 </header>
                 {collapsed ? null : (
                   <>
-                    <LiveSidebarSearch value={search} onChange={setSearch} />
+                    <div {...stylex.props(styles.searchRow)}>
+                      <LiveSidebarSearch value={search} onChange={setSearch} />
+                      <SidebarShowMenu
+                        query={search}
+                        onQueryChange={setSearch}
+                        rows={agents.map((row) => ({ host: row.host, asking: asking.has(row.ref), others: matchesText(row) }))}
+                        hosts={fleet._tag === 'Observed' ? fleet.value.hosts.map((row) => row.id) : []}
+                        {...(scheme === 'light' ? { popoverTheme: compositionLightTheme } : {})}
+                      />
+                    </div>
                     <nav ref={rosterCommit} aria-label="Agent roster" onMouseOverCapture={rememberHoverOwner} onFocusCapture={rememberHoverOwner} {...stylex.props(styles.roster)}>
                       {fleet._tag === 'Waiting' ? <div aria-hidden="true" data-wf-roster-skeleton="waiting" {...stylex.props(styles.rosterSkeleton)}>
                         {Array.from({ length: 8 }, (_, index) => <div key={index} data-wf-skeleton-row="" {...stylex.props(styles.skeletonRow)}>
@@ -417,7 +435,7 @@ export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool
 /** Roster filter in the live sidebar. */
 export function LiveSidebarSearch({ value, onChange }: { readonly value: string; readonly onChange: (value: string) => void }) {
   return <Aria.SearchField aria-label="Search agents" value={value} onChange={onChange} {...stylex.props(styles.search)}>
-    <Aria.Input aria-description="Use machine:synthetic-138/1 or host:synthetic-138/1,synthetic-138/2 to filter host prefixes, ignoring case. Comma-separated values match any host; separate tokens must all match. Combine with search text." placeholder="Search agents" {...stylex.props(styles.searchInput)} />
+    <Aria.Input aria-description="Use is:asking for agents waiting for an answer. Use machine:synthetic-138/1 or host:synthetic-138/1,synthetic-138/2 to filter host prefixes, ignoring case. Comma-separated values match any host; separate tokens must all match. Combine with search text." placeholder="Search agents" {...stylex.props(styles.searchInput)} />
   </Aria.SearchField>
 }
 
@@ -428,8 +446,10 @@ const styles = stylex.create({
   brand: { height: g.band, paddingInline: s.lg, display: 'flex', alignItems: 'center', gap: s.md, flexShrink: 0 },
   iconButton: { width: 28, height: 28, display: 'inline-flex', justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer' },
   textButton: { padding: '4px 8px', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer', fontSize: t.metaSize },
+  // Search grows; the Show trigger stretches to the field's height.
+  searchRow: { marginInline: s.md, display: 'flex', alignItems: 'stretch', gap: s.sm, flexShrink: 0 },
   // Message fill plus a hairline: raised equals the sidebar surface in light mode.
-  search: { marginInline: s.md, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message, flexShrink: 0 },
+  search: { flexGrow: 1, minWidth: 0, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message },
   searchInput: { width: '100%', minWidth: 0, borderWidth: 0, outline: 'none', backgroundColor: 'transparent', color: c.fg, fontSize: t.metaSize },
   roster: { display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: s.md, minHeight: 0, flexGrow: 1, gap: 2 },
   // Match SR-2's shared row/control/icon geometry and the roster's 2px inter-row gap.

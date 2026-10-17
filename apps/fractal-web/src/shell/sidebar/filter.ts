@@ -33,34 +33,58 @@ export interface SidebarRow {
   readonly agent: Agent | undefined
   readonly status: AgentStatus
   readonly needsMe: boolean
+  /** st reports an ask-tool question or open attention for this agent; see data/asking.ts. */
+  readonly asking: boolean
 }
 
-/** Parsed sidebar search; machine groups AND together while prefixes within a group OR together. */
+/** Parsed sidebar search: `is:asking`, AND-ed machine groups of OR-ed prefixes, and bare text. */
 export interface SidebarQuery {
   readonly query: string
+  readonly asking: boolean
   readonly machines: readonly (readonly string[])[]
 }
-/** Bare fuzzy text and AND-ed machine facets, each containing OR-ed lowercase prefixes. */
+/** The Show menu's "Waiting for answer" filter, as a search token. */
+export const askingToken = 'is:asking'
+/** Bare fuzzy text, `is:asking`, and AND-ed machine facets, each containing OR-ed lowercase prefixes. */
 export const parseSidebarQuery = (query: string): SidebarQuery => {
   const terms: string[] = []
   const machines: string[][] = []
+  let asking = false
   for (const token of query.trim().split(/\s+/)) {
     const facet = /^(?:machine|host):(.*)$/i.exec(token)
-    if (facet === null) {
+    if (token.toLowerCase() === askingToken) asking = true
+    else if (facet === null) {
       if (token !== '') terms.push(token)
     } else {
       const values = facet[1]!.toLowerCase().split(',').filter((value) => value !== '')
       if (values.length > 0) machines.push(values)
     }
   }
-  return { query: terms.join(' '), machines }
+  return { query: terms.join(' '), asking, machines }
 }
+/** Canonical search text for a parsed query; parsing the result returns the same query. */
+export const printSidebarQuery = ({ query, asking, machines }: SidebarQuery): string =>
+  [...(asking ? [askingToken] : []), ...machines.map((values) => `machine:${values.join(',')}`), query]
+    .filter((part) => part !== '')
+    .join(' ')
+/** The machine value a row host ID matches against: lowercase, without its host/ namespace. */
+export const sidebarHostValue = (hostId: string): string => hostId.toLowerCase().replace(/^host\//, '')
 /** Row host IDs omit their host/ namespace; query values remain literal shared-contract prefixes. */
 export const matchesSidebarHost = (hostId: string, machines: SidebarQuery['machines']): boolean => {
-  const host = hostId.toLowerCase().replace(/^host\//, '')
+  const host = sidebarHostValue(hostId)
   return machines.every((values) => values.some((value) => host.startsWith(value)))
 }
-/** Matches a sidebar row against visibility, status, host and contextual search filters. */
+/** Show menu filters: every active filter applies (AND); machines OR within one token. */
+export const matchesShow = ({
+  host,
+  asking,
+  parsedQuery,
+}: {
+  readonly host: string
+  readonly asking: boolean
+  readonly parsedQuery: SidebarQuery
+}): boolean => (!parsedQuery.asking || asking) && matchesSidebarHost(host, parsedQuery.machines)
+/** Matches a sidebar row against visibility, status, Show and contextual search filters. */
 export const matchesRow = ({
   row,
   filters,
@@ -73,13 +97,11 @@ export const matchesRow = ({
   readonly parsedQuery?: SidebarQuery
 }): boolean => {
   if (
-    (filters.needsMe && !row.needsMe) ||
     (filters.hideEnded && row.status === 'ended') ||
     (filters.hideRetired && row.status === 'retired') ||
-    (filters.host !== '' && row.workspace.host !== filters.host) ||
     (filters.statuses.length > 0 && !filters.statuses.includes(row.status))
   ) return false
-  if (!matchesSidebarHost(row.workspace.host, parsedQuery.machines)) return false
+  if (!matchesShow({ host: row.workspace.host, asking: row.asking, parsedQuery })) return false
   return parsedQuery.query === '' ||
     scoreTokens({
       tokens: tokenize(parsedQuery.query),
@@ -150,11 +172,10 @@ export const filterFolders = ({
     })
     const filtering =
       parsedQuery.query !== '' ||
+      parsedQuery.asking ||
       parsedQuery.machines.length > 0 ||
-      filters.needsMe ||
       filters.hideEnded ||
       filters.hideRetired ||
-      filters.host !== '' ||
       filters.statuses.length > 0
     return filtering && children.length === 0 && members.length === 0
       ? []

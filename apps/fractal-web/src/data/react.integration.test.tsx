@@ -223,7 +223,7 @@ it('invalidates folder membership/order only for active filter dependencies', ()
     },
   })
   expect(sameFolderFleet(left, right, defaultFilters)).toBe(true)
-  expect(sameFolderFleet(left, right, { ...defaultFilters, needsMe: true })).toBe(false)
+  expect(sameFolderFleet(left, right, { ...defaultFilters, hideEnded: true })).toBe(false)
   expect(sameFolderFleet(left, right, { ...defaultFilters, query: 'Changed' })).toBe(false)
   expect(sameFolderFleet(left, right, { ...defaultFilters, sort: 'activity' })).toBe(false)
   expect(sameFolderFleet(left, right, { ...defaultFilters, sort: 'status' })).toBe(false)

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The Show menu beside agent search replaces the Needs me toggle and Host select with counted choices for Waiting for answer and machines. Menu choices and typed search filters stay in sync, and this browser remembers complete machine choices without changing how separate machine filters combine.",
+  "replay": {
+    "status": "none",
+    "detail": "Fractal web sidebar only; reads existing st agent ask and attention fields, no daemon or schema change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Fractal web sidebar only; reads existing st agent ask and attention fields, no daemon or schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Fractal web sidebar only; reads existing st agent ask and attention fields, no daemon or schema change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Saved sidebar filters keep working; retired Needs me and Host values are ignored. Browser machine memory uses version 2 to preserve separate machine tokens, ignores unreadable entries and earlier flattened memory, and only records complete known hosts."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Fractal web sidebar only; reads existing st agent ask and attention fields, no daemon or schema change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Fractal web sidebar only; reads existing st agent ask and attention fields, no daemon or schema change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Fractal web sidebar only; reads existing st agent ask and attention fields, no daemon or schema change."
+  }
+}

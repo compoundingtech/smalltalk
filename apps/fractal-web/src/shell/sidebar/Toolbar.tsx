@@ -1,6 +1,7 @@
 import * as stylex from '@stylexjs/stylex'
 import * as React from 'react'
-import { DialogTrigger, Dialog, Popover, ToggleButton } from 'react-aria-components'
+import { DialogTrigger, Dialog, Popover } from 'react-aria-components'
+import { compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
 
 import {
   Button,
@@ -15,19 +16,31 @@ import { scale, tokens } from '../../ui-compat/tokens.stylex.ts'
 
 import { IconButton } from '../../workbench-kit/IconButton.tsx'
 import { parseSidebarQuery, sortModes, type SortMode } from './filter.ts'
+import { SidebarShowMenu } from './ShowMenu.tsx'
+import type { ShowRow } from './show.ts'
 import { defaultFilters, type SidebarFilters } from './state.ts'
 import { statuses, type AgentStatus } from './StatusIcon.tsx'
 
-/** Sidebar search, visibility, host, status and view-only ordering controls. */
+const readLightScheme = () => document.documentElement.dataset.scheme !== 'dark'
+const subscribeScheme = (notify: () => void) => {
+  const observer = new MutationObserver(notify)
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-scheme'] })
+  return () => observer.disconnect()
+}
+
+/** Sidebar search, Show, visibility, status and view-only ordering controls. */
 export const SidebarToolbar = ({
   filters,
   update,
   hosts,
+  showRows,
 }: {
   readonly filters: SidebarFilters
   readonly update: (value: SidebarFilters) => void
   readonly hosts: readonly string[]
+  readonly showRows: readonly ShowRow[]
 }) => {
+  const light = React.useSyncExternalStore(subscribeScheme, readLightScheme, () => true)
   const search = React.useRef<HTMLDivElement>(null)
   const shortcut = React.useCallback((node: HTMLDivElement | null) => {
     if (node === null) return
@@ -48,23 +61,23 @@ export const SidebarToolbar = ({
     document.addEventListener('keydown', listener)
     return () => document.removeEventListener('keydown', listener)
   }, [])
+  const parsedQuery = parseSidebarQuery(filters.query)
   const activeCount =
     Number(filters.hideEnded) +
     Number(filters.hideRetired) +
-    Number(filters.host !== '') +
-    parseSidebarQuery(filters.query).machines.length +
+    Number(parsedQuery.asking) +
+    parsedQuery.machines.length +
     filters.statuses.length
   return (
     <div ref={shortcut} {...stylex.props(styles.toolbar)}>
       <div {...stylex.props(styles.controls)}>
-        <ToggleButton
-          aria-label="Needs me only"
-          isSelected={filters.needsMe}
-          onChange={(needsMe) => update({ ...filters, needsMe })}
-          {...stylex.props(styles.toggle)}
-        >
-          Needs me
-        </ToggleButton>
+        <SidebarShowMenu
+          query={filters.query}
+          onQueryChange={(query) => update({ ...filters, query })}
+          rows={showRows}
+          hosts={hosts}
+          {...(light ? { popoverTheme: compositionLightTheme } : {})}
+        />
         <div {...stylex.props(styles.menus)}>
           <DialogTrigger>
             <IconButton
@@ -87,20 +100,6 @@ export const SidebarToolbar = ({
                 >
                   Hide retired
                 </Checkbox>
-                <label {...stylex.props(styles.label)}>
-                  Host
-                  <select
-                    aria-label="Filter by host"
-                    value={filters.host}
-                    onChange={(event) => update({ ...filters, host: event.target.value })}
-                    {...stylex.props(styles.select)}
-                  >
-                    <option value="">All hosts</option>
-                    {hosts.map((host) => (
-                      <option key={host}>{host}</option>
-                    ))}
-                  </select>
-                </label>
                 <fieldset {...stylex.props(styles.statuses)}>
                   <legend>Status</legend>
                   {(Object.keys(statuses) as AgentStatus[]).map((status) => (
@@ -164,7 +163,7 @@ export const SidebarToolbar = ({
       <div ref={search}>
         <Input
           aria-label="Search agents and folders"
-          aria-description="Use machine:synthetic-138/1 or host:synthetic-138/1,synthetic-138/2 to filter by host; combine with search text."
+          aria-description="Use is:asking for agents waiting for an answer, and machine:synthetic-138/1 or host:synthetic-138/1,synthetic-138/2 to filter by host; combine with search text."
           placeholder="Search agents…  /"
           size="sm"
           value={filters.query}
@@ -221,21 +220,6 @@ const styles = stylex.create({
     justifyContent: 'space-between',
     gap: scale.space2,
   },
-  toggle: {
-    border: 0,
-    borderRadius: scale.radiusSm,
-    padding: '5px 8px',
-    backgroundColor: {
-      default: 'transparent',
-      ':hover': tokens['--ds-gray-alpha-100'],
-      ':is([data-selected])': tokens['--ds-gray-alpha-200'],
-    },
-    color: tokens['--ds-gray-1000'],
-    fontSize: '0.75rem',
-    cursor: 'pointer',
-    outlineColor: tokens['--ds-focus-color'],
-    whiteSpace: 'nowrap',
-  },
   popover: {
     backgroundColor: tokens['--ds-background-100'],
     borderRadius: scale.radiusDefault,
@@ -249,26 +233,6 @@ const styles = stylex.create({
     overflowY: 'auto',
   },
   dialog: { display: 'flex', flexDirection: 'column', gap: scale.space3, outline: 'none' },
-  label: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: scale.space1,
-    fontSize: '0.75rem',
-    color: tokens['--ds-gray-900'],
-  },
-  select: {
-    minWidth: 0,
-    width: '100%',
-    fontSize: '0.75rem',
-    padding: '4px',
-    borderWidth: 1,
-    borderStyle: 'solid',
-    borderColor: tokens['--ds-gray-alpha-400'],
-    borderRadius: scale.radiusSm,
-    color: tokens['--ds-gray-1000'],
-    backgroundColor: tokens['--ds-background-100'],
-    outlineColor: tokens['--ds-focus-color'],
-  },
   statuses: {
     display: 'flex',
     flexDirection: 'column',

@@ -4,7 +4,7 @@ import * as fc from 'fast-check'
 
 import { applyOp, createFolder, emptyDoc, place, project } from '../../folders/core.mts'
 import { dailyDriver } from '../fixtures/layouts.ts'
-import { filterFolders, matchesRow, matchesSidebarHost, parseSidebarQuery, sortMembers, type SidebarRow } from './filter.ts'
+import { filterFolders, matchesRow, matchesShow, matchesSidebarHost, parseSidebarQuery, printSidebarQuery, sortMembers, type SidebarRow } from './filter.ts'
 import { defaultFilters } from './state.ts'
 
 const row = (
@@ -31,6 +31,7 @@ const row = (
   },
   status,
   needsMe: status === 'waiting',
+  asking: status === 'waiting',
 })
 const rows = new Map([
   ['a', row('a', 'Zulu compiler', 'idle', 'build-a', 100)],
@@ -56,7 +57,7 @@ describe('sidebar view projection', () => {
       'a',
     ])
   })
-  it('keeps every ancestor of fuzzy matches and applies host/status filters at arbitrary depth', () => {
+  it('keeps every ancestor of fuzzy matches and applies Show/status filters at arbitrary depth', () => {
     const doc = emptyDoc()
     const ops = [
       createFolder('root', 'Product', null, 'V', [1, 0, 't']),
@@ -73,9 +74,7 @@ describe('sidebar view projection', () => {
       rows: rows,
       filters: {
         ...defaultFilters,
-        query: 'asb',
-        needsMe: true,
-        host: 'laptop24',
+        query: 'is:asking machine:laptop asb',
         statuses: ['waiting'],
       },
       sort: 'manual',
@@ -88,7 +87,7 @@ describe('sidebar view projection', () => {
       filterFolders({
         folders: folders,
         rows: rows,
-        filters: { ...defaultFilters, query: 'asb', host: 'build-a' },
+        filters: { ...defaultFilters, query: 'asb machine:build-a' },
         sort: 'manual',
       }),
     ).toEqual([])
@@ -98,16 +97,19 @@ describe('sidebar view projection', () => {
 
 describe('sidebar machine query', () => {
   it.each([
-    ['', '', []],
-    ['  compiler  sidebar ', 'compiler sidebar', []],
-    ['machine:synthetic-138/1', '', [['synthetic-138/1']]],
-    ['machine:synthetic-138/1,,synthetic-138/2,', '', [['synthetic-138/1', 'synthetic-138/2']]],
-    ['HOST:SYNTHETIC-138 machine:synthetic-138/1', '', [['synthetic-138'], ['synthetic-138/1']]],
-    ['machine: host:,, compiler', 'compiler', []],
-    ['compiler machine:synthetic-138/1 sidebar host:SYNTHETIC-138', 'compiler sidebar', [['synthetic-138/1'], ['synthetic-138']]],
-    ['other:synthetic-138/1 compiler-machine:synthetic-138/1', 'other:synthetic-138/1 compiler-machine:synthetic-138/1', []],
-  ] as const)('parses %j without highlighting facets', (input, query, machines) => {
-    expect(parseSidebarQuery(input)).toEqual({ query, machines })
+    ['', '', false, []],
+    ['  compiler  sidebar ', 'compiler sidebar', false, []],
+    ['machine:host-a', '', false, [['host-a']]],
+    ['machine:host-a,,host-b,', '', false, [['host-a', 'host-b']]],
+    ['HOST:HOST machine:host-a', '', false, [['host'], ['host-a']]],
+    ['machine: host:,, compiler', 'compiler', false, []],
+    ['compiler machine:host-a sidebar host:HOST', 'compiler sidebar', false, [['host-a'], ['host']]],
+    ['other:host-a compiler-machine:host-a', 'other:host-a compiler-machine:host-a', false, []],
+    ['IS:Asking compiler', 'compiler', true, []],
+    ['is:asking is:asking machine:host-a', '', true, [['host-a']]],
+    ['is:askingx is:', 'is:askingx is:', false, []],
+  ] as const)('parses %j without highlighting facets', (input, query, asking, machines) => {
+    expect(parseSidebarQuery(input)).toEqual({ query, asking, machines })
   })
 
   it('shares row host namespace stripping without rewriting query values', () => {
@@ -117,30 +119,53 @@ describe('sidebar machine query', () => {
   })
 
   const machineRows = [
-    row('synthetic-138/1', 'Compiler', 'idle', 'host/synthetic-138/1', 0),
-    row('synthetic-138/2', 'Sidebar', 'idle', 'SYNTHETIC-138/2', 0),
+    { ...row('host-a', 'Compiler', 'idle', 'host/host-a', 0), asking: true },
+    row('host-b', 'Sidebar', 'idle', 'HOST-B', 0),
     row('other', 'Compiler', 'idle', 'host/laptop24', 0),
   ]
   it.each([
-    ['machine:synthetic-138/1', '', ['synthetic-138/1']],
-    ['machine:synthetic-138/1,synthetic-138/2', '', ['synthetic-138/1', 'synthetic-138/2']],
-    ['HOST:SYNTHETIC-138', '', ['synthetic-138/1', 'synthetic-138/2']],
-    ['machine:synthetic-138 machine:synthetic-138/1', '', ['synthetic-138/1']],
-    ['machine:synthetic-138/1 host:synthetic-138/2', '', []],
-    ['machine:synthetic-138/9', '', []],
-    ['machine:', '', ['synthetic-138/1', 'synthetic-138/2', 'other']],
-    ['machine:,,', '', ['synthetic-138/1', 'synthetic-138/2', 'other']],
-    ['machine:synthetic-138/1,,', '', ['synthetic-138/1']],
-    ['compiler machine:synthetic-138', '', ['synthetic-138/1']],
-    ['laptop machine:synthetic-138', '', []],
-    ['machine:synthetic-138', 'host/synthetic-138/1', ['synthetic-138/1']],
-    ['machine:synthetic-138/1', 'SYNTHETIC-138/2', []],
-    ['machine:synthetic-138', 'synthetic-138/1', []],
-  ] as const)('matches %j AND the exact menu host %j', (query, host, expected) => {
+    ['machine:host-a', ['host-a']],
+    ['machine:host-a,host-b', ['host-a', 'host-b']],
+    ['HOST:HOST', ['host-a', 'host-b']],
+    ['machine:host machine:host-a', ['host-a']],
+    ['machine:host-a host:host-b', []],
+    ['machine:host-z', []],
+    ['machine:', ['host-a', 'host-b', 'other']],
+    ['machine:,,', ['host-a', 'host-b', 'other']],
+    ['machine:host-a,,', ['host-a']],
+    ['compiler machine:host', ['host-a']],
+    ['laptop machine:host', []],
+    ['is:asking', ['host-a']],
+    ['is:asking machine:host-a,host-b', ['host-a']],
+    ['is:asking machine:host-b', []],
+    ['is:asking machine:host-b,laptop', []],
+  ] as const)('matches %j: Show filters AND, machines OR within a token', (query, expected) => {
     expect(machineRows.filter((candidate) =>
-      matchesRow({ row: candidate, filters: { ...defaultFilters, query, host }, context: '' }),
+      matchesRow({ row: candidate, filters: { ...defaultFilters, query }, context: '' }),
     ).map((candidate) => candidate.workspace.id)).toEqual(expected)
   })
+
+  it('requires the asking signal itself, not a waiting status (negative control)', () => {
+    const parsedQuery = parseSidebarQuery('is:asking')
+    expect(matchesShow({ host: 'host-a', asking: false, parsedQuery })).toBe(false)
+    expect(matchesRow({ row: { ...row('w', 'Waiting', 'waiting', 'host-a', 0), asking: false }, filters: { ...defaultFilters, query: 'is:asking' }, context: '' })).toBe(false)
+    expect(matchesShow({ host: 'host-a', asking: true, parsedQuery })).toBe(true)
+  })
+
+  it.live('printing and reparsing any query is stable', () => Effect.sync(() => {
+    const word = fc.stringMatching(/^[a-z0-9-]{1,8}$/u)
+    fc.assert(fc.property(
+      fc.boolean(),
+      fc.array(fc.array(word, { minLength: 1, maxLength: 3 }), { maxLength: 3 }),
+      fc.array(word, { maxLength: 3 }),
+      (asking, machines, words) => {
+        const parsed = { query: words.join(' '), asking, machines }
+        const printed = printSidebarQuery(parsed)
+        expect(parseSidebarQuery(printed)).toEqual(parsed)
+        expect(printSidebarQuery(parseSidebarQuery(printed))).toBe(printed)
+      },
+    ))
+  }))
 
   it.live('case and alias preserve every generated host prefix match', () => Effect.sync(() => {
     fc.assert(fc.property(
@@ -152,7 +177,7 @@ describe('sidebar machine query', () => {
         const candidate = row('generated', 'Compiler', 'idle', `host/${host}`, 0)
         for (const key of ['machine', 'HOST']) {
           const query = `${key}:${prefix.toUpperCase()},,`
-          expect(parseSidebarQuery(query)).toEqual({ query: '', machines: [[prefix]] })
+          expect(parseSidebarQuery(query)).toEqual({ query: '', asking: false, machines: [[prefix]] })
           expect(matchesRow({ row: candidate, filters: { ...defaultFilters, query }, context: '' })).toBe(true)
         }
       },
@@ -164,6 +189,6 @@ describe('sidebar machine query', () => {
     applyOp(doc, createFolder('empty', 'Empty', null, 'V', [1, 0, 't']))
     const folders = project(doc, []).folders
     expect(filterFolders({ folders, rows, filters: { ...defaultFilters, query: 'machine: host:,, ' }, sort: 'manual' })).toEqual(folders)
-    expect(filterFolders({ folders, rows, filters: { ...defaultFilters, query: 'machine:dev9' }, sort: 'manual' })).toEqual([])
+    expect(filterFolders({ folders, rows, filters: { ...defaultFilters, query: 'machine:host-z' }, sort: 'manual' })).toEqual([])
   })
 })

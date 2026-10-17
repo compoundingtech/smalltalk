@@ -32,19 +32,34 @@ vi.mock('@stylexjs/stylex', async () => {
     props: (...styles: readonly Applied[]) => ({ className: classNames(styles).join(' ') }),
   }
 })
+// Folder transport is not under test: live-mode trees read the fixture folder document. fixture.ts imports
+// client.ts, so the factory must not import it (that waits on this factory); the export reads a hoisted holder.
+const liveFolders = vi.hoisted(() => ({ atom: undefined as unknown }))
+vi.mock('../folders/client.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof FolderClient>()),
+  get folders() {
+    return liveFolders.atom
+  },
+}))
 
 import { fixtureSource } from '../data/fixtureSource.ts'
 import { DataSourceProvider, useSubjectList } from '../data/react.tsx'
+import type { DataSource } from '../data/source.ts'
 import { fixtureProjections } from '../fixtures/projections.ts'
 import type { ArrangementRefusal, SidebarOperation } from '../folders/edit.ts'
+import type * as FolderClient from '../folders/client.ts'
 import type { FolderState } from '../folders/client.ts'
 import { fixtureFolders } from '../folders/fixture.ts'
 import { SubjectAddress } from '../resources/contract.ts'
+import { persistedAtom } from '../state/persistence.ts'
 import { dailyDriver } from './fixtures/layouts.ts'
-import { defaultFilters, fixtureSidebarState } from './sidebar/state.ts'
+import { machineMemory } from './sidebar/show.ts'
+import { defaultFilters, fixtureSidebarState, sidebarState, type SidebarFilters } from './sidebar/state.ts'
 import { createWindow, projectWorkspaces, reduceWindow, type WindowAction } from './workspaces.ts'
 import { AgentFolders, ArrangementEditFeedback } from './AgentFolders.tsx'
 import { WorkbenchContextProvider } from './context.tsx'
+
+liveFolders.atom = fixtureFolders
 
 const viewport = { width: 340, height: 800 }
 const viewportSize: ResizeObserverSize = { inlineSize: viewport.width, blockSize: viewport.height }
@@ -77,7 +92,7 @@ const folderOps = (refs: readonly string[]): readonly SidebarOperation[] => [
   { op: 'subject.place', subject: refs[0]!, folder: 'product', key: 'W' },
 ]
 
-const FolderTree = ({ query }: { readonly query: string }) => {
+const FolderTree = () => {
   const subjects = useSubjectList()
   const [windowAtom] = React.useState(() =>
     Atom.make(createWindow({ seed: dailyDriver, subjects, attention: [] })),
@@ -114,26 +129,32 @@ const FolderTree = ({ query }: { readonly query: string }) => {
   )
 }
 
-const mountTree = ({ query }: { readonly query: string }) => {
+const mountTree = ({
+  query = '',
+  source = fixtureSource({ world: fixtureProjections }),
+  filters = { ...defaultFilters, query },
+}: {
+  readonly query?: string
+  readonly source?: DataSource
+  readonly filters?: SidebarFilters
+}) => {
   const registry = AtomRegistry.make()
-  const source = fixtureSource({ world: fixtureProjections })
   registry.get(fixtureFolders).edit(folderOps(fixtureProjections.agents.map((a) => a.id)))
-  registry.set(fixtureSidebarState(source.gateway ?? source.mode).filters, {
-    ...defaultFilters,
-    query,
-  })
+  const state = (source.mode === 'fixtures' ? fixtureSidebarState : sidebarState)(source.gateway ?? source.mode)
+  registry.set(state.filters, filters)
   const container = document.createElement('div')
   document.body.append(container)
   const root = createRoot(container)
   flushSync(() => {
     root.render(
       <DataSourceProvider source={source} registry={registry}>
-        <FolderTree query={query} />
+        <FolderTree />
       </DataSourceProvider>,
     )
   })
   return {
     container,
+    filters: () => registry.get(state.filters),
     unmount: () => {
       flushSync(() => root.unmount())
       container.remove()
@@ -176,6 +197,64 @@ describe('AgentFolders row styling', () => {
       expect(tree.container.querySelector('[role="status"]')?.classList.contains('stylex:notice')).toBe(true)
     } finally {
       tree.unmount()
+    }
+  })
+})
+
+describe('AgentFolders remembered machines', () => {
+  const agentRefs = (container: HTMLElement) =>
+    [...container.querySelectorAll<HTMLElement>('[data-wf-agent-ref]')].map((row) => row.dataset.wfAgentRef!)
+  // A new live gateway whose own settings differ from the defaults.
+  const live = (gateway: string) => ({ ...fixtureSource({ world: fixtureProjections }), mode: 'live' as const, gateway })
+  const settings: SidebarFilters = { ...defaultFilters, query: '', hideRetired: true, sort: 'name' }
+  // The live workspace's write path: the shared browser persistence document.
+  const remember = (machines: readonly (readonly string[])[] | null) => {
+    const registry = AtomRegistry.make()
+    registry.set(persistedAtom(machineMemory), machines)
+    registry.dispose()
+  }
+
+  it('seeds a new gateway from the remembered machine and keeps its other settings', async () => {
+    remember([['build-host-b']])
+    const tree = mountTree({ source: live('restore.gateway.invalid'), filters: settings })
+    try {
+      expect(tree.filters()).toEqual({ ...settings, query: 'machine:build-host-b' })
+      await vi.waitFor(() => expect(agentRefs(tree.container).length).toBeGreaterThan(0))
+      expect(agentRefs(tree.container).every((ref) => ref.startsWith('agent/build-host-b/'))).toBe(true)
+      const trigger = [...tree.container.querySelectorAll('button')].find((button) => button.textContent?.startsWith('Show'))
+      expect(trigger?.textContent).toContain(', 1 active')
+    } finally {
+      tree.unmount()
+      remember(null)
+    }
+  })
+
+  it('restores nothing from corrupt memory another tab wrote', async () => {
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'wf.ui@1',
+      newValue: JSON.stringify({
+        version: 1,
+        entries: { [machineMemory.key]: { version: 2, value: [['BUILD HOST B']], clock: Date.now() + 60_000, writer: 'other-tab' } },
+      }),
+    }))
+    const tree = mountTree({ source: live('corrupt.gateway.invalid'), filters: settings })
+    try {
+      expect(tree.filters()).toEqual(settings)
+      await vi.waitFor(() => expect(agentRefs(tree.container).some((ref) => ref.startsWith('agent/build-host-a/'))).toBe(true))
+    } finally {
+      tree.unmount()
+      remember(null)
+    }
+  })
+
+  it('drops a gateway’s stale machine token when machines were cleared in this browser', async () => {
+    remember([])
+    const tree = mountTree({ source: live('cleared.gateway.invalid'), filters: { ...settings, query: 'is:asking machine:build-host-b' } })
+    try {
+      expect(tree.filters()).toEqual({ ...settings, query: 'is:asking' })
+    } finally {
+      tree.unmount()
+      remember(null)
     }
   })
 })

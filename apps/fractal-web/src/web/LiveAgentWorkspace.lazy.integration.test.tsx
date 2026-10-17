@@ -31,8 +31,10 @@ vi.mock('./ConversationPaneFallback.tsx', async importOriginal => {
 // pending, and no backend is needed to prove when its code is requested.
 let gatewayObservation: FeedSyncObservation | undefined
 const reconnect = vi.fn()
+const askingAgents: ReadonlySet<string> = new Set()
 vi.mock('../data/react.tsx', () => ({
   useFleet: () => rosterFeed,
+  useAskingAgents: () => askingAgents,
   useSubjectList: () => [],
   useConnection: () => ({ _tag: 'Live' }),
   useNow: () => 0,

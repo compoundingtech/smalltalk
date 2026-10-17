@@ -3,13 +3,11 @@ import * as Atom from 'effect/reactivity/Atom'
 
 import { persistedAtom } from '../../state/persistence.ts'
 
-/** Persisted sidebar search, visibility, status and ordering settings. */
+/** Persisted sidebar search, visibility, status and ordering settings; Show filters live in the query. */
 export const SidebarFilters = Schema.Struct({
   query: Schema.String,
-  needsMe: Schema.Boolean,
   hideEnded: Schema.Boolean,
   hideRetired: Schema.Boolean,
-  host: Schema.String,
   statuses: Schema.Array(Schema.String),
   sort: Schema.Literals(['manual', 'status', 'activity', 'name', 'host']),
 })
@@ -17,10 +15,8 @@ export type SidebarFilters = typeof SidebarFilters.Type
 /** Unfiltered manual-order sidebar settings for a new gateway. */
 export const defaultFilters: SidebarFilters = {
   query: '',
-  needsMe: false,
   hideEnded: false,
   hideRetired: false,
-  host: '',
   statuses: [],
   sort: 'manual',
 }
