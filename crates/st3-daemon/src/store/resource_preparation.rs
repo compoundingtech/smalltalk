@@ -113,11 +113,21 @@ impl Fence {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn prepare<T>(
         &self,
         store: &Store,
         read: impl FnOnce(&Connection) -> T,
     ) -> Prepared<T> {
+        self.prepare_with_actuals(store, |connection, _| read(connection))
+    }
+
+    pub(super) fn prepare_with_actuals<T>(
+        &self,
+        store: &Store,
+        read: impl FnOnce(&Connection, Option<u64>) -> T,
+    ) -> Prepared<T> {
+        let mut actual_serial = None;
         let mut prepared = Prepared {
             owner: self.owner.clone(),
             cut: None,
@@ -152,6 +162,9 @@ impl Fence {
             let work = smallclaims::sqlite::work::SqliteWorkScope::start();
             if connection.is_autocommit() {
                 prepared.cut = NativeCut::read(&connection);
+                actual_serial = store.smalltalk.observer_actuals.seed(
+                    &connection, || connection.reverify_observer_coverage(),
+                ).ok();
             }
             drop(connection);
             #[cfg(test)]
@@ -195,7 +208,7 @@ impl Fence {
             if prepared.cut.as_ref().is_none_or(|cut| cut.schema != schema) {
                 return Ok(None);
             }
-            Ok(Some(read(&connection)))
+            Ok(Some(read(&connection, actual_serial)))
         });
         #[cfg(test)]
         COUNTS.with(|counts| {
@@ -281,6 +294,15 @@ pub(super) struct Inputs {
     pub(super) should_record: bool,
 }
 
+pub(super) struct Observation<'a> {
+    pub(super) observer: &'a str,
+    pub(super) desired_revision: &'a str,
+    pub(super) attempt: Option<&'a str>,
+    pub(super) resource: &'a str,
+    pub(super) facts: &'a Value,
+    pub(super) subscriptions: &'a [(String, SubscriptionSpec)],
+}
+
 pub(super) fn inputs(
     transaction: &Connection,
     observer: &str,
@@ -290,6 +312,17 @@ pub(super) fn inputs(
     facts: &Value,
     subscriptions: &[(String, SubscriptionSpec)],
 ) -> Result<Inputs, St3Error> {
+    inputs_with_actuals(transaction, Observation {
+        observer, desired_revision, attempt, resource, facts, subscriptions,
+    }, &mut |subject| latest_actual(transaction, subject))
+}
+
+pub(super) fn inputs_with_actuals(
+    transaction: &Connection,
+    observation: Observation<'_>,
+    actual: &mut dyn FnMut(&str) -> Result<Option<Value>>,
+) -> Result<Inputs, St3Error> {
+    let Observation { observer, desired_revision, attempt, resource, facts, subscriptions } = observation;
     let mut active_subscriptions = Vec::new();
     for (subject, expected) in subscriptions {
         let Some(desired) = current_desired_row_tx(transaction, subject).map_err(internal)? else {
@@ -319,7 +352,7 @@ pub(super) fn inputs(
     let facts = normalized_observation
         .get("facts")
         .expect("a normalized resource observation has facts");
-    let previous = latest_actual(transaction, resource)
+    let previous = actual(resource)
         .map_err(internal)?
         .and_then(|actual| actual.get("facts").cloned());
     let baseline = previous.is_none();
@@ -368,7 +401,7 @@ pub(super) fn inputs(
             .filter_map(|item| item.get("number").and_then(Value::as_u64))
         {
             let subject = format!("{resource}/{segment}/{number}");
-            let recorded = latest_actual(transaction, &subject)
+            let recorded = actual(&subject)
                 .map_err(internal)?
                 .and_then(|actual| actual.get("facts").cloned());
             let observed_at = transaction
@@ -411,7 +444,7 @@ pub(super) fn inputs(
         discovered.extend(items.into_iter().map(|item| (field, item)));
     }
     let changed_fields = changed_fields.into_iter().collect::<Vec<_>>();
-    let observer_health_is_current = latest_actual(transaction, observer)
+    let observer_health_is_current = actual(observer)
         .map_err(internal)?
         .is_some_and(|actual| {
             actual.get("state").and_then(Value::as_str) == Some("healthy")
@@ -434,7 +467,7 @@ pub(super) fn inputs(
             true
         };
         let status = if target_exists { "active" } else { "pending" };
-        let current_status = latest_actual(transaction, subscription_subject)
+        let current_status = actual(subscription_subject)
             .map_err(internal)?
             .and_then(|actual| {
                 actual

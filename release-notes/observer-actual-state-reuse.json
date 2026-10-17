@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Resource observations reuse bounded actual-state reductions for unchanged subjects instead of reading and parsing their claim histories on every observation; unrelated subject appends keep the reductions reusable",
+  "replay": {"status": "none", "detail": "No replay required; replay invalidates the in-memory reductions."},
+  "schema": {"status": "none", "detail": "No schema change or SQL triggers; native writer row notifications maintain process-local invalidation."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "The existing canonical actual-state fold remains authoritative. Affected subject writes invalidate its reduction; adding explicit canonical positions during local sealing preserves reuse only when they equal the previous effective ranks. Actual rank changes invalidate the affected subjects. Ambiguous mutations, bulk edits, replay, schema changes and external writes invalidate all reductions. External native-version changes latch reuse off and require dispatcher verification of the watched physical rowid tables before reuse resumes. Unsupported native hook coverage stays disabled until positively re-verified. A source guard forbids implicit replacement deletes in production fold-source writers. Preparation still validates its native writer fence before use."},
+  "downtime": {"status": "none", "detail": "Normal daemon upgrade; reductions start empty after restart."},
+  "manual": {"status": "none", "detail": "No operator step."},
+  "recovery": {"status": "none", "detail": "Revert the commit; no persisted cache or migration."}
+}

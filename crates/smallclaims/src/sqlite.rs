@@ -1001,6 +1001,14 @@ fn run_write_batch(
 }
 
 impl WriterGuard<'_> {
+    /// Re-verify native observation after detecting writes through another connection.
+    /// Unsupported coverage is reported through the observer's latched failure callback.
+    pub fn reverify_observer_coverage(&self) {
+        if let Some(observer) = self.mutation_observer {
+            observer.reverify(self);
+        }
+    }
+
     /// Begin a managed transaction and run prepare before returning it. Existing helpers
     /// accepting &Transaction can use the wrapper through dereference; commit finalizes
     /// before COMMIT. Prepare failure rolls back and retains its original error cause.

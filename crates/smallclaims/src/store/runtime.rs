@@ -48,6 +48,10 @@ pub struct ReplayProgress {
 
 /// A runtime's claim kinds and projections.
 pub trait Runtime: Send + Sync {
+    /// Optional process-local invalidation at the single writer's resolution boundary.
+    fn writer_observer(&self) -> Option<std::sync::Arc<dyn crate::sqlite::WriterObserver>> {
+        None
+    }
     /// A completed local response still names live work. Cleanup extends its retry window;
     /// the runtime checks only the bounded candidate, never its complete history.
     fn idempotency_response_in_use(

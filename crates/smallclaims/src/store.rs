@@ -1027,7 +1027,12 @@ impl Store {
         )?;
         let committed_index = Arc::new(AtomicU64::new(index));
         Ok(Self {
-            connection: WriterConnection::new(connection, committed_index.clone()),
+            connection: match runtime.writer_observer() {
+                Some(observer) => WriterConnection::new_with_observer(
+                    connection, committed_index.clone(), observer,
+                )?,
+                None => WriterConnection::new(connection, committed_index.clone()),
+            },
             readers,
             committed_index,
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),

@@ -59,6 +59,7 @@ mod owned_sets_tests;
 mod usage_fold_tests;
 mod resources;
 mod resource_preparation;
+mod observer_actuals;
 #[cfg(test)]
 mod resource_preparation_fence_tests;
 mod github_workflow_failures;
