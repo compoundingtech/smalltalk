@@ -304,6 +304,8 @@ fn import_until_error(
 ) -> anyhow::Result<()> {
     let connection = crate::sekrets::client::Connection::open(socket)?;
     loop {
+        // Finish each sample per page; the importer thread itself never returns.
+        crate::task_cpu::blocking("sekrets.import", || -> anyhow::Result<()> {
         let value = connection.manage(&crate::sekrets::protocol::Request::Log {
             after: *cursor,
             limit: 200,
@@ -311,10 +313,12 @@ fn import_until_error(
         })?;
         let entries: Vec<crate::sekrets::store::LogEntry> = serde_json::from_value(value)?;
         let Some(_) = entries.last() else {
-            continue;
+            return Ok(());
         };
         import_entries(&entries, node, person, cursor_path, cursor, |claim| {
             store.append_claim(claim).map(|_| ())
+        })?;
+        Ok(())
         })?;
     }
 }

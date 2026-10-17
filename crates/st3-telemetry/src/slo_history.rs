@@ -103,7 +103,8 @@ pub fn buckets(points: &[(u64, f64)], since_ms: u64, until_ms: u64, count: usize
 }
 
 /// Sample `rows` into the log once a minute until the process stops. A failed append is reported
-/// once and the next minute tries again.
+/// once and the next minute tries again. Blocking work is charged to `slo.history` through
+/// `smallclaims::task_cpu`.
 pub async fn run<F>(dir: PathBuf, rows: F)
 where
     F: Fn() -> anyhow::Result<Vec<Value>> + Send + Sync + Clone + 'static,
@@ -115,9 +116,9 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
         let (log, rows) = (dir.clone(), rows.clone());
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = tokio::task::spawn_blocking(move || smallclaims::task_cpu::blocking("slo.history", || -> anyhow::Result<()> {
             Ok(append(&log, now, &rows()?)?)
-        })
+        }))
         .await;
         match result {
             Ok(Ok(())) => failing = false,

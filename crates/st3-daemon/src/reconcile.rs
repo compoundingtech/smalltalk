@@ -1441,7 +1441,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let notify = self.notify.clone();
             let events = self.event_notify.clone();
             let incoming = self.incoming_resumes.clone();
-            tokio::spawn(async move {
+            tokio::spawn(crate::task_cpu::account("seat.snapshot_transfer", async move {
                 let result = crate::seat_snapshot::transfer(
                     store.clone(),
                     relay,
@@ -1477,7 +1477,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     state.join("replication.wake"),
                     uuid::Uuid::now_v7().to_string(),
                 );
-            });
+            }));
         }
         Ok(())
     }
@@ -1676,7 +1676,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         work: impl FnOnce(&Self) -> T + Send + 'static,
     ) -> T {
         let this = self.clone();
-        match self.store.connection.write_workers().spawn_blocking(move || work(&this)).await {
+        match self.store.connection.write_workers().spawn_blocking(move || crate::task_cpu::blocking("reconcile", || work(&this))).await {
             Ok(value) => value,
             Err(error) => std::panic::resume_unwind(error.into_panic()),
         }
@@ -1688,7 +1688,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut delay = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
-            let Err(error) = tokio::spawn(self.clone().run()).await else {
+            let Err(error) = tokio::spawn(crate::task_cpu::account("reconcile", self.clone().run())).await else {
                 return;
             };
             if !error.is_panic() {
@@ -8607,7 +8607,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let notify = self.notify.clone();
         let delayed = self.delayed_restarts.clone();
         let subject = subject.to_owned();
-        handle.spawn(async move {
+        handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
             let delay = until.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
             tokio::time::sleep(Duration::from_millis(delay)).await;
             {
@@ -8629,7 +8629,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Some(restart_wake_kind(&subject)),
             );
             notify.notify_one();
-        });
+        }));
     }
 
     /// Observe only the invocation, never the borrowed shell's lifecycle as an agent exit.
@@ -13640,7 +13640,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let notify = self.notify.clone();
         let armed = self.step_deadlines.clone();
         let key = key.to_owned();
-        handle.spawn(async move {
+        handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
             tokio::time::sleep(Duration::from_millis(remaining)).await;
             {
                 let mut armed = armed.lock().unwrap_or_else(PoisonError::into_inner);
@@ -13650,7 +13650,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             crate::reconcile_telemetry::record_wake(wake, None);
             notify.notify_one();
-        });
+        }));
     }
 
     /// Why a run-owned stop must wait for `seat`: it holds a message nobody has read, or work in a
@@ -13976,7 +13976,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let host = self.host.clone();
         let started_at = self.started_at_unix_ms;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
+            handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
                 let delay = scheduled_at.saturating_sub(now_ms() as i64).max(0) as u64;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 if store
@@ -14126,7 +14126,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&operation);
                 signal_changed(&notify, &event_notify);
-            });
+            }));
         } else {
             self.armed_schedules
                 .lock()
@@ -15154,7 +15154,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         let agent_workspaces = agent_workspaces.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
+            handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
                 let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 if store
@@ -15358,7 +15358,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     injection.fault("observer-completion-finished", &observer_subject);
                 }
                 signal_changed(&notify, &event_notify);
-            });
+            }));
         } else {
             self.armed_observers
                 .lock()
@@ -15522,11 +15522,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let notify = self.notify.clone();
                         let remaining = (*duration_ms as u128).saturating_sub(elapsed) as u64;
-                        handle.spawn(async move {
+                        handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
                             tokio::time::sleep(Duration::from_millis(remaining)).await;
                             crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerGate, None);
                             notify.notify_one();
-                        });
+                        }));
                     }
                     GateOutcome::Pass
                 }
@@ -16098,7 +16098,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let armed = self.gate_poll_armed.clone();
             let runtimes = self.gate_poll_runtimes.clone();
             let runtime = self.runtime.clone();
-            handle.spawn(async move {
+            handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
                 let armed_at = tokio::time::Instant::now();
                 loop {
                     tokio::time::sleep(GATE_POLL_INTERVAL).await;
@@ -16107,13 +16107,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .unwrap_or_else(PoisonError::into_inner)
                         .clone();
                     let runtime = runtime.clone();
-                    let all_running = tokio::task::spawn_blocking(move || {
+                    let all_running = tokio::task::spawn_blocking(move || crate::task_cpu::blocking("reconcile.gate_poll", || {
                         watched.iter().all(|runtime_id| {
                             runtime.observe_exec(runtime_id).is_ok_and(|observation| {
                                 observation.is_some_and(|item| item.status == "running")
                             })
                         })
-                    })
+                    }))
                     .await
                     .unwrap_or(false);
                     if !all_running || armed_at.elapsed() >= GATE_POLL_PASS_INTERVAL {
@@ -16127,7 +16127,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 armed.store(false, Ordering::Release);
                 crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerGatePoll, None);
                 notify.notify_one();
-            });
+            }));
         }
     }
 
@@ -16216,11 +16216,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     smallclaims::touched::note_due(now_ms().saturating_add(100));
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let notify = self.notify.clone();
-                        handle.spawn(async move {
+                        handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerLlmGate, None);
                             notify.notify_one();
-                        });
+                        }));
                     }
                     return Ok(GateOutcome::Pending);
                 }
@@ -16306,11 +16306,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let notify = self.notify.clone();
                 let remaining = (time_limit_ms as u128).saturating_sub(elapsed) as u64;
-                handle.spawn(async move {
+                handle.spawn(crate::task_cpu::account("reconcile.timer", async move {
                     tokio::time::sleep(Duration::from_millis(remaining)).await;
                     crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerLlmGate, None);
                     notify.notify_one();
-                });
+                }));
             }
             return Ok(GateOutcome::Pending);
         }

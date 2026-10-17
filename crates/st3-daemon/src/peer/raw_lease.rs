@@ -107,7 +107,7 @@ where
     let monitor = tokio::io::unix::AsyncFd::new(bridge.try_clone()?)?;
     let bridge = tokio::net::UnixStream::from_std(bridge)?;
     let (control, mut controls) = mpsc::channel::<Value>(16);
-    tokio::spawn(async move {
+    tokio::spawn(crate::task_cpu::account("peer.raw_lease", async move {
         let auth = &relay.auth;
         let node = &relay.node;
         let (mut sink, mut source) = socket.split();
@@ -215,7 +215,7 @@ where
             }
         };
         tokio::select! { biased; () = expired => {}, () = closed => {}, () = upload => {}, () = download => {} }
-    });
+    }));
     Ok((client, control))
 }
 

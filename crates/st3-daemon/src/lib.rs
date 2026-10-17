@@ -116,6 +116,7 @@ pub mod suspension;
 pub(crate) use st3_kernel::publication;
 pub mod seat_snapshot;
 pub mod telemetry;
+pub use smallclaims::task_cpu;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 #[cfg(test)]
