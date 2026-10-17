@@ -156,6 +156,27 @@ const itemOf = ({
 }): ConversationItem => {
   switch (entry.type) {
     case 'content': {
+      // Native text blocks can carry only {body_ref:true}, not their own prose:
+      // external_sessions.rs:3698-3728,4813-4832; Schema.generated.ts:2639-2662.
+      // Mixed bodies therefore need a visible disclosure, not guessed text boundaries.
+      // This mixed-content path goes away once TimelineBlock carries per-block text or body ranges.
+      const blocks = entry.body.blocks?.filter((block) => block.kind !== 'source_record')
+      if (blocks?.some((block) =>
+        block.visibility === 'internal' || block.visibility === 'hidden-by-harness',
+      )) {
+        const mixedContent = blocks.some((block) =>
+          block.visibility !== 'internal' && block.visibility !== 'hidden-by-harness',
+        )
+        const primaryType = blocks[0]?.view?.type
+        return {
+          _tag: 'UnknownEvent',
+          id: entry.id,
+          at: entryTimestamp(entry),
+          eventType: typeof primaryType === 'string' ? primaryType : primaryType?.raw ?? 'internal native content',
+          ...(mixedContent ? { mixedContent: true } : {}),
+          data: entry.body,
+        }
+      }
       const internal = unrecognizedOmpItem(entry)
       if (internal !== undefined) return internal
       const reasoning = parseNativeReasoning(entry)

@@ -13,7 +13,7 @@ import type { FeedSyncObservation } from '../data/feedSync.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import { sendFailureDetail } from './composerSend.ts'
 
-/** Unknown protocol events are hidden by default; explicit inspection uses payload-free notices. */
+/** Unknown protocol events are hidden by default; mixed messages retain an explicit body disclosure. */
 type KitConversationItem = NonNullable<ConversationRuntimeOptions['messages']>[number]
 type KitTextItem = Extract<KitConversationItem, { _tag: 'Text' }>
 
@@ -50,7 +50,7 @@ const isPrompt = (item: KitConversationItem): item is KitTextItem & { readonly r
   item._tag === 'Text' && item.role === 'user'
 
 
-const isOmittedItem = (item: ConversationItem): boolean => item._tag === 'UnknownEvent'
+const isOmittedItem = (item: ConversationItem): boolean => item._tag === 'UnknownEvent' && item.mixedContent !== true
 
 /** The host owns work-log classification: how a tool reads, runs or edits. */
 const toolKindFor = (name: string): WorkKind => {
@@ -157,9 +157,9 @@ export const prepareTranscriptTurns = (
   }
   for (const sourceItem of items) {
     if (!options.showSystemEvents && isOmittedItem(sourceItem)) continue
-    // The runtime must not receive unknown protocol payloads either: its converter and fallback
-    // rows render the same short notice, never a raw JSON envelope or producer-specific kind.
-    const item: KitConversationItem = sourceItem._tag === 'UnknownEvent'
+    // Only mixed messages carry their full body to the kit's opt-in disclosure.
+    // Other unknown protocol rows remain payload-free notices under explicit inspection.
+    const item: KitConversationItem = sourceItem._tag === 'UnknownEvent' && sourceItem.mixedContent !== true
       ? { _tag: 'Notice', id: sourceItem.id, kind: 'event', text: 'An event this view cannot show yet.',
         ...(sourceItem.at === undefined ? {} : { at: sourceItem.at }) }
       : hasKitSendState(sourceItem) ? sourceItem

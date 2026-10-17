@@ -70,6 +70,36 @@ describe('kit transcript turn mapping', () => {
     expect(inspected[0]!.items.filter(item => item._tag === 'Notice')).toHaveLength(2)
     expect(JSON.stringify(inspected)).not.toContain('private-event')
   })
+  it('keeps mixed messages visible by default with their full body available only for explicit disclosure', () => {
+    const data = { text: 'Synthetic visible prose', blocks: [
+      { visibility: 'visible', payload: { text: 'Synthetic visible prose' } },
+      { visibility: 'internal', payload: { raw: 'synthetic-internal-sentinel' } },
+    ] }
+    const mixed: ConversationItem = { _tag: 'UnknownEvent', id: 'mixed', eventType: 'synthetic-kind', mixedContent: true, data }
+    const internal: ConversationItem = { ...mixed, id: 'internal', mixedContent: false }
+    const unspecified: ConversationItem = { _tag: 'UnknownEvent', id: 'unspecified', eventType: 'synthetic-kind', data }
+    for (const showSystemEvents of [false, true]) {
+      const state = mapConversationFeed({
+        _tag: 'Observed', freshness: 'live',
+        value: { items: [mixed, internal, unspecified], hasOlder: false, observation: { empty: false } },
+      }, { showSystemEvents })
+      expect(state._tag).toBe('Observed')
+      if (state._tag !== 'Observed') throw new Error('Expected observed mixed message')
+      expect(state.filteredEmpty).toBe(false)
+      expect(state.items[0]).toBe(mixed)
+      expect(state.items[0]!._tag === 'UnknownEvent' && state.items[0]!.data).toBe(data)
+      expect(state.items.slice(1).map(item => item._tag)).toEqual(showSystemEvents ? ['Notice', 'Notice'] : [])
+      const converted = convertConversationItem(state.items[0]!)
+      expect(converted.content).toEqual([{ type: 'text', text: 'Message with internal records' }])
+      expect(JSON.stringify(converted.content)).not.toContain('synthetic-internal-sentinel')
+      expect(JSON.stringify(converted.content)).not.toContain('synthetic-kind')
+    }
+    const control = mapConversationFeed({
+      _tag: 'Observed', freshness: 'live',
+      value: { items: [internal, unspecified], hasOlder: false, observation: { empty: false } },
+    }, {})
+    expect(control).toMatchObject({ _tag: 'Observed', filteredEmpty: true, items: [] })
+  })
   it('prepares the leading assistant tail as a prompt-less turn without losing its work', () => {
     const leading = [scenario[1]!, scenario[2]!, scenario[3]!]
     const prepared = prepareTranscriptTurns([...leading, ...scenario], { firstTurnComplete: false })

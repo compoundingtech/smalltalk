@@ -169,6 +169,8 @@ export const ConversationItem = Schema.TaggedUnion({
     id: Schema.String,
     eventType: Schema.String,
     data: Schema.Unknown,
+    /** Mixed visibility needs a visible disclosure until blocks carry separable prose. */
+    mixedContent: Schema.optional(Schema.Boolean),
     sender: Schema.optional(Sender),
     at: Schema.optional(Schema.String),
   },
