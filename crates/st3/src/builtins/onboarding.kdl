@@ -1,6 +1,6 @@
 version 2
 mission "st/onboarding" state="ready" {
-  goal "You meet the Smalltalk Assistant, watch two agents talk and a small mission run, see how an alert reaches you, then tell it what you want to do in Smalltalk and it starts that work."
+  goal "You meet the Fractal Assistant, watch two agents talk and a small mission run, see how an alert reaches you, then tell it what you want to do in Fractal and it starts that work."
   assigned-to "agent/st/assistant"
   baseline "the bundled guide is available" {
     document "@GUIDE@"
@@ -32,7 +32,7 @@ mission "st/onboarding" state="ready" {
   step "act-three" timeout="2h" {
     depends-on { step "act-two" completed }
     goal "You see a short, true alert from the Assistant appear above the message input, are told in a sentence or two that you can read and dismiss it, and the Assistant waits for that."
-    goal "You are asked what you want to accomplish in Smalltalk today, and the Assistant asks follow-ups until it can start a seat or a mission for your project, in a folder you name or in the work folder."
+    goal "You are asked what you want to accomplish in Fractal today, and the Assistant asks follow-ups until it can start a seat or a mission for your project, in a folder you name or in the work folder."
     goal "You leave knowing the Assistant stays here for questions, and that phone pairing, a second machine and GitHub are there when you want them."
   }
 }

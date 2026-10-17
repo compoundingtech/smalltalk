@@ -860,7 +860,7 @@
     },
     {
       "command": "st conversations timeline",
-      "description": "Show one conversation as stui shows it: messages, folded tools, Small Talk. `--raw` prints every normalized entry (ids, message boundaries, tool JSON); `--json` the page",
+      "description": "Show one conversation as stui shows it: messages, folded tools, Fractal. `--raw` prints every normalized entry (ids, message boundaries, tool JSON); `--json` the page",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
       ],

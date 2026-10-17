@@ -243,7 +243,7 @@ def check_pull_request(repo, base, source, pr_number=None, queue_ref=None):
 def render(repo, previous, source, tag, repository='compoundingtech/smalltalk', since=None):
     report = collect(repo, since or previous, source)
     source, since = report['source'], report['previous_source']
-    lines = [f'Smalltalk {tag} at `{source}`. Artifacts identify this exact source in RELEASE.json.', '',
+    lines = [f'Fractal {tag} at `{source}`. Artifacts identify this exact source in RELEASE.json.', '',
              '## Upgrade impact', '',
              f'From **{previous}** (`{since}`) to **{tag}** (`{source}`).',
              'This classification covers the entire source interval. Earlier starting releases may have additional requirements.', '',

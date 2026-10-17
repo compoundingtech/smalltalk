@@ -582,15 +582,15 @@ impl Screen {
         };
         let focus = |item: Item| self.focus == item && !matches!(self.phase, Phase::Running);
 
-        lines.push(Line::from(Span::styled("Smalltalk setup", theme::strong(theme::ACCENT))));
+        lines.push(Line::from(Span::styled("Fractal setup", theme::strong(theme::ACCENT))));
         lines.push(Line::default());
         lines.extend(wrap(
-            "Smalltalk runs your AI agents as durable seats that message each other, and keeps their work as missions. Five quick choices, about a minute.",
+            "Fractal runs your AI agents as durable seats that message each other, and keeps their work as missions. Five quick choices, about a minute.",
             0,
             theme::text(),
         ));
         lines.extend(wrap(
-            "The Smalltalk Assistant, your first agent, runs on your own Claude or Codex account and uses that account's usage.",
+            "The Fractal Assistant, your first agent, runs on your own Claude or Codex account and uses that account's usage.",
             0,
             theme::soft(),
         ));
@@ -1052,7 +1052,7 @@ mod tests {
         let mut screen = Screen::new(form());
         let shown = frame(&mut screen, 110, 60);
         for text in [
-            "Smalltalk setup",
+            "Fractal setup",
             "your own Claude or Codex account",
             "Your name",
             "ada",
@@ -1270,10 +1270,10 @@ mod tests {
         screen.focus = Item::Skip;
         let shown = frame(&mut screen, 80, 14);
         assert!(shown.contains("Skip for now"), "{shown}");
-        assert!(!shown.contains("Smalltalk setup"), "the top scrolled away:\n{shown}");
+        assert!(!shown.contains("Fractal setup"), "the top scrolled away:\n{shown}");
         screen.focus = Item::Name;
         let shown = frame(&mut screen, 80, 14);
-        assert!(shown.contains("Smalltalk setup"), "{shown}");
+        assert!(shown.contains("Fractal setup"), "{shown}");
     }
 
     #[test]

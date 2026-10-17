@@ -50,8 +50,8 @@ With Node 24 and Corepack, run `corepack enable` and `pnpm install --frozen-lock
 
 | Variant | Installed identity | Bundle identifier | Use |
 | --- | --- | --- | --- |
-| `dev` (default) | Smalltalk Dev, amber DEV-badged icon | `com.compoundingtech.smalltalk.starter` | Debug with Metro, simulator and device smoke tests |
-| `daily` | Smalltalk, ordinary icon | `com.compoundingtech.smalltalk` | Release build used every day on a phone |
+| `dev` (default) | Fractal Dev, amber DEV-badged icon | `com.compoundingtech.smalltalk.starter` | Debug with Metro, simulator and device smoke tests |
+| `daily` | Fractal, ordinary icon | `com.compoundingtech.smalltalk` | Release build used every day on a phone |
 
 The two apps coexist on one phone and keep separate Keychain profiles, so each is paired on its own. Any other value fails the configuration. Changing variants requires a clean prebuild, and the same `APP_VARIANT` must stay exported for the Xcode build that embeds the bundle. The EAS simulator profile selects dev; preview selects daily.
 

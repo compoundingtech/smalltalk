@@ -613,7 +613,7 @@ jobs:
           python3 ../scripts/release-smalltalk-manifest.py "$SOURCE_SHA"
           # Refuse to replace any existing release or its assets. A partial draft stays private
           # for inspection; delete that draft before retrying, never move the tag.
-          gh release create "$TAG" --verify-tag --draft --title "Smalltalk $TAG" \
+          gh release create "$TAG" --verify-tag --draft --title "Fractal $TAG" \
             --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json UPGRADE-IMPACT.json
           gh release edit "$TAG" --draft=false
 

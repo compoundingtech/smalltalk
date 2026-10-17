@@ -130,7 +130,7 @@ def main():
     notes_file = pathlib.Path(tempfile.mkdtemp(prefix='smalltalk-edge-')) / 'NOTES.md'
     notes_file.write_text(body)
     files = [str(dist / n) for n in names]
-    title = f'Smalltalk edge ({args.source[:9]})'
+    title = f'Fractal edge ({args.source[:9]})'
     existing = release_assets(repository)
     if existing is None:
         run('gh', 'release', 'create', TAG, '--repo', repository, '--target', args.source, '--prerelease',

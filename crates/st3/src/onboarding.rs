@@ -16,7 +16,7 @@ use st3::model::{
 
 pub const ASSISTANT_SUBJECT: &str = "agent/st/assistant";
 /// The seat's subject is durable; people see this name.
-const ASSISTANT_NAME: &str = "Smalltalk Assistant";
+const ASSISTANT_NAME: &str = "Fractal Assistant";
 const MISSION: &str = "st/onboarding";
 const ASSISTANT: &str = include_str!("builtins/assistant.kdl");
 const ONBOARDING: &str = include_str!("builtins/onboarding.kdl");
@@ -146,7 +146,7 @@ pub async fn start(
         })
     {
         said(
-            "The built-in Smalltalk Assistant is stopped; setup leaves it stopped. Use st setup --onboarding to begin again explicitly."
+            "The built-in Fractal Assistant is stopped; setup leaves it stopped. Use st setup --onboarding to begin again explicitly."
         );
         return Ok(None);
     }
@@ -240,18 +240,18 @@ pub async fn start(
     }
     let current = assistant_status(&client)
         .await?
-        .context("built-in Smalltalk Assistant disappeared during publication")?;
+        .context("built-in Fractal Assistant disappeared during publication")?;
     if current.kind.as_deref() != Some("agent") {
-        said("The built-in Smalltalk Assistant was stopped; setup leaves it stopped.");
+        said("The built-in Fractal Assistant was stopped; setup leaves it stopped.");
         return Ok(None);
     }
     anyhow::ensure!(
         current.conflicts.is_empty(),
-        "the built-in Smalltalk Assistant has conflicting declarations"
+        "the built-in Fractal Assistant has conflicting declarations"
     );
     let token = current
         .desired_token
-        .context("the built-in Smalltalk Assistant has no declaration")?;
+        .context("the built-in Fractal Assistant has no declaration")?;
     let claim: st3::model::ClaimRecord = client.get(&format!("/v1/claims/by-id/{token}")).await?;
     let desired: st3::model::DesiredSubject = serde_json::from_value(claim.body)?;
     let mut agent = st3::graph::render_desired_node(&desired.desired)?;
@@ -294,7 +294,7 @@ pub async fn start(
 fn declaration_changed(rerun: bool) -> Result<Option<String>> {
     anyhow::ensure!(
         !rerun,
-        "the built-in Smalltalk Assistant changed during setup; retry setup to inspect its new state"
+        "the built-in Fractal Assistant changed during setup; retry setup to inspect its new state"
     );
     said(
         "The onboarding declarations changed concurrently; ordinary setup preserves their current state. Run st setup again if onboarding has not started."
@@ -328,7 +328,7 @@ fn declarations(
         .and_then(|body| body.get("description"))
         .and_then(|node| node.get(0))
         .and_then(|value| value.as_string())
-        .context("built-in Smalltalk Assistant description is missing")?;
+        .context("built-in Fractal Assistant description is missing")?;
     let args = st3_client::AgentCreateParameters {
         name: "st/assistant".into(),
         harness: harness.into(),
@@ -353,7 +353,7 @@ fn declarations(
         .iter_mut()
         .find(|node| node.name().value() == "agent")
         .and_then(|node| node.children_mut().as_mut())
-        .context("built-in Smalltalk Assistant declaration has no body")?
+        .context("built-in Fractal Assistant declaration has no body")?
         .nodes_mut()
         .insert(0, display_name);
     let mut run = KdlNode::new("mission-run");
@@ -446,7 +446,7 @@ mod tests {
             let intent = st3::parse_intent(&source, "studio").unwrap();
             assert!(intent.subjects.contains_key(super::ASSISTANT_SUBJECT));
             assert!(!source.contains("model "));
-            assert!(source.contains("name \"Smalltalk Assistant\""));
+            assert!(source.contains("name \"Fractal Assistant\""));
             assert!(source.contains(&format!("mission/st/onboarding@{revision}")));
             assert!(
                 mission.missions[super::MISSION]
@@ -504,7 +504,7 @@ mod tests {
         // Act three raises the alert before the interview, and the interview ends onboarding.
         let alert = super::GUIDE.find("Raise one alert").expect("act three raises an alert");
         let interview = super::GUIDE
-            .find("What do you want to accomplish in Smalltalk today?")
+            .find("What do you want to accomplish in Fractal today?")
             .expect("act three ends in the interview");
         assert!(alert < interview, "the alert comes before the interview");
         assert!(super::GUIDE.contains("above the message input"));

@@ -58,7 +58,7 @@ final class Dictation {
 
   func start(locale wanted: Locale) async throws {
     guard await AVAudioApplication.requestRecordPermission() else {
-      throw Exception(name: "Microphone", description: "The microphone is off for Small Talk in Settings")
+      throw Exception(name: "Microphone", description: "The microphone is off for Fractal in Settings")
     }
     let locale = await SpeechTranscriber.supportedLocale(equivalentTo: wanted) ?? Locale(identifier: "en-US")
     let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [.volatileResults], attributeOptions: [])

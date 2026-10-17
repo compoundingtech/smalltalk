@@ -240,7 +240,7 @@ fn conversation_with_output_mode(
             } else {
                 // An older st sends neither side; say what it is rather than draw a blank.
                 let (from, to) = match (from, message.to.as_deref()) {
-                    ("", None) => ("Small Talk".to_owned(), String::new()),
+                    ("", None) => ("Fractal".to_owned(), String::new()),
                     (from, to) => (name(from), name(to.unwrap_or_default())),
                 };
                 let images = message
@@ -612,7 +612,7 @@ fn append_unpaired_media(
     }
     let mut text = format!(
         "media from {}: ",
-        name(message.from.as_deref().unwrap_or("Small Talk"))
+        name(message.from.as_deref().unwrap_or("Fractal"))
     );
     for (index, attachment) in message.attachments.iter().enumerate() {
         if index != 0 {

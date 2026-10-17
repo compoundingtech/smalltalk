@@ -3708,7 +3708,7 @@ enum MessageCommand {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Show one conversation as stui shows it: messages, folded tools, Small Talk. `--raw`
+    /// Show one conversation as stui shows it: messages, folded tools, Fractal. `--raw`
     /// prints every normalized entry (ids, message boundaries, tool JSON); `--json` the page.
     Timeline {
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Session)))]

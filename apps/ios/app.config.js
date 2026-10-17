@@ -14,7 +14,7 @@ module.exports = () => {
     ios: {
       ...base.ios,
       bundleIdentifier: daily ? 'com.compoundingtech.smalltalk' : 'com.compoundingtech.smalltalk.starter',
-      infoPlist: { ...base.ios.infoPlist, CFBundleDisplayName: daily ? 'Smalltalk' : 'Smalltalk Dev' },
+      infoPlist: { ...base.ios.infoPlist, CFBundleDisplayName: daily ? 'Fractal' : 'Fractal Dev' },
     },
   };
 };

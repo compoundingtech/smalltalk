@@ -3624,7 +3624,7 @@ mod tests {
             let mut world = super::super::demo::world();
             let mut assistant = world.agents.items()[0].clone();
             assistant.id = "agent/st/assistant".into();
-            assistant.name = "Smalltalk Assistant".into();
+            assistant.name = "Fractal Assistant".into();
             let other = world.agents.items()[0].id.clone();
             let mut ui = Ui::new(world.clone());
             if spaces {

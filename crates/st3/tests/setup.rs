@@ -846,7 +846,7 @@ fn plain_st_first_run_shows_the_setup_screen_starts_daemon_and_opens_home() {
     // I log in" is unticked, and the one action is pressed. Without any agent installed it ends
     // by itself and the interface opens.
     for (prompt, answer) in [
-        ("Smalltalk setup", "\t\u{15}studio\t \t\r"),
+        ("Fractal setup", "\t\u{15}studio\t \t\r"),
         (stui::HOME_IDLE_TEXT, "\u{11}"),
     ] {
         while !String::from_utf8_lossy(&output).contains(prompt) {
@@ -1247,7 +1247,7 @@ fn the_setup_screen_sets_up_each_agent_on_its_own_and_stores_an_unticked_codex_b
     let (success, output) = play(
         command,
         &[
-            ("Smalltalk setup", "\t\t\t\t\t\t \t\r"),
+            ("Fractal setup", "\t\t\t\t\t\t \t\r"),
             ("Codex is asking you to sign in", ""),
             ("did not finish", "\x1b"),
         ],
@@ -1282,7 +1282,7 @@ fn leaving_the_setup_screen_before_the_button_changes_nothing() {
     fixture.unpack_archive();
     let mut command = portable_pty::CommandBuilder::new(fixture.path("archive/st"));
     command.args(["setup", "--install", "false", "--start", "false", "--service", "false"]);
-    let (success, output) = play(command, &[("Smalltalk setup", "\x1b")], &mut fixture);
+    let (success, output) = play(command, &[("Fractal setup", "\x1b")], &mut fixture);
     assert!(!success, "{output}");
     assert!(output.contains("setup was cancelled; nothing was changed"), "{output}");
     assert!(!fixture.path("home/.config/st3/config.toml").exists());
@@ -1305,7 +1305,7 @@ fn skipping_sets_up_st_and_no_agent() {
     // Name, machine, login box, the Pi row, then the two buttons: Tab to Skip for now.
     let (success, output) = play(
         command,
-        &[("Smalltalk setup", "\t\t\t\t\t\r"), ("st is set up", "\r")],
+        &[("Fractal setup", "\t\t\t\t\t\r"), ("st is set up", "\r")],
         &mut fixture,
     );
     assert!(success, "{output}");

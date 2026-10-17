@@ -333,7 +333,7 @@ def main():
     if notes:
         print()
         print(textwrap.fill(" ".join(notes), 100, break_on_hyphens=False))
-    print("\n## Small Talk\n")
+    print("\n## Fractal\n")
     bullet(f"Runtime work messages: `{len(work_messages)}`" +
            (", for " + ", ".join(label(n) if "/" in n else n for n, _ in woken) if woken else ""))
     bullet(f"Direct agent messages: `{len(direct)}`")

@@ -107,7 +107,7 @@ class RigChecks(unittest.TestCase):
             self.assertFalse(out.exists())
 
     def test_focus_probe_rejects_sidebar_and_unfocused_composer(self):
-        code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Assistant sidebar Message Smalltalk Assistant "+"·".encode()+b" click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
+        code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Assistant sidebar Message Fractal Assistant "+"·".encode()+b" click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
         request={"argv":["python3","-c",code],"timeout":5,"expect_assistant":True,"assistant_focus_timeout":0.1}
         r=subprocess.run(["python3","-c",rig.PTY_PROBE,json.dumps(request)],capture_output=True,text=True,timeout=8)
         self.assertEqual(r.returncode,0)
@@ -117,7 +117,7 @@ class RigChecks(unittest.TestCase):
         self.assertTrue(value["restored"])
 
     def test_focus_probe_accepts_focused_assistant_before_navigation(self):
-        code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Message Smalltalk Assistant "+"·".encode()+b" type or click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
+        code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Message Fractal Assistant "+"·".encode()+b" type or click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
         request={"argv":["python3","-c",code],"timeout":5,"expect_assistant":True,"assistant_focus_timeout":0.1}
         r=subprocess.run(["python3","-c",rig.PTY_PROBE,json.dumps(request)],capture_output=True,text=True,timeout=8)
         self.assertEqual(r.returncode,0)
