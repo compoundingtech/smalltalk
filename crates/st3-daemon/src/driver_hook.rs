@@ -36,13 +36,7 @@ pub struct Diagnostic {
     pub idempotency_key: String,
 }
 
-/// What a hook sees of its process environment.
-pub trait HookEnv {
-    fn var(&self, name: &str) -> Option<String>;
-    fn raw_var(&self, name: &str) -> Option<String> {
-        self.var(name)
-    }
-}
+pub use crate::telemetry::HookEnv;
 
 /// The real process environment. Empty values count as unset, as the scripts treated them.
 pub struct ProcessEnv;
@@ -53,15 +47,6 @@ impl HookEnv for ProcessEnv {
     }
     fn var(&self, name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|value| !value.is_empty())
-    }
-}
-
-impl HookEnv for BTreeMap<String, String> {
-    fn raw_var(&self, name: &str) -> Option<String> {
-        self.get(name).cloned()
-    }
-    fn var(&self, name: &str) -> Option<String> {
-        self.get(name).filter(|value| !value.is_empty()).cloned()
     }
 }
 
@@ -739,6 +724,29 @@ fn unbound(env: &dyn HookEnv, report: &mut dyn FnMut(Diagnostic), reason: &str) 
         });
     }
     1
+}
+
+/// Hand a harness telemetry claim to the daemon at `ST3_ENDPOINT` (else this user's configured
+/// socket), within [`crate::telemetry::HOOK_SUBMIT_TIMEOUT`].
+pub fn submit_telemetry(env: &dyn HookEnv, claim: &crate::model::ClaimInput) -> Result<()> {
+    let endpoint = match env.var("ST3_ENDPOINT") {
+        Some(endpoint) => crate::client::Endpoint::parse(endpoint),
+        None => {
+            crate::client::Endpoint::Unix(crate::config::Config::load_client_unvalidated(None)?.0.socket)
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let client = crate::client::Client::new(endpoint);
+        tokio::time::timeout(
+            crate::telemetry::HOOK_SUBMIT_TIMEOUT,
+            client.post::<_, Value>("/v1/claims", claim),
+        )
+        .await??;
+        Ok(())
+    })
 }
 
 /// Record `diagnostic` with the daemon at `ST3_ENDPOINT` (else this user's configured socket).

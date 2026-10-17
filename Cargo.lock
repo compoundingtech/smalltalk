@@ -4913,6 +4913,7 @@ dependencies = [
  "st3-daemon",
  "st3-kernel",
  "st3-schema",
+ "st3-telemetry",
  "st3-terminal-direct",
  "st3-ui-model",
  "tar",
@@ -4955,6 +4956,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "libc",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4967,6 +4969,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "urlencoding",
  "uuid",
@@ -5003,6 +5006,36 @@ dependencies = [
  "sha2",
  "st-storage-version",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "st3-telemetry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures-util",
+ "hex",
+ "libc",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallclaims",
+ "st-drivers",
+ "st3-kernel",
+ "tempfile",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

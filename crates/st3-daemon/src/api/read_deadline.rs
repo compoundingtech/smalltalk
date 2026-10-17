@@ -1078,13 +1078,13 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let state = bounded_state(root.path(), 1);
             let store = state.store.clone();
-            let capture = relay_trace::tests::Capture::default();
+            let capture = relay_trace::test_capture::Capture::default();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             tracing::dispatcher::with_default(&capture.dispatch(), || {
-                let trace = relay_trace::tests::trace();
+                let trace = relay_trace::test_capture::trace();
                 with_store(Some(store.clone()), || {
                     read_budget::with(Some(ReadBudget::new("/phase-control", ORDINARY)), || {
                         runtime.block_on(relay_trace::scope(Some(trace.clone()), async {
@@ -1536,7 +1536,7 @@ mod tests {
     #[test]
     fn timeout_terminal_waits_for_response_construction_and_survives_late_child_completion() {
         use crate::relay_trace::{self, Outcome, Phase};
-        let capture = relay_trace::tests::Capture::default();
+        let capture = relay_trace::test_capture::Capture::default();
         let dispatch = capture.dispatch();
         let (entered, waiting) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
@@ -1544,7 +1544,7 @@ mod tests {
         let expected_id = request_id.clone();
         let worker = std::thread::spawn(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                let trace = relay_trace::tests::trace();
+                let trace = relay_trace::test_capture::trace();
                 let mut child = trace.span(Phase::BlockingWork);
                 relay_trace::blocking(Some(trace.clone()), || {
                     let response = construct_timeout_response(|| {
@@ -1618,9 +1618,9 @@ mod tests {
     #[test]
     fn aborted_timeout_construction_records_panic_instead_of_timeout_completion() {
         use crate::relay_trace;
-        let capture = relay_trace::tests::Capture::default();
+        let capture = relay_trace::test_capture::Capture::default();
         tracing::dispatcher::with_default(&capture.dispatch(), || {
-            let trace = relay_trace::tests::trace();
+            let trace = relay_trace::test_capture::trace();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 relay_trace::blocking(Some(trace), || {
                     construct_timeout_response(|| panic!("private construction failure"))

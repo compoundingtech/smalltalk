@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use smallclaims::windows::StoreWork;
 
@@ -260,17 +260,46 @@ pub fn verdict(windows: &Value, p99: bool) -> Verdict {
     Verdict { met, message }
 }
 
+/// One measurement of the store.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DatabaseSize {
+    pub measured_at_unix_ms: u128,
+    /// The store's pages, including free ones and those committed to the WAL but not yet copied
+    /// into the main file.
+    pub file_bytes: u64,
+    /// The pages in use: the file less its free pages, which SQLite reuses before growing.
+    pub live_bytes: u64,
+    /// How much `live_bytes` grew a day, from the sample nearest a day ago (or the oldest, when
+    /// the store has been sampled for less than a day but at least an hour). Negative when
+    /// checkpoints freed more than was written.
+    pub growth_bytes_per_day: Option<i64>,
+    /// The span the growth was measured over.
+    pub growth_span_ms: Option<u128>,
+    /// The WAL file's length beside the store.
+    pub wal_bytes: u64,
+    /// The main file's length. Pages committed to the WAL and not yet copied in are not in it.
+    pub main_file_bytes: u64,
+    /// What the store takes on disk: the main file's length and the WAL's. Page counts include
+    /// pages still in the WAL, so they are not added to it.
+    pub physical_bytes: u64,
+    /// How much `physical_bytes` grew since the sample nearest exactly a day ago, within half an
+    /// hour of it, scaled to a day. Never extrapolated: none until that baseline exists.
+    pub physical_growth_bytes_per_day: Option<i64>,
+    /// The span the physical growth was measured over, within half an hour of a day.
+    pub physical_growth_span_ms: Option<u128>,
+}
+
 /// This member's newest store size, which the daemon measures hourly.
-static DATABASE: std::sync::Mutex<Option<crate::store::DatabaseSize>> = std::sync::Mutex::new(None);
+static DATABASE: std::sync::Mutex<Option<DatabaseSize>> = std::sync::Mutex::new(None);
 
 /// Remember the newest store size for its readers.
-pub fn note_database_size(size: &crate::store::DatabaseSize) {
+pub fn note_database_size(size: &DatabaseSize) {
     *DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size.clone());
 }
 
 /// The newest store size the daemon measured: the one sample every reader of the store's size
 /// and growth uses, the database target and disk-filling conditions alike.
-pub fn database_size() -> Option<crate::store::DatabaseSize> {
+pub fn database_size() -> Option<DatabaseSize> {
     DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
@@ -614,7 +643,7 @@ mod tests {
 
     #[test]
     fn every_route_path_in_the_targets_file_is_a_route_the_daemon_serves() {
-        let source = include_str!("api.rs");
+        let source = include_str!("../../st3-daemon/src/api.rs");
         for latency in &targets().latency {
             for path in &latency.paths {
                 let Some(route) = path.strip_prefix("GET ").or(path.strip_prefix("POST ")) else {

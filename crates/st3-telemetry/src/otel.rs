@@ -38,7 +38,7 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn fixture_export_scope() -> impl Drop {
+pub fn fixture_export_scope() -> impl Drop {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -52,7 +52,7 @@ pub fn export_enabled() -> bool {
     if FIXTURE_EXPORT.with(std::cell::Cell::get) {
         return true;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if TEST_EXPORT_ENABLED.get() { return true; }
     EXPORT_ENABLED.load(Ordering::Relaxed)
 }
@@ -110,7 +110,7 @@ pub fn stage_root(
 }
 
 #[derive(Default)]
-pub(crate) struct RosterAttributes {
+pub struct RosterAttributes {
     values: std::collections::BTreeMap<&'static str, opentelemetry::Value>,
     worker_queue_ms: Option<f64>,
     reader_acquire_ms: Option<f64>,
@@ -122,7 +122,7 @@ thread_local! {
 }
 
 /// Only preparatory warming may collect attributes before its cold publication span exists.
-pub(crate) fn roster_collect_warm<T>(work: impl FnOnce() -> T) -> T {
+pub fn roster_collect_warm<T>(work: impl FnOnce() -> T) -> T {
     if !export_enabled() {
         return work();
     }
@@ -137,20 +137,20 @@ pub(crate) fn roster_collect_warm<T>(work: impl FnOnce() -> T) -> T {
 }
 
 /// Move accumulated measurements across a preparatory warm worker or a WS read retry.
-pub(crate) fn seed_roster_attributes(attributes: Option<RosterAttributes>) {
+pub fn seed_roster_attributes(attributes: Option<RosterAttributes>) {
     if let Some(attributes) = attributes {
         ROSTER_SCOPE.with(|slot| *slot.borrow_mut() = Some(attributes));
     }
 }
 
-pub(crate) fn take_roster_attributes() -> Option<RosterAttributes> {
+pub fn take_roster_attributes() -> Option<RosterAttributes> {
     if !export_enabled() {
         return None;
     }
     ROSTER_SCOPE.with(|slot| slot.borrow_mut().take())
 }
 
-pub(crate) struct RosterScopeGuard(Option<RosterAttributes>);
+pub struct RosterScopeGuard(Option<RosterAttributes>);
 
 impl Drop for RosterScopeGuard {
     fn drop(&mut self) {
@@ -159,7 +159,7 @@ impl Drop for RosterScopeGuard {
 }
 
 /// A cold rebuild can run after the first frame; it still attributes its own synchronous work.
-pub(crate) fn ensure_roster_scope() -> Option<RosterScopeGuard> {
+pub fn ensure_roster_scope() -> Option<RosterScopeGuard> {
     ROSTER_SCOPE.with(|slot| {
         let active = slot.borrow().is_some();
         if active {
@@ -182,7 +182,7 @@ pub fn roster_scope<T>(work: impl FnOnce() -> T) -> T {
     )
 }
 
-pub(crate) fn roster_recording() -> bool {
+pub fn roster_recording() -> bool {
     export_enabled()
         && ROSTER_SCOPE.with(|slot| slot.borrow().is_some())
         && (COLLECT_ROSTER_WARM.with(std::cell::Cell::get) || roster_destination_recording())
@@ -309,7 +309,7 @@ pub fn roster_worker_started(submitted: Option<Instant>) {
     }
 }
 
-pub(crate) fn copy_roster_attributes(context: &opentelemetry::Context) {
+pub fn copy_roster_attributes(context: &opentelemetry::Context) {
     use opentelemetry::trace::TraceContextExt as _;
     if !context.span().is_recording() {
         return;
@@ -329,13 +329,13 @@ pub(crate) fn copy_roster_attributes(context: &opentelemetry::Context) {
     });
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_EXPORT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
-pub(crate) fn capture_test_spans(work: impl FnOnce()) -> Vec<opentelemetry_sdk::trace::SpanData> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn capture_test_spans(work: impl FnOnce()) -> Vec<opentelemetry_sdk::trace::SpanData> {
     use opentelemetry::trace::TracerProvider as _;
     #[derive(Clone, Debug)]
     struct Exporter(std::sync::mpsc::Sender<Vec<opentelemetry_sdk::trace::SpanData>>);
@@ -744,7 +744,7 @@ fn register_daemon_memory_metrics(provider: &SdkMeterProvider) {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn linux_rss_bytes() -> Option<u64> {
+pub fn linux_rss_bytes() -> Option<u64> {
     let mut buffer = [0_u8; 128];
     let bytes = std::fs::File::open("/proc/self/statm").ok()?.read(&mut buffer).ok()?;
     let pages = std::str::from_utf8(&buffer[..bytes]).ok()?

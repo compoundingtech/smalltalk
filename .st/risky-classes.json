@@ -12,7 +12,7 @@
     },
     {
       "name": "protocol",
-      "globs": ["crates/st-wire/**", "crates/st-resource-protocol/**", "crates/st3-client/**", "crates/st3-client-codegen/**", "clients/**", "wit/**", "crates/st3-daemon/src/api.rs", "crates/st3-daemon/src/api/**", "crates/st3-daemon/src/peer.rs", "crates/st3-daemon/src/peer/**", "crates/st3-daemon/src/relay_trace.rs", "docs/st3/client-v0/**", "docs/st3/ios-fabric-protocol.md"],
+      "globs": ["crates/st-wire/**", "crates/st-resource-protocol/**", "crates/st3-client/**", "crates/st3-client-codegen/**", "clients/**", "wit/**", "crates/st3-daemon/src/api.rs", "crates/st3-daemon/src/api/**", "crates/st3-daemon/src/peer.rs", "crates/st3-daemon/src/peer/**", "crates/st3-telemetry/src/relay_trace.rs", "docs/st3/client-v0/**", "docs/st3/ios-fabric-protocol.md"],
       "forces": ["integration", "client contract tests", "codegen --check", "scripts/read-contract-report"]
     },
     {
@@ -38,7 +38,7 @@
     },
     {
       "name": "config-and-build",
-      "globs": ["**/Cargo.toml", "Cargo.lock", ".cargo/**", "flake.nix", "flake.lock", "nix/**", ".config/nextest.toml", ".github/**", "scripts/ci-*", "crates/st3/build.rs", "crates/st3-daemon/src/config.rs"],
+      "globs": ["**/Cargo.toml", "Cargo.lock", ".cargo/**", "flake.nix", "flake.lock", "nix/**", ".config/nextest.toml", ".github/**", "scripts/ci-*", "crates/st3/build.rs", "crates/st3-kernel/src/config.rs"],
       "forces": ["every required check in full"]
     },
     {

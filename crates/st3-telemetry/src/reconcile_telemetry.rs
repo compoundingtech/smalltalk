@@ -11,8 +11,8 @@ use std::time::Instant;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 /// Mirror bounded profiler sections without exporting per-subject isolate operations.
-pub(crate) struct Phase {
-    _profile: Option<crate::profile::Span>,
+pub struct Phase {
+    _profile: Option<smallclaims::profile::Span>,
     span: Option<opentelemetry::global::BoxedSpan>,
     members: Option<[MemberTotals; 2]>,
 }
@@ -24,8 +24,8 @@ struct MemberTotals {
     max: std::time::Duration,
 }
 
-pub(crate) struct Member<'a> {
-    _profile: Option<crate::profile::Span>,
+pub struct Member<'a> {
+    _profile: Option<smallclaims::profile::Span>,
     phase: &'a mut Phase,
     started: Option<Instant>,
     stop: bool,
@@ -43,9 +43,9 @@ impl Drop for Member<'_> {
     }
 }
 
-pub(crate) fn phase(scope: &str) -> Phase {
+pub fn phase(scope: &str) -> Phase {
     use opentelemetry::trace::Tracer as _;
-    let profile = crate::profile::span(scope);
+    let profile = smallclaims::profile::span(scope);
     let name = match scope {
         "pass/changes" => "st.reconcile.changes",
         "pass/gate-runners" => "st.reconcile.gate-runners",
@@ -81,13 +81,13 @@ pub(crate) fn phase(scope: &str) -> Phase {
 }
 
 impl Phase {
-    pub(crate) fn member(&mut self, stop: bool) -> Member<'_> {
-        let profile = crate::profile::span(if stop { "pass/member stop" } else { "pass/member live" });
+    pub fn member(&mut self, stop: bool) -> Member<'_> {
+        let profile = smallclaims::profile::span(if stop { "pass/member stop" } else { "pass/member live" });
         let started = self.members.as_ref().map(|_| Instant::now());
         Member { _profile: profile, phase: self, started, stop }
     }
 
-    pub(crate) fn items(&mut self, count: usize) {
+    pub fn items(&mut self, count: usize) {
         use opentelemetry::trace::Span as _;
         if let Some(span) = &mut self.span {
             span.set_attribute(KeyValue::new("st.reconcile.items", i64::try_from(count).unwrap_or(i64::MAX)));
@@ -116,7 +116,7 @@ impl Drop for Phase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
-pub(crate) enum WakeCause {
+pub enum WakeCause {
     Api,
     ReplicationReceive,
     Deadline,
@@ -136,7 +136,7 @@ pub(crate) enum WakeCause {
     Other,
 }
 impl WakeCause {
-    pub(crate) const ALL: [Self; 17] = [
+    pub const ALL: [Self; 17] = [
         Self::Api,
         Self::ReplicationReceive,
         Self::Deadline,
@@ -180,7 +180,7 @@ impl From<&str> for WakeCause {
     }
 }
 impl WakeCause {
-    pub(crate) const fn legacy_str(self) -> &'static str {
+    pub const fn legacy_str(self) -> &'static str {
         match self {
             Self::Api => "api",
             Self::ReplicationReceive => "replication receive",
@@ -201,7 +201,7 @@ impl WakeCause {
             Self::Other => "other",
         }
     }
-    pub(crate) const fn otel_str(self) -> &'static str {
+    pub const fn otel_str(self) -> &'static str {
         match self {
             Self::Api => "api",
             Self::ReplicationReceive => "replication_receive",
@@ -260,40 +260,40 @@ static METRICS: LazyLock<Instruments> = LazyLock::new(|| {
             .build(),
     }
 });
-pub(crate) fn init() {
+pub fn init() {
     LazyLock::force(&ATTRIBUTES);
     LazyLock::force(&TASKS);
     LazyLock::force(&METRICS);
     smallclaims::fifo::init(&opentelemetry::global::meter("st3.fifo"));
 }
 /// Notify coalesces wakes: the next pass carries the last recorded cause, not a request parent.
-pub(crate) fn record_wake(cause: WakeCause, detail: Option<&str>) {
-    crate::performance::record_wake(cause.legacy_str(), detail);
+pub fn record_wake(cause: WakeCause, detail: Option<&str>) {
+    smallclaims::performance::record_wake(cause.legacy_str(), detail);
     PENDING.store(cause as usize, Ordering::Relaxed);
     if crate::otel::metrics_enabled() {
         METRICS.wakes.add(1, &ATTRIBUTES[cause as usize]);
     }
 }
 /// A rejected physical capture is visible without unbounded subject metric labels.
-pub(crate) fn record_runtime_observation_drop() {
+pub fn record_runtime_observation_drop() {
     if crate::otel::metrics_enabled() {
         METRICS.observation_drops.add(1, &[]);
     }
 }
 
-pub(crate) fn take_wake() -> WakeCause {
+pub fn take_wake() -> WakeCause {
     WakeCause::ALL[PENDING.swap(WakeCause::Other as usize, Ordering::Relaxed)]
 }
 
 /// Count completed passes in one outer wake, including a wake that reaches the continuation cap.
-pub(crate) fn record_wake_passes(passes: usize, cause: WakeCause) {
+pub fn record_wake_passes(passes: usize, cause: WakeCause) {
     if crate::otel::metrics_enabled() {
         METRICS.passes_per_wake.record(passes as u64, &ATTRIBUTES[cause as usize]);
     }
 }
 
 /// Fault isolation lets the pass continue, but its root must still be retained as an error.
-pub(crate) fn record_error() {
+pub fn record_error() {
     if !crate::otel::export_enabled() {
         return;
     }
@@ -308,13 +308,13 @@ pub(crate) fn record_error() {
     }
 }
 
-pub(crate) struct Operation {
+pub struct Operation {
     started: Option<Instant>,
     task: usize,
-    pub(crate) span: tracing::Span,
+    pub span: tracing::Span,
 }
 impl Operation {
-    pub(crate) fn new(deadline: bool, cause: WakeCause) -> Self {
+    pub fn new(deadline: bool, cause: WakeCause) -> Self {
         let span = if !crate::otel::export_enabled() {
             tracing::Span::none()
         } else {
@@ -336,7 +336,7 @@ impl Operation {
             span,
         }
     }
-    pub(crate) fn error(&self) {
+    pub fn error(&self) {
         self.span
             .set_status(opentelemetry::trace::Status::error("reconcile failed"));
     }
