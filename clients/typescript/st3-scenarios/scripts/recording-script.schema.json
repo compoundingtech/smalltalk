@@ -4,13 +4,27 @@
   "additionalProperties": false,
   "required": ["format_version", "world", "agent", "host", "person", "workspace", "id_map", "turns", "reads"],
   "properties": {
-    "format_version": { "const": 1 },
+    "format_version": { "enum": [1, 2] },
     "world": { "type": "string" },
+    "anchor": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$" },
     "agent": { "type": "string" },
     "host": { "type": "string" },
     "person": { "type": "string" },
     "workspace": { "type": "string" },
     "id_map": { "type": "object", "additionalProperties": { "type": "string" } },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent", "host"],
+        "properties": { "agent": { "type": "string" }, "host": { "type": "string" } }
+      }
+    },
+    "historical_turns": { "type": "integer", "minimum": 0 },
+    "empty_baseline": { "type": "boolean" },
+    "walk_pages": { "type": "boolean" },
+    "reconnect_after": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "uniqueItems": true },
     "turns": {
       "type": "array",
       "items": {
@@ -21,10 +35,26 @@
           "prompt": { "type": "string" },
           "answer": { "type": "string" },
           "timestamp": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$" },
-          "command": { "type": "string" }
+          "command": { "type": "string" },
+          "agent": { "type": "string" },
+          "revisions": { "type": "array", "items": { "type": "string" } },
+          "tool": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name", "input", "result"],
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "input": {},
+              "result": {}
+            }
+          }
         }
       }
     },
     "reads": { "type": "array", "items": { "type": "string" } }
-  }
+  },
+  "allOf": [
+    { "if": { "properties": { "format_version": { "const": 2 } } }, "then": { "required": ["anchor"] } }
+  ]
 }

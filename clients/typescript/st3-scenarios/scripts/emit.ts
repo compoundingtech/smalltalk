@@ -2,7 +2,7 @@
  * The only writer of `fixtures/scenarios`. `--check` generates into a temporary directory and
  * fails on any byte difference, naming each stale, missing or extra file.
  */
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,15 +11,26 @@ import { ANCHOR, ANCHOR_MS, catalog, loadWorld, SLICE_KINDS, wireValues, type An
 import { loadDefinitions, makeInstantFinder } from './times.ts'
 import { rebaseVectors } from './vectors.ts'
 import { decodeRecording, decodeScript, normalizeRecording } from './recordings.ts'
+import { NARRATIVE_RECORDINGS, narrativeScript } from './narrative-scripts.ts'
 
 export const FIXTURES_DIR = fileURLToPath(new URL('../../../../fixtures/scenarios/', import.meta.url))
 export const SLICE_FORMAT = 'st3.scenario.slice.v1'
 export const RECORDINGS_DIR = fileURLToPath(new URL('../recordings/', import.meta.url))
 
-/** Recorder inputs are source files, not generated files; only normalized siblings are emitted. */
+/** Raw recordings and the version-1 proof script are inputs; narrative scripts are generated. */
 export const generateRecordings = (root: string = RECORDINGS_DIR): Map<string, string> => {
   const files = new Map<string, string>()
-  for (const name of readdirSync(root).filter((name) => name.endsWith('.script.json')).sort()) {
+  const generated = new Set<string>()
+  for (const id of NARRATIVE_RECORDINGS) {
+    const name = `${id}.script.json`
+    generated.add(name)
+    const raw = join(root, `${id}.recording.jsonl`)
+    const rows = existsSync(raw) ? decodeRecording(readFileSync(raw, 'utf8')) : []
+    const script = narrativeScript(id, rows)
+    files.set(name, canonicalJson(script))
+    if (rows.length) files.set(`${id}.normalized.json`, canonicalJson(normalizeRecording(script, rows, ANCHOR_MS)))
+  }
+  for (const name of readdirSync(root).filter((name) => name.endsWith('.script.json') && !generated.has(name)).sort()) {
     const stem = name.slice(0, -'.script.json'.length)
     const script = decodeScript(JSON.parse(readFileSync(join(root, name), 'utf8')))
     const rows = decodeRecording(readFileSync(join(root, `${stem}.recording.jsonl`), 'utf8'))
@@ -153,10 +164,10 @@ export const checkTree = (root: string, files: Map<string, string> = generate())
   }
 }
 
-/** Compare only generated normalized outputs; script/raw inputs are deliberately not extras. */
+/** Generated narrative scripts and normalized outputs both participate in freshness. */
 export const checkRecordings = (root: string = RECORDINGS_DIR): FreshnessProblem[] => {
   const files = generateRecordings(root)
-  const actual = new Set(readdirSync(root).filter((name) => name.endsWith('.normalized.json')))
+  const actual = new Set(readdirSync(root).filter((name) => name.endsWith('.normalized.json') || NARRATIVE_RECORDINGS.some((id) => name === `${id}.script.json`)))
   const problems: FreshnessProblem[] = []
   for (const [path, bytes] of files) {
     if (!actual.has(path)) problems.push({ path, problem: 'missing' })
@@ -189,6 +200,6 @@ if (import.meta.main) {
       if (!recordings.has(name)) rmSync(join(RECORDINGS_DIR, name))
     }
     writeTree(RECORDINGS_DIR, recordings)
-    console.log(`emit: wrote ${recordings.size} normalized recordings`)
+    console.log(`emit: wrote ${recordings.size} generated recording files`)
   }
 }

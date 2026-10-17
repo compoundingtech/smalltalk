@@ -1,0 +1,93 @@
+{
+  "agent": "agent/example/sprout/builder",
+  "agents": [
+    {
+      "agent": "agent/example/sprout/builder",
+      "host": "host/quarry"
+    }
+  ],
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "empty_baseline": true,
+  "format_version": 2,
+  "historical_turns": 0,
+  "host": "host/quarry",
+  "id_map": {
+    "27177e18-4c2d-517c-84af-8a46405ca683": "message/scenario-first-run-onboarding/captured-6",
+    "3e59d868-c554-5ea7-abe5-c140a7250f3e": "message/scenario-first-run-onboarding/captured-27",
+    "88164bfc-05a1-51b2-ae5e-fc9cd6cbcaa0": "message/scenario-first-run-onboarding/captured-24",
+    "action/example-attach": "action/example-attach",
+    "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef": "message/scenario-first-run-onboarding/captured-12",
+    "agent/example/sprout/builder": "agent/example/sprout/builder",
+    "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91": "message/scenario-first-run-onboarding/captured-9",
+    "d5e0fcbb-3867-5369-9cec-4e9a180b2533": "message/scenario-first-run-onboarding/captured-18",
+    "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f": "message/scenario-first-run-onboarding/captured-21",
+    "ecde7c89-9cb8-5d44-89fe-f055d96e63a9": "message/scenario-first-run-onboarding/captured-15",
+    "host/quarry": "host/quarry",
+    "person/ada": "person/ada",
+    "runtime/example-sprout-builder": "runtime/example-sprout-builder",
+    "runtime/example-sprout-builder-shell": "runtime/example-sprout-builder-shell",
+    "session/89fb4d8c067c28167f6c0cc3": "session/example-sprout-builder",
+    "session/example-sprout-builder": "session/example-sprout-builder",
+    "terminal/agent/example/sprout/builder": "terminal/example-sprout-builder",
+    "terminal/example-sprout-builder": "terminal/example-sprout-builder",
+    "timeline-entry/89fb4d8c067c28167f6c0cc3/367a470219f2514c17b13f4f": "timeline-entry/scenario-first-run-onboarding/captured-2",
+    "timeline-entry/89fb4d8c067c28167f6c0cc3/7619ac5b48c6bf55c9526908": "timeline-entry/scenario-first-run-onboarding/captured-4",
+    "timeline-entry/89fb4d8c067c28167f6c0cc3/9561dcd5bbf8a300b4b22ecd": "timeline-entry/scenario-first-run-onboarding/captured-3",
+    "timeline-entry/89fb4d8c067c28167f6c0cc3/aab3b320dffcf9f9fc8ca480": "timeline-entry/scenario-first-run-onboarding/captured-5",
+    "timeline-entry/89fb4d8c067c28167f6c0cc3/eef28a2a734491126c88b7e8": "timeline-entry/scenario-first-run-onboarding/captured-1",
+    "timeline-entry/native-13824": "timeline-entry/scenario-first-run-onboarding/captured-16",
+    "timeline-entry/native-13825": "timeline-entry/scenario-first-run-onboarding/captured-17",
+    "timeline-entry/native-16": "timeline-entry/scenario-first-run-onboarding/captured-7",
+    "timeline-entry/native-17": "timeline-entry/scenario-first-run-onboarding/captured-8",
+    "timeline-entry/native-19504": "timeline-entry/scenario-first-run-onboarding/captured-19",
+    "timeline-entry/native-19505": "timeline-entry/scenario-first-run-onboarding/captured-20",
+    "timeline-entry/native-24944": "timeline-entry/scenario-first-run-onboarding/captured-22",
+    "timeline-entry/native-24945": "timeline-entry/scenario-first-run-onboarding/captured-23",
+    "timeline-entry/native-30240": "timeline-entry/scenario-first-run-onboarding/captured-25",
+    "timeline-entry/native-30241": "timeline-entry/scenario-first-run-onboarding/captured-26",
+    "timeline-entry/native-34496": "timeline-entry/scenario-first-run-onboarding/captured-28",
+    "timeline-entry/native-34497": "timeline-entry/scenario-first-run-onboarding/captured-29",
+    "timeline-entry/native-4272": "timeline-entry/scenario-first-run-onboarding/captured-10",
+    "timeline-entry/native-4273": "timeline-entry/scenario-first-run-onboarding/captured-11",
+    "timeline-entry/native-9568": "timeline-entry/scenario-first-run-onboarding/captured-13",
+    "timeline-entry/native-9569": "timeline-entry/scenario-first-run-onboarding/captured-14"
+  },
+  "person": "person/ada",
+  "reads": [
+    "/v1/client/agents",
+    "/v1/client/sessions/agent/example/sprout/builder/timeline",
+    "/v1/client/terminals/agent%2Fexample%2Fsprout%2Fbuilder/screen"
+  ],
+  "reconnect_after": [],
+  "turns": [
+    {
+      "agent": "agent/example/sprout/builder",
+      "answer": "The first mission is running. Checking sprout now.",
+      "prompt": "Launch the smoke check.",
+      "timestamp": "2030-01-01T12:00:05.000Z"
+    },
+    {
+      "agent": "agent/example/sprout/builder",
+      "answer": "Observed shell result for Launch the smoke check..",
+      "command": "printf '%s\\n' '$ pnpm test smoke' '\u001b[32m3 tests passed; 0 failures\u001b[0m'",
+      "prompt": "Launch the smoke check.",
+      "timestamp": "2030-01-01T12:00:09.000Z",
+      "tool": {
+        "id": "call-builder-4",
+        "input": {
+          "command": "pnpm test smoke"
+        },
+        "name": "shell",
+        "result": "3 tests passed; 0 failures"
+      }
+    },
+    {
+      "agent": "agent/example/sprout/builder",
+      "answer": "The first run is green: 3 tests passed, 0 failures.",
+      "prompt": "Launch the smoke check.",
+      "timestamp": "2030-01-01T12:00:11.000Z"
+    }
+  ],
+  "workspace": "~/src/sprout/.worktrees/builder",
+  "world": "first-run-onboarding"
+}

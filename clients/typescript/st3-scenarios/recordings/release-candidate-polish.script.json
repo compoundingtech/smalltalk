@@ -1,0 +1,147 @@
+{
+  "agent": "agent/example/meadow/builder",
+  "agents": [
+    {
+      "agent": "agent/example/meadow/builder",
+      "host": "host/quarry"
+    },
+    {
+      "agent": "agent/example/meadow/docs",
+      "host": "host/quarry"
+    }
+  ],
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "empty_baseline": false,
+  "format_version": 2,
+  "historical_turns": 4,
+  "host": "host/quarry",
+  "id_map": {
+    "22653a08-a560-5d20-960d-c982844929e0": "message/scenario-release-candidate-polish/captured-37",
+    "27177e18-4c2d-517c-84af-8a46405ca683": "message/scenario-release-candidate-polish/captured-10",
+    "3e59d868-c554-5ea7-abe5-c140a7250f3e": "message/scenario-release-candidate-polish/captured-34",
+    "467d8459-5357-5351-b055-de4267fad9a9": "message/scenario-release-candidate-polish/captured-46",
+    "5192796c-3128-5bd3-ade4-fe3c36176c2c": "message/scenario-release-candidate-polish/captured-45",
+    "664b9c46-9d50-524b-aa8d-86f0cdcfba0b": "message/scenario-release-candidate-polish/captured-40",
+    "88164bfc-05a1-51b2-ae5e-fc9cd6cbcaa0": "message/scenario-release-candidate-polish/captured-31",
+    "action/example-attach": "action/example-attach",
+    "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef": "message/scenario-release-candidate-polish/captured-16",
+    "agent/example/meadow/builder": "agent/example/meadow/builder",
+    "agent/example/meadow/docs": "agent/example/meadow/docs",
+    "agent/example/meadow/reviewer": "agent/example/meadow/reviewer",
+    "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91": "message/scenario-release-candidate-polish/captured-13",
+    "d5e0fcbb-3867-5369-9cec-4e9a180b2533": "message/scenario-release-candidate-polish/captured-22",
+    "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f": "message/scenario-release-candidate-polish/captured-28",
+    "ecde7c89-9cb8-5d44-89fe-f055d96e63a9": "message/scenario-release-candidate-polish/captured-19",
+    "host/lantern": "host/lantern",
+    "host/quarry": "host/quarry",
+    "message/85599d3b1b4f18271f7f5912": "message/scenario-release-candidate-polish/captured-43",
+    "person/ada": "person/ada",
+    "runtime/example-meadow-builder": "runtime/example-meadow-builder",
+    "runtime/example-meadow-builder-shell": "runtime/example-meadow-builder-shell",
+    "runtime/example-meadow-docs": "runtime/example-meadow-docs",
+    "runtime/example-meadow-docs-shell": "runtime/example-meadow-docs-shell",
+    "runtime/example-meadow-reviewer": "runtime/example-meadow-reviewer",
+    "runtime/example-meadow-reviewer-shell": "runtime/example-meadow-reviewer-shell",
+    "session/695337c3809846f39ff08939": "session/example-meadow-builder",
+    "session/6ec5793d2d11bf10f2f19ad2": "session/example-meadow-docs",
+    "session/example-meadow-builder": "session/example-meadow-builder",
+    "session/example-meadow-docs": "session/example-meadow-docs",
+    "session/example-meadow-reviewer": "session/example-meadow-reviewer",
+    "terminal/agent/example/meadow/builder": "terminal/example-meadow-builder",
+    "terminal/example-meadow-builder": "terminal/example-meadow-builder",
+    "terminal/example-meadow-docs": "terminal/example-meadow-docs",
+    "terminal/example-meadow-reviewer": "terminal/example-meadow-reviewer",
+    "timeline-entry/695337c3809846f39ff08939/10a8781c95ea44a2e1c5ae39": "timeline-entry/scenario-release-candidate-polish/captured-2",
+    "timeline-entry/695337c3809846f39ff08939/2950cd7b53ee27c003646454": "timeline-entry/scenario-release-candidate-polish/captured-1",
+    "timeline-entry/695337c3809846f39ff08939/892f759143e401b4f4923b71": "timeline-entry/scenario-release-candidate-polish/captured-9",
+    "timeline-entry/695337c3809846f39ff08939/8dfe84e840f4faab1c6b350a": "timeline-entry/scenario-release-candidate-polish/captured-4",
+    "timeline-entry/695337c3809846f39ff08939/9234da6c7e7088802fe040a7": "timeline-entry/scenario-release-candidate-polish/captured-3",
+    "timeline-entry/6ec5793d2d11bf10f2f19ad2/3a94b05c8f4a4dd84442c3e8": "timeline-entry/scenario-release-candidate-polish/captured-26",
+    "timeline-entry/6ec5793d2d11bf10f2f19ad2/539e093c973d9754585c9061": "timeline-entry/scenario-release-candidate-polish/captured-27",
+    "timeline-entry/6ec5793d2d11bf10f2f19ad2/6042cbc5922a38c6c556caa8": "timeline-entry/scenario-release-candidate-polish/captured-25",
+    "timeline-entry/6ec5793d2d11bf10f2f19ad2/87e4992c617afe9412c93c8a": "timeline-entry/scenario-release-candidate-polish/captured-5",
+    "timeline-entry/6ec5793d2d11bf10f2f19ad2/8d6f18b3d8ad133ee7b2720e": "timeline-entry/scenario-release-candidate-polish/captured-8",
+    "timeline-entry/6ec5793d2d11bf10f2f19ad2/9c06c43400d588dff7b5478f": "timeline-entry/scenario-release-candidate-polish/captured-6",
+    "timeline-entry/6ec5793d2d11bf10f2f19ad2/cb4b465f2b9f5458d91bf5f5": "timeline-entry/scenario-release-candidate-polish/captured-7",
+    "timeline-entry/f4c10ad0fe3b50191188b98f0424a1c8": "timeline-entry/scenario-release-candidate-polish/captured-44",
+    "timeline-entry/native-12640": "timeline-entry/scenario-release-candidate-polish/captured-17",
+    "timeline-entry/native-12641": "timeline-entry/scenario-release-candidate-polish/captured-18",
+    "timeline-entry/native-16": "timeline-entry/scenario-release-candidate-polish/captured-11",
+    "timeline-entry/native-17": "timeline-entry/scenario-release-candidate-polish/captured-12",
+    "timeline-entry/native-19504": "timeline-entry/scenario-release-candidate-polish/captured-20",
+    "timeline-entry/native-19505": "timeline-entry/scenario-release-candidate-polish/captured-21",
+    "timeline-entry/native-26112": "timeline-entry/scenario-release-candidate-polish/captured-23",
+    "timeline-entry/native-26113": "timeline-entry/scenario-release-candidate-polish/captured-24",
+    "timeline-entry/native-31696": "timeline-entry/scenario-release-candidate-polish/captured-29",
+    "timeline-entry/native-31697": "timeline-entry/scenario-release-candidate-polish/captured-30",
+    "timeline-entry/native-40080": "timeline-entry/scenario-release-candidate-polish/captured-32",
+    "timeline-entry/native-40081": "timeline-entry/scenario-release-candidate-polish/captured-33",
+    "timeline-entry/native-4240": "timeline-entry/scenario-release-candidate-polish/captured-47",
+    "timeline-entry/native-4241": "timeline-entry/scenario-release-candidate-polish/captured-48",
+    "timeline-entry/native-48352": "timeline-entry/scenario-release-candidate-polish/captured-35",
+    "timeline-entry/native-48353": "timeline-entry/scenario-release-candidate-polish/captured-36",
+    "timeline-entry/native-54960": "timeline-entry/scenario-release-candidate-polish/captured-38",
+    "timeline-entry/native-54961": "timeline-entry/scenario-release-candidate-polish/captured-39",
+    "timeline-entry/native-5600": "timeline-entry/scenario-release-candidate-polish/captured-14",
+    "timeline-entry/native-5601": "timeline-entry/scenario-release-candidate-polish/captured-15",
+    "timeline-entry/native-60544": "timeline-entry/scenario-release-candidate-polish/captured-41",
+    "timeline-entry/native-60545": "timeline-entry/scenario-release-candidate-polish/captured-42"
+  },
+  "person": "person/ada",
+  "reads": [
+    "/v1/client/agents",
+    "/v1/client/sessions/agent/example/meadow/builder/timeline",
+    "/v1/client/sessions/agent/example/meadow/docs/timeline",
+    "/v1/client/terminals/agent%2Fexample%2Fmeadow%2Fbuilder/screen"
+  ],
+  "reconnect_after": [],
+  "turns": [
+    {
+      "agent": "agent/example/meadow/builder",
+      "answer": "Observed edit result for Prepare the 0.8.4 candidate. Limit changes to the patch version and release notes, then verify the matrix..",
+      "prompt": "Prepare the 0.8.4 candidate. Limit changes to the patch version and release notes, then verify the matrix.",
+      "timestamp": "2030-01-01T11:48:00.000Z",
+      "tool": {
+        "id": "call-builder-3",
+        "input": {
+          "new_string": "{ \"version\": \"0.8.4\" }\n",
+          "old_string": "{ \"version\": \"0.8.3\" }\n",
+          "path": "package.json"
+        },
+        "name": "edit",
+        "result": "--- a/package.json\n+++ b/package.json\n@@ -1,1 +1,1 @@\n-{ \"version\": \"0.8.3\" }\n+{ \"version\": \"0.8.4\" }\n"
+      }
+    },
+    {
+      "agent": "agent/example/meadow/builder",
+      "answer": "Observed edit result for Prepare the 0.8.4 candidate. Limit changes to the patch version and release notes, then verify the matrix..",
+      "prompt": "Prepare the 0.8.4 candidate. Limit changes to the patch version and release notes, then verify the matrix.",
+      "timestamp": "2030-01-01T11:50:00.000Z",
+      "tool": {
+        "id": "call-builder-5",
+        "input": {
+          "new_string": "# Changelog\n\n## 0.8.4\n- Preserve selected tabs when reopening the settings panel.\n- Clarify the offline recovery message.\n",
+          "old_string": "# Changelog\n",
+          "path": "CHANGELOG.md"
+        },
+        "name": "edit",
+        "result": "--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n@@ -1,1 +1,5 @@\n-# Changelog\n+# Changelog\n+\n+## 0.8.4\n+- Preserve selected tabs when reopening the settings panel.\n+- Clarify the offline recovery message.\n"
+      }
+    },
+    {
+      "agent": "agent/example/meadow/builder",
+      "answer": "The 0.8.4 candidate is ready. Linux and macOS unit tests, typecheck, lint, package smoke tests and release-note checks all passed. No API changes; no remaining release gates. I am idle until the release is tagged.",
+      "command": "printf '%s\\n' '$ pnpm release:verify --version 0.8.4' '\u001b[32mmeadow\u001b[0m:builder $ pnpm release:verify --version 0.8.4\nRelease candidate 0.8.4\nlinux   unit tests       PASS (184 tests)\nmacos   unit tests       PASS (184 tests)\nall     typecheck        PASS\nall     lint             PASS\nall     package smoke    PASS\nall     release notes    PASS\nMatrix: 6/6 checks passed\nExit code: 0\n\u001b[32mmeadow\u001b[0m:builder $ '",
+      "prompt": "Prepare the 0.8.4 candidate. Limit changes to the patch version and release notes, then verify the matrix.",
+      "timestamp": "2030-01-01T11:51:00.000Z"
+    },
+    {
+      "agent": "agent/example/meadow/docs",
+      "answer": "Release notes for 0.8.4 are complete: preserve selected tabs when reopening settings and clarify offline recovery. No API changes or remaining release gates.",
+      "prompt": "Write the changelog",
+      "timestamp": "2030-01-01T11:57:00.000Z"
+    }
+  ],
+  "workspace": "~/src/meadow/.worktrees/builder",
+  "world": "release-candidate-polish"
+}

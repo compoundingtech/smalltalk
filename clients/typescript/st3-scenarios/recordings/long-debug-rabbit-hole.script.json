@@ -1,0 +1,428 @@
+{
+  "agent": "agent/example/atlas/builder",
+  "agents": [
+    {
+      "agent": "agent/example/atlas/builder",
+      "host": "host/lantern"
+    }
+  ],
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "empty_baseline": false,
+  "format_version": 2,
+  "historical_turns": 19,
+  "host": "host/lantern",
+  "id_map": {
+    "04aea0e1-7cae-519a-ad75-cffc269a727d": "message/scenario-long-debug-rabbit-hole/captured-81",
+    "0592fa9d-5d88-51a0-9a1d-2ec67067b03a": "message/scenario-long-debug-rabbit-hole/captured-177",
+    "0e861d7f-9e06-576f-aa1c-6b469603c652": "message/scenario-long-debug-rabbit-hole/captured-93",
+    "0ed84b8d-8116-5da1-b152-2f01a211ac11": "message/scenario-long-debug-rabbit-hole/captured-99",
+    "13fba2fb-8fbc-56ac-989f-f41c07a047e9": "message/scenario-long-debug-rabbit-hole/captured-156",
+    "16fdea40-d13b-5957-b2e5-7a45ad595faf": "message/scenario-long-debug-rabbit-hole/captured-45",
+    "19a49f27-ea8c-5f6b-b30c-6958f6fd3829": "message/scenario-long-debug-rabbit-hole/captured-42",
+    "1a6858f1-7b09-526d-957e-61646653cfd0": "message/scenario-long-debug-rabbit-hole/captured-126",
+    "22653a08-a560-5d20-960d-c982844929e0": "message/scenario-long-debug-rabbit-hole/captured-30",
+    "27177e18-4c2d-517c-84af-8a46405ca683": "message/scenario-long-debug-rabbit-hole/captured-6",
+    "2eb85a86-58d3-5a08-8f9f-282a7c754648": "message/scenario-long-debug-rabbit-hole/captured-78",
+    "31b7ecf2-14ba-5870-ac2f-7ab200283410": "message/scenario-long-debug-rabbit-hole/captured-141",
+    "3375778d-cafa-58a2-99d8-8fe426bb938c": "message/scenario-long-debug-rabbit-hole/captured-66",
+    "342f509b-5d76-5860-ad6a-a1e794f7130e": "message/scenario-long-debug-rabbit-hole/captured-96",
+    "358693df-55a0-54d5-abeb-81d4549ef993": "message/scenario-long-debug-rabbit-hole/captured-183",
+    "3e59d868-c554-5ea7-abe5-c140a7250f3e": "message/scenario-long-debug-rabbit-hole/captured-27",
+    "4296f888-1ccc-57a8-b508-d9830dfa7148": "message/scenario-long-debug-rabbit-hole/captured-168",
+    "4432f5aa-5009-5fdd-b443-810e45400115": "message/scenario-long-debug-rabbit-hole/captured-51",
+    "47279687-8ffd-5c51-8c55-1a3b43beecf7": "message/scenario-long-debug-rabbit-hole/captured-102",
+    "47a7c7bd-f213-5655-aebb-103d993f6224": "message/scenario-long-debug-rabbit-hole/captured-123",
+    "55a18962-c32d-5a69-beec-a9d6a50c8411": "message/scenario-long-debug-rabbit-hole/captured-87",
+    "57c4e0de-4399-57b9-8792-2b8c353c7e9f": "message/scenario-long-debug-rabbit-hole/captured-165",
+    "5a886574-3788-5bf2-b983-300f8b867750": "message/scenario-long-debug-rabbit-hole/captured-114",
+    "5d53fd56-cc48-5e72-aaf2-4c546e7e2736": "message/scenario-long-debug-rabbit-hole/captured-75",
+    "61d6b5a4-1e54-5054-be90-b941ab9f9785": "message/scenario-long-debug-rabbit-hole/captured-69",
+    "664b9c46-9d50-524b-aa8d-86f0cdcfba0b": "message/scenario-long-debug-rabbit-hole/captured-33",
+    "793abab4-75f1-5968-b9b5-306d8d5f50b7": "message/scenario-long-debug-rabbit-hole/captured-159",
+    "88164bfc-05a1-51b2-ae5e-fc9cd6cbcaa0": "message/scenario-long-debug-rabbit-hole/captured-24",
+    "897ac304-e4ce-55d2-a15c-27ff1f0ba2e7": "message/scenario-long-debug-rabbit-hole/captured-72",
+    "8a44fb5a-068e-5246-babe-66d52d86b9de": "message/scenario-long-debug-rabbit-hole/captured-180",
+    "902449cd-4c09-5e03-b387-dc7df1a9c6e7": "message/scenario-long-debug-rabbit-hole/captured-153",
+    "904b081c-9bb6-5128-82a3-b600773651ff": "message/scenario-long-debug-rabbit-hole/captured-147",
+    "93db3116-6722-5b8c-8dca-67cb9edd0e9d": "message/scenario-long-debug-rabbit-hole/captured-120",
+    "96737ffb-ccd2-5bb1-bd11-f3c21d2e18ca": "message/scenario-long-debug-rabbit-hole/captured-60",
+    "98b26960-6da6-5c3a-9ea8-bd230afc3ba4": "message/scenario-long-debug-rabbit-hole/captured-132",
+    "a105847d-1190-5633-bf25-c50d758698e5": "message/scenario-long-debug-rabbit-hole/captured-105",
+    "a2160009-6349-5e21-aaca-ff53548bbafc": "message/scenario-long-debug-rabbit-hole/captured-90",
+    "acd57ac3-2fff-5389-a0fd-34d4ec873b8f": "message/scenario-long-debug-rabbit-hole/captured-174",
+    "acde1bb4-4c7e-5cc5-9d2d-6dd8f054d62a": "message/scenario-long-debug-rabbit-hole/captured-39",
+    "action/example-attach": "action/example-attach",
+    "ae34aa45-54d0-54e2-9c05-f3c0a5d65fef": "message/scenario-long-debug-rabbit-hole/captured-12",
+    "ae6cd380-1440-5b92-8b40-c83035ca7ed5": "message/scenario-long-debug-rabbit-hole/captured-57",
+    "af7c34dc-c14e-5a5b-8ba6-4ab2dcb2f98c": "message/scenario-long-debug-rabbit-hole/captured-54",
+    "agent/example/atlas/builder": "agent/example/atlas/builder",
+    "b478d53b-782c-56cb-8c42-086e01101682": "message/scenario-long-debug-rabbit-hole/captured-135",
+    "b4c52710-ce0b-5de8-89f3-8d9ba54d6f91": "message/scenario-long-debug-rabbit-hole/captured-9",
+    "cae19314-dcf0-5974-b0b3-821cd5ea2732": "message/scenario-long-debug-rabbit-hole/captured-36",
+    "cc7c861b-5d8f-5db6-a4b9-03eb6b4dd10e": "message/scenario-long-debug-rabbit-hole/captured-108",
+    "ceb55ecc-8330-5e2e-a870-3811d2068729": "message/scenario-long-debug-rabbit-hole/captured-171",
+    "d5e0fcbb-3867-5369-9cec-4e9a180b2533": "message/scenario-long-debug-rabbit-hole/captured-18",
+    "d73a8142-8d45-5cdc-a719-9a664055c669": "message/scenario-long-debug-rabbit-hole/captured-63",
+    "d8137e5a-a686-52e7-9a37-07e845373540": "message/scenario-long-debug-rabbit-hole/captured-117",
+    "e0c55107-290f-59df-965b-e95063d17b42": "message/scenario-long-debug-rabbit-hole/captured-129",
+    "e6c7aca8-e795-51b4-8dd3-ba13765c5712": "message/scenario-long-debug-rabbit-hole/captured-48",
+    "eb405f94-5157-5650-a822-36ea8d1b1c1a": "message/scenario-long-debug-rabbit-hole/captured-150",
+    "eba35e9a-f359-5a01-843d-e7cccdc376bb": "message/scenario-long-debug-rabbit-hole/captured-144",
+    "ebc67194-c4ab-59b4-8ed9-6f73cc9a950f": "message/scenario-long-debug-rabbit-hole/captured-21",
+    "ecde7c89-9cb8-5d44-89fe-f055d96e63a9": "message/scenario-long-debug-rabbit-hole/captured-15",
+    "ed21cf6a-dde1-5e61-beb7-e8ddb8278f6d": "message/scenario-long-debug-rabbit-hole/captured-84",
+    "f3efab5c-0de7-50c1-b6ca-00c9f5208f9f": "message/scenario-long-debug-rabbit-hole/captured-138",
+    "fd96649b-5a36-5b1f-bd3e-82246c439376": "message/scenario-long-debug-rabbit-hole/captured-162",
+    "fdc5e30b-aee1-5b3f-ba0e-bc7bafb68714": "message/scenario-long-debug-rabbit-hole/captured-111",
+    "host/lantern": "host/lantern",
+    "person/ada": "person/ada",
+    "runtime/example-atlas-builder": "runtime/example-atlas-builder",
+    "runtime/example-atlas-builder-shell": "runtime/example-atlas-builder-shell",
+    "session/5193817fac047cfc47f5d00a": "session/example-atlas-builder",
+    "session/example-atlas-builder": "session/example-atlas-builder",
+    "terminal/agent/example/atlas/builder": "terminal/example-atlas-builder",
+    "terminal/example-atlas-builder": "terminal/example-atlas-builder",
+    "timeline-entry/5193817fac047cfc47f5d00a/2417acbd44ab63e247677267": "timeline-entry/scenario-long-debug-rabbit-hole/captured-3",
+    "timeline-entry/5193817fac047cfc47f5d00a/39acca984e68b6b808094bfc": "timeline-entry/scenario-long-debug-rabbit-hole/captured-5",
+    "timeline-entry/5193817fac047cfc47f5d00a/5aa1e733c64e91898ba0eb63": "timeline-entry/scenario-long-debug-rabbit-hole/captured-1",
+    "timeline-entry/5193817fac047cfc47f5d00a/b01a9f294347b608c67e99a5": "timeline-entry/scenario-long-debug-rabbit-hole/captured-4",
+    "timeline-entry/5193817fac047cfc47f5d00a/c7fa9e2ead3759e1623e0348": "timeline-entry/scenario-long-debug-rabbit-hole/captured-2",
+    "timeline-entry/native-101776": "timeline-entry/scenario-long-debug-rabbit-hole/captured-46",
+    "timeline-entry/native-101777": "timeline-entry/scenario-long-debug-rabbit-hole/captured-47",
+    "timeline-entry/native-10432": "timeline-entry/scenario-long-debug-rabbit-hole/captured-13",
+    "timeline-entry/native-10433": "timeline-entry/scenario-long-debug-rabbit-hole/captured-14",
+    "timeline-entry/native-107744": "timeline-entry/scenario-long-debug-rabbit-hole/captured-49",
+    "timeline-entry/native-107745": "timeline-entry/scenario-long-debug-rabbit-hole/captured-50",
+    "timeline-entry/native-112672": "timeline-entry/scenario-long-debug-rabbit-hole/captured-52",
+    "timeline-entry/native-112673": "timeline-entry/scenario-long-debug-rabbit-hole/captured-53",
+    "timeline-entry/native-119072": "timeline-entry/scenario-long-debug-rabbit-hole/captured-55",
+    "timeline-entry/native-119073": "timeline-entry/scenario-long-debug-rabbit-hole/captured-56",
+    "timeline-entry/native-124592": "timeline-entry/scenario-long-debug-rabbit-hole/captured-58",
+    "timeline-entry/native-124593": "timeline-entry/scenario-long-debug-rabbit-hole/captured-59",
+    "timeline-entry/native-130000": "timeline-entry/scenario-long-debug-rabbit-hole/captured-61",
+    "timeline-entry/native-130001": "timeline-entry/scenario-long-debug-rabbit-hole/captured-62",
+    "timeline-entry/native-135520": "timeline-entry/scenario-long-debug-rabbit-hole/captured-64",
+    "timeline-entry/native-135521": "timeline-entry/scenario-long-debug-rabbit-hole/captured-65",
+    "timeline-entry/native-142656": "timeline-entry/scenario-long-debug-rabbit-hole/captured-67",
+    "timeline-entry/native-142657": "timeline-entry/scenario-long-debug-rabbit-hole/captured-68",
+    "timeline-entry/native-15696": "timeline-entry/scenario-long-debug-rabbit-hole/captured-16",
+    "timeline-entry/native-15697": "timeline-entry/scenario-long-debug-rabbit-hole/captured-17",
+    "timeline-entry/native-16": "timeline-entry/scenario-long-debug-rabbit-hole/captured-7",
+    "timeline-entry/native-161360": "timeline-entry/scenario-long-debug-rabbit-hole/captured-70",
+    "timeline-entry/native-161361": "timeline-entry/scenario-long-debug-rabbit-hole/captured-71",
+    "timeline-entry/native-167920": "timeline-entry/scenario-long-debug-rabbit-hole/captured-73",
+    "timeline-entry/native-167921": "timeline-entry/scenario-long-debug-rabbit-hole/captured-74",
+    "timeline-entry/native-17": "timeline-entry/scenario-long-debug-rabbit-hole/captured-8",
+    "timeline-entry/native-173440": "timeline-entry/scenario-long-debug-rabbit-hole/captured-76",
+    "timeline-entry/native-173441": "timeline-entry/scenario-long-debug-rabbit-hole/captured-77",
+    "timeline-entry/native-180976": "timeline-entry/scenario-long-debug-rabbit-hole/captured-79",
+    "timeline-entry/native-180977": "timeline-entry/scenario-long-debug-rabbit-hole/captured-80",
+    "timeline-entry/native-185888": "timeline-entry/scenario-long-debug-rabbit-hole/captured-82",
+    "timeline-entry/native-185889": "timeline-entry/scenario-long-debug-rabbit-hole/captured-83",
+    "timeline-entry/native-191504": "timeline-entry/scenario-long-debug-rabbit-hole/captured-85",
+    "timeline-entry/native-191505": "timeline-entry/scenario-long-debug-rabbit-hole/captured-86",
+    "timeline-entry/native-196416": "timeline-entry/scenario-long-debug-rabbit-hole/captured-88",
+    "timeline-entry/native-196417": "timeline-entry/scenario-long-debug-rabbit-hole/captured-89",
+    "timeline-entry/native-203584": "timeline-entry/scenario-long-debug-rabbit-hole/captured-91",
+    "timeline-entry/native-203585": "timeline-entry/scenario-long-debug-rabbit-hole/captured-92",
+    "timeline-entry/native-222304": "timeline-entry/scenario-long-debug-rabbit-hole/captured-94",
+    "timeline-entry/native-222305": "timeline-entry/scenario-long-debug-rabbit-hole/captured-95",
+    "timeline-entry/native-228256": "timeline-entry/scenario-long-debug-rabbit-hole/captured-97",
+    "timeline-entry/native-228257": "timeline-entry/scenario-long-debug-rabbit-hole/captured-98",
+    "timeline-entry/native-22832": "timeline-entry/scenario-long-debug-rabbit-hole/captured-19",
+    "timeline-entry/native-22833": "timeline-entry/scenario-long-debug-rabbit-hole/captured-20",
+    "timeline-entry/native-233168": "timeline-entry/scenario-long-debug-rabbit-hole/captured-100",
+    "timeline-entry/native-233169": "timeline-entry/scenario-long-debug-rabbit-hole/captured-101",
+    "timeline-entry/native-239904": "timeline-entry/scenario-long-debug-rabbit-hole/captured-103",
+    "timeline-entry/native-239905": "timeline-entry/scenario-long-debug-rabbit-hole/captured-104",
+    "timeline-entry/native-245120": "timeline-entry/scenario-long-debug-rabbit-hole/captured-106",
+    "timeline-entry/native-245121": "timeline-entry/scenario-long-debug-rabbit-hole/captured-107",
+    "timeline-entry/native-250224": "timeline-entry/scenario-long-debug-rabbit-hole/captured-109",
+    "timeline-entry/native-250225": "timeline-entry/scenario-long-debug-rabbit-hole/captured-110",
+    "timeline-entry/native-255440": "timeline-entry/scenario-long-debug-rabbit-hole/captured-112",
+    "timeline-entry/native-255441": "timeline-entry/scenario-long-debug-rabbit-hole/captured-113",
+    "timeline-entry/native-262560": "timeline-entry/scenario-long-debug-rabbit-hole/captured-115",
+    "timeline-entry/native-262561": "timeline-entry/scenario-long-debug-rabbit-hole/captured-116",
+    "timeline-entry/native-281104": "timeline-entry/scenario-long-debug-rabbit-hole/captured-118",
+    "timeline-entry/native-281105": "timeline-entry/scenario-long-debug-rabbit-hole/captured-119",
+    "timeline-entry/native-287360": "timeline-entry/scenario-long-debug-rabbit-hole/captured-121",
+    "timeline-entry/native-287361": "timeline-entry/scenario-long-debug-rabbit-hole/captured-122",
+    "timeline-entry/native-292576": "timeline-entry/scenario-long-debug-rabbit-hole/captured-124",
+    "timeline-entry/native-292577": "timeline-entry/scenario-long-debug-rabbit-hole/captured-125",
+    "timeline-entry/native-299936": "timeline-entry/scenario-long-debug-rabbit-hole/captured-127",
+    "timeline-entry/native-299937": "timeline-entry/scenario-long-debug-rabbit-hole/captured-128",
+    "timeline-entry/native-304832": "timeline-entry/scenario-long-debug-rabbit-hole/captured-130",
+    "timeline-entry/native-304833": "timeline-entry/scenario-long-debug-rabbit-hole/captured-131",
+    "timeline-entry/native-310448": "timeline-entry/scenario-long-debug-rabbit-hole/captured-133",
+    "timeline-entry/native-310449": "timeline-entry/scenario-long-debug-rabbit-hole/captured-134",
+    "timeline-entry/native-315344": "timeline-entry/scenario-long-debug-rabbit-hole/captured-136",
+    "timeline-entry/native-315345": "timeline-entry/scenario-long-debug-rabbit-hole/captured-137",
+    "timeline-entry/native-322480": "timeline-entry/scenario-long-debug-rabbit-hole/captured-139",
+    "timeline-entry/native-322481": "timeline-entry/scenario-long-debug-rabbit-hole/captured-140",
+    "timeline-entry/native-341024": "timeline-entry/scenario-long-debug-rabbit-hole/captured-142",
+    "timeline-entry/native-341025": "timeline-entry/scenario-long-debug-rabbit-hole/captured-143",
+    "timeline-entry/native-346960": "timeline-entry/scenario-long-debug-rabbit-hole/captured-145",
+    "timeline-entry/native-346961": "timeline-entry/scenario-long-debug-rabbit-hole/captured-146",
+    "timeline-entry/native-351856": "timeline-entry/scenario-long-debug-rabbit-hole/captured-148",
+    "timeline-entry/native-351857": "timeline-entry/scenario-long-debug-rabbit-hole/captured-149",
+    "timeline-entry/native-358144": "timeline-entry/scenario-long-debug-rabbit-hole/captured-151",
+    "timeline-entry/native-358145": "timeline-entry/scenario-long-debug-rabbit-hole/captured-152",
+    "timeline-entry/native-363040": "timeline-entry/scenario-long-debug-rabbit-hole/captured-154",
+    "timeline-entry/native-363041": "timeline-entry/scenario-long-debug-rabbit-hole/captured-155",
+    "timeline-entry/native-371312": "timeline-entry/scenario-long-debug-rabbit-hole/captured-157",
+    "timeline-entry/native-371313": "timeline-entry/scenario-long-debug-rabbit-hole/captured-158",
+    "timeline-entry/native-376208": "timeline-entry/scenario-long-debug-rabbit-hole/captured-160",
+    "timeline-entry/native-376209": "timeline-entry/scenario-long-debug-rabbit-hole/captured-161",
+    "timeline-entry/native-384384": "timeline-entry/scenario-long-debug-rabbit-hole/captured-163",
+    "timeline-entry/native-384385": "timeline-entry/scenario-long-debug-rabbit-hole/captured-164",
+    "timeline-entry/native-392864": "timeline-entry/scenario-long-debug-rabbit-hole/captured-166",
+    "timeline-entry/native-392865": "timeline-entry/scenario-long-debug-rabbit-hole/captured-167",
+    "timeline-entry/native-398784": "timeline-entry/scenario-long-debug-rabbit-hole/captured-169",
+    "timeline-entry/native-398785": "timeline-entry/scenario-long-debug-rabbit-hole/captured-170",
+    "timeline-entry/native-403680": "timeline-entry/scenario-long-debug-rabbit-hole/captured-172",
+    "timeline-entry/native-403681": "timeline-entry/scenario-long-debug-rabbit-hole/captured-173",
+    "timeline-entry/native-410384": "timeline-entry/scenario-long-debug-rabbit-hole/captured-175",
+    "timeline-entry/native-410385": "timeline-entry/scenario-long-debug-rabbit-hole/captured-176",
+    "timeline-entry/native-41456": "timeline-entry/scenario-long-debug-rabbit-hole/captured-22",
+    "timeline-entry/native-41457": "timeline-entry/scenario-long-debug-rabbit-hole/captured-23",
+    "timeline-entry/native-418128": "timeline-entry/scenario-long-debug-rabbit-hole/captured-178",
+    "timeline-entry/native-418129": "timeline-entry/scenario-long-debug-rabbit-hole/captured-179",
+    "timeline-entry/native-424064": "timeline-entry/scenario-long-debug-rabbit-hole/captured-181",
+    "timeline-entry/native-424065": "timeline-entry/scenario-long-debug-rabbit-hole/captured-182",
+    "timeline-entry/native-428960": "timeline-entry/scenario-long-debug-rabbit-hole/captured-184",
+    "timeline-entry/native-428961": "timeline-entry/scenario-long-debug-rabbit-hole/captured-185",
+    "timeline-entry/native-47760": "timeline-entry/scenario-long-debug-rabbit-hole/captured-25",
+    "timeline-entry/native-47761": "timeline-entry/scenario-long-debug-rabbit-hole/captured-26",
+    "timeline-entry/native-5280": "timeline-entry/scenario-long-debug-rabbit-hole/captured-10",
+    "timeline-entry/native-5281": "timeline-entry/scenario-long-debug-rabbit-hole/captured-11",
+    "timeline-entry/native-53024": "timeline-entry/scenario-long-debug-rabbit-hole/captured-28",
+    "timeline-entry/native-53025": "timeline-entry/scenario-long-debug-rabbit-hole/captured-29",
+    "timeline-entry/native-60496": "timeline-entry/scenario-long-debug-rabbit-hole/captured-31",
+    "timeline-entry/native-60497": "timeline-entry/scenario-long-debug-rabbit-hole/captured-32",
+    "timeline-entry/native-65424": "timeline-entry/scenario-long-debug-rabbit-hole/captured-34",
+    "timeline-entry/native-65425": "timeline-entry/scenario-long-debug-rabbit-hole/captured-35",
+    "timeline-entry/native-71040": "timeline-entry/scenario-long-debug-rabbit-hole/captured-37",
+    "timeline-entry/native-71041": "timeline-entry/scenario-long-debug-rabbit-hole/captured-38",
+    "timeline-entry/native-75968": "timeline-entry/scenario-long-debug-rabbit-hole/captured-40",
+    "timeline-entry/native-75969": "timeline-entry/scenario-long-debug-rabbit-hole/captured-41",
+    "timeline-entry/native-83136": "timeline-entry/scenario-long-debug-rabbit-hole/captured-43",
+    "timeline-entry/native-83137": "timeline-entry/scenario-long-debug-rabbit-hole/captured-44"
+  },
+  "person": "person/ada",
+  "reads": [
+    "/v1/client/agents",
+    "/v1/client/sessions/agent/example/atlas/builder/timeline?limit=50",
+    "/v1/client/terminals/agent%2Fexample%2Fatlas%2Fbuilder/screen"
+  ],
+  "reconnect_after": [],
+  "turns": [
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Wrong hypothesis 1: network retry latency",
+      "prompt": "Investigate wrong hypothesis 1: network retry latency. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:20:00.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Investigate wrong hypothesis 1: network retry latency. Keep the failing shuffle seeds..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=1 --repeat=12' '\u001b[31mseed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.\u001b[0m'",
+      "prompt": "Investigate wrong hypothesis 1: network retry latency. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:20:04.000Z",
+      "tool": {
+        "id": "call-builder-4",
+        "input": {
+          "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=1 --repeat=12"
+        },
+        "name": "shell",
+        "result": "seed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests."
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "2 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun.",
+      "prompt": "Investigate wrong hypothesis 1: network retry latency. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:20:06.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Batch 8/8: preserve the seed and whether cancellation precedes search.",
+      "prompt": "Run the next shuffled batch for network; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:31:40.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Run the next shuffled batch for network; compare it with batch 7..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=85 --repeat=12' '\u001b[31mseed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.\u001b[0m'",
+      "prompt": "Run the next shuffled batch for network; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:31:44.000Z",
+      "tool": {
+        "id": "call-builder-53",
+        "input": {
+          "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=85 --repeat=12"
+        },
+        "name": "shell",
+        "result": "seed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests."
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Rejected hypothesis 1: the same AbortError occurs with a stubbed network. Increasing the retry timeout changes nothing.",
+      "prompt": "Run the next shuffled batch for network; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:31:46.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Wrong hypothesis 2: fake timers leave a pending microtask",
+      "prompt": "Investigate wrong hypothesis 2: fake timers leave a pending microtask. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:33:20.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Investigate wrong hypothesis 2: fake timers leave a pending microtask. Keep the failing shuffle seeds..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=1 --repeat=12' '\u001b[31mseed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\u001b[0m'",
+      "prompt": "Investigate wrong hypothesis 2: fake timers leave a pending microtask. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:33:24.000Z",
+      "tool": {
+        "id": "call-builder-60",
+        "input": {
+          "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=1 --repeat=12"
+        },
+        "name": "shell",
+        "result": "seed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending."
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "2 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun.",
+      "prompt": "Investigate wrong hypothesis 2: fake timers leave a pending microtask. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:33:26.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Batch 8/8: preserve the seed and whether cancellation precedes search.",
+      "prompt": "Run the next shuffled batch for timers; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:45:00.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Run the next shuffled batch for timers; compare it with batch 7..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=85 --repeat=12' '\u001b[31mseed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\u001b[0m'",
+      "prompt": "Run the next shuffled batch for timers; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:45:04.000Z",
+      "tool": {
+        "id": "call-builder-109",
+        "input": {
+          "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=85 --repeat=12"
+        },
+        "name": "shell",
+        "result": "seed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending."
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Rejected hypothesis 2: real timers fail with the same seeds. The abort is already set before the search starts, not during a timer callback.",
+      "prompt": "Run the next shuffled batch for timers; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:45:06.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Wrong hypothesis 3: stale search cache",
+      "prompt": "Investigate wrong hypothesis 3: stale search cache. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:46:40.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Investigate wrong hypothesis 3: stale search cache. Keep the failing shuffle seeds..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=1 --repeat=12' '\u001b[31mseed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.\u001b[0m'",
+      "prompt": "Investigate wrong hypothesis 3: stale search cache. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:46:44.000Z",
+      "tool": {
+        "id": "call-builder-116",
+        "input": {
+          "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=1 --repeat=12"
+        },
+        "name": "shell",
+        "result": "seed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search."
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "2 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun.",
+      "prompt": "Investigate wrong hypothesis 3: stale search cache. Keep the failing shuffle seeds.",
+      "timestamp": "2030-01-01T11:46:46.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Batch 8/8: preserve the seed and whether cancellation precedes search.",
+      "prompt": "Run the next shuffled batch for cache; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:58:20.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Run the next shuffled batch for cache; compare it with batch 7..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=85 --repeat=12' '\u001b[31mseed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.\u001b[0m'",
+      "prompt": "Run the next shuffled batch for cache; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:58:24.000Z",
+      "tool": {
+        "id": "call-builder-165",
+        "input": {
+          "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=85 --repeat=12"
+        },
+        "name": "shell",
+        "result": "seed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search."
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortError.",
+      "prompt": "Run the next shuffled batch for cache; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:58:26.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Forty minutes of evidence: network, fake timers and cache are ruled out. The cancellation test aborts sharedController; shuffled search tests inherit its already-aborted signal. A fresh AbortController in beforeEach is the one-line fix.",
+      "prompt": "Run the next shuffled batch for cache; compare it with batch 7.",
+      "timestamp": "2030-01-01T11:59:52.000Z"
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed edit result for Run the next shuffled batch for cache; compare it with batch 7..",
+      "prompt": "Run the next shuffled batch for cache; compare it with batch 7.",
+      "timestamp": "2030-01-01T12:00:04.000Z",
+      "tool": {
+        "id": "call-builder-170",
+        "input": {
+          "new_string": "client = createClient(new AbortController().signal);",
+          "old_string": "client = createClient(sharedController.signal);",
+          "path": "packages/web/test/searchClient.test.ts"
+        },
+        "name": "edit",
+        "result": "--- a/packages/web/test/searchClient.test.ts\n+++ b/packages/web/test/searchClient.test.ts\n@@ -1,1 +1,1 @@\n-client = createClient(sharedController.signal);\n+client = createClient(new AbortController().signal);\n"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Observed shell result for Run the next shuffled batch for cache; compare it with batch 7..",
+      "command": "printf '%s\\n' '$ pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100' '\u001b[32m100 shuffled orders passed; 0 AbortError failures\nCancellation still aborts its own request; search uses a fresh signal.\n1 file changed, 1 insertion(+), 1 deletion(-)\u001b[0m'",
+      "prompt": "Run the next shuffled batch for cache; compare it with batch 7.",
+      "timestamp": "2030-01-01T12:00:12.000Z",
+      "tool": {
+        "id": "call-builder-172",
+        "input": {
+          "command": "pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100"
+        },
+        "name": "shell",
+        "result": "100 shuffled orders passed; 0 AbortError failures\nCancellation still aborts its own request; search uses a fresh signal.\n1 file changed, 1 insertion(+), 1 deletion(-)"
+      }
+    },
+    {
+      "agent": "agent/example/atlas/builder",
+      "answer": "Fixed: each test gets a fresh abort signal. All 100 shuffled orders pass, cancellation coverage is intact, and no production code changed.",
+      "prompt": "Run the next shuffled batch for cache; compare it with batch 7.",
+      "timestamp": "2030-01-01T12:00:22.000Z"
+    }
+  ],
+  "walk_pages": true,
+  "workspace": "~/src/atlas/.worktrees/builder",
+  "world": "long-debug-rabbit-hole"
+}

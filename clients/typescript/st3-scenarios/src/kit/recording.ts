@@ -9,6 +9,7 @@ export type RecordedFrame = {
 } & (
   | { readonly kind: 'conversation'; readonly event?: number; readonly replace: boolean; readonly has_more?: boolean }
   | { readonly kind: 'screen'; readonly event?: number; readonly snapshot: Snapshot }
+  | { readonly kind: 'snapshot'; readonly snapshot: Snapshot; readonly item_ids: readonly string[]; readonly order: readonly string[]; readonly has_more: boolean }
   | { readonly kind: 'error'; readonly code?: string; readonly message: string; readonly retryable?: boolean }
 )
 
@@ -24,7 +25,7 @@ export interface RecordedHttp {
   readonly value:
     | { readonly kind: 'screen'; readonly terminal: string }
     | { readonly kind: 'timeline'; readonly agent: string; readonly items: readonly { readonly id: string; readonly blocks: boolean }[]; readonly page: { readonly limit: number; readonly has_more: boolean; readonly next_cursor?: string } }
-    | { readonly kind: 'agents'; readonly page: { readonly limit: number; readonly has_more: boolean; readonly next_cursor?: string }; readonly filters: Readonly<Record<string, string>> }
+    | { readonly kind: 'agents'; readonly items?: readonly string[]; readonly page: { readonly limit: number; readonly has_more: boolean; readonly next_cursor?: string }; readonly filters: Readonly<Record<string, string>> }
     | { readonly kind: 'attach'; readonly action_id: string; readonly operation_id: string; readonly snapshot_id: string; readonly attachment: TerminalAttachment }
 }
 

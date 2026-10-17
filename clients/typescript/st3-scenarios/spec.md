@@ -430,14 +430,16 @@ slices of the recording's own world, and recorded slices reused by narrative wor
   `emit`; the freshness, decode, privacy and fidelity gates cover them. A re-recording that
   changes the wire shape is a reviewed diff.
 
-Run the ignored `-p st3 --test scenario_recorder` Cargo target inside `nix develop`,
-under `gate-slot --class heavy`, with `-- --ignored --nocapture`. Set
+First compile with `nix develop -c gate-slot --class gate -- cargo check -p st3 --tests
+--locked`. Once clean, run the cheap recorder tests and all seven ignored
+`-p st3 --test scenario_recorder` captures sequentially in one `gate-slot --class heavy`
+lease inside `nix develop`, with `-- --ignored --nocapture` for captures. Set
 `ST3_SCENARIO_SCRIPT` and `ST3_SCENARIO_OUTPUT` to absolute paths; the output must not
 already exist. Re-record into a new candidate, then review it before replacing the committed
-input. The recorder accepts no caller-owned endpoint or state directory.
-Re-recording creates fresh session/message identities: replace the script's captured `id_map`
-keys with the candidate's observed identities while keeping the public cast values, and remove
-obsolete keys before running `emit`. Prompts, turns and commands remain unchanged.
+input. The recorder accepts no caller-owned endpoint or state directory. Failed scripts are
+reported individually; a second heavy lease is restricted to failed scripts.
+Fresh capture identities are inputs to the generated script's identity map; regeneration
+preserves cast ownership and story content rather than hand-editing generated prompts.
 Each command-bearing turn has its own projected-screen revision fence and a harness-emitted
 per-turn completion marker after stdout. Earlier or intermediate screen changes cannot
 satisfy the current turn's barrier. All recorder subprocesses, including curl and PTY
@@ -455,13 +457,23 @@ in `crates/st3-daemon/src/api/client_v0.rs` supplies the real PTY/projector and 
 
 `scripts/recording-script.schema.json` is the authoritative field contract for both the
 Rust recorder and TypeScript decoder (including required fields and unknown-field rejection).
-Version 1 scripts contain `format_version: 1`, `world`, the selected cast `agent`, `host`,
-`person`, public `workspace`, the explicit scratch-to-cast `id_map`, ordered `turns`
-(`prompt`, `answer`, native `timestamp`, optional shell `command`), and ordered HTTP GET
-`reads`. This single-agent proof format is extended with an explicit version change before
-recording multi-agent scripts. Native timestamps can describe historical past; they do not
-slow or scale the receive clock. Recording privacy scanning decodes JSON/JSONL before checking
-capability field names and values, including Unicode-escaped keys.
+Version 1 is the retained single-agent proof contract: `format_version: 1`, `world`,
+selected cast `agent`, `host`, `person`, public `workspace`, explicit scratch-to-cast
+`id_map`, ordered `turns` (`prompt`, `answer`, native `timestamp`, optional shell
+`command`), and ordered HTTP GET `reads`. The seven generated narrative scripts use
+version 2, with an explicit `agents` cast (`agent`, `host`), `historical_turns` prefix
+count, `empty_baseline`, optional `walk_pages`, and `reconnect_after` turn indices. Turns identify their cast
+`agent`; optional `tool` carries native tool-use `id`, `name`, JSON `input`, and JSON
+`result`. Commands run only in the selected terminal owner's harness.
+Historical turns complete before the baseline snapshot; native timestamps describe the
+past without sleeps or receive-clock scaling. An empty baseline subscribes before creating
+the seats. Reconnect steps disconnect the real client and resubscribe on a new socket,
+capturing authoritative replacement frames, not fabricated sync events.
+When `walk_pages` is enabled, the recorder follows each timeline read's actual
+`next_cursor` until `has_more: false`, recording every HTTP route/query/status/body.
+The hunt uses `limit=50` so its more-than-50-entry native history exercises older pages.
+Recording privacy scanning decodes JSON/JSONL before checking capability field names and
+values, including Unicode-escaped keys.
 Both the scanner and recording decoder reject duplicate JSON object member names before
 parsing discards earlier values, including names equivalent after Unicode-escape decoding.
 Schema identities include `x-st-ref` annotations and `$ref` names ending in `Id`; neither
@@ -494,7 +506,56 @@ budget; the fixtures-tree 24 MiB budget is unchanged.
 The recorded-world end state is seven story-specific narratives: `fleet-mid-refactor`,
 `ci-failing-fix`, `merge-conflict-standoff`, `long-debug-rabbit-hole`,
 `release-candidate-polish`, `offline-reconnect-storm`, and `first-run-onboarding`.
-Proof captures may be committed incrementally; one proof is not this narrative cutover.
+This recording stage commits all seven scripts, raw captures and emitted normalized oracles.
+The catalog's 146 fixtures remain byte-identical: adoption of recorded conversation/terminal
+slices is the next stage, not an overlay or a change to world definitions here.
+
+### Narrative capture selection
+
+Each capture owns one scratch daemon on the narrative terminal owner's declared host.
+Other-host agents remain synthetic; no identity map changes their host ownership. Selection
+uses the committed cast, including future cast entries for initially empty worlds. The
+recorder's terminal viewport is bounded to 80 columns by 24 rows.
+
+| World | Recorded cast and story | Synthetic cast retained |
+| --- | --- | --- |
+| `fleet-mid-refactor` | Atlas builder and migrator on `host/meadow`: blocked worker typecheck and the fetchUser-to-loadUser migration, with real builder terminal output. | Reviewer and docs on `host/foundry`; their waiting review and idle-to-start milestones remain unchanged. |
+| `ci-failing-fix` | Atlas builder on `host/meadow`: omitted-limit regression, bisect, default patch retaining the dependency bump, green retry. | Existing roster/work/card timing at 10/18/30 seconds remains synthetic. |
+| `long-debug-rabbit-hole` | Atlas builder on `host/lantern`: three wrong hypotheses and forty minutes of native historical timestamps, terminal evidence, and the one-line fix. | Existing future milestones retain their synthetic timing. |
+| `first-run-onboarding` | Sprout's future cast on `host/quarry`: subscription-before-create, empty conversation/terminal baseline, first native turn and green command. | First mission card and onboarding roster/details/attention remain synthetic. |
+| `merge-conflict-standoff` | Harbor builder and reviewer on `host/lantern`: both branches, actual native tool call/result carrying the same file/base/ours/theirs conflict, person decision, combined policy and cache verification. | Mission/card and roster milestones remain synthetic. |
+| `offline-reconnect-storm` | Harbor builder on `host/foundry`: retained native entry identities and three real disconnect/resubscribe replacement windows. | Reviewer on `host/orchard`; synthetic sync close/backoff schedule at 2/8/16 seconds remains unchanged. |
+| `release-candidate-polish` | Meadow builder and docs on `host/quarry`: completed patch-version/changelog/matrix history and terminal command evidence; all scripted turns precede baseline, so no future agent activity is recorded. | Reviewer on `host/lantern`, and the completed synthetic mission/roster/card state. |
+
+Current Claude native ingestion emits `revision: 1` and `final: true`, even when the
+same native entry is rewritten. Scripts may supply `revisions` (intermediate assistant
+texts) to capture real same-id content replacements, but the recorder preserves the
+daemon's revision/finality fields exactly. Increasing streaming revision chains for
+the migrator and reconnect story remain synthetic in the next cutover stage; these
+recordings do not claim increasing native revision numbers.
+
+The generated selection has 8/8/22/3/10/7/4 turns in the table's world order,
+with 1/3/7/1/2/1/1 terminal commands respectively. Historical prefixes have
+5/2/19/0/6/2/4 turns. The scripts derive prose, tool data and terminal output from the
+existing world's cast and content; shell commands use `printf` to paint that fictional
+project output in a real PTY. They do not run a nonexistent Atlas/Harbor/Sprout/Meadow
+checkout or claim that the displayed project test commands actually executed. Green/red
+output is story evidence, while PTY execution and screen projection are real.
+Version 2's authored `anchor` maps historical native timestamps to the scratch capture's
+wall clock; future turns use their actual native write time. Receipt offsets are never
+scaled to the synthetic world's milestone offsets.
+
+The initial hunt capture selected all 76 authored turns and 25 commands. The daemon
+emitted 152 real replacement conversation frames and 14 delta frames, up to 200 entries
+per frame; raw input alone reached 13,351,803 bytes. The hunt harness only appended native
+rows (no content rewrites), and the recorder wrote the received frames unchanged.
+Client-v0's follower reopens authoritative pages after cursor gaps, so historical
+native insertion exhibits quadratic replacement-page growth; this is a product-wire
+finding, not a reason to omit recorded frames or increase the 12 MiB budget.
+The generated capture selection therefore retains the first and final shuffled batch of
+each hypothesis, all three headings/rejections, more than 50 native entries, the full
+forty-minute timestamp span, summary, one-line fix and green run. The repeated middle
+batches remain in the unchanged synthetic catalog world, not in the smaller recording.
 
 ### Normalization
 
@@ -521,6 +582,11 @@ frames and HTTP exchanges alike:
    operation, attachment, and capability ids become `request#n`, `operation#n`,
    `attachment#n`, and `capability#n`, preserving equality (capabilities are already scrubbed
    at capture).
+   An action result can reference a later committed snapshot than its HTTP envelope.
+   If no full snapshot object witnesses that typed `snapshot_id`, its daemon encoding
+   `snapshot/<host>/<store>/<digest>` supplies only host/store identity for ordinal
+   ranking. The host must match the cast; no timestamp or snapshot object is invented,
+   and the distinct result/envelope fence relationship remains intact.
 4. Nothing else changes: payloads, order, `has_more`, revisions and frame boundaries stay as
    recorded.
 
@@ -529,6 +595,14 @@ frames and HTTP exchanges alike:
 Each recording has a **fidelity world**, `recorded-<name>`: every slice comes from the recording,
 none from factories. Fidelity worlds are test-only; they are not in the catalog or in
 `fixtures/scenarios`.
+
+This stage provides capture-derived test-only `recorded-<name>` imports for all seven
+narratives and checks each against its emitted normalization oracle. The existing
+proof retains independent per-frame/per-HTTP replay fidelity and mutation tests.
+Full replay fidelity for the new historical/reconnect captures is deferred to the
+cutover stage: prebaseline historical replacement windows and connection lifecycles
+need additional replay boundary representation. Import-oracle equality is not
+presented as proof that replay already reproduces those windows.
 
 The TypeScript proof world is `recorded-fleet-mid-refactor-proof`, defined only in the test tree.
 Its six slices are imported from captured state and events. Optional typed `recording` transport
@@ -560,10 +634,11 @@ Independent mutations to slice items/revisions and typed metadata `has_more`, fr
 store fences and HTTP status must fail fidelity while leaving the oracle untouched.
 
 The required narrative end state reuses a recording's `conversation` and `terminal` slices and
-generates other slices from the same cast. This proof wave does not perform that cutover:
+generates other slices from the same cast. This recording stage does not perform that cutover:
 the ordinary 24 catalog worlds and their fixture bytes remain unchanged. Edge-state worlds
 remain synthetic. The proof capture has a reusable attachment; it does not prove a single-use
-capability recording or complete native PTY-server asciicast.
+capability recording or complete native PTY-server asciicast. Narrative PTY output records
+the actual scripted command stdout, not an invented full native-project scrollback.
 
 ## Replay (D8)
 

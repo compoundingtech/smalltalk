@@ -356,7 +356,7 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
       if (metadata.kind === 'conversation') {
         if (!('conversation' in metadata.selector)) throw new Error('Conversation frame requires a conversation selector')
         const agent = metadata.selector.conversation
-        const thread = world.slices.conversation.state.threads.find((thread) => thread.agent === agent)
+        const thread = state('conversation').threads.find((thread) => thread.agent === agent)
         const event = metadata.event === undefined ? undefined : world.slices.conversation.timeline[metadata.event]
         if (thread === undefined || event !== undefined && event._tag !== 'entries' && event._tag !== 'replace') throw new Error('Invalid recorded conversation boundary')
         emit(connection, { kind: 'conversation', ...identity,
@@ -372,6 +372,14 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
         const screen = event === undefined ? terminal?.screens.filter((item) => item.at_ms <= metadata.at_ms).at(-1)?.screen : event.screen
         if (screen === undefined) throw new Error('Missing recorded screen')
         emit(connection, { kind: 'screen', ...identity, snapshot: metadata.snapshot, value: screen })
+      } else if (metadata.kind === 'snapshot') {
+        const resources = rows(metadata.selector.collection)
+        emit(connection, { kind: 'snapshot', ...identity, snapshot: metadata.snapshot,
+          items: metadata.item_ids.map((id) => {
+            const item = resources.find((item) => item.id === id)
+            if (item === undefined) throw new Error('Missing recorded snapshot resource ' + id)
+            return item
+          }), order: metadata.order, has_more: metadata.has_more })
       } else {
         emit(connection, { kind: 'error', ...identity, message: metadata.message,
           ...(metadata.code === undefined ? {} : { code: metadata.code }),
@@ -457,7 +465,12 @@ export const createReplay = (world: World, { clock }: { readonly clock: Clock })
         break
       }
       case 'agents':
-        value = { kind: 'page', collection: 'agents', filters: source.filters, items: rows('agents'), page: source.page }
+        value = { kind: 'page', collection: 'agents', filters: source.filters, items: source.items === undefined
+          ? rows('agents') : source.items.map((id) => {
+            const item = rows('agents').find((item) => item.id === id)
+            if (item === undefined) throw new Error('Missing recorded HTTP agent ' + id)
+            return item
+          }), page: source.page }
         consumed.add('roster')
         break
       case 'attach':

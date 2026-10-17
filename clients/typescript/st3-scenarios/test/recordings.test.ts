@@ -148,8 +148,22 @@ describe('recording schema-directed N (batch 2)', () => {
     valid.push({ ...extra, ordinal: 9, receive_ms: 30560 })
     expect(() => normalizeRecording(script, valid, anchor)).toThrow('snapshot equality mismatch')
   })
+  it('retains a later action-result fence absent from the HTTP snapshot objects', () => {
+    const committed = decodeScript(JSON.parse(readFileSync(new URL('../recordings/fleet-mid-refactor-proof.script.json', import.meta.url), 'utf8')))
+    const capture = decodeRecording(readFileSync(new URL('../recordings/fleet-mid-refactor-proof.recording.jsonl', import.meta.url), 'utf8'))
+    const action = capture.find((row) => row.kind === 'http' && row.value.method === 'POST')
+    if (action === undefined) throw new Error('Missing captured attach exchange')
+    obj(obj(action.value.body).value).snapshot_id = 'snapshot/meadow/999999/0123456789abcdef'
+    const normalized = normalizeRecording(committed, capture, anchor)
+    const result = normalized.find((row) => row.ordinal === action.ordinal)
+    if (result === undefined) throw new Error('Missing normalized attach exchange')
+    expect(obj(obj(result.value.body).value).snapshot_id).toMatch(/^snapshot\/host\/meadow\/store#[1-9]\d*$/u)
+    expect(normalizeRecording(committed, normalized, anchor)).toEqual(normalized)
+    obj(obj(action.value.body).value).snapshot_id = 'snapshot/orchard/999999/0123456789abcdef'
+    expect(() => normalizeRecording(committed, capture, anchor)).toThrow('snapshot host mismatch')
+  })
   it('rejects malformed script/rows and corrupt frame fields', () => {
-    expect(() => decodeScript({ format_version: 2 })).toThrow('unsupported version')
+    expect(() => decodeScript({ format_version: 3 })).toThrow('unsupported version')
     expect(() => decodeRecording('{corrupt')).toThrow('invalid JSON')
     expect(() => decodeRecording(JSON.stringify([{ ordinal: 0, receive_ms: 0, kind: 'frame', socket_id: null, value: {} }]))).toThrow('socket required')
     const capture = rows()

@@ -138,7 +138,7 @@ export interface SliceStates {
 
 /** Names one subscription by collection and filter. */
 export type Selector =
-  | { readonly collection: 'agents' | 'missions' | 'work' | 'attention' }
+  | { readonly collection: 'agents' | 'missions' | 'work' | 'attention' | 'terminals' }
   | { readonly collection: 'conversation'; readonly conversation: Id }
   | { readonly collection: 'terminal'; readonly terminal: Id }
 
