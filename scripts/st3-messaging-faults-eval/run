@@ -23,6 +23,10 @@ HERE = Path(__file__).resolve().parent
 CASES = ("baseline", "daemon-restart", "binary-swap", "path-deploy", "link-seconds", "link-minutes",
          "receiver-down", "harness-restart", "channel-killed", "old-channel", "handoff-failed")
 
+# delivery-presence's startup grace in the daemon (STARTUP_GRACE). The observation tail must
+# outlast it by this margin, which is what the 25 s tail always was at the real 20 s grace.
+DELIVERY_STARTUP_GRACE_SECONDS = 20
+OBSERVE_MARGIN_SECONDS = 5
 RECOVERY_CASES = ("daemon-restart", "binary-swap", "path-deploy", "receiver-down",
               "harness-restart", "channel-killed")
 
@@ -501,6 +505,17 @@ def judge(proof):
     return failures
 
 
+def with_startup_grace(env, seconds):
+    """The nodes' environment, with the daemon's delivery-presence grace shortened to `seconds`.
+
+    Test-only and shorten-only: the daemon's own grace is 20 s unless this is set, so the real
+    value adds nothing to the environment.
+    """
+    if seconds >= DELIVERY_STARTUP_GRACE_SECONDS:
+        return env
+    return {**env, "ST3_TEST_DELIVERY_STARTUP_GRACE_MS": str(round(seconds * 1000))}
+
+
 async def run_case(args, case, directory, candidate, old, replacement):
     root = Path(tempfile.mkdtemp(prefix="mfe-", dir=os.environ["ST3_MESSAGING_ROOT"]))
     binary_root = Path(tempfile.mkdtemp(prefix="mfe-bin-", dir=args.scratch))
@@ -525,6 +540,7 @@ async def run_case(args, case, directory, candidate, old, replacement):
                "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
         if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
             env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
+        env = with_startup_grace(env, args.startup_grace_seconds)
         source = Node(root, "amber", candidate, env, binary_root, args.ready_seconds)
         target = Node(root, "cobalt", candidate, env, binary_root, args.ready_seconds)
         nodes = [source, target]
@@ -922,6 +938,7 @@ async def main(args):
                   "old_binary_resume_probe_exit_code": probe.returncode,
                   "old_binary_resume_probe_stdout": probe_stdout.decode().strip(),
                   "read_deadline_ms": 10000, "observe_seconds": args.observe_seconds,
+                  "startup_grace_seconds": args.startup_grace_seconds,
                   "short_seconds": args.short_seconds, "long_seconds": args.long_seconds,
                   "agent_tokens": 0, "judge_tokens": 0, "cases": []}
         # Copies, resume probe and digests of the three pinned executables, before any case.
@@ -958,11 +975,17 @@ if __name__ == "__main__":
     parser.add_argument("--short-seconds", type=float, default=3)
     parser.add_argument("--long-seconds", type=float, default=120)
     parser.add_argument("--observe-seconds", type=float, default=25)
+    parser.add_argument("--startup-grace-seconds", type=float, default=DELIVERY_STARTUP_GRACE_SECONDS,
+                        help="shorten the daemon's delivery-presence startup grace (test-only; the real value is 20)")
     parser.add_argument("--ready-seconds", type=float, default=60)
     args = parser.parse_args()
     args.scratch = (args.scratch or args.out).resolve()
-    if args.observe_seconds < 25 or args.long_seconds < 120 or args.short_seconds < 2:
-        parser.error("observe >=25s, long outage >=120s, short outage >=2s are required")
+    if not 0 <= args.startup_grace_seconds <= DELIVERY_STARTUP_GRACE_SECONDS:
+        parser.error("the startup grace can only be shortened from 20s")
+    if (args.observe_seconds < args.startup_grace_seconds + OBSERVE_MARGIN_SECONDS
+            or args.long_seconds < 120 or args.short_seconds < 2):
+        parser.error(f"observe >= startup grace + {OBSERVE_MARGIN_SECONDS:g}s (25s at the real 20s grace), "
+                     "long outage >=120s, short outage >=2s are required")
     if os.environ.get("ST_AGENT"):
         parser.error("run detached outside an st seat; see the eval README")
     if not shutil.which("node") or not shutil.which("pty"):

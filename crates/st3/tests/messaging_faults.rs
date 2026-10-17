@@ -24,7 +24,25 @@ fn controller_death_cleanup() {
     );
 }
 
+/// The daemon's delivery-presence startup grace is 20 s. Every case but three keeps the real
+/// value and the 25 s tail: `daemon_restart`, which restarts the daemon inside the observation;
+/// `handoff_failed`, whose tail waits for the channel's retry backoff after a refused handoff
+/// to clear (a 6 s tail failed 11 of 20 runs, "delivery report is stale: the provider rejected a
+/// native handoff"), which is not the grace; and the optional `link_minutes`. The rest run the
+/// daemon with a 1 s grace through a test-only cap and observe for that grace plus the eval's
+/// 5 s margin. The assertions are the same; the clock is shorter.
+const FAST_GRACE_SECONDS: &str = "1";
+const FAST_OBSERVE_SECONDS: &str = "6";
+
 fn run_case(case: &str) {
+    run_case_at(case, false);
+}
+
+fn run_case_at_real_grace(case: &str) {
+    run_case_at(case, true);
+}
+
+fn run_case_at(case: &str, real_grace: bool) {
     use std::path::PathBuf;
 
     let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -80,8 +98,8 @@ fn run_case(case: &str) {
         .unwrap();
     // Double-fork out of the CI seat's ancestry. A sender is person/eval; an st harness
     // must never impersonate that sender. Captured pipes stay open until the eval exits.
-    let output = st3::test_support::command("setsid")
-        .args(["-f", "env", "-u", "ST_AGENT", "python3"])
+    let mut eval = st3::test_support::command("setsid");
+    eval.args(["-f", "env", "-u", "ST_AGENT", "python3"])
         .arg(repo.join("scripts/st3-messaging-faults-eval/run"))
         .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
@@ -89,9 +107,16 @@ fn run_case(case: &str) {
         .arg(old)
         .arg("--scratch")
         .arg(scratch.path())
-        .args(["--cases", case])
-        .output()
-        .expect("run the isolated messaging fault eval");
+        .args(["--cases", case]);
+    if !real_grace {
+        eval.args([
+            "--startup-grace-seconds",
+            FAST_GRACE_SECONDS,
+            "--observe-seconds",
+            FAST_OBSERVE_SECONDS,
+        ]);
+    }
+    let output = eval.output().expect("run the isolated messaging fault eval");
     let result = std::fs::read_to_string(evidence.join("result.json"));
     let passed = result
         .as_ref()
@@ -139,7 +164,8 @@ fn daemon_restart() {
     if st3::test_support::supervise_test() {
         return;
     }
-    run_case("daemon-restart");
+    // The control: the real 20 s grace and the 25 s observation, across a daemon restart.
+    run_case_at_real_grace("daemon-restart");
 }
 
 #[test]
@@ -171,7 +197,7 @@ fn link_minutes() {
     if st3::test_support::supervise_test() {
         return;
     }
-    run_case("link-minutes");
+    run_case_at_real_grace("link-minutes");
 }
 
 #[test]
@@ -211,5 +237,5 @@ fn handoff_failed() {
     if st3::test_support::supervise_test() {
         return;
     }
-    run_case("handoff-failed");
+    run_case_at_real_grace("handoff-failed");
 }

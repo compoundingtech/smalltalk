@@ -87,7 +87,11 @@ handoff, one authoritative graph read within ten seconds of clearing, convergenc
 of the read receipt back to the sender, and no unexpected provider replacement.
 The runner also counts message files below inbox/archive directories in the private receiver state;
 any projection fails the no-files gate. It observes a fixed 25-second tail after clearing, even when the first read is fast,
-to catch duplicates and to outlast the delivery report's 20-second startup grace.
+to catch duplicates and to outlast the delivery report's 20-second startup grace by 5 seconds.
+`--startup-grace-seconds` runs the daemon with a shorter grace through the test-only
+`ST3_TEST_DELIVERY_STARTUP_GRACE_MS` cap (it can only shorten the grace, and is unset in production); the
+tail then only has to outlast that grace plus the same 5 seconds. The Rust tests use a 1-second grace and a
+6-second tail for every case but `daemon_restart` and `link_minutes`, which keep the real 20 and 25 seconds.
 Duplicates after that bounded observation window are not covered.
 
 Delivery and reporting are separate results: a working old channel that st reports
@@ -110,7 +114,8 @@ image at the same path. `--swap-binary` tests a real other build instead. `--cas
 selects cases for diagnosis. `--short-seconds`, `--long-seconds`,
 `--observe-seconds`, and `--ready-seconds` adjust durations without relaxing the
 ten-second read gate. The runner refuses a short outage below two seconds, a long
-outage below two minutes, or an observation tail below 25 seconds. It exits nonzero
+outage below two minutes, or an observation tail below the startup grace plus 5 seconds (25 seconds at
+the real grace). It exits nonzero
 for a failed gate or fixture error and writes partial results after each case.
 
 The oracle's negative controls run with:

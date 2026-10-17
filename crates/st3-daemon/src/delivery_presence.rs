@@ -23,6 +23,9 @@ use serde_json::{Value, json};
 /// A seat gets this long after the daemon starts before a missing poll counts as stale. Drivers
 /// retry every second while the daemon restarts, and a replaced driver re-executes within two.
 const STARTUP_GRACE: Duration = Duration::from_secs(20);
+/// A test-only cap on the grace, read once at daemon start. It can only shorten it, so a fault
+/// eval need not wait out 20 s to see a seat go stale. Unset, the grace is `STARTUP_GRACE`.
+const STARTUP_GRACE_CAP_ENV: &str = "ST3_TEST_DELIVERY_STARTUP_GRACE_MS";
 /// Delivery polls every second and backs off to at most 30 seconds on a failing daemon call.
 const POLL_STALE_AFTER: Duration = Duration::from_secs(45);
 /// The Claude channel refreshes its presence every second.
@@ -73,6 +76,21 @@ fn presence() -> &'static Presence {
         image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
         beats: Mutex::new(HashMap::new()),
         monitors: Mutex::new(HashMap::new()),
+    })
+}
+
+fn startup_grace_with_cap(cap_ms: Option<&str>) -> Duration {
+    cap_ms
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(STARTUP_GRACE, |cap| {
+            Duration::from_millis(cap).min(STARTUP_GRACE)
+        })
+}
+
+fn startup_grace() -> Duration {
+    static GRACE: OnceLock<Duration> = OnceLock::new();
+    *GRACE.get_or_init(|| {
+        startup_grace_with_cap(std::env::var(STARTUP_GRACE_CAP_ENV).ok().as_deref())
     })
 }
 
@@ -282,7 +300,7 @@ fn assess_beat(
     driver: &str,
 ) -> Assessment {
     let Some((age, report)) = beat else {
-        if uptime < STARTUP_GRACE {
+        if uptime < startup_grace() {
             return Assessment {
                 state: "unknown",
                 reason: Some(format!(
@@ -518,6 +536,16 @@ mod tests {
         assert_eq!(early.state, "unknown");
         let late = assess_beat(Duration::from_secs(60), DAEMON, None, "codex");
         assert!(late.stale(), "{late:?}");
+    }
+
+    #[test]
+    fn the_test_cap_can_only_shorten_the_startup_grace() {
+        assert_eq!(startup_grace_with_cap(None), Duration::from_secs(20));
+        assert_eq!(startup_grace_with_cap(Some("2000")), Duration::from_secs(2));
+        assert_eq!(startup_grace_with_cap(Some("0")), Duration::ZERO);
+        assert_eq!(startup_grace_with_cap(Some("60000")), Duration::from_secs(20));
+        assert_eq!(startup_grace_with_cap(Some("soon")), Duration::from_secs(20));
+        assert_eq!(startup_grace_with_cap(Some("")), Duration::from_secs(20));
     }
 
     #[test]

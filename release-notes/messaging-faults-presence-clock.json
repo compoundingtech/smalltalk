@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The messaging fault tests shorten the daemon's delivery-presence startup grace through a test-only cap; the production grace stays 20 seconds",
+  "replay": {"status": "none", "detail": "No graph replay; no stored data changes."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. ST3_TEST_DELIVERY_STARTUP_GRACE_MS is unset in production and can only shorten the grace."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to roll back; reverting the commit restores the 25 second observation in the tests."}
+}

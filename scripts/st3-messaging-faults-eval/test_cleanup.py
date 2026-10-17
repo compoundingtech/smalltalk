@@ -51,11 +51,20 @@ def descendants(pid):
     return result
 
 
+class StartupGraceTests(unittest.TestCase):
+    def test_only_a_shortened_grace_reaches_the_daemons_environment(self):
+        env = {'PATH': '/bin'}
+        self.assertEqual(runner.with_startup_grace(env, 20), env)
+        shortened = runner.with_startup_grace(env, 1.5)
+        self.assertEqual(shortened['ST3_TEST_DELIVERY_STARTUP_GRACE_MS'], '1500')
+        self.assertNotIn('ST3_TEST_DELIVERY_STARTUP_GRACE_MS', env)
+
+
 class CleanupTests(unittest.TestCase):
     def test_evidence_failure_still_cleans_both_nodes_and_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
-            args = SimpleNamespace(scratch=parent, keep=False, ready_seconds=60)
+            args = SimpleNamespace(scratch=parent, keep=False, ready_seconds=60, startup_grace_seconds=20)
             nodes = [SimpleNamespace(cleanup=AsyncMock(), name=name, root=parent / name) for name in ('amber', 'cobalt')]
             with patch.dict(os.environ, ST3_MESSAGING_ROOT=directory), \
                  patch.object(runner, 'Node', side_effect=nodes), \
