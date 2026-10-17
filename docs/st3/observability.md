@@ -416,6 +416,56 @@ the SDK samples the maximum of the last delay and an overdue pending wakeup, so 
 stalled runtime remains visible before the sampling task resumes.
 Synchronous storage-only telemetry registers no lag instrument when no Tokio runtime exists.
 
+### Write-worker admission
+
+These process-wide instruments cover the asynchronous admission queue before a
+writer-bound blocking callback starts, not the SQLite writer's separate batch queue.
+They use the existing SDK meter provider and daemon resource identity.
+
+| Instrument | Kind | Unit | Attributes / meaning |
+| --- | --- | --- | --- |
+| `st.write_workers.queue.depth` | Observable gauge | `{job}` | Queued, not-yet-started top-level callbacks |
+| `st.write_workers.queue.busy_age` | Observable gauge | `s` | Maximum per-store busy-period age: conservative upper bound on oldest queued age, not exact; zero when empty |
+| `st.write_workers.queue.wait` | Histogram | `s` | `origin`: normalized HTTP route when available, otherwise `other`; enqueue through callback start (or explicit admission grant) |
+| `st.write_workers.abandoned_callback_starts` | Counter | `{job}` | `outcome=ran`: callbacks starting after their request waiter was dropped |
+
+Inherited dependent callbacks do not add queue entries. Pending admission cancellation
+removes the entry; admitted callbacks remain queued until their blocking thread starts.
+Explicit `admit_write` calls leave the queue when granted capacity. Each store tracks
+depth and a busy-period start using atomics, without a per-write mutex, map allocation
+or job scan. Across stores the gauges sum depth and take the maximum busy age.
+
+On a 0-to-1 depth transition, an atomic minimum publishes the busy start. On the
+1-to-0 decrement, the start is cleared, then depth is rechecked: if a new enqueue
+raced the clear, an atomic minimum restores the earlier start. Acquire/release
+operations order depth transitions and busy-start publication; overlapping transitions
+may conservatively retain an earlier start. Empty observations always emit zero.
+Busy age is an upper bound, **not exact oldest age**: a continuously nonempty queue
+never resets even if its oldest items have started, and overlapping empty transitions
+can retain an earlier start. Thus false-positive alerts are possible. A busy queue
+observed before its start is published uses process-local queue uptime as the bound.
+The wait histogram remains unchanged.
+
+Mutation handlers retain their existing detached completion behavior. A closed response
+oneshot detects abandonment before each synchronous handler poll; it only counts and
+never cancels or skips work. Consequently the counter counts callback starts, not unique
+HTTP requests; a pending handler can contribute again on a later abandoned poll.
+`outcome=skipped` is reserved for jobs skipped after abandonment; the current implementation
+does not skip jobs and emits only `ran`. Wait histograms use the storage duration buckets.
+
+An alert for potentially old queued work uses the conservative upper bound:
+
+```promql
+max by (host_name) (st_write_workers_queue_busy_age_seconds * on(instance) group_left(host_name) target_info{job="infra/st-daemon"}) > 5
+```
+
+Proof: `worker_queue_exports_wait_and_abandoned_callback_starts` blocks worker capacity,
+checks exported depth and busy-age bound, drops the requester before start,
+and checks the exported abandonment counter, wait histogram, and empty-queue reset.
+It also checks pending-admission cancellation removes queue entries.
+`busy_period_covers_all_queued_callbacks_and_clears` checks busy-period publication,
+retention across queued callbacks, clear and restart.
+
 Loan age covers a connection checkout, which may have no active transaction; it does
 not identify a WAL frame owner. An empty registry reports zero with origin `other`.
 Checkpoint lag is the most recent successful PASSIVE report, not a WAL file-size estimate.
@@ -432,7 +482,6 @@ Authoritative inventory, graph and projection inputs remain captured together by
 use scoped read guards. No snapshot is released and reacquired halfway through a build.
 An expired export returns the existing `read-deadline` error, not a partial exchange;
 the peer retries without acknowledging a partial inventory or advancing its cursor.
-
 
 A scoped thread-local `Option<Arc<WriterWait>>` shares a request accumulator across
 handler, store, action, and API blocking sections. Two relaxed atomics sum writer ACK

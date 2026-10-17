@@ -516,6 +516,7 @@ where
 /// the shared permit until its actual completion.
 pub(super) fn spawn_mutation_handler<F, P, T>(
     store: Arc<super::Store>,
+    route: String,
     future: F,
     mut scope: P,
 ) -> impl Future<Output = Result<T, WorkError>>
@@ -529,16 +530,19 @@ where
         fn wake(self: Arc<Self>) { self.0.notify_one(); }
         fn wake_by_ref(self: &Arc<Self>) { self.0.notify_one(); }
     }
+    let (requester, response_waiter) = tokio::sync::oneshot::channel::<()>();
+    let requester = Arc::new(requester);
     let task = tokio::spawn(async move {
         let wake = Arc::new(Wake(tokio::sync::Notify::new()));
         let waker = std::task::Waker::from(wake.clone());
         let mut future = Box::pin(future);
+        let workers = store.connection.write_workers().with_requester(requester, route);
         loop {
             // No blocking parent parks while this admission is pending. Only a
             // synchronous poll (or its dependent writer child) retains capacity.
             let polling_store = store.clone();
             let polling_waker = waker.clone();
-            let (result, returned_future, returned_scope) = store.connection.write_workers()
+            let (result, returned_future, returned_scope) = workers.clone()
                 .spawn_blocking(move || {
                     let mut cx = Context::from_waker(&polling_waker);
                     let result = with_handler(|| with_store(Some(polling_store), || {
@@ -554,7 +558,11 @@ where
             }
         }
     });
-    async move { task.await.map_err(WorkError::Join)? }
+    async move {
+        let result = task.await.map_err(WorkError::Join)?;
+        drop(response_waiter);
+        result
+    }
 }
 
 /// Propagate the read budget to every nested blocking task in the API. This wrapper has
@@ -1178,7 +1186,7 @@ mod tests {
         let (entered, waiting) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let (committed, commit) = tokio::sync::oneshot::channel();
-        let mut handler = Box::pin(spawn_mutation_handler(state.store.clone(), async move {
+        let mut handler = Box::pin(spawn_mutation_handler(state.store.clone(), "/test".to_owned(), async move {
             entered.send(()).unwrap();
             released.await.unwrap();
             assert!(store.connection.current_write_permit().is_some());
