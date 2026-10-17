@@ -70,6 +70,15 @@ fn current_provider(
     agent_dir: &Path,
     owner: &Authority,
 ) -> Result<(), St3Error> {
+    current_provider_record(fence, agent_dir, owner)?;
+    state.store.mailbox_session_active(fence, owner)
+}
+
+fn current_provider_record(
+    fence: &Fence,
+    agent_dir: &Path,
+    owner: &Authority,
+) -> Result<(), St3Error> {
     let raw = st_drivers::harness_events::read_runtime_state(agent_dir, &fence.incarnation)
         .map_err(internal)?
         .ok_or_else(|| refused("the provider source disappeared"))?;
@@ -81,16 +90,51 @@ fn current_provider(
     {
         return Err(refused("the provider is terminal or superseded"));
     }
-    state.store.mailbox_session_active(fence, owner)
+    Ok(())
 }
 
 /// Presence reports inherit the admitted peer's custody, never their reported PID.
-/// Recheck the durable provider fence without repeatedly querying the PTY process tree.
+/// Ordinary reports share one durable fence snapshot; re-exec retains writer revalidation.
 pub(super) fn admit_report(
     state: &AppState,
     fence: &Fence,
     peer: &NativeDeliveryPeer,
     raw: &str,
+) -> Result<(), St3Error> {
+    let evaluated = std::cell::Cell::new(false);
+    let check = |owner: Option<&Authority>| {
+        evaluated.set(true);
+        let started = std::time::Instant::now();
+        let result = state.store.read_snapshot(|_| {
+            state.store.check_mailbox(fence)?;
+            if let Some(owner) = owner
+                && !state.store.owns_mailbox_lease(fence, owner)?
+            {
+                return Err(anyhow::Error::new(refused("the report lease was superseded")));
+            }
+            Ok(())
+        }).map_err(|error| error.downcast::<St3Error>().unwrap_or_else(internal));
+        crate::otel::record_mailbox_fence_check(
+            crate::otel::MailboxFenceCaller::Report, started.elapsed(),
+        );
+        result
+    };
+    let result = admit_report_with(state, fence, peer, raw, &check, &evaluated);
+    // Even malformed/foreign/terminal reports evaluate the durable fence.
+    // Never use an earlier report's admission to authorize a later report.
+    if !evaluated.get() {
+        check(None)?;
+    }
+    result
+}
+
+fn admit_report_with(
+    state: &AppState,
+    fence: &Fence,
+    peer: &NativeDeliveryPeer,
+    raw: &str,
+    check: &dyn Fn(Option<&Authority>) -> Result<(), St3Error>,
+    evaluated: &std::cell::Cell<bool>,
 ) -> Result<(), St3Error> {
     let report: Value = serde_json::from_str(raw).map_err(internal)?;
     if report["transport"].as_str() != Some(peer.transport)
@@ -98,18 +142,12 @@ pub(super) fn admit_report(
     {
         return Err(refused("the report belongs to another native process"));
     }
-    let owner = state
-        .store
-        .mailbox_lease_authority(fence)?
+    let owner = state.store.mailbox_lease_authority(fence)?
         .ok_or_else(|| refused("the report has no canonical lease"))?;
     if owner.sequence == 0 {
         return with_authority(state, fence, peer, |owner, validate| {
             validate()?;
-            state.store.check_mailbox(fence)?;
-            if !state.store.owns_mailbox_lease(fence, owner)? {
-                return Err(refused("the report lease was superseded"));
-            }
-            Ok(())
+            check(Some(owner))
         });
     }
     if owner.pid != peer.pid || process_birth(peer.pid)? != owner.process_token {
@@ -121,22 +159,15 @@ pub(super) fn admit_report(
         &owner.session,
         owner.sequence,
         || {
-            current_provider(state, fence, &agent_dir, &owner)?;
-            state.store.check_mailbox(fence)?;
-            if !state.store.owns_mailbox_lease(fence, &owner)? {
-                return Err(anyhow::Error::new(refused(
-                    "the report lease was superseded",
-                )));
-            }
-            Ok(())
+            // check_mailbox includes incarnation and declaration checks; do not
+            // repeat mailbox_session_active's store reads on the report path.
+            current_provider_record(fence, &agent_dir, &owner)?;
+            check(Some(&owner)).map_err(anyhow::Error::new)
         },
-    )
-    .map_err(|error| {
-        error
-            .downcast::<St3Error>()
-            .unwrap_or_else(|error| refused(error.to_string()))
+    ).map_err(|error| {
+        error.downcast::<St3Error>().unwrap_or_else(|error| refused(error.to_string()))
     });
-    if result.is_ok() {
+    if result.is_ok() || evaluated.get() {
         return result;
     }
     let current = st_drivers::harness_events::read_runtime_state(&agent_dir, &fence.incarnation)
@@ -147,16 +178,11 @@ pub(super) fn admit_report(
         && observed.evidence_incarnation.as_deref() == Some(&owner.session)
         && observed.ownership_sequence.is_some_and(|sequence| sequence > owner.sequence)
     {
-        // A surviving wrapper reclaims its provider record during re-exec. Re-admit
-        // this exact capability under physical/provider and writer fences once, rather
-        // than treating the ownership transition as a new channel or fresh token.
-        return with_authority(state, fence, peer, |current_owner, validate| {
+        // Preserve writer-side revalidation for exceptional bootstrap/re-exec,
+        // even though it requires additional fence work beyond ordinary reports.
+        return with_authority(state, fence, peer, |owner, validate| {
             validate()?;
-            state.store.check_mailbox(fence)?;
-            if !state.store.owns_mailbox_lease(fence, current_owner)? {
-                return Err(refused("the report lease was superseded"));
-            }
-            Ok(())
+            check(Some(owner))
         });
     }
     result
@@ -1013,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_terminal_authority_survives_staleness_and_clock_skew_under_the_owner_lock() {
+    fn reports_evaluate_one_fence_and_preserve_terminal_authority_under_clock_skew() {
         use st_drivers::{harness_events, harness_state};
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -1069,6 +1095,23 @@ mod tests {
             archives_inbox: true,
         };
         let report = json!({"transport":"app-server","pid":peer.pid}).to_string();
+        let assert_report = |raw: &str, admitted: bool| {
+            let before = crate::store::mailbox_fence_evaluations();
+            let incarnations_before = crate::store::mailbox_incarnation_evaluations();
+            let result = admit_report(&state, &fence, &peer, raw);
+            assert_eq!(crate::store::mailbox_fence_evaluations() - before, 1);
+            assert_eq!(crate::store::mailbox_incarnation_evaluations() - incarnations_before, 1);
+            if admitted {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code, "stale-mailbox-session");
+            }
+        };
+        for _ in 0..8 {
+            assert_report(&report, true);
+        }
+        assert_report(&json!({"transport":"another-provider","pid":peer.pid}).to_string(), false);
+        let admitted_provider = serde_json::to_vec(&record).unwrap();
         let now = client_now_ms() as u64;
         for stamp in [1, now.saturating_add(3_600_000)] {
             record["writtenAtMs"] = json!(stamp);
@@ -1101,12 +1144,7 @@ mod tests {
                 assert!(result.is_err(), "{operation} admitted terminal authority");
                 assert!(!admitted.load(std::sync::atomic::Ordering::SeqCst));
             }
-            assert_eq!(
-                admit_report(&state, &fence, &peer, &report)
-                    .unwrap_err()
-                    .code,
-                "stale-mailbox-session"
-            );
+            assert_report(&report, false);
             assert_eq!(
                 store.mailbox_lease_authority(&fence).unwrap(),
                 Some(owner.clone())
@@ -1120,5 +1158,36 @@ mod tests {
             assert!(decode_provider_authority(&raw).is_err());
         }
         assert!(decode_provider_authority(b"{broken").is_err());
+        harness_events::write_snapshot(&agent_dir, "harness-state", &admitted_provider).unwrap();
+        assert_report(&report, true);
+        for (kind, terminal, restored) in [
+            ("harness.observed",
+                json!({"state":"ended","driver":"codex","incarnation_id":"current"}),
+                json!({"state":"ready","driver":"codex","incarnation_id":"current"})),
+            ("runtime.observed",
+                json!({"status":"exited","runtime_id":"eval.worker","incarnation_id":"current"}),
+                json!({"status":"running","runtime_id":"eval.worker","incarnation_id":"current"})),
+        ] {
+            for (phase, fields, admitted) in [
+                ("revoke", terminal, false), ("restore", restored, true),
+            ] {
+                store.append_claim(&ClaimInput {
+                    subject: fence.subject.clone(),
+                    kind: kind.into(),
+                    actor: Some("daemon/runtime".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("report-fence:{kind}:{phase}")),
+                }).unwrap();
+                // No notification, generation cache, delay or dirty pass intervenes.
+                assert_report(&report, admitted);
+            }
+        }
+        store.connection.write().execute(
+            "UPDATE local_mailbox_leases SET revoked=1 WHERE subject=?1",
+            [&fence.subject],
+        ).unwrap();
+        assert_report(&report, false);
     }
 }

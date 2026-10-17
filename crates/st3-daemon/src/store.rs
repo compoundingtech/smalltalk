@@ -10848,6 +10848,8 @@ fn check_mailbox_incarnation(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
 ) -> Result<(), St3Error> {
+    #[cfg(test)]
+    MAILBOX_INCARNATION_EVALUATIONS.set(MAILBOX_INCARNATION_EVALUATIONS.get() + 1);
     let runtime: Option<(String, String)> = connection
         .prepare_cached(&format!(
             "{} LIMIT 1",
@@ -11058,11 +11060,30 @@ pub(crate) struct MailboxWatermark {
     desired: Option<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static MAILBOX_FENCE_EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MAILBOX_INCARNATION_EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Thread-local instrumentation of actual full fence evaluations, not API calls.
+#[cfg(test)]
+pub(crate) fn mailbox_fence_evaluations() -> u64 {
+    MAILBOX_FENCE_EVALUATIONS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn mailbox_incarnation_evaluations() -> u64 {
+    MAILBOX_INCARNATION_EVALUATIONS.get()
+}
+
 fn check_mailbox_fence(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
     host: &str,
 ) -> Result<(), St3Error> {
+    #[cfg(test)]
+    MAILBOX_FENCE_EVALUATIONS.set(MAILBOX_FENCE_EVALUATIONS.get() + 1);
     check_mailbox_incarnation(connection, fence)?;
     mailbox_lease::check_lease_fence(connection, fence, host)?;
     let owner: Option<(String, u64)> = connection

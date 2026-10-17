@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Reduce repeated mailbox report fence reads and expose fence-check caller counts and durations",
+  "replay": {"status": "none", "detail": "Mailbox replay proof, immediate incarnation revocation and writer-side admission checks are preserved; no verdict cache is introduced."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint, canonical ordering, repair membership or digest changes."},
+  "compatibility": {"status": "none", "detail": "Existing mailbox frames, report authentication and ownership contracts remain unchanged. Ordinary report admission reuses one consistent read snapshot rather than repeating the full store fence."},
+  "downtime": {"status": "none", "detail": "No migration or additional startup work."},
+  "manual": {"status": "none", "detail": "No operator action required. Mailbox fence metrics distinguish reports, graph-change dirty passes, heartbeats and safety rechecks."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new rollback restrictions."}
+}

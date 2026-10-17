@@ -637,6 +637,56 @@ pub fn record_http_request_duration(
     );
 }
 
+/// Bounded reasons a mailbox stream checks its authority; never label metrics with a seat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailboxFenceCaller {
+    Report,
+    DirtyPass,
+    Heartbeat,
+    Safety,
+}
+
+impl MailboxFenceCaller {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Report => "report",
+            Self::DirtyPass => "dirty_pass",
+            Self::Heartbeat => "heartbeat",
+            Self::Safety => "safety",
+        }
+    }
+}
+
+static MAILBOX_FENCE_CHECKS: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        opentelemetry::global::meter("st3.mailbox")
+            .u64_counter("st.mailbox.fence.check")
+            .with_description("Completed mailbox fence checks, including rejected and failed checks")
+            .build()
+    });
+static MAILBOX_FENCE_DURATION: std::sync::LazyLock<opentelemetry::metrics::Histogram<f64>> =
+    std::sync::LazyLock::new(|| {
+        opentelemetry::global::meter("st3.mailbox")
+            .f64_histogram("st.mailbox.fence.check.duration")
+            .with_unit("s")
+            .with_description("Duration of mailbox fence checks, including rejected and failed checks")
+            .build()
+    });
+
+/// Record each completed fence check, including rejected and failed checks.
+///
+/// Call once around the whole authority check, not once per underlying store read.
+/// Metrics remain independent of trace sampling and allocate no per-check label strings.
+pub fn record_mailbox_fence_check(caller: MailboxFenceCaller, elapsed: Duration) {
+    if !metrics_enabled() {
+        return;
+    }
+    let attributes = [KeyValue::new("caller", caller.as_str())];
+    MAILBOX_FENCE_CHECKS.add(1, &attributes);
+    MAILBOX_FENCE_DURATION.record(elapsed.as_secs_f64(), &attributes);
+}
+
+
 /// Request totals stay on the SERVER span, without sub-millisecond noise.
 pub fn record_writer_wait(server: &tracing::Span, (wait_ms, ops): (f64, u64)) {
     if wait_ms >= 1.0 {
