@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Document a proposed staged receive-replay publication boundary and its required storage decision.",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation only. No implementation, format/version reservation, migration, replay, admission policy, client contract, service restart or production repair is introduced. Proposed future generation storage and its mixed-build/recovery obligations require separate approval and qualification."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation only. No implementation, format/version reservation, migration, replay, admission policy, client contract, service restart or production repair is introduced. Proposed future generation storage and its mixed-build/recovery obligations require separate approval and qualification."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation only. No implementation, format/version reservation, migration, replay, admission policy, client contract, service restart or production repair is introduced. Proposed future generation storage and its mixed-build/recovery obligations require separate approval and qualification."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation only. No implementation, format/version reservation, migration, replay, admission policy, client contract, service restart or production repair is introduced. Proposed future generation storage and its mixed-build/recovery obligations require separate approval and qualification."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation only. No implementation, format/version reservation, migration, replay, admission policy, client contract, service restart or production repair is introduced. Proposed future generation storage and its mixed-build/recovery obligations require separate approval and qualification."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation only. No implementation, format/version reservation, migration, replay, admission policy, client contract, service restart or production repair is introduced. Proposed future generation storage and its mixed-build/recovery obligations require separate approval and qualification."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation only. No implementation, format/version reservation, migration, replay, admission policy, client contract, service restart or production repair is introduced. Proposed future generation storage and its mixed-build/recovery obligations require separate approval and qualification."
+  }
+}

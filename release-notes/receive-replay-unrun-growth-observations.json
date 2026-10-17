@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Separate main database, WAL and cleanup growth in the unrun replay-swap recipe.",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation/source recipe pointers only. No control execution, runtime/client/storage/rules change, version reservation, replay, repair or deployment. Aggregate hosted disk quota and exact executor remain unqualified."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation/source recipe pointers only. No control execution, runtime/client/storage/rules change, version reservation, replay, repair or deployment. Aggregate hosted disk quota and exact executor remain unqualified."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation/source recipe pointers only. No control execution, runtime/client/storage/rules change, version reservation, replay, repair or deployment. Aggregate hosted disk quota and exact executor remain unqualified."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation/source recipe pointers only. No control execution, runtime/client/storage/rules change, version reservation, replay, repair or deployment. Aggregate hosted disk quota and exact executor remain unqualified."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation/source recipe pointers only. No control execution, runtime/client/storage/rules change, version reservation, replay, repair or deployment. Aggregate hosted disk quota and exact executor remain unqualified."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation/source recipe pointers only. No control execution, runtime/client/storage/rules change, version reservation, replay, repair or deployment. Aggregate hosted disk quota and exact executor remain unqualified."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation/source recipe pointers only. No control execution, runtime/client/storage/rules change, version reservation, replay, repair or deployment. Aggregate hosted disk quota and exact executor remain unqualified."
+  }
+}

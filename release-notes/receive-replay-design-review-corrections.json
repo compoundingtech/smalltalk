@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Clarify the proposed receive-replay storage/client decision, source inventory and unrun qualification recipes.",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation and source-review artifacts only. No runtime, emitted client contract, schema/storage/rules marker, replay, build/test, format reservation, service change or production repair is implemented. Future storage/client changes and F1/F3 controls remain proposed and unqualified."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation and source-review artifacts only. No runtime, emitted client contract, schema/storage/rules marker, replay, build/test, format reservation, service change or production repair is implemented. Future storage/client changes and F1/F3 controls remain proposed and unqualified."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation and source-review artifacts only. No runtime, emitted client contract, schema/storage/rules marker, replay, build/test, format reservation, service change or production repair is implemented. Future storage/client changes and F1/F3 controls remain proposed and unqualified."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation and source-review artifacts only. No runtime, emitted client contract, schema/storage/rules marker, replay, build/test, format reservation, service change or production repair is implemented. Future storage/client changes and F1/F3 controls remain proposed and unqualified."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation and source-review artifacts only. No runtime, emitted client contract, schema/storage/rules marker, replay, build/test, format reservation, service change or production repair is implemented. Future storage/client changes and F1/F3 controls remain proposed and unqualified."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation and source-review artifacts only. No runtime, emitted client contract, schema/storage/rules marker, replay, build/test, format reservation, service change or production repair is implemented. Future storage/client changes and F1/F3 controls remain proposed and unqualified."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation and source-review artifacts only. No runtime, emitted client contract, schema/storage/rules marker, replay, build/test, format reservation, service change or production repair is implemented. Future storage/client changes and F1/F3 controls remain proposed and unqualified."
+  }
+}

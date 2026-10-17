@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prepare an unrun ephemeral hosted source binding for the replay-swap design experiment.",
+  "replay": {
+    "status": "none",
+    "detail": "Controller/job source preparation only; Draft remains Draft, no invocation, runtime/storage/client/format change, repair or rollout. Hard-quota/provider and queue-terminal/cleanup guarantees remain unqualified executor inputs."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Controller/job source preparation only; Draft remains Draft, no invocation, runtime/storage/client/format change, repair or rollout. Hard-quota/provider and queue-terminal/cleanup guarantees remain unqualified executor inputs."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Controller/job source preparation only; Draft remains Draft, no invocation, runtime/storage/client/format change, repair or rollout. Hard-quota/provider and queue-terminal/cleanup guarantees remain unqualified executor inputs."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Controller/job source preparation only; Draft remains Draft, no invocation, runtime/storage/client/format change, repair or rollout. Hard-quota/provider and queue-terminal/cleanup guarantees remain unqualified executor inputs."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Controller/job source preparation only; Draft remains Draft, no invocation, runtime/storage/client/format change, repair or rollout. Hard-quota/provider and queue-terminal/cleanup guarantees remain unqualified executor inputs."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Controller/job source preparation only; Draft remains Draft, no invocation, runtime/storage/client/format change, repair or rollout. Hard-quota/provider and queue-terminal/cleanup guarantees remain unqualified executor inputs."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Controller/job source preparation only; Draft remains Draft, no invocation, runtime/storage/client/format change, repair or rollout. Hard-quota/provider and queue-terminal/cleanup guarantees remain unqualified executor inputs."
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Refine the receive-replay proposal with routing classes and larger unrun swap controls.",
+  "replay": {
+    "status": "none",
+    "detail": "Docs/source-review recipes only. No runtime/client emission, storage21 reservation, format change, replay, experiment, build/test, rollout or production repair. F1 result is missing decision evidence; F3 execution gates future implementation. Existing storage20 owner/hold and hard hosted resource inputs remain unqualified."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Docs/source-review recipes only. No runtime/client emission, storage21 reservation, format change, replay, experiment, build/test, rollout or production repair. F1 result is missing decision evidence; F3 execution gates future implementation. Existing storage20 owner/hold and hard hosted resource inputs remain unqualified."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Docs/source-review recipes only. No runtime/client emission, storage21 reservation, format change, replay, experiment, build/test, rollout or production repair. F1 result is missing decision evidence; F3 execution gates future implementation. Existing storage20 owner/hold and hard hosted resource inputs remain unqualified."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Docs/source-review recipes only. No runtime/client emission, storage21 reservation, format change, replay, experiment, build/test, rollout or production repair. F1 result is missing decision evidence; F3 execution gates future implementation. Existing storage20 owner/hold and hard hosted resource inputs remain unqualified."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Docs/source-review recipes only. No runtime/client emission, storage21 reservation, format change, replay, experiment, build/test, rollout or production repair. F1 result is missing decision evidence; F3 execution gates future implementation. Existing storage20 owner/hold and hard hosted resource inputs remain unqualified."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Docs/source-review recipes only. No runtime/client emission, storage21 reservation, format change, replay, experiment, build/test, rollout or production repair. F1 result is missing decision evidence; F3 execution gates future implementation. Existing storage20 owner/hold and hard hosted resource inputs remain unqualified."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Docs/source-review recipes only. No runtime/client emission, storage21 reservation, format change, replay, experiment, build/test, rollout or production repair. F1 result is missing decision evidence; F3 execution gates future implementation. Existing storage20 owner/hold and hard hosted resource inputs remain unqualified."
+  }
+}
