@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add offline scripts that build a predictive test selection dataset from CI history and evaluate a simple selector",
+  "replay": {
+    "status": "none",
+    "detail": "No canonical replay change or new replay trigger."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema digest, kind, field, table, index or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, rule digest or admission changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Analysis scripts only; nothing in the product or in CI runs them."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action; the scripts are run by hand for analysis."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to roll back beyond removing the scripts."
+  }
+}

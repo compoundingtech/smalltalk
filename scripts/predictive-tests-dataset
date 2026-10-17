@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Build the predictive test selection dataset from GitHub Actions history (offline analysis only).
+
+`fetch` reads Workspace CI and Nix runs of merge_group and pull_request events through `gh api`,
+caching every response under --cache so a second run costs no API calls. It reads the job list of
+every run that failed or was retried, the nextest log of every failed linux-tests shard, and the
+logs of a few successful runs per day for the test inventory, durations and flaky retries.
+`build` joins that with changed paths from a local git checkout and writes one JSON line per tested
+change. The model and the held-out evaluation are in scripts/predictive-tests-evaluate.
+
+Nothing here is wired into CI. See doc/fleet/factory/predictive-tests/report.
+"""
+import argparse
+import bisect
+from concurrent.futures import ThreadPoolExecutor
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import threading
+import time
+
+REPO = "compoundingtech/smalltalk"
+WORKFLOWS = ("fleet.yml", "nix.yml")
+EVENTS = ("merge_group", "pull_request")
+# Jobs that run no product check of their own: routing, the evidence lookups, the aggregate gate
+# (it fails whenever a member fails), path detection and capacity bookkeeping.
+NOT_CHECKS = re.compile(r"^(pick-runner|evidence-.*|namespace-capacity|linux-gate|fractal-web-changes"
+                        r"|fractal-web-execution|linux-test-build|perf-cost)$")
+NEXTEST_JOB = re.compile(r"^linux-tests(-shard-\d+)?$")
+# Tests named as failing at random in the flake issues #2725, #2122 and #2896 (issue text read
+# 2026-10-15). Their failures are marked flaky in the dataset whatever the run looked like.
+KNOWN_FLAKY_ISSUES = {
+    "#2725": [
+        "boot_canaries::claude::a_fresh_seat_boots",
+        "boot_canaries::claude_missing_channel_blocks_and_recovers_early_mail_without_replay",
+        "boot_canaries::claude_permanent_channel_failure_parks_after_three_attempts_without_a_restart_loop",
+        "boot_canaries::claude_uninitialized_channel_blocks_until_native_attachment",
+        "boot_canaries::codex::a_suspended_seat_resumes_its_own_native_session",
+        "boot_canaries::codex_idle_minute_makes_no_hold_calls_then_delivers_with_hold_release_and_expiry",
+        "boot_canaries::omp_when_idle_replacement_binds_its_original_native_session",
+        "boot_canaries::opencode_idle_minute_makes_no_hold_calls_then_delivers_with_hold_release_and_expiry",
+        "boot_canaries::pi::five_seats_launching_at_once_all_boot",
+        "boot_canaries::plain_codex_auto_config_boots_and_resumes_with_a_workspace_socket_profile",
+        "codex_bootstrap::bound_codex_foreign_invocation_after_terminal_stays_fenced",
+        "codex_bootstrap::delayed_delivery_control_holds_visible_native_input_and_recovers_once",
+        "daemon_restart::claude_mcp_initializes_offline_then_attaches_and_reconnects_without_restarting",
+        "daemon_restart::claude_mcp_retries_initialization_without_blocking_requests_or_eof",
+        "log_diet::a_busy_daemon_replicates_at_most_a_fifth_of_what_main_would",
+        "messaging_faults::baseline",
+        "messaging_faults::link_minutes",
+        "messaging_faults::link_seconds",
+        "mission_cancellation::cancellation_adopts_and_stops_gate_processes_after_daemon_restart",
+    ],
+    "#2122": ["messaging_faults::link_minutes"],
+    "#2896": ["store::tombstones_tests::a_trim_never_makes_a_write_wait_long"],
+}
+
+STATUS = re.compile(r"^\S+\s+(?:TRY (?P<try>\d+) )?(?P<status>PASS|FAIL|FLAKY \d+/\d+|TIMEOUT|SIGSEGV|SIGABRT|"
+                    r"SIGKILL|SIGTERM|ABORT|LEAK|LEAK-FAIL)\s+\[\s*>?\s*(?P<secs>[\d.]+)s\]\s+(?:\([^)]*\)\s+)?"
+                    r"(?P<binary>\S+)\s+(?P<test>\S+)\s*$")
+ANSI = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def parse_nextest_log(text):
+    """Final nextest outcome per test: pass, flaky (failed then passed on retry) or fail."""
+    seen = {}
+    for line in text.splitlines():
+        match = STATUS.match(line)
+        if match:
+            entry = seen.setdefault(f"{match['binary']} {match['test']}", {"passed": False, "failed": False, "flaky": False})
+            status = match["status"]
+            entry["seconds"] = float(match["secs"])
+            if status.startswith("FLAKY"):
+                entry["flaky"] = True
+            elif status in ("PASS", "LEAK"):
+                entry["passed"] = True
+            else:
+                entry["failed"] = True
+    # The final summary repeats each failure, so a result is the union of every line for a test.
+    return {key: {"outcome": "flaky" if entry["flaky"] or (entry["passed"] and entry["failed"])
+                  else "fail" if entry["failed"] else "pass", "seconds": entry["seconds"]}
+            for key, entry in seen.items()}
+
+
+def known_flaky(test):
+    name = test.split(" ", 1)[-1]
+    return [issue for issue, names in KNOWN_FLAKY_ISSUES.items()
+            if any(name == known or name.endswith("::" + known) for known in names)]
+
+
+class Api:
+    """`gh api` with an on-disk cache and a floor on the shared hourly rate limit."""
+
+    def __init__(self, cache, floor):
+        self.cache, self.floor, self.calls, self.lock = Path(cache), floor, 0, threading.Lock()
+
+    def path(self, endpoint):
+        return self.cache / "api" / (hashlib.sha256(endpoint.encode()).hexdigest() + ".bin")
+
+    def get(self, endpoint, raw=False):
+        path = self.path(endpoint)
+        if path.exists():
+            data = path.read_bytes()
+        else:
+            self.wait_for_budget()
+            arguments = ["gh", "api", endpoint] + (["--allow-escape-sequences"] if raw else [])
+            for attempt in range(4):
+                done = subprocess.run(arguments, capture_output=True)
+                if done.returncode == 0:
+                    break
+                if b"404" in done.stderr or b"410" in done.stderr:
+                    data = b""
+                    break
+                time.sleep(5 * (attempt + 1))
+            else:
+                raise RuntimeError(f"gh api {endpoint}: {done.stderr.decode(errors='replace')}")
+            if done.returncode == 0:
+                data = ANSI.sub(b"", done.stdout) if raw else done.stdout
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            with self.lock:
+                self.calls += 1
+        if raw:
+            return data.decode(errors="replace")
+        return json.loads(data) if data else None
+
+    def wait_for_budget(self):
+        with self.lock:
+            if self.calls % 50:
+                return
+            while True:
+                core = json.loads(subprocess.check_output(["gh", "api", "rate_limit"]))["resources"]["core"]
+                if core["remaining"] > self.floor:
+                    return
+                pause = max(30, core["reset"] - time.time() + 5)
+                print(f"rate limit {core['remaining']} <= floor {self.floor}; sleeping {pause:.0f}s", file=sys.stderr)
+                time.sleep(pause)
+
+
+def list_runs(api, since, until):
+    runs = []
+    day = since
+    while day < until:
+        # Half-day windows stay under the API's 1000-result cap for one query.
+        for start, end in ((f"{day}T00:00:00Z", f"{day}T11:59:59Z"), (f"{day}T12:00:00Z", f"{day}T23:59:59Z")):
+            for workflow in WORKFLOWS:
+                for event in EVENTS:
+                    page = 1
+                    while True:
+                        endpoint = (f"repos/{REPO}/actions/workflows/{workflow}/runs?event={event}&status=completed"
+                                    f"&created={start}..{end}&per_page=100&page={page}")
+                        body = api.get(endpoint) or {"workflow_runs": []}
+                        for run in body["workflow_runs"]:
+                            runs.append({key: run.get(key) for key in (
+                                "id", "name", "event", "head_sha", "head_branch", "conclusion", "run_attempt",
+                                "created_at", "updated_at", "run_started_at")} | {
+                                "workflow": workflow,
+                                "prs": [pr["number"] for pr in run.get("pull_requests") or []]})
+                        if len(body["workflow_runs"]) < 100:
+                            break
+                        page += 1
+        day += dt.timedelta(days=1)
+    return runs
+
+
+def jobs_of(api, run, attempt):
+    jobs, page = [], 1
+    while True:
+        body = api.get(f"repos/{REPO}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100&page={page}")
+        if not body:
+            return jobs
+        jobs += [{key: job.get(key) for key in ("id", "name", "conclusion", "started_at", "completed_at")}
+                 for job in body["jobs"]]
+        if len(body["jobs"]) < 100:
+            return jobs
+        page += 1
+
+
+def fetch(arguments):
+    api = Api(arguments.cache, arguments.rate_floor)
+    since = dt.date.fromisoformat(arguments.since)
+    until = dt.date.fromisoformat(arguments.until)
+    runs = list_runs(api, since, until)
+    print(f"{len(runs)} completed runs", file=sys.stderr)
+
+    # Job lists: every run that did not pass at once (failed, or passed only on a retry), plus the
+    # inventory sample: the first successful Workspace CI run of each event per day.
+    sampled, per_day = set(), {}
+    for run in sorted(runs, key=lambda run: run["created_at"]):
+        bucket = (run["created_at"][:10], run["event"])
+        if run["workflow"] == "fleet.yml" and run["conclusion"] == "success" and run["run_attempt"] == 1:
+            if per_day.get(bucket, 0) < arguments.inventory_per_day:
+                per_day[bucket] = per_day.get(bucket, 0) + 1
+                sampled.add(run["id"])
+    wanted = [run for run in runs if run["conclusion"] == "failure" or run["run_attempt"] > 1 or run["id"] in sampled
+              or (arguments.all_jobs and run["conclusion"] == "success")]
+
+    def load(run):
+        attempts = []
+        for attempt in range(1, run["run_attempt"] + 1):
+            jobs = jobs_of(api, run["id"], attempt)
+            for job in jobs:
+                if not NEXTEST_JOB.match(job["name"]):
+                    continue
+                if job["conclusion"] == "failure" or (run["id"] in sampled and job["conclusion"] == "success"):
+                    log = api.get(f"repos/{REPO}/actions/jobs/{job['id']}/logs", raw=True)
+                    job["tests"] = parse_nextest_log(log)
+                    job["log_bytes"] = len(log)
+            attempts.append({"attempt": attempt, "jobs": jobs})
+        return run["id"], attempts
+
+    details = {}
+    with ThreadPoolExecutor(arguments.jobs) as pool:
+        for count, (run_id, attempts) in enumerate(pool.map(load, wanted), 1):
+            details[run_id] = attempts
+            if count % 100 == 0:
+                print(f"{count}/{len(wanted)} runs read, {api.calls} API calls", file=sys.stderr)
+    for run in runs:
+        run["attempts"] = details.get(run["id"])
+        run["inventory_sample"] = run["id"] in sampled
+    out = Path(arguments.cache) / "runs.jsonl"
+    out.write_text("".join(json.dumps(run, sort_keys=True) + "\n" for run in runs))
+    print(f"wrote {out}; {api.calls} API calls this time", file=sys.stderr)
+
+
+def git(repo, *arguments, check=True):
+    return subprocess.run(["git", "-C", repo, *arguments], capture_output=True, text=True, check=check).stdout
+
+
+def main_history(repo):
+    """origin/main's first-parent commits as (commit time, id), oldest first."""
+    lines = git(repo, "log", "--first-parent", "--format=%ct %H", "origin/main").split()
+    return sorted((int(lines[i]), lines[i + 1]) for i in range(0, len(lines), 2))
+
+
+def changed_paths(repo, run, cache, main, queue):
+    """The base and the paths the tree under test changes: a queue entry together with the entries ahead
+    of it that were still being tested, or the PR against main as it was when the run started."""
+    sha = run["head_sha"]
+    if sha not in cache:
+        if run["event"] == "merge_group":
+            # A queue commit merges its entry into the entry ahead of it. Walk back past entries whose own
+            # runs had not finished when this one started: their changes are untested parts of this tree.
+            base = git(repo, "rev-parse", f"{sha}^1", check=False).strip()
+            started = run["created_at"]
+            while base in queue and queue[base] > started:
+                base = git(repo, "rev-parse", f"{base}^1", check=False).strip()
+            out = git(repo, "diff", "--name-only", base, sha, check=False) if base else None
+        else:
+            # Main at the time of the run: a merged PR's head is on today's main, so today's merge-base is the head.
+            started = dt.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00")).timestamp()
+            index = bisect.bisect_right(main, (started, "~")) - 1
+            tip = main[index][1] if index >= 0 else "origin/main"
+            base = git(repo, "merge-base", tip, sha, check=False).strip()
+            out = git(repo, "diff", "--name-only", base, sha, check=False) if base else None
+        cache[sha] = (base or None, sorted(filter(None, out.splitlines())) if out is not None else None)
+    return cache[sha]
+
+
+def defined_at(repo, base, test, cache):
+    """Whether the test's function already existed in the base tree (false: the change adds or renames it)."""
+    name = test.rsplit("::", 1)[-1]
+    if (base, name) not in cache:
+        found = subprocess.run(["git", "-C", repo, "grep", "-q", "-w", "-e", f"fn {name}", base, "--", "*.rs"],
+                               capture_output=True)
+        cache[(base, name)] = found.returncode == 0
+    return cache[(base, name)]
+
+
+def build(arguments):
+    cache = Path(arguments.cache)
+    runs = [json.loads(line) for line in (cache / "runs.jsonl").read_text().splitlines()]
+    shas = sorted({run["head_sha"] for run in runs})
+    missing = [sha for sha in shas if subprocess.run(
+        ["git", "-C", arguments.repo, "cat-file", "-e", f"{sha}^{{commit}}"], capture_output=True).returncode]
+    for start in range(0, len(missing), 200):
+        # GitHub serves unadvertised commits by id; queue entries that never merged are only here.
+        subprocess.run(["git", "-C", arguments.repo, "fetch", "--quiet", "--no-tags", "origin",
+                        *missing[start:start + 200]], capture_output=True)
+    path_cache, defined, changes, inventory, main = {}, {}, [], {}, main_history(arguments.repo)
+    queue = {}  # queue head -> when its last run finished
+    for run in runs:
+        if run["event"] == "merge_group":
+            queue[run["head_sha"]] = max(queue.get(run["head_sha"], ""), run["updated_at"])
+    for run in sorted(runs, key=lambda run: run["created_at"]):
+        if run["attempts"] is None and run["conclusion"] != "success":
+            continue  # cancelled or skipped before any check result we read
+        for attempt in run["attempts"] or [{"attempt": run["run_attempt"], "jobs": None}]:
+            last = attempt["attempt"] == run["run_attempt"]
+            base, paths = changed_paths(arguments.repo, run, path_cache, main, queue)
+            change = {
+                "id": f"{run['id']}/{attempt['attempt']}", "run": run["id"], "attempt": attempt["attempt"],
+                "workflow": run["workflow"], "event": run["event"], "head_sha": run["head_sha"],
+                "branch": run["head_branch"], "prs": run["prs"], "created_at": run["created_at"], "updated_at": run["updated_at"],
+                "run_conclusion": run["conclusion"] if last else "failure",
+                "base": base, "paths": paths,
+                "checks": {}, "failed_tests": {}, "flaky_tests": [], "nextest_job_failed_without_test": False,
+            }
+            if attempt["jobs"] is None:
+                # A run that passed on its first attempt: every check that ran passed.
+                change["checks"] = None
+            else:
+                for job in attempt["jobs"]:
+                    if NOT_CHECKS.match(job["name"]) or job["conclusion"] in (None, "skipped"):
+                        continue
+                    check = "linux-tests" if NEXTEST_JOB.match(job["name"]) else job["name"]
+                    if run["workflow"] == "nix.yml":
+                        check = f"nix:{job['name']}"
+                    previous = change["checks"].get(check)
+                    change["checks"][check] = "failure" if "failure" in (previous, job["conclusion"]) else job["conclusion"]
+                    for test, result in (job.get("tests") or {}).items():
+                        if result["outcome"] == "fail":
+                            change["failed_tests"][test] = {
+                                "seconds": result["seconds"], "known_flaky": known_flaky(test),
+                                "new_in_change": bool(base) and not defined_at(arguments.repo, base, test, defined)}
+                        elif result["outcome"] == "flaky":
+                            change["flaky_tests"].append(test)
+                        # Inventory: tests on their way to main (queue entries) or on a sampled passing run.
+                        # Logs list passing tests only since about 2026-10-06 (--status-level pass).
+                        if run["event"] == "merge_group" or run["inventory_sample"]:
+                            seen = inventory.setdefault(test, {"first_seen": run["created_at"], "seconds": [], "flaky": 0, "runs": 0})
+                            seen["seconds"].append(result["seconds"])
+                            seen["runs"] += 1
+                            seen["flaky"] += result["outcome"] == "flaky"
+                    if NEXTEST_JOB.match(job["name"]) and job["conclusion"] == "failure" and "tests" in job \
+                            and not any(r["outcome"] == "fail" for r in job["tests"].values()):
+                        change["nextest_job_failed_without_test"] = True
+            changes.append(change)
+    # A test that failed at a head and passed in another attempt or run at the same head is flaky there.
+    passed_at = {}
+    for change in changes:
+        if change["checks"] is None or change["checks"].get("linux-tests") == "success":
+            passed_at.setdefault(change["head_sha"], set()).add("linux-tests")
+    for change in changes:
+        for test, failure in change["failed_tests"].items():
+            failure["passed_same_head"] = "linux-tests" in passed_at.get(change["head_sha"], set())
+    out = Path(arguments.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "changes.jsonl").write_text("".join(json.dumps(change, sort_keys=True) + "\n" for change in changes))
+    tests = {test: {"first_seen": seen["first_seen"], "runs": seen["runs"], "flaky": seen["flaky"],
+                    "seconds": sorted(seen["seconds"])[len(seen["seconds"]) // 2]} for test, seen in inventory.items()}
+    (out / "tests.json").write_text(json.dumps(tests, indent=1, sort_keys=True) + "\n")
+    print(f"{len(changes)} changes, {len(tests)} inventoried tests, "
+          f"{sum(1 for c in changes if c['paths'] is None)} without changed paths", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    fetching = commands.add_parser("fetch", help="read run, job and nextest history into --cache")
+    fetching.add_argument("--cache", required=True)
+    fetching.add_argument("--since", default=str(dt.date.today() - dt.timedelta(days=60)))
+    fetching.add_argument("--until", default=str(dt.date.today() + dt.timedelta(days=1)))
+    fetching.add_argument("--inventory-per-day", type=int, default=2, help="successful runs per day and event to read in full")
+    fetching.add_argument("--all-jobs", action="store_true",
+                          help="also read the job list of every passing run (which checks ran; one call per run)")
+    fetching.add_argument("--rate-floor", type=int, default=1500, help="pause while fewer API calls than this remain")
+    fetching.add_argument("--jobs", type=int, default=6)
+    building = commands.add_parser("build", help="join the cache with changed paths into a dataset")
+    building.add_argument("--cache", required=True)
+    building.add_argument("--repo", default=".", help="a smalltalk checkout with origin/main")
+    building.add_argument("--out", required=True)
+    arguments = parser.parse_args()
+    {"fetch": fetch, "build": build}[arguments.command](arguments)
+
+
+if __name__ == "__main__":
+    main()

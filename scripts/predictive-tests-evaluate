@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Fit a simple predictive test selector and evaluate it on a later, held-out window.
+
+Reads the dataset from scripts/predictive-tests-dataset build (changes.jsonl, tests.json) and the
+workspace's Cargo manifests, then prints Markdown: per check, the fraction of tests (or runs of the
+check) selected against the fraction of faulty changes caught, on changes created at or after
+--split. Weights are fit only on changes before --split; history features (which tests failed
+after which paths changed, and when) use every run that had finished before the change was
+created, as a deployed selector would.
+
+Labels: a failure counts as a fault only if it is not flaky. Flaky means named in a flake issue,
+passed at the same head in another attempt or run, or retried to a pass (nextest FLAKY) at least
+--flaky-min times anywhere in the data. The paper (Machalica et al., Predictive Test Selection,
+ICSE-SEIP 2019) warns that flaky labels teach the model noise.
+"""
+import argparse
+import bisect
+from collections import Counter, defaultdict
+import datetime as dt
+import json
+import math
+from pathlib import Path
+import random
+import re
+import tomllib
+
+RATIOS = (0.05, 0.1, 0.2, 0.3, 0.5, 0.75)
+FEATURES = ("file_history", "directory_history", "crate_history", "same_crate", "depends_on_changed",
+            "module_named", "recently_failed", "base_rate", "log_seconds")
+
+
+def when(stamp):
+    return dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+def workspace(repo):
+    """Package name -> directory, and package -> workspace packages it depends on (transitively)."""
+    root = Path(repo)
+    members = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["members"]
+    directory, direct = {}, {}
+    for member in members:
+        manifest = tomllib.loads((root / member / "Cargo.toml").read_text())
+        name = manifest["package"]["name"]
+        directory[name] = member
+        direct[name] = set()
+        for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+            direct[name] |= set(manifest.get(table, {}))
+    names = set(directory)
+    closure = {}
+    for name in names:
+        seen, stack = set(), [name]
+        while stack:
+            for dependency in direct.get(stack.pop(), ()):
+                if dependency in names and dependency not in seen:
+                    seen.add(dependency)
+                    stack.append(dependency)
+        closure[name] = seen
+    return directory, closure
+
+
+def package_of_path(path, directory):
+    best = None
+    for name, folder in directory.items():
+        if path.startswith(folder + "/") and (best is None or len(folder) > len(directory[best])):
+            best = name
+    return best
+
+
+def test_package(test):
+    return test.split(" ", 1)[0].split("::", 1)[0]
+
+
+def test_module(test):
+    return test.split(" ", 1)[-1].split("::", 1)[0]
+
+
+class History:
+    """Failure history known at a point in time, built incrementally in completion order."""
+
+    def __init__(self):
+        self.touch = defaultdict(Counter)                        # level -> key -> changes touching it
+        self.fail = defaultdict(lambda: defaultdict(Counter))    # level -> key -> test or check -> faults
+        self.last_failed = {}                                    # test or check -> time of its last fault
+        self.failures = Counter()                                # test or check -> faults
+        self.changes = 0
+
+    def add(self, keys, failed, finished):
+        self.changes += 1
+        for level, values in keys.items():
+            for value in values:
+                self.touch[level][value] += 1
+                for item in failed:
+                    self.fail[level][value][item] += 1
+        for item in failed:
+            self.failures[item] += 1
+            self.last_failed[item] = max(finished, self.last_failed.get(item, 0))
+
+    def conditional(self, level, values):
+        """For every test or check: the highest smoothed P(fault | key touched) over the touched keys."""
+        best = {}
+        for value in values:
+            seen = self.touch[level][value]
+            for item, count in self.fail[level][value].items():
+                best[item] = max(best.get(item, 0.0), count / (seen + 2))
+        return best
+
+
+def path_keys(paths, directory):
+    files = set(paths)
+    folders = {path.rsplit("/", 1)[0] if "/" in path else "." for path in paths}
+    packages = {package_of_path(path, directory) for path in paths} - {None}
+    stems = {Path(path).stem for path in paths} | {Path(path).parent.name for path in paths}
+    return {"file": files, "directory": folders, "crate": packages}, stems
+
+
+def features(history, conditionals, stems, packages_changed, closure, item, package, module, seconds, now):
+    last = history.last_failed.get(item)
+    return [
+        conditionals["file"].get(item, 0.0),
+        conditionals["directory"].get(item, 0.0),
+        conditionals["crate"].get(item, 0.0),
+        1.0 if package in packages_changed else 0.0,
+        1.0 if package and closure.get(package, set()) & packages_changed else 0.0,
+        1.0 if module and module in stems else 0.0,
+        math.exp(-(now - last) / 86400 / 3) if last else 0.0,
+        history.failures[item] / (history.changes + 2),
+        math.log1p(seconds),
+    ]
+
+
+def fit(rows, labels, weights, iterations=25, ridge=1.0):
+    """Weighted logistic regression by Newton's method (stdlib only)."""
+    size = len(rows[0]) + 1
+    beta = [0.0] * size
+    for _ in range(iterations):
+        gradient = [0.0] * size
+        hessian = [[0.0] * size for _ in range(size)]
+        for row, label, weight in zip(rows, labels, weights):
+            x = [1.0] + row
+            z = sum(b * v for b, v in zip(beta, x))
+            p = 1 / (1 + math.exp(-max(-30, min(30, z))))
+            for i in range(size):
+                gradient[i] += weight * (label - p) * x[i]
+                for j in range(i, size):
+                    hessian[i][j] += weight * p * (1 - p) * x[i] * x[j]
+        for i in range(size):
+            for j in range(i):
+                hessian[i][j] = hessian[j][i]
+            if i:
+                hessian[i][i] += ridge
+                gradient[i] -= ridge * beta[i]
+        step = solve(hessian, gradient)
+        beta = [b + s for b, s in zip(beta, step)]
+        if max(abs(s) for s in step) < 1e-6:
+            break
+    return beta
+
+
+def solve(matrix, vector):
+    size = len(vector)
+    augmented = [row[:] + [value] for row, value in zip(matrix, vector)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
+        augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        if abs(augmented[column][column]) < 1e-12:
+            continue
+        for row in range(size):
+            if row != column:
+                factor = augmented[row][column] / augmented[column][column]
+                augmented[row] = [a - factor * b for a, b in zip(augmented[row], augmented[column])]
+    return [augmented[i][size] / augmented[i][i] if abs(augmented[i][i]) > 1e-12 else 0.0 for i in range(size)]
+
+
+def score(beta, row):
+    return sum(b * v for b, v in zip(beta, [1.0] + row))
+
+
+def widespread(failures, window, minimum, runs=None, share=0.0):
+    """Failures seen on at least `minimum` different branches within `window` seconds (and, when `runs`
+    gives every run's time per item, in at least `share` of the runs then): a broken base or an
+    environment, not the change. `failures` maps an item to its (time, branch) list."""
+    marked = set()
+    for item, seen in failures.items():
+        seen.sort()
+        times = [time for time, _ in seen]
+        all_times = sorted(runs[item]) if runs else None
+        for time, branch in seen:
+            low, high = bisect.bisect_left(times, time - window), bisect.bisect_right(times, time + window)
+            if len({other for _, other in seen[low:high]}) < minimum:
+                continue
+            if all_times:
+                total = bisect.bisect_right(all_times, time + window) - bisect.bisect_left(all_times, time - window)
+                if (high - low) / total < share:
+                    continue
+            marked.add((item, time, branch))
+    return marked
+
+
+def load(arguments):
+    changes = [json.loads(line) for line in (Path(arguments.data) / "changes.jsonl").read_text().splitlines()]
+    tests = json.loads((Path(arguments.data) / "tests.json").read_text())
+    retried = Counter(test for change in changes for test in change["flaky_tests"])
+    for test, seen in tests.items():
+        retried[test] = max(retried[test], seen["flaky"])
+    flaky_tests = {test for test, count in retried.items() if count >= arguments.flaky_min}
+    failures = defaultdict(list)
+    for change in changes:
+        change["start"] = when(change["created_at"])
+        change["finish"] = when(change.get("updated_at") or change["created_at"])
+        for test in change["failed_tests"]:
+            failures[test].append((change["start"], change["branch"]))
+    spread = widespread(failures, arguments.widespread_hours * 3600, arguments.widespread_branches)
+    reasons = Counter()
+    for change in changes:
+        faults = set()
+        for test, failure in change["failed_tests"].items():
+            if failure["known_flaky"]:
+                reasons["named in a flake issue"] += 1
+            elif failure["passed_same_head"]:
+                reasons["passed at the same head in another attempt or run"] += 1
+            elif test in flaky_tests:
+                reasons[f"test retried to a pass >= {arguments.flaky_min} times"] += 1
+            elif (test, change["start"], change["branch"]) in spread:
+                reasons[f"same test failed on >= {arguments.widespread_branches} branches within "
+                        f"{arguments.widespread_hours} h"] += 1
+            else:
+                faults.add(test)
+        change["faults"] = faults
+    return changes, tests, reasons, flaky_tests
+
+
+def check_faults(changes, arguments):
+    """Per check, whether it failed for a reason the change can own."""
+    passed_at, failures, runs = defaultdict(set), defaultdict(list), defaultdict(list)
+    for change in changes:
+        for check, conclusion in (change["checks"] or {}).items():
+            runs[check].append(change["start"])
+            if conclusion == "success":
+                passed_at[change["head_sha"]].add(check)
+            elif conclusion == "failure":
+                failures[check].append((change["start"], change["branch"]))
+    # A check is coarse: several real faults an hour are normal, so it also needs a failing share.
+    spread = widespread(failures, arguments.widespread_hours * 3600, arguments.widespread_branches, runs,
+                        arguments.widespread_check_share)
+    reasons = Counter()
+    for change in changes:
+        change["check_faults"] = set()
+        for check, conclusion in (change["checks"] or {}).items():
+            if conclusion != "failure":
+                continue
+            if check in passed_at[change["head_sha"]]:
+                reasons[(check, "passed at the same head")] += 1
+            elif (check, change["start"], change["branch"]) in spread:
+                reasons[(check, "widespread")] += 1
+            elif check == "linux-tests" and not change["faults"]:
+                reasons[(check, "no attributable test failure (build, infrastructure or flaky only)")] += 1
+            else:
+                change["check_faults"].add(check)
+    return reasons
+
+
+def random_catch(total, failing, chosen):
+    """Probability that `chosen` of `total` tests drawn at random include one of `failing`."""
+    if failing == 0 or chosen <= 0:
+        return 0.0
+    if chosen >= total - failing + 1:
+        return 1.0
+    miss = 1.0
+    for i in range(failing):
+        miss *= (total - chosen - i) / (total - i)
+    return 1 - miss
+
+
+def replay(changes, tests, directory, closure, visit):
+    """Visit changes in start order with the history of every change that had finished by then."""
+    first_seen = {test: when(seen["first_seen"]) for test, seen in tests.items()}
+    seconds = {test: seen["seconds"] for test, seen in tests.items()}
+    history, check_history, finished = History(), History(), 0
+    pending = sorted(changes, key=lambda change: change["finish"])
+    earlier_faults = defaultdict(set)
+    for change in changes:
+        while finished < len(pending) and pending[finished]["finish"] <= change["start"]:
+            done = pending[finished]
+            keys, _ = path_keys(done["paths"], directory)
+            if done["ran_tests"]:
+                history.add(keys, done["faults"], done["finish"])
+            check_history.add(keys, done["check_faults"], done["finish"])
+            finished += 1
+        keys, stems = path_keys(change["paths"], directory)
+        # A failing test the base already defined existed then even if no sampled log had listed it yet.
+        new = {test for test in change["faults"] if change["failed_tests"][test].get("new_in_change")}
+        known = [test for test in tests if first_seen[test] <= change["start"]]
+        known += sorted(test for test in change["faults"] - new if first_seen.get(test, float("inf")) > change["start"])
+        conditionals = {level: history.conditional(level, values) for level, values in keys.items()}
+        check_conditionals = {level: check_history.conditional(level, values) for level, values in keys.items()}
+
+        def row(test):
+            return features(history, conditionals, stems, keys["crate"], closure, test, test_package(test),
+                            test_module(test), seconds.get(test, 1.0), change["start"])
+
+        def check_row(check):
+            return features(check_history, check_conditionals, stems, keys["crate"], closure, check, None, None,
+                            1.0, change["start"])
+        repeat = change["faults"] & earlier_faults[pull_request(change)]
+        unseen = sum(1 for path in keys["file"] if not history.touch["file"][path]) / max(1, len(keys["file"]))
+        visit(change, known, row, check_row, new, repeat, unseen)
+        if change["ran_tests"]:
+            earlier_faults[pull_request(change)] |= change["faults"]
+
+
+def evaluate(arguments):
+    changes, tests, reasons, flaky_tests = load(arguments)
+    directory, closure = workspace(arguments.repo)
+    check_reasons = check_faults(changes, arguments)
+    changes = [change for change in changes if change["paths"] is not None and change["workflow"] == "fleet.yml"]
+    changes.sort(key=lambda change: change["start"])
+    for change in changes:
+        change["ran_tests"] = change["checks"] is None or "linux-tests" in change["checks"]
+    # Walk forward one day at a time: each held-out day is scored by weights fit on every earlier day.
+    first = dt.date.fromisoformat(arguments.split)
+    last = dt.datetime.fromtimestamp(changes[-1]["start"], dt.timezone.utc).date()
+    folds = [when(f"{first + dt.timedelta(days=day)}T00:00:00Z") for day in range((last - first).days + 1)]
+    if not arguments.walk_forward:
+        folds = folds[:1]
+
+    def fold_of(start):
+        return bisect.bisect_right(folds, start) - 1
+
+    random.seed(7)
+    train, check_rows = [], defaultdict(list)
+
+    train_from = when(arguments.train_from + "T00:00:00Z") if arguments.train_from else 0
+
+    def collect(change, known, row, check_row, new, repeat, unseen):
+        if change["ran_tests"] and change["start"] >= train_from:
+            negatives = random.sample(known, min(arguments.negatives, len(known)))
+            weight = max(1.0, (len(known) - len(change["faults"])) / max(1, len(negatives)))
+            for test in set(negatives) | (change["faults"] - new):
+                label = 1.0 if test in change["faults"] else 0.0
+                train.append((change["start"], row(test), label, 1.0 if label else weight))
+        for check in set(change["checks"] or {}) - {"linux-tests"}:
+            check_rows[check].append((change, check_row(check), 1.0 if check in change["check_faults"] else 0.0))
+    replay(changes, tests, directory, closure, collect)
+    betas = [fit([r for start, r, _, _ in train if start < fold], [l for start, _, l, _ in train if start < fold],
+                 [w for start, _, _, w in train if start < fold]) for fold in folds]
+
+    held_out = []
+
+    def rank(change, known, row, check_row, new, repeat, unseen):
+        queue = change["event"] == "merge_group"
+        if not change["ran_tests"] or change["start"] < folds[0] or not (change["faults"] or queue):
+            return
+        beta = betas[fold_of(change["start"])]
+        scores = {test: score(beta, row(test)) for test in known}
+        # Risk of the whole change: the expected number of faulty tests under the model.
+        risk = sum(1 / (1 + math.exp(-max(-30, min(30, value)))) for value in scores.values())
+        if queue:
+            ordered = sorted(known, key=lambda test: -scores[test])
+            durations = [tests[test]["seconds"] if test in tests else 1.0 for test in ordered]
+            total, prefix = sum(durations), [0.0]
+            for value in durations:
+                prefix.append(prefix[-1] + value)
+            queue_time[0] += 1
+            for ratio in RATIOS:
+                queue_time[ratio] = queue_time.get(ratio, 0.0) + prefix[math.ceil(ratio * len(ordered))] / total
+            queue_risk.append((change, risk))
+        if not change["faults"]:
+            return
+        # Cost-aware order: fault probability per second of test time, filled up to a time budget.
+        seconds = {test: tests[test]["seconds"] if test in tests else 1.0 for test in known}
+        total_time = sum(seconds.values())
+
+        def time_to_first(order, faults):
+            spent = 0.0
+            for test in order:
+                spent += seconds[test]
+                if test in faults:
+                    return spent / total_time
+            return 1.0
+        by_score = sorted(known, key=lambda test: -scores[test])
+        by_rate = sorted(known, key=lambda test: -(scores[test] - math.log(max(seconds[test], 0.05))))
+        ordered = sorted(known, key=lambda test: -scores[test])
+        position = {test: index + 1 for index, test in enumerate(ordered)}
+        rule = {test for test in known if row(test)[3] or row(test)[4]}
+        held_out.append({"change": change, "total": len(known), "new": new, "repeat": repeat,
+                         "position": {test: position[test] for test in change["faults"] if test in position},
+                         "rule_share": len(rule) / len(known), "rule_hits": change["faults"] & rule, "risk": risk,
+                         "unseen": unseen, "time_score": time_to_first(by_score, change["faults"] - new - repeat),
+                         "time_rate": time_to_first(by_rate, change["faults"] - new - repeat),
+                         "time_rate_all": time_to_first(by_rate, change["faults"] - new)})
+    queue_risk, queue_time = [], {0: 0}
+    replay(changes, tests, directory, closure, rank)
+    print_report(arguments, changes, tests, reasons, check_reasons, flaky_tests, folds, betas, held_out,
+                 check_rows, train)
+    print_adaptive(held_out, queue_risk)
+    if queue_time[0]:
+        print("Test time (sum of median durations) in the top share of tests, mean over held-out queue runs: "
+              + ", ".join(f"{int(r*100)}% of tests → {queue_time[r]/queue_time[0]:.0%} of test time" for r in RATIOS) + ".\n")
+    unseen = [item for item in held_out if item["change"]["faults"] - item["new"] and item["unseen"] == 1.0]
+    caught = sum(item["time_rate_all"] <= 0.2 for item in unseen)
+    print(f"Held-out faulty changes whose changed files had no history at all: {len(unseen)} of {len(held_out)}; "
+          f"caught within 20% of test time: {caught}.\n")
+
+
+def print_adaptive(held_out, queue_risk):
+    """A risk-adaptive queue ratio of test time: the riskiest share of entries runs `high`, the rest `low`,
+    each filling its budget in score-per-second order."""
+    risks = sorted(risk for _, risk in queue_risk)
+    items = [item for item in held_out if item["change"]["event"] == "merge_group"
+             and item["change"]["faults"] - item["new"]]
+    if not risks or not items:
+        return
+    print(f"### Merge queue: risk-adaptive share of test time (held-out queue runs: {len(risks)}, faulty: {len(items)})\n")
+    print(table_line(["low", "high", "entries at high", "mean test time run", "faulty entries caught"]))
+    print(table_line(["---"] * 5))
+    for low in (0.2, 0.3, 0.5):
+        for high in (0.75, 1.0):
+            for share in (0.1, 0.2, 0.3):
+                threshold = risks[min(len(risks) - 1, int((1 - share) * len(risks)))]
+                caught = sum(item["time_rate_all"] <= (high if item["risk"] >= threshold else low) for item in items)
+                mean = sum(high if risk >= threshold else low for risk in risks) / len(risks)
+                print(table_line([f"{low:.0%}", f"{high:.0%}", f"{share:.0%}", f"{mean:.0%}",
+                                  f"{caught}/{len(items)} ({caught/len(items):.0%})"]))
+    print("\nThe risk is the model's expected number of faulty tests in the entry; the cut is the share of "
+          "held-out queue entries ranked riskiest. Tests the entry or an entry ahead adds or renames run in every row.\n")
+
+
+def pull_request(change):
+    """The pull request a run tested: queue entries name it in their branch."""
+    match = re.search(r"/pr-(\d+)-", change["branch"] or "")
+    if match:
+        return f"#{match[1]}"
+    return f"#{change['prs'][0]}" if change["prs"] else change["branch"]
+
+
+def table_line(cells):
+    return "| " + " | ".join(str(cell) for cell in cells) + " |"
+
+
+def nextest_rows(items):
+    """Per ratio: share of changes whose known faults include a selected test, model and random."""
+    cells, needed = [], []
+    for item in items:
+        positions = [item["position"][test] for test in item["faults"] if test in item["position"]]
+        needed.append(min(positions) / item["total"] if positions else 1.0)
+    for ratio in RATIOS:
+        caught = expected = 0.0
+        for item, share in zip(items, needed):
+            chosen = math.ceil(ratio * item["total"])
+            caught += share * item["total"] <= chosen
+            expected += random_catch(item["total"], len(item["faults"] & item["position"].keys()), chosen)
+        cells.append(f"{caught/len(items):.0%} / {expected/len(items):.0%}")
+    rule = (sum(item["rule_share"] for item in items) / len(items),
+            sum(bool(item["rule_hits"] & item["faults"]) for item in items) / len(items))
+    return cells, sorted(needed), rule
+
+
+def print_report(arguments, changes, tests, reasons, check_reasons, flaky_tests, folds, betas, held_out,
+                 check_rows, train):
+    ran = [change for change in changes if change["ran_tests"]]
+    span = f"{arguments.split} to {dt.datetime.fromtimestamp(changes[-1]['start'], dt.timezone.utc):%Y-%m-%d %H:%MZ}"
+    print(f"Workspace CI changes where linux-tests ran: {sum(c['start'] < folds[0] for c in ran)} before {arguments.split}, "
+          f"{sum(c['start'] >= folds[0] for c in ran)} held out ({span}, "
+          f"{'walk-forward, refit daily' if len(folds) > 1 else 'one fit'}). Inventoried tests: {len(tests)}. "
+          f"Training rows: {len(train)}, faulty (change, test) pairs: {int(sum(r[2] for r in train))}.\n")
+    print("Test failures not counted as faults: " + "; ".join(f"{count} {reason}" for reason, count in reasons.most_common())
+          + f". {len(flaky_tests)} tests retried to a pass >= {arguments.flaky_min} times.\n")
+    print("Check failures not counted as faults: " + "; ".join(
+        f"{check} {reason}: {count}" for (check, reason), count in sorted(check_reasons.items())) + ".\n")
+    print("Model weights (logistic, last fold): " + ", ".join(
+        f"{name} {weight:+.2f}" for name, weight in zip(("intercept",) + FEATURES, betas[-1])) + "\n")
+
+    print("### linux-tests (nextest): held-out faulty changes caught, model / random order\n")
+    print(table_line(["events", "faults counted", "faulty changes", "new tests only"]
+                     + [f"{int(r*100)}% tests" for r in RATIOS]
+                     + ["share of tests to reach the first fault (median / p90)", "crate rule: tests run → caught"]))
+    print(table_line(["---"] * (4 + len(RATIOS) + 2)))
+    for event in (None, "merge_group", "pull_request"):
+        for mode in ("every run", "first failure per PR"):
+            items, new_only = [], 0
+            for item in held_out:
+                if event and item["change"]["event"] != event:
+                    continue
+                faults = item["change"]["faults"] - (item["repeat"] if mode != "every run" else set())
+                if not faults:
+                    continue
+                if not faults - item["new"]:
+                    new_only += 1
+                    continue
+                items.append(item | {"faults": faults - item["new"]})
+            if not items:
+                continue
+            cells, needed, rule = nextest_rows(items)
+            print(table_line([event or "all", mode, len(items), new_only] + cells
+                             + [f"{needed[len(needed)//2]:.1%} / {needed[int(len(needed)*0.9)]:.1%}",
+                                f"{rule[0]:.0%} → {rule[1]:.0%}"]))
+    print("\n### linux-tests by test time: faulty changes caught within a share of the total test time\n")
+    print(table_line(["events", "faults counted", "faulty changes", "order"] + [f"{int(r*100)}% time" for r in RATIOS]))
+    print(table_line(["---"] * (4 + len(RATIOS))))
+    for event in (None, "merge_group", "pull_request"):
+        items = [item for item in held_out if (not event or item["change"]["event"] == event)
+                 and item["change"]["faults"] - item["repeat"] - item["new"]]
+        if not items:
+            continue
+        for order, key in (("model score", "time_score"), ("score per second", "time_rate")):
+            print(table_line([event or "all", "first failure per PR", len(items), order]
+                             + [f"{sum(item[key] <= r for item in items)/len(items):.0%}" for r in RATIOS]))
+    print("\nRandom order catches about the time share itself.")
+    print("\nA change whose only faults are tests it adds or renames (the function is not in its base tree) is counted in "
+          "\"new tests only\" and left out of the ratios: no history exists for them, so they must always run.\n")
+
+    print("### Other checks: run the check on the riskiest share of each held-out day's changes\n")
+    print(table_line(["check", "held-out runs", "held-out faulty"] + [f"run {int(r*100)}%" for r in RATIOS]))
+    print(table_line(["---"] * (3 + len(RATIOS))))
+    for check, entries in sorted(check_rows.items()):
+        held = [(change, row, label) for change, row, label in entries if change["start"] >= folds[0]]
+        faulty = sum(label for _, _, label in held)
+        if not held:
+            continue
+        caught = Counter()
+        for index, fold in enumerate(folds):
+            end = folds[index + 1] if index + 1 < len(folds) else float("inf")
+            train_rows = [(row, label) for change, row, label in entries if change["start"] < fold]
+            day = [(row, label) for change, row, label in held if fold <= change["start"] < end]
+            if not day or not sum(label for _, label in day):
+                continue
+            if not sum(label for _, label in train_rows):
+                beta = [0.0] * (len(FEATURES) + 1)
+            else:
+                positives = sum(label for _, label in train_rows)
+                weights = [1.0 if label else positives / len(train_rows) for _, label in train_rows]
+                beta = fit([row for row, _ in train_rows], [label for _, label in train_rows], weights)
+            ordered = sorted(day, key=lambda entry: -score(beta, entry[0]))
+            for ratio in RATIOS:
+                caught[ratio] += sum(label for _, label in ordered[:math.ceil(ratio * len(ordered))])
+        cells = [check, len(held), int(faulty)]
+        cells += [f"{caught[ratio]/faulty:.0%}" if faulty else "-" for ratio in RATIOS]
+        print(table_line(cells))
+    print("\nRandom order catches about the run share itself (5% of runs → about 5% of faulty changes).\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--data", required=True, help="directory written by predictive-tests-dataset build")
+    parser.add_argument("--repo", default=".", help="smalltalk checkout for the Cargo workspace layout")
+    parser.add_argument("--split", required=True, help="first day of the held-out window, YYYY-MM-DD")
+    parser.add_argument("--walk-forward", action="store_true",
+                        help="refit at the start of every held-out day on all earlier days (default: one fit)")
+    parser.add_argument("--train-from", help="fit only on changes from this day (the test inventory exists from it)")
+    parser.add_argument("--negatives", type=int, default=150, help="passing tests sampled per training change")
+    parser.add_argument("--flaky-min", type=int, default=2)
+    parser.add_argument("--widespread-branches", type=int, default=4)
+    parser.add_argument("--widespread-hours", type=float, default=3)
+    parser.add_argument("--widespread-check-share", type=float, default=0.5,
+                        help="share of a check's runs in the window that must fail to call a check failure widespread")
+    evaluate(parser.parse_args())
+
+
+if __name__ == "__main__":
+    main()

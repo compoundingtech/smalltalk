@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""The dataset must tell a final failure from a retried flake, and mark tests named in flake issues."""
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader("dataset", str(root / "scripts/predictive-tests-dataset"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+log = """\
+2026-10-15T07:38:09.1127470Z         PASS [   8.029s] (   1/1807) st3::integration boot_canaries::every_exit_reaps
+2026-10-15T07:39:59.7554481Z   TRY 1 FAIL [  52.408s] (─────────) st3::integration messaging_faults::old_channel
+2026-10-15T07:40:09.2721775Z   TRY 1 FAIL [   0.303s] (─────────) smallclaims sqlite::queued_deadline
+2026-10-15T07:40:55.5347293Z   TRY 2 PASS [   0.026s] (  86/1807) smallclaims sqlite::queued_deadline
+2026-10-15T07:41:29.7581602Z   TRY 2 SLOW [> 60.000s] (─────────) st3::integration messaging_faults::old_channel
+2026-10-15T07:42:12.0381797Z   TRY 3 FAIL [ 102.281s] ( 635/1807) st3::integration messaging_faults::old_channel
+2026-10-15T07:39:59.9680805Z         FAIL [ 118.884s] (  13/1807) st3::integration boot_canaries::claude::a_fresh_seat_boots
+2026-10-15T07:40:00.0000000Z     SIGSEGV [   1.000s] (  14/1807) st-wire codec::round_trip
+2026-10-15T07:48:52.4450000Z      Summary [ 651.400s] 1807 tests run: 1806 passed (15 slow, 1 flaky), 3 failed
+2026-10-15T07:48:52.4503041Z    FLAKY 2/3 [   0.026s] (  86/1807) smallclaims sqlite::queued_deadline
+2026-10-15T07:48:52.4503042Z    TRY 3 FAIL [ 102.281s] ( 635/1807) st3::integration messaging_faults::old_channel
+2026-10-15T07:48:52.4505171Z         FAIL [ 118.884s] (  13/1807) st3::integration boot_canaries::claude::a_fresh_seat_boots
+"""
+results = module.parse_nextest_log(log)
+assert {test: result["outcome"] for test, result in results.items()} == {
+    "st3::integration boot_canaries::every_exit_reaps": "pass",
+    "st3::integration messaging_faults::old_channel": "fail",
+    "smallclaims sqlite::queued_deadline": "flaky",
+    "st3::integration boot_canaries::claude::a_fresh_seat_boots": "fail",
+    "st-wire codec::round_trip": "fail",
+}, results
+assert results["st3::integration boot_canaries::every_exit_reaps"]["seconds"] == 8.029
+assert module.known_flaky("st3::integration boot_canaries::claude::a_fresh_seat_boots") == ["#2725"]
+assert module.known_flaky("st3::integration messaging_faults::link_minutes") == ["#2725", "#2122"]
+assert module.known_flaky("st3 store::tombstones_tests::a_trim_never_makes_a_write_wait_long") == ["#2896"]
+assert module.known_flaky("st3::integration boot_canaries::every_exit_reaps") == []
+assert module.NEXTEST_JOB.match("linux-tests-shard-3") and not module.NEXTEST_JOB.match("linux-test-build")
+assert module.NOT_CHECKS.match("linux-gate") and not module.NOT_CHECKS.match("typescript-client")
+print("predictive-tests dataset parser: ok")
