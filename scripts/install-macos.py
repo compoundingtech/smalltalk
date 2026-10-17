@@ -12,6 +12,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 
 CERTIFICATE = os.environ.get('ST_MACOS_SIGNING_IDENTITY') or None
@@ -185,6 +186,21 @@ def prepare(home, job, built):
     return app, dict(identity, payload_unchanged=False), payload
 
 
+def owns_fractal(path):
+    return path.is_symlink() and os.readlink(path) in ('st3', str(path.parent / 'st3'))
+
+def foreign_fractal_on_path(destination):
+    for directory in os.environ.get('PATH', '').split(os.pathsep):
+        candidate = Path(directory or '.').absolute() / 'fractal'
+        if candidate.parent.resolve() == destination.parent.resolve():
+            continue
+        if candidate.exists() or candidate.is_symlink():
+            if not (candidate.is_symlink() and os.readlink(candidate) == str(destination.parent / 'st3')):
+                return True
+    return False
+
+
+
 def backup(home, job):
     previous = Path(job) / 'previous-app'
     current = fixed(home)
@@ -201,8 +217,11 @@ def backup(home, job):
     entries = {}
     previous_bin = Path(job) / 'previous-bin'
     previous_bin.mkdir(exist_ok=True)
-    for name in ['st3', 'stui', 'st']:
+    for name in ['st3', 'stui', 'st', 'fractal']:
         path = bin_dir(home) / name
+        # A foreign fractal command is outside this transaction, including rollback.
+        if name == 'fractal' and (path.exists() or path.is_symlink()) and not owns_fractal(path):
+            continue
         if path.is_symlink():
             entries[name] = {'link': os.readlink(path)}
         elif path.exists():
@@ -251,13 +270,29 @@ def install(app, home, job):
     if retired.is_dir():
         raise RuntimeError('refusing to remove directory: ' + str(retired))
     swap(app, home, job, 'install')
-    links = dict(binaries(fixed(home)), st=Path('st3'))
+    links = dict(binaries(fixed(home)))
+    # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+    links['st'] = Path('st3')
+    # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
     for name, path in links.items():
         link = bin_dir(home) / name
         link.parent.mkdir(parents=True, exist_ok=True)
         staged = link.parent / ('.' + name + '-' + Path(job).name)
         staged.unlink(missing_ok=True); staged.symlink_to(path); os.replace(staged, link)
     retired.unlink(missing_ok=True)
+    alias = bin_dir(home) / 'fractal'
+    if owns_fractal(alias):
+        staged = alias.parent / ('.fractal-' + Path(job).name)
+        staged.unlink(missing_ok=True)
+        staged.symlink_to('st3')
+        os.replace(staged, alias)
+    else:
+        try:
+            if foreign_fractal_on_path(alias):
+                raise FileExistsError('foreign fractal on PATH')
+            alias.symlink_to('st3')
+        except FileExistsError:
+            print('install: leaving fractal unchanged: destination ' + str(alias) + ' or PATH contains a foreign command; use st, or move the foreign fractal and reinstall to enable the alias.', file=sys.stderr)
     for service in SERVICES:
         path = Path(home) / 'Library/LaunchAgents' / (service + '.plist')
         if not path.exists():
@@ -293,6 +328,8 @@ def restore(home, job, had_app):
 
     for name, prior in json.loads((Path(job) / 'previous-bin.json').read_text()).items():
         path = bin_dir(home) / name
+        if name == 'fractal' and (path.exists() or path.is_symlink()) and not owns_fractal(path):
+            continue
         if prior is None:
             path.unlink(missing_ok=True)
         elif 'link' in prior:

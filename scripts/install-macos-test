@@ -138,6 +138,70 @@ class Installer(unittest.TestCase):
                 m.prepare(self.home, self.job, self.built)
         self.assertFalse(any('--sign' in call for call in self.calls))
 
+    def test_fractal_collisions_and_rollback(self):
+        for kind in ['free', 'owned-relative', 'owned-absolute', 'file', 'link', 'dangling', 'directory', 'path']:
+            with self.subTest(kind=kind):
+                home = self.home / kind
+                job = home / 'job'
+                job.mkdir(parents=True)
+                destination = m.bin_dir(home)
+                destination.mkdir(parents=True)
+                alias = destination / 'fractal'
+                path_dir = home / 'foreign-path'
+                path_dir.mkdir()
+                if kind == 'owned-relative':
+                    alias.symlink_to('st3')
+                elif kind == 'owned-absolute':
+                    alias.symlink_to(destination / 'st3')
+                elif kind == 'file':
+                    alias.write_text('foreign')
+                elif kind == 'link':
+                    alias.symlink_to(self.built['st3'])
+                elif kind == 'dangling':
+                    alias.symlink_to('/missing/fractal')
+                elif kind == 'directory':
+                    alias.mkdir()
+                elif kind == 'path':
+                    (path_dir / 'fractal').write_text('foreign')
+                previous = os.readlink(alias) if alias.is_symlink() else None
+                with patch.dict(os.environ, PATH=str(path_dir)), \
+                        patch.object(m, 'command', side_effect=self.command), \
+                        patch.object(m, 'exchange', side_effect=self.exchange), \
+                        contextlib.redirect_stderr(io.StringIO()) as errors:
+                    app, _, _ = m.prepare(home, job, self.built)
+                    had_app = m.backup(home, job)
+                    m.install(app, home, job)
+                    if kind in ['free', 'owned-relative', 'owned-absolute']:
+                        self.assertEqual(os.readlink(alias), 'st3')
+                        self.assertEqual(errors.getvalue(), '')
+                    else:
+                        self.assertIn('leaving fractal unchanged:', errors.getvalue())
+                    self.assertEqual((destination / 'st').read_bytes(), b'st3-one')
+                    m.restore(home, job, had_app)
+                if previous is not None:
+                    self.assertEqual(os.readlink(alias), previous)
+                elif kind == 'file':
+                    self.assertEqual(alias.read_text(), 'foreign')
+                elif kind == 'directory':
+                    self.assertEqual(list(alias.iterdir()), [])
+                else:
+                    self.assertFalse(alias.exists() or alias.is_symlink())
+                if kind == 'path':
+                    self.assertEqual((path_dir / 'fractal').read_text(), 'foreign')
+
+    def test_fractal_rollback_does_not_overwrite_new_foreign_command(self):
+        with patch.dict(os.environ, PATH=''), \
+                patch.object(m, 'command', side_effect=self.command), \
+                patch.object(m, 'exchange', side_effect=self.exchange):
+            app, _, _ = m.prepare(self.home, self.job, self.built)
+            had_app = m.backup(self.home, self.job)
+            m.install(app, self.home, self.job)
+            alias = m.bin_dir(self.home) / 'fractal'
+            alias.unlink()
+            alias.write_text('new foreign owner')
+            m.restore(self.home, self.job, had_app)
+        self.assertEqual(alias.read_text(), 'new foreign owner')
+
     def test_full_bundle_plists_cli_restore_and_unchanged_payload(self):
         bin_dir = m.bin_dir(self.home)
         bin_dir.mkdir(parents=True)

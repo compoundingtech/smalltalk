@@ -21,7 +21,9 @@ let
         postBuild = ''
           rm "$out/bin/st3" "$out/bin/pty" "$out/bin/st"
           cp ${cfg.package}/bin/st3 "$out/bin/st3"
+          # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
           ln -s st3 "$out/bin/st"
+          # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
           ln -s ${cfg.ptyPackage}/bin/pty "$out/bin/pty"
         '';
       };
@@ -72,6 +74,11 @@ let
   hasDeclarations = applyCommands != [ ];
 in
 {
+  options.programs.smalltalk.fractalBinary.enable = mkEnableOption ''
+    the opt-in fractal alias in the Home Manager-owned Smalltalk stable bin directory.
+    Requires services.smalltalk.enable; ignored when services.smalltalk.binary.path is set
+  '';
+
   options.services.smalltalk = {
     enable = mkEnableOption "the smalltalk user daemon";
     package = mkOption {
@@ -178,7 +185,23 @@ in
               ${pkgs.coreutils}/bin/chmod 755 "$temporary"
               ${pkgs.coreutils}/bin/mv -f "$temporary" "$target"
             fi
+            # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
             ${pkgs.coreutils}/bin/ln -sfn st3 "$binDir/st"
+            ${if config.programs.smalltalk.fractalBinary.enable then ''
+              if [[ -L "$binDir/fractal" ]] && [[ "$(${pkgs.coreutils}/bin/readlink "$binDir/fractal")" == st3 ]]; then
+                : # Already points at the stable executable.
+              elif [[ ! -e "$binDir/fractal" && ! -L "$binDir/fractal" ]]; then
+                ${pkgs.coreutils}/bin/ln -s st3 "$binDir/fractal" ||
+                  echo "Could not create $binDir/fractal; kept the existing path. Smalltalk remains available as st." >&2
+              else
+                echo "Not replacing $binDir/fractal: it is not a Smalltalk alias. Move it yourself to opt in; use st meanwhile." >&2
+              fi
+            '' else ''
+              if [[ -L "$binDir/fractal" ]] && [[ "$(${pkgs.coreutils}/bin/readlink "$binDir/fractal")" == st3 ]]; then
+                ${pkgs.coreutils}/bin/rm "$binDir/fractal"
+              fi
+            ''}
+            # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
           )
         fi
       '');

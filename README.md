@@ -32,6 +32,17 @@ print checks alone do not prove that the Assistant can authenticate.
 Neither GitHub nor `gh` is required. Native macOS build and installer tests run in CI;
 clean-machine app, launchd and permission setup still need a manual rehearsal.
 
+Releases also offer `fractal`: `fractal` or `fractal tui` opens the same terminal
+interface; other commands, such as `fractal work ls`, use the existing `st` CLI.
+`fractal web` opens an already-running web interface at `http://127.0.0.1:5173`
+(override with the `FRACTAL_WEB_URL` environment variable); it does not start a
+server. If no browser opener is available, it prints the URL instead.
+Installers leave an unrelated `fractal` executable untouched and keep `st` working.
+Nix installation of the new name is opt-in; see the Home Manager guide.
+The existing `st` and `st3` names and display strings remain unchanged. Their
+sunset is 60 days after the first release shipping `fractal`; the release date
+and resulting sunset date will be recorded when that release ships.
+
 **[Get started](docs/getting-started.md)** covers first-run questions, the Fractal Assistant,
 installation choices and background services. Each person currently runs their own
 fleet; start with one machine and add others when you need them.

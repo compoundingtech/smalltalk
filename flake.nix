@@ -80,13 +80,14 @@
                 systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
                 launchd.agents = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
               };
+              config.programs.smalltalk.fractalBinary.enable = extraConfig.fractalBinary or false;
               config.services.smalltalk = {
                 enable = true;
                 person = "person/ada";
                 socket = "/tmp/smalltalk-test.sock";
                 ptyPackage = ptyPackage;
                 declarations.seats = [ ./examples/st3/seats/claude.kdl ];
-              } // extraConfig;
+              } // builtins.removeAttrs extraConfig [ "fractalBinary" ];
             })
           ];
         };
@@ -546,7 +547,9 @@
             pkgs.lsof
           ];
           postInstall = ''
+            # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
             ln -s st3 $out/bin/st
+            # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
             ln -s ${ptyPackage}/bin/pty $out/bin/pty
             $out/bin/st completions bash > st.bash
             $out/bin/st completions zsh > _st
@@ -566,6 +569,16 @@
         st3 = st3Check.overrideAttrs (_: {
           doCheck = false;
         });
+
+        # Explicit opt-in: the default st3 package never gains bin/fractal.
+        fractal = pkgs.runCommand "fractal-${version}" {
+          meta = st3.meta // { mainProgram = "fractal"; };
+        } ''
+          mkdir -p $out/bin
+          # LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+          ln -s ${st3}/bin/st3 $out/bin/fractal
+          # LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-fractal-binary-aliases
+        '';
 
         stChatgpt = pkgs.rustPlatform.buildRustPackage {
           pname = "st-chatgpt";
@@ -589,6 +602,7 @@
         } ''
           test "$(readlink ${st3}/bin/st)" = st3
           test ! -e ${st3}/bin/stui
+          test ! -e ${st3}/bin/fractal
           test -x ${st3}/bin/pty
           expected='${version}+${sourceRev}${pkgs.lib.optionalString (sourceDirty && !(pkgs.lib.hasSuffix "-dirty" sourceRev)) "-dirty"}'
           ${st3}/bin/st3 --version > st3.version
@@ -879,6 +893,7 @@
         # The release target still links through the pinned Zig/glibc-baseline wrapper.
         packages.release-cc = pkgs.stdenv.cc;
         packages.st3 = st3;
+        packages.fractal = fractal;
         packages.st-chatgpt = stChatgpt;
         packages.st3-migrate = st3;
         packages.small-talk = st3;
@@ -958,6 +973,8 @@
             (if pkgs.stdenv.hostPlatform.isLinux then "reloadSystemd" else "setupLaunchAgents")
           ];
           assert builtins.deepSeq activation.data true;
+          assert !rendered.programs.smalltalk.fractalBinary.enable;
+          assert !(pkgs.lib.hasInfix ''/bin/ln -s st3 "$binDir/fractal"'' activation.data);
           assert builtins.length rendered.home.packages == 1;
           assert builtins.deepSeq (if pkgs.stdenv.hostPlatform.isLinux then
             rendered.systemd.user.services.smalltalk-apply.Service.ExecStart
@@ -966,6 +983,28 @@
           assert (!pkgs.stdenv.hostPlatform.isLinux)
             || rendered.systemd.user.services.smalltalk.Service.MemoryMax == "8G";
           pkgs.runCommand "smalltalk-hm-module-eval" { } "touch $out";
+        checks.fractal-aliases =
+          let
+            rendered = (mkHmModuleEval { fractalBinary = true; }).config;
+            external = (mkHmModuleEval {
+              fractalBinary = true;
+              binary.path = "/opt/smalltalk/bin/st3";
+            }).config;
+            activation = rendered.home.activation.smalltalkBinary.data;
+          in
+          assert rendered.programs.smalltalk.fractalBinary.enable;
+          assert builtins.length rendered.home.packages == 1;
+          assert pkgs.lib.hasInfix ''/bin/ln -s st3 "$binDir/fractal"'' activation;
+          assert pkgs.lib.hasInfix ''[[ ! -e "$binDir/fractal" && ! -L "$binDir/fractal" ]]'' activation;
+          assert !(pkgs.lib.hasInfix ''ln -sfn st3 "$binDir/fractal"'' activation);
+          assert !(external.home.activation ? smalltalkBinary);
+          assert self.packages.${system}.default == st3;
+          pkgs.runCommand "fractal-aliases-${version}" { } ''
+            test "$(readlink ${fractal}/bin/fractal)" = ${st3}/bin/st3
+            test -x ${fractal}/bin/fractal
+            test ! -e ${st3}/bin/fractal
+            touch $out
+          '';
         checks.hm-module-external-binary-eval =
           let
             executable = "/opt/smalltalk/bin/st3";

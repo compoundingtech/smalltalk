@@ -30,6 +30,9 @@ check() {
   local bin=$1 version=$2 binary
   [[ -L $bin/st && $(readlink "$bin/st") == st3 ]] || fail "$bin/st is not a symlink to st3"
   [[ $("$bin/st") == "st3 $version" ]] || fail "st does not run st3 $version"
+  if [[ ${EXPECT_FOREIGN_FRACTAL:-false} != true ]]; then
+    [[ -L $bin/fractal && $(readlink "$bin/fractal") == st3 ]] || fail "fractal does not link to st3"
+  fi
   for binary in st3 st3-migrate; do
     [[ -f $bin/$binary && ! -L $bin/$binary ]] || fail "$bin/$binary is not a regular file"
     [[ $("$bin/$binary") == "$binary $version" ]] || fail "$bin/$binary is not version $version"
@@ -57,6 +60,37 @@ ln -sfn "$work/one/st3" "$work/stale/st"
 bash "$install" --from "$work/one" --bin-dir "$work/stale" > /dev/null
 check "$work/stale" 1
 
+# Foreign commands (including dangling links and directories) survive; st stays usable.
+for kind in file link dangling directory; do
+  bin="$work/collision-$kind"
+  mkdir -p "$bin"
+  case $kind in
+    file) printf foreign > "$bin/fractal" ;;
+    link) ln -s "$work/one/st3" "$bin/fractal" ;;
+    dangling) ln -s /missing/fractal "$bin/fractal" ;;
+    directory) mkdir "$bin/fractal" ;;
+  esac
+  bash "$install" --from "$work/one" --bin-dir "$bin" > /dev/null 2> "$work/collision.err"
+  EXPECT_FOREIGN_FRACTAL=true check "$bin" 1
+  grep -q 'leaving fractal unchanged:.*use st' "$work/collision.err" || fail "missing collision guidance"
+  case $kind in
+    file) [[ $(cat "$bin/fractal") == foreign ]] || fail "foreign file replaced" ;;
+    link) [[ $(readlink "$bin/fractal") == "$work/one/st3" ]] || fail "foreign link replaced" ;;
+    dangling) [[ $(readlink "$bin/fractal") == /missing/fractal ]] || fail "dangling link replaced" ;;
+    directory) [[ -d $bin/fractal && -z $(ls -A "$bin/fractal") ]] || fail "foreign directory modified" ;;
+  esac
+done
+# Both installer-owned link spellings converge to the relative alias.
+ln -sfn "$work/stale/st3" "$work/stale/fractal"
+bash "$install" --from "$work/one" --bin-dir "$work/stale" > /dev/null
+check "$work/stale" 1
+# A free destination must not introduce an alias shadowing a foreign PATH command.
+mkdir -p "$work/foreign-path"
+cp "$work/one/st3" "$work/foreign-path/fractal"
+PATH="$work/foreign-path:$PATH" bash "$install" --from "$work/one" --bin-dir "$work/path-collision" > /dev/null 2> "$work/path.err"
+[[ ! -e $work/path-collision/fractal && ! -L $work/path-collision/fractal ]] || fail "foreign PATH command shadowed"
+EXPECT_FOREIGN_FRACTAL=true check "$work/path-collision" 1
+grep -q 'PATH contains a foreign command' "$work/path.err" || fail "missing PATH guidance"
 # A directory in the way is refused before anything is replaced.
 mkdir -p "$work/blocked/st"
 if bash "$install" --from "$work/two" --bin-dir "$work/blocked" 2> /dev/null; then

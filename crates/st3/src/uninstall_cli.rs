@@ -6,6 +6,17 @@ fn directory_is_empty(path: &Path) -> bool {
     fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
+fn remove_uninstall_path(path: &Path, binary_aliases: &[&Path]) -> std::io::Result<()> {
+    if binary_aliases.contains(&path) && !fractal::owns_alias(path) {
+        return Ok(());
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 pub(super) async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
     st3::service::preflight(!args.no_service)?;
     let config = Config::load_unvalidated(None)?;
@@ -28,13 +39,26 @@ pub(super) async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> R
     let manifest: Option<Value> = fs::read(data_dir.join("install.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let binaries = manifest
+    let binaries = fractal::installed_binaries(
+        manifest
+            .as_ref()
+            .and_then(|manifest| manifest["files"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|path| path.as_str().map(PathBuf::from))
+            .collect::<Vec<_>>(),
+    );
+    let instance_alias = instance
         .as_ref()
-        .and_then(|manifest| manifest["files"].as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|path| path.as_str().map(PathBuf::from))
+        .map(|instance| instance.bin_dir().join("fractal"));
+    let mut binary_aliases = binaries
+        .iter()
+        .filter(|path| path.file_name() == Some(std::ffi::OsStr::new("fractal")))
+        .map(PathBuf::as_path)
         .collect::<Vec<_>>();
+    if let Some(alias) = instance_alias.as_deref() {
+        binary_aliases.push(alias);
+    }
     let work_root = config.work_root().ok();
     let st2_state = state_home.join("st2");
     let st2_only_hooks = fs::read_dir(&st2_state)
@@ -163,11 +187,8 @@ pub(super) async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> R
         eprintln!("could not unregister st's Claude plugin: {error:#}");
     }
     for path in &paths {
-        let result = if path.is_dir() {
-            fs::remove_dir_all(path)
-        } else {
-            fs::remove_file(path)
-        };
+        // Recheck ownership only for identified executable aliases, never state directories.
+        let result = remove_uninstall_path(path, &binary_aliases);
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -181,6 +202,7 @@ pub(super) async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> R
         let _ = fs::remove_dir(work);
     }
     if let Some(instance) = &instance {
+        let _ = fs::remove_dir(instance.bin_dir());
         // The directory that holds instances goes with the last one; `remove_dir` leaves it alone
         // while another instance, or anything else, is inside.
         let _ = fs::remove_dir(instance.root());
@@ -207,4 +229,90 @@ pub(super) async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> R
     anyhow::ensure!(remaining.is_empty(), "some st3 files remain");
     println!("uninstalled");
     Ok(())
+}
+
+#[cfg(test)]
+mod instance_uninstall_tests {
+    use super::*;
+
+    fn names(paths: Vec<PathBuf>) -> Vec<String> {
+        let mut names = paths
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_instance_uninstall_removes_everything_but_the_work_folder() {
+        let root = tempfile::tempdir().unwrap();
+        for entry in ["bin", "state", "work/agents/site"] {
+            fs::create_dir_all(root.path().join(entry)).unwrap();
+        }
+        fs::write(root.path().join("work/agents/site/notes.txt"), "mine").unwrap();
+        let work = root.path().join("work");
+        assert_eq!(names(instance_removals(root.path(), &work)), ["bin", "state"]);
+    }
+
+    #[test]
+    fn an_entry_that_contains_a_nested_work_folder_is_kept_and_the_others_go() {
+        let root = tempfile::tempdir().unwrap();
+        for entry in ["bin", "data/projects", "state"] {
+            fs::create_dir_all(root.path().join(entry)).unwrap();
+        }
+        let work = root.path().join("data/projects");
+        assert_eq!(names(instance_removals(root.path(), &work)), ["bin", "state"]);
+    }
+
+    #[test]
+    fn a_work_folder_outside_the_instance_removes_every_entry() {
+        let root = tempfile::tempdir().unwrap();
+        for entry in ["bin", "state", "work"] {
+            fs::create_dir_all(root.path().join(entry)).unwrap();
+        }
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(
+            names(instance_removals(root.path(), elsewhere.path())),
+            ["bin", "state", "work"]
+        );
+    }
+
+    #[test]
+    fn an_instance_uninstall_preserves_a_foreign_fractal_but_removes_its_owned_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("st3"), "ours").unwrap();
+        let alias = bin.join("fractal");
+        std::os::unix::fs::symlink("st3", &alias).unwrap();
+        let work = root.path().join("work");
+        assert_eq!(names(instance_removals(root.path(), &work)), ["fractal", "st3"]);
+        fs::remove_file(&alias).unwrap();
+        fs::write(&alias, "foreign").unwrap();
+        assert_eq!(names(instance_removals(root.path(), &work)), ["st3"]);
+    }
+
+    #[test]
+    fn a_state_directory_named_fractal_is_removed_without_alias_ownership_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let alias = bin.join("fractal");
+        fs::write(&alias, "foreign").unwrap();
+        let binary_aliases = [alias.as_path()];
+        for parent in ["state", "config", "data"] {
+            let directory = root.path().join(parent).join("fractal");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("owned-state"), "ours").unwrap();
+            remove_uninstall_path(&directory, &binary_aliases).unwrap();
+            assert!(!directory.exists());
+        }
+        remove_uninstall_path(&alias, &binary_aliases).unwrap();
+        assert_eq!(fs::read_to_string(&alias).unwrap(), "foreign");
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("st3", &alias).unwrap();
+        remove_uninstall_path(&alias, &binary_aliases).unwrap();
+        assert!(fs::symlink_metadata(&alias).is_err());
+    }
 }

@@ -744,7 +744,9 @@ fn record_installed_binaries(bin: &Path) -> Result<()> {
     let manifest = serde_json::json!({
         "version": 1,
         "source": "setup",
-        "files": [bin.join("st3"), bin.join("st"), bin.join("pty")],
+        "files": crate::fractal::installed_binaries(vec![
+            bin.join("st3"), bin.join("st"), bin.join("pty"),
+        ]),
     });
     let mut pending = tempfile::NamedTempFile::new_in(&data)?;
     pending.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
