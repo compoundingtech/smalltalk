@@ -1084,6 +1084,7 @@ async fn dial_peer<B: Backend>(
     // once, even though the peer dialed in recently.
     let mut moving = false;
     let mut route = 0_usize;
+    let mut preferred_retry = None;
     let mut last_http_success = None;
     // Routes whose one early attempt after an outage is spent, until a probe sees them down again
     // or an exchange over them succeeds. See `wait_peer_retry`.
@@ -1170,6 +1171,10 @@ async fn dial_peer<B: Backend>(
             let routes = routes.borrow_and_update();
             let now = tokio::time::Instant::now();
             refused.retain(|(route, until)| routes.contains(route) && *until > now);
+            if preferred_retry.is_some_and(|deadline| now >= deadline) {
+                route = 0;
+                preferred_retry = None;
+            }
             (0..routes.len())
                 .map(|offset| routes[(route.wrapping_add(offset)) % routes.len()].clone())
                 .find(|candidate| !refused.iter().any(|(route, _)| route == candidate))
@@ -1273,6 +1278,15 @@ async fn dial_peer<B: Backend>(
         };
         match exchange_via(&http, &backend, &node, &peer, &auth, &fleet, carrier).await {
             Ok(moved) => {
+                if route > 0 {
+                    // Keep a working fallback while a transient preferred-route failure cools
+                    // down. Busy successful exchanges must not keep postponing its retry.
+                    preferred_retry.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + worker_interval(Duration::from_secs(60))
+                    });
+                } else {
+                    preferred_retry = None;
+                }
                 if is_http {
                     last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
                 }

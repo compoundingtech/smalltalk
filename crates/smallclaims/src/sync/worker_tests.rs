@@ -1064,6 +1064,146 @@ async fn members_exchange_with_signatures_and_a_removed_member_is_refused() {
 mod retry_tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn fallback_returns_to_preferred_after_cooldown_and_survives_repeat_failure() {
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Use the existing signed peer harness with two fake HTTP routes. No external
+        // transport or Fabric process participates; only in-process loopback listeners.
+        let fleet_id = "d706eab5-433c-474b-ae43-fd2a7891d85d";
+        let auth = FleetAuth::test(fleet_id, &[42; 32]);
+        let local = Arc::new(plain_memory("harbor").unwrap());
+        let remote = Arc::new(plain_memory("beacon").unwrap());
+        for store in [&local, &remote] {
+            store.bind_fleet(fleet_id).unwrap();
+        }
+        let preferred_up = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut urls = Vec::new();
+        let mut servers = Vec::new();
+        for preferred in [true, false] {
+            let up = preferred_up.clone();
+            let observed = attempts.clone();
+            let app = peer_router(
+                PeerState {
+                    backend: Local(remote.clone()),
+                    node: "beacon".into(),
+                    auth: auth.clone(),
+                    fleet: FleetContext::legacy(BTreeSet::from(["harbor".into()])),
+                    outbound_notify: watch::channel(0).0,
+                },
+                Router::new(),
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let up = up.clone();
+                    let observed = observed.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            observed.lock().push(preferred);
+                            if preferred && !up.load(Ordering::SeqCst) {
+                                return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            }
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(Route::Http(format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            )));
+            servers.push(tokio::spawn(axum::serve(listener, app).into_future()));
+        }
+        // Socket readiness must not race Tokio's automatic clock advances.
+        let awake = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let (_route_tx, routes) = watch::channel(urls);
+        let (notify, _) = watch::channel(0);
+        let fleet = FleetContext::legacy(BTreeSet::from(["beacon".into()]));
+        let dialer = tokio::spawn(dial_peer(
+            Local(local),
+            "harbor".into(),
+            "beacon".into(),
+            routes,
+            auth,
+            fleet.clone(),
+            notify.subscribe(),
+        ));
+        async fn tick() {
+            // Allow signed exchange/store work and socket I/O to settle at this instant.
+            for _ in 0..500 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        for _ in 0..20 {
+            tick().await;
+            if fleet.activity.read().unwrap().contains_key("beacon") {
+                break;
+            }
+        }
+        assert!(fleet.activity.read().unwrap().contains_key("beacon"));
+        assert!(attempts.lock()[0], "preferred fails first");
+        assert_eq!(attempts.lock().last(), Some(&false), "fallback succeeds");
+        preferred_up.store(true, Ordering::SeqCst);
+        // Local writes wake the worker throughout cooldown, but neither retry early nor
+        // slide the deadline on each successful fallback exchange.
+        for _ in 0..20 {
+            notify.send_modify(|generation| *generation += 1);
+            tick().await;
+        }
+        assert_eq!(attempts.lock().iter().filter(|&&route| route).count(), 1);
+        for _ in 0..70 {
+            notify.send_modify(|generation| *generation += 1);
+            tick().await;
+            if attempts.lock().last() == Some(&true) {
+                break;
+            }
+        }
+        assert_eq!(attempts.lock().last(), Some(&true), "preferred recovers");
+        preferred_up.store(false, Ordering::SeqCst);
+        let before = attempts.lock().len();
+        for _ in 0..20 {
+            notify.send_modify(|generation| *generation += 1);
+            tick().await;
+            let observed = attempts.lock();
+            if observed.len() > before && observed.last() == Some(&false) {
+                break;
+            }
+        }
+        assert_eq!(attempts.lock().last(), Some(&false));
+        let preferred_before = attempts.lock().iter().filter(|&&route| route).count();
+        for _ in 0..90 {
+            notify.send_modify(|generation| *generation += 1);
+            tick().await;
+            let observed = attempts.lock();
+            if observed.iter().filter(|&&route| route).count() > preferred_before
+                && observed.last() == Some(&false)
+            {
+                break;
+            }
+        }
+        let observed = attempts.lock();
+        assert!(observed.iter().filter(|&&route| route).count() > preferred_before);
+        assert_eq!(
+            observed.last(),
+            Some(&false),
+            "repeat failure keeps fallback usable"
+        );
+        drop(observed);
+        dialer.abort();
+        awake.abort();
+        for server in servers {
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn authenticated_activity_does_not_start_redundant_healthy_exchanges() {
         use std::sync::atomic::{AtomicUsize, Ordering};

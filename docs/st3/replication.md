@@ -374,6 +374,12 @@ See [Tailscale setup](tailscale.md) for direct-host setup and
 [the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
 for replacing a legacy local dial helper.
 
+After a successful exchange on a fallback route, the worker keeps using it for a
+60-second cooldown, then starts the next exchange from the preferred route again.
+Successful fallback exchanges do not extend that cooldown. If the preferred route
+still fails, normal route failover resumes; Fabric grant refusals retain their
+separate, longer cooldown.
+
 The peer HTTP listener is not the privileged local Unix API: it exposes only fleet replication,
 join, and owner-forwarded client operations. Replication and forwarded client requests require
 the fleet HMAC and peer admission; current members must also sign with their member key.
