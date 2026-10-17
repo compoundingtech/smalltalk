@@ -10,6 +10,13 @@ module.exports = () => {
   const daily = variant === 'daily';
   return {
     ...base,
+    ...(process.env.ST_IOS_PUSH === '1' ? { extra: { ...base.extra, stIosPush: true } } : {}),
+    plugins: [
+      ...(base.plugins ?? []),
+      process.env.ST_IOS_PUSH === '1'
+        ? ['expo-notifications', { mode: 'development' }]
+        : './plugins/withoutPush',
+    ],
     icon: daily ? './assets/icon.png' : './assets/icon-dev.png',
     ios: {
       ...base.ios,

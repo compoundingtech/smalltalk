@@ -1090,7 +1090,7 @@ fn emit_object(object: &Map<String, Value>, cx: &mut Cx, indent: &str) -> Result
     })
 }
 
-/// The single-const discriminator shared by every branch, if all values are unique.
+/// A unique string/number discriminator; Effect tagged unions require PropertyKey tags.
 fn tagged_by(branches: &[Value], cx: &Cx) -> Option<String> {
     let resolved: Vec<&Value> = branches
         .iter()
@@ -1108,7 +1108,7 @@ fn tagged_by(branches: &[Value], cx: &Cx) -> Option<String> {
                 .map(|branch| branch.get("properties")?.get(key.as_str())?.get("const"))
                 .collect();
             values.is_some_and(|values| {
-                values
+                values.iter().all(|value| value.is_string() || value.is_number()) && values
                     .iter()
                     .map(|value| value.to_string())
                     .collect::<BTreeSet<_>>()
@@ -1750,6 +1750,28 @@ mod tests {
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0]["required"], json!(["id", "payload", "type"]));
         assert_eq!(branches[1]["properties"]["payload"], json!({ "const": "complete" }));
+    }
+
+    #[test]
+    fn boolean_discriminators_remain_plain_unions() {
+        let mut schema = json!({"x-st-integers": "json-safe", "$defs": {
+            "Status": {"oneOf": [
+                {"type": "object", "additionalProperties": false, "required": ["registered"],
+                    "properties": {"registered": {"const": false}}},
+                {"type": "object", "additionalProperties": false, "required": ["registered", "environment"],
+                    "properties": {"registered": {"const": true}, "environment": {"type": "string"}}}
+            ]}
+        }});
+        let generated = models(&schema).unwrap();
+        assert!(generated.contains("Schema.Literal(false)"));
+        assert!(generated.contains("Schema.Literal(true)"));
+        assert!(!generated.contains("Schema.toTaggedUnion(\"registered\")"));
+        for tags in [[json!("off"), json!("on")], [json!(0), json!(1)]] {
+            for (branch, tag) in schema["$defs"]["Status"]["oneOf"].as_array_mut().unwrap().iter_mut().zip(tags) {
+                branch["properties"]["registered"]["const"] = tag;
+            }
+            assert!(models(&schema).unwrap().contains("Schema.toTaggedUnion(\"registered\")"));
+        }
     }
 
     #[test]

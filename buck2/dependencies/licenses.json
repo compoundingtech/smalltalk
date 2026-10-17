@@ -2,7 +2,7 @@
   "generated": "Do not edit; run nix develop .#web -c python3 scripts/ci-fractal-web-licenses",
   "source": "pnpm-lock.yaml packages; installed package.json license (legacy licenses fallback); missing manifests from lock-integrity-verified npm archives",
   "schemaVersion": 1,
-  "lockfileSha256": "6328225ae0297574934f029769793dbcdef5515b9b36e3a709f6c51bbe99e0ee",
+  "lockfileSha256": "5ce109db00dfa49b076181eca1c11b1485c1eca1cb79bc4c6efdd4702c3f7df4",
   "packages": [
     {
       "name": "@adobe/css-tools",
@@ -630,6 +630,11 @@
       "license": "MIT"
     },
     {
+      "name": "@expo/image-utils",
+      "version": "0.11.6",
+      "license": "MIT"
+    },
+    {
       "name": "@expo/inline-modules",
       "version": "0.1.7",
       "license": "MIT"
@@ -687,6 +692,11 @@
     {
       "name": "@expo/require-utils",
       "version": "57.0.5",
+      "license": "MIT"
+    },
+    {
+      "name": "@expo/require-utils",
+      "version": "57.0.6",
       "license": "MIT"
     },
     {
@@ -2160,6 +2170,11 @@
       "license": "MIT"
     },
     {
+      "name": "badgin",
+      "version": "1.2.3",
+      "license": "MIT"
+    },
+    {
       "name": "bail",
       "version": "2.0.2",
       "license": "MIT"
@@ -2695,6 +2710,11 @@
       "license": "MIT"
     },
     {
+      "name": "expo-application",
+      "version": "57.0.3",
+      "license": "MIT"
+    },
+    {
       "name": "expo-asset",
       "version": "57.0.18",
       "license": "MIT"
@@ -2711,7 +2731,7 @@
     },
     {
       "name": "expo-constants",
-      "version": "57.0.20",
+      "version": "57.0.21",
       "license": "MIT"
     },
     {
@@ -2757,6 +2777,11 @@
     {
       "name": "expo-modules-jsi",
       "version": "57.1.1",
+      "license": "MIT"
+    },
+    {
+      "name": "expo-notifications",
+      "version": "57.0.22",
       "license": "MIT"
     },
     {

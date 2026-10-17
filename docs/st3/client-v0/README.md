@@ -78,6 +78,13 @@ Paired sessions can send bounded disjoint UTC minute diagnostics with
 [`observations.report`](observations.md). This command has no action receipt, replication
 or snapshot fence. Live-share is typed foreground/live time, separate from latency histograms.
 
+### Push registration
+
+A paired phone can store its APNs device token with [`push.register`](push.md) and remove it with
+`push.unregister`, advertised as the optional `push-registration` capability. The token stays on
+the member that issued the pairing; it is never a claim, never replicated and never logged.
+Revoking or expiring the pairing removes it. st does not send pushes yet.
+
 ### Mission run timing
 
 `GET /v1/client/missions/{id}` requires `read.projections`, like other projection reads.
@@ -181,7 +188,8 @@ Fabric. Never expose the privileged local Unix API through a TCP forwarder.
 The gateway authenticates a paired device and derives the actor and scopes for the connection.
 Request bodies never select an actor. Device credentials are scoped, individually revocable, and
 different from fleet replication secrets. A remote client is always online: v0 has no offline
-mutation queue, push notification service, cached graph authority, or multi-master replication.
+mutation queue, push notification sender, cached graph authority, or multi-master replication.
+A paired phone may register a push token ([push registration](push.md)), but nothing sends to it.
 
 ### Tailnet carrier
 
@@ -681,7 +689,8 @@ Clients must evict removed source cards and replace their window from fresh snap
 reconnect. The iOS cache version is 4 and the terminal UI's is 3; older cached cards are discarded. Offline
 cards are marked stale and cannot submit actions. A future notification consumer should compare
 fixed-recipient snapshots at an explicit `as_of` and deduplicate transitions by source, person,
-and episode, notifying only when an episode first appears. There is no push delivery service.
+and episode, notifying only when an episode first appears. There is no push delivery service;
+[push registration](push.md) only stores a paired phone's token.
 
 Every attention resource carries its concrete `person_id`, original `source_id`, semantic
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A

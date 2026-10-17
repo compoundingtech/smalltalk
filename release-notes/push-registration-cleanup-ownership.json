@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Check push expiry inside the writer and retain every issuer's opt-out ownership",
+  "replay": {"status": "none", "detail": "Push registrations remain local-only; no claims or replication change."},
+  "schema": {"status": "none", "detail": "No database or wire schema change. The phone journals only safe profile identities for pending cleanup, never tokens or credentials."},
+  "rules": {"status": "none", "detail": "No checkpoint rule, retention or digest change."},
+  "compatibility": {"status": "none", "detail": "Registration mutations sample expiry after writer admission. Phone opt-out cleans all previously registered issuers; Forget and independent-member removal retain credentials until remote cleanup is confirmed."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No upgrade step. If opt-out cannot reach a previously registered member, reconnect and retry before forgetting its pairing."},
+  "recovery": {"status": "none", "detail": "Pending cleanup ownership survives phone restart and retries using current paired routes."}
+}

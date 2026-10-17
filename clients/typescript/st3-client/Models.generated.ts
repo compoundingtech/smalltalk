@@ -775,6 +775,7 @@ export type Device = ResourceHeader & {
   kind: "device";
   name?: string | null;
   person_id: Id;
+  push?: PushRegistrationStatus;
   scopes: Array<string>;
   session_actor: Id;
   state: "active" | "expired" | "revoked";
@@ -1588,6 +1589,28 @@ export type PublicationDefinition = {
   subject: string;
   token: string;
 };
+
+export type PushEnvironment = "development" | "production";
+
+export type PushRegistration = {
+  app_version: string;
+  bundle_id: string;
+  environment: PushEnvironment;
+  token: string;
+};
+
+export type PushRegistrationResponse = {
+  api_version: "st3.client.v0";
+  request_id: RequestId;
+  value: PushRegistrationStatus;
+};
+
+export type PushRegistrationStatus = ({
+  registered: false;
+} | {
+  environment: PushEnvironment;
+  registered: true;
+});
 
 export type ReplicatedNotice = {
   complete: boolean;

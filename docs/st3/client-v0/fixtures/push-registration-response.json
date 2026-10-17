@@ -1,0 +1,8 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/push-register-1",
+  "value": {
+    "registered": true,
+    "environment": "development"
+  }
+}

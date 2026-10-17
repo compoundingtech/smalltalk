@@ -19,6 +19,8 @@
     { "file": "terminal-end.json", "definition": "ActionRequest" },
 
     { "file": "pairing.json", "definition": "Envelope" },
+    { "file": "push-registration.json", "definition": "PushRegistration" },
+    { "file": "push-registration-response.json", "definition": "PushRegistrationResponse" },
     { "file": "terminal-screen.json", "definition": "Envelope" },
     { "file": "terminal-screen-changed.json", "definition": "Envelope" },
     { "file": "terminal-stale-fence-error.json", "definition": "ErrorEnvelope" },

@@ -9,7 +9,7 @@ use std::convert::Infallible;
 pub(super) struct Context {
     pub state: AppState,
     pub client_request: bool,
-    pub observation_report: bool,
+    pub local_only_response: bool,
     pub request_id: String,
     pub client_snapshot: Option<ClientSnapshot>,
     pub server: Option<tracing::Span>,
@@ -138,7 +138,7 @@ impl Context {
                 },
                 Err(error) => (error_value("response-read-failed", error).into(), None),
             };
-            let metadata = if self.observation_report {
+            let metadata = if self.local_only_response {
                 json!({"api_version": CLIENT_API_VERSION, "request_id": self.request_id})
             } else if self.client_request {
                 json!({
@@ -340,7 +340,7 @@ mod tests {
         Context {
             state: super::super::tests::state(root),
             client_request: client,
-            observation_report: observation,
+            local_only_response: observation,
             request_id: "request/control".into(),
             client_snapshot: client.then(snapshot),
             server: None,

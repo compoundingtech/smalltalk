@@ -280,6 +280,54 @@ It completes the phone's real device-key verification read-only: the unauthentic
 
 Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.
 
+## Push registration, opt-in
+
+This slice registers a phone with its paired member; it does **not** send alerts, configure an
+Apple sender key, or handle notification taps. Under Fleet › this connection, **Notifications**
+is a native switch, off by default and saved only on this phone. Enabling requires a live paired
+session, the member's granted `push-registration` version 1 capability, and a push-enabled physical
+iPhone build. Only an intentional switch-on requests iOS notification permission. Launch and
+foreground refreshes read existing permission without prompting; authorized phones acquire a
+direct APNs device token and register again, and token changes replace that registration.
+There is no Expo push service.
+
+Ordinary prebuilds retain their previous signing requirements and do not gain `aps-environment`.
+Expo automatically applies installed notification plugins, so `plugins/withoutPush.js` reserves
+the notification plugin's run-once identity without changing native configuration. To opt in,
+run `ST_IOS_PUSH=1 pnpm exec expo prebuild --platform ios --clean --no-install`, then install pods
+and build as usual. The flag applies the real `expo-notifications` plugin and its development
+entitlement. Keep `ST_IOS_PUSH=1` set for subsequent prebuilds, Metro, bundle exports and Xcode build
+invocations for that target: its Expo runtime configuration also gates native token acquisition.
+A paid Apple Developer membership and Push Notifications enabled for the app's bundle identifier are required for
+physical-device APNs registration; retain signing material only in local configuration.
+
+The app obtains the actual APNs environment through SDK 57
+`expo-application.getIosPushNotificationServiceEnvironmentAsync()`, which reads `aps-environment`
+from the installed provisioning profile. It never guesses from Debug versus Release: a
+development-signed Release build can still use the development environment. Missing entitlement,
+unknown environment and the simulator fail closed. The native bundle identifier and application
+version accompany the token.
+
+Turning the switch off unregisters from every issuer this phone may have registered with,
+including earlier members after switching connections. Before sending any registration, the phone
+durably records only its pairing-profile key as cleanup ownership—not a token or credential.
+That ownership survives restart and is cleared only after confirmed unregistration and durable
+journal removal. An offline or failed opt-out stays visibly pending/failed until its issuer can
+be reached again. Forgetting this device, removing an independently paired member, or replacing
+its pairing fences native work and requires confirmed cleanup before deleting or replacing the
+affected pairing credentials. After expiry or revocation, the saved bearer retains only authority
+to DELETE its exact old pairing incarnation's push registration on its issuer, returning the
+existing `registered: false` confirmation even if the registration was already removed. It cannot
+read, register, or delete a replacement pairing's registration. This is not a live paired session;
+a generic 401/403 or transport failure is not cleanup confirmation. If cleanup or journal removal
+fails, the credentials remain and the phone shows a safe reconnect/retry message.
+Never-enabled phones with no cleanup ownership can still forget while offline.
+Pending native permission/token callbacks are canceled locally on opt-out or forget; push HTTP
+requests have an eight-second abort deadline. The token is held only for native acquisition and
+the paired registration request: it is never persisted in phone preferences, projection caches,
+claims, observations, logs or displayed errors. Fleet device rows show only the member's safe
+registered/environment summary. Revocation or expiry also removes the registration on its issuer.
+
 ## Fabric, an opt-in carrier
 
 The app reaches its member over its saved gateway (Tailscale, the local network or HTTPS) unless the person turns on **Fabric** under Fleet › carrier. Fabric needs a build that links the native bridge: build with `ST3_FABRIC=1 pnpm run pods` after building the Rust framework (see [the module's README](modules/st-fabric/README.md)). A build without it is the ordinary app and shows no carrier setting.

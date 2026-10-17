@@ -108,7 +108,8 @@
   {
     "id": "device/ios-release", "kind": "device", "revision": "dv2", "updated_at": "2026-09-20T11:09:30Z",
     "person_id": "person/alex", "name": "Alex's iPhone", "session_actor": "person/alex/session/ios-release", "state": "active",
-    "scopes": ["read.projections", "terminal.read", "control.attention", "control.launches"], "expires_at": "2026-10-20T11:09:30Z"
+    "scopes": ["read.projections", "terminal.read", "control.attention", "control.launches"], "expires_at": "2026-10-20T11:09:30Z",
+    "push": {"registered": true, "environment": "production"}
   },
   {
     "id": "operation/transport-host-b", "kind": "operation", "revision": "op2", "updated_at": "2026-09-20T11:10:00Z",

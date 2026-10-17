@@ -77,6 +77,7 @@ mod roster_fresh_proof_tests;
 mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
 mod operation_audit;
+pub(crate) mod push_registrations;
 mod mission_provenance;
 pub(crate) mod agent_queue_values;
 pub mod backup_format;

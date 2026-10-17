@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep local push revocation cleanup atomic with claim admission",
+  "replay": {"status": "none", "detail": "No additional replay or claim change."},
+  "schema": {"status": "none", "detail": "The local push revocation trigger already removes rows atomically for both local and replicated revocations. No additional table change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule, retention or digest change."},
+  "compatibility": {"status": "none", "detail": "No additional protocol or client change; removes a redundant second local deletion transaction after successful claim admission."},
+  "downtime": {"status": "none", "detail": "No additional service interruption."},
+  "manual": {"status": "none", "detail": "No manual upgrade step."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure."}
+}

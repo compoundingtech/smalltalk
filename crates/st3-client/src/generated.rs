@@ -1692,6 +1692,8 @@ pub struct Device {
     #[serde(default)]
     pub scopes: Vec<String>,
     pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushRegistrationStatus>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Operation {
@@ -4205,4 +4207,43 @@ pub struct ObservationResponse {
     pub api_version: String,
     pub request_id: String,
     pub value: ObservationAccepted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PushEnvironment {
+    Development,
+    Production,
+}
+
+/// Secret-bearing request. Never include its serialized bytes in diagnostics.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushRegistration {
+    pub token: String,
+    pub environment: PushEnvironment,
+    pub bundle_id: String,
+    pub app_version: String,
+}
+
+impl std::fmt::Debug for PushRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushRegistration")
+            .field("token", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PushRegistrationStatus {
+    pub registered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<PushEnvironment>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PushRegistrationResponse {
+    pub api_version: String,
+    pub request_id: String,
+    pub value: PushRegistrationStatus,
 }

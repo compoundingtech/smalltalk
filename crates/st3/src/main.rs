@@ -5781,6 +5781,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_native_session_discovery(&state);
     // Nor does the first agents roster read fold every agent's card.
     st3::api::start_agent_roster(&state);
+    // Pairing-secret expiry cleanup runs even with no attention readers or publications.
+    st3::api::start_push_registration_cleanup(&state);
     // Nor does an attention window fold every person's attention.
     st3::api::start_attention_list(&state);
     // Nor does a missions window fold the missions it shows.

@@ -7,6 +7,15 @@ have their own logical authority digests; local physical fields and caches are o
 
 The claim log and immutable blobs are the durable graph authority.
 
+`local_push_registrations` is member-local secret authority, not a shared projection or a
+rebuildable cache. Its token and registration metadata come from an authenticated phone;
+pairing claims constrain ownership and lifetime but cannot reconstruct the token. Rows
+survive daemon restarts and stay outside graph replication, exports and projection digests.
+Explicit unregistration, pairing revocation/replacement and expiry remove them. Deleting
+or losing this local table loses registrations; recovery requires the phone to register
+again with a valid locally issued pairing, not a graph replay. Full local database backups
+contain these secrets and must remain private; a graph-only backup cannot recover them.
+
 A claim kind of `local` retention (`st schema show KIND`) is an observation that only the node
 that made it reads. The daemon records it in `local_observations` instead of the claim log. It gets
 no batch, no envelope and no digest, so it never replicates and trimming it never changes what a

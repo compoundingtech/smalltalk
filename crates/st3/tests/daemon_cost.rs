@@ -32,6 +32,10 @@
 //! Arrangement probes keep one live resource's register heads fixed while its edit history grows
 //! with the generated scale, so both the owner-selected list and detail must be history-independent.
 //!
+//! Push registration probes use a real locally completed pairing and the paired HTTP router.
+//! Every sample starts without a registration for POST and with one for DELETE; fixture writes
+//! and row-count assertions stay outside the measured request.
+//!
 //! - `ST_COST_SCALES` sets the two generated scales, smaller first. The default is `0.01,0.1`.
 //! - `ST_BENCH_DIR` keeps generated stores for the next run, as for `daemon_bench`.
 //! - `ST_COST_REPORT` writes the measurements as JSON to that path.
@@ -451,6 +455,13 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    post("POST /v1/client/push-registration", "/v1/client/push-registration", |_, _| push_body()),
+    Probe {
+        route: "DELETE /v1/client/push-registration",
+        path: "/v1/client/push-registration",
+        body: None,
+        direct: None,
+    },
     // Offline reads exercise populated local receipts without network timing. The sync
     // probe exercises the named non-owner refusal; real fetch/import is tested in changes::service.
     get("GET /v1/client/changes", "/v1/client/changes?repository=cost/garden&offline=true&limit=10"),
@@ -1986,6 +1997,51 @@ fn seed_git_change_reads(store: &Store, scale: f64) {
     }
 }
 
+fn push_body() -> Value {
+    json!({
+        "token":"0123456789abcdef0123456789abcdef",
+        "environment":"development",
+        "bundle_id":"org.example.cost",
+        "app_version":"1.0",
+    })
+}
+
+async fn paired_push(
+    app: &Router,
+    credential: &str,
+    method: &str,
+    body: Option<&Value>,
+) -> Result<Value, String> {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt as _;
+
+    let bytes = body.map(serde_json::to_vec).transpose().map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    let response = app.clone().oneshot(Request::builder()
+        .method(method)
+        .uri("/v1/client/push-registration")
+        .header("authorization", format!("Bearer {credential}"))
+        .header("content-type", "application/json")
+        .body(Body::from(bytes)).map_err(|error| error.to_string())?)
+        .await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536).await
+        .map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("paired push {method} failed: {status}"));
+    }
+    let response: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let expected = if method == "POST" {
+        json!({"registered":true,"environment":"development"})
+    } else {
+        json!({"registered":false})
+    };
+    if response["value"] != expected {
+        return Err(format!("paired push {method} did not return its registration status"));
+    }
+    Ok(response)
+}
+
 async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u64, u64)) -> Measured {
     let work_directory = tempfile::tempdir().unwrap();
     let root = work_directory.path();
@@ -2079,6 +2135,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
     };
+    let paired_router = st3::api::fabric_router(state.clone());
     let server_socket = socket.clone();
     let server =
         tokio::spawn(
@@ -2090,6 +2147,22 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
     let client = Client::unix(&socket);
     // Client reads come from a person, as stui and the app make them.
     let person = Client::unix_as(&socket, "person/bench-operator").unwrap();
+    let challenge: Value = person.post("/v1/client/pairings", &json!({
+        "api_version":"st3.client.v0", "device_name":"Cost phone",
+        "person_id":"person/bench-operator",
+    })).await.unwrap();
+    let pairing = challenge["pairing_id"].as_str().unwrap().trim_start_matches("pairing/");
+    let paired: Value = client.post(
+        &format!("/v1/client/pairings/{}/complete", urlencoding::encode(pairing)),
+        &json!({
+            "api_version":"st3.client.v0", "code":challenge["code"],
+            "device_public_key":"cost-phone-key-00000000000000000000000000",
+        }),
+    ).await.unwrap();
+    let push_credential = paired["credential"].as_str().unwrap();
+    let push_rows = rusqlite::Connection::open_with_flags(
+        &database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).unwrap();
     let changes: Value = person.get("/v1/client/changes?repository=cost/garden&offline=true&limit=10").await.unwrap();
     assert_eq!(changes["items"].as_array().unwrap().len(), 10);
     assert!(changes["items"][0]["last_indexed"].is_object());
@@ -2303,7 +2376,25 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
             if probe.route.contains("/replication/") {
                 prepare_replication(&mut fixture, &store, &peer).await;
             }
-            let cost = if let Some(call) = probe.direct {
+            let push = probe.path == "/v1/client/push-registration";
+            if push {
+                let (setup_method, setup_body) = if probe.body.is_some() {
+                    ("DELETE", None)
+                } else {
+                    ("POST", Some(push_body()))
+                };
+                paired_push(&paired_router, push_credential, setup_method, setup_body.as_ref())
+                    .await.unwrap();
+                let rows: u64 = push_rows.query_row(
+                    "SELECT COUNT(*) FROM local_push_registrations", [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(rows, u64::from(probe.body.is_none()));
+            }
+            let cost = if push {
+                let method = probe.route.split_once(' ').unwrap().0;
+                let body = probe.body.map(|body| body(&fixture, attempt));
+                counted(|| paired_push(&paired_router, push_credential, method, body.as_ref())).await
+            } else if let Some(call) = probe.direct {
                 let (store, fixture) = (store.clone(), &fixture);
                 counted(|| async move {
                     tokio::task::block_in_place(|| call(&store, fixture, attempt))
@@ -2365,6 +2456,12 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path, usage_window: (u
                 })
                 .await
             };
+            if push {
+                let rows: u64 = push_rows.query_row(
+                    "SELECT COUNT(*) FROM local_push_registrations", [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(rows, u64::from(probe.body.is_some()));
+            }
             if attempt > 0 {
                 samples.push(cost);
             }

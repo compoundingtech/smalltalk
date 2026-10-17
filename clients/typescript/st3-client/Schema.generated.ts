@@ -1345,6 +1345,19 @@ export const ConnectedClient = /*#__PURE__*/ (() => Schema.Struct({
 export type ConnectedClient = typeof ConnectedClient.Type
 export type ConnectedClientEncoded = typeof ConnectedClient.Encoded
 
+/** APNs environment the phone's token was issued for: `development` (sandbox) or `production`. */
+export const PushEnvironment = /*#__PURE__*/ (() => Schema.Literals(["development","production"]).annotate({ identifier: "PushEnvironment", description: "APNs environment the phone's token was issued for: `development` (sandbox) or `production`." }))()
+export type PushEnvironment = typeof PushEnvironment.Type
+export type PushEnvironmentEncoded = typeof PushEnvironment.Encoded
+
+/** Safe registration summary; never carries the token. `environment` is present exactly when `registered` is true. */
+export const PushRegistrationStatus = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "registered": Schema.Literal(false) }),
+  Schema.Struct({ "environment": PushEnvironment, "registered": Schema.Literal(true) })
+], { mode: "oneOf" }).annotate({ identifier: "PushRegistrationStatus", description: "Safe registration summary; never carries the token. `environment` is present exactly when `registered` is true." }))()
+export type PushRegistrationStatus = typeof PushRegistrationStatus.Type
+export type PushRegistrationStatusEncoded = typeof PushRegistrationStatus.Encoded
+
 export const Device = /*#__PURE__*/ (() => Schema.Struct({
   "expires_at": Timestamp,
   "id": Id,
@@ -1352,6 +1365,8 @@ export const Device = /*#__PURE__*/ (() => Schema.Struct({
   "name": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "operational": optionalKey(Operational),
   "person_id": Id,
+  /** Push registration state for this pairing. Present only on the member that issued the pairing (registered false when none is stored); omitted by other members. Never includes the token. */
+  "push": optionalKey(PushRegistrationStatus),
   "revision": Revision,
   "scopes": Schema.Array(Schema.String).check(Schema.isUnique()),
   "session_actor": Id,
@@ -3362,6 +3377,26 @@ export const PairingComplete = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "PairingComplete" }))()
 export type PairingComplete = typeof PairingComplete.Type
 export type PairingCompleteEncoded = typeof PairingComplete.Encoded
+
+/** A paired phone's APNs device token. The person and device come only from the paired session; any other field, including a person or device identity, is refused. The token is a secret: it is stored only on the member that issued the pairing and never appears in claims, replication, resources, logs or error messages. */
+export const PushRegistration = /*#__PURE__*/ (() => Schema.Struct({
+  /** Printable ASCII. */
+  "app_version": Schema.String.check(Schema.isPattern(new RegExp("^[\\x20-\\x7E]{1,64}$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(64)).annotate({ description: "Printable ASCII." }),
+  "bundle_id": Schema.String.check(Schema.isPattern(new RegExp("^[A-Za-z0-9.-]{1,255}$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(255)),
+  "environment": PushEnvironment,
+  /** Hex-encoded APNs device token, 1–256 bytes. */
+  "token": Schema.RedactedFromValue(Schema.String.check(Schema.isPattern(new RegExp("^(?:[0-9a-fA-F]{2}){1,256}$", "u"))).check(Schema.isMinLength(2)).check(Schema.isMaxLength(512))).annotate({ description: "Hex-encoded APNs device token, 1–256 bytes." })
+}).annotate({ identifier: "PushRegistration", description: "A paired phone's APNs device token. The person and device come only from the paired session; any other field, including a person or device identity, is refused. The token is a secret: it is stored only on the member that issued the pairing and never appears in claims, replication, resources, logs or error messages." }))()
+export type PushRegistration = typeof PushRegistration.Type
+export type PushRegistrationEncoded = typeof PushRegistration.Encoded
+
+export const PushRegistrationResponse = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "request_id": RequestId,
+  "value": PushRegistrationStatus
+}).annotate({ identifier: "PushRegistrationResponse" }))()
+export type PushRegistrationResponse = typeof PushRegistrationResponse.Type
+export type PushRegistrationResponseEncoded = typeof PushRegistrationResponse.Encoded
 
 export const ResourceHeader = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,

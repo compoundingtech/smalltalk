@@ -1100,6 +1100,53 @@ async fn devices_inventory_expires_a_hidden_row_and_updates_has_more_at_its_dead
 }
 
 #[tokio::test]
+async fn devices_inventory_follows_local_push_changes_without_a_graph_claim() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "devices-push-fixture");
+    let credential = "push-window-fixture-credential";
+    let grant = state.store.append_claim(&ClaimInput {
+        subject: "custom/client/push-fixture".into(),
+        kind: "custom.client.pairing-completed".into(),
+        actor: Some("person/ada".into()),
+        fields: serde_json::from_value(json!({
+            "credential_hash": credential_digest(credential),
+            "session_actor": "person/ada/session/push-fixture", "person_id": "person/ada",
+            "device_id": "device/push-fixture", "expires_at_unix_ms": (client_now_ms()+600_000) as u64,
+            "scopes": ["read.projections"]
+        })).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let session = paired_client_session(&state, &grant, "fabric-loopback", false).unwrap();
+    let mut fixture = Fixture::open_as(state.clone(), session.clone(), true, None, &["devices"]).await;
+    let snapshot = fixture.frame().await;
+    assert_eq!(snapshot["items"][0]["push"], json!({"registered": false}), "{snapshot}");
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    let response = super::super::client_push::register(State(state.clone()), Extension(session.clone()), headers,
+        Ok(axum::body::Bytes::from_static(br#"{"token":"aabbccdd","environment":"development","bundle_id":"example.push","app_version":"1"}"#)))
+        .await.unwrap();
+    assert_eq!(response.0, json!({"registered": true, "environment": "development"}));
+    let registered = fixture.frame().await;
+    assert_eq!(registered["kind"], "changes", "{registered}");
+    assert_eq!(registered["upserts"][0]["push"], json!({"registered": true, "environment": "development"}));
+    assert_eq!(registered["snapshot"]["store_index"], snapshot["snapshot"]["store_index"]);
+    assert!(!registered.to_string().contains("aabbccdd"));
+    let request = Request::builder().method("DELETE").uri("/v1/client/push-registration")
+        .header(AUTHORIZATION, format!("Bearer {credential}")).body(Body::empty()).unwrap();
+    let super::super::client_push::Authentication::Cleanup(proof) =
+        super::super::client_push::authenticate(&state, &request, "fabric-loopback").unwrap()
+    else { panic!("exact push DELETE must receive cleanup-only authentication"); };
+    let response = super::super::client_push::unregister(State(state), Some(Extension(proof)), Ok(axum::body::Bytes::new()))
+        .await.unwrap();
+    assert_eq!(response.0, json!({"registered": false}));
+    let removed = fixture.frame().await;
+    assert_eq!(removed["upserts"][0]["push"], json!({"registered": false}), "{removed}");
+    assert_eq!(removed["snapshot"]["store_index"], snapshot["snapshot"]["store_index"]);
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("devices", 3)]));
+}
+
+#[tokio::test]
 async fn clients_inventory_expires_recent_requests_at_their_deadline() {
     let root = tempfile::tempdir().unwrap();
     let state = super::tests::test_state_named(root.path(), "clients-deadline-fixture");
@@ -1123,6 +1170,7 @@ fn paired_session() -> ClientSession {
         actor: "person/avery/session/phone".into(),
         authority_actor: "person/avery".into(),
         pairing_grant: None,
+        pairing_issued_here: false,
         grant_expires_at: None,
         transport: "paired",
         custom_forms: false,

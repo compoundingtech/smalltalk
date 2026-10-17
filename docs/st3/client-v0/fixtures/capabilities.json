@@ -47,6 +47,11 @@
         "id": "control.glasses",
         "version": 0,
         "state": "granted"
+      },
+      {
+        "id": "push-registration",
+        "version": 1,
+        "state": "granted"
       }
     ],
     "limits": {

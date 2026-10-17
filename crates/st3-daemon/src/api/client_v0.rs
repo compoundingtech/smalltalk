@@ -136,6 +136,8 @@ pub(super) mod observer_subscription_detail_tests;
 mod launch_detail_tests;
 #[cfg(test)]
 mod agents_window_tests;
+#[cfg(test)]
+mod push_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -1787,6 +1789,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut roster = state.store.subscribe_agent_roster();
     let mut views = state.store.subscribe_collection_views();
     let mut presence_changes = super::client_presence::subscribe();
+    let mut push_changes = super::client_push::subscribe();
     let mut native_watch: Option<inventory::NativeWatch> = None;
     let mut native_watch_pending: Option<tokio::task::JoinHandle<Result<inventory::NativeWatch, ApiError>>> = None;
     let windows = collection_windows::Windows::attach(&state.store);
@@ -2152,6 +2155,13 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 if result.as_ref().is_ok_and(|member| member != &state.node) { continue; }
                 if matches!(result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { return; }
                 reread_due.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "clients").map(|(id, _)| id.clone()));
+                if last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(reread_due.iter().cloned());
+            }
+            result = push_changes.recv(), if !command_waiting => {
+                if result.as_ref().is_ok_and(|member| member != &state.node) { continue; }
+                if matches!(result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { return; }
+                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "devices").map(|(id, _)| id.clone()));
                 if last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
                 refresh.extend(reread_due.iter().cloned());
             }
@@ -2761,6 +2771,8 @@ pub(super) struct ClientSession {
     /// The exact pairing grant that authenticated this session. Two pairings of the same
     /// person and device key share an actor, so only this subject names the exact grant.
     pub(super) pairing_grant: Option<String>,
+    /// Local-only push registrations belong to the member that issued this exact pairing.
+    pub(super) pairing_issued_here: bool,
     grant_expires_at: Option<u128>,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
@@ -2775,6 +2787,7 @@ impl ClientSession {
             actor: actor.into(),
             authority_actor: authority_actor.into(),
             pairing_grant: None,
+            pairing_issued_here: false,
             grant_expires_at: None,
             transport,
             custom_forms: true,
@@ -2810,6 +2823,7 @@ impl ClientSession {
                 actor: "client/local/read-only".into(),
                 authority_actor: "client/local/read-only".into(),
                 pairing_grant: None,
+                pairing_issued_here: false,
             grant_expires_at: None,
                 transport: "unix",
                 custom_forms,
@@ -2826,6 +2840,7 @@ impl ClientSession {
             actor: person.into(),
             authority_actor: person.into(),
             pairing_grant: None,
+            pairing_issued_here: false,
             grant_expires_at: None,
             transport: "unix",
             custom_forms,
@@ -2839,6 +2854,7 @@ impl ClientSession {
             actor: "client/pairing/completion".into(),
             authority_actor: "client/pairing/completion".into(),
             pairing_grant: None,
+            pairing_issued_here: false,
             grant_expires_at: None,
             transport: "fabric-loopback",
             custom_forms: false,
@@ -2910,6 +2926,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     }));
     capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
     capabilities.push(json!({"id":"conversation-blocks", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    capabilities.push(json!({"id":"push-registration", "version":1, "state":if session.pairing_issued_here && session.transport != "unix" {"granted"} else {"unavailable"}}));
     // Agent rows carry st's presentation (docs/clients/ui-contract.md, Agent).
     capabilities.push(json!({"id":"presentation", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities
@@ -3063,6 +3080,7 @@ fn paired_client_session(
         actor: actor.into(),
         authority_actor: authority_actor.into(),
         pairing_grant: Some(paired.subject.clone()),
+        pairing_issued_here: paired.origin == state.store.origin(),
         grant_expires_at: Some(expires_at),
         transport,
         custom_forms,
@@ -5345,6 +5363,8 @@ fn device_resources(
     // Pairing and revocation are fenced by the graph snapshot above. Expiration is
     // live state: its clock must advance even when no claim advances that snapshot.
     let at = client_now_ms();
+    let push = state.store.push_registration_statuses(person, at as u64)
+        .map_err(|_| ApiError::internal("local push registration status is unavailable"))?;
     let mut resources = paired
         .into_iter()
         .map(|(device_id, (completed, revoked))| {
@@ -5362,7 +5382,7 @@ fn device_resources(
             } else {
                 "active"
             };
-            json!({
+            let mut resource = json!({
                 "id": device_id,
                 "kind": "device",
                 "revision": selected.id,
@@ -5378,7 +5398,18 @@ fn device_resources(
                     "actionable": state_name == "active",
                     "reasons": if state_name == "active" { Vec::<&str>::new() } else { vec![state_name] }
                 }
-            })
+            });
+            if completed.origin == state.node {
+                resource["push"] = if state_name == "active" {
+                    push.get(&device_id).map_or_else(
+                        || json!({"registered":false}),
+                        |status| json!(status),
+                    )
+                } else {
+                    json!({"registered":false})
+                };
+            }
+            resource
         })
         .collect::<Vec<_>>();
     resources.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
@@ -23635,6 +23666,7 @@ mission "example/zero-run" state="ready" {
             actor: "person/alex/session/device-one".into(),
             authority_actor: "person/alex".into(),
             pairing_grant: None,
+            pairing_issued_here: false,
             grant_expires_at: None,
             transport: "paired",
             custom_forms: false,

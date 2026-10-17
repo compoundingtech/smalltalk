@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Exercise held device-window cleanup using authenticated pairing proof",
+  "replay": {"status": "none", "detail": "Test-only caller migration; no claim semantics change."},
+  "schema": {"status": "none", "detail": "No schema or generated contract change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule, retention or digest change."},
+  "compatibility": {"status": "none", "detail": "Migrates the held device-window fixture to obtain cleanup-only proof through real credential authentication, preserving notification and unchanged graph-index assertions."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No recovery change."}
+}

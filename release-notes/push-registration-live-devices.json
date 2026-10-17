@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh held device rows when local push registration changes",
+  "replay": {"status": "none", "detail": "No claim or replay change; push registration remains local-only."},
+  "schema": {"status": "none", "detail": "No additional table change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule, retention or digest change."},
+  "compatibility": {"status": "none", "detail": "Held devices collections receive token-free registration changes without requiring a graph commit or polling."},
+  "downtime": {"status": "none", "detail": "No additional service interruption."},
+  "manual": {"status": "none", "detail": "No manual upgrade step."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure."}
+}

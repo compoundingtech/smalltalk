@@ -6,6 +6,23 @@ import FoundationNetworking
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testPushRegistrationRoundTripAndRedactedDescription() throws {
+        let registration = PushRegistration(token: String(repeating: "ab", count: 32),
+            environment: .development, bundleID: "example.push", appVersion: "1.0")
+        XCTAssertFalse(String(describing: registration).contains(registration.token))
+        XCTAssertFalse(String(reflecting: registration).contains(registration.token))
+        let data = try JSONEncoder().encode(registration)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), Set(["token", "environment", "bundle_id", "app_version"]))
+        XCTAssertEqual(object["token"] as? String, registration.token)
+        let decoded = try JSONDecoder().decode(PushRegistration.self, from: data)
+        XCTAssertEqual(decoded.environment, .development)
+        let response = try JSONDecoder().decode(PushRegistrationResponse.self, from: Data(
+            #"{"api_version":"st3.client.v0","request_id":"request/push","value":{"registered":false}}"#.utf8))
+        XCTAssertFalse(response.value.registered)
+        XCTAssertNil(response.value.environment)
+    }
+
     func testQueuedMissionDeadlineAcceptsNullAndAdmissionTimestamp() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

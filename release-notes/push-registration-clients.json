@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Publish typed push registration clients and the opt-in build proof",
+  "replay": {"status": "none", "detail": "No additional claim or projection replay."},
+  "schema": {"status": "none", "detail": "Generated client models project the push registration contract; no additional persistent state change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule, retention or digest change."},
+  "compatibility": {"status": "changed", "detail": "Rust, TypeScript and Swift clients expose paired-session push register/unregister methods and safe device registration summaries. The optional capability remains required before use; no sender is added."},
+  "downtime": {"status": "none", "detail": "No additional service interruption."},
+  "manual": {"status": "none", "detail": "Ordinary iOS prebuild entitlements and signing configuration remain unchanged. Push capture is opt-in through ST_IOS_PUSH=1 and the phone setting."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure."}
+}
