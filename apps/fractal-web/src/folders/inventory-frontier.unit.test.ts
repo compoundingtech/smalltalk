@@ -28,7 +28,7 @@ it('rejects a delayed subscription inventory captured before an accepted rename'
     collectionStream: async (options) => {
       stream = options
       const noop = () => undefined
-      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop }
+      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeAgent: async () => undefined, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop }
     },
     actions: {
       snapshot: Effect.succeed(testSnapshot.id),

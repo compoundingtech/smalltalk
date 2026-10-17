@@ -20,9 +20,44 @@ Send one JSON command per subscription:
 
 Collections are `missions`, `attention` (also subscribable as `alerts`, the name a person reads; frames name it `attention`), `agents`, `work`, `glasses`, and `arrangements`,
 plus `terminal` and `conversation` (below). The optional `actor` filter applies to work,
-`person` to attention, and `status` to agents. For `arrangements`, `person: "person/NAME"`
+`person` to attention, and `status` plus exact `agent` to agents. For `arrangements`, `person: "person/NAME"`
 is required: agents explicitly select a fleet person's collection, never an inferred
-owner. Each read checks `read.arrangements` and the selected person's access. For example:
+owner. Each read checks `read.arrangements` and the selected person's access.
+
+To follow one agent's current card, including usage/context, queue preview, workspace
+and current subagents, select its full ID:
+
+```json
+{"kind":"subscribe","id":"agent-details","collection":"agents","agent":"agent/ID"}
+```
+
+This window contains zero or one rows and always has `has_more: false`, independent
+of fleet ordering or the requested limit (which must still be 1–200). An absent or
+historical agent starts empty; creation/current-state entry inserts it, and retirement
+or leaving current state removes it. `status` intersects the exact selector after
+live status overlays. Omitting `agent` retains the bounded fleet window. Other
+collections reject `agent`, and malformed IDs or IDs longer than 256 bytes are refused. The selector does not
+grant authority: every read rechecks the same `read.projections` scope and pairing
+grant as a fleet subscription.
+
+Exact windows construct only the selected card and reuse the existing changed-agent
+key hints for subsequent reads. Unrelated agent changes neither refold the selected
+card nor emit a change frame. They do not build a fleet roster.
+The selected card folds apart from the fleet roster: a warm fleet projection neither
+answers an exact window nor is narrowed or evicted by one.
+
+The existing HTTP `GET /v1/client/agents/{id}` detail read folds only that agent's card; it does
+not require a fleet list read first.
+A daemon that serves exact selectors advertises capability
+`collection.agents.exact-selector` version 1 in `GET /v1/client/capabilities`. An older
+daemon ignores unknown fields and would answer with the fleet window, so a client sends
+`agent` only after the connected daemon granted that capability. The generated clients
+enforce this: Rust `Client::subscribe_agent`, TypeScript `CollectionStream.subscribeAgent`
+and Swift `agentsStream(agent:)` read the capabilities first and fail with an explicit
+error, sending nothing, when it is missing. TypeScript `subscribe` and Rust
+`CollectionStream::subscribe` never send `agent`.
+
+An arrangement window explicitly selects its owner:
 
 ```json
 {"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100}

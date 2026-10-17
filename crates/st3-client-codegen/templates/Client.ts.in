@@ -53,8 +53,12 @@ export type TerminalStreamOptions = {
 export type TerminalStream = { close(): void };
 
 /** `person` applies to attention and usage, `actor` to work, `status` to agents;
- * `since_ms` and `until_ms` select the optional usage inventory period. */
+ * `since_ms` and `until_ms` select the optional usage inventory period. Follow one exact agent
+ * with `subscribeAgent`, which checks that the daemon advertises it. */
 export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null; since_ms?: number; until_ms?: number };
+/** Advertised in `/v1/client/capabilities` when an agents subscription may select one exact
+ * agent. An older daemon ignores the selector and answers with the fleet. */
+export const EXACT_AGENT_SELECTOR_CAPABILITY = 'collection.agents.exact-selector';
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
@@ -77,6 +81,9 @@ export type CollectionStream = {
     subscribeGlasses(id: string): void;
     subscribeArrangements(id: string, person: string, limit?: number, subject?: ArrangementId): void;
     subscribe(id: string, collection: Exclude<CollectionName, 'arrangements'>, limit?: number, filters?: CollectionFilters): void;
+    /** Follow exactly one current agent's card, intersected with `status`. Rejects, sending nothing,
+     * when the daemon does not grant `collection.agents.exact-selector`. */
+    subscribeAgent(id: string, agent: string, status?: string | null): Promise<void>;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
     subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
     /** Follow the conversation of an agent or a session. */
@@ -469,7 +476,20 @@ export class St3Client {
         return {
             subscribeGlasses: id => send({kind: 'subscribe', id, collection: 'glasses', limit: 100}),
             subscribeArrangements: (id, person, limit = 100, subject) => send({kind: 'subscribe', id, collection: 'arrangements', person, limit, ...(subject === undefined ? {} : {subject})}),
-            subscribe: (id, collection, limit, filters = {}) => send({ kind: 'subscribe', id, collection, ...(limit === undefined ? {} : { limit }), ...filters }),
+            subscribe: (id, collection, limit, filters = {}) => {
+                // Only subscribeAgent may send an exact selector: it first checks the daemon.
+                if ((filters as { agent?: unknown }).agent != null) throw new TypeError('Follow one exact agent with subscribeAgent');
+                const command: Record<string, unknown> = { kind: 'subscribe', id, collection, ...(limit === undefined ? {} : { limit }), ...filters };
+                delete command.agent;
+                send(command);
+            },
+            subscribeAgent: async (id, agent, status) => {
+                const capabilities = (await this.capabilities()).value.capabilities;
+                if (!capabilities.some(capability => capability.id === EXACT_AGENT_SELECTOR_CAPABILITY && capability.version >= 1 && capability.state === 'granted')) {
+                    throw new Error(`This daemon does not advertise ${EXACT_AGENT_SELECTOR_CAPABILITY}; upgrade it before following one exact agent`);
+                }
+                send({ kind: 'subscribe', id, collection: 'agents', limit: 1, agent, ...(status === undefined ? {} : { status }) });
+            },
             subscribeTerminal: (id, terminal, incarnation, capability) => send({ kind: 'subscribe', id, collection: 'terminal', terminal, incarnation, capability }),
             subscribeConversation: (id, conversation) => send({ kind: 'subscribe', id, collection: 'conversation', conversation }),
             unsubscribe: id => send({ kind: 'unsubscribe', id }),

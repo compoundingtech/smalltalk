@@ -412,6 +412,19 @@ impl Heard {
 }
 
 
+/// The capability a daemon advertises in `/v1/client/capabilities` when an agents subscription
+/// may select one exact agent. An older daemon ignores the selector and answers with the fleet.
+pub const EXACT_AGENT_SELECTOR_CAPABILITY: &str = "collection.agents.exact-selector";
+
+impl Capabilities {
+    /// Whether this daemon granted capability `id` at `version` or newer.
+    pub fn grants(&self, id: &str, version: u32) -> bool {
+        self.capabilities.iter().any(|capability| {
+            capability.id == id && capability.version >= version && capability.state == CapabilityState::Granted
+        })
+    }
+}
+
 impl CollectionStream {
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> { self.subscribe(id, "glasses", 100, None, None).await }
     /// Select the owner's fleet explicitly; agent identity is not an owner selector.
@@ -2086,6 +2099,25 @@ impl Client {
             heard,
             subscribed: std::collections::HashMap::new(),
         })
+    }
+
+    /// Follow exactly one current agent's card on `stream`, a window of zero or one rows,
+    /// intersected with `status`. This reads the daemon's capabilities first and refuses, before
+    /// anything is sent, when it does not grant [`EXACT_AGENT_SELECTOR_CAPABILITY`]: an older
+    /// daemon would ignore the selector and answer with the fleet.
+    pub async fn subscribe_agent(
+        &self,
+        stream: &mut CollectionStream,
+        id: &str,
+        agent: &str,
+        status: Option<&str>,
+    ) -> Result<(), ClientError> {
+        if !self.capabilities_internal().await?.value.grants(EXACT_AGENT_SELECTOR_CAPABILITY, 1) {
+            return Err(ClientError::Protocol(format!(
+                "this daemon does not advertise {EXACT_AGENT_SELECTOR_CAPABILITY}; upgrade it before following one exact agent"
+            )));
+        }
+        stream.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"agents", "limit":1, "actor":null, "status":status, "agent":agent})).await
     }
 
     pub async fn conversation_stream(

@@ -69,7 +69,7 @@ it('shows the lowest-UUIDv7 arrangement and switches when an empty owner frame r
     collectionStream: async (next) => {
       options = next
       const noop = () => undefined
-      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop } satisfies CollectionStream
+      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeAgent: async () => undefined, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop } satisfies CollectionStream
     },
   }
   const atom = sidebarFolders({ gateway: () => gateway })
@@ -111,7 +111,7 @@ it('binds a granted live Sidebar atom to optimistic generated edits and exactly 
     collectionStream: async (next) => {
       options = next
       const noop = () => undefined
-      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop }
+      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeAgent: async () => undefined, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop }
     },
     actions: {
       snapshot: Effect.succeed(testSnapshot.id),
@@ -166,7 +166,7 @@ it.each([false, true])('propagates adoption metadata and a removed reserved Side
       options = next
       subscriptions++
       const noop = () => undefined
-      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop }
+      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeAgent: async () => undefined, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: noop }
     },
     actions: {
       snapshot: Effect.succeed(testSnapshot.id),

@@ -443,11 +443,13 @@ test('collection commands preserve omitted and nullable options and failure meta
     const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), socket: () => socket });
     socket.onopen();
     stream.subscribe('agents', 'agents');
+    stream.subscribe('fleet', 'agents', 100, { agent: null });
     stream.subscribe('nullable', 'work', 100, { person: null, actor: null, status: null });
     stream.subscribeTerminal('current', 'terminal/example', undefined, 'capability-proof');
     stream.subscribeTerminal('nullable-terminal', 'terminal/example', null, 'capability-proof');
     assert.deepEqual(socket.sent, [
         { kind: 'subscribe', id: 'agents', collection: 'agents' },
+        { kind: 'subscribe', id: 'fleet', collection: 'agents', limit: 100 },
         { kind: 'subscribe', id: 'nullable', collection: 'work', limit: 100, person: null, actor: null, status: null },
         { kind: 'subscribe', id: 'current', collection: 'terminal', terminal: 'terminal/example', capability: 'capability-proof' },
         { kind: 'subscribe', id: 'nullable-terminal', collection: 'terminal', terminal: 'terminal/example', incarnation: null, capability: 'capability-proof' },
@@ -461,6 +463,30 @@ test('collection commands preserve omitted and nullable options and failure meta
     for (const frame of failures) socket.onmessage({ data: JSON.stringify(frame) });
     assert.deepEqual(frames, failures);
     stream.close();
+});
+
+test('exact agent subscriptions are sent only to a daemon that advertises the selector', async () => {
+    const exact = { id: 'collection.agents.exact-selector', version: 1, state: 'granted' };
+    for (const advertised of [false, true]) {
+        const socket = collectionSocket();
+        const calls = [];
+        // The fixture daemon's capabilities lack the selector, as an older daemon's do.
+        const value = advertised ? { ...capabilityFixture.value, capabilities: [...capabilityFixture.value.capabilities, exact] } : capabilityFixture.value;
+        const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async url => { calls.push(String(url)); return response(envelope(value)); } });
+        const stream = await client.collectionStream({ onFrame: () => {}, socket: () => socket });
+        socket.onopen();
+        assert.throws(() => stream.subscribe('raw', 'agents', 1, { agent: 'agent/example/worker' }), /subscribeAgent/);
+        const subscribed = stream.subscribeAgent('details', 'agent/example/worker', 'working');
+        if (advertised) {
+            await subscribed;
+            assert.deepEqual(socket.sent, [{ kind: 'subscribe', id: 'details', collection: 'agents', limit: 1, agent: 'agent/example/worker', status: 'working' }]);
+        } else {
+            await assert.rejects(subscribed, /collection\.agents\.exact-selector/);
+            assert.deepEqual(socket.sent, []);
+        }
+        assert.deepEqual(calls, ['https://example.test/v1/client/capabilities']);
+        stream.close();
+    }
 });
 
 test('closing the collection stream sends nothing more and reports no end', async () => {

@@ -40,7 +40,11 @@ pub fn agent_queue_metadata(
     subjects: &BTreeSet<String>,
 ) -> anyhow::Result<Vec<Value>> {
     crate::otel::roster_phase("queue_selection", || -> anyhow::Result<Vec<Value>> {
-        let queues = store.agent_work_queues()?;
+        let queues = if subjects.len() == 1 {
+            store.agent_work_queues_for(subjects.first().map(String::as_str))?
+        } else {
+            store.agent_work_queues()?
+        };
         let steps = queues.values().flat_map(|queue| {
             queue.current_work_ids.iter().chain(queue.next_work_id.iter())
                 .chain(queue.upcoming_work_ids.iter()).cloned()

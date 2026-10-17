@@ -649,14 +649,20 @@ async fn a_terminal_rides_the_collection_socket_and_its_end_leaves_the_rest() {
         serve_terminal_state("client-collection-terminal", 24, 80).await;
     let attachment = attach_terminal(&client, "collection-terminal").await;
     let mut stream = client.collection_stream().await.unwrap();
-    stream
-        .subscribe("agents", "agents", 20, None, None)
+    // The real daemon grants the exact selector, so the client sends it.
+    client
+        .subscribe_agent(&mut stream, "agents", "agent/terminal-demo", None)
         .await
         .unwrap();
-    assert!(matches!(
-        next_collection_event(&mut stream, "the agents snapshot").await,
-        CollectionEvent::Snapshot { id, .. } if id == "agents"
-    ));
+    match next_collection_event(&mut stream, "the exact agent snapshot").await {
+        CollectionEvent::Snapshot { id, items, has_more, .. } => {
+            assert_eq!(id, "agents");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].header().id, "agent/terminal-demo");
+            assert!(!has_more);
+        }
+        other => panic!("expected an exact agent snapshot, got {other:?}"),
+    }
     stream
         .subscribe_terminal(
             "screen",

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Let a web client follow one exact agent card without subscribing to the fleet roster",
+  "replay": {"status": "none", "detail": "No replay or projection rebuild. Existing current-agent card semantics and changed-agent dependency hints are reused. Exact-agent cards fold in their own small per-agent cache; they never borrow, narrow or evict the fleet roster's rows."},
+  "schema": {"status": "changed", "detail": "The public client-v0 CollectionCommand schema adds an optional full agent ID selector to agents subscriptions. No database tables, columns, indexes or claim schemas change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules, digests and fleet coordination are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Agents subscriptions may select agent for a zero-or-one current-card window, intersected with status. Omitting agent preserves fleet windows. The daemon advertises capability collection.agents.exact-selector version 1 in /v1/client/capabilities. The new Rust Client::subscribe_agent, TypeScript CollectionStream.subscribeAgent and Swift agentsStream(agent:) read the capabilities first and refuse, sending nothing, when the connected daemon does not grant it. Rust CollectionStream::subscribe and TypeScript subscribe are unchanged and never send agent. Selectors longer than 256 bytes are refused."},
+  "downtime": {"status": "none", "detail": "No coordinated interruption is required; the selector becomes available when the upgraded daemon serves the connection. Existing connections retain their established behavior until reconnecting."},
+  "manual": {"status": "none", "detail": "No client source change is required: Rust CollectionStream::subscribe keeps its signature. To follow one agent, call Client::subscribe_agent, CollectionStream.subscribeAgent or agentsStream(agent:). No database or fleet-wide manual migration is required."},
+  "recovery": {"status": "none", "detail": "Rollback requires no data repair. A rolled-back daemon no longer advertises collection.agents.exact-selector, so the generated clients refuse exact subscriptions with an explicit error instead of sending a selector an older daemon would ignore and answer with the fleet window."}
+}

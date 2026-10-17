@@ -48,7 +48,7 @@ const mount = async ({ items: startingItems = [initial()], editable = true }: { 
     collectionStream: async (options) => {
       streamOptions = options
       const noop = () => undefined
-      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: () => { closes++ } }
+      return { subscribeGlasses: noop, subscribeArrangements: noop, subscribe: noop, subscribeAgent: async () => undefined, subscribeTerminal: noop, subscribeConversation: noop, unsubscribe: noop, close: () => { closes++ } }
     },
     actions: {
       snapshot: Effect.sync(() => `snapshot/fresh/${++snapshots}`),

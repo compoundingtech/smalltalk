@@ -3413,10 +3413,18 @@ impl Store {
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        self.agent_work_queues_for(None)
+    }
+
+    /// Build queue previews from the same selector, reading only one agent's inputs when named.
+    pub(crate) fn agent_work_queues_for(
+        &self,
+        selected_agent: Option<&str>,
+    ) -> Result<BTreeMap<String, AgentWorkQueue>> {
         crate::performance::task("agent_work_queues", || -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
-        let orders = seat_run_orders_tx(&connection, None)?;
-        let rows = seat_step_rows_tx(&connection, None)?;
+        let orders = seat_run_orders_tx(&connection, selected_agent)?;
+        let rows = seat_step_rows_tx(&connection, selected_agent)?;
         let mut seats = BTreeMap::<&str, Vec<SeatStep<'_>>>::new();
         for row in &rows {
             let step = row.seat_step();
@@ -3425,6 +3433,9 @@ impl Store {
                 .flatten()
                 .collect::<BTreeSet<_>>()
             {
+                if selected_agent.is_some_and(|selected| selected != agent) {
+                    continue;
+                }
                 seats.entry(agent).or_default().push(step);
             }
         }

@@ -386,12 +386,36 @@ async fn emitted_person_ask_mission_list_and_detail_conform_and_decode() {
 }
 
 #[tokio::test]
-async fn outbound_rust_collection_commands_conform_with_none_options() {
+async fn outbound_rust_collection_commands_conform_with_none_and_exact_agent() {
     use axum::extract::ws::WebSocketUpgrade;
     use futures_util::StreamExt as _;
     let validator = contract_validator("CollectionCommand");
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    // A stub daemon: older until `advertise` is set, then one that grants the exact selector.
+    let advertise = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let advertised = advertise.clone();
     let app = axum::Router::new().route(
+        "/v1/client/capabilities",
+        axum::routing::get(move || {
+            let granted = advertised.load(std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let capabilities = if granted {
+                    serde_json::json!([{"id":st3_client::EXACT_AGENT_SELECTOR_CAPABILITY, "version":1, "state":"granted"}])
+                } else {
+                    serde_json::json!([{"id":"collections", "version":1, "state":"granted"}])
+                };
+                axum::Json(serde_json::json!({
+                    "api_version":"st3.client.v0", "request_id":"request/capabilities",
+                    "snapshot":{"id":"snapshot/host/1/a", "host_id":"host/example", "store_index":1,
+                        "projection_version":"client-projection.v0", "created_at":"2026-10-17T00:00:00Z"},
+                    "value":{"kind":"capabilities", "session_actor":"person/example", "transport":"fabric-loopback",
+                        "capabilities":capabilities,
+                        "limits":{"max_page_items":200, "max_event_items":500, "max_response_bytes":1048576, "max_wait_ms":30000},
+                        "event_cursor":"event-cursor/example/1", "oldest_event_cursor":"event-cursor/example/0", "schemas":[]},
+                }))
+            }
+        }),
+    ).route(
         "/v1/client/collections/stream",
         axum::routing::get(move |upgrade: WebSocketUpgrade| {
             let sender = sender.clone();
@@ -422,18 +446,45 @@ async fn outbound_rust_collection_commands_conform_with_none_options() {
         .subscribe("agents", "agents", 100, None, None)
         .await
         .unwrap();
+    // An older daemon is never sent the selector: the client refuses before sending.
+    let refused = client
+        .subscribe_agent(&mut stream, "refused", "agent/example/worker", None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains(st3_client::EXACT_AGENT_SELECTOR_CAPABILITY),
+        "{refused}"
+    );
+    advertise.store(true, std::sync::atomic::Ordering::SeqCst);
+    client
+        .subscribe_agent(&mut stream, "selected", "agent/example/worker", None)
+        .await
+        .unwrap();
     stream.subscribe_glasses("glasses").await.unwrap();
     stream
         .subscribe_terminal("term", "terminal/example", None, "synthetic-capability")
         .await
         .unwrap();
-    for expected in ["agents", "glasses", "term"] {
+    for expected in ["agents", "selected", "glasses", "term"] {
         let command = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(command["id"], expected);
         assert_conforms(&validator, "actual Rust None command", &command);
+        if expected == "selected" {
+            assert_eq!(command["agent"], "agent/example/worker");
+            let mut wrong_collection = command.clone();
+            wrong_collection["collection"] = serde_json::json!("work");
+            assert!(!validator.is_valid(&wrong_collection));
+            for invalid in ["worker", "person/worker", "agent/", "agent/bad id"] {
+                let mut malformed = command.clone();
+                malformed["agent"] = serde_json::json!(invalid);
+                assert!(!validator.is_valid(&malformed));
+            }
+        } else {
+            assert!(command.get("agent").is_none());
+        }
         let mut omitted = command.clone();
         if expected == "term" {
             assert_eq!(command.get("incarnation"), Some(&Value::Null));
@@ -467,6 +518,7 @@ async fn outbound_rust_collection_commands_conform_with_none_options() {
         }] = serde_json::json!(false);
         assert!(!validator.is_valid(&bad_type));
     }
+    assert!(receiver.try_recv().is_err(), "the refused subscription sent nothing");
     stream.close().await;
     server.abort();
 }
