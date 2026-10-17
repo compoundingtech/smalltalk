@@ -4790,7 +4790,6 @@ name = "st3-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "base64 0.22.1",
  "bytes",
  "ciborium",
@@ -4810,7 +4809,6 @@ dependencies = [
  "sha2",
  "signal-hook 0.3.18",
  "smallclaims",
- "st3-daemon",
  "st3-schema",
  "tempfile",
  "thiserror 2.0.20",
@@ -4930,6 +4928,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "st3-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "ring",
+ "serde_json",
+ "sha2",
+ "smallclaims",
+ "st3-client",
+ "st3-daemon",
+ "st3-feed",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.27.0",
+]
+
+[[package]]
 name = "st3-feed"
 version = "0.1.0"
 dependencies = [
@@ -4938,7 +4961,6 @@ dependencies = [
  "serde_json",
  "st3-client",
  "st3-conversation-ui",
- "st3-daemon",
  "tempfile",
  "tokio",
  "uuid",

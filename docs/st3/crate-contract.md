@@ -1,12 +1,13 @@
 # st3 crates: what is where and who may use what
 
-Three packages come from what used to be the single `st3` package:
+Four packages carry what used to be the single `st3` package and its end-to-end tests:
 
 | package | path | holds |
 |---|---|---|
 | `st3-kernel` | `crates/st3-kernel` | the library's leaf modules, which name no store, api or reconcile code: `accounts`, `archive`, `boot`, `cli_output`, `conversation_header`, `conversation_search`, `disk`, `evidence`, `fleet`, `gate_kinds`, `gate_report`, `github_admission`, `harness_events`, `hooks`, `instance`, `lane`, `memory`, `model`, `native_views`, `pricing`, `projection`, `publication`, `read_cache`, `rules`, `seat_queue`, `skill`, `terminal_binding`. st3-daemon re-exports each one at its old path (`pub use st3_kernel::model;`), so `crate::model` and `st3::model` read the same |
 | `st3-daemon` | `crates/st3-daemon` | the library: the claims graph, store, API, reconciliation and every module the daemon runs, its `hooks/`, `fixtures/` and `proptest-regressions/` |
 | `st3` | `crates/st3` | the `st3` binary (`main.rs` and the modules only the binary uses: `cli_help`, `completion`, `directive_note`, `doctor_cli`, `change_cli`, `presentation`, `setup`, `onboarding`), the `st3-fixture` binary, `build.rs`, `tests/`, `examples/`, and an empty library target (`src/package_marker.rs`, see below) |
+| `st3-e2e` | `crates/st3-e2e` | tests only: the tests that start a real daemon and drive a client or the feed against it (st3-client's `device_signing` and `transports`, the st3-feed tests). `st3-client` and `st3-feed` no longer have a dev-dependency on `st3-daemon`; `st3-client` had one, which closed a cycle with the daemon. |
 
 The binary and the tests depend on the library under the name `st3`
 (`st3 = { package = "st3-daemon", path = "../st3-daemon" }`), so `use st3::...` reads the same in

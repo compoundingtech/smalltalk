@@ -15,5 +15,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-st3 = { package = "st3-daemon", path = "../st3-daemon" }
 tempfile = "3"
