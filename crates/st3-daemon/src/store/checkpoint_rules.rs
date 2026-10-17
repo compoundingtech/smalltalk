@@ -36,7 +36,9 @@ pub(crate) use staged::plan_staged;
 /// `runtime.reconcile-decision` of each decision key.
 /// Version 16 preserves exact review binding, withdrawal and author-attempt references.
 /// It ships in the reader release before review-at-head activation.
-pub const RULES_VERSION: u32 = 16;
+/// Version 18 adds harness-question lifecycle retention after #1473's allocated version 17.
+/// Whichever PR lands second must renumber in a plain follow-up commit.
+pub const RULES_VERSION: u32 = 18;
 
 /// Usage rollups keep their hourly history for this long before the cut, so a usage period that
 /// ends within it is exact to the hour. Before it, each rollup series keeps only its newest
@@ -74,8 +76,8 @@ proof=the-sealed-claims-and-the-blobs-they-reference
 graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
 replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
-witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
-carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field
+witness=every-field-set-again-by-a-later-kept-claim-of-the-slot-but-harness-questions
+carriers=every-rule-but-loop.state-and-harness-questions-keeps-the-newest-carrier-of-each-field
 review=retain-binding,withdrawal,verdict,actor-evidence,attempt-relation-references";
 
 /// A canonical description of every rule: one line per rule of the retention policy
@@ -108,6 +110,32 @@ pub(crate) enum Rule {
     UsageSeries,
     UsageCumulative,
     AccountLimits,
+    /// Keep pending history; after a day keep the newest observation indefinitely.
+    QuestionLifecycle,
+}
+
+/// Whether claims of `kind` belong to a harness question.
+pub(crate) fn question_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        st3_schema::harness_questions::OBSERVED | st3_schema::harness_questions::RESOLVED
+    )
+}
+
+/// Questions whose redundant observation history may expire. Their compact records stay.
+pub(crate) fn expired_questions<'a>(
+    resolutions: impl Iterator<Item = (&'a str, u128)>,
+    cut: u128,
+) -> BTreeSet<&'a str> {
+    resolutions
+        .filter(|(_, accepted_at)| question_expired(*accepted_at, cut))
+        .map(|(subject, _)| subject)
+        .collect()
+}
+
+/// Whether redundant observation history may expire at `at`.
+pub(crate) fn question_expired(resolved_at: u128, at: u128) -> bool {
+    resolved_at.saturating_add(st3_schema::harness_questions::RESOLVED_RETENTION_MS) <= at
 }
 
 pub(crate) fn fields(claim: &ClaimRecord) -> Option<&serde_json::Map<String, Value>> {
@@ -151,6 +179,7 @@ fn planner_rule(rule: &st3_schema::retention::RulePolicy) -> Option<Rule> {
         "newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at" => {
             Rule::AccountLimits
         }
+        "all-while-pending,newest-once-resolved-1d-before-cut" => Rule::QuestionLifecycle,
         _ if rule.kind == "seat.status-history" => return None,
         other => panic!("retention.toml: no planner keeps `{other}` for {}", rule.kind),
     };
@@ -486,6 +515,12 @@ impl Rule {
         )
     }
 
+    /// Whether the newest claim carrying each field stays. Question observations have a
+    /// fixed shape, and a loop state keeps its own runs.
+    pub(crate) fn keeps_field_carriers(self) -> bool {
+        !matches!(self, Rule::LoopState | Rule::QuestionLifecycle)
+    }
+
     /// Whether a claim accepted at `accepted_at` is old enough for the rule to drop.
     pub(crate) fn old_enough(self, accepted_at: u128, cut: u128) -> bool {
         match self {
@@ -504,6 +539,7 @@ impl Rule {
             Rule::UsageSeries => "usage-series".into(),
             Rule::UsageCumulative => "usage-cumulative".into(),
             Rule::AccountLimits => "account-limits".into(),
+            Rule::QuestionLifecycle => "question-lifecycle".into(),
         }
     }
 
@@ -516,6 +552,7 @@ impl Rule {
             "usage-series" => Rule::UsageSeries,
             "usage-cumulative" => Rule::UsageCumulative,
             "account-limits" => Rule::AccountLimits,
+            "question-lifecycle" => Rule::QuestionLifecycle,
             tag => Rule::NewestAged(tag.strip_prefix("newest-aged:")?.parse().ok()?),
         })
     }
@@ -552,6 +589,8 @@ pub(crate) fn rule_keep(
         Rule::LoopState => loop_keep(claims),
         Rule::Deferral if closed => newest,
         Rule::Deferral => (0..len).collect(),
+        Rule::QuestionLifecycle if closed => newest,
+        Rule::QuestionLifecycle => (0..len).collect(),
     }
 }
 
@@ -716,17 +755,29 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                 .map(|request| (sealed_claim.claim.subject.clone(), request.to_owned()))
         })
         .collect::<BTreeSet<_>>();
+    let expired_questions = expired_questions(
+        first
+            .iter()
+            .map(|index| &claims[*index].claim)
+            .filter(|claim| claim.kind == st3_schema::harness_questions::RESOLVED)
+            .map(|claim| (claim.subject.as_str(), claim.accepted_at_unix_ms)),
+        cut,
+    );
     for ((rule, slot), members) in &slots {
         let slot_claims = members
             .iter()
             .map(|index| &claims[*index].claim)
             .collect::<Vec<_>>();
-        let closed = *rule == Rule::Deferral && {
-            let request = slot.last().cloned().unwrap_or_default();
-            closed_requests.contains(&(slot[0].clone(), request))
+        let closed = match rule {
+            Rule::Deferral => {
+                let request = slot.last().cloned().unwrap_or_default();
+                closed_requests.contains(&(slot[0].clone(), request))
+            }
+            Rule::QuestionLifecycle => expired_questions.contains(slot[0].as_str()),
+            _ => false,
         };
         let mut keep = rule_keep(*rule, members.len(), &slot_claims, closed, &limits_newest, cut);
-        if *rule != Rule::LoopState {
+        if rule.keeps_field_carriers() {
             keep.extend(field_carriers(&slot_claims));
         }
         for (position, index) in members.iter().enumerate() {
@@ -791,7 +842,11 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
     loop {
         let mut changed = false;
         // Newest first, so a claim kept back here can witness the ones before it.
-        for members in slots.values() {
+        // A question goes whole, so no claim of it witnesses another.
+        for ((rule, _), members) in &slots {
+            if *rule == Rule::QuestionLifecycle {
+                continue;
+            }
             let mut later = BTreeSet::new();
             let mut later_claims = 0;
             for index in members.iter().rev() {
@@ -810,6 +865,7 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                 }
             }
         }
+        // Operations and envelopes remain atomic; question history is independently compacted.
         for members in operations.values().chain(envelope_claims.values()) {
             if members.iter().any(|index| dropped[*index])
                 && members.iter().any(|index| !dropped[*index])
@@ -1014,6 +1070,11 @@ fn subject_answers_inner(connection: &Connection, subject: &str, cut: u128, sour
         "source".into(),
         json!(selected_actual_source_at(connection, subject, None, None)?),
     );
+    if subject.starts_with("harness-question/") {
+        // Compact ended records remain visible forever, including after history compaction.
+        let question = super::harness_questions::question_at(connection, subject, Some(cut))?;
+        answers.insert("harness_question".into(), json!(question));
+    }
     let kinds = connection
         .prepare_cached("SELECT DISTINCT kind FROM claims WHERE subject=?1 ORDER BY kind")?
         .query_map([subject], |row| row.get::<_, String>(0))?
@@ -1021,7 +1082,7 @@ fn subject_answers_inner(connection: &Connection, subject: &str, cut: u128, sour
     let mut latest = serde_json::Map::new();
     for kind in &kinds {
         let claims = claims_of_kind_in_order(connection, subject, kind)?;
-        if let Some(claim) = claims.last() {
+        if let Some(claim) = claims.last().filter(|_| !question_kind(kind)) {
             latest.insert(kind.clone(), json!(claim.id));
         }
         match kind.as_str() {

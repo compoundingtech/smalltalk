@@ -188,6 +188,7 @@ pub(crate) mod summary_list;
 pub(crate) mod attention_ivm;
 mod backup;
 mod checkpoint_rules;
+pub(crate) mod harness_questions;
 mod checkpoint_status;
 mod mission_eligibility;
 pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;

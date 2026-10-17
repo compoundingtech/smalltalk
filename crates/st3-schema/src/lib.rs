@@ -5,6 +5,7 @@ pub mod custom;
 pub mod accountable;
 pub mod directive_notes;
 pub mod glasses;
+pub mod harness_questions;
 pub mod owned_terminals;
 pub mod provenance;
 pub mod retention;
@@ -539,6 +540,7 @@ impl Registry {
         if kind == "mission.provenance" {
             provenance::validate_claim(subject, fields)?;
         }
+        harness_questions::validate(kind, fields)?;
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
         }
@@ -849,6 +851,12 @@ fn build_registry() -> Registry {
             false,
         ),
         ("host", "host/NAME", "A graph host.", false),
+        (
+            "harness-question",
+            "harness-question/ID",
+            "A question a seat's harness asked natively: question ids and option positions, never text.",
+            false,
+        ),
         (
             "lane",
             "lane/RUN/LOCAL_ID",
@@ -1956,6 +1964,26 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::SameSubjectActor,
             Cardinality::Append,
             Some("subagents"),
+            false,
+            &[],
+        ),
+        // A question a seat's harness asked natively, and how it ended. Only st writes them: a
+        // client that could write one could forge a question or its answer.
+        (
+            harness_questions::OBSERVED,
+            &["harness-question"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
+            harness_questions::RESOLVED,
+            &["harness-question"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
             false,
             &[],
         ),
@@ -3471,6 +3499,22 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("cached_tokens", integer()),
             ("total_tokens", integer()),
         ],
+        harness_questions::OBSERVED => &[
+            ("agent", required_reference_to(&["agent"])),
+            ("session", required_string()),
+            ("native_id", required_string()),
+            ("runtime_incarnation", required_string()),
+            ("questions", required_array()),
+        ],
+        harness_questions::RESOLVED => &[
+            (
+                "status",
+                required_enum(&["answered", "answered_elsewhere", "expired", "cancelled"]),
+            ),
+            ("revision", required_string()),
+            ("answers", required_object()),
+            ("receipt", object()),
+        ],
         "harness.telemetry" => &[
             ("driver", required_enum(&["claude"])),
             ("unit", required_enum(&["hook"])),
@@ -4241,6 +4285,7 @@ mod tests {
                 "gate-operation",
                 "github-post",
                 "glass",
+                "harness-question",
                 "host",
                 "lane",
                 "loop-run",
@@ -4338,6 +4383,8 @@ mod tests {
                 "github.posted",
                 "glass.deleted",
                 "glass.upserted",
+                "harness-question.observed",
+                "harness-question.resolved",
                 "harness.context-clear.requested",
                 "harness.context-clear.result",
                 "harness.diagnostic",

@@ -26,6 +26,7 @@ Storage digest: `1dcbc0927e291e822470da735e497deec0a5ad4f1cd6cb7e00679a0e44fab09
 | `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
 | `github-post` | `github-post/OWNER/REPO/KIND/ID` | no | A GitHub comment or review an agent seat posted, by its GitHub ID. |
 | `glass` | `glass/person/NAME/UUID` | no | A private person workspace. |
+| `harness-question` | `harness-question/ID` | no | A question a seat's harness asked natively: question ids and option positions, never text. |
 | `host` | `host/NAME` | no | A graph host. |
 | `lane` | `lane/RUN/LOCAL_ID` | no | A mission-run lane: an ordered line of entries its run works through front first. |
 | `loop-run` | `loop-run/GENERATION/PATH` | no | One bounded loop execution. |
@@ -102,6 +103,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `github.posted` | `github-post` | `system-only` | `once` | `durable` | `agent!:subject-reference(agent)`, `id!:integer`, `item!:integer`, `kind!:string`, `login:string`, `repository!:string`, `url:string` |  |
 | `glass.deleted` | `glass` | `authorized-requester` | `append` | `durable` | `base_revision:string`, `replaced_revision:string` |  |
 | `glass.upserted` | `glass` | `authorized-requester` | `append` | `durable` | `base_revision:string`, `body:object`, `replaced_revision:string` |  |
+| `harness-question.observed` | `harness-question` | `system-only` | `append` | `durable` | `agent!:subject-reference(agent)`, `native_id!:string`, `questions!:array`, `runtime_incarnation!:string`, `session!:string` |  |
+| `harness-question.resolved` | `harness-question` | `system-only` | `append` | `durable` | `answers!:object`, `receipt:object`, `revision!:string`, `status!:string` |  |
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `durable` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
 | `harness.context-clear.result` | `agent` | `system-only` | `once` | `durable` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
 | `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `durable` | `attempt:integer`, `auth_attention_key:string`, `code:string`, `driver:string`, `incarnation_id:string`, `matched_line:string`, `observed_since_ms:integer`, `ownership_sequence:integer`, `provider_auth_sequence:integer`, `readiness_epoch:integer`, `reason:string`, `retry_after_unix_ms:integer`, `retry_attempt:integer`, `selector_scope:string`, `session_id:string`, `severity:string`, `status:string`, `step_run:subject-reference(step-run)`, `wake_attempts:integer` |  |

@@ -1726,3 +1726,77 @@ fn a_store_pins_one_anchor() {
     assert!(a.pin_fleet_anchor("second").is_err());
     assert_eq!(a.fleet_anchor().unwrap().as_deref(), Some("first"));
 }
+
+#[test]
+fn harness_questions_wait_on_older_members_without_a_heal_and_converge_after_upgrade() {
+    use st3_schema::harness_questions::{OBSERVED, Question, RESOLVED, Status};
+    let anchor_key = key();
+    let older_key = key();
+    let current = node("current", Some(&anchor_key), Some(&anchor_key));
+    admit(&current, "current", &anchor_key, "anchor", None);
+    admit(&current, "older", &older_key, "invite", None);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("older.sqlite3");
+    let older = Store::open(&path, "older").unwrap();
+    older.bind_fleet(FLEET).unwrap();
+    older.pin_fleet_anchor(anchor_key.public()).unwrap();
+    older.set_member_key(Some(older_key.clone())).unwrap();
+    // A build from before harness questions: neither kind is registered.
+    let mut registry = st3_schema::registry().clone();
+    for kind in [OBSERVED, RESOLVED] {
+        registry.claims.remove(kind).unwrap();
+    }
+    older.set_claim_registry(registry);
+    sync(&current, &older);
+
+    let question = current
+        .observe_harness_question(&harness_questions::QuestionObservation {
+            agent: "agent/ada".into(),
+            session: "tester".into(),
+            native_id: "call-1".into(),
+            runtime_incarnation: "inc-1".into(),
+            questions: vec![Question { id: "q0".into(), options: 2, multi: false, required: true }],
+        })
+        .unwrap();
+    let (resolved, _) = current
+        .resolve_harness_question(&question.id, Status::Cancelled, &question.revision, &BTreeMap::new(), None)
+        .unwrap();
+
+    // The older member holds both claims as unknown records and keeps every claim it knows.
+    let later = note(&current, "A known claim after the question");
+    let admission = sync(&current, &older);
+    assert_eq!(admission.unknown, 2);
+    assert_eq!(admission.invalid, 0);
+    assert!(admitted(&older, &later));
+    assert!(older.harness_question(&question.id, 0).unwrap().is_none());
+    let local = note(&older, "The older member can still write known claims");
+    sync(&older, &current);
+    assert!(admitted(&current, &local));
+    // Equal wire summaries across different registries preserve the older member's waiting
+    // claims without invalid records.
+    for (from, to) in [(&current, &older), (&older, &current)] {
+        let exchange = from.export_replication_summary(FLEET).unwrap();
+        to.receive_replication_exchange_asking(&from.origin, FLEET, &exchange, true)
+            .unwrap();
+    }
+    let before = older.replication_status(true, Some(FLEET), &[]).unwrap();
+    let source = current.replication_status(true, Some(FLEET), &[]).unwrap();
+    assert_eq!(before.waiting_claims, 2);
+    assert_eq!(before.invalid_records, 0);
+    assert_eq!(before.unhealthy_projections, 0);
+    assert_eq!(before.authority_digest, source.authority_digest);
+    drop(older);
+
+    // Upgrading retries the held claims with the new registry and converges on the same graph.
+    let upgraded = Store::open(&path, "older").unwrap();
+    upgraded.set_member_key(Some(older_key)).unwrap();
+    upgraded.validate_replication_backlog().unwrap();
+    upgraded.apply_replication_repairs().unwrap();
+    upgraded.project_replication_backlog().unwrap();
+    let after = upgraded.replication_status(true, Some(FLEET), &[]).unwrap();
+    assert_eq!(after.waiting_claims, 0);
+    assert_eq!(after.graph_digest, source.graph_digest);
+    assert_eq!(after.projection_digests, source.projection_digests);
+    let at = resolved.resolution.as_ref().unwrap().resolved_at_unix_ms;
+    assert_eq!(upgraded.harness_question(&question.id, at).unwrap(), Some(resolved));
+}

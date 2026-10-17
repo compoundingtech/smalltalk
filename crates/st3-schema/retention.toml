@@ -57,6 +57,10 @@
 "github.posted" = { class = "durable" }
 "glass.deleted" = { class = "durable" }
 "glass.upserted" = { class = "durable" }
+# Compact question identity, shape, status, positions and receipt stay indefinitely.
+# Only redundant observation history expires a day after resolution.
+"harness-question.observed" = { class = "current" }
+"harness-question.resolved" = { class = "durable" }
 "harness.context-clear.requested" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "harness.context-clear.result" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "harness.diagnostic" = { class = "transition", window = "7d", pending = "only the seat status history rule retains its sources" }
@@ -352,3 +356,11 @@ kind = "harness.todo.observed"
 slot = []
 keep = "newest"
 undescribed = true
+
+# Keep pending history, then compact to the newest observation after one day.
+# The resolution and newest observation are never dropped.
+[[rules]]
+kind = "harness-question.observed"
+slot = []
+keep = "all-while-pending,newest-once-resolved-1d-before-cut"
+

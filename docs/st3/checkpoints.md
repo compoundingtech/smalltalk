@@ -141,8 +141,12 @@ what the fold ends with only by replacing the witness, which is also what it wou
 dropped claim. A kind that clears all of its fields on every update (a state transition) is
 witnessed by any later kept claim of its slot.
 
-Every rule of every kind except `loop.state` also keeps the newest claim carrying each field, so a
-field set only once still has its last value.
+The harness question rule compacts only redundant observations a day after resolution.
+The newest observation and resolution remain indefinitely, so the compact record and receipt
+continue to answer readers and prevent re-observation from reopening the question.
+
+Every rule of every kind except `loop.state` and the harness question rule also keeps the newest
+claim carrying each field, so a field set only once still has its last value.
 
 ### Guards
 
@@ -190,6 +194,7 @@ agree on a checkpoint only when they run the same rules. In summary:
 | `harness.limits` | subject | the newest; the newest reading the account fold accepts, and any accepted at the same time; every reading measured within an hour of the newest reading of its account group (driver, account, declared account, weekly or five-hour only) across every seat |
 | `harness.todo.observed` | subject | the newest (a rule that predates its description line) |
 | `runtime.reconcile-decision` | subject, decision key | the newest of each key; the reconciler asks whether a key was recorded, reads the newest member-reconcile decision and the subject's newest |
+| `harness-question.observed` | subject | every observation while pending; newest observation indefinitely once resolved at least a day before the cut (rules version 18, following #1473's allocated 17); the resolution is durable (see [Harness questions](harness-questions.md)) |
 | `harness.usage`, response rollups | subject, incarnation, model, account, run, step, host | the last snapshot of each UTC hour in the seven days before the cut, the newest snapshot before that window, and the newest of all |
 | `harness.usage`, session cumulative | subject, incarnation | the newest and the last claim of the largest total |
 | `harness.usage`, context occupancy | subject, incarnation | the newest |

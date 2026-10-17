@@ -60,6 +60,8 @@ Use these documents for implementation details:
   stopping a seat ends every process the seat started, and what a host without systemd misses.
 - [Subagents](subagents.md) explains how st records the subagents a seat's harness runs as claims
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
+- [Harness questions](harness-questions.md) explains how st records the questions a seat's harness
+  asks natively, as ids and option positions without text, retaining compact ended records forever.
 - [Model accounts](accounts.md) explains how a person declares several Claude and Codex accounts, how a
   seat binds one or a pool, and how a pooled seat at its limit restarts on another account.
 - [Instances](instances.md) explains `--instance NAME`: a second, fully separate st on one machine
