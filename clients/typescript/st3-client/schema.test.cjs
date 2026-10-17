@@ -541,3 +541,32 @@ test('exchange carrier additions preserve legacy absence and future carrier valu
     assert.deepEqual(Schema.encodeSync(Rich.SyncPeer)(decode(future)), future);
     assert.throws(() => decode({ ...observed, last_failed_exchange: { carrier: 'fabric' } }));
 });
+
+test('stream sync notice frames decode in both modes, and a bad notice never reads as level', async () => {
+    const [, Rich] = await modules;
+    const fixture = require('../../../fixtures/clients/stream-sync/frames.json');
+    // What a reader makes of a decoded frame's sync: only exactly level, or a catching-up or
+    // diverged with peers, is known; anything else is unknown.
+    const read = (sync) => sync === undefined ? 'unknown'
+        : sync.state === 'level' && !sync.peers ? 'level'
+        : (sync.state === 'catching-up' || sync.state === 'diverged') && sync.peers?.length ? sync.state
+        : 'unknown';
+    for (const [name, { frame, expect }] of Object.entries(fixture.valid)) {
+        for (const mode of ['tolerant', 'strict']) {
+            const decoded = Rich.decodeUnknownSync(Rich.CollectionFrame, mode)(frame);
+            assert.equal(read(decoded.sync), expect, `${name} ${mode}`);
+        }
+        // A key a newer daemon adds is ignored when tolerant, the production default.
+        const newer = { ...frame, a_key_from_a_newer_daemon: { any: 'value' } };
+        assert.equal(read(Rich.decodeUnknownSync(Rich.CollectionFrame, 'tolerant')(newer).sync), expect, `${name} newer`);
+    }
+    for (const [name, { frame, expect }] of Object.entries(fixture.invalid)) {
+        assert.throws(() => Rich.decodeUnknownSync(Rich.CollectionFrame, 'strict')(frame), undefined, `${name} strict`);
+        assert.equal(expect, 'unknown');
+        // Tolerant decoding never turns a bad notice into level: it fails the frame, or reads it
+        // as something the reader rule calls unknown.
+        let decoded;
+        try { decoded = Rich.decodeUnknownSync(Rich.CollectionFrame, 'tolerant')(frame); } catch { decoded = undefined; }
+        if (decoded) assert.notEqual(read(decoded.sync), 'level', `${name} tolerant`);
+    }
+});

@@ -626,7 +626,7 @@ async fn connected(
                 let received = std::time::Instant::now();
                 *failures = 0;
                 match event {
-                    CollectionEvent::Snapshot { id, snapshot, items, order, has_more } => {
+                    CollectionEvent::Snapshot { id, snapshot, items, order, has_more, .. } => {
                         let Some(window) = Window::from_id(&id) else { continue };
                         // A frame already on its way when the window was left: the socket was
                         // heard from, but nothing of the window comes back.
@@ -643,7 +643,7 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more } => {
+                    CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more, .. } => {
                         let Some(window) = Window::from_id(&id) else { continue };
                         if left(window, *missions) || matches!(window, Window::Inventory(inventory) if !inventory_granted || !inventories.contains(inventory)) {
                             continue;

@@ -3114,6 +3114,20 @@
         }
       ]
     },
+    "StreamSync": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "description": "This host's replication as a stream frame states it: level, or catching up with or diverged from the peers named. Unlike a page's SyncNotice it is explicit when level, so that its absence on a stream means unknown. A state this client does not know reads as unknown, never level.",
+      "properties": {
+        "state": { "anyOf": [{ "enum": ["level", "catching-up", "diverged"] }, { "type": "string" }], "description": "level; diverged when any peer has diverged; else catching-up." },
+        "peers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/SyncPeer" }, "description": "The peers this host is behind or diverged from: present exactly when the state is not level." }
+      },
+      "allOf": [
+        { "if": { "properties": { "state": { "const": "level" } } }, "then": { "properties": { "peers": { "type": "array", "maxItems": 0 } } } },
+        { "if": { "properties": { "state": { "enum": ["catching-up", "diverged"] } } }, "then": { "required": ["peers"] } }
+      ]
+    },
     "CollectionFrame": {
       "oneOf": [
         {
@@ -3127,7 +3141,8 @@
             "snapshot": { "$ref": "#/$defs/Snapshot" },
             "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
             "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-            "has_more": { "type": "boolean" }
+            "has_more": { "type": "boolean" },
+            "sync": { "$ref": "#/$defs/StreamSync", "description": "This host's replication, taken when this frame was built. A daemon that sends it sends it on every snapshot of the collections that carry it (attention). Absent means unknown (an older daemon), never level." }
           }
         },
         {
@@ -3142,7 +3157,8 @@
             "upserts": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
             "removes": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "order": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-            "has_more": { "type": "boolean" }
+            "has_more": { "type": "boolean" },
+            "sync": { "$ref": "#/$defs/StreamSync", "description": "Present only when this host's replication changed since the last frame of this subscription (its state, or which peers are ahead), including back to level. Absent means it did not change." }
           }
         },
         {

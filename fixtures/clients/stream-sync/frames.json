@@ -1,0 +1,228 @@
+{
+  "about": "Stream sync notice frames (docs/st3/client-v0/collections.md, Sync on the stream). `valid` decode in every client in tolerant and strict mode; `invalid` are rejected by the schema and the TypeScript strict decoder, and no client reads one as level.",
+  "valid": {
+    "old_daemon": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false
+      },
+      "expect": "unknown"
+    },
+    "level": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false,
+        "sync": {
+          "state": "level"
+        }
+      },
+      "expect": "level"
+    },
+    "catching_up": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false,
+        "sync": {
+          "state": "catching-up",
+          "peers": [
+            {
+              "host_id": "host/example-peer",
+              "peer_only_envelopes": 26820,
+              "local_only_envelopes": 0,
+              "last_exchange_at": "2026-10-15T21:59:00Z",
+              "estimated_catch_up_seconds": 840
+            }
+          ]
+        }
+      },
+      "expect": "catching-up"
+    },
+    "diverged": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false,
+        "sync": {
+          "state": "diverged",
+          "peers": [
+            {
+              "host_id": "host/example-peer",
+              "peer_only_envelopes": 0,
+              "local_only_envelopes": 0,
+              "last_exchange_at": "2026-10-15T21:59:00Z",
+              "diverged_since": "2026-10-15T20:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": "diverged"
+    },
+    "changes_back_to_level": {
+      "frame": {
+        "kind": "changes",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "upserts": [],
+        "removes": [],
+        "order": [],
+        "has_more": false,
+        "sync": {
+          "state": "level"
+        }
+      },
+      "expect": "level"
+    }
+  },
+  "invalid": {
+    "level_with_peers": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false,
+        "sync": {
+          "state": "level",
+          "peers": [
+            {
+              "host_id": "host/example-peer",
+              "peer_only_envelopes": 26820,
+              "local_only_envelopes": 0,
+              "last_exchange_at": "2026-10-15T21:59:00Z",
+              "estimated_catch_up_seconds": 840
+            }
+          ]
+        }
+      },
+      "expect": "unknown"
+    },
+    "catching_up_without_peers": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false,
+        "sync": {
+          "state": "catching-up"
+        }
+      },
+      "expect": "unknown"
+    },
+    "unknown_state": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false,
+        "sync": {
+          "state": "lagging",
+          "peers": [
+            {
+              "host_id": "host/example-peer",
+              "peer_only_envelopes": 26820,
+              "local_only_envelopes": 0,
+              "last_exchange_at": "2026-10-15T21:59:00Z",
+              "estimated_catch_up_seconds": 840
+            }
+          ]
+        }
+      },
+      "expect": "unknown"
+    },
+    "wrong_type": {
+      "frame": {
+        "kind": "snapshot",
+        "id": "alerts",
+        "collection": "attention",
+        "snapshot": {
+          "id": "snapshot/example-host/7/0",
+          "host_id": "host/example-host",
+          "store_index": 7,
+          "projection_version": "client-projection.v0",
+          "created_at": "2026-10-15T22:00:00Z"
+        },
+        "items": [],
+        "order": [],
+        "has_more": false,
+        "sync": "level"
+      },
+      "expect": "unknown"
+    }
+  }
+}
