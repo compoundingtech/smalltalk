@@ -334,6 +334,7 @@ pub struct WriterConnection {
     finalizers: Arc<TransactionFinalizers>,
     background: Arc<writer_queue::BackgroundAdmission>,
     workers: Arc<Semaphore>,
+    worker_queue: Arc<writer_admission::WorkerQueue>,
     handler_policy: Arc<Mutex<Option<Arc<writer_budget::OwnedHandlerPolicy>>>>,
     mutation_observer: Option<Arc<writer_observer::MutationState>>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
@@ -470,6 +471,7 @@ impl WriterConnection {
             finalizers,
             background,
             workers: Arc::new(Semaphore::new(writer_admission::constructor_write_limit())),
+            worker_queue: writer_admission::WorkerQueue::new(),
             handler_policy,
             mutation_observer,
             batches,

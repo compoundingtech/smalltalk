@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Expose write-worker admission backlog and abandoned callback starts",
+  "replay": {"status": "none", "detail": "No claim, projection or replay changes."},
+  "schema": {"status": "none", "detail": "Queue timestamps and requester liveness are process-local; storage schema and digests are unchanged."},
+  "rules": {"status": "none", "detail": "Writer admission, dependent permit sharing and detached mutation completion are unchanged."},
+  "compatibility": {"status": "changed", "detail": "The existing OTel pipeline exports st.write_workers.queue.depth, st.write_workers.queue.busy_age (seconds, maximum per-store busy-period age: a conservative upper bound on oldest queued age, not exact), st.write_workers.queue.wait (seconds, bounded normalized route origin), and st.write_workers.abandoned_callback_starts (outcome=ran, per callback poll rather than unique request). Atomic depth and busy-period state replace the proposed locked oldest-age metric. Alerts use busy_age: a continuously nonempty queue never resets, and overlapping empty transitions may retain an earlier start, so false positives are possible. Busy start is atomically published on 0-to-1 depth transitions; clearing on 1-to-0 rechecks depth and restores an earlier start if enqueue raced the clear. Empty observations emit zero. Observable gauges include admission and blocking-pool waits until callback start; explicit admission leaves the queue at grant. Dropped request waiters are observed without skipping work."},
+  "downtime": {"status": "none", "detail": "No additional downtime beyond the normal binary restart."},
+  "manual": {"status": "none", "detail": "Existing OTel exporter configuration applies. No additional setup is required."},
+  "recovery": {"status": "none", "detail": "Binary swap-back requires no data migration."}
+}

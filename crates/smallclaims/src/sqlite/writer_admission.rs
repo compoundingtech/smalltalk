@@ -1,6 +1,81 @@
 //! Admission of top-level writer-bound callbacks before they occupy blocking threads.
 use super::*;
 use std::future::Future;
+use std::time::Instant;
+
+pub(super) struct WorkerQueue {
+    epoch: Instant,
+    depth: AtomicU64,
+    // u64::MAX means no busy period has been published yet.
+    busy_since_micros: AtomicU64,
+}
+
+impl WorkerQueue {
+    pub(super) fn new() -> Arc<Self> {
+        let queue = Arc::new(Self {
+            epoch: Instant::now(),
+            depth: AtomicU64::new(0),
+            busy_since_micros: AtomicU64::new(u64::MAX),
+        });
+        telemetry::register_worker_queue(&queue);
+        queue
+    }
+
+    pub(super) fn sample(&self) -> (u64, f64) {
+        (self.depth.load(Ordering::Acquire), self.busy_age())
+    }
+
+    pub(super) fn busy_age(&self) -> f64 {
+        if self.depth.load(Ordering::Acquire) == 0 {
+            return 0.0;
+        }
+        let since = self.busy_since_micros.load(Ordering::Acquire);
+        // An enqueue may not have published its start yet. Epoch zero remains an
+        // upper bound in that window, rather than hiding potentially old work.
+        let since = if since == u64::MAX { 0 } else { since };
+        let age = self.micros().saturating_sub(since);
+        if self.depth.load(Ordering::Acquire) == 0 {
+            return 0.0;
+        }
+        std::time::Duration::from_micros(age).as_secs_f64()
+    }
+
+    fn micros(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    fn enqueue(self: &Arc<Self>) -> QueuedWorker {
+        std::sync::LazyLock::force(&telemetry::METRICS);
+        let at = Instant::now();
+        let micros = u64::try_from(at.duration_since(self.epoch).as_micros()).unwrap_or(u64::MAX);
+        if self.depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.busy_since_micros.fetch_min(micros, Ordering::AcqRel);
+        }
+        QueuedWorker { queue: self.clone(), micros, at }
+    }
+}
+
+struct QueuedWorker {
+    queue: Arc<WorkerQueue>,
+    micros: u64,
+    at: Instant,
+}
+
+impl Drop for QueuedWorker {
+    fn drop(&mut self) {
+        let last = self.queue.depth.fetch_sub(1, Ordering::AcqRel) == 1;
+        if last {
+            let since = self.queue.busy_since_micros.swap(u64::MAX, Ordering::AcqRel);
+            // A new 0->1 enqueue may publish before our clear. Recheck depth and
+            // restore the earlier start with atomic min, never moving a newer
+            // busy period forward. Overlapping empty transitions can retain an
+            // older start: this is a conservative bound, not exact oldest age.
+            if self.queue.depth.load(Ordering::Acquire) != 0 {
+                self.queue.busy_since_micros.fetch_min(since.min(self.micros), Ordering::AcqRel);
+            }
+        }
+    }
+}
 
 pub const MAX_WRITE_WORKERS: usize = 32;
 
@@ -76,18 +151,31 @@ impl WritePermit {
 }
 
 /// An owned admission handle, so a store can move into its own blocking callback.
+#[derive(Clone)]
 pub struct WriteWorkers {
     admission: Arc<Semaphore>,
     inherited: Option<WritePermit>,
+    queue: Arc<WorkerQueue>,
+    requester: Option<Arc<tokio::sync::oneshot::Sender<()>>>,
+    route: Option<opentelemetry::KeyValue>,
 }
 
 impl WriteWorkers {
+    /// Observe a detached request without cancelling or skipping its work.
+    /// `route` must be the router's normalized matched path, never a raw URI.
+    pub fn with_requester(mut self, requester: Arc<tokio::sync::oneshot::Sender<()>>, route: String) -> Self {
+        self.requester = Some(requester);
+        self.route = Some(opentelemetry::KeyValue::new("origin", Arc::<str>::from(route)));
+        self
+    }
+
     /// Admit before submitting work; dependent callbacks retain their parent's slot.
     pub async fn spawn_blocking<F, T>(self, work: F) -> Result<T, tokio::task::JoinError>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        let queued = self.inherited.is_none().then(|| self.queue.enqueue());
         let permit = match self.inherited {
             Some(permit) => permit,
             None => {
@@ -103,7 +191,20 @@ impl WriteWorkers {
                 }
             }
         };
-        tokio::task::spawn_blocking(move || permit.run(work)).await
+        tokio::task::spawn_blocking(move || {
+            if let Some(queued) = queued {
+                let wait = queued.at.elapsed();
+                drop(queued);
+                telemetry::METRICS.worker_wait.record(
+                    wait.as_secs_f64(),
+                    &[self.route.unwrap_or_else(|| opentelemetry::KeyValue::new("origin", "other"))],
+                );
+            }
+            if self.requester.is_some_and(|requester| requester.is_closed()) {
+                telemetry::METRICS.abandoned_callback_starts.add(1, &[opentelemetry::KeyValue::new("outcome", "ran")]);
+            }
+            permit.run(work)
+        }).await
     }
 }
 
@@ -114,6 +215,9 @@ impl WriterConnection {
         WriteWorkers {
             admission: self.workers.clone(),
             inherited: self.current_write_permit(),
+            queue: self.worker_queue.clone(),
+            requester: None,
+            route: None,
         }
     }
 
@@ -134,12 +238,16 @@ impl WriterConnection {
     /// semaphore grants queued admission in FIFO order. No store locks may be held here.
     pub fn admit_write(&self) -> impl Future<Output = WritePermit> + Send + use<> {
         let admission = self.workers.clone();
+        let queue = self.worker_queue.clone();
         async move {
+            let queued = queue.enqueue();
             let permit = admission
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("writer worker admission is never closed");
+            telemetry::METRICS.worker_wait.record(queued.at.elapsed().as_secs_f64(), &[opentelemetry::KeyValue::new("origin", "other")]);
+            drop(queued);
             WritePermit {
                 admission,
                 _permit: Arc::new(permit),
@@ -169,6 +277,27 @@ mod tests {
     use futures_util::poll;
     use std::task::Poll;
     use std::time::Duration;
+
+    #[test]
+    fn busy_period_covers_all_queued_callbacks_and_clears() {
+        let queue = WorkerQueue::new();
+        let first = queue.enqueue();
+        let since = queue.busy_since_micros.load(Ordering::Relaxed);
+        assert_ne!(since, u64::MAX);
+        let second = queue.enqueue();
+        assert_eq!(queue.busy_since_micros.load(Ordering::Relaxed), since);
+        drop(first);
+        assert_eq!(queue.busy_since_micros.load(Ordering::Relaxed), since);
+        assert!(since <= second.micros);
+        drop(second);
+        assert_eq!(queue.busy_since_micros.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(queue.sample(), (0, 0.0));
+        assert_eq!(queue.busy_age(), 0.0);
+        let next = queue.enqueue();
+        assert_ne!(queue.busy_since_micros.load(Ordering::Relaxed), u64::MAX);
+        drop(next);
+        assert_eq!(queue.busy_age(), 0.0);
+    }
 
     fn writer(limit: usize) -> Arc<WriterConnection> {
         with_write_limit_for_test(limit, || {
