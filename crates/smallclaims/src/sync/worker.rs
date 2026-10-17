@@ -2561,14 +2561,20 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
             )
         })?
         .to_vec();
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both — DELETE at contraction.
+    // Both signature names require authentication, including refusals. Switch senders only
+    // after every member accepts aliases; sunset 60 days after the first shipping release.
+    let unsigned = !headers.contains_key(HEADER_SIGNATURE)
+        && !headers.contains_key("x-fractal-signature");
+    // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both
     // A build older than a path answers an unsigned 404.
-    if status == StatusCode::NOT_FOUND && headers.get(HEADER_SIGNATURE).is_none() {
+    if status == StatusCode::NOT_FOUND && unsigned {
         anyhow::bail!("peer {} runs a build without `{path}`", peer.name);
     }
     // Any other refusal without the fleet's signature is reported by its status, before the
     // signature check would report only a missing header and hide why the exchange failed. Its
     // body is never trusted as data; an unsigned success still fails the signature check below.
-    if !status.is_success() && headers.get(HEADER_SIGNATURE).is_none() {
+    if !status.is_success() && unsigned {
         anyhow::bail!(unsigned_refusal(&peer.name, status, &bytes));
     }
     let bytes = if deflated(&headers) {

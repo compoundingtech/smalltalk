@@ -654,6 +654,7 @@ impl Client {
                 .header("content-type", "application/json")
                 .header("connection", "close");
                 request = st3_client::propagation::inject_http(request);
+                // TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old names until all members accept aliases; sunset 60 days after first shipping release.
                 if let Some(person) = self.person.as_deref() {
                     request = request.header("x-st3-person", person);
                 }
@@ -1028,6 +1029,7 @@ impl std::error::Error for UnexpectedResponse {}
 fn terminal_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let mut request = url.into_client_request()?;
     st3_client::propagation::inject_headers(request.headers_mut());
+    // TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old names until all members accept aliases; sunset 60 days after first shipping release.
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         "st3.terminal.v1"

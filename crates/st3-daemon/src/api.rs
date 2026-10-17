@@ -67,6 +67,7 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+mod wire_names;
 mod client_blobs;
 #[cfg(test)]
 mod terminal_gate_evidence;
@@ -181,6 +182,7 @@ pub struct AppState {
     pub planner_default: PlannerSpec,
 }
 
+// TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old output until all members accept aliases; sunset 60 days after first shipping release.
 const CLIENT_API_VERSION: &str = "st3.client.v0";
 const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
 const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
@@ -955,6 +957,9 @@ async fn response_envelope_unbounded(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    if let Err(error) = wire_names::receive_headers(request.headers_mut()) {
+        return error.into_response();
+    }
     // Anonymous pairing discovery is public, static compatibility metadata. Bypass
     // authentication, snapshots, presence and the normal envelope/activity counter entirely.
     if matches!(transport, ClientTransportBoundary::FabricLoopback)

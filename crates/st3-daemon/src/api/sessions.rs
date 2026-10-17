@@ -359,6 +359,7 @@ pub(super) async fn terminal_session(
             "the terminal incarnation changed before attachment",
         )));
     }
+    // TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old names until all members accept aliases; sunset 60 days after first shipping release.
     Ok(websocket
         .protocols(["st3.terminal.v1"])
         .on_upgrade(move |socket| terminal_proxy(socket, state.pty_root, runtime_id)))

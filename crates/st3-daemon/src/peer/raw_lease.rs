@@ -244,6 +244,7 @@ pub(super) async fn receive_owner(
             urlencoding::encode(binding.terminal.trim_start_matches("terminal/")),
             urlencoding::encode(&binding.incarnation)
         );
+        // TODO(live-migration: arn:lmig:smalltalk:2026-10-16-wire-fractal-accept-both): keep old names until all members accept aliases; sunset 60 days after first shipping release.
         let mut request = format!("ws://localhost{raw_path}").into_client_request()?;
         request
             .headers_mut()
