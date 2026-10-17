@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-ui sidebar rows show reported context occupancy and windowed spend, with a Layout C metric option",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Only packages/fractal-ui changes. `SidebarAgentRowData` gains optional `context` and `spend`, and `SidebarAgentRow` gains optional `metricLayout`; `SidebarContext` and `SidebarWindowSpend` are new exported types. Hosts that pass none of them render as before."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

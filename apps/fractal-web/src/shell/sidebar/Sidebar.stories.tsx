@@ -1,6 +1,8 @@
 import { useAtom } from '@effect/atom-react'
 import { Agent, Attention, decodeUnknownSync } from '@smalltalk/st3-client/schema'
 import type { Meta, StoryObj } from '@storybook/react'
+import { SidebarAgentRow, assistantDarkTheme, type SidebarAgentRowData } from '@smalltalk/fractal-ui/assistant-ui/shell'
+import { expect, userEvent, waitFor, within } from 'storybook/test'
 import * as stylex from '@stylexjs/stylex'
 import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
@@ -8,6 +10,8 @@ import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import * as React from 'react'
 
 import { scale, tokens } from '../../ui-compat/tokens.stylex.ts'
+import { liveLegacyTheme } from '../../ui-compat/live-theme.stylex.ts'
+import { colorVars as c, typeVars as compositionType } from '../../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 
 import { fixtureSource } from '../../data/fixtureSource.ts'
 import { DataSourceProvider, useSubjectList } from '../../data/react.tsx'
@@ -16,6 +20,8 @@ import type { SidebarOperation } from '../../folders/edit.ts'
 import { fixtureFolders } from '../../folders/fixture.ts'
 import { SubjectAddress } from '../../resources/contract.ts'
 import { AgentFolders } from '../AgentFolders.tsx'
+import type { SidebarNode } from '../../folders/sidebarContract.ts'
+import { assertTreeIndentation, measureTreeIndentation } from './treeIndentation.ts'
 import { WorkbenchContextProvider } from '../context.tsx'
 import { dailyDriver } from '../fixtures/layouts.ts'
 import { createWindow, projectWorkspaces, reduceWindow, type WindowAction } from '../workspaces.ts'
@@ -32,6 +38,7 @@ const styles = stylex.create({
     borderInlineEndStyle: 'solid',
     borderInlineEndColor: tokens['--ds-gray-alpha-400'],
   },
+  indentViewport: { display: 'flex', flexDirection: 'column', height: '100dvh', minHeight: 0, color: c.fg, fontFamily: compositionType.fontSans, fontSize: compositionType.uiSize, lineHeight: compositionType.uiLeading },
   narrow: { width: '280px' },
   statusGrid: { display: 'flex', flexWrap: 'wrap', gap: scale.space4, padding: scale.space4 },
   status: { display: 'flex', alignItems: 'center', gap: scale.space2, fontSize: '0.75rem' },
@@ -194,4 +201,69 @@ export const EndedOptions: Story = {
       </div>
     </div>
   ),
+}
+
+const indentNow = Date.UTC(2026, 9, 8, 12)
+const indentRow = (ref: string, title: string): SidebarAgentRowData => ({
+  ref, id: ref, title, host: 'local', status: 'idle', statusLabel: 'Idle', freshness: 'live', unread: 2,
+  usage: { _tag: 'Known', scope: '24h-root-and-subagents', usd: 4.2, tokens: 2_300_000 },
+  duration: { _tag: 'Known', scope: '24h-activity-span', ms: 3_600_000 },
+  lastTurn: { _tag: 'Known', kind: 'turn-completed', at: indentNow - 180_000 }, children: [],
+})
+const detailChild = { ...indentRow('agent/builder/subagent/review/subagent/check/subagent/detail', 'Verify detail'), parentRef: 'agent/builder/subagent/review/subagent/check' }
+const checkChild = { ...indentRow('agent/builder/subagent/review/subagent/check', 'Check review'), parentRef: 'agent/builder/subagent/review', children: [detailChild] }
+const reviewChild = { ...indentRow('agent/builder/subagent/review', 'Review output'), parentRef: 'agent/builder', children: [checkChild] }
+const testChild = { ...indentRow('agent/builder/subagent/test', 'Check tests'), parentRef: 'agent/builder' }
+const indentRows = [
+  indentRow('agent/root', 'Root session'),
+  indentRow('agent/folder', 'Folder session'),
+  { ...indentRow('agent/builder', 'Builder session'), children: [reviewChild, testChild] },
+]
+const indentAgent = (row: SidebarAgentRowData): SidebarNode => ({ _tag: 'Agent', id: row.ref, subject: row.ref, label: row.title })
+const indentTree: readonly SidebarNode[] = [
+  indentAgent(indentRows[0]!),
+  { _tag: 'Folder', id: 'product', label: 'Product', collapsed: false, children: [
+    indentAgent(indentRows[1]!),
+    { _tag: 'Folder', id: 'interface', label: 'Interface', collapsed: false, children: [indentAgent(indentRows[2]!)] },
+  ] },
+]
+
+/** Real folder collection plus the production row's recursive, non-RAC subagent expansion. */
+const TreeIndentationSurface = () => {
+  const [expandedRefs, setExpandedRefs] = React.useState<ReadonlySet<string>>(new Set())
+  return <div data-tree-indent-surface="" data-frame-rows="" {...stylex.props(styles.sidebar, styles.indentViewport, liveLegacyTheme, assistantDarkTheme)}>
+    <AgentFolders tree={indentTree} canDrop={() => ({ refused: 'Read-only geometry fixture' })}
+      onMove={() => undefined} onCreateFolder={() => undefined} onRenameFolder={() => undefined}
+      onDeleteFolder={() => undefined} onToggleCollapsed={() => undefined}
+      renderAgent={node => <SidebarAgentRow item={indentRows.find(row => row.ref === node.id)!}
+        now={indentNow} extraSignals={['X-subs', 'X-unread']} expandedRefs={expandedRefs} active={node.id === 'agent/builder'}
+        onToggleChildren={ref => setExpandedRefs(previous => { const next = new Set(previous); if (next.has(ref)) next.delete(ref); else next.add(ref); return next })} />} />
+  </div>
+}
+
+export const TreeIndentation: Story = {
+  render: () => <TreeIndentationSurface />,
+  parameters: { docs: { description: { story: 'One 16px step from RAC levels through depths 0–5: folder → folder → agent → subagent → sub-subagent → leaf. The real > n controls expand every agent level. Highlights remain full-width; title and metadata share a text start; timestamps and counts retain aligned columns. The play test forces a zero-step control and requires the same measurement to reject it.' } } },
+  play: async ({ canvasElement }) => {
+    const surface = canvasElement.querySelector<HTMLElement>('[data-tree-indent-surface]')!
+    await document.fonts.ready
+    await userEvent.click(await within(surface).findByRole('button', { name: 'Expand 2 subagents' }))
+    for (const ref of ['agent/builder/subagent/review', 'agent/builder/subagent/review/subagent/check']) {
+      await waitFor(() => expect(surface.querySelector(`[data-wf-agent-ref="${ref}"] [data-testid="taste-agent-row"]`)).not.toBeNull())
+      const row = surface.querySelector<HTMLElement>(`[data-wf-agent-ref="${ref}"] [data-testid="taste-agent-row"]`)!
+      await userEvent.click(within(row).getByRole('button', { name: 'Expand 1 subagents' }))
+    }
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    const measurement = measureTreeIndentation(surface)
+    assertTreeIndentation(measurement)
+    surface.dataset.treeIndentMeasurement = JSON.stringify(measurement)
+    surface.style.setProperty('--sidebar-tree-step', '0px')
+    try {
+      const control = measureTreeIndentation(surface)
+      surface.dataset.treeIndentControl = JSON.stringify(control)
+      await expect(() => assertTreeIndentation(control)).toThrow('expected 16px, received 0px')
+    } finally {
+      surface.style.removeProperty('--sidebar-tree-step')
+    }
+  },
 }

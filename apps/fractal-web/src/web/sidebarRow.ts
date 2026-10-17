@@ -1,9 +1,11 @@
 import type { SidebarAgentRowData, SidebarAgentStatus } from '@smalltalk/fractal-ui/assistant-ui'
 import type { Agent } from '../data/source.ts'
+import { contextOccupancy } from '../data/contextOccupancy.ts'
+import type { SidebarSpendObservation } from '../extensions/contract.ts'
 
 /** Presentation of one actual roster observation. No per-row reads or inferred usage. */
-export const sidebarRow = ({ agent, stale, now }: {
-  readonly agent: Agent; readonly stale: boolean; readonly now: number
+export const sidebarRow = ({ agent, stale, now, spendObservation }: {
+  readonly agent: Agent; readonly stale: boolean; readonly now: number; readonly spendObservation?: SidebarSpendObservation
 }): SidebarAgentRowData => {
   const status: SidebarAgentStatus = stale ? 'stale' : agent.state === 'retired' ? 'retired'
     : agent.state === 'suspended' ? 'suspended'
@@ -21,6 +23,8 @@ export const sidebarRow = ({ agent, stale, now }: {
     statusLabel: stale ? 'Last verified · ' + statusLabel : !agent.connected ? 'Offline · ' + statusLabel : statusLabel,
     freshness: stale ? 'stale' : 'live', description: agent.description, harness: agent.harness,
     terminal: agent.terminal || undefined, mission: agent.mission, lastActivityAt, statusSince,
+    context: contextOccupancy({ usage: agent.usage, now, observedAfter: agent.contextObservedAfter }),
+    spend: agent.harness === 'omp' && agent.incarnationId !== undefined && spendObservation?.agentRef === agent.ref && spendObservation.incarnationId === agent.incarnationId ? spendObservation.spend : undefined,
     // Roster has no authoritative unread count or attention request. No signal is fabricated.
     childrenKnown: false, children: [], usage: { _tag: 'Unknown' }, duration: { _tag: 'Unknown' },
     lastTurn: lastActivityAt === undefined ? { _tag: 'Unknown' } : { _tag: 'Known', kind: 'activity', at: lastActivityAt },

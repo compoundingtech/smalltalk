@@ -26,6 +26,8 @@ import type { NativeSubjectView } from '../resources/react.tsx'
 import type { RegisteredRenderer, RegisteredSubjectRenderer, Registry } from '../resources/registry.ts'
 import type { SubjectEnvelope } from '../resources/envelope.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
+import type { Feed } from '../data/source.ts'
+import type { SidebarWindowSpend } from '@smalltalk/fractal-ui/assistant-ui'
 
 export interface AgentRowProps {
   readonly agentRef: string
@@ -60,3 +62,12 @@ export interface ExtensionFixtures {
   readonly envelopes: readonly SubjectEnvelope[]
   readonly subjects: readonly SubjectSummary[]
 }
+
+/** Exact native-root attribution for shared trailing-window observations. */
+export interface SidebarSpendObservation {
+  readonly agentRef: string
+  readonly incarnationId: string
+  readonly nativeSessionId: string
+  readonly spend: { readonly last24h: SidebarWindowSpend; readonly last7d: SidebarWindowSpend }
+}
+export type UseSidebarSpend = () => Feed<readonly SidebarSpendObservation[]>

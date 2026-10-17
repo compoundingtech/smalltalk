@@ -2,8 +2,14 @@ export { matchPositions } from './fuzzy.ts'
 export type SidebarUsage = { readonly _tag: 'Known'; readonly scope: '24h-root-and-subagents' | 'lifetime-incl-subagents'; readonly tokens: number; readonly usd: number } | { readonly _tag: 'Unknown' }
 export type SidebarDuration = { readonly _tag: 'Known'; readonly scope: '24h-activity-span' | 'lifetime'; readonly ms: number } | { readonly _tag: 'Unknown' }
 export type SidebarLastTurn = { readonly _tag: 'Known'; readonly kind: 'turn-completed' | 'activity'; readonly at: number } | { readonly _tag: 'Unknown' }
+/** Reported main-context occupancy; this is not cumulative usage or descendant accounting. */
+export type SidebarContext = { readonly _tag: 'Known'; readonly usedTokens?: number; readonly windowTokens?: number; readonly usedPercent: number; readonly observedAt: number } | { readonly _tag: 'Unknown' }
+/** API-equivalent root-and-descendant spend over explicit trailing windows, not billed spend. */
+export type SidebarWindowSpend = { readonly _tag: 'Known'; readonly usd: number; readonly since: number; readonly until: number; readonly observedAt: number } | { readonly _tag: 'Unknown' }
 export interface SidebarReported {
   readonly model?: string
+  readonly context?: SidebarContext
+  readonly spend?: { readonly last24h: SidebarWindowSpend; readonly last7d: SidebarWindowSpend }
   /** Producers may provide both scoped observations; the row prefers an explicit lifetime fact. */
   readonly usage?: SidebarUsage | readonly SidebarUsage[]
   readonly duration?: SidebarDuration | readonly SidebarDuration[]

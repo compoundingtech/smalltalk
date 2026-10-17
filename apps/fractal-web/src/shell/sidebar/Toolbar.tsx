@@ -12,11 +12,13 @@ import {
   MenuTrigger,
 } from '../../ui-compat/components.tsx'
 import { scale, tokens } from '../../ui-compat/tokens.stylex.ts'
+import { spaceVars as space } from '../../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 
 import { IconButton } from '../../workbench-kit/IconButton.tsx'
 import { parseSidebarQuery, sortModes, type SortMode } from './filter.ts'
 import { defaultFilters, type SidebarFilters } from './state.ts'
 import { statuses, type AgentStatus } from './StatusIcon.tsx'
+import { Icon } from '../../../../../packages/fractal-ui/src/assistant-ui/composition/Icons.tsx'
 
 /** Sidebar search, visibility, host, status and view-only ordering controls. */
 export const SidebarToolbar = ({
@@ -151,7 +153,7 @@ export const SidebarToolbar = ({
                     key={value}
                     id={value}
                     textValue={label}
-                    suffix={filters.sort === value ? <span aria-hidden="true">✓</span> : undefined}
+                    suffix={filters.sort === value ? <Icon name="check" /> : undefined}
                   >
                     {label}
                   </MenuItem>
@@ -167,6 +169,7 @@ export const SidebarToolbar = ({
           aria-description="Use machine:synthetic-138/1 or host:synthetic-138/1,synthetic-138/2 to filter by host; combine with search text."
           placeholder="Search agents…  /"
           size="sm"
+          stylexStyle={styles.search}
           value={filters.query}
           onChange={(query) => update({ ...filters, query })}
           onKeyDown={(event) => {
@@ -211,9 +214,14 @@ const styles = stylex.create({
   toolbar: {
     display: 'flex',
     flexDirection: 'column',
-    gap: scale.space2,
-    paddingInline: scale.space2,
-    paddingBottom: scale.space2,
+    gap: space.md,
+    paddingInline: space.md,
+    paddingBottom: space.md,
+  },
+  search: {
+    boxSizing: 'border-box',
+    borderRadius: 6,
+    ':focus-visible': { outline: `2px solid ${tokens['--ds-focus-color']}`, outlineOffset: 2 },
   },
   controls: {
     display: 'flex',

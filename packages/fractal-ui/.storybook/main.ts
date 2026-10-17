@@ -3,7 +3,7 @@ import tailwindcss from '@tailwindcss/vite'
 import stylex from '@stylexjs/unplugin'
 
 const config: StorybookConfig = {
-  stories: ['../src/**/*.stories.tsx'],
+  stories: ['../src/**/*.stories.tsx', '../../../apps/fractal-web/src/web/ResponsiveAgentSidebar.stories.tsx', '../../../apps/fractal-web/src/web/SidebarLayoutC.stories.tsx', '../../../apps/fractal-web/src/web/SidebarChrome.stories.tsx'],
   staticDirs: ['./fixtures'],
   framework: '@storybook/react-vite',
   addons: ['@storybook/addon-docs', '@storybook/addon-a11y'],

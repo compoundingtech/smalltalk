@@ -11,6 +11,8 @@ import type * as FallbackModule from './ConversationPaneFallback.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { Feed, Fleet } from '../data/source.ts'
 import type { FeedSyncObservation } from '../data/feedSync.ts'
+import { Agent, decodeUnknownSync } from '@smalltalk/st3-client/schema'
+import { fleetFromAgents } from '../data/projections.ts'
 
 vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 // Header actions read resources from a data source; they are outside this import boundary.
@@ -37,7 +39,7 @@ vi.mock('../data/react.tsx', () => ({
   useConnection: () => ({ _tag: 'Live' }),
   useNow: () => 0,
   useGatewaySync: () => gatewayObservation,
-  useDataSource: () => ({ gateway: 'alpha.example', reconnect }),
+  useDataSource: () => ({ gateway: 'alpha.example', reconnect, prefetchTerminal: terminalPrefetch }),
   useFeedInterest: () => {},
 }))
 
@@ -49,12 +51,20 @@ let rejectImport: (reason: Error) => void
 let mountCount: number
 let frameId: number
 const requested = vi.fn()
+const terminalRequested = vi.fn()
+const terminalPrefetch = vi.fn()
+const prepareTerminal = vi.fn(async () => ({ _tag: 'Ready' as const }))
+let resolveTerminal: () => void
+let rejectTerminal: (reason: Error) => void
 const frames = new Map<number, FrameRequestCallback>()
 const paintTasks: (() => void)[] = []
 
 beforeEach(async () => {
   vi.resetModules()
   requested.mockClear()
+  terminalRequested.mockClear()
+  terminalPrefetch.mockClear()
+  prepareTerminal.mockClear()
   gatewayObservation = { status: { _tag: 'Live', since: 0 }, observedAt: 0 }
   reconnect.mockClear()
   mountCount = 0
@@ -71,6 +81,8 @@ beforeEach(async () => {
     unobserve() {}
     disconnect() {}
   })
+  Object.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect() })
+  Object.defineProperty(Range.prototype, 'getClientRects', { configurable: true, value: () => [] })
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
     const id = ++frameId
     frames.set(id, callback)
@@ -101,6 +113,12 @@ beforeEach(async () => {
       },
     }
   })
+  const terminalReady = new Promise<void>((resolve, reject) => { resolveTerminal = resolve; rejectTerminal = reject })
+  vi.doMock('../terminal/TerminalDetail.tsx', async () => {
+    terminalRequested()
+    await terminalReady
+    return { prepareTerminal, TerminalDetail: () => <div data-terminal-loaded="">Output</div> }
+  })
   workspace = await import('./LiveAgentWorkspace.tsx')
   container = document.createElement('div')
   document.body.appendChild(container)
@@ -111,6 +129,7 @@ afterEach(async () => {
   await act(async () => root.unmount())
   container.remove()
   vi.doUnmock('./ConversationPane.tsx')
+  vi.doUnmock('../terminal/TerminalDetail.tsx')
   vi.unstubAllGlobals()
   window.history.replaceState(null, '', '/')
 })
@@ -156,6 +175,72 @@ describe('gateway footer honesty', () => {
     expect(reconnect).toHaveBeenCalledTimes(1)
   })
 })
+describe('terminal import intent', () => {
+  const terminalRoster = () => {
+    const row = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example', host_id: 'host/example', runtime_ids: ['runtime/example'], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
+    rosterFeed = { _tag: 'Observed', freshness: 'live', value: fleetFromAgents([row]) }
+  }
+  it('warms code and fonts only after paint and idle, never data without header intent', async () => {
+    const idle: (() => void)[] = []
+    vi.stubGlobal('requestIdleCallback', (callback: () => void) => { idle.push(callback); return 1 })
+    vi.stubGlobal('cancelIdleCallback', vi.fn())
+    terminalRoster()
+    await renderShell()
+    expect(terminalRequested).not.toHaveBeenCalled()
+    await paintShellFrame()
+    await act(async () => { for (const task of paintTasks.splice(0)) task() })
+    expect(terminalRequested).not.toHaveBeenCalled()
+    expect(idle).toHaveLength(1)
+    await act(async () => idle[0]?.())
+    expect(terminalRequested).toHaveBeenCalledTimes(1)
+    expect(terminalPrefetch).not.toHaveBeenCalled()
+    await act(async () => resolveTerminal())
+    expect(prepareTerminal).toHaveBeenCalledTimes(1)
+    const toggle = container.querySelector('[aria-label="Toggle terminal drawer"]')!
+    await act(async () => toggle.dispatchEvent(new MouseEvent('pointerover', { bubbles: true })))
+    expect(terminalPrefetch).toHaveBeenCalledWith('terminal/example')
+    expect(terminalRequested).toHaveBeenCalledTimes(1)
+    await act(async () => toggle.dispatchEvent(new FocusEvent('focusin', { bubbles: true })))
+    expect(terminalPrefetch).toHaveBeenCalledTimes(2)
+    await act(async () => (toggle as HTMLButtonElement).click())
+    // Drawer demand reuses the idle request rather than importing the terminal chunk again.
+    expect(terminalRequested).toHaveBeenCalledTimes(1)
+  })
+  it('renders a loaded terminal in the reopen commit without a lazy fallback', async () => {
+    const show = <workspace.WorkspaceBody current="agent/example" rosterRefs={[]} view={{ _tag: 'Terminal', ref: 'terminal/example' }} agentName="Example" onOpenTool={() => {}} />
+    await act(async () => root.render(show))
+    await act(async () => resolveTerminal())
+    await act(async () => { await vi.waitFor(() => expect(container.querySelector('[data-terminal-loaded]')).not.toBeNull()) })
+    await act(async () => root.render(null))
+    // A fresh TerminalCodeBoundary on reopen must render the loaded module in the same synchronous commit.
+    act(() => {
+      flushSync(() => root.render(show))
+      expect(container.querySelector('[data-terminal-loaded]')?.textContent).toBe('Output')
+      expect(container.textContent).not.toContain('Loading terminal')
+    })
+    expect(terminalRequested).toHaveBeenCalledTimes(1)
+  })
+  it('retries a rejected terminal chunk with a fresh lazy identity', async () => {
+    const show = <workspace.WorkspaceBody current="agent/example" rosterRefs={[]} view={{ _tag: 'Terminal', ref: 'terminal/example' }} agentName="Example" onOpenTool={() => {}} />
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await act(async () => root.render(show))
+      await act(async () => rejectTerminal(new Error('Chunk unavailable')))
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain('This terminal view could not load')
+      // Vitest caches the failed module evaluation, not just the loader promise; clearing its
+      // registry models a recovered chunk transport while the real workspace module stays alive.
+      vi.resetModules()
+      vi.doMock('../terminal/TerminalDetail.tsx', () => {
+        terminalRequested()
+        return { prepareTerminal, TerminalDetail: () => <div data-terminal-loaded="">Recovered</div> }
+      })
+      await act(async () => [...container.querySelectorAll('button')].find(button => button.textContent === 'Try again')?.click())
+      await act(async () => { await vi.waitFor(() => expect(terminalRequested).toHaveBeenCalledTimes(2)) })
+      await act(async () => { await vi.waitFor(() => expect(container.querySelector('[data-terminal-loaded]')?.textContent).toBe('Recovered')) })
+    } finally { errors.mockRestore() }
+  })
+})
+
 describe('conversation import boundary', () => {
   it('reserves non-interactive roster rows while waiting and keeps the honest wait notice', async () => {
     await renderShell()
