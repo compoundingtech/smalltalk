@@ -1,4 +1,0 @@
-// Shared diagnostics kit, landed in effect-utils PR #1727.
-members {
-  effect-utils "overengineeringstudio/effect-utils#8cb2135bd4a852b99ca3f677c0815d0268766ff5"
-}
