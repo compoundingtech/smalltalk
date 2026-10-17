@@ -82,6 +82,20 @@ class Ratchet(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "baseline increased: part: lint-a: 2 -> 3"):
             check(more, more, base_with_part, splits)
 
+    def test_chained_splits_fold_to_the_first_crate_the_base_has(self):
+        # b was split out of a, and c out of b; the base has only a.
+        old = baseline({"a": {"lint-a": 4}})
+        splits = {"b": "a", "c": "b"}
+        moved = baseline({"b": {"lint-a": 1}, "c": {"lint-a": 3}})
+        check(moved, moved, old, splits)
+        more = baseline({"b": {"lint-a": 1}, "c": {"lint-a": 4}})
+        with self.assertRaisesRegex(ValueError, "baseline increased: a: lint-a: 4 -> 5"):
+            check(more, more, old, splits)
+        # The chain stops at the first crate the base has: here b exists, so c folds into b.
+        old_with_b = baseline({"a": {"lint-a": 1}, "b": {"lint-a": 3}})
+        check(baseline({"a": {"lint-a": 1}, "b": {"lint-a": 1}, "c": {"lint-a": 2}}),
+              baseline({"a": {"lint-a": 1}, "b": {"lint-a": 1}, "c": {"lint-a": 2}}), old_with_b, splits)
+
     def test_removed_warning_requires_lower_baseline(self):
         old = baseline({"sample": {"lint-a": 2}})
         lowered = baseline({"sample": {"lint-a": 1}})

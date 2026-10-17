@@ -75,14 +75,22 @@ def folded(counts, splits, previous):
     """Counts with each split-out crate added back to its origin, for crates the base lacks.
 
     A crate split out of another one may take warnings from its origin, never add any: against the base
-    revision the two are compared together, so the ceiling stays the origin's own.
+    revision the two are compared together, so the ceiling stays the origin's own. A chain of splits
+    (a crate split out of a crate that was itself split out) folds to the first crate in the chain
+    that the base has, whatever order the crates sort in.
     """
-    result = {crate: dict(lints) for crate, lints in counts.items()}
-    for new, origin in sorted(splits.items()):
-        if new in previous:
-            continue
-        for lint, count in result.pop(new, {}).items():
-            result.setdefault(origin, {})[lint] = result.get(origin, {}).get(lint, 0) + count
+    def home(crate):
+        seen = set()
+        while crate in splits and crate not in previous and crate not in seen:
+            seen.add(crate)
+            crate = splits[crate]
+        return crate
+
+    result = {}
+    for crate, lints in counts.items():
+        target = result.setdefault(home(crate), {})
+        for lint, count in lints.items():
+            target[lint] = target.get(lint, 0) + count
     return result
 
 
