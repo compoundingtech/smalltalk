@@ -14,6 +14,10 @@
 //! The scope provides survival and descendant containment. The runtimes still own adoption,
 //! signals, and teardown. Teardown ends with the scope: [`end_scope`] ends every process a task
 //! started, including one that left its process tree or started a process group of its own.
+//!
+//! These modes isolate native process lifetimes, not a filesystem, network or Unix identity.
+//! Container selection uses [`crate::container::SeatRuntime`] and its authenticated seat bridge.
+//! It must not reuse this module's detached fallback when a container bridge is unavailable.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;

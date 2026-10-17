@@ -4,6 +4,7 @@
 //! `pty` binary and reads and controls it through `pty-client`. It has no catalog, graph, claim, or
 //! provider policy.
 
+pub mod container;
 mod environment;
 mod isolate;
 mod priority;
