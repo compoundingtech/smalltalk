@@ -1,0 +1,32 @@
+name: Design / refactor
+description: Propose a design change or refactoring.
+labels: ['type:chore']
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem / motivation
+    validations:
+      required: true
+  - type: textarea
+    id: direction
+    attributes:
+      label: Proposed direction
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope / non-goals
+    validations:
+      required: true
+  - type: textarea
+    id: links
+    attributes:
+      label: Links

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add a Design / refactor issue form",
+  "replay": {"status": "none", "detail": "Issue form only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No installation or upgrade steps change."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}
