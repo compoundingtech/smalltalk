@@ -266,7 +266,7 @@ impl Registry {
                     tile.agent
                 );
             }
-            if crate::sekrets::store::person_name(&tile.person).is_none() {
+            if crate::model::person_name(&tile.person).is_none() {
                 bail!(
                     "tile {name}: `{}` is not a person such as person/ada",
                     tile.person

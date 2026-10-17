@@ -25,7 +25,7 @@ use std::process::Command;
 
 use anyhow::{Context as _, Result, bail};
 
-use super::registry::{self, Registry, Tile};
+use crate::tile_registry::{self as registry, Registry, Tile};
 use super::uids;
 
 /// Where a tile's own directories appear inside it.

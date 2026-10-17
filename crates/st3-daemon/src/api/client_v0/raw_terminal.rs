@@ -250,7 +250,7 @@ pub(crate) async fn stream(
                 &client_detail_id("terminal", &id),
                 &query.incarnation,
                 query.mode,
-                lease.clone(),
+                lease.clone().map(|lease| lease as Arc<dyn crate::peer::RawTerminalLease>),
             )
             .await
             .map_err(|error| remote_read_error(&live.owner_host_id, error))?;

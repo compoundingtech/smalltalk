@@ -32,6 +32,12 @@ use crate::graph::{parse_intent, resolve_document_references};
 use crate::message_body;
 #[cfg(test)]
 use crate::model::AttentionRequest;
+pub(crate) use crate::client_values::{
+    client_attention_actions, client_attention_id, client_timestamp, client_work_state,
+};
+pub(crate) use crate::store::agent_queue_values::{
+    AGENT_QUEUE_FIELDS, agent_queue_fields, agent_queue_metadata,
+};
 use crate::model::ClientReplicated;
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView,
@@ -69,7 +75,7 @@ mod client_adapters;
 mod client_presence;
 mod client_v0;
 mod custom;
-mod delivery_presence;
+use crate::delivery_presence;
 pub(crate) mod agent_harness;
 #[cfg(test)]
 mod harness_health_controls;
@@ -145,16 +151,17 @@ use records::post_claim;
 use replication::{replication_export, replication_receive, replication_wake};
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
-pub(crate) use client_v0::raw_terminal::{
-    Lease as RawTerminalLease, LeaseBinding as RawTerminalLeaseBinding,
-    ORIGIN_HEADER as RAW_ORIGIN_HEADER,
-};
 
-/// Recheck the initialized live delivery owner before replacing an unattached seat.
-pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation: &str) -> bool {
-    delivery_presence::attachment(subject, incarnation)
-        .is_some_and(|fence| store.check_mailbox(&fence).is_ok())
+/// The owner side of a peer raw terminal route: the plain byte splice, with no lease or control
+/// channel. The daemon passes it to `peer::run_worker` as its `RawSplice`.
+pub fn raw_terminal_owner_splice(
+    socket: axum::extract::ws::WebSocket,
+    transport: tokio::net::UnixStream,
+) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(raw_terminal_splice(socket, transport, None, None, None, None, None))
 }
+
+pub(crate) use crate::delivery_presence::claude_channel_attached;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1414,25 +1421,7 @@ pub(crate) fn request_latency_windows() -> Value {
     request_latency().lock().unwrap().windows(Instant::now())
 }
 
-tokio::task_local! {
-    /// Set while a request is handled; a read relayed from another machine's owner marks it.
-    static SERVED_REMOTE: Arc<std::sync::atomic::AtomicBool>;
-}
-
-/// Run a request's handler with its remote-read flag in scope. The flag follows the handler's
-/// own task. A relay awaited inside a `tokio::spawn` would lose it, so such a spawn must pass
-/// its own flag, as the collections socket does for the conversation follower.
-pub(crate) async fn track_remote_reads<F: Future>(
-    flag: Arc<std::sync::atomic::AtomicBool>,
-    handler: F,
-) -> F::Output {
-    SERVED_REMOTE.scope(flag, handler).await
-}
-
-/// The request being handled read from another machine, so its target is the remote one.
-pub(crate) fn note_remote_read() {
-    let _ = SERVED_REMOTE.try_with(|remote| remote.store(true, std::sync::atomic::Ordering::Relaxed));
-}
+pub(crate) use crate::peer::track_remote_reads;
 
 /// A query that asks the daemon to wait for a change makes the request a long poll.
 fn asks_to_wait(query: &str) -> bool {
@@ -1554,43 +1543,13 @@ fn record_request_latency(
     eprintln!("st3: slow request {path} took {} ms", elapsed.as_millis());
 }
 
-pub(crate) fn new_request_id() -> String {
-    let mut bytes = [0_u8; 16];
-    if getrandom::fill(&mut bytes).is_err() {
-        let fallback = format!(
-            "{}:{}:{:?}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-            std::thread::current().id()
-        );
-        bytes.copy_from_slice(&Sha256::digest(fallback.as_bytes())[..16]);
-    }
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes")),
-        u16::from_be_bytes(bytes[4..6].try_into().expect("two bytes")),
-        u16::from_be_bytes(bytes[6..8].try_into().expect("two bytes")),
-        u16::from_be_bytes(bytes[8..10].try_into().expect("two bytes")),
-        u64::from_be_bytes([
-            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ])
-    )
-}
+pub(crate) use crate::model::new_request_id;
 
 fn client_now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-pub(crate) fn client_timestamp(unix_ms: u128) -> String {
-    let unix_ms = i64::try_from(unix_ms).unwrap_or(i64::MAX);
-    chrono::DateTime::from_timestamp_millis(unix_ms)
-        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn client_snapshot_time(snapshot: &ClientSnapshot) -> u128 {
@@ -2424,15 +2383,6 @@ fn client_work_item(
     Ok(client_work_values(store, vec![work], &desired, snapshot_index)?.pop())
 }
 
-/// Translate internal step states once for every client projection.
-pub(crate) fn client_work_state(status: &str) -> &str {
-    match status {
-        "pending" => "waiting",
-        "working" => "claimed",
-        other => other,
-    }
-}
-
 /// Client resources for `work`, with the usage of the seats in `desired` that its steps own.
 fn client_work_values(
     store: &Store,
@@ -3067,54 +3017,6 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
         item["state"] = Value::String("waiting".into());
     }
     item["delivery"] = assessment.to_value();
-}
-
-pub(crate) const AGENT_QUEUE_FIELDS: [&str; 8] = [
-    "current_work_ids", "active_work_count", "next_work_id", "upcoming_work_ids",
-    "queued_work_count", "current_work", "next_work", "upcoming_work",
-];
-
-fn agent_queue_fields(
-    queue: &crate::store::AgentWorkQueue,
-    labels: &BTreeMap<String, crate::store::StepLabel>,
-) -> Value {
-    let label = |id: &String| labels.get(id).map(|step| json!({
-        "id": id, "mission_id": step.mission, "mission_run_id": step.run,
-        "path": step.path, "title": step.title, "goal": step.goal,
-        "state": client_work_state(&step.status),
-        "since": client_timestamp(step.updated_at_unix_ms),
-    }));
-    json!({
-        "current_work_ids": queue.current_work_ids,
-        "active_work_count": queue.active_work_count,
-        "next_work_id": queue.next_work_id,
-        "upcoming_work_ids": queue.upcoming_work_ids,
-        "queued_work_count": queue.queued_work_count,
-        "current_work": queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-        "next_work": queue.next_work_id.as_ref().and_then(label),
-        "upcoming_work": queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-    })
-}
-
-/// Refresh queue selection and presentation once, without folding any agent cards.
-pub(crate) fn agent_queue_metadata(
-    store: &Store,
-    subjects: &BTreeSet<String>,
-) -> anyhow::Result<Vec<Value>> {
-    crate::otel::roster_phase("queue_selection", || -> anyhow::Result<Vec<Value>> {
-        let queues = store.agent_work_queues()?;
-        let steps = queues.values().flat_map(|queue| {
-            queue.current_work_ids.iter().chain(queue.next_work_id.iter())
-                .chain(queue.upcoming_work_ids.iter()).cloned()
-        }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-        let labels = store.step_labels(&steps)?;
-        let empty = crate::store::AgentWorkQueue::default();
-        Ok(subjects.iter().map(|subject| {
-            let mut fields = agent_queue_fields(queues.get(subject).unwrap_or(&empty), &labels);
-            fields["id"] = json!(subject);
-            fields
-        }).collect())
-    })
 }
 
 #[cfg(test)]
@@ -3877,29 +3779,6 @@ fn snapshot_time_ms(timestamp: &str) -> u128 {
         .unwrap_or_default()
 }
 
-pub(crate) fn client_attention_actions(
-    kind: &str,
-    review_mode: Option<&str>,
-) -> Vec<&'static str> {
-    if kind.starts_with("custom.") {
-        return vec!["custom.reply"];
-    }
-    match kind {
-        "human-gate" if review_mode == Some("feedback") => {
-            vec!["review.approve", "review.request-changes"]
-        }
-        "human-gate" => vec!["review.approve", "review.reject"],
-        "launch-approval" => vec!["launch.approve", "launch.cancel"],
-        "revision-approval" => {
-            vec!["mission.approve-revision", "mission.cancel-revision"]
-        }
-        "unread-message" => vec!["message.read"],
-        "person-step" => vec!["work.done"],
-        "fault" | "agent-request" => Vec::new(),
-        _ => Vec::new(),
-    }
-}
-
 /// Describe the current source targets beside a failure.
 fn insert_attention_target_states(
     store: &Store,
@@ -3921,20 +3800,6 @@ fn insert_attention_target_states(
         resource.insert("target_states".into(), Value::Array(states));
     }
     Ok(())
-}
-
-/// An attention card's ID: its source, recipient and waiting episode. A source asked again
-/// (a human gate's new request, a person step's new episode) gets a new card.
-pub(crate) fn client_attention_id(
-    subject: &str,
-    person: &str,
-    episode: &str,
-) -> anyhow::Result<String> {
-    let identity = serde_json::to_vec(&(subject, person, episode))?;
-    Ok(format!(
-        "attention/{}",
-        &hex::encode(Sha256::digest(identity))[..32]
-    ))
 }
 
 fn client_attention_resources(
@@ -7900,11 +7765,7 @@ async fn replication_worker_status(
     Json(json!({ "recorded": true, "changed": false }))
 }
 
-#[derive(Deserialize, Serialize)]
-pub struct FleetEndpointsRequest {
-    pub mode: String,
-    pub endpoints: Vec<Value>,
-}
+pub use crate::model::FleetEndpointsRequest;
 
 /// The peers a node reports on: its config peers and the current listening members it dials.
 /// A dial-out member is never dialed, and an ended name is history, so neither is reported.

@@ -36,8 +36,33 @@ _CFG_TEST = re.compile(
 
 
 def strip_comments(source):
-    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
-    return re.sub(r"//[^\n]*", "", source)
+    """Remove line and (nested) block comments, leaving string and char literals intact."""
+    out, cursor, start = [], 0, 0
+    while cursor < len(source):
+        skipped = _skip_literal(source, cursor)
+        if skipped != cursor:
+            cursor = skipped
+            continue
+        if source.startswith("//", cursor):
+            out.append(source[start:cursor])
+            end = source.find("\n", cursor)
+            cursor = start = len(source) if end < 0 else end
+            continue
+        if source.startswith("/*", cursor):
+            out.append(source[start:cursor])
+            depth, cursor = 1, cursor + 2
+            while cursor < len(source) and depth:
+                if source.startswith("/*", cursor):
+                    depth, cursor = depth + 1, cursor + 2
+                elif source.startswith("*/", cursor):
+                    depth, cursor = depth - 1, cursor + 2
+                else:
+                    cursor += 1
+            start = cursor
+            continue
+        cursor += 1
+    out.append(source[start:])
+    return "".join(out)
 
 
 def drop_cfg_test(source):
@@ -55,6 +80,10 @@ def drop_cfg_test(source):
             continue
         depth, cursor = 0, position
         while cursor < len(source):
+            skipped = _skip_literal(source, cursor)
+            if skipped != cursor:
+                cursor = skipped
+                continue
             if source[cursor] == "{":
                 depth += 1
             elif source[cursor] == "}":
@@ -63,6 +92,34 @@ def drop_cfg_test(source):
                     break
             cursor += 1
         index = cursor + 1
+
+
+_RAW_STRING = re.compile(r'b?r(#*)"')
+_CHAR = re.compile(r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|.)|[^\\'\n])'")
+
+
+def _skip_literal(source, cursor):
+    """The index after a string, raw string or char literal starting at `cursor`, else `cursor`.
+    Braces inside literals (KDL and JSON in test fixtures) must not close the item being skipped."""
+    raw = _RAW_STRING.match(source, cursor)
+    if raw and (cursor == 0 or not (source[cursor - 1].isalnum() or source[cursor - 1] == "_")):
+        end = source.find('"' + raw.group(1), raw.end())
+        return len(source) if end < 0 else end + 1 + len(raw.group(1))
+    char = source[cursor]
+    if char == '"' or (char == "b" and source[cursor + 1:cursor + 2] == '"'):
+        index = cursor + (2 if char == "b" else 1)
+        while index < len(source):
+            if source[index] == "\\":
+                index += 2
+                continue
+            if source[index] == '"':
+                return index + 1
+            index += 1
+        return len(source)
+    literal = _CHAR.match(source, cursor)
+    if literal and (cursor == 0 or not (source[cursor - 1].isalnum() or source[cursor - 1] == "_")):
+        return literal.end()
+    return cursor
 
 
 def path_targets(source):

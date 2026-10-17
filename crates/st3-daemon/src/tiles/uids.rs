@@ -19,7 +19,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 
-use super::registry::{Registry, UidRange};
+use crate::tile_registry::{Registry, UidRange};
 
 /// Holds the state root's lock: one launcher allocates or releases at a time.
 struct Lock(#[allow(dead_code)] fs::File);
@@ -50,7 +50,7 @@ fn reload(registry: &Registry) -> Result<Registry> {
     let path = registry.uids_file();
     let text = match fs::read_to_string(&path) {
         Ok(text) => {
-            super::registry::root_controlled(&path)?;
+            crate::tile_registry::root_controlled(&path)?;
             text
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),

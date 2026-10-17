@@ -74,6 +74,21 @@ class ModuleLayers(unittest.TestCase):
         modules, edges = ml.production_graph(str(self.root))
         self.assertEqual(edges["c"], {"b": 1})
 
+    def test_braces_in_literals_do_not_end_test_code(self):
+        fixture = 'r#"mission "m" { step "s" }}"#'
+        self.write("crates/st3/src/c.rs", "pub fn h() {}\n#[cfg(test)]\nmod tests {\n"
+                   f"    const KDL: &str = {fixture};\n    const C: char = '}}';\n"
+                   "    const S: &str = \"}} \\\" }}\";\n"
+                   "    #[test] fn t() { crate::a::g() }\n}\n")
+        modules, edges = ml.production_graph(str(self.root))
+        self.assertEqual(edges["c"], {})
+
+    def test_comment_markers_in_literals_are_not_comments(self):
+        self.write("crates/st3/src/c.rs", "pub fn h() { let _ = \"http://x\"; crate::b::f() }\n"
+                   "/* outer /* nested */ crate::a::g() */\n")
+        modules, edges = ml.production_graph(str(self.root))
+        self.assertEqual(edges["c"], {"b": 1})
+
     def test_reexports_count_toward_their_module(self):
         self.write("crates/st3/src/c.rs", "use crate::parse_intent;\npub fn h() {}\n")
         self.write("crates/st3-daemon/src/graph.rs", "pub fn parse_intent() {}\n")

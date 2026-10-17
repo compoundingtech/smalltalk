@@ -18,6 +18,83 @@ pub use smallclaims::replication::{
 
 pub const MAX_EVAL_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 
+/// The diagnostic code of a call Claude's auto mode classifier denied.
+pub const PERMISSION_DENIED_CODE: &str = "permission-denied";
+pub const PLACEMENT_SOURCE_OFFLINE_KIND: &str = "agent.placement.source-offline";
+/// The former owners and declarations which can acknowledge their latest departure.
+/// Walk causal predecessors, never receiver-local indexes or receipt timestamps.
+pub struct PlacementFence {
+    pub token: String,
+    pub destination: String,
+    pub sources: BTreeMap<String, BTreeSet<String>>,
+}
+
+pub fn canonical_child_string(value: &Value, name: &str) -> Option<String> {
+    value
+        .get("children")?
+        .as_array()?
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some(name))?
+        .get("arguments")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+pub fn new_request_id() -> String {
+    let mut bytes = [0_u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        let fallback = format!(
+            "{}:{}:{:?}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            std::thread::current().id()
+        );
+        bytes.copy_from_slice(&<sha2::Sha256 as sha2::Digest>::digest(fallback.as_bytes())[..16]);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes")),
+        u16::from_be_bytes(bytes[4..6].try_into().expect("two bytes")),
+        u16::from_be_bytes(bytes[6..8].try_into().expect("two bytes")),
+        u16::from_be_bytes(bytes[8..10].try_into().expect("two bytes")),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    )
+}
+
+/// `person/ada` → `ada`, when the name is a valid word (`sekrets`, `tile_registry`).
+pub fn person_name(person: &str) -> Option<&str> {
+    person
+        .strip_prefix("person/")
+        .filter(|name| valid_word(name))
+}
+
+/// A sekrets or tile name: lowercase letters, digits, `-`, `_` and `.`, 64 bytes at most, not
+/// starting with `.` or `-`.
+pub fn valid_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 64
+        && !word.starts_with(['.', '-'])
+        && word.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+        })
+}
+
+/// The fault scope of the scheduler's first-readiness fault (`reconcile`).
+pub const FIRST_READINESS_FAULT_SCOPE: &str = "scheduler/first-readiness";
+
+/// The endpoints a replication worker publishes for its member (`api`, `peer`).
+#[derive(Deserialize, Serialize)]
+pub struct FleetEndpointsRequest {
+    pub mode: String,
+    pub endpoints: Vec<Value>,
+}
+
 /// The error code of a send or reply addressed to a person.
 pub const PERSON_HAS_NO_INBOX_CODE: &str = "person-has-no-inbox";
 

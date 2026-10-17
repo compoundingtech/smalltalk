@@ -131,7 +131,7 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
             context,
         );
         servers.push(tokio::spawn(async move {
-            axum::serve(listener, peer_router(state, smalltalk_routes()))
+            axum::serve(listener, peer_router(state, smalltalk_routes(crate::api::raw_terminal_owner_splice)))
                 .await
                 .unwrap()
         }));

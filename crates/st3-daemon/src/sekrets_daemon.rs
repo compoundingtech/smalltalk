@@ -8,8 +8,8 @@ use std::sync::OnceLock;
 
 use rusqlite::OptionalExtension as _;
 
-use super::identity::{self, STATEMENT_VERSION, Statement};
-use super::protocol::Attestation;
+use crate::sekrets::identity::{self, STATEMENT_VERSION, Statement};
+use crate::sekrets::protocol::Attestation;
 use crate::model::St3Error;
 use crate::store::Store;
 
@@ -159,7 +159,7 @@ pub fn attest(
         pid: pid_i32,
         pid_start,
         nonce: nonce.to_owned(),
-        issued_at_unix_ms: super::store::now_unix_ms(),
+        issued_at_unix_ms: crate::sekrets::store::now_unix_ms(),
     };
     let text = serde_json::to_string(&statement)
         .map_err(|error| St3Error::new("internal", error.to_string()))?;
@@ -189,7 +189,7 @@ impl Store {
 pub fn claim_for(
     node: &str,
     person: &str,
-    entry: &super::store::LogEntry,
+    entry: &crate::sekrets::store::LogEntry,
 ) -> Option<smallclaims::ClaimInput> {
     use serde_json::{Value, json};
     if entry.caller_person.as_deref() != Some(person) {
@@ -302,14 +302,14 @@ fn import_until_error(
     cursor_path: &Path,
     cursor: &mut i64,
 ) -> anyhow::Result<()> {
-    let connection = super::client::Connection::open(socket)?;
+    let connection = crate::sekrets::client::Connection::open(socket)?;
     loop {
-        let value = connection.manage(&super::protocol::Request::Log {
+        let value = connection.manage(&crate::sekrets::protocol::Request::Log {
             after: *cursor,
             limit: 200,
             wait_ms: 55_000,
         })?;
-        let entries: Vec<super::store::LogEntry> = serde_json::from_value(value)?;
+        let entries: Vec<crate::sekrets::store::LogEntry> = serde_json::from_value(value)?;
         let Some(_) = entries.last() else {
             continue;
         };
@@ -322,7 +322,7 @@ fn import_until_error(
 // Advance a gateway page only after all retryable storage failures are excluded. Entries
 // before a failed append can be replayed safely using their existing idempotency keys.
 fn import_entries(
-    entries: &[super::store::LogEntry],
+    entries: &[crate::sekrets::store::LogEntry],
     node: &str,
     person: &str,
     cursor_path: &Path,
