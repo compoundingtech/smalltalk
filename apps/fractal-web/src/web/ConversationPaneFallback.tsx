@@ -18,7 +18,7 @@ export const ConversationPaneFallback = ({ agentName, visible = true }: {
   <div aria-label="Transcript" {...stylex.props(styles.frame)}>
     <header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{agentName}</strong></header>
     <ErrorOverlayHost lane>
-      <EmbraceScrollViewport items={noItems} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
+      <EmbraceScrollViewport items={noItems} data-testid="transcript-scroll" role="group" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
         {/* TODO(kit): replace with the exported TranscriptSkeleton */}
         <div data-testid="transcript-placeholder" aria-label="Loading conversation" {...stylex.props(styles.placeholder)}>
           <p role="status">Loading conversation…</p>

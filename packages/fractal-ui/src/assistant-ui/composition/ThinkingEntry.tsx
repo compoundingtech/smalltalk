@@ -4,11 +4,23 @@ import { Button as AriaButton } from 'react-aria-components'
 import { accentVars as accent, textVars as text, borderVars as border, surfaceVars as surface, spaceVars as s, geometryVars as g, typeVars as t, radiusVars as r, motionVars as m } from '../composition-tokens.stylex'
 import { Markdown } from './Markdown'
 import { Icon } from './Icons'
+import type { ReasoningItem } from '../embrace-data/model'
 
 const reasoningType = stylex.createTheme(t, { bodySize: t.codeSize, bodyLeading: t.uiLeading })
 
 /** Muted reasoning as a work row: glyph slot, label, and the shared pinned disclosure; the opened body starts on the text column. */
 export function ThinkingEntry({ text: value, streaming = false }: { text: string; streaming?: boolean }) {
+  return <ThinkingDisclosure streaming={streaming}><Markdown text={value} streaming={streaming} tone="muted" /></ThinkingDisclosure>
+}
+
+/** One disclosure for a turn's reasoning; source ids and individual Markdown boundaries remain intact. */
+export function ThinkingRun({ items }: { readonly items: readonly ReasoningItem[] }) {
+  return <ThinkingDisclosure streaming={items.some(item => item.streaming)}>
+    {items.map(item => <div key={item.id} data-conversation-entry-id={item.id}><Markdown text={item.text} streaming={item.streaming} tone="muted" /></div>)}
+  </ThinkingDisclosure>
+}
+
+function ThinkingDisclosure({ children, streaming }: { readonly children: React.ReactNode; readonly streaming: boolean }) {
   const [open, setOpen] = React.useState(false)
   const contentId = React.useId()
   return <div data-testid="thinking-entry" data-streaming={streaming} {...stylex.props(styles.thinking)}>
@@ -19,7 +31,7 @@ export function ThinkingEntry({ text: value, streaming = false }: { text: string
       <span aria-hidden="true" data-row-disclosure={open ? 'open' : 'closed'} {...stylex.props(styles.slot, styles.disclosure)}><span {...stylex.props(styles.chevron, open && styles.disclosureOpen)}><Icon name="chevron-right" size={12} /></span></span>
       <span data-call-duration />
     </AriaButton>
-    {open ? <div id={contentId} data-testid="thinking-body" {...stylex.props(styles.body, reasoningType)}><Markdown text={value} streaming={streaming} tone="muted" /></div> : null}
+    {open ? <div id={contentId} data-testid="thinking-body" {...stylex.props(styles.body, reasoningType)}>{children}</div> : null}
   </div>
 }
 

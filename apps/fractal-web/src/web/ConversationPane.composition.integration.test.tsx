@@ -6,6 +6,7 @@
  * rendered transcript reproduces the Storybook-reference structure on real components.
  */
 import * as React from 'react'
+import { useAui } from '@assistant-ui/react'
 import { createRoot, type Root } from 'react-dom/client'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -32,6 +33,8 @@ const source = vi.hoisted(() => ({
   transcriptTurns: [] as (readonly TranscriptTurn[])[],
   scrollToBottomKeys: [] as (string | undefined)[],
   composerProps: [] as React.ComponentProps<typeof Kit.EmbraceComposer>[],
+  setDraft: undefined as ((text: string) => void) | undefined,
+  sendable: false,
   agentControls: undefined as { readonly control: () => Promise<never>; readonly interrupt: (agent: string) => Promise<{ readonly _tag: 'Sent' } | { readonly _tag: 'Refused'; readonly detail: string }> } | undefined,
 }))
 
@@ -42,10 +45,11 @@ vi.mock('../data/react.tsx', async () => {
   return ({
   useConversation: () => source.feed,
   useConversationSync: () => source.sync,
-  useDataSource: () => ({ agents, conversationInterest: undefined, agentControls: source.agentControls }),
+  // A sendable view exposes attachments; the composer stays disabled otherwise.
+  useDataSource: () => ({ agents, conversationInterest: undefined, agentControls: source.agentControls, ...(source.sendable ? { attachments: {} } : {}) }),
   useFeedInterest: () => {},
   useNow: () => source.now,
-  useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted' }),
+  useGrants: () => ({ actions: 'ungranted', messageSend: source.sendable ? 'granted' : 'ungranted', terminalInput: 'ungranted' }),
   useAttention: () => ({ _tag: 'Waiting' }),
   })
 })
@@ -53,11 +57,16 @@ vi.mock('../data/react.tsx', async () => {
 // Tap the input seams but keep the real kit/runtime rendering and effects.
 vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx', async importOriginal => {
   const kit = await importOriginal<typeof KitRuntime>()
+  const DraftProbe = () => {
+    const aui = useAui()
+    source.setDraft = text => aui.composer().setText(text)
+    return null
+  }
   return {
     ...kit,
     EmbraceRuntimeProvider: (props: React.ComponentProps<typeof Kit.EmbraceRuntimeProvider>) => {
       source.runtimeItems.push(props.options.messages ?? [])
-      return <kit.EmbraceRuntimeProvider {...props} />
+      return <kit.EmbraceRuntimeProvider {...props}><DraftProbe />{props.children}</kit.EmbraceRuntimeProvider>
     },
   }
 })
@@ -85,6 +94,10 @@ vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx', 
 
 import { ConversationPane } from './ConversationPane.tsx'
 import { WorkspaceBody } from './LiveAgentWorkspace.tsx'
+import { EmbraceRuntimeProvider } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx'
+import { Transcript } from '../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx'
+import { workLogTurnFromItems } from '../../../../packages/fractal-ui/src/assistant-ui/taste/work-log.ts'
+import type { ConversationItem as KitItem, TextItem as KitText } from '../../../../packages/fractal-ui/src/assistant-ui/embrace-data/model.ts'
 
 const at = (seconds: number) => `2026-10-08T12:00:${String(seconds).padStart(2, '0').slice(-2)}.000Z`
 /** The recorded scenario page: every item kind the gate replays, in delivery order. */
@@ -106,6 +119,7 @@ beforeEach(() => {
   source.transcriptTurns = []
   source.scrollToBottomKeys = []
   source.composerProps = []
+  source.sendable = false
   source.agentControls = undefined
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
   // jsdom has no layout observers; the kit instantiates one while attaching scroll.
@@ -139,6 +153,62 @@ const mount = async (ux?: UxTelemetry) => {
 const text = () => container.textContent ?? ''
 
 describe('ConversationPane composition activation', () => {
+  it('waits for actual source adoption without painting stranded rows or replacing the composer', async () => {
+    source.feed = { _tag: 'Waiting' }
+    // Focus and caret retention need an enabled composer once the conversation loads.
+    source.sendable = true
+    source.sync = { status: { _tag: 'Requested', since: 990 }, observedAt: 990 }
+    await mount()
+    expect(container.querySelector('[data-testid="transcript-placeholder"]')?.textContent).toBe('')
+    const strandedPaints: Element[] = []
+    const observer = new MutationObserver(records => {
+      for (const record of records) for (const node of record.addedNodes) if (node instanceof Element) {
+        if (node.matches('[data-testid="transcript-stranded"]')) strandedPaints.push(node)
+        strandedPaints.push(...node.querySelectorAll('[data-testid="transcript-stranded"]'))
+      }
+    })
+    observer.observe(container, { childList: true, subtree: true })
+    const loadingInput = container.querySelector('textarea')
+    await act(async () => { source.setDraft!('Retain this unsent draft') })
+    loadingInput!.setSelectionRange(7, 11)
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: true, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 1000 }, observedAt: 1000 }
+    try { await mount() } finally { observer.disconnect() }
+    expect(strandedPaints).toHaveLength(0)
+    const readyInput = container.querySelector('textarea')
+    expect(readyInput).toBe(loadingInput)
+    expect(readyInput?.value).toBe('Retain this unsent draft')
+    expect(readyInput?.selectionStart).toBe(7)
+    expect(readyInput?.selectionEnd).toBe(11)
+    expect(container.querySelector('[data-testid="transcript-placeholder"]')).toBeNull()
+    expect(container.querySelector('[data-testid="history-boundary"]')).not.toBeNull()
+    readyInput?.focus()
+    source.feed = { ...source.feed, value: { ...source.feed.value, items: [...scenario] } }
+    await mount()
+    expect(container.querySelector('textarea')).toBe(readyInput)
+    expect(document.activeElement).toBe(readyInput)
+    expect(readyInput?.selectionStart).toBe(7)
+    expect(readyInput?.selectionEnd).toBe(11)
+  })
+
+  it.each([false, true])('groups all eleven reasoning entries of a work log into one disclosure (tool between=%s)', async separated => {
+    const reasoning: ConversationItem[] = Array.from({ length: 11 }, (_, index) => ({
+      _tag: 'Reasoning', id: `thought-${index}`, text: `Thought number ${index + 1}.`, streaming: false, at: at(index + 1),
+    }))
+    const items = separated ? [...reasoning.slice(0, 5), scenario[1]!, ...reasoning.slice(5)] : reasoning
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, ...items, scenario[3]!], hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!.click() })
+    const disclosures = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="thinking-entry"] button')]
+    expect(disclosures).toHaveLength(1)
+    expect(disclosures.every(button => button.getAttribute('aria-expanded') === 'false')).toBe(true)
+    expect(text()).not.toContain('Thought number 1.')
+    for (const button of disclosures) await act(async () => { button.click() })
+    expect([...container.querySelectorAll('[data-testid="thinking-entry"] [data-conversation-entry-id]')].map(element => element.textContent))
+      .toEqual(reasoning.map(item => item._tag === 'Reasoning' ? item.text : ''))
+  })
+
   it('insets the composer dock so its focus outline stays inside the viewport', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()
@@ -751,5 +821,59 @@ describe('ConversationPane composition activation', () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, { _tag: 'Status', id: 'run', status: 'running', at: at(2) }], hasOlder: false, observation: { empty: false } } }
     await mount()
     expect(container.querySelector('[data-testid="run-stop"]')).toBeNull()
+  })
+})
+
+describe('Transcript under a host that filters adapter entries', () => {
+  // The kit StrandedItem story's shape: the host keeps every entry in its turns but withholds some
+  // from the runtime adapter, so those ids are never adopted and must render their fallback.
+  const at0 = '2026-10-08T12:00:00.000Z'
+  const entry = (id: string, role: 'user' | 'assistant', body: string): KitText => ({ _tag: 'Text', id, role, text: body, attachments: [], streaming: false, at: at0 })
+  const prompt = { ...entry('stranded/prompt', 'user', 'Summarize the retained rows.'), role: 'user' as const }
+  const items: readonly KitItem[] = [entry('stranded/lost-answer', 'assistant', 'This answer never reached the runtime.'), { _tag: 'UnknownEvent', id: 'stranded/lost-event', eventType: 'opaque', data: {}, at: at0 }, entry('stranded/answer', 'assistant', 'A later answer stays in order.')]
+  const appended: readonly KitItem[] = [{ _tag: 'Notice', id: 'stranded/lost-notice', kind: 'event', text: 'An appended entry the runtime drops.', at: at0 }, entry('stranded/late-answer', 'assistant', 'The appended answer follows it.')]
+  const secondPrompt = { ...entry('stranded/lost-prompt', 'user', 'A prompt the runtime never adopted.'), role: 'user' as const }
+  const secondItems: readonly KitItem[] = [entry('stranded/second-answer', 'assistant', 'Its answer still renders after it.')]
+  const drop = new Set(['stranded/lost-answer', 'stranded/lost-event', 'stranded/lost-notice', 'stranded/lost-prompt'])
+  const settled = (turnItems: readonly KitItem[]) => workLogTurnFromItems(turnItems, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true })
+  const turnsFor = (withAppended: boolean): readonly TranscriptTurn[] => {
+    const firstItems = withAppended ? [...items, ...appended] : items
+    return [
+      { id: 'stranded', prompt, items: firstItems, work: settled(firstItems) },
+      { id: 'stranded-second', prompt: secondPrompt, items: secondItems, work: settled(secondItems) },
+    ]
+  }
+  const render = async (turns: readonly TranscriptTurn[]) => {
+    const messages = turns.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt]), ...turn.items]).filter(item => !drop.has(item.id))
+    await act(async () => {
+      root!.render(<EmbraceRuntimeProvider options={{ messages, isRunning: false, onNew: async () => {} }}>
+        <Transcript title="Row projection" turns={turns} sync={{ _tag: 'Live', since: 1000 }} now={1000} observedAt={1000} />
+      </EmbraceRuntimeProvider>)
+    })
+    // The external store publishes adopted messages a task after adoption.
+    await act(async () => { await Promise.resolve() })
+  }
+  const order = (turn: Element) => Array.from(turn.querySelectorAll('[data-item-id]'), element => element.getAttribute('data-item-id'))
+  const strandedIds = () => Array.from(container.querySelectorAll('[data-testid="transcript-stranded"]'), element => element.getAttribute('data-item-id'))
+
+  it('shows dropped entries as fallbacks, keeps later valid answers, and keeps a turn whose prompt was dropped', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await render(turnsFor(false))
+      expect(strandedIds()).toEqual(['stranded/lost-answer', 'stranded/lost-event', 'stranded/lost-prompt'])
+      const [first, second] = container.querySelectorAll('[data-testid="transcript-turn"]')
+      expect(order(first!)).toEqual(['stranded/prompt', 'stranded/lost-answer', 'stranded/lost-event', 'stranded/answer'])
+      expect(order(second!)).toEqual(['stranded/lost-prompt', 'stranded/second-answer'])
+      expect(text()).toContain('A later answer stays in order.')
+      expect(text()).toContain('Its answer still renders after it.')
+      await render(turnsFor(true))
+      expect(strandedIds()).toEqual(['stranded/lost-answer', 'stranded/lost-event', 'stranded/lost-notice', 'stranded/lost-prompt'])
+      const turns = container.querySelectorAll('[data-testid="transcript-turn"]')
+      expect(turns).toHaveLength(2)
+      expect(turns[0]).toBe(first)
+      expect(turns[1]).toBe(second)
+      expect(order(first!)).toEqual(['stranded/prompt', 'stranded/lost-answer', 'stranded/lost-event', 'stranded/answer', 'stranded/lost-notice', 'stranded/late-answer'])
+      expect(text()).toContain('The appended answer follows it.')
+    } finally { warn.mockRestore() }
   })
 })

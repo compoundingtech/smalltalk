@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Registers transcript reasoning and loading improvements in the public web changelog.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild; this follow-up only registers a changelog entry for existing UI behavior."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No persisted schema or runtime data changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No additional API, protocol or extension compatibility change; the original transcript release note remains unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No downtime for this changelog registration."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No additional manual step for this changelog registration."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional recovery action."
+  }
+}
