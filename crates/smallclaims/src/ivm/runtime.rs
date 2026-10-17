@@ -13,7 +13,8 @@ use crate::{
     store::{
         ReplicatedClaimAdmission, Runtime, Store, append_claim_record_tx,
         checkpoint::{DropPlan, SealedSet},
-        claim_from_row, current_index_tx,
+        checkpointed_operation_outcome, claim_from_row, claim_operation, current_index_tx,
+        operation_tx, register_operation_tx,
         runtime::{IncrementalProjection, LegacyDigestTable},
     },
 };
@@ -183,22 +184,56 @@ impl Runtime for ViewRuntime {
         store: &Store,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), Error> {
-        let body = json!({ "fields": input.fields, "evidence": input.evidence });
+        let operation = claim_operation(input)?;
+        let mut body = json!({ "fields": input.fields, "evidence": input.evidence });
+        if let Some((operation_id, request_digest)) = &operation {
+            body["_operation"] = json!({ "id": operation_id, "request_digest": request_digest });
+        }
         store
             .connection
             .batched(|transaction| {
-                self.append_claim_tx(
-                    transaction,
-                    &store.origin,
-                    &input.subject,
-                    &input.kind,
-                    input.actor.as_deref(),
-                    &body,
-                    &[],
-                    None,
-                )
-                .map(|claim| (claim, true))
-                .map_err(crate::error::typed)
+                if let Some((operation_id, request_digest)) = &operation {
+                    if let Some((stored_digest, canonical_claim, state)) =
+                        operation_tx(transaction, operation_id).map_err(crate::error::internal)?
+                    {
+                        if state == "conflict" {
+                            return Err(Error::new(
+                                "idempotency-conflict",
+                                "the replicated operation has conflicting requests",
+                            )
+                            .with_detail("operation_id", operation_id.clone()));
+                        }
+                        if stored_digest != *request_digest {
+                            return Err(Error::new(
+                                "idempotency-mismatch",
+                                "the idempotency key already identifies a different request",
+                            )
+                            .with_detail("operation_id", operation_id.clone())
+                            .with_detail("stored_digest", stored_digest)
+                            .with_detail("request_digest", request_digest.clone()));
+                        }
+                        return record(transaction, &canonical_claim)
+                            .map(|claim| (claim, false))
+                            .map_err(crate::error::typed);
+                    }
+                    checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
+                }
+                let claim = self
+                    .append_claim_tx(
+                        transaction,
+                        &store.origin,
+                        &input.subject,
+                        &input.kind,
+                        input.actor.as_deref(),
+                        &body,
+                        &[],
+                        None,
+                    )
+                    .map_err(crate::error::typed)?;
+                if operation.is_some() {
+                    register_operation_tx(transaction, &claim).map_err(crate::error::internal)?;
+                }
+                Ok((claim, true))
             })
             .map_err(|error| Error::new("internal", error))?
     }

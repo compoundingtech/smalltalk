@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Honor claim idempotency keys in the smallclaims ViewRuntime reference runtime",
+  "replay": {"status": "none", "detail": "No replay or backfill. Claims previously written without operation metadata remain unchanged."},
+  "schema": {"status": "none", "detail": "Uses the existing operations table and claim operation metadata; no schema changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes."},
+  "compatibility": {"status": "changed", "detail": "ViewRuntime now returns the original claim for a repeated keyed request, rejects a changed request with idempotency-mismatch, and validates keys using the shared claim-operation helper. Keyless writes retain their existing behavior. Old builds still ignore these keys; use the fixed runtime for keyed writes."},
+  "downtime": {"status": "none", "detail": "No additional interruption or recovery work is introduced."},
+  "manual": {"status": "none", "detail": "No migration or configuration steps. Existing duplicates are not removed and old claims without operation metadata do not acquire idempotency keys."},
+  "recovery": {"status": "changed", "detail": "New operation metadata uses the existing storage format. Reverting to an older ViewRuntime restores its behavior of ignoring idempotency keys and can append duplicates; retain the fixed runtime when relying on keyed writes."}
+}
