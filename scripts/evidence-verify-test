@@ -4,6 +4,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import re
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -894,7 +895,10 @@ class CommittedPolicy(unittest.TestCase):
 
     def test_declared_inputs_are_exactly_the_reviewed_list_and_all_exist(self):
         # Written out here: changing what a check depends on is a reviewed change to the policy AND to this list.
-        declared = {'typescript-client': sorted([
+        declared = {'linux-gate': sorted([
+            '.cargo', '.config/nextest.toml', '.github', 'Cargo.lock', 'Cargo.toml', 'claude-channel', 'clients', 'components', 'crates',
+            'docs/st2', 'docs/st3', 'docs/vrs', 'evals', 'examples', 'fixtures', 'flake.lock', 'flake.nix', 'nix', 'plugins', 'scripts',
+            'slo', 'src', 'templates', 'tests', 'vendor', 'wit']), 'typescript-client': sorted([
             'apps/fractal-web/package.json', 'apps/fractal-web/packages/st3-sdk/package.json', 'apps/ios',
             'clients/typescript', 'crates/stui/tests/fixtures/quality-hour.json', 'docs/st3/client-v0/fixtures',
             'fixtures/clients', 'flake.lock', 'flake.nix', 'package.json', 'packages/fractal-ui/package.json',
@@ -905,6 +909,28 @@ class CommittedPolicy(unittest.TestCase):
             for path in rules['inputs'] or ():
                 self.assertTrue((ROOT / path).exists(), f'{check} declares {path}, which does not exist')
         self.assertEqual(self.rules('typescript-client')['sample_one_in'], 5)
+        self.assertEqual(self.rules('linux-gate')['sample_one_in'], 5)
+
+    def test_every_compile_time_include_of_the_rust_sources_is_inside_the_declared_inputs_of_linux_gate(self):
+        # The declared list comes from a textual scan, which cannot see paths built at run time but CAN enumerate the
+        # compile-time ones: include_str!/include_bytes!/include! with a literal path. A source file that includes something
+        # outside the declared inputs would let a change to it keep the old key (a stale pass), so this fails instead.
+        declared = [path.rstrip('/') for path in self.rules('linux-gate')['inputs']]
+        pattern = re.compile(r'include(?:_str|_bytes)?!\(\s*"([^"]+)"')
+        outside = []
+        for source in sorted(ROOT.glob('**/*.rs')):
+            parts = source.relative_to(ROOT).parts
+            if 'target' in parts or '.git' in parts or 'node_modules' in parts:
+                continue
+            for literal in pattern.findall(source.read_text(errors='replace')):
+                target = (source.parent / literal).resolve()
+                try:
+                    relative = target.relative_to(ROOT.resolve()).as_posix()
+                except ValueError:
+                    continue  # outside the repository (OUT_DIR, generated files)
+                if not any(relative == path or relative.startswith(path + '/') for path in declared):
+                    outside.append(f'{source.relative_to(ROOT)} includes {relative}')
+        self.assertEqual(outside, [], 'a compile-time include outside the declared linux-gate inputs: declare it or stop including it')
 
     def test_the_host_level_is_admitted_for_exactly_two_checks_wrapper_kind_and_covers_pull_requests_only(self):
         policy = json.loads((ROOT / '.st/evidence-skip-policy.json').read_text())
