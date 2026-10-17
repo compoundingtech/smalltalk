@@ -1985,6 +1985,8 @@ export type ScgReadAuthorizationPayload = {
   request_digest: string;
 };
 
+export type SenderRef = string;
+
 export type Session = ResourceHeader & {
   ended_at?: (Timestamp | null);
   kind: "session";
@@ -2362,7 +2364,7 @@ export type TimelineMessageBody = {
   attachments?: Array<Attachment>;
   blocks?: Array<TimelineBlock>;
   body_bytes?: number;
-  from?: ParticipantRef;
+  from?: SenderRef;
   message_id: string;
   provenance?: MessageProvenance;
   reply_to?: string | null;
