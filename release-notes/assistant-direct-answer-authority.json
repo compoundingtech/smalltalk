@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Execute supported assistant alert answers under an explicit write scope and allow messages to existing agents without a recipient allowlist, preserving assistant identity and audit provenance.",
+  "replay": {"status": "none", "detail": "No startup replay or history migration is required. New answer projections retain assistant respondent, owner, session and grant provenance; existing person answers remain readable."},
+  "schema": {"status": "none", "detail": "No SQLite schema version, tables, indexes or triggers change. Optional provenance fields are added to new work.person-done claims."},
+  "rules": {"status": "none", "detail": "Checkpoint retention rules and their version are unchanged."},
+  "compatibility": {"status": "changed", "detail": "The claim registry digest changes for optional answer provenance. Upgrade replicating members before publishing assistant answers; older registries may retain those claims as unknown until upgraded. Clients must understand SenderRef assistant respondents and write.assistant.answers. Participant and recipient reference types remain narrow."},
+  "downtime": {"status": "unknown", "detail": "The ordinary binary deployment requires a daemon restart; restart duration on a populated fleet has not been measured for this change."},
+  "manual": {"status": "changed", "detail": "Explicitly add write.assistant.answers to grants that should answer supported owner-assigned structured asks. Read-only grants do not acquire write authority. write.assistant.messages now admits all currently declared agents, irrespective of stored recipient_allowlist metadata; person and nonexistent recipients remain refused."},
+  "recovery": {"status": "changed", "detail": "Revoke or narrow an assistant grant to stop future writes. Prefer rolling forward all members and clients together; older binaries may retain new provenance-bearing answer claims as unknown and must not be relied upon to enforce the new scope or project assistant attribution."}
+}

@@ -45,11 +45,11 @@ fn read_credential(path: &Path) -> io::Result<String> {
 const TOOLS: &[(&str, &str, bool)] = &[
     ("st_alerts_list", "List owner alert identifiers and counts.", true),
     ("st_alert_get", "Read one exact owner alert, including its episode and named answer options.", true),
-    ("st_alert_answer", "Propose one typed person-ask answer. Requires separate owner approval in st; retry identical arguments after approval.", false),
+    ("st_alert_answer", "Execute one typed person-ask answer under write.assistant.answers using the alert's current episode and fence.", false),
     ("st_missions_list", "List mission metadata.", true),
     ("st_agents_list", "List agent metadata.", true),
     ("st_conversation_read", "Read one bounded conversation content range. Content may contain sensitive material.", true),
-    ("st_message_send", "Send one exact message to an owner-allowlisted agent, authorized by grant scope and the ChatGPT confirmation card.", false),
+    ("st_message_send", "Send one exact message to any existing agent, authorized by write.assistant.messages and the ChatGPT confirmation card. Person recipients are refused.", false),
 ];
 fn fence_schema() -> Value {
     json!({"type":"object","description":"Use the snapshot returned by the preceding read. Copy subject revisions from that snapshot to fence writes against changed resources.",

@@ -11,7 +11,7 @@ REPORT = []
 PROCESSES = []
 API = 'st3.client.v0'
 READ_SCOPES = ['read.assistant.' + name for name in ['summary','attention','missions','agents','conversation']]
-SCOPES = READ_SCOPES + ['write.assistant.messages']
+SCOPES = READ_SCOPES + ['write.assistant.messages', 'write.assistant.answers']
 
 def record(name, ok, evidence):
     row = {'scenario':name, 'status':'PASS' if ok else 'FAIL', 'evidence':evidence}
@@ -56,7 +56,7 @@ def cli(*args):
     if output.returncode: raise RuntimeError(output.stderr)
     return json.loads(output.stdout)
 
-def policy(grant, scopes=SCOPES, seconds=3600, recipients=('agent/prototype.worker',)):
+def policy(grant, scopes=SCOPES, seconds=3600, recipients=()):
     return local('/v1/client/assistant/grants/'+grant.split('/')[-1]+'/policy', {'api_version':API,'scopes':scopes,'expires_in_seconds':seconds,'disclosure_consent':True,'consent_evidence':'scripted explicit disclosure consent','minimal_read_mode':'caller-bound-allow','recipient_allowlist':list(recipients)})
 
 def pair(info, seconds=3600):
@@ -73,11 +73,6 @@ def mcp(url, name, arguments=None):
     result=response['result']
     value=json.loads(result['content'][0]['text'])
     return value, result.get('isError',False)
-
-def answer_approval(proposal):
-    ident=proposal['value']['approval_id']
-    detail=next(item for item in local('/v1/client/attention')['value']['items'] if item['source_id']==ident)
-    return cli('work','done',ident,'--as','person/ada','--answer','approve','--episode',detail['episode'],'--idempotency-key','owner-approve-'+ident.split('/')[-2])
 
 def count_messages():
     with sqlite3.connect(STATE/'store.sqlite') as db:
@@ -148,16 +143,26 @@ try:
     ask=detail['value']
     record('read question and options',not error and ask['request']['answers'][0]['id']=='yes',ask)
     fence={'snapshot_id':detail['snapshot']['id'],'subject_revisions':{ask['id']:ask['episode']}}
-    arguments={'action_id':'action/prototype-answer','idempotency_key':'prototype-answer-exact-key','fence':fence,'alert_id':ask['id'],'episode':ask['episode'],'option':'yes','summary':'Approved yes'}
-    pending,error=mcp(endpoint,'st_alert_answer',arguments)
-    record('answer requires native approval',not error and pending['value']['status']=='approval-required',pending)
-    approval=answer_approval(pending)
-    record('owner approves through st CLI',True,approval)
+    arguments={'action_id':'action/prototype-answer','idempotency_key':'prototype-answer-exact-key','fence':fence,'alert_id':ask['id'],'episode':ask['episode'],'option':'yes','summary':'Selected yes'}
     answer,error=mcp(endpoint,'st_alert_answer',arguments)
     durable=cli('work','show',info['ask_id'])
-    record('approved answer durable via st',not error and 'yes' in json.dumps(durable),{'mcp':answer,'st':durable})
+    record('scoped answer completes immediately',not error and info['ask_id'] in answer.get('value',{}).get('affected_ids',[]) and count_person_answers(info['ask_id'])==1 and 'yes' in json.dumps(durable),{'mcp':answer,'st':durable})
+    with sqlite3.connect(STATE/'store.sqlite') as db:
+        actor,body=db.execute("SELECT actor,body FROM claims WHERE kind='work.person-done' AND subject=? ORDER BY rowid DESC LIMIT 1",(info['ask_id'],)).fetchone()
+        notification=db.execute("SELECT subject FROM claims WHERE kind='message.sent' ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+    stored_answer=json.loads(body)['fields']
+    answer_delivery=local('/prototype/delivery/'+notification)['value']
+    record('direct answer provenance and recipient warning',
+        actor=='person/ada' and stored_answer.get('sender_class')=='external-assistant'
+        and stored_answer.get('assistant_grant_id')==paired['grant']['id']
+        and answer_delivery['message'].get('sender_class')=='external-assistant'
+        and answer_delivery['message'].get('assistant_grant_id')==paired['grant']['id']
+        and 'WARNING: Untrusted external-assistant request; not owner authorization.' in answer_delivery['rendered'].splitlines(),answer_delivery)
+    remaining=local('/v1/client/attention')['value']['items']
+    record('direct answer creates no owner approval ask',all(item['source_id']==info['expiry_ask_id'] for item in remaining),remaining)
+    answer_messages=count_messages()
     repeated,error=mcp(endpoint,'st_alert_answer',arguments)
-    record('answer idempotent retry',not error and 'affected_ids' in answer['value'] and repeated['value'].get('affected_ids')==answer['value']['affected_ids'],repeated)
+    record('answer idempotent retry',not error and 'affected_ids' in answer['value'] and repeated['value'].get('affected_ids')==answer['value']['affected_ids'] and count_person_answers(info['ask_id'])==1 and count_messages()==answer_messages,repeated)
     for tool in ['st_missions_list','st_agents_list']:
         value,error=mcp(endpoint,tool,{'max_response_bytes':16384})
         record(tool,not error and any('title' in row for row in value['value']['items']),value)
@@ -184,12 +189,12 @@ try:
     conversation_args={'agent_id':'agent/prototype.worker','session_id':info['session_id'],'reference':reference,'revision':containing_revision(timeline),'start':0,'end':23,'max_response_bytes':16384}
     conversation,error=mcp(endpoint,'st_conversation_read',conversation_args)
     record('conversation bounded content',not error and 'Prototype conversation' in json.dumps(conversation),conversation)
-    policy(paired['grant']['id'])  # Add the exact write recipient; initial reads needed no policy call.
+    policy(paired['grant']['id'])  # An empty legacy allowlist does not restrict existing agents.
     before=count_messages()
     message_args={'action_id':'action/prototype-message','idempotency_key':'prototype-message-exact-key','fence':{'snapshot_id':local('/v1/client/attention')['snapshot']['id']},'to':'agent/prototype.worker','title':'Prototype message','content':'Hello from approved grant'}
     message,error=mcp(endpoint,'st_message_send',message_args)
     after=count_messages()
-    record('allowlisted message send',not error and after==before+1,message)
+    record('existing agent outside empty allowlist admitted',not error and after==before+1,message)
     with sqlite3.connect(STATE/'store.sqlite') as db:
         subject,body=db.execute("SELECT subject,body FROM claims WHERE kind='message.sent' ORDER BY rowid DESC LIMIT 1").fetchone()
     stored=json.loads(body)['fields']
@@ -208,37 +213,43 @@ try:
         forged.get('code')=='assistant-send-refused' and count_messages()==before_forgery,forged)
     retry,error=mcp(endpoint,'st_message_send',message_args)
     record('message idempotent no duplicate',not error and count_messages()==after,retry)
-    foreign=dict(message_args,to='agent/not-allowlisted',idempotency_key='prototype-message-denied-key',action_id='action/prototype-denied-message')
-    denied,error=mcp(endpoint,'st_message_send',foreign)
-    record('recipient allowlist denial',error,denied)
+    for recipient in ['agent/not-existing','person/ada']:
+        before_denial=count_messages()
+        foreign=dict(message_args,to=recipient,idempotency_key='prototype-denied-'+recipient,action_id='action/prototype-denied-'+recipient.replace('/','-'))
+        denied,error=mcp(endpoint,'st_message_send',foreign)
+        record('recipient admission rejects '+recipient,error and count_messages()==before_denial,denied)
     policy(paired['grant']['id'],scopes=READ_SCOPES[:4])
     denied,error=mcp(endpoint,'st_conversation_read',conversation_args)
     record('scope denial',error,denied)
     policy(paired['grant']['id'])
     incomplete,error=mcp(endpoint,'st_alerts_list',{'max_response_bytes':1})
     record('budget exceeded explicit incomplete',error and incomplete['code']=='incomplete',incomplete)
-    stale=dict(arguments,action_id='action/prototype-stale-answer',idempotency_key='prototype-stale-answer-exact-key',episode='claim/stale')
-    pending,error=mcp(endpoint,'st_alert_answer',stale)
-    answer_approval(pending)
+    expiry_detail,error=mcp(endpoint,'st_alert_get',{'alert_id':info['expiry_ask_id']})
+    expiry_ask=expiry_detail['value']
+    expiry_args=dict(arguments,action_id='action/direct-expiry',idempotency_key='direct-expiry-key',alert_id=expiry_ask['id'],episode=expiry_ask['episode'],fence={'snapshot_id':expiry_detail['snapshot']['id'],'subject_revisions':{expiry_ask['id']:expiry_ask['episode']}})
+    stale=dict(expiry_args,action_id='action/prototype-stale-answer',idempotency_key='prototype-stale-answer-exact-key',episode='claim/stale')
     denied,error=mcp(endpoint,'st_alert_answer',stale)
-    record('stale episode/fence rejected after approval',error,denied)
+    record('stale episode/fence rejected directly',error and count_person_answers(info['expiry_ask_id'])==0,denied)
+    policy(paired['grant']['id'],scopes=[scope for scope in SCOPES if scope!='write.assistant.answers'])
+    denied,error=mcp(endpoint,'st_alert_answer',expiry_args)
+    record('direct answer requires current answer scope',error and count_person_answers(info['expiry_ask_id'])==0,denied)
+    denied,error=mcp(endpoint,'st_alert_answer',arguments)
+    record('answer replay requires current answer scope',error and count_person_answers(info['ask_id'])==1,denied)
+    policy(paired['grant']['id'])
     before=count_messages()
-    narrowed=dict(message_args,action_id='action/allowlist-race',idempotency_key='allowlist-race-key',fence={'snapshot_id':local('/v1/client/attention')['snapshot']['id']})
+    narrowed=dict(message_args,action_id='action/message-scope-race',idempotency_key='message-scope-race-key',fence={'snapshot_id':local('/v1/client/attention')['snapshot']['id']})
     arm_mutation_gate()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future=executor.submit(mcp,endpoint,'st_message_send',narrowed)
         wait_mutation_gate('entered')
-        policy(paired['grant']['id'],recipients=())
+        policy(paired['grant']['id'],scopes=[scope for scope in SCOPES if scope!='write.assistant.messages'])
         release_mutation_gate()
         denied,error=future.result()
-    record('recipient removed during synchronous send before commit',error and denied.get('daemon',{}).get('code')=='forbidden' and count_messages()==before,{'denial':denied,'message_claims_before':before,'message_claims_after':count_messages()})
+    record('message scope removed during synchronous send before commit',error and denied.get('daemon',{}).get('code')=='forbidden' and count_messages()==before,{'denial':denied,'message_claims_before':before,'message_claims_after':count_messages()})
+    denied,error=mcp(endpoint,'st_message_send',message_args)
+    record('message replay requires current message scope',error and count_messages()==before,denied)
     policy(paired['grant']['id'])
 
-    expiry_detail,error=mcp(endpoint,'st_alert_get',{'alert_id':info['expiry_ask_id']})
-    expiry_ask=expiry_detail['value']
-    expiry_args=dict(arguments,action_id='action/approval-expiry',idempotency_key='approval-expiry-key',alert_id=expiry_ask['id'],episode=expiry_ask['episode'],fence={'snapshot_id':expiry_detail['snapshot']['id'],'subject_revisions':{expiry_ask['id']:expiry_ask['episode']}})
-    pending,error=mcp(endpoint,'st_alert_answer',expiry_args)
-    answer_approval(pending)
     policy(paired['grant']['id'],seconds=2)
     arm_mutation_gate()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -247,7 +258,12 @@ try:
         time.sleep(2.2)
         release_mutation_gate()
         denied,error=future.result()
-    record('expiry between proposal approval and execution',error and count_person_answers(info['expiry_ask_id'])==0,denied)
+    record('grant expiry during direct answer before commit',error and count_person_answers(info['expiry_ask_id'])==0,denied)
+    denied,error=mcp(endpoint,'st_alert_answer',expiry_args)
+    record('expired grant cannot answer',error and count_person_answers(info['expiry_ask_id'])==0,denied)
+    before_expired_send=count_messages()
+    denied,error=mcp(endpoint,'st_message_send',message_args)
+    record('expired grant cannot replay message',error and count_messages()==before_expired_send,denied)
     replace_expired_grant()
     stdio=subprocess.Popen(adapter_args+['--transport','stdio'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=open(STATE/'stdio.log','wb'),env=ENV,text=True,bufsize=1)
     PROCESSES.append(stdio)
@@ -278,6 +294,8 @@ try:
     record('revoke during synchronous send before commit',error and denied.get('daemon',{}).get('code')=='forbidden' and count_messages()==before,{'denial':denied,'message_claims_before':before,'message_claims_after':count_messages()})
     denied,error=mcp(endpoint,'st_agents_list')
     record('revoked grant denied',error,denied)
+    denied,error=mcp(endpoint,'st_alert_answer',expiry_args)
+    record('revoked grant cannot answer',error and count_person_answers(info['expiry_ask_id'])==0,denied)
     fixture.terminate();fixture.wait(timeout=10)
     unavailable,error=mcp(endpoint,'st_agents_list')
     record('daemon down explicit unavailable',error and unavailable['code']=='unavailable',unavailable)

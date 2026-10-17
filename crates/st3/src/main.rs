@@ -1833,6 +1833,9 @@ struct AssistantGrantTerms {
     #[arg(long, value_parser = parse_assistant_grant_expiry)]
     expires_in: Option<u64>,
     /// One exact assistant scope; repeat for each scope. Nothing is granted implicitly.
+    /// Add write.assistant.answers to answer supported owner alerts immediately;
+    /// read.assistant.attention only permits reads. write.assistant.messages permits
+    /// messages to any existing agent, never a person.
     #[arg(long = "scope", value_parser = parse_assistant_scope)]
     scopes: Vec<AssistantScope>,
     /// Consent that every assistant read is disclosed to OpenAI.
@@ -1854,7 +1857,7 @@ enum AssistantGrantCommand {
         grant: String,
         #[command(flatten)]
         terms: AssistantGrantTerms,
-        /// Exact agent IDs permitted as low-risk assistant message recipients.
+        /// Stored recipient metadata; does not restrict sends to existing agents.
         #[arg(long = "allow-recipient")]
         recipients: Vec<String>,
     },
@@ -12670,6 +12673,18 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
             "Person answer: {typed}: {} ({}, {})",
             response.summary, response.respondent, response.ask
         );
+        if let Some(sender_class) = &response.sender_class {
+            let _ = writeln!(output, "  Sender class: {sender_class}");
+        }
+        if let Some(grant) = &response.assistant_grant_id {
+            let _ = writeln!(output, "  Assistant grant: {grant}");
+        }
+        if let Some(owner) = &response.assistant_owner {
+            let _ = writeln!(output, "  Assistant owner: {owner}");
+        }
+        if let Some(session_actor) = &response.assistant_session_actor {
+            let _ = writeln!(output, "  Assistant session actor: {session_actor}");
+        }
     }
     if let Some(usage) = &work.usage {
         let _ = writeln!(output, "Usage: {}", render_usage(usage));

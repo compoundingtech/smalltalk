@@ -621,7 +621,7 @@ public struct RequestSubject: Codable, Sendable { public var kind, label: String
 public struct RequestAnswerOption: Codable, Sendable { public var id, label, consequence: String; public var outcome: String?; public var conditions: [String]? }
 public struct PersonAnswerInput: Codable, Sendable { public var id, text: String?; public init(id: String? = nil, text: String? = nil) { self.id = id; self.text = text } }
 public struct PersonAnswer: Codable, Sendable { public let type, outcome: String; public let id, label, text: String? }
-public struct PersonAnswerRecord: Codable, Sendable { public let ask, status, summary, respondent: String; public let actedFor: String?; public let answeredAtUnixMS: UInt64; public let answer: PersonAnswer?; public let evidence: [String]?; enum CodingKeys: String, CodingKey { case ask, status, summary, respondent, actedFor = "acted_for", answer, evidence, answeredAtUnixMS = "answered_at_unix_ms" } }
+public struct PersonAnswerRecord: Codable, Sendable { public let ask, status, summary, respondent: String; public let actedFor, senderClass, assistantGrantID, assistantOwner, assistantSessionActor: String?; public let answeredAtUnixMS: UInt64; public let answer: PersonAnswer?; public let evidence: [String]?; enum CodingKeys: String, CodingKey { case ask, status, summary, respondent, actedFor = "acted_for", senderClass = "sender_class", assistantGrantID = "assistant_grant_id", assistantOwner = "assistant_owner", assistantSessionActor = "assistant_session_actor", answer, evidence, answeredAtUnixMS = "answered_at_unix_ms" } }
 public struct TargetParameters: Codable, Sendable { public var targetID: String; public var reason: String?; public var summary: String?; public var evidence: [String]; public init(targetID: String, reason: String? = nil, summary: String? = nil, evidence: [String] = []) { self.targetID = targetID; self.reason = reason; self.summary = summary; self.evidence = evidence }; enum CodingKeys: String, CodingKey { case targetID = "target_id", reason, summary, evidence } }
 public struct AgentRetireParameters: Codable, Sendable { public var agent: String; public var reason: String; public init(agent: String, reason: String) { self.agent = agent; self.reason = reason } }
 public struct AgentStopParameters: Codable, Sendable { public var agent: String; public var reason: String?; public init(agent: String, reason: String? = nil) { self.agent = agent; self.reason = reason } }
@@ -707,7 +707,7 @@ public enum AssistantSenderClass: String, Codable, Sendable { case externalAssis
 public enum AssistantMinimalReadMode: String, Codable, Sendable { case approvalOnce = "approval-once", callerBoundAllow = "caller-bound-allow" }
 public enum AssistantScope: String, Codable, Sendable {
     case summary = "read.assistant.summary", attention = "read.assistant.attention", missions = "read.assistant.missions", agents = "read.assistant.agents", conversation = "read.assistant.conversation", terminal = "read.assistant.terminal"
-    case messages = "write.assistant.messages", customReply = "write.assistant.custom-reply"
+    case messages = "write.assistant.messages", customReply = "write.assistant.custom-reply", answers = "write.assistant.answers"
 }
 public struct AssistantPairingBegin: Codable, Sendable {
     public let apiVersion, deviceName: String; public let assistantID: AssistantPrincipal; public let scopes: [AssistantScope]; public let expiresInSeconds: UInt64?; public let disclosureConsent: Bool; public let consentEvidence: String; public let minimalReadMode: AssistantMinimalReadMode?

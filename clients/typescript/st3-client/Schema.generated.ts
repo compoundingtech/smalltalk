@@ -1268,7 +1268,7 @@ export const AssistantReadTrust = /*#__PURE__*/ (() => Schema.Struct({
 export type AssistantReadTrust = typeof AssistantReadTrust.Type
 export type AssistantReadTrustEncoded = typeof AssistantReadTrust.Encoded
 
-export const AssistantScope = /*#__PURE__*/ (() => Schema.Literals(["read.assistant.summary","read.assistant.attention","read.assistant.missions","read.assistant.agents","read.assistant.conversation","read.assistant.terminal","write.assistant.messages","write.assistant.custom-reply"]).annotate({ identifier: "AssistantScope" }))()
+export const AssistantScope = /*#__PURE__*/ (() => Schema.Literals(["read.assistant.summary","read.assistant.attention","read.assistant.missions","read.assistant.agents","read.assistant.conversation","read.assistant.terminal","write.assistant.messages","write.assistant.custom-reply","write.assistant.answers"]).annotate({ identifier: "AssistantScope" }))()
 export type AssistantScope = typeof AssistantScope.Type
 export type AssistantScopeEncoded = typeof AssistantScope.Encoded
 
@@ -1292,7 +1292,8 @@ export const AssistantGrant = /*#__PURE__*/ (() => Schema.Struct({
   "principal": AssistantPrincipal,
   /** Owner-provisioned public pins for SCG read proofs. Absent means every assistant read is denied. */
   "read_trust": optionalKey(AssistantReadTrust),
-  "recipient_allowlist": Schema.Array(Schema.String.check(Schema.isPattern(new RegExp("^agent/.+$", "u")))),
+  /** Stored policy metadata; does not restrict message.send. write.assistant.messages permits any existing agent recipient, never a person. */
+  "recipient_allowlist": Schema.Array(Schema.String.check(Schema.isPattern(new RegExp("^agent/.+$", "u")))).annotate({ description: "Stored policy metadata; does not restrict message.send. write.assistant.messages permits any existing agent recipient, never a person." }),
   "revoked": Schema.Boolean,
   "scopes": Schema.Array(AssistantScope).check(Schema.isMinLength(1)).check(Schema.isUnique()),
   "sender_class": AssistantSenderClass,
@@ -1307,7 +1308,8 @@ export const AssistantGrantPolicy = /*#__PURE__*/ (() => Schema.Struct({
   "disclosure_consent": Schema.Literal(true),
   "expires_in_seconds": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(2592000))),
   "minimal_read_mode": AssistantMinimalReadMode,
-  "recipient_allowlist": optionalKey(Schema.Array(Schema.String.check(Schema.isPattern(new RegExp("^agent/.+$", "u"))))),
+  /** Stored policy metadata; does not restrict message.send. write.assistant.messages permits any existing agent recipient, never a person. */
+  "recipient_allowlist": optionalKey(Schema.Array(Schema.String.check(Schema.isPattern(new RegExp("^agent/.+$", "u"))))).annotate({ description: "Stored policy metadata; does not restrict message.send. write.assistant.messages permits any existing agent recipient, never a person." }),
   "scopes": Schema.Array(AssistantScope).check(Schema.isMinLength(1)).check(Schema.isUnique())
 }).annotate({ identifier: "AssistantGrantPolicy" }))()
 export type AssistantGrantPolicy = typeof AssistantGrantPolicy.Type
@@ -2467,14 +2469,27 @@ export const PersonAnswer = /*#__PURE__*/ (() => Schema.Struct({
 export type PersonAnswer = typeof PersonAnswer.Type
 export type PersonAnswerEncoded = typeof PersonAnswer.Encoded
 
+export const SenderRef = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:agent|assistant|person|step)/[^\\s]+$", "u"), "agent", "assistant", "person", "step").annotate({ identifier: "SenderRef" }))()
+export type SenderRef = typeof SenderRef.Type
+export type SenderRefEncoded = typeof SenderRef.Encoded
+
 export const PersonAnswerRecord = /*#__PURE__*/ (() => Schema.Struct({
   /** The person whose prior instruction the agent respondent recorded. */
   "acted_for": optionalKey(Id),
   "answer": optionalKey(PersonAnswer),
   "answered_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "ask": Id,
+  /** The assistant grant that authorized the response. */
+  "assistant_grant_id": optionalKey(Id),
+  /** Server-owned provenance naming the person who owns the assistant grant, not the respondent or delegated person authority. */
+  "assistant_owner": optionalKey(PersonId),
+  /** Server-owned grant-bound assistant session audit actor, separate from the answering principal. */
+  "assistant_session_actor": optionalKey(Schema.String).annotate({ description: "Server-owned grant-bound assistant session audit actor, separate from the answering principal." }),
   "evidence": optionalKey(Schema.Array(Id)),
-  "respondent": Id,
+  /** The actual answering principal, including assistant/chatgpt for an assistant response; never replaced by its grant owner. */
+  "respondent": SenderRef,
+  /** External assistant attribution when the response was submitted through an assistant grant. */
+  "sender_class": optionalKey(Schema.String).annotate({ description: "External assistant attribution when the response was submitted through an assistant grant." }),
   "status": Schema.Literals(["completed","cancelled"]),
   "summary": Schema.String
 }).annotate({ identifier: "PersonAnswerRecord" }))()

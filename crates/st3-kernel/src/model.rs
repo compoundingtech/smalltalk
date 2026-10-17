@@ -3036,16 +3036,28 @@ pub struct AnswerInput {
     pub text: Option<String>,
 }
 
-/// A person's response to an ask, as data: the typed answer when the ask was structured.
+/// A response to a person ask, including answers submitted by an authorized assistant.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PersonAnswerView {
     /// The person whose prior instruction the respondent recorded, when delegated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acted_for: Option<String>,
+    /// Assistant provenance, absent for responses submitted directly by a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_grant_id: Option<String>,
+    /// Server-owned grant owner provenance, not person-delegation authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_owner: Option<String>,
+    /// Grant-bound assistant session audit actor, separate from the respondent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_session_actor: Option<String>,
     pub ask: String,
-    /// `completed` when the person answered, `cancelled` when the ask was withdrawn.
+    /// `completed` when answered, `cancelled` when the ask was withdrawn.
     pub status: String,
     pub summary: String,
+    /// The answering principal, including `assistant/chatgpt` for assistant responses.
     pub respondent: String,
     pub answered_at_unix_ms: u128,
     /// The typed answer: `type`, `outcome`, and `id`, `label` and `text` when present.

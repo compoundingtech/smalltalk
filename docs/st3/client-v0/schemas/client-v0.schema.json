@@ -68,6 +68,7 @@
     "TimelineEntryId": {"type": "string", "pattern": "^(?:timeline-entry)/[^\\s]+$", "x-st-ref": "timeline-entry"},
     "ActorRef": {"type": "string", "pattern": "^(?:agent|daemon|person)/[^\\s]+$", "x-st-ref": ["agent", "daemon", "person"]},
     "ParticipantRef": {"type": "string", "pattern": "^(?:agent|person|step)/[^\\s]+$", "x-st-ref": ["agent", "person", "step"]},
+    "SenderRef": {"type": "string", "pattern": "^(?:agent|assistant|person|step)/[^\\s]+$", "x-st-ref": ["agent", "assistant", "person", "step"]},
     "MissionState": {"anyOf": [{"enum": ["draft", "ready", "retired", "running", "standing", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Lifecycle state of a mission."},
     "MustAct": {"anyOf": [{"enum": ["you", "agent", "system", "blocked", "nobody"]}, {"type": "string"}], "description": "Who must act next on a mission or run."},
     "RunOutcomeStatus": {"anyOf": [{"enum": ["completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Terminal outcome of a finished run."},
@@ -2238,8 +2239,12 @@
         "ask": {"$ref": "#/$defs/Id"},
         "status": {"enum": ["completed", "cancelled"]},
         "summary": {"type": "string"},
-        "respondent": {"$ref": "#/$defs/Id"},
+        "respondent": {"$ref": "#/$defs/SenderRef", "description": "The actual answering principal, including assistant/chatgpt for an assistant response; never replaced by its grant owner."},
         "acted_for": {"$ref": "#/$defs/Id", "description": "The person whose prior instruction the agent respondent recorded."},
+        "sender_class": {"type": "string", "description": "External assistant attribution when the response was submitted through an assistant grant."},
+        "assistant_grant_id": {"$ref": "#/$defs/Id", "description": "The assistant grant that authorized the response."},
+        "assistant_owner": {"$ref": "#/$defs/PersonId", "description": "Server-owned provenance naming the person who owns the assistant grant, not the respondent or delegated person authority."},
+        "assistant_session_actor": {"type": "string", "description": "Server-owned grant-bound assistant session audit actor, separate from the answering principal."},
         "answered_at_unix_ms": {"type": "integer", "minimum": 0},
         "answer": {"$ref": "#/$defs/PersonAnswer"},
         "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}
@@ -2509,7 +2514,7 @@
     },
     "AssistantPrincipal": { "enum": ["assistant/chatgpt"] },
     "AssistantSenderClass": { "enum": ["external-assistant"] },
-    "AssistantScope": { "enum": ["read.assistant.summary", "read.assistant.attention", "read.assistant.missions", "read.assistant.agents", "read.assistant.conversation", "read.assistant.terminal", "write.assistant.messages", "write.assistant.custom-reply"] },
+    "AssistantScope": { "enum": ["read.assistant.summary", "read.assistant.attention", "read.assistant.missions", "read.assistant.agents", "read.assistant.conversation", "read.assistant.terminal", "write.assistant.messages", "write.assistant.custom-reply", "write.assistant.answers"] },
     "AssistantMinimalReadMode": { "enum": ["approval-once", "caller-bound-allow"] },
     "AssistantGrant": {
       "type": "object",
@@ -2528,7 +2533,7 @@
         "expires_at": { "$ref": "#/$defs/Timestamp" },
         "policy_revision": { "type": "integer", "minimum": 1 },
         "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" },
-        "recipient_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^agent/.+$" } },
+        "recipient_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^agent/.+$" }, "description": "Stored policy metadata; does not restrict message.send. write.assistant.messages permits any existing agent recipient, never a person." },
         "disclosure_consent": { "type": "boolean" },
         "consent_evidence": { "type": "string", "minLength": 1, "maxLength": 512 },
         "revoked": { "type": "boolean" },
@@ -2545,7 +2550,7 @@
         "expires_in_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "default": 3600 },
         "disclosure_consent": { "const": true },
         "consent_evidence": { "type": "string", "minLength": 1, "maxLength": 512 },
-        "recipient_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^agent/.+$" } },
+        "recipient_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^agent/.+$" }, "description": "Stored policy metadata; does not restrict message.send. write.assistant.messages permits any existing agent recipient, never a person." },
         "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
       }
     },

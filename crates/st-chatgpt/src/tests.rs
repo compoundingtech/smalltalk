@@ -123,6 +123,51 @@ async fn invalid_calls_fail_before_contacting_gateway() {
 }
 
 #[tokio::test]
+async fn alert_answer_maps_to_work_done_and_returns_direct_action_result_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("client.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let expected = json!({
+        "api_version":"st3.client.v0",
+        "value":{"kind":"action-result", "action_id":"action/answer",
+            "operation_id":"operation/client-answer", "status":"completed",
+            "affected_ids":["step-run/test/ask"], "snapshot_id":"snapshot/after-answer"},
+        "snapshot":{"id":"snapshot/after-answer"}
+    });
+    let response = expected.clone();
+    let (sent, mut received) = tokio::sync::mpsc::channel(1);
+    let gateway = Router::new().route("/v1/client/assistant/propose", axum::routing::post(
+        move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+            sent.send((headers, body)).await.unwrap();
+            axum::Json(response)
+        },
+    ));
+    let server = tokio::spawn(async move { axum::serve(listener, gateway).await.unwrap() });
+    let adapter = Adapter {
+        client: reqwest::Client::builder().unix_socket(socket).build().unwrap(),
+        bearer: "test-only-answer-credential".into(),
+    };
+    let arguments = json!({
+        "action_id":"action/answer", "idempotency_key":"answer-key",
+        "fence":{"snapshot_id":"snapshot/before-answer"},
+        "alert_id":"step-run/test/ask", "episode":"claim/ask", "option":"yes",
+        "summary":"Proceed with the selected option"
+    });
+    let result = call(&adapter, "st_alert_answer", &arguments).await;
+    server.abort();
+    assert_eq!(result.unwrap(), expected);
+    let (headers, body) = received.recv().await.unwrap();
+    assert_eq!(headers["authorization"], "Bearer test-only-answer-credential");
+    assert_eq!(body, json!({
+        "api_version":"st3.client.v0", "id":"action/answer", "type":"work.done",
+        "idempotency_key":"answer-key", "fence":{"snapshot_id":"snapshot/before-answer"},
+        "parameters":{"target_id":"step-run/test/ask", "episode":"claim/ask",
+            "summary":"Proceed with the selected option", "answer":{"id":"yes"}}
+    }));
+    assert!(expected["value"].get("approval_id").is_none());
+}
+
+#[tokio::test]
 async fn http_router_rejects_get_mcp_and_unknown_paths_without_content() {
     let app = http_router(disconnected_adapter());
     for (method, path, status) in [

@@ -605,7 +605,7 @@ export type AssistantReadTrustRequest = {
 
 export type AssistantResponseBytes = number;
 
-export type AssistantScope = "read.assistant.summary" | "read.assistant.attention" | "read.assistant.missions" | "read.assistant.agents" | "read.assistant.conversation" | "read.assistant.terminal" | "write.assistant.messages" | "write.assistant.custom-reply";
+export type AssistantScope = "read.assistant.summary" | "read.assistant.attention" | "read.assistant.missions" | "read.assistant.agents" | "read.assistant.conversation" | "read.assistant.terminal" | "write.assistant.messages" | "write.assistant.custom-reply" | "write.assistant.answers";
 
 export type AssistantSenderClass = "external-assistant";
 
@@ -1770,8 +1770,12 @@ export type PersonAnswerRecord = {
   answer?: PersonAnswer;
   answered_at_unix_ms: number;
   ask: Id;
+  assistant_grant_id?: Id;
+  assistant_owner?: PersonId;
+  assistant_session_actor?: string;
   evidence?: Array<Id>;
-  respondent: Id;
+  respondent: SenderRef;
+  sender_class?: string;
   status: "completed" | "cancelled";
   summary: string;
 };
@@ -1984,6 +1988,8 @@ export type ScgReadAuthorizationPayload = {
   projection: AssistantProjection;
   request_digest: string;
 };
+
+export type SenderRef = string;
 
 export type Session = ResourceHeader & {
   ended_at?: (Timestamp | null);

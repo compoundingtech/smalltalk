@@ -668,6 +668,9 @@ fn assistant_provenance_generic_signed_and_transaction_appends_refuse_forgery() 
 #[test]
 fn assistant_provenance_stamps_authenticated_grant_and_preserves_replica_admission() {
     let store = Store::open_memory("node").unwrap();
+    store.apply_internal(&crate::graph::parse_test_intent(
+        "version 2\nagent \"eval.recipient\" { workspace \"/tmp/st-test\"; command \"true\"; restart always; }", "node").unwrap(),
+        "assistant-recipient").unwrap();
     let grant_subject = "custom/client/assistant-v1-native-fixture";
     let grant_id = "assistant-grant/native-fixture";
     let session_actor = format!("assistant/chatgpt/session/{grant_id}");
@@ -686,7 +689,7 @@ fn assistant_provenance_stamps_authenticated_grant_and_preserves_replica_admissi
     let authorization = assistant_write::AssistantWriteAuthorization {
         grant_subject: grant_subject.into(), actor: session_actor.clone(),
         owner: "person/eval".into(), policy_revision: 1, scope: "write.assistant.messages".into(),
-        recipient: Some("agent/eval.recipient".into()), approval_subject: None,
+        recipient: Some("agent/eval.recipient".into()),
     };
     let mut input = request();
     input.actor = Some("assistant/chatgpt".into());
