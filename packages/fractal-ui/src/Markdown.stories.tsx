@@ -258,8 +258,12 @@ export const CopyFailure: Story = { tags: ['critical'],
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new DOMException('Clipboard permission denied', 'NotAllowedError') } } })
     try {
       flushSync(() => copy.click())
-      await settle()
-      if (fence.dataset.copyState !== 'failed' || !fence.querySelector('[role="status"]')?.textContent?.includes('Check clipboard permissions') || copy.disabled) throw new Error('Copy failure must report the permission problem and leave retry available')
+      // The rejected write settles asynchronously: wait for the copy to leave ready/copying, not a fixed two frames.
+      for (let frame = 0; (fence.dataset.copyState === 'ready' || fence.dataset.copyState === 'copying') && frame < 600; frame++) await settle()
+      const status = fence.querySelector('[role="status"]')?.textContent ?? ''
+      if (fence.dataset.copyState !== 'failed' || !status.includes('Check clipboard permissions') || copy.disabled) {
+        throw new Error(`Copy failure must report the permission problem and leave retry available (state ${fence.dataset.copyState}, status ${JSON.stringify(status)}, disabled ${copy.disabled})`)
+      }
     } finally {
       if (descriptor === undefined) Reflect.deleteProperty(navigator, 'clipboard')
       else Object.defineProperty(navigator, 'clipboard', descriptor)

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The Markdown copy-failure play waits for the rejected clipboard write to settle before asserting, instead of a fixed two frames, and reports the observed state when it fails.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "No application or API change. Story test only; the same assertions hold." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}
