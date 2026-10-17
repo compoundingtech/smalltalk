@@ -1325,6 +1325,92 @@ fn manual_publication_preserves_completed_suspension_across_reopens() {
 }
 
 #[test]
+fn a_pending_manual_launch_is_read_at_its_snapshot_and_never_for_a_stopped_seat() {
+    let seat = Seat::new();
+    let (operation, _, _) = seat.finish_suspend();
+    seat.publish_mode(2, "second", None, false, true);
+    let pending = seat.store.index().unwrap();
+    let at_pending = crate::suspension::current_at(&seat.store, SUBJECT, Some(pending))
+        .unwrap()
+        .expect("a pending manual launch keeps the incumbent suspension");
+    assert_eq!(at_pending.operation_id, operation);
+    let lineage_at_pending = seat.store.suspension_lineage_at(SUBJECT, Some(pending)).unwrap();
+    // A later launch of the pending declaration changes the selection's rollout, the actual
+    // state and the launch record; none of it may reach a read at the earlier snapshot.
+    let pending_token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    seat.append(
+        "runtime.action.succeeded",
+        json!({"action":"start","desired_token":pending_token,"incarnation_id":"later-1"}),
+    );
+    seat.append("runtime.observed", json!({"status":"running","host":"amber","incarnation_id":"later-1"}));
+    let unchanged = crate::suspension::current_at(&seat.store, SUBJECT, Some(pending))
+        .unwrap()
+        .expect("claims after the snapshot do not change the pending manual launch read at it");
+    assert_eq!(unchanged.operation_id, operation);
+    assert_eq!(unchanged.phase, at_pending.phase);
+    assert_eq!(
+        seat.store.suspension_lineage_at(SUBJECT, Some(pending)).unwrap(),
+        lineage_at_pending
+    );
+    // The seat is stopped while the manual publication is still pending.
+    seat.publish(3, "second", None, true);
+    let stopped = seat.store.index().unwrap();
+    assert_eq!(
+        seat.store.selected_desired_kind_at(SUBJECT, Some(stopped)).unwrap().as_deref(),
+        Some("stop")
+    );
+    assert!(
+        crate::suspension::current_at(&seat.store, SUBJECT, Some(stopped)).unwrap().is_none(),
+        "a stopped seat reports no suspension, whatever manual launch was pending"
+    );
+    assert!(crate::suspension::current(&seat.store, SUBJECT).unwrap().is_none());
+    // The earlier snapshot is unchanged by the later stop.
+    let again = crate::suspension::current_at(&seat.store, SUBJECT, Some(pending))
+        .unwrap()
+        .expect("the snapshot still sees the pending manual launch it was taken under");
+    assert_eq!(again.operation_id, operation);
+    assert_eq!(again.phase, "suspended");
+}
+
+#[test]
+fn a_retirement_alone_ends_the_suspension_a_pending_manual_launch_kept() {
+    let seat = Seat::new();
+    let (operation, _, _) = seat.finish_suspend();
+    seat.publish_mode(2, "second", None, false, true);
+    let before = seat.store.index().unwrap();
+    assert_eq!(
+        crate::suspension::current_at(&seat.store, SUBJECT, Some(before)).unwrap()
+            .expect("a pending manual launch keeps the incumbent suspension").operation_id,
+        operation
+    );
+    // One terminal stop claim, and nothing else, separates the two snapshots.
+    let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    let (retired, _) = seat.store
+        .retire_agent(SUBJECT, "person/operator", "Work finished", &token, None, "retire-pending", &[])
+        .unwrap();
+    let after = seat.store.index().unwrap();
+    assert_eq!((retired.store_index, after), (before + 1, before + 1));
+    assert_eq!(
+        seat.store.selected_desired_kind_at(SUBJECT, Some(before)).unwrap().as_deref(),
+        Some("agent")
+    );
+    assert_eq!(
+        seat.store.selected_desired_kind_at(SUBJECT, Some(after)).unwrap().as_deref(),
+        Some("stop")
+    );
+    assert!(
+        crate::suspension::current_at(&seat.store, SUBJECT, Some(after)).unwrap().is_none(),
+        "a stopped seat reports no suspension, whatever manual launch was pending"
+    );
+    assert!(crate::suspension::current(&seat.store, SUBJECT).unwrap().is_none());
+    assert_eq!(
+        crate::suspension::current_at(&seat.store, SUBJECT, Some(before)).unwrap()
+            .expect("the earlier snapshot keeps its suspension").operation_id,
+        operation
+    );
+}
+
+#[test]
 fn suspended_non_launch_publications_preserve_hold_and_resume_updated_environment() {
     for owned in [false, true] {
         for edit in [r#"env { COLOR "blue"; }"#, r#"name "New label";"#] {

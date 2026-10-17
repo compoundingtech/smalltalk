@@ -534,6 +534,46 @@ agent "test/worker" { command "true"; name "A" }
 }
 
 #[test]
+fn a_suspension_lineage_snapshot_ignores_a_predecessor_replicated_after_it() {
+    let left = Store::open_memory("left").unwrap();
+    let right = Store::open_memory("right").unwrap();
+    let reader = Store::open_memory("reader").unwrap();
+    let intent = parse_intent(r#"version 2
+agent "test/worker" { command "true"; name "A" }
+"#, "left").unwrap();
+    let preview = left.mission(&intent, IntentInput {
+        kdl: String::new(), source_name: None,
+    }).unwrap();
+    left.apply(&intent, &preview.subject_tokens, "a").unwrap();
+    let declared = left.selected_desired_token("agent/test/worker").unwrap().unwrap();
+    receive_and_project(&right, "left", &exchange_from(&left, &ReplicationInventory::default()));
+    // A relabel keeps the declared launch, so the declaration stays in its successor's lineage.
+    right.rename_agent("agent/test/worker", Some("B"), "b").unwrap();
+    let renamed = right.selected_desired_token("agent/test/worker").unwrap().unwrap();
+    assert_eq!(
+        right.suspension_lineage_at("agent/test/worker", None).unwrap(),
+        vec![renamed.clone(), declared.clone()]
+    );
+    // The reader receives the relabel before the declaration it succeeds.
+    receive_and_project(
+        &reader, "right", &exchange_from(&right, &left.replication_inventory().unwrap()),
+    );
+    assert!(reader.claim_by_id(&declared).unwrap().is_none());
+    let at = reader.index().unwrap();
+    receive_and_project(&reader, "left", &exchange_from(&left, &reader.replication_inventory().unwrap()));
+    assert!(reader.claim_by_id(&declared).unwrap().is_some());
+    assert_eq!(
+        reader.suspension_lineage_at("agent/test/worker", Some(at)).unwrap(),
+        vec![renamed.clone()],
+        "a snapshot walks only the ancestry it held"
+    );
+    assert_eq!(
+        reader.suspension_lineage_at("agent/test/worker", None).unwrap(),
+        vec![renamed, declared]
+    );
+}
+
+#[test]
 fn seat_rename_refuses_an_unreadable_member_and_an_empty_label() {
     let store = Store::open_memory("node").unwrap();
     let intent = parse_intent(r#"version 2
