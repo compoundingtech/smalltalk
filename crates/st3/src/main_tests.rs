@@ -844,6 +844,161 @@ fn conversations_ls_accepts_the_read_spelling_of_its_mailbox() {
 }
 
 #[test]
+fn conversations_ls_accepts_sender_and_literal_subject_filters() {
+    for (flag, subject) in [
+        ("--subject", "Review: café & ready?"),
+        ("--subject-prefix", "Review_%"),
+        ("--subject", ""),
+        ("--subject-prefix", ""),
+    ] {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "ls",
+            "agent/reader",
+            "--from",
+            "person/operator",
+            flag,
+            subject,
+            "--archive",
+            "--count",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Ls(args),
+        } = cli.command
+        else {
+            panic!("conversations ls")
+        };
+        assert_eq!(args.sender.as_deref(), Some("person/operator"));
+        assert_eq!(
+            args.subject.as_deref(),
+            (flag == "--subject").then_some(subject)
+        );
+        assert_eq!(
+            args.subject_prefix.as_deref(),
+            (flag == "--subject-prefix").then_some(subject)
+        );
+        assert!(args.archive);
+        assert!(args.count);
+    }
+    assert!(
+        Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "ls",
+            "agent/reader",
+            "--from",
+            "agent/ada",
+            "--subject",
+            "Review",
+            "--subject-prefix",
+            "Re",
+        ])
+        .is_err()
+    );
+    for flag in ["--subject", "--subject-prefix"] {
+        let error = Cli::try_parse_from([
+            "st3", "conversations", "ls", "agent/reviewer", flag, "Review",
+        ])
+        .err()
+        .expect("subject filters need a sender filter");
+        assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--from"));
+    }
+}
+
+#[tokio::test]
+async fn message_pages_encode_filters_and_preserve_unfiltered_delivery_queries() {
+    use axum::{Json, Router, extract::Query, routing::get};
+
+    let queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let recorded = queries.clone();
+    let app = Router::new().route(
+        "/v1/messages/page",
+        get(move |Query(query): Query<BTreeMap<String, String>>| {
+            let recorded = recorded.clone();
+            async move {
+                recorded.lock().await.push(query);
+                Json(json!({"api_version": "st3.v1", "value": {
+                    "items": [], "has_more": false, "next_cursor": null, "limit": 100
+                }}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = Client::new(Endpoint::Http(format!("http://{address}")));
+    let filters = MessagePageFilters {
+        from: Some("person/operator"),
+        subject: Some("Review: café & ready?"),
+        subject_prefix: None,
+    };
+    for cursor in [None, Some("opaque+/=&cursor")] {
+        message_page_filtered(&client, Some("agent/reader"), true, cursor, None, filters)
+            .await
+            .unwrap();
+    }
+    message_page_filtered(
+        &client,
+        Some("agent/reader"),
+        false,
+        None,
+        None,
+        MessagePageFilters {
+            from: None,
+            subject: None,
+            subject_prefix: Some("Review_%/"),
+        },
+    )
+    .await
+    .unwrap();
+    message_page(&client, Some("agent/reader"), false, None)
+        .await
+        .unwrap();
+    message_page_reporting(
+        &client,
+        Some("agent/reader"),
+        false,
+        Some("delivery-cursor"),
+        Some("delivery/report"),
+    )
+    .await
+    .unwrap();
+
+    let queries = queries.lock().await;
+    assert_eq!(queries.len(), 5);
+    for (index, query) in queries[..2].iter().enumerate() {
+        assert_eq!(query["to"], "agent/reader");
+        assert_eq!(query["from"], "person/operator");
+        assert_eq!(query["subject"], "Review: café & ready?");
+        assert_eq!(query["include_closed"], "true");
+        assert_eq!(query["limit"], "100");
+        assert!(!query.contains_key("subject_prefix"));
+        assert!(!query.contains_key("delivery"));
+        assert_eq!(
+            query.get("cursor").map(String::as_str),
+            (index == 1).then_some("opaque+/=&cursor")
+        );
+    }
+    assert_eq!(queries[2]["subject_prefix"], "Review_%/");
+    assert!(!queries[2].contains_key("subject"));
+    assert!(!queries[2].contains_key("from"));
+    for query in &queries[3..] {
+        assert_eq!(query["to"], "agent/reader");
+        assert_eq!(query["include_closed"], "false");
+        assert!(!query.contains_key("from"));
+        assert!(!query.contains_key("subject"));
+        assert!(!query.contains_key("subject_prefix"));
+    }
+    assert!(!queries[3].contains_key("delivery"));
+    assert_eq!(queries[4]["cursor"], "delivery-cursor");
+    assert_eq!(queries[4]["delivery"], "delivery/report");
+    server.abort();
+}
+
+#[test]
 fn pi_family_mail_uses_the_shared_envelope_and_the_steer_boundary() {
     let message = st3::model::MessageView {
         subject: "message/0123456789abcdef".into(),

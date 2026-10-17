@@ -206,35 +206,65 @@ pub(super) async fn run_message(
             if json_output && !args.count {
                 print!("[");
             }
-            for_each_message(client, Some(&identity), args.archive, |message| {
-                if sender
-                    .as_deref()
-                    .is_some_and(|sender| sender != message.from)
-                {
-                    return Ok(());
-                }
-                count += 1;
-                if args.count {
-                    return Ok(());
-                }
-                if json_output {
-                    if !first {
-                        print!(",");
+            let filters = MessagePageFilters {
+                from: sender.as_deref(),
+                subject: args.subject.as_deref(),
+                subject_prefix: args.subject_prefix.as_deref(),
+            };
+            let mut cursor = None;
+            loop {
+                let page = message_page_filtered(
+                    client,
+                    Some(&identity),
+                    args.archive,
+                    cursor.as_deref(),
+                    None,
+                    filters,
+                )
+                .await?;
+                for message in page.items {
+                    // Older daemons ignore the query filters; keep the same local result there.
+                    if sender
+                        .as_deref()
+                        .is_some_and(|sender| sender != message.from)
+                        || args
+                            .subject
+                            .as_deref()
+                            .is_some_and(|subject| message.title.as_deref() != Some(subject))
+                        || args.subject_prefix.as_deref().is_some_and(|prefix| {
+                            !message
+                                .title
+                                .as_deref()
+                                .is_some_and(|title| title.starts_with(prefix))
+                        })
+                    {
+                        continue;
                     }
-                    print!("{}", serde_json::to_string(&message)?);
-                    first = false;
-                } else {
-                    rows.push(format!(
-                        "{}\t{}\t{}\t{}",
-                        message.subject,
-                        message.status,
-                        message.from,
-                        message.title.as_deref().unwrap_or("message")
-                    ));
+                    count += 1;
+                    if args.count {
+                        continue;
+                    }
+                    if json_output {
+                        if !first {
+                            print!(",");
+                        }
+                        print!("{}", serde_json::to_string(&message)?);
+                        first = false;
+                    } else {
+                        rows.push(format!(
+                            "{}\t{}\t{}\t{}",
+                            message.subject,
+                            message.status,
+                            message.from,
+                            message.title.as_deref().unwrap_or("message")
+                        ));
+                    }
                 }
-                Ok(())
-            })
-            .await?;
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
             if args.count {
                 println!("{count}");
             } else if json_output {

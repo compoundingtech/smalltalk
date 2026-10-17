@@ -12059,6 +12059,155 @@ fn native_mailbox_pages_use_exact_recipient_and_stable_created_cursors() {
     assert_eq!(closed[0].status, "closed");
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn filtered_message_pages_match_views_across_sender_and_lifecycle_boundaries(
+        entries in proptest::collection::vec((0usize..4, 0usize..3, 0usize..5, any::<bool>(), 0usize..3), 24..72),
+        page_size in 1usize..8,
+        selected_sender in 0usize..4,
+        include_closed in any::<bool>(),
+    ) {
+        let store = Store::open_memory("node").unwrap();
+        let titles = ["topic", "topic_%*", "topic_%* child", "other", r"topic_\%*"];
+        let mut declarations = String::from(
+            "version 2\nagent \"worker\" {\n workspace \"/work\"\n command \"sleep 60\"\n restart \"never\"\n}\n",
+        );
+        for sender in 0..4 {
+            declarations.push_str(&format!(
+                "agent \"sender-{sender}\" {{\n workspace \"/work\"\n command \"sleep 60\"\n restart \"never\"\n}}\n",
+            ));
+        }
+        for (index, (sender, _, title, _, flavor)) in entries.iter().enumerate() {
+            if *flavor == 2 {
+                declarations.push_str(&format!(
+                    "message \"filter-{index}\" {{\n from \"agent/sender-{sender}\"\n to \"worker\"\n title {}\n content \"example\"\n}}\n",
+                    serde_json::to_string(titles[*title]).unwrap(),
+                ));
+            }
+        }
+        let intent = crate::graph::parse_test_intent(&declarations, "local").unwrap();
+        let mission = store.mission(&intent, IntentInput {
+            kdl: declarations.clone(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &mission.subject_tokens, "message").unwrap();
+        for (index, (sender, lifecycle, title, archived, flavor)) in entries.iter().enumerate() {
+            let resource = format!("message/filter-{index}");
+            if *flavor != 2 {
+                store.append_claim(&ClaimInput {
+                    subject: resource.clone(),
+                    kind: "message.sent".into(),
+                    actor: Some(format!("agent/sender-{sender}")),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!(format!("agent/sender-{sender}"))),
+                        ("to".into(), json!("agent/worker")),
+                        ("title".into(), json!(titles[*title])),
+                        ("content".into(), json!("example")),
+                        ("status".into(), json!("sent")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("filter-send-{index}")),
+                }).unwrap();
+                if *flavor == 1 {
+                    // Legacy imported sends store their fields at the body root.
+                    store.connection.lock().unwrap().execute(
+                        "UPDATE claims SET body=json_extract(body,'$.fields')
+                         WHERE subject=?1 AND kind='message.sent'",
+                        [&resource],
+                    ).unwrap();
+                }
+            }
+            let target = if *archived || *lifecycle == 1 {
+                "closed"
+            } else if *lifecycle == 2 {
+                "read"
+            } else {
+                "sent"
+            };
+            let mut current = store.message(&resource).unwrap().expect("generated message");
+            prop_assert_eq!(current.status.as_str(), "sent");
+            while current.status != target {
+                // All sources follow the same admitted transport lifecycle. Do not skip
+                // delivery for agent recipients, even when the generated target is read.
+                let next = match current.status.as_str() {
+                    "sent" | "staged" => "delivered",
+                    "delivered" => "read",
+                    "read" => "closed",
+                    status => panic!("unexpected generated message status {status}"),
+                };
+                store.append_claim(&ClaimInput {
+                    subject: resource.clone(),
+                    kind: format!("message.{next}"),
+                    actor: Some("agent/worker".into()),
+                    fields: BTreeMap::from([("status".into(), json!(next))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("filter-state-{index}-{next}")),
+                }).unwrap();
+                current = store.message(&resource).unwrap().expect("transitioned message");
+                prop_assert_eq!(current.status.as_str(), next);
+            }
+            prop_assert_eq!(current.status.as_str(), target);
+        }
+        let through = store.index().unwrap();
+        let sender = format!("sender-{selected_sender}");
+        let normalized_sender = format!("agent/{sender}");
+        for recipient in [Some("worker"), None] {
+            // Keep the existing listing as the oracle for each discovery domain.
+            let all = store.messages(recipient, true).unwrap();
+            for (index, (_, _, _, _, flavor)) in entries.iter().enumerate() {
+                if *flavor == 1 {
+                    let resource = format!("message/filter-{index}");
+                    prop_assert_eq!(
+                        all.iter().any(|message| message.subject == resource),
+                        recipient.is_none(),
+                    );
+                }
+            }
+            for (exact, prefix) in [
+                (None, None),
+                (Some("topic_%*"), None),
+                (None, Some("topic_%*")),
+                (Some("topic"), None),
+                (None, Some("")),
+                (None, Some("TOPIC")),
+                (Some(r"topic_\%*"), None),
+                (None, Some(r"topic_\")),
+            ] {
+                let mut expected: Vec<_> = all.iter().filter(|message| {
+                    message.from == normalized_sender
+                        && (include_closed || message.status != "closed")
+                        && exact.is_none_or(|title| message.title.as_deref() == Some(title))
+                        && prefix.is_none_or(|prefix| message.title.as_deref().is_some_and(|title| title.starts_with(prefix)))
+                }).map(|message| (message.created_index, message.subject.clone())).collect();
+                expected.sort();
+                let mut actual = Vec::new();
+                let mut after = None;
+                loop {
+                    let (page, next) = store.messages_page_filtered(
+                        recipient, Some(&sender), exact, prefix, include_closed, after, through, page_size,
+                    ).unwrap();
+                    prop_assert!(page.len() <= page_size);
+                    if next.is_some() {
+                        prop_assert_eq!(page.len(), page_size);
+                        prop_assert_eq!(next, page.last().map(|message| message.created_index));
+                        prop_assert!(next > after);
+                    }
+                    actual.extend(page.into_iter().map(|message| (message.created_index, message.subject)));
+                    match next {
+                        Some(next) => after = Some(next),
+                        None => break,
+                    }
+                    prop_assert!(actual.len() <= expected.len());
+                }
+                prop_assert_eq!(actual, expected);
+            }
+        }
+    }
+}
+
 #[test]
 fn reconciler_work_mailbox_keeps_closed_attempts_without_unrelated_messages() {
     let store = Store::open_memory("node").unwrap();
@@ -12221,6 +12370,7 @@ version 2
     from "requester"
     to "mix.sup"
     content "work"
+    title "topic_%* child"
   }
 
 "#,
@@ -12256,6 +12406,24 @@ version 2
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].subject, messages[0].subject);
     assert!(next.is_none());
+    for (exact, prefix) in [
+        (Some("topic_%* child"), None),
+        (None, Some("topic_%*")),
+        (None, Some("")),
+    ] {
+        let (filtered, next) = store.messages_page_filtered(
+            Some("mix.sup"), Some("requester"), exact, prefix, false,
+            None, store.index().unwrap(), 1,
+        ).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].subject, messages[0].subject);
+        assert!(next.is_none());
+    }
+    let error = store.messages_page_filtered(
+        Some("mix.sup"), None, Some("topic_%* child"), None, false,
+        None, store.index().unwrap(), 1,
+    ).unwrap_err();
+    assert_eq!(error.to_string(), "subject filters need a sender filter");
 }
 
 #[test]

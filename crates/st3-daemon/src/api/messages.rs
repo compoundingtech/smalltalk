@@ -111,6 +111,9 @@ pub(super) async fn send_message(
 #[derive(Deserialize)]
 pub(super) struct MessagesPageQuery {
     to: Option<String>,
+    from: Option<String>,
+    subject: Option<String>,
+    subject_prefix: Option<String>,
     #[serde(default)]
     include_closed: bool,
     cursor: Option<String>,
@@ -119,13 +122,61 @@ pub(super) struct MessagesPageQuery {
     delivery: Option<String>,
 }
 
+impl MessagesPageQuery {
+    fn validate_filters(&self) -> Result<(), ApiError> {
+        if (self.subject.is_some() || self.subject_prefix.is_some()) && self.from.is_none() {
+            return Err(ApiError::bad(St3Error::new(
+                "validation-failed",
+                "subject filters need a sender filter",
+            )));
+        }
+        if self.subject.is_some() && self.subject_prefix.is_some() {
+            return Err(ApiError::bad(St3Error::new(
+                "validation-failed",
+                "subject and subject_prefix are mutually exclusive",
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct MessagesPageCursor {
     after: u64,
     through: u64,
     to: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    subject_prefix: Option<String>,
     include_closed: bool,
     limit: usize,
+}
+
+impl MessagesPageCursor {
+    fn validate(
+        &self,
+        query: &MessagesPageQuery,
+        to: Option<&str>,
+        from: Option<&str>,
+        limit: usize,
+    ) -> Result<(), ApiError> {
+        let matches = self.to.as_deref() == to
+            && self.from.as_deref() == from
+            && self.subject == query.subject
+            && self.subject_prefix == query.subject_prefix
+            && self.include_closed == query.include_closed
+            && self.limit == limit;
+        if !matches {
+            return Err(ApiError::bad(St3Error::new(
+                "validation-failed",
+                "message cursor filters changed",
+            )));
+        }
+        Ok(())
+    }
 }
 
 pub(super) async fn list_messages_page(
@@ -135,6 +186,8 @@ pub(super) async fn list_messages_page(
 ) -> Result<Json<MessagePage>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     let to = query.to.as_deref().map(normalize_message_party);
+    let from = query.from.as_deref().map(normalize_message_party);
+    query.validate_filters()?;
     if let (Some(to), Some(report)) = (to.as_deref(), query.delivery.as_deref()) {
         delivery_presence::record(to, report);
     } else {
@@ -156,15 +209,7 @@ pub(super) async fn list_messages_page(
             let cursor: MessagesPageCursor = serde_json::from_slice(&bytes).map_err(|_| {
                 ApiError::bad(St3Error::new("validation-failed", "invalid message cursor"))
             })?;
-            if cursor.to != to
-                || cursor.include_closed != query.include_closed
-                || cursor.limit != limit
-            {
-                return Err(ApiError::bad(St3Error::new(
-                    "validation-failed",
-                    "message cursor filters changed",
-                )));
-            }
+            cursor.validate(&query, to.as_deref(), from.as_deref(), limit)?;
             Ok(cursor)
         })
         .transpose()?;
@@ -173,13 +218,27 @@ pub(super) async fn list_messages_page(
         None => state.store.index().map_err(ApiError::internal)?,
     };
     let after = cursor.as_ref().map(|cursor| cursor.after);
+    let subject = query.subject.clone();
+    let subject_prefix = query.subject_prefix.clone();
     let store = state.store.clone();
     let (items, next_after) = blocking_store(move || {
         let native = !query.include_closed
             && peer
                 .as_ref()
                 .is_some_and(|peer| to.as_deref() == Some(peer.0.agent.as_str()));
-        let (mut items, next_after) = if native {
+        let filtered = from.is_some() || subject.is_some() || subject_prefix.is_some();
+        let (mut items, next_after) = if filtered {
+            store.messages_page_filtered(
+                to.as_deref(),
+                from.as_deref(),
+                subject.as_deref(),
+                subject_prefix.as_deref(),
+                query.include_closed,
+                after,
+                through,
+                limit,
+            )?
+        } else if native {
             store.messages_page_for_delivery(to.as_deref().unwrap(), after, through, limit)?
         } else {
             store.messages_page(to.as_deref(), query.include_closed, after, through, limit)?
@@ -196,6 +255,9 @@ pub(super) async fn list_messages_page(
                 after,
                 through,
                 to: query.to.as_deref().map(normalize_message_party),
+                from: query.from.as_deref().map(normalize_message_party),
+                subject: query.subject.clone(),
+                subject_prefix: query.subject_prefix.clone(),
                 include_closed: query.include_closed,
                 limit,
             };
@@ -362,4 +424,82 @@ pub(super) async fn post_message_claim(
         signal_message_changed(&state, kind, work_wake);
     }
     Ok(Json(record))
+}
+
+#[cfg(test)]
+mod page_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn message_cursor_rejects_changed_filters() {
+        let cursor: MessagesPageCursor = serde_json::from_value(json!({
+            "after": 10, "through": 100, "to": "agent/reviewer",
+            "from": "agent/ada", "subject": "review", "subject_prefix": null,
+            "include_closed": true, "limit": 2
+        }))
+        .unwrap();
+        let binding = json!({
+            "to": "agent/reviewer", "from": "agent/ada", "subject": "review",
+            "include_closed": true, "limit": 2
+        });
+        let validate = |value: Value| {
+            let query: MessagesPageQuery = serde_json::from_value(value).unwrap();
+            let to = query.to.as_deref().map(normalize_message_party);
+            let from = query.from.as_deref().map(normalize_message_party);
+            cursor.validate(&query, to.as_deref(), from.as_deref(), query.limit.unwrap())
+        };
+        assert!(validate(binding.clone()).is_ok());
+        for (field, value) in [
+            ("to", json!("agent/operator")),
+            ("from", json!("agent/alex")),
+            ("from", Value::Null),
+            ("subject", json!("other")),
+            ("subject_prefix", json!("rev")),
+            ("include_closed", json!(false)),
+            ("limit", json!(3)),
+        ] {
+            let mut changed = binding.clone();
+            changed[field] = value;
+            let error = validate(changed).expect_err("accepted changed cursor filters");
+            assert_eq!(error.code, "validation-failed");
+            assert_eq!(error.message, "message cursor filters changed");
+        }
+    }
+
+    #[test]
+    fn message_cursor_prefix_binding_and_legacy_defaults() {
+        let mut cursor: MessagesPageCursor = serde_json::from_value(json!({
+            "after": 10, "through": 100, "to": null,
+            "include_closed": true, "limit": 2
+        }))
+        .unwrap();
+        let mut query: MessagesPageQuery = serde_json::from_value(json!({
+            "include_closed": true, "limit": 2
+        }))
+        .unwrap();
+        assert!(cursor.validate(&query, None, None, 2).is_ok());
+        query.subject_prefix = Some("literal_%".into());
+        assert!(cursor.validate(&query, None, None, 2).is_err());
+        cursor.subject_prefix = query.subject_prefix.clone();
+        assert!(cursor.validate(&query, None, None, 2).is_ok());
+        query.subject_prefix = Some("literal".into());
+        assert!(cursor.validate(&query, None, None, 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod subject_filter_tests {
+    use super::*;
+
+    #[test]
+    fn subject_filters_require_sender_before_store_access() {
+        for field in ["subject", "subject_prefix"] {
+            let query: MessagesPageQuery =
+                serde_json::from_value(json!({(field): "review", "to": "agent/reviewer"}))
+                    .unwrap();
+            let error = query.validate_filters().expect_err("accepted subject-only query");
+            assert_eq!(error.code, "validation-failed");
+            assert_eq!(error.message, "subject filters need a sender filter");
+        }
+    }
 }

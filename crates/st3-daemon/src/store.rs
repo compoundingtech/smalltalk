@@ -843,6 +843,8 @@ CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject
 CREATE INDEX IF NOT EXISTS desired_claim_index ON desired(claim_id);
 CREATE INDEX IF NOT EXISTS desired_agent_subject_index ON desired(subject) WHERE kind='agent';
 CREATE INDEX IF NOT EXISTS desired_agent_host_index ON desired(json_extract(member, '$.host'), subject) WHERE kind='agent';
+-- Filtered mail candidate discovery must not walk unrelated desired resources.
+CREATE INDEX IF NOT EXISTS desired_message_subject_index ON desired(subject) WHERE kind='message';
 
 -- Watch subjects encode OWNER/REPO/NUMBER followed by the recipient (which may contain slashes).
 -- Seek that suffix so an idle seat never scans the fleet's declarations.
