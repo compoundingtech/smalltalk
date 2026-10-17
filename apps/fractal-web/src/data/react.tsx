@@ -6,6 +6,7 @@ import type * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { createContext, type ReactNode, useContext } from 'react'
 import * as React from 'react'
 
+import { HumanClockProvider } from '../../../../packages/fractal-ui/src/time/clock.tsx'
 import type { MissionView } from '../missions/model.ts'
 import type { SubjectSummary } from '../shell/context.tsx'
 import { createProjections } from './projections.ts'
@@ -199,9 +200,13 @@ export const DataSourceProvider = ({
     value = derive(source)
     derived.set(source, value)
   }
+  const clock = React.useMemo(() => ({
+    now: () => registry.get(source.now),
+    subscribe: (onTick: () => void) => registry.subscribe(source.now, onTick),
+  }), [registry, source.now])
   return (
     <RegistryContext.Provider value={registry}>
-      <DataContext.Provider value={value}>{children}</DataContext.Provider>
+      <DataContext.Provider value={value}><HumanClockProvider clock={clock}>{children}</HumanClockProvider></DataContext.Provider>
     </RegistryContext.Provider>
   )
 }
@@ -338,3 +343,5 @@ export const useEnvelope = (ref: string) => useAtomValue(useDataSource().envelop
 export const useEvents = () => useAtomValue(useDataSource().events)
 /** Observe the source clock. */
 export const useNow = (): number => useAtomValue(useDataSource().now)
+/** Capture fallback observation timestamps without subscribing the containing content tree. */
+export const useNowSnapshot = (): number => useContext(RegistryContext).get(useDataSource().now)

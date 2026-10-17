@@ -36,6 +36,7 @@ vi.mock('../data/react.tsx', () => ({
   useSubjectList: () => [],
   useConnection: () => ({ _tag: 'Live' }),
   useNow: () => 0,
+  useNowSnapshot: () => 0,
   useGatewaySync: () => gatewayObservation,
   useDataSource: () => ({ gateway: 'alpha.example', reconnect }),
   useFeedInterest: () => {},

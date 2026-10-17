@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { sidebarRow } from './sidebarRow.ts'
 import type { Agent } from '../data/source.ts'
 const agent: Agent = { ref:'agent/fixture/readonly', terminal:'', name:'Reported name', lifecycle: {_tag:'Unknown'}, host:'Reported host', connected:true, activity:'idle', status:'idle', usage: {_tag:'Unknown'}, checkout: {_tag:'Unknown'}, workspace: {_tag:'Unknown'}, startedAt: {_tag:'Unknown'}, endedAt: {_tag:'Unknown'}, blockedOn: {_tag:'Unknown'}, ask: {_tag:'Unknown'}, lastActivityAt: {_tag:'Unknown'} }
-const row = (change: Partial<Agent> = {}, stale = false) => sidebarRow({agent:{...agent,...change},stale,now:10000})
+const row = (change: Partial<Agent> = {}, stale = false) => sidebarRow({agent:{...agent,...change},stale})
 describe('controlled native sidebar observations', () => {
   it('never exposes an unknown raw status in hover copy', () => {
     for (const status of ['indeterminate', 'unexpected-runtime-value']) {
@@ -25,11 +25,14 @@ describe('controlled native sidebar observations', () => {
     expect(row({lastActivityAt:{_tag:'Known',value:9000}}).lastTurn).toEqual({_tag:'Known',kind:'activity',at:9000})
     expect(row({lastActivityAt:{_tag:'Known',value:9000}}).statusSince).toBeUndefined()
   })
-  it('rejects future, nonfinite and non-date timestamps before render', () => {
-    for(const at of [10001,NaN,Infinity,-1,8640000000000001]) {
+  it('rejects nonfinite and non-date timestamps before render', () => {
+    for(const at of [NaN,Infinity,-1,8640000000000001]) {
       expect(row({lastActivityAt:{_tag:'Known',value:at},statusSince:at}).lastTurn).toEqual({_tag:'Unknown'})
       expect(row({lastActivityAt:{_tag:'Known',value:at},statusSince:at}).statusSince).toBeUndefined()
     }
+  })
+  it('preserves structurally valid timestamps for the subscribed leaf to validate against its clock', () => {
+    expect(row({lastActivityAt:{_tag:'Known',value:5500},statusSince:5500})).toMatchObject({lastActivityAt:5500,statusSince:5500})
   })
   it('retains distinct native lifecycle states and freshness', () => {
     for(const [state,status] of [['retired','retired'],['suspended','suspended'],['stopped','ended'],['starting','pending']] as const)

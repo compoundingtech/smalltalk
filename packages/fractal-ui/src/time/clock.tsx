@@ -37,13 +37,15 @@ export const HumanClockProvider = ({ clock, zone, children }: { readonly clock: 
 
 /** The viewer zone from context; pure formatters take it explicitly. */
 export const useHumanTimeZone = (): HumanTimeZone => React.useContext(ZoneContext)
+const noTicks = () => () => {}
 
 /**
  * Subscribe to the context clock through a label projection. React compares the returned
  * strings, so a once-a-second tick re-renders only labels whose text actually changed.
  */
-export const useClockLabel = (label: (now: number, zone: HumanTimeZone) => string): string => {
+export const useClockLabel = (label: (now: number, zone: HumanTimeZone) => string, fixedNow?: number): string => {
   const clock = React.useContext(ClockContext)
   const zone = React.useContext(ZoneContext)
-  return React.useSyncExternalStore(clock.subscribe, () => label(clock.now(), zone), () => label(clock.now(), zone))
+  const snapshot = () => label(fixedNow ?? clock.now(), zone)
+  return React.useSyncExternalStore(fixedNow === undefined ? clock.subscribe : noTicks, snapshot, snapshot)
 }

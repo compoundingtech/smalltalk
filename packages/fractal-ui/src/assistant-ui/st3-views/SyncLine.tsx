@@ -2,15 +2,18 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { Button, Dialog, DialogTrigger, Popover, Tooltip, TooltipTrigger } from 'react-aria-components'
-import { syncLine, type SyncLineInput } from './sync-line'
+import { syncLine, type SyncLineInput, type SyncLineValue } from './sync-line'
 import { accentVars as accent, borderVars as border, geometryVars as g, motionVars as m, radiusVars as r, spaceVars as s, statusVars as status, surfaceVars as surface, textVars as ink, typeVars as t } from '../composition-tokens.stylex'
+import { useClockLabel } from '../../time/clock'
 
 /** The host owns the clock and decodes its own transport into the portable tagged union. */
-export interface SyncLineProps extends SyncLineInput { readonly onRetry?: () => void; readonly compact?: boolean; readonly pill?: boolean }
+export interface SyncLineProps extends Omit<SyncLineInput, 'now'> { readonly now?: number; readonly onRetry?: () => void; readonly compact?: boolean; readonly pill?: boolean }
 const pulse = stylex.keyframes({ from: { opacity: 0.5 }, to: { opacity: 1 } })
 /** Always occupies its existing 24px slot; Live and Evicted leave the slot empty, never add a band. */
 export const SyncLine = React.memo(function SyncLine({ status: observation, label, now, observedAt, gateway, socket, onRetry, compact = false, pill = false }: SyncLineProps) {
-  const line = syncLine({ status: observation, label, now, observedAt, gateway, socket })
+  // A primitive snapshot lets unchanged live/hidden status lines skip clock renders.
+  const snapshot = useClockLabel(now => JSON.stringify(syncLine({ status: observation, label, now, observedAt, gateway, socket }) ?? null), now)
+  const line: SyncLineValue | undefined = JSON.parse(snapshot) ?? undefined
   const failed = observation._tag === 'Failed' && line !== undefined
   const retryable = failed && !(observation.cause._tag === 'Server' && (observation.cause.code === 'unsupported' || observation.cause.code === 'forbidden'))
   return <div data-testid="sync-line" data-sync-state={observation._tag} data-sync-visible={line !== undefined} aria-busy={observation._tag !== 'Live' && observation._tag !== 'Failed'} {...stylex.props(styles.root, compact && styles.compact, pill && styles.fitContent, pill && line !== undefined && styles.pill)}>

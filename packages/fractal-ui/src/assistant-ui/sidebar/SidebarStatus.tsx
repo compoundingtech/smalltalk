@@ -1,9 +1,10 @@
-// Explicit-clock presentation only.
+// Time-bearing leaves support a contextual or explicit clock.
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { VisuallyHidden } from 'react-aria-components'
 import { geometryVars as g, motionVars as m, spaceVars as s, statusVars as tone, textVars as ink, typeVars as t } from '../composition-tokens.stylex'
 import { compactTime, statuses, type AgentStatus } from './model'
+import { useClockLabel } from '../../time/clock'
 
 export type GlyphVariant = 'SG-1' | 'SG-2' | 'SG-3'
 export type DiscRefinement = 'G1' | 'G2' | 'G3'
@@ -33,7 +34,7 @@ const paths: Record<AgentStatus, React.ReactNode> = {
 /** Shapes never collapse distinct states into an attention or completion fixture state. */
 export function SidebarStatus({ status, statusLabel = statuses[status].label, variant = 'SG-1', discRefinement = 'G1', statusSince, now, freshness = 'unobserved', iconOnly = false }: SidebarStatusProps) {
   const boundary = statusSince === undefined ? 'Status boundary unavailable' : `Observed status since ${new Date(statusSince).toISOString()}`
-  const elapsed = statusSince !== undefined && now !== undefined ? compactTime({ at: statusSince, now }) : undefined
+  const elapsed = useClockLabel(now => statusSince === undefined || statusSince > now || iconOnly ? '' : compactTime({ at: statusSince, now }), statusSince === undefined || iconOnly ? 0 : now)
   const runningRing = variant === 'SG-1' && discRefinement === 'G2' && status === 'working'
   const shapeCue = variant === 'SG-1' && discRefinement === 'G3' && status !== 'working' && status !== 'idle'
   // The former native title text stays exact as the glyph's description; hosts own the only hover disclosure.
@@ -43,7 +44,7 @@ export function SidebarStatus({ status, statusLabel = statuses[status].label, va
     <VisuallyHidden elementType="span"><span id={descriptionId}>{`${statusLabel}. ${boundary}. Observation ${freshness}.`}</span></VisuallyHidden>
     {variant === 'SG-2' && !iconOnly && <span>{statusLabel}</span>}
     {/* Icon-only glyphs sit in a fixed icon column; visible text there would overrun the next column. */}
-    {elapsed !== undefined && !iconOnly && <time dateTime={new Date(statusSince!).toISOString()} aria-label={`Elapsed in ${statusLabel}: ${elapsed}`}>{elapsed}</time>}
+    {elapsed !== '' && !iconOnly && <time dateTime={new Date(statusSince!).toISOString()} aria-label={`Elapsed in ${statusLabel}: ${elapsed}`}>{elapsed}</time>}
   </span>
 }
 const styles = stylex.create({

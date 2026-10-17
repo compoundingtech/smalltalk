@@ -5,7 +5,7 @@ import { EmbraceComposer } from '../../../../packages/fractal-ui/src/assistant-u
 import { EmbraceRuntimeProvider } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx'
 import { Transcript } from '../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx'
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
-import { useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useNow } from '../data/react.tsx'
+import { useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useNowSnapshot } from '../data/react.tsx'
 import { createConversationTranscript, openableImageUrl, transcriptObservedAt, transcriptSyncStatus, type ConversationTranscriptState } from './conversationTranscript.ts'
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
@@ -104,8 +104,6 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
   readonly state: ConversationTranscriptState
 }) {
   const source = useDataSource()
-  const now = useNow()
-  const observation = useConversationSync(agentRef)
   const grants = useGrants()
   const [refusal, setRefusal] = React.useState<SendRefusal>()
   const binding = composerSendBinding({
@@ -144,14 +142,13 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
   return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: running, ...(onCancel === undefined ? {} : { onCancel }) }}>
     {/* Bound the 100%-height kit frame to the space left above the composer. */}
     <div data-testid="conversation-history-host" onClickCapture={followDocumentLinks} style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
-    <Transcript
+    <ConversationTranscript
+      agentRef={agentRef}
+      feed={feed}
       viewportKey={agentRef}
       turns={state._tag === 'Observed' ? state.turns : []}
       scrollToBottomKey={feed._tag === 'Observed' ? feed.value.lastSendId : undefined}
       title={agentName}
-      sync={transcriptSyncStatus(observation, feed, now)}
-      now={now}
-      observedAt={transcriptObservedAt(observation, now)}
       onOpenTool={onOpenTool}
       onRetrySync={state._tag === 'Unavailable' || retryConversation === undefined ? undefined : () => retryConversation(agentRef)}
       {...(renderInlineReference === undefined ? {} : { renderInlineReference })}
@@ -178,3 +175,13 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     </div>
   </EmbraceRuntimeProvider>
 })
+
+/** Sync observations can change without rebuilding the runtime or its callbacks. */
+function ConversationTranscript({ agentRef, feed, ...props }: Omit<React.ComponentProps<typeof Transcript>, 'sync' | 'now' | 'observedAt'> & {
+  readonly agentRef: string
+  readonly feed: Feed<ConversationPage>
+}) {
+  const now = useNowSnapshot()
+  const observation = useConversationSync(agentRef)
+  return <Transcript {...props} sync={transcriptSyncStatus(observation, feed, now)} observedAt={transcriptObservedAt(observation, now)} />
+}

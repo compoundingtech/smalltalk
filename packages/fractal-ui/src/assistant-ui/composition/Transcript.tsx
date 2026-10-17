@@ -17,6 +17,7 @@ import { SendFailure, SendUnconfirmed, TranscriptEmptyContent, type TranscriptEm
 import { Icon } from './Icons'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g, motionVars as m } from '../composition-tokens.stylex'
 import { readingColumnStyles } from '../reading-column.stylex'
+import { useClockLabel } from '../../time/clock'
 
 export type LiveActivityState = { readonly _tag: 'Working' } | { readonly _tag: 'WaitingForAnswer' }
 export interface TranscriptTurn {
@@ -37,7 +38,8 @@ export interface TranscriptProps {
   readonly turns: readonly TranscriptTurn[]
   readonly title: string
   readonly sync: SyncStatus
-  readonly now: number
+  /** Omit to subscribe only elapsed/sync labels to the host HumanClockProvider. */
+  readonly now?: number
   readonly observedAt: number
   /** Open output in the host's detail surface. No split/controller is hidden in the kit. */
   readonly onOpenTool?: (call: WorkLogCall) => void
@@ -215,7 +217,7 @@ const contentVersion = (item: ConversationItem): string => {
   contentVersions.set(item, version)
   return version
 }
-const PreparedTurn = React.memo(function PreparedTurn({ turn, now, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; now: number; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
+const PreparedTurn = React.memo(function PreparedTurn({ turn, now, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; now?: number; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
   const reasoning = turn.items.filter(item => item._tag === 'Reasoning')
   const shown = turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning')
@@ -235,11 +237,20 @@ const PreparedTurn = React.memo(function PreparedTurn({ turn, now, stranded, onO
   </section>
 })
 /** Host clock keeps elapsed labels deterministic and pauses with the conversation clock. */
-export function LiveActivity({ state, startedAt, now }: { readonly state: LiveActivityState; readonly startedAt?: string; readonly now: number }) {
-  const started = Date.parse(startedAt ?? '')
-  const duration = Number.isFinite(started) && started <= now ? formatWorkDuration(now - started) || '<1s' : ''
+export function LiveActivity({ state, startedAt, now }: { readonly state: LiveActivityState; readonly startedAt?: string; readonly now?: number }) {
+  const duration = useClockLabel(now => {
+    const started = Date.parse(startedAt ?? '')
+    return Number.isFinite(started) && started <= now ? formatWorkDuration(now - started) || '<1s' : ''
+  }, now)
   const waiting = state._tag === 'WaitingForAnswer'
   return <div data-testid="live-work" role="status" aria-label={waiting ? 'Waiting for your answer' : 'Response in progress'} {...stylex.props(styles.liveActivity)}><span aria-hidden="true" {...stylex.props(styles.liveRing, waiting && styles.waitingRing)} /><span data-testid="live-activity-label" {...stylex.props(styles.liveLabel)}>{`${waiting ? 'Waiting for your answer' : 'Working'}${duration === '' ? '' : ` · ${duration}`}`}</span></div>
+}
+function RunElapsed({ startedAt, now }: { readonly startedAt?: string; readonly now?: number }) {
+  const elapsed = useClockLabel(now => {
+    const started = Date.parse(startedAt ?? '')
+    return Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''
+  }, now)
+  return <span data-testid="run-elapsed">Running{elapsed}</span>
 }
 // Hosts using AssistantRuntimeProvider directly expose no adoption store; its absence never changes.
 const staticSubscription = () => () => undefined
@@ -295,8 +306,8 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   const rows = React.useMemo(() => committed.map(turn => ({ id: turn.id, version: (turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]).map(contentVersion).join(' ') })), [committed])
   const running = [...committed].reverse().find(turn => turn.work.running)
   const progress = sync._tag === 'Progress' && sync.stage === 'reading' && sync.done !== undefined && sync.total !== undefined ? sync : undefined
-  const failure = syncLine({ status: sync, label: 'conversation', now, observedAt })
-  const started = Date.parse(running?.work.startedAt ?? '')
+  // Error copy is time-independent; time-bearing sync copy subscribes inside SyncLine.
+  const failure = sync._tag === 'Failed' ? syncLine({ status: sync, label: 'conversation', now: now ?? observedAt, observedAt }) : undefined
   if (availability._tag === 'Unavailable') return <section aria-label={`Conversation unavailable${landmarkContext ? `, ${landmarkContext}` : ''}`} data-testid="transcript-unavailable" {...stylex.props(styles.frame, styles.empty)}><header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{title}</strong></header><div {...stylex.props(styles.emptyBody)}>
     <TranscriptEmptyContent emptyState={{ title: availability.reason }} />
     {availability.action !== undefined && <Button data-testid="transcript-unavailable-action" onPress={availability.action.onPress} {...stylex.props(styles.unavailableAction)}>{availability.action.label}</Button>}
@@ -309,7 +320,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     <header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{title}</strong>
       {progress !== undefined && <ProgressBar aria-label="Thread synchronization" value={progress.done} maxValue={progress.total} {...stylex.props(styles.progress)}><div {...stylex.props(styles.track)}><div {...stylex.props(styles.fill(`${progress.total === 0 ? 0 : progress.done! / progress.total! * 100}%`))} /></div></ProgressBar>}
       {committed.length > 0 && <SyncLine status={sync} label="conversation" now={now} observedAt={observedAt} onRetry={onRetrySync} />}
-      {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><span data-testid="run-elapsed">Running{Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''}</span></>}
+      {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><RunElapsed startedAt={running.work.startedAt} now={now} /></>}
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport items={rows} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
