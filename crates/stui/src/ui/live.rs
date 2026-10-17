@@ -27,7 +27,10 @@ use st3_client::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     io,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex, mpsc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -604,6 +607,8 @@ pub fn run(context: Context) -> Result<()> {
     let mut attach_started: Option<Instant> = None;
     // Why the attach in progress is waiting, when st refused it for a reason that passes.
     let mut attach_note: Option<String> = None;
+    // Whether a shell's attach is still wanted: its retries stop once its tab is gone.
+    let mut attach_wanted: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
     // The cursor shape last set, so it changes only when the attached terminal asks.
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
@@ -1291,8 +1296,13 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 }
                 Fetched::AttachWaiting { agent, reason } => {
-                    if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
-                        attach_note = Some(reason);
+                    if ui.terminal_view(&agent).is_some() {
+                        if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+                            attach_note = Some(reason);
+                        }
+                    } else if let Some(wanted) = attach_wanted.remove(&agent) {
+                        // Its tab is gone (closed by any route): stop asking.
+                        wanted.store(false, Ordering::Relaxed);
                     }
                 }
                 Fetched::NativeFailed {
@@ -1630,6 +1640,10 @@ pub fn run(context: Context) -> Result<()> {
                     attach_started = Some(Instant::now());
                     attach_note = None;
                     let _ = commands.send(Command::Unfollow);
+                    let wanted = Arc::new(AtomicBool::new(true));
+                    if let Some(earlier) = attach_wanted.insert(agent.clone(), wanted.clone()) {
+                        earlier.store(false, Ordering::Relaxed);
+                    }
                     {
                         let client = client.clone();
                         let tx = fetched_tx.clone();
@@ -1645,6 +1659,7 @@ pub fn run(context: Context) -> Result<()> {
                             };
                             let attached = retry_attach(
                                 delays,
+                                || wanted.load(Ordering::Relaxed),
                                 |reason| {
                                     let _ = tx.send(Fetched::AttachWaiting {
                                         agent: agent.clone(),
@@ -1663,6 +1678,10 @@ pub fn run(context: Context) -> Result<()> {
                                 },
                             )
                             .await;
+                            // Its tab closed while it waited: nobody is left to hear the outcome.
+                            if !wanted.load(Ordering::Relaxed) {
+                                return;
+                            }
                             let _ = tx.send(match attached {
                                 Ok(direct) => Fetched::Native { agent, direct },
                                 Err(reason) => Fetched::NativeFailed {
@@ -1693,6 +1712,11 @@ pub fn run(context: Context) -> Result<()> {
                     let _ = commands.send(Command::Unfollow);
                     attached = None;
                     terminal_runtimes = None;
+                    if let Some(view) = &ui.terminal
+                        && let Some(wanted) = attach_wanted.remove(&view.agent)
+                    {
+                        wanted.store(false, Ordering::Relaxed);
+                    }
                     ui.terminal = None;
                 }
                 Effect::TerminalKey(key) => {
@@ -3149,6 +3173,7 @@ mod tests {
                 .unwrap()
                 .block_on(retry_attach(
                     &vec![Duration::ZERO; delays],
+                    || true,
                     |reason| said.push(reason.to_owned()),
                     || {
                         let next = refusals.next();
@@ -3172,10 +3197,22 @@ mod tests {
             assert_eq!(outcome, Err(reason.to_owned()));
             assert!(said.is_empty(), "{reason} must not be retried");
         }
-        // The retried reasons are the words st's own messages use.
+        // The retried reasons are the words st's own messages use, for every code behind them:
+        // rewording one in st3-client must not quietly stop the retries.
+        for code in [
+            st3_client::ErrorCode::RuntimeAuthorityIndeterminate,
+            st3_client::ErrorCode::RemoteUnavailable,
+            st3_client::ErrorCode::RateLimited,
+            st3_client::ErrorCode::StaleFence,
+        ] {
+            assert!(
+                super::worth_retrying(&st3_client::plain_message(Some(&code), "")),
+                "{code:?} is not retried"
+            );
+        }
         assert!(super::worth_retrying(&st3_client::plain_message(
-            Some(&st3_client::ErrorCode::RuntimeAuthorityIndeterminate),
-            ""
+            Some(&st3_client::ErrorCode::RemoteUnavailable),
+            "host/example is away"
         )));
         assert!(!super::worth_retrying(&st3_client::plain_message(
             Some(&st3_client::ErrorCode::NotFound),
@@ -3183,6 +3220,33 @@ mod tests {
         )));
         // A refusal that passes waits about a minute and a half before the tab gives up.
         assert!(super::ATTACH_RETRY_DELAYS.iter().sum::<Duration>() >= Duration::from_secs(90));
+    }
+
+    #[test]
+    fn a_shells_attach_stops_retrying_once_its_tab_is_closed() {
+        let unsure = "st cannot tell yet which host runs this";
+        let wanted = std::cell::Cell::new(true);
+        let attempts = std::cell::Cell::new(0);
+        let mut said = 0;
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(retry_attach(
+                &[Duration::ZERO; 20],
+                || wanted.get(),
+                |_| {
+                    said += 1;
+                    // The tab is closed while the first wait is under way.
+                    wanted.set(false);
+                },
+                || {
+                    attempts.set(attempts.get() + 1);
+                    async move { Err::<(), _>(unsure.to_owned()) }
+                },
+            ));
+        assert_eq!(outcome, Err(unsure.to_owned()));
+        assert_eq!((attempts.get(), said), (1, 1), "no attempt after the tab is gone");
     }
 
     #[test]
@@ -4794,9 +4858,11 @@ fn worth_retrying(reason: &str) -> bool {
 }
 
 /// Try `attempt` again after each delay while it fails for a reason that passes, telling `waiting`
-/// the reason before each wait; the last refusal comes back once the delays are used up.
+/// the reason before each wait; the last refusal comes back once the delays are used up, or as soon
+/// as `wanted` says nobody is waiting any more (the tab was closed).
 async fn retry_attach<T, Fut>(
     delays: &[Duration],
+    wanted: impl Fn() -> bool,
     mut waiting: impl FnMut(&str),
     mut attempt: impl FnMut() -> Fut,
 ) -> Result<T, String>
@@ -4807,10 +4873,14 @@ where
     loop {
         match attempt().await {
             Err(reason) if worth_retrying(&reason) => match delays.next() {
-                Some(delay) => {
+                Some(delay) if wanted() => {
                     waiting(&reason);
                     tokio::time::sleep(*delay).await;
+                    if !wanted() {
+                        return Err(reason);
+                    }
                 }
+                Some(_) => return Err(reason),
                 None => return Err(reason),
             },
             done => return done,

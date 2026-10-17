@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "stui stops retrying a shell's attach when its tab is closed, and a test now pins every refusal the retry waits out",
+  "replay": {"status": "none", "detail": "Client-only change; no claim replay or recovery behavior."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "The daemon's frames and the client API are unchanged."},
+  "downtime": {"status": "none", "detail": "No startup work or expected interruption."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes; schema and rules versions are unchanged."}
+}
