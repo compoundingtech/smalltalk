@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url'
 import { assertBundleBoundary } from '../src/extensions/bundle-policy.mjs'
-import { assertPublicChangelogBoundary, evaluateBuildIdentityModule, prepareChangelogBuild } from './changelog-build.mjs'
+import { assertPublicChangelogBoundary, ensureChangelogRegistries, evaluateBuildIdentityModule, prepareChangelogBuild } from './changelog-build.mjs'
 
 const changelogManifestModule = fileURLToPath(new URL('../src/changelog/build.ts', import.meta.url))
 const changelogMetadataModule = fileURLToPath(new URL('../src/changelog/metadata.ts', import.meta.url))
@@ -24,6 +24,8 @@ export const extensionBuild = ({ entry, privateBuild, changelogDeployment, chang
     enforce: 'pre',
     configResolved(config) {
       building = config.command === 'build'
+      // The dev server imports the registry from the browser graph without a build start.
+      ensureChangelogRegistries(changelogRegistries)
     },
     // Compile independently of whether the UI graph reaches the changelog modules (production
     // excludes the devbar). The identity is the code this build bundles for `virtual:build-identity`,

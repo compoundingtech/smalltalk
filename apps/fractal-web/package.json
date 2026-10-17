@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "changelog:registry": "node scripts/changelog-registry.mjs",
+    "changelog:registry:check": "node scripts/changelog-registry.mjs --check",
+    "typecheck": "node scripts/changelog-registry.mjs && tsc --noEmit",
     "dev": "vite --config vite.config.ts --configLoader runner",
     "build": "vite build --config vite.config.ts --configLoader runner",
     "start": "node server/main.mts"

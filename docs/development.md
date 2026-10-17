@@ -167,9 +167,15 @@ Ratatui builds, and [build your own client](clients/build-your-own.md) for the c
 
 ## Fractal web changelog
 
-Author a short user-facing entry in `apps/fractal-web/.changelog/YYYY-MM-DD-slug.ts`
-and register it in that directory's `mod.ts`. Export `{ title, summary, kind?, publicPrUrl? }`
-as the default value. Summaries contain one to three complete sentences; kinds are
+Author a short user-facing entry in `apps/fractal-web/.changelog/YYYY-MM-DD-slug.ts`.
+That one new file is the whole change: never edit `mod.ts`, which derives the registry from
+the directory through `registry.generated.ts`. Git ignores that generated file (a committed
+sorted list conflicts whenever two branches add an entry), and every build, typecheck, test and
+dev-server start regenerates it; `pnpm --filter fractal-web changelog:registry` does so by hand
+and `changelog:registry:check` fails when it is missing or stale. Export `{ title, summary, kind?,
+publicPrUrl? }` as the default value. An entry is public unless it also exports
+`visibility = 'private'`, which a public build rejects.
+Summaries contain one to three complete sentences; kinds are
 `feature`, `improvement`, or `fix`. The immutable filename supplies the entry ID and date.
 Only link to a confirmed public GitHub pull request. Do not put private names, hosts,
 paths, seats, or links in public entries.

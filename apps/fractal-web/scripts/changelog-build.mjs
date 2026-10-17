@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { compileChangelog, compileChangelogEntries } from '../src/changelog/compiler.ts'
 import { changelogAudienceByDeployment } from '../src/changelog/contract.ts'
+import { changelogRegistryDirectory, changelogRegistryModules, writeChangelogRegistry } from './changelog-registry.mjs'
 
 // Native loading survives Vite's runner disposing the config evaluator before build hooks.
 const nativeImport = createRequire(import.meta.url)('./changelog-native-import.cjs')
@@ -16,9 +17,14 @@ export const defaultChangelogRegistries = Object.freeze({
 
 const leak = 'Public build leaked private changelog'
 
-/** Every file beside `mod.ts` is an entry; the compiler requires a registry bijection with them. */
+/** Every file beside the registry modules is an entry; the compiler requires a registry bijection with them. */
 const listEntries = (registry, visibility) =>
-  readdirSync(dirname(registry)).filter((file) => file !== 'mod.ts').map((file) => ({ file, visibility }))
+  readdirSync(dirname(registry)).filter((file) => !changelogRegistryModules.includes(file)).map((file) => ({ file, visibility }))
+
+/** The public registry is derived from its directory; derive it before anything imports it. */
+export const ensureChangelogRegistries = (registries = defaultChangelogRegistries) => {
+  if (dirname(registries.public) === changelogRegistryDirectory) writeChangelogRegistry()
+}
 
 const importRegistry = async (registry) => {
   const module = await nativeImport(pathToFileURL(registry).href)
@@ -32,6 +38,7 @@ const importRegistry = async (registry) => {
  * private registry (when present) only to learn what must never appear in their output.
  */
 export const prepareChangelogBuild = async ({ privateBuild, deployment, registries = defaultChangelogRegistries }) => {
+  ensureChangelogRegistries(registries)
   const publicInventory = listEntries(registries.public, 'public')
   const hasPrivate = existsSync(registries.private)
   if (privateBuild && !hasPrivate) throw new Error(`Private build requires ${registries.private}`)

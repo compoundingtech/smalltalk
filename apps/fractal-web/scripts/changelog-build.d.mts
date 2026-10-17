@@ -2,6 +2,7 @@ import type { ChangelogDeployment, ChangelogEntry, ChangelogManifest } from '../
 
 export interface ChangelogRegistries { readonly public: string; readonly private: string }
 export const defaultChangelogRegistries: ChangelogRegistries
+export const ensureChangelogRegistries: (registries?: ChangelogRegistries) => void
 export const prepareChangelogBuild: (options: {
   readonly privateBuild: boolean
   readonly deployment?: ChangelogDeployment | undefined

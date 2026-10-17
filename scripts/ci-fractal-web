@@ -49,6 +49,7 @@ kit_plays() (
 )
 lane "Toolchain and Buck root" toolchain
 lane "Frozen install" pnpm install --frozen-lockfile
+lane "Changelog registry derives from its directory" bash -c 'node apps/fractal-web/scripts/changelog-registry.mjs && node apps/fractal-web/scripts/changelog-registry.mjs --check'
 lane "Dependency licenses" python3 scripts/ci-fractal-web-licenses --check
 lane "Buck typecheck" buck2 build //:typecheck
 lane "Scenario typecheck" pnpm --filter @smalltalk/st3-scenarios typecheck
