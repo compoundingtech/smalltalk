@@ -82,6 +82,8 @@ pub struct SmalltalkRuntime {
     pub(crate) published_missions: published_list::PublishedList<mission_list::MissionRows>,
     /// The current work list, while a refresher keeps it published.
     pub(crate) published_work: published_list::PublishedList<work_list::WorkRows>,
+    /// Current runtime resources, built only by the background collection refresher.
+    pub(crate) published_runtimes: published_list::PublishedList<runtime_list::RuntimeRows>,
     #[cfg(test)]
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -463,6 +465,7 @@ impl Runtime for SmalltalkRuntime {
         // fold under way, before the windows that read them are told to reread.
         self.published_missions.forget();
         self.published_work.forget();
+        self.published_runtimes.forget();
         self.published_views.invalidate();
         self.agent_page_refs_cache
             .lock()

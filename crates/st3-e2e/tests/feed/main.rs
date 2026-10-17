@@ -286,7 +286,13 @@ async fn the_missions_window_is_followed_only_when_asked_and_left_when_not_wante
 async fn a_cursor_from_another_member_discards_the_timeline_and_reloads_snapshots() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
-    let app = st3::api::router(test_state(root.path()));
+    let state = test_state(root.path());
+    let seeded_cut = state.store.index().unwrap();
+    st3::api::start_published_lists(&state);
+    tokio::time::timeout(Duration::from_secs(10),
+        st3::api::wait_published_lists_at_least(&state.store, seeded_cut))
+        .await.expect("cursor-gap reload lists publish their seeded cut").unwrap();
+    let app = st3::api::router(state);
     let server_socket = socket.clone();
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -320,6 +326,7 @@ async fn a_cursor_from_another_member_discards_the_timeline_and_reloads_snapshot
         client.capabilities().await.unwrap().value.event_cursor
     );
     assert!(model.machines.snapshot.is_some());
+    assert!(model.runtimes.snapshot.is_some(), "cursor-gap reload includes the published runtime list");
     assert_eq!(model.status, "Resynchronized after cursor gap");
     server.abort();
 }

@@ -581,6 +581,37 @@ fn authority_error_codes_are_typed_and_round_trip() {
 }
 
 #[test]
+fn runtime_publication_errors_are_typed_and_round_trip() {
+    for (raw, expected) in [
+        ("runtime-list-not-ready", ErrorCode::RuntimeListNotReady),
+        ("runtime-list-ended", ErrorCode::RuntimeListEnded),
+    ] {
+        let decoded: ErrorCode = serde_json::from_str(&format!("\"{raw}\"")).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), format!("\"{raw}\""));
+    }
+}
+
+#[test]
+fn runtime_publication_error_messages_preserve_retryability() {
+    for (code, retryable, expected) in [
+        (ErrorCode::RuntimeListNotReady, true,
+            "st is still preparing the runtime list; try again shortly"),
+        (ErrorCode::RuntimeListEnded, false,
+            "the runtime list stopped updating; restart st"),
+    ] {
+        let envelope = serde_json::from_value(serde_json::json!({
+            "api_version": "st3.client.v0", "error_version": "st3.client.error.v0",
+            "request_id": "request/runtime-publication", "code": code,
+            "message": "raw server message", "retryable": retryable, "details": {},
+        })).unwrap();
+        let error = ClientError::Api(code, "raw server message".into(), Box::new(envelope));
+        assert_eq!(error.plain(), expected);
+        assert_eq!(error.is_transient(), retryable);
+    }
+}
+
+#[test]
 fn creation_actions_round_trip_typed_parameters() {
     for name in ["agent-create.json", "terminal-create.json", "terminal-end.json"] {
         let action: ActionRequest = decode(name);
