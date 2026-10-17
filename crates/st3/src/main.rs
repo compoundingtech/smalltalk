@@ -5958,6 +5958,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
                 }
             });
             spawn_publication_evidence(store.clone());
+            tokio::spawn(build_transport_observation_index(store.clone()));
             startup_telemetry.serving();
             let ready_at = Instant::now();
             startup_phases.log_ready(
@@ -17680,6 +17681,46 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
         });
     if let Err(error) = worker {
         eprintln!("st3: start WAL checkpoint worker: {error}");
+    }
+}
+
+/// This starts only after both APIs serve. Each 128-source-row page joins the
+/// managed background writer queue, releases its loan, then yields for 100 ms.
+async fn build_transport_observation_index(store: Arc<Store>) {
+    use smallclaims::store::transport_observation_index as index;
+    let started = Instant::now();
+    st3::otel::record_index_migration(index::NAME, false, None, None);
+    loop {
+        let page_store = store.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<Option<index::Page>> {
+            if index::ready(&page_store.readers.get())? {
+                return Ok(None);
+            }
+            index::advance(&page_store.connection).map(Some)
+        }).await;
+        match result {
+            Ok(Ok(None)) => {
+                st3::otel::record_index_migration(index::NAME, true, None, None);
+                return;
+            }
+            Ok(Ok(Some(page))) => {
+                st3::otel::record_index_migration(
+                    index::NAME,
+                    page.ready,
+                    Some(page.write_hold),
+                    page.ready.then(|| started.elapsed()),
+                );
+                if page.ready {
+                    return;
+                }
+            }
+            Ok(Err(error)) if maintenance_contention(&error) => {}
+            error => {
+                eprintln!("st: transport observation index build stopped: {error:?}");
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

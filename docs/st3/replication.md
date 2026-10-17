@@ -46,6 +46,53 @@ keeps the newest observation per origin/subject after the D+2 cut; a two-to-thre
 window holds roughly 5,760-8,640 refresh claims, plus each retained newest claim. These are
 arithmetic bounds, not measured saturated-daemon costs.
 
+The receive path's latest-observation lookup uses a local transport-only side index once
+its background bootstrap completes. Store opening does no work for this index: after both
+APIs serve, the managed background writer queue atomically installs capture triggers and a
+high-water mark, then copies at most 128 source rows per transaction with 100 ms yields.
+Each page releases its background loan; pending foreground writers retain priority.
+Sharing the writer also preserves deferred read-then-write snapshots: no independent
+bootstrap connection can commit across an application writer's pending upgrade.
+Inserts, identity/kind/time updates and deletes maintain the index in their claim
+transaction. Until the final page commits, readers use the original canonical query.
+WAL readers remain available during a copy page; other writers wait only for that page,
+not a whole-history `CREATE INDEX`. `st.db.migration.index.ready{index="transport_observation_seek"}`
+reports the switch; `st.db.migration.index.build.duration` records elapsed build seconds and
+`st.db.migration.index.write_hold.duration` records each page's begin-through-commit
+write-hold upper bound, including finalizers and SQLite acquisition wait but excluding
+background queue admission. The index is rebuildable local acceleration, not replicated authority.
+
+For offline production-size evidence, build the aggregate-only
+`smallclaims` example `transport_observation_bench` in release mode with the
+`transport-bench` feature. Run `--store COPY --n 1000 --mode before --bootstrap-yield-ms 0`,
+then the same command with `--mode after`, using the same checkpointed disposable input.
+Both modes measure a private temporary copy; the before mode removes the helper
+objects and uses main's identical SQL literal, per-call canonical expansion and
+uncached `query_row` preparation path, without readiness probes. The after mode
+executes every real bootstrap page. The example-only `--bootstrap-yield-ms` defaults
+to the daemon's 100 ms inter-page yield; use `0` for the accelerated measurement
+without changing transaction boundaries or sampling. Production pacing is unchanged.
+Project production-paced bootstrap time as `bootstrap_elapsed_ms / 1000 +
+bootstrap_pages * 0.1` seconds from a zero-yield run (a conservative extra yield
+for the final page). Removing deliberate sleeps targets an approximately one-hour
+operator run, but storage speed and unknown claim count can still exceed that target.
+The harness rejects open databases, SQLite sidecars and nearby daemon socket/lock
+artifacts; Linux write-lease support is required. Set `TMPDIR` to private local
+storage with capacity for the database plus its working WAL (reflinks are attempted).
+Only aggregate JSON is emitted, including every bootstrap transaction and the
+writer-transaction totals and wall time per synthetic receive-shaped claim insert.
+The JSON also reports `source_claim_rows` from one premeasurement count,
+`bootstrap_elapsed_ms`, `bootstrap_pages`, `bootstrap_yield_ms` and `index_bytes`.
+When `index_bytes_dbstat` is true, size sums `dbstat.pgsize` for both helper tables
+and their indexes. Otherwise it is the checkpointed `page_count * page_size` growth
+across bootstrap, excluding WAL; reused free pages can make this fallback undercount
+the objects' occupied space. Sizing/checkpoint work is outside transaction samples.
+The advance API exposes copied observation rows, not scanned source rows, so
+`bootstrap_rows_copied` must not be interpreted as the scanned claim count.
+The workload persists a synthetic message and its transport observation, not the
+full replication authentication or runtime projection path. No stored message
+bodies or identifiers are emitted; failures are deliberately detail-free.
+
 The daemon caches its sealed membership view at the store's fleet generation, rather than
 folding the full fleet history on every worker poll. The generation and fold share a read
 snapshot. Fleet claims, their batch/envelope identities, verified signer rows and the pinned

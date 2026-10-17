@@ -30,6 +30,23 @@ mod read_admission_tests;
 use transaction_finalizer::TransactionFinalizers;
 pub use transaction_finalizer::WriterTransaction;
 
+/// Aggregate-only samples for the isolated, serial benchmark process.
+#[cfg(feature = "transport-bench")]
+pub mod transport_bench {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static SAMPLES: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(duration: Duration) {
+        SAMPLES.lock().expect("benchmark sample mutex").push(duration);
+    }
+
+    pub fn take() -> Vec<Duration> {
+        std::mem::take(&mut *SAMPLES.lock().expect("benchmark sample mutex"))
+    }
+}
+
 pub(crate) mod writer_observer;
 pub use writer_observer::WriterObserver;
 
@@ -977,6 +994,8 @@ fn run_write_batch(
     drop(transaction_timer);
     // Observe COMMIT before post-commit callbacks can unwind; no changed-row or ACK claim.
     if committed.is_ok() {
+        #[cfg(feature = "transport-bench")]
+        transport_bench::record(started.elapsed());
         crate::profile::managed_commit_succeeded();
     }
     telemetry::METRICS.batch.record(started.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());

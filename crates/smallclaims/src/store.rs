@@ -78,6 +78,7 @@ pub mod first_sync;
 pub mod principals;
 pub mod projection_digest;
 pub mod runtime;
+pub mod transport_observation_index;
 
 pub use runtime::{IncrementalProjection, ReplayProgress, Runtime};
 
@@ -751,6 +752,9 @@ pub type MemberRoots = BTreeSet<(String, String)>;
 /// projections read and write through the same connections.
 pub struct Store {
     pub connection: WriterConnection,
+    /// Same-code baseline for the isolated transport benchmark only.
+    #[cfg(feature = "transport-bench")]
+    pub transport_bench_original_lookup: AtomicBool,
     pub readers: ReadPool,
     pub committed_index: Arc<AtomicU64>,
     pub seeded_batch_rowid: AtomicI64,
@@ -1028,6 +1032,8 @@ impl Store {
         let committed_index = Arc::new(AtomicU64::new(index));
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
+            #[cfg(feature = "transport-bench")]
+            transport_bench_original_lookup: AtomicBool::new(false),
             readers,
             committed_index,
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
@@ -7732,19 +7738,32 @@ impl Store {
         let subject = format!("host/{peer}");
         let now = now_ms();
         // Another member's observation of this peer cannot renew this node's evidence.
-        let latest: Option<(String, String)> = self
-            .readers
-            .get()
-            .query_row(
-                &canonical_sql(
-                    "SELECT body, accepted_at_unix_ms FROM claims
+        #[cfg(feature = "transport-bench")]
+        let latest = if self.transport_bench_original_lookup.load(Ordering::Relaxed) {
+            // Preserve main's uncached query_row path, including per-call SQL expansion.
+            let latest: Option<(String, String)> = self
+                .readers
+                .get()
+                .query_row(
+                    &canonical_sql(
+                        "SELECT body, accepted_at_unix_ms FROM claims
                 WHERE subject=?1 AND kind='transport.observed' AND origin=?2
                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                params![subject, self.origin],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
+                    ),
+                    params![subject, self.origin],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            latest
+        } else {
+            transport_observation_index::latest(
+                &self.readers.get(), &subject, &self.origin,
+            )?
+        };
+        #[cfg(not(feature = "transport-bench"))]
+        let latest = transport_observation_index::latest(
+            &self.readers.get(), &subject, &self.origin,
+        )?;
         let already_current = latest.is_some_and(|(body, accepted_at)| {
             let body: Value = serde_json::from_str(&body).unwrap_or_default();
             let observed_at = body

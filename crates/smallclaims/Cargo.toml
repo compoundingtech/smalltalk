@@ -37,6 +37,8 @@ uuid = { version = "1", features = ["v7"] }
 # Counters that tests of a runtime built on the graph read, such as the SQLite statements a
 # thread ran. Off in every non-test build.
 test-support = []
+# Opt-in standalone transport benchmark; absent from production builds.
+transport-bench = []
 
 [dev-dependencies]
 futures-util = "0.3"
@@ -45,3 +47,7 @@ proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
+
+[[example]]
+name = "transport_observation_bench"
+required-features = ["transport-bench"]
