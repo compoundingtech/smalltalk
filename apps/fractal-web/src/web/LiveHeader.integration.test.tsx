@@ -145,7 +145,10 @@ describe('live header parity', () => {
   it('retains a disabled resources control with a human refusal reason', async () => {
     await click('Resources')
     await act(async () => registry.set(resources, unavailable({ reason: 'ungranted', detail: 'raw-denial-code' })))
-    expect(button('Resources')?.disabled).toBe(true)
+    // Focusable while disabled, so keyboard users reach the reason in the kit tooltip.
+    expect(button('Resources')?.getAttribute('aria-disabled')).toBe('true')
+    expect(button('Resources')?.disabled).toBe(false)
+    expect(button('Resources')?.closest('[title]')).toBeNull()
     const reason = document.getElementById(button('Resources')!.getAttribute('aria-describedby')!)
     expect(reason?.textContent).toBe('Read access to agent resources has not been granted.')
     expect(host.querySelector('[data-testid="thread-header"]')?.textContent).not.toMatch(/raw-denial-code|Unknown/)

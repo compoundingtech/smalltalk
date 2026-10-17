@@ -1,6 +1,6 @@
 import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { expect, within } from 'storybook/test'
+import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { ThreadHeader } from './assistant-ui/composition/Shell'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
@@ -15,16 +15,22 @@ function ThreadHeaderStory({ scheme = 'dark', terminalDisabledReason }: { scheme
 const meta = { title: 'Fractal UI/Thread header', component: ThreadHeaderStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ThreadHeaderStory>
 export default meta
 type Story = StoryObj<typeof meta>
-/** The host knows why the terminal is unavailable: the toggle stays in place, disabled and described. */
+/** The host knows why the terminal is unavailable: the toggle stays in place and in the tab order, disabled and described; focus shows the reason in the kit tooltip. */
 export const TerminalDisabled: Story = { tags: ['critical'], args: { terminalDisabledReason: terminalReason }, play: async ({ canvasElement }) => {
   const header = within(canvasElement).getByTestId('thread-header')
   const toggle = within(header).getByRole('button', { name: 'Toggle terminal drawer' })
   await expect(toggle).toBeVisible()
-  await expect(toggle).toBeDisabled()
+  await expect(toggle).toHaveAttribute('aria-disabled', 'true')
   await expect(toggle).toHaveAccessibleName('Toggle terminal drawer')
   await expect(toggle).toHaveAccessibleDescription(terminalReason)
   await expect(within(header).getAllByRole('button').map(button => button.getAttribute('aria-label'))).toEqual(['Toggle terminal drawer', 'Toggle right panel'])
-  await expect(toggle.closest('[title]')).toHaveAttribute('title', terminalReason)
+  await expect(header.querySelector('[title]')).toBeNull()
+  ;(document.activeElement as HTMLElement | null)?.blur()
+  await userEvent.tab()
+  await expect(toggle).toHaveFocus()
+  await waitFor(() => expect(within(document.body).getByRole('tooltip')).toHaveTextContent(`Toggle terminal drawer · ${terminalReason}`))
+  await userEvent.keyboard('{Escape}')
+  await waitFor(() => expect(within(document.body).queryByRole('tooltip')).toBeNull())
 } }
 export const TerminalDisabledLight: Story = { ...TerminalDisabled, args: { ...TerminalDisabled.args, scheme: 'light' } }
 /** Without a reason the unavailable terminal leaves no toggle behind. */

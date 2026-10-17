@@ -4,8 +4,7 @@ import * as stylex from '@stylexjs/stylex'
 import { useAtom, useAtomValue } from '@effect/atom-react'
 import * as Atom from 'effect/reactivity/Atom'
 import { DateTime } from 'effect'
-// Deep import: the assistant-ui barrel would pull the transcript graph into the eager shell.
-import { Icon as CompositionIcon } from '../../../../packages/fractal-ui/src/assistant-ui/composition/Icons.tsx'
+import { ChromeControl } from '@smalltalk/fractal-ui/assistant-ui/shell'
 import { colorVars as c, typeVars as t, spaceVars as s } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { compactTime } from '../../../../packages/fractal-ui/src/assistant-ui/sidebar/model.ts'
 import { useDataSource, useNow } from '../data/react.tsx'
@@ -25,14 +24,13 @@ export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: str
   // resource read and keeps its 15-second poll alive despite showing no resources.
   const resources = useAtomValue(source.resources === undefined ? unsupportedResources
     : resourcesOpen ? source.resources.byAgent(agentRef) : unopenedResources)
-  const reasonId = React.useId()
   const disabledReason = resources._tag === 'Unavailable'
     ? resources.reason === 'ungranted' ? 'Read access to agent resources has not been granted.'
       : resources.reason === 'unsupported' ? 'This connection does not support agent resources.' : undefined
     : undefined
   return <div {...stylex.props(styles.actions)}>
     <Aria.DialogTrigger isOpen={resourcesOpen} onOpenChange={setResourcesOpen}>
-      <Aria.Button aria-label="Resources" aria-expanded={resourcesOpen} isDisabled={disabledReason !== undefined} aria-describedby={disabledReason === undefined ? undefined : reasonId} {...stylex.props(styles.button)}><CompositionIcon name="folder" />Resources</Aria.Button>
+      <ChromeControl icon="folder" label="Resources" {...(disabledReason === undefined ? {} : { disabledReason })} />
       <Aria.ModalOverlay isDismissable {...stylex.props(styles.overlay)}>
         <Aria.Modal {...stylex.props(styles.modal)}>
           <Aria.Dialog aria-label="Agent resources" {...stylex.props(styles.dialog)}>
@@ -42,9 +40,8 @@ export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: str
         </Aria.Modal>
       </Aria.ModalOverlay>
     </Aria.DialogTrigger>
-    {disabledReason === undefined ? null : <span id={reasonId} {...stylex.props(styles.reason)}>{disabledReason}</span>}
     <Aria.MenuTrigger>
-      <Aria.Button aria-label="Conversation menu" {...stylex.props(styles.button)}><CompositionIcon name="gear" /></Aria.Button>
+      <ChromeControl icon="gear" label="Conversation menu" />
       <Aria.Popover {...stylex.props(styles.popover)}>
         <Aria.Menu aria-label="Conversation settings" selectionMode="multiple" selectedKeys={showSystemEvents ? ['system'] : []} onSelectionChange={keys => setShowSystemEvents(keys === 'all' || keys.has('system'))} {...stylex.props(styles.menu)}>
           <Aria.MenuItem id="system" {...stylex.props(styles.menuItem)}>Show all system events</Aria.MenuItem>
@@ -97,7 +94,6 @@ const ReadNotice = ({ feed, label }: { readonly feed: Exclude<Feed<unknown>, { r
 const styles = stylex.create({
   actions: { display: 'flex', alignItems: 'center', gap: s.md },
   button: { display: 'inline-flex', alignItems: 'center', gap: s.xs, padding: '4px 8px', borderWidth: 0, borderRadius: 6, backgroundColor: 'transparent', color: c.fgMuted, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outline: `2px solid ${c.primary}` }, ':disabled': { opacity: 0.5, cursor: 'default' } },
-  reason: { fontSize: t.denseSize, color: c.fgMuted },
   overlay: { position: 'fixed', inset: 0, zIndex: 100, display: 'flex', justifyContent: 'flex-end', backgroundColor: 'rgba(0, 0, 0, 0.4)' },
   modal: { width: 380, maxWidth: 'calc(100vw - 24px)', height: '100%', backgroundColor: c.raised, color: c.fg, fontFamily: t.fontSans, fontSize: t.metaSize },
   dialog: { display: 'flex', flexDirection: 'column', height: '100%', outline: 'none' },

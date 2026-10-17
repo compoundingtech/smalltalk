@@ -1,6 +1,7 @@
 import * as stylex from '@stylexjs/stylex'
 import * as React from 'react'
 import * as Aria from 'react-aria-components'
+import { ChromeControl } from '@smalltalk/fractal-ui/assistant-ui/shell'
 
 import { colorVars as c, spaceVars as s, typeVars as t } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import type { AgentControl, AgentControlResult } from '../agents/agent-control-port.ts'
@@ -73,7 +74,7 @@ export const AgentActions = ({ agent }: { readonly agent: Pick<Agent, 'ref' | 'n
     <div {...stylex.props(styles.actions)}>
       {status ? <span role="status" {...stylex.props(styles.status)}>{status}</span> : null}
       <Aria.MenuTrigger>
-        <Aria.Button aria-label={`Actions for ${agent.name}`} isDisabled={busy} {...stylex.props(styles.button)}>Agent</Aria.Button>
+        <ChromeControl icon="person" label={`Actions for ${agent.name}`} isDisabled={busy} />
         <Aria.Popover placement="bottom end" {...stylex.props(styles.popover)}>
           <Aria.Menu
             aria-label={`Actions for ${agent.name}`}
