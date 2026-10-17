@@ -71,14 +71,24 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 [patch.crates-io]
 libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
 
+# Debug assertions are OFF in the dev and test profiles and ON in release-with-assertions runs
+# (docs/ci.md, "Debug assertions"): measured on the same tree, they cost about 21% of compile CPU
+# and 26% of a cold compile's wall time, and about 14% of a debug-glue-heavy test's CPU (std's
+# unsafe-precondition checks and debug_assert! in every crate). Overflow checks, assert! and
+# bounds checks stay on. To run a build with the assertions: CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=true
+# CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true. The profile is part of the tree, so a signed run binds it.
 [profile.dev]
 debug = 1
+debug-assertions = false
+overflow-checks = true
 
 [profile.dev.package."*"]
 debug = 0
 
 [profile.test]
 debug = 1
+debug-assertions = false
+overflow-checks = true
 
 [profile.test.package."*"]
 debug = 0
@@ -88,8 +98,9 @@ debug = 0
 [profile.test.package.st3-daemon]
 debug = 0
 
-# Optimize hot third-party code in dev/test while preserving assertions and the
-# existing no-debug-info dependency policy. Workspace crates retain opt-level 0.
+# Optimize hot third-party code in dev/test while preserving assertions (these four keep
+# debug-assertions on at opt-level 3, where they are cheap) and the existing no-debug-info
+# dependency policy. Workspace crates retain opt-level 0.
 
 [profile.dev.package.libsqlite3-sys]
 opt-level = 3

@@ -416,6 +416,7 @@ fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() 
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
     let _runtime = RUNTIME_TEST.lock().unwrap();

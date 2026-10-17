@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The dev and test profiles build without debug assertions (overflow checks stay on); release is unchanged",
+  "replay": {"status": "none", "detail": "Build profile only."},
+  "schema": {"status": "none", "detail": "No schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {"status": "none", "detail": "No product behaviour change; the st2 test seams (ST2_TEST_*) exist only in builds with debug assertions."},
+  "downtime": {"status": "none", "detail": "No restart."},
+  "manual": {"status": "none", "detail": "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=true CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true builds with them."},
+  "recovery": {"status": "none", "detail": "Revert the commit."}
+}

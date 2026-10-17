@@ -115,6 +115,7 @@ fn completed_event_replay_rejects_changed_supersession_intent() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn durable_successor_failure_retains_replayable_pending_receipt() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -697,6 +698,7 @@ fn initial_supersession_authenticates_predecessor_immediately_before_archive() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn predecessor_replacement_after_validation_cannot_forge_archive_receipt() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -893,6 +895,7 @@ fn invalid_archive_receipt_blocks_supersession_before_successor_publication() {
     assert!(archive.join(&predecessor.filename).is_file());
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn a_different_event_reconciles_both_pending_crash_windows() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -976,6 +979,7 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -1059,6 +1063,7 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn pending_reconciliation_rejects_a_fifo_without_blocking() {
     use std::ffi::CString;
@@ -1112,6 +1117,7 @@ fn pending_reconciliation_rejects_a_fifo_without_blocking() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn a_different_event_completes_pending_successor_compaction() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -1158,6 +1164,7 @@ fn a_different_event_completes_pending_successor_compaction() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn pending_supersession_authenticates_its_predecessor_before_archive() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -1209,6 +1216,7 @@ fn pending_supersession_authenticates_its_predecessor_before_archive() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn pending_supersession_accepts_an_authenticated_archive_only_predecessor() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -1245,6 +1253,7 @@ fn pending_supersession_accepts_an_authenticated_archive_only_predecessor() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn pending_supersession_recovery_unlinks_a_durably_archived_predecessor() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -1281,6 +1290,7 @@ fn pending_supersession_recovery_unlinks_a_durably_archived_predecessor() {
     assert!(!inbox.join(&predecessor.filename).exists());
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn archived_pending_event_still_authenticates_a_same_name_inbox_entry() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
@@ -1330,6 +1340,7 @@ fn archived_pending_event_still_authenticates_a_same_name_inbox_entry() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn pending_supersession_fails_closed_when_predecessor_has_no_receipt() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();

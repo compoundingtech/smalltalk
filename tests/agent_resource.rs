@@ -511,6 +511,7 @@ fn a_binding_with_a_trailing_line_comment_is_removable_and_updatable() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn refresh_binding_validation_and_generation_share_one_catalog_snapshot() {
     let _guard = OBSERVE_ENV_LOCK
@@ -636,6 +637,7 @@ fn refresh_binding_validation_and_generation_share_one_catalog_snapshot() {
     assert!(spec(&root).contains("https://example.test/replacement"));
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn refresh_cli_reports_exact_receipts_and_wait_expiry_keeps_the_request() {
     let _guard = OBSERVE_ENV_LOCK

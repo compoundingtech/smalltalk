@@ -774,6 +774,7 @@ fn wait_for(path: &Path) {
     assert!(path.exists(), "timed out waiting for {}", path.display());
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn retained_prepared_capture_cannot_be_redirected_by_a_source_swap() {
     let (temp, catalog, prepared, root) = fixture();

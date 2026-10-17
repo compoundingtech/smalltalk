@@ -411,6 +411,7 @@ fn concurrent_cli_writers_serialize_without_losing_either_field() {
     assert_eq!(fs::metadata(lock_path).unwrap().ino(), inode);
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
     let temporary = tempfile::tempdir().unwrap();
@@ -536,6 +537,7 @@ fn catalog_lock_refuses_a_symlinked_control_directory() {
     assert!(!outside.join("catalog-authoring.lock").exists());
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn presentation_crash_stages_only_in_the_control_plane() {
     let temporary = tempfile::tempdir().unwrap();
@@ -595,6 +597,7 @@ fn presentation_crash_stages_only_in_the_control_plane() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn presentation_post_commit_generation_failure_is_fenced_and_recovered() {
     let temporary = tempfile::tempdir().unwrap();
@@ -650,6 +653,7 @@ fn presentation_post_commit_generation_failure_is_fenced_and_recovered() {
     assert!(!root.join(".st2/catalog-generation-incomplete").exists());
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn control_directory_swap_cannot_redirect_presentation_staging() {
     let temporary = tempfile::tempdir().unwrap();

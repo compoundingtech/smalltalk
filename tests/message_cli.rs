@@ -274,6 +274,7 @@ fn replies_are_indexed_with_the_canonical_recipient_and_thread_relation() {
     assert_eq!(value["messages"][0]["idempotencyKey"], "answer-once");
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() {
     let tmp = tempfile::tempdir().unwrap();
@@ -354,6 +355,7 @@ fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() 
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn keyed_retry_recovers_every_crash_boundary_without_false_sent_or_duplicates() {
     for crash_after in [
@@ -449,6 +451,7 @@ fn keyed_retry_recovers_every_crash_boundary_without_false_sent_or_duplicates() 
     }
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_invalid() {
     let prepare = || {
@@ -1011,6 +1014,7 @@ fn idempotency_key_scope_is_independent_across_senders_and_recipients() {
     );
 }
 
+#[cfg_attr(not(debug_assertions), ignore = "needs a debug-assertions build: the ST2_TEST_* fault and pause seams exist only with debug assertions")]
 #[test]
 fn unkeyed_retry_after_committed_response_loss_publishes_again() {
     for crash_after in ["head", "pending-cleanup", "active-cleanup"] {

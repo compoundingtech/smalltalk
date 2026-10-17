@@ -748,6 +748,34 @@ Cargo builds use the host's four-job limit. Workspace test shards explicitly use
 threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
 can override admission; keep it at four when preserving CPU capacity for reserved lanes.
 
+### Debug assertions
+
+The workspace `dev` and `test` profiles build with `debug-assertions = false` and
+`overflow-checks = true` (root `Cargo.toml`), so CI, the signed full-gate runs and every seat build
+the same profile; `release` is unchanged. Measured on one tree, the assertions cost about 21% of
+compile CPU, 26% of a cold compile's wall time and about 14% of a debug-glue-heavy test's CPU (std's
+unsafe-precondition checks and `debug_assert!` in every crate). `assert!`, bounds checks and integer
+overflow checks stay on. The profile is part of the tree, so a signed note binds it.
+
+To build and test with the assertions (what the daily run does), set both lines:
+
+    CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=true CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true
+
+What only exists or only means something with them:
+
+- The `ST2_TEST_*` fault and pause seams of the st2 catalog, event, message and agent publish code
+  (`crates/st-drivers`, `src/`) are compiled under `cfg(debug_assertions)`. The st2 tests that drive
+  them carry `#[cfg_attr(not(debug_assertions), ignore = "...")]`: they are listed as ignored in the
+  default profile and run in the assertions profile (`tests/agent_presentation.rs`,
+  `tests/agent_publish.rs`, `tests/agent_resource.rs`, `tests/message_cli.rs`,
+  `tests/stream_authoring_cli.rs`, `tests/catalog_apply.rs`, `tests/catalog_diff.rs`,
+  `tests/event_e2e.rs`).
+- The daemon benchmark and load tests (`daemon_bench`, `first_sync`, `daemon_load`) skipped in any
+  build that was not optimized by testing `cfg!(debug_assertions)`; they now ask
+  `st3::test_support::optimized_build()` (the executable is under `target/release/`).
+- Tests already behind `#[cfg(debug_assertions)]` (`ding/tests.rs`, `empty_authority_guard.rs`)
+  run only in the assertions profile.
+
 ### Compiler-cache measurement
 
 `python3 scripts/sccache-evidence capture` reads an already-running Linux sccache

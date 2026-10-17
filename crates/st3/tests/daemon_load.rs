@@ -330,7 +330,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         println!("skipped: set ST_LOAD_GATE=1 to run the load test");
         return;
     }
-    if cfg!(debug_assertions) {
+    if !st3::test_support::optimized_build() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
@@ -423,7 +423,7 @@ fn a_seat_priority_hog_leaves_the_request_latency_targets_reported() {
         println!("skipped: set ST_LOAD_GATE=1 and ST_LOAD_HOG=1 to run the hog load test");
         return;
     }
-    if cfg!(debug_assertions) {
+    if !st3::test_support::optimized_build() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
@@ -711,7 +711,7 @@ fn a_cold_roster_rebuild_reads_the_fleet_in_few_statements() {
         println!("skipped: set ST_LOAD_GATE=1 to run the load test");
         return;
     }
-    if cfg!(debug_assertions) {
+    if !st3::test_support::optimized_build() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
