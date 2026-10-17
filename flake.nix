@@ -1222,6 +1222,7 @@
             pkgs.git
             pkgs.gnutar
             pkgs.jq
+            pkgs.nodejs
             pkgs.openssh
             pkgs.python3
             pkgs.zstd
@@ -1393,7 +1394,7 @@
         };
         # Configuration generation must not realize the Rust/PTY/collector shell.
         devShells.genie = pkgs.mkShell {
-          packages = [ effect-utils.packages.${system}.genie ];
+          packages = [ effect-utils.packages.${system}.genie pkgs.nodejs ];
           shellHook = ''
             mkdir -p repos
             ln -sfn ${effect-utils} repos/effect-utils

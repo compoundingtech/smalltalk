@@ -3456,6 +3456,9 @@ jobs:
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (success()) }}
   fractal-web-execution:
     name: fractal-web-execution
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.fractal-web-changes.outputs.kit-inputs == 'true' && '{"shard":[0,1]}' || '{"shard":[0]}') }}
     needs: [fractal-web-changes, genie-freshness]
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (!cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' && needs.genie-freshness.result == 'success') }}
     runs-on: ubuntu-latest
@@ -3493,11 +3496,21 @@ jobs:
         env:
           pnpm_config_store_dir: "${{ runner.temp }}/pnpm-store"
           KIT_INPUTS: ${{ needs.fractal-web-changes.outputs.kit-inputs }}
+          KIT_SHARD_INDEX: ${{ matrix.shard }}
+          KIT_SHARD_COUNT: "2"
+          KIT_RECEIPT_DIRECTORY: "${{ runner.temp }}/kit-play-receipts"
           KIT_PLAY_SET: ${{ github.event_name == 'pull_request' && 'critical' || 'all' }}
           KIT_PLAY_A11Y: ${{ github.event_name == 'pull_request' && 'off' || 'on' }}
           KIT_PLAY_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '420' || '' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+      - name: Preserve kit shard receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "kit-play-${{ github.run_id }}-${{ github.sha }}-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+          path: "${{ runner.temp }}/kit-play-receipts/receipt.json"
+          if-no-files-found: ignore
       - name: Report job cache coverage
         if: always()
         shell: bash
@@ -3510,7 +3523,8 @@ jobs:
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (always()) }}
     runs-on: ubuntu-latest
     timeout-minutes: 1
-    permissions: {}
+    permissions:
+      contents: read
     steps:
       - name: Require detection and, for web changes, execution
         env:
@@ -3556,6 +3570,18 @@ jobs:
               sys.exit(main())
 
           PY
+      - uses: actions/checkout@v4
+        if: needs.fractal-web-changes.outputs.kit-inputs == 'true' && needs.fractal-web-changes.outputs.relevant == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: needs.fractal-web-changes.outputs.kit-inputs == 'true' && needs.fractal-web-changes.outputs.relevant == 'true'
+        with:
+          pattern: "kit-play-${{ github.run_id }}-${{ github.sha }}-shard-*-attempt-*"
+          path: "${{ runner.temp }}/kit-play-receipts"
+      - name: Require every kit shard and exact full-index coverage
+        if: needs.fractal-web-changes.outputs.kit-inputs == 'true' && needs.fractal-web-changes.outputs.relevant == 'true'
+        run: node packages/fractal-ui/scripts/kit-play-shards.mjs "$RUNNER_TEMP/kit-play-receipts" 2
       - name: Report job cache coverage
         if: always()
         shell: bash
