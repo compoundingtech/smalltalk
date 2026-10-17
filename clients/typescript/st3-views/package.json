@@ -2,6 +2,7 @@
   "name": "@smalltalk/st3-views",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": "./index.ts",
