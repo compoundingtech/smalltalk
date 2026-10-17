@@ -649,6 +649,13 @@ fn archive_setup_installs_st_and_starts_one_isolated_daemon_without_gh_or_harnes
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("not installed on the daemon's login PATH"));
     assert!(before.elapsed() < Duration::from_secs(5), "missing harness must fail before waiting for a seat");
+    // Socket readiness is not a roster publication; this fixture explicitly needs one.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(st3_client::Client::unix(fixture.path("run/st3.sock")).agents_list_after(None, None, false, 0))
+        .expect("the fixture must publish its initial roster");
     let agents = fixture.cli().args(["agents", "ls", "--json"]).output().unwrap();
     assert!(!success(&agents).contains("fixture-missing"), "missing binary must not publish a restarting seat");
     let output = fixture

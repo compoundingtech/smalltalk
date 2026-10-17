@@ -11,6 +11,11 @@ st --instance trial agents ls
 st --instance trial uninstall --yes --erase-local-graph
 ```
 
+After instance startup, `agents ls` may report that its initial roster is still being
+prepared. After changing an agent it can show the previous publication. A client that needs
+its own write uses that instance daemon's receipt `store_index` as `min_cut` and checks the
+served snapshot; a receipt from the default install or another host is not interchangeable.
+
 `st --instance NAME setup` runs the first-run questions for the instance: it installs `st3`, `st` and
 `pty` into the instance's own `bin/` (nothing goes on your login PATH or into `~/.local/bin`), and
 the built-in Smalltalk Assistant works in the instance's work folder, `work/agents/`. Run the instance's commands from

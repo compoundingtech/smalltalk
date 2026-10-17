@@ -20,6 +20,11 @@ newest publication at once. Its original snapshot cut and publication time show 
 The other two answer at once from a published roster. Count the fresh row against its own
 target: the route total includes it.
 
+A first page with `min_cut=N` instead waits for that fixed host-local acceptance index,
+not the changing request head. It uses the same `fresh` request-latency classification and
+`fresh-wait`/`fresh-page` stages. If both `fresh=true` and `min_cut` are supplied, only the
+named barrier runs. Plain CLI listings send neither and remain `first-page` reads.
+
 `scope: "agents-roster"` rows (also under route `/v1/client/agents`) time where that wait goes,
 each in its own last-512 sample, `duration_scope: "roster-stage"`. Stage `refresh` is one refresher
 fold from the previous publication, `refresh-cold` one with no publication to start from, which
@@ -60,9 +65,9 @@ time from a subscription on the client collections socket to its first snapshot,
 page or terminal screen. A read the daemon relayed from another machine's owner counts toward
 the target's `remote_windows` and its remote target. A request that asks to wait (`wait_ms` above
 zero, or `wait=true`) is a long poll: it is kept under `METHOD /route (long poll)` and counts
-toward no target. An agents list asked to be fresh (`fresh=true`, which `st agents ls` and
-`st agents tree` always send) waits for one roster refresh by design but is still a wait a person
-sits through, so it is the path `GET /v1/client/agents (fresh)` with its own `person-read-fresh`
+toward no target. An agents list with legacy `fresh=true` or an explicit `min_cut` asks to wait for a
+publication. Ordinary `st agents ls` and `st agents tree` send neither. The explicit wait is
+still a wait a person sits through, so it is the path `GET /v1/client/agents (fresh)` with its own `person-read-fresh`
 target and counts toward no other: a first page is held to the 100 ms of `person-read`, a fresh
 list to 300 ms. The `sql-statement`, `transaction` (`read`, `write`, `writer_hold`) and `cpu`
 rows cover the store's statements, its read and write transactions, each hold of its single

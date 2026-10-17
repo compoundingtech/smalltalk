@@ -30,6 +30,49 @@ fn test_state(root: &Path) -> AppState {
 }
 
 #[tokio::test]
+async fn ordinary_agent_list_and_tree_cli_send_no_freshness_barrier() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    for (args, path) in [
+        (vec!["agents", "ls", "--limit", "5"], "/v1/client/agents?limit=5"),
+        (vec!["agents", "tree", "--limit", "5"], "/v1/client/agents?limit=5"),
+        (vec!["agents", "ls", "--limit", "5", "--status", "running"],
+            "/v1/client/agents?limit=5&status=running"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("roster.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+                request.push(byte[0]);
+            }
+            let response = serde_json::json!({
+                "api_version":"st3.client.v0", "request_id":"request/plain-roster",
+                "snapshot":{"id":"snapshot/old", "host_id":"host/fixture", "store_index":1,
+                    "projection_version":"client-projection.v0", "created_at":"2026-10-16T00:00:00Z"},
+                "value":{"kind":"page", "collection":"agents", "filters":{}, "items":[],
+                    "page":{"limit":5, "has_more":false}}
+            }).to_string();
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(), response).as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap().lines().next().unwrap().to_owned()
+        });
+        let mut command = st3::test_support::async_command(test_bin!("st3-fixture"));
+        command.kill_on_drop(true).env_remove("ST_AGENT").env_remove("ST_MISSION_RUN")
+            .args(["--endpoint", socket.to_str().unwrap(), "--daemon-wait", "0", "--json"])
+            .args(args);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+            .await.expect("a plain listing must not wait for another publication").unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(server.await.unwrap(), format!("GET {path} HTTP/1.1"));
+    }
+}
+
+#[tokio::test]
 async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secrets() {
     use ring::{
         rand::SystemRandom,

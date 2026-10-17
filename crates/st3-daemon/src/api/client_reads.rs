@@ -422,14 +422,28 @@ pub(super) async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
+    if query.min_cut.is_some() && query.cursor.is_some() {
+        return Err(client_v0::validation("min_cut is only supported on the first agents page"));
+    }
+    if let Some(wanted) = query.min_cut {
+        let head = state.store.index().map_err(ApiError::internal)?;
+        if wanted > head {
+            let mut error = agent_roster_cut_not_ready(wanted);
+            error.details.insert("head".into(), json!(head));
+            return Err(error);
+        }
+    }
     // A daemon's readers never fold the roster: they answer from its refresher's publications.
     if state.store.agent_roster_refresher_running() {
         return client_agents_published(state, snapshot, query).await;
     }
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
-    let requested = snapshot.store_index;
-    let fresh = query.fresh;
+    // Embedded stores without a refresher build once and reject an unmet cut immediately;
+    // only the daemon's publication path has a refresher to wait for.
+    let requested = query.min_cut.unwrap_or(snapshot.store_index);
+    let fresh = query.fresh || query.min_cut.is_some();
+    let min_cut = query.min_cut;
     for admitted in [false, true] {
         let admission = if admitted {
             Some(state.store.admit_agent_resources("http").await)
@@ -457,6 +471,8 @@ pub(super) async fn client_agents(
             })
         }).await??;
         if let Some(page) = result {
+            let page = checked_agent_roster_page(Some(page), min_cut)?
+                .expect("an exact roster page is present");
             let path = match (filtered, admitted) {
                 (true, _) => "filtered_full",
                 (false, true) => "exact_cold",
@@ -470,17 +486,17 @@ pub(super) async fn client_agents(
 }
 
 /// An agents page from the refresher's publications. A first page answers at once from the
-/// newest one, or says not ready; a fresh read briefly waits for its cut or for proof that
-/// a complete publication's cards are unchanged through it. A
-/// continuation answers from the roster published at exactly its first page's cut, or says the
-/// page expired. Neither folds a card.
+/// newest one, or says not ready; a legacy fresh read briefly waits for its cut or for proof
+/// that a complete publication's cards are unchanged through it, while a named min_cut uses one
+/// strict, fixed mutation-cut barrier. A continuation answers from the roster published at
+/// exactly its first page's cut, or says the page expired. Neither folds a card.
 async fn client_agents_published(
     state: AppState,
     snapshot: ClientSnapshot,
     query: ClientListQuery,
 ) -> Result<ClientPageResponse, ApiError> {
     state.store.note_agent_roster_read();
-    let requested = snapshot.store_index;
+    let requested = query.min_cut.unwrap_or(snapshot.store_index);
     if query.cursor.is_some() {
         let reader = state.clone();
         return blocking_roster(move || {
@@ -488,8 +504,17 @@ async fn client_agents_published(
         })
         .await?;
     }
-    let fresh = query.fresh;
-    let fresh_wait = if fresh {
+    let fresh = query.fresh || query.min_cut.is_some();
+    let fresh_wait = if let Some(wanted) = query.min_cut {
+        let waited = Instant::now();
+        let published = wait_for_agent_roster_cut(&state.store, query.history, wanted).await;
+        record_roster_stage(request_latency::RosterStage::FreshWait, waited.elapsed());
+        crate::otel::roster_attribute("st.roster.publication_wait_ms", waited.elapsed().as_secs_f64() * 1000.0);
+        if !published {
+            return Err(agent_roster_cut_not_ready(wanted));
+        }
+        None
+    } else if query.fresh {
         let waited = Instant::now();
         let outcome = wait_for_agent_roster(&state.store, query.history).await;
         record_roster_stage(request_latency::RosterStage::FreshWait, waited.elapsed());
@@ -499,6 +524,7 @@ async fn client_agents_published(
     };
     let reader = state.clone();
     let history = query.history;
+    let min_cut = query.min_cut;
     let built = Instant::now();
     let page = blocking_roster(move || {
         Ok(client_agents_published_page(&reader, &query, requested, fresh_wait))
@@ -506,7 +532,7 @@ async fn client_agents_published(
     if fresh {
         record_roster_stage(request_latency::RosterStage::FreshPage, built.elapsed());
     }
-    match page?? {
+    match checked_agent_roster_page(page??, min_cut)? {
         Some(page) => Ok(page),
         None => {
             crate::otel::record_roster_read("not_ready", requested, None, fresh);

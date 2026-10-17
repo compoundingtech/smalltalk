@@ -144,6 +144,13 @@ fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
         return;
     };
     let newcomer = Newcomer::start(&pty);
+    // Socket readiness is not a roster publication; this fixture explicitly needs one.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(st3_client::Client::unix(newcomer.root.path().join("run/st.sock")).agents_list_after(None, None, false, 0))
+        .expect("the fixture must publish its initial roster");
     for args in [
         &["now"][..],
         &["agents", "ls"],

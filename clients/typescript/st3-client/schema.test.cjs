@@ -97,6 +97,8 @@ test('unknown cases round-trip tolerantly and reject in both strict decoding API
     assert.deepEqual(future, { _tag: 'Unknown', raw: 'future-error' });
     assert.equal(Schema.encodeSync(Rich.ErrorCode)(future), 'future-error');
     assert.equal(Rich.decodeUnknownSync(Rich.ErrorCode, 'strict')('not-found'), 'not-found');
+    assert.equal(Rich.decodeUnknownSync(Rich.ErrorCode, 'strict')('agent-roster-cut-not-ready'), 'agent-roster-cut-not-ready');
+    assert.equal(Schema.encodeSync(Rich.ErrorCode)('agent-roster-cut-not-ready'), 'agent-roster-cut-not-ready');
     assert.throws(() => Rich.decodeUnknownSync(Rich.ErrorCode, 'strict')('future-error'));
     assert.deepEqual(Effect.runSync(Rich.decodeUnknownEffect(Rich.ErrorCode)('future-error')), future);
     assert.throws(() => Effect.runSync(Rich.decodeUnknownEffect(Rich.ErrorCode, 'strict')('future-error')));

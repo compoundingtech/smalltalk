@@ -48,7 +48,7 @@ paths = [
 
 [[latency]]
 name = "person-read-fresh"
-about = "An agents list asked to be fresh (st agents ls and tree always ask): it waits for one roster refresh by design, so it has its own target and counts toward no other"
+about = "An agents list with legacy fresh=true or an explicit min_cut asks to wait for publication; ordinary st agents ls and tree do not. Explicit waits have their own target and count toward no other"
 p99_ms = 300
 paths = [
   "GET /v1/client/agents (fresh)",
