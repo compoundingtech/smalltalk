@@ -175,3 +175,21 @@ describe('shipped live sidebar machine query', () => {
     expect([...roster().querySelectorAll('mark')].some(mark => mark.textContent?.includes('machine:'))).toBe(false)
   })
 })
+
+describe('workspace overlays', () => {
+  // Outside the themed root only the legacy document palette applies (the olive/teal menus).
+  it('portals a row actions menu into the themed workspace root, not document.body', async () => {
+    // React Aria's menu selection escapes keys with CSS.escape, which jsdom does not provide.
+    if (globalThis.CSS?.escape === undefined) vi.stubGlobal('CSS', { escape: (value: string) => value.replace(/[^\w-]/g, (char) => `\\${char}`) })
+    registry.set(agents, observed({ value: [agent] }))
+    await mount(1440)
+    const trigger = roster().querySelector<HTMLElement>('[data-agent-menu]')!
+    await act(async () => {
+      trigger.focus()
+      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    })
+    const menu = document.querySelector('[role="menu"]')
+    expect(menu).not.toBeNull()
+    expect(host.querySelector('[data-testid="live-agent-workspace"]')!.contains(menu)).toBe(true)
+  })
+})
