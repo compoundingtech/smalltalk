@@ -30,6 +30,19 @@ export const workspaceView = (pane: { readonly ref: string } | undefined): Works
 export const workspaceViewNotice = (view: Extract<WorkspaceView, { _tag: 'ViewUnavailable' }>): string =>
   `View unavailable. ${view.reason}`
 
+// App screens opened from the sidebar footer: their tabs read as the buttons that opened them.
+const SCREEN_LABELS: Readonly<Record<string, string | undefined>> = { [MISSIONS_REF]: 'Missions', 'monitor/quota': 'Usage' }
+
+/**
+ * A workspace tab's label: the subject's own title verbatim (agent names keep their case), else the
+ * screen's name, else the ref's last segment in sentence case like "Thread".
+ */
+export const paneTabLabel = (ref: string, title: string | undefined): string => {
+  if (title !== undefined) return title
+  const label = SCREEN_LABELS[ref] ?? ref.split('/').at(-1) ?? ref
+  return label.charAt(0).toUpperCase() + label.slice(1)
+}
+
 /** A conversation pane kept mounted after it was opened; `used` is its logical recency. */
 export interface RetainedPane {
   readonly ref: string

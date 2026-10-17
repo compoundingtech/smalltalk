@@ -4,7 +4,7 @@ import type * as ConversationPaneModule from './ConversationPane.tsx'
 import { ConversationHeaderActions } from './ConversationHeaderActions.tsx'
 import { AgentActions } from './AgentActions.tsx'
 import { retainPane, workspaceView, workspaceViewNotice, type RetainedPane, type WorkspaceView } from './workspaceView.ts'
-import { MISSIONS_REF } from './workspaceView.ts'
+import { MISSIONS_REF, paneTabLabel } from './workspaceView.ts'
 import { ThreadHeaderSlotContext } from '../shell/threadHeaderSlot.tsx'
 import { liveLegacyTheme } from '../ui-compat/live-theme.stylex.ts'
 import { colorVars as c, typeVars as t, spaceVars as s, geometryVars as g } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
@@ -284,7 +284,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                       const id = `${pane.ref}:${pane.presentation ?? 'detail'}`
                       return (
                         <Aria.Button key={id} aria-pressed={id === selectedPane} onPress={() => navigate(current, id)} {...stylex.props(styles.textButton)}>
-                          {byRef.get(pane.ref)?.title ?? pane.ref.split('/').at(-1)}
+                          {paneTabLabel(pane.ref, byRef.get(pane.ref)?.title)}
                         </Aria.Button>
                       )
                     })}
@@ -428,10 +428,11 @@ const styles = stylex.create({
   brand: { height: g.band, paddingInline: s.lg, display: 'flex', alignItems: 'center', gap: s.md, flexShrink: 0 },
   iconButton: { width: 28, height: 28, display: 'inline-flex', justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer' },
   textButton: { padding: '4px 8px', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer', fontSize: t.metaSize },
-  // Message fill plus a hairline: raised equals the sidebar surface in light mode.
-  search: { marginInline: s.md, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message, flexShrink: 0 },
+  // Message fill plus a hairline: raised equals the sidebar surface in light mode. The gap below the field sits outside
+  // the roster's scroller, so scrolled rows clip at a clear edge instead of running into the field's border.
+  search: { marginInline: s.md, marginBlockEnd: s.md, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message, flexShrink: 0 },
   searchInput: { width: '100%', minWidth: 0, borderWidth: 0, outline: 'none', backgroundColor: 'transparent', color: c.fg, fontSize: t.metaSize },
-  roster: { display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: s.md, minHeight: 0, flexGrow: 1, gap: 2 },
+  roster: { display: 'flex', flexDirection: 'column', overflowY: 'auto', paddingInline: s.md, paddingBlockEnd: s.md, minHeight: 0, flexGrow: 1, gap: 2 },
   // Match SR-2's shared row/control/icon geometry and the roster's 2px inter-row gap.
   rosterSkeleton: { display: 'flex', flexDirection: 'column', gap: 2 },
   skeletonRow: { height: g.sidebarRow, flexShrink: 0, display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr)`, gridTemplateRows: `${g.controlSm} ${g.controlSm}`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, paddingInline: s.sm, boxSizing: 'border-box' },
