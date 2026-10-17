@@ -20,7 +20,13 @@ mod tests;
 
 pub const NOTES_PREFIX: &str = "refs/notes/evidence/";
 pub const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
-pub const PREDICATE_TYPE: &str = "https://smalltalk.dev/evidence/gate/v1";
+pub const FRACTAL_PREDICATE_TYPE: &str = "https://compounding.tech/fractal/evidence/gate/v1";
+// Permanent signed-history decoder exception: evidence predicate URI, #3032.
+const LEGACY_PREDICATE_TYPE: &str = "https://smalltalk.dev/evidence/gate/v1";
+// LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-16-evidence-predicate-uri — DELETE at contraction — https://github.com/compoundingtech/smalltalk/issues/3032
+// Keep observers writing the old URI until the accepting verifier release is on main.
+pub const PREDICATE_TYPE: &str = LEGACY_PREDICATE_TYPE;
+// LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-16-evidence-predicate-uri
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -305,7 +311,11 @@ pub fn changed_files(
 impl Statement {
     pub fn validate(&self, repo: &Path) -> Result<&str> {
         ensure!(
-            self.statement_type == STATEMENT_TYPE && self.predicate_type == PREDICATE_TYPE,
+            self.statement_type == STATEMENT_TYPE
+                && matches!(
+                    self.predicate_type.as_str(),
+                    FRACTAL_PREDICATE_TYPE | LEGACY_PREDICATE_TYPE
+                ),
             "unsupported evidence format"
         );
         ensure!(
