@@ -166,6 +166,7 @@ impl PtyRuntime {
     /// reconciler reads an empty snapshot as every PTY being gone, so that is an error here. A
     /// root that does not exist yet holds no PTYs.
     fn sessions(&self) -> Result<Vec<SessionInfo>> {
+        crate::procfs::require_matching_procfs()?;
         if let Err(error) = std::fs::read_dir(&self.root) {
             if error.kind() == std::io::ErrorKind::NotFound {
                 return Ok(Vec::new());
@@ -292,6 +293,7 @@ impl PtyRuntime {
         cutover: Option<(&str, &str)>,
         guard: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<()> {
+        crate::procfs::require_matching_procfs()?;
         // The backend owns the physical boundary. Until the spawn lock and prior
         // evidence are read, an earlier detached producer cannot be excluded.
         let mut producer_entered = true;
@@ -689,15 +691,20 @@ impl PtyRuntime {
         if stopped.verified_empty() {
             return Ok(());
         }
-        let running = |pids: &[i32]| {
-            pids.iter()
-                .copied()
-                .filter(|pid| u32::try_from(*pid).is_ok_and(process_runs))
-                .collect::<Vec<_>>()
+        let running = |pids: &[i32]| -> Result<Vec<i32>> {
+            let mut running = Vec::new();
+            for &pid in pids {
+                if let Ok(pid_u32) = u32::try_from(pid)
+                    && process_runs(pid_u32)?
+                {
+                    running.push(pid);
+                }
+            }
+            Ok(running)
         };
-        let survived = running(&stopped.aftermath.survived);
-        let escalated = running(stopped.escalated.as_deref().unwrap_or_default());
-        let unknown = running(&stopped.aftermath.unknown);
+        let survived = running(&stopped.aftermath.survived)?;
+        let escalated = running(stopped.escalated.as_deref().unwrap_or_default())?;
+        let unknown = running(&stopped.aftermath.unknown)?;
         anyhow::ensure!(
             survived.is_empty() && escalated.is_empty() && unknown.is_empty(),
             "stop PTY failed: the daemon stopped, but processes {survived:?} survived, \
@@ -804,6 +811,7 @@ impl PtyRuntime {
     /// removed itself. A session whose harness still runs keeps everything; [`Self::stop_if`]
     /// ends it.
     pub fn end_leftovers(&self, id: &str) -> Result<()> {
+        crate::procfs::require_matching_procfs()?;
         // A launch under way ends its predecessor's scope itself, and its own is no leftover.
         let Some(_lock) = self.try_spawn_lock(id)? else {
             return Ok(());
@@ -842,6 +850,7 @@ impl PtyRuntime {
     /// its session if the record is still there, names. Then it forgets the recorded one. The
     /// caller holds the spawn lock.
     fn end_previous_scopes(&self, id: &str, ended: Option<&PtyObservation>) -> Result<()> {
+        crate::procfs::require_matching_procfs()?;
         let recorded = self.spawn_state_path(id, "scope");
         let mut units = BTreeSet::new();
         match std::fs::read_to_string(&recorded) {
@@ -882,9 +891,12 @@ impl PtyRuntime {
     }
     /// Every synchronous migration shares the publication path's durable ownership gate.
     fn server_apart(&self, id: &str, unit: &str, observed: Option<&PtyObservation>) -> Result<bool> {
-        let server = observed.and_then(|observed| observed.pid)
-            .filter(|pid| process_runs(*pid));
-        let Some(server) = server else { return Ok(true); };
+        let Some(server) = observed.and_then(|observed| observed.pid) else {
+            return Ok(true);
+        };
+        if !process_runs(server)? {
+            return Ok(true);
+        }
         self.record_server_ownership(observed.context("live PTY server has no observation")?)?;
         Ok(crate::priority::keep_server_apart(id, server, unit))
     }
@@ -1062,18 +1074,19 @@ fn work_scope(session: &SessionInfo) -> Option<&str> {
 
 
 /// Whether `pid` names a process that has not exited. A zombie has exited.
-fn process_runs(pid: u32) -> bool {
+fn process_runs(pid: u32) -> Result<bool> {
     if pid == 0 || pid > i32::MAX as u32 {
-        return false;
+        return Ok(false);
     }
+    crate::procfs::require_matching_procfs()?;
     if cfg!(target_os = "linux") {
-        return std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        return Ok(std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
             stat.rsplit_once(") ")
                 .is_some_and(|(_, tail)| !tail.starts_with('Z'))
-        });
+        }));
     }
     let result = unsafe { libc::kill(pid as i32, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    Ok(result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 fn observation_is_live(observation: &PtyObservation) -> bool {
@@ -1159,6 +1172,22 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use pty_core::protocol::{MessageType, PacketReader, encode_screen, encode_status_response};
+
+    #[test]
+    fn process_liveness_rejects_invalid_pids() {
+        assert!(!process_runs(0).unwrap());
+        assert!(!process_runs(i32::MAX as u32 + 1).unwrap());
+    }
+
+    #[test]
+    fn process_liveness_distinguishes_current_and_exited_processes() {
+        crate::procfs::require_matching_procfs().unwrap();
+        assert!(process_runs(std::process::id()).unwrap());
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        assert!(!process_runs(pid).unwrap());
+    }
 
     fn fake_executable(root: &Path, name: &str, body: &str) -> PathBuf {
         let source = root.join(format!("{name}.source"));
@@ -2147,6 +2176,7 @@ exit 0
     }
 
     fn cgroup_leaf(pid: u32) -> String {
+        crate::procfs::require_matching_procfs().unwrap();
         let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
         let path = text
             .lines()
@@ -2156,6 +2186,7 @@ exit 0
     }
 
     fn cgroup_file(pid: u32, file: &str) -> String {
+        crate::procfs::require_matching_procfs().unwrap();
         let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
         let path = text
             .lines()
@@ -2261,7 +2292,7 @@ exit 0
                 runtime.end_previous_scopes(id, Some(&observed)).unwrap();
             }
             assert_eq!(cgroup_leaf(server), crate::server_unit(id, server));
-            assert!(process_runs(server), "the supporting server must still be live");
+            assert!(process_runs(server).unwrap(), "the supporting server must still be live");
             assert!(crate::isolate::observe_closed_scope(&unit).unwrap().is_some(),
                 "only the server scope should remain populated");
             assert!(!runtime.start_operation_closed(id, &operation).unwrap(),
@@ -2357,7 +2388,7 @@ exit 0
 
     fn assert_gone_soon(pid: u32, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while process_runs(pid) {
+        while process_runs(pid).unwrap() {
             if Instant::now() >= deadline {
                 // Leave nothing behind for the next run.
                 unsafe { libc::kill(pid as i32, libc::SIGKILL) };
@@ -2403,7 +2434,7 @@ exit 0
             started.spawn(&orphaning_harness(&harness, &orphan, then), tags);
             started.harness = read_pid(&harness);
             started.orphan = read_pid(&orphan);
-            assert!(process_runs(started.orphan));
+            assert!(process_runs(started.orphan).unwrap());
             assert!(cgroup_leaf(started.orphan).starts_with(&format!("st3-{id}-")));
             started
         }
@@ -2446,7 +2477,8 @@ exit 0
             loop {
                 let observation = self.observe();
                 if observation.as_ref().is_none_or(|observation| {
-                    observation.status != "running" && !observation.pid.is_some_and(process_runs)
+                    observation.status != "running"
+                        && !observation.pid.is_some_and(|pid| process_runs(pid).unwrap())
                 }) {
                     return;
                 }
@@ -2547,7 +2579,7 @@ exit 0
         assert!(crate::end_scope(&ended_unit, crate::SCOPE_GRACE).unwrap());
         session.runtime.end_leftovers(&session.id).unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        assert!(process_runs(replacement), "the replacement ended");
+        assert!(process_runs(replacement).unwrap(), "the replacement ended");
         session.runtime.stop(&session.id).unwrap();
         assert_gone_soon(replacement, "replacement harness");
     }
@@ -2559,6 +2591,7 @@ exit 0
     }
 
     fn parent_of(pid: u32) -> u32 {
+        crate::procfs::require_matching_procfs().unwrap();
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
         // The fields after the parenthesized name: state, then the parent.
         let after_name = &stat[stat.rfind(')').unwrap() + 2..];

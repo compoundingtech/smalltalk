@@ -125,6 +125,7 @@ impl ExecRuntime {
         guard: Option<&dyn Fn() -> Result<()>>,
         child_created: &mut bool,
     ) -> Result<ExecGeneration> {
+        crate::procfs::require_matching_procfs()?;
         fs::create_dir_all(&self.state_dir)?;
         fs::create_dir_all(&self.log_dir)?;
         // What the previous generation left running ends before its replacement starts. Each
@@ -519,6 +520,7 @@ fn signal_group(id: &str, group: u32, signal: i32) -> Result<()> {
 }
 
 fn process_group_is_live(group: u32) -> Result<bool> {
+    crate::procfs::require_matching_procfs()?;
     if unsafe { libc::kill(-(group as i32), 0) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
@@ -600,6 +602,7 @@ pub fn process_start_token(pid: u32) -> Result<u64> {
 
 #[cfg(target_os = "linux")]
 fn process_identity(pid: u32) -> Result<(char, u64)> {
+    crate::procfs::require_matching_procfs()?;
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat.rfind(')').context("malformed process stat")?;
     let tail = stat.get(end + 2..).context("malformed process stat tail")?;
@@ -646,6 +649,120 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_process_token_matches_proc_self() {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        eprintln!(
+            "process namespace probe: getpid={} proc_self={:?} {}",
+            std::process::id(),
+            fs::read_link("/proc/self").unwrap(),
+            status
+                .lines()
+                .find(|line| line.starts_with("NSpid:"))
+                .unwrap_or("NSpid: unavailable")
+        );
+        let stat = fs::read_to_string("/proc/self/stat").unwrap();
+        let (_, tail) = stat.rsplit_once(") ").unwrap();
+        let token = tail
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+
+        assert_eq!(process_start_token(std::process::id()).unwrap(), token);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_outer_procfs_refuses_spawn_before_creating_a_child() {
+        const ROOT: &str = "FRACTAL_EXEC_INHERITED_PROCFS_TEST_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let runtime = ExecRuntime::new(root.join("exec"), root.join("logs"));
+            let error = runtime
+                .spawn(
+                    "refused",
+                    &crate::Launch::Shell("touch child-created".into()),
+                    &root,
+                    &BTreeMap::new(),
+                )
+                .unwrap_err();
+            assert!(error.downcast_ref::<StartRejected>().is_some());
+            assert!(error.downcast_ref::<crate::ProcessNamespaceMismatch>().is_some());
+            assert!(
+                process_start_token(std::process::id())
+                    .unwrap_err()
+                    .downcast_ref::<crate::ProcessNamespaceMismatch>()
+                    .is_some()
+            );
+            assert!(
+                process_group_is_live(std::process::id())
+                    .unwrap_err()
+                    .downcast_ref::<crate::ProcessNamespaceMismatch>()
+                    .is_some()
+            );
+            let pty = crate::PtyRuntime::new(root.join("pty"));
+            let error = pty
+                .spawn(
+                    "refused",
+                    &crate::Launch::Shell("touch pty-child-created".into()),
+                    &root,
+                    &BTreeMap::new(),
+                    None,
+                    &BTreeMap::new(),
+                    None,
+                )
+                .unwrap_err();
+            assert!(error.downcast_ref::<crate::ProcessNamespaceMismatch>().is_some());
+            assert!(!root.join("pty").exists());
+            assert!(
+                pty.snapshot()
+                    .unwrap_err()
+                    .downcast_ref::<crate::ProcessNamespaceMismatch>()
+                    .is_some()
+            );
+            assert!(!root.join("pty").exists());
+            assert!(!root.join("pty-child-created").exists());
+            assert!(!root.join("exec").exists());
+            assert!(!root.join("logs").exists());
+            assert!(!root.join("child-created").exists());
+            fs::write(root.join("refusal-confirmed"), b"before-child").unwrap();
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        // Deliberately inherit procfs rather than mounting one for the new PID
+        // namespace. Re-exec the real test binary so spawn runs in that namespace.
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--pid", "--fork"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::tests::inherited_outer_procfs_refuses_spawn_before_creating_a_child",
+                "--nocapture",
+            ])
+            .env(ROOT, root.path())
+            .output()
+            .expect("launch inherited-procfs namespace regression");
+        assert!(
+            output.status.success(),
+            "namespace regression failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root.path().join("exec").exists());
+        assert!(!root.path().join("logs").exists());
+        assert!(!root.path().join("child-created").exists());
+        assert!(!root.path().join("pty").exists());
+        assert!(!root.path().join("pty-child-created").exists());
+        assert_eq!(
+            fs::read(root.path().join("refusal-confirmed")).unwrap(),
+            b"before-child"
+        );
+    }
 
     #[cfg(not(target_os = "linux"))]
     #[test]

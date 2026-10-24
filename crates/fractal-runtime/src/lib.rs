@@ -15,6 +15,7 @@ mod environment;
 mod isolate;
 mod priority;
 mod process;
+mod procfs;
 mod pty;
 #[path = "../../pty-launch-environment.rs"]
 mod pty_launch_environment;
@@ -37,6 +38,7 @@ pub use priority::{
 pub use process::{
     ExecGeneration, ExecObservation, ExecRuntime, StartRejected, process_start_token,
 };
+pub use procfs::ProcessNamespaceMismatch;
 pub use pty::{
     Launch, LegacyStartClosureEvidence, LegacyStartClosureProof, LegacyStartProofUnavailable, ProcfsHidesProcesses, PtyObservation, PtyRuntime,
     PtySpawnTimeout, PtySpawnTimeoutPhase, TerminalSize,

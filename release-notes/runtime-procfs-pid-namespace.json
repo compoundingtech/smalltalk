@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Runtime refuses mismatched Linux procfs PID namespaces before launch instead of confusing local and outer process identities (#3767)",
+  "replay": {"status": "none", "detail": "No projection replay or new runtime ownership authority."},
+  "schema": {"status": "none", "detail": "No database or replicated schema changes. Persisted process IDs and signal targets remain namespace-local."},
+  "rules": {"status": "none", "detail": "No claim admission, checkpoint or projection rule changes."},
+  "compatibility": {"status": "changed", "detail": "Linux runtime launch and process observation require procfs mounted for the caller's PID namespace. Inherited outer procfs is unsupported and returns typed ProcessNamespaceMismatch rather than guessing identity or treating live processes as exited. Launch refuses before child creation or launch-state mutation; PTY stop and cleanup refuse mismatched procfs too. Correctly mounted namespace-local procfs remains supported; non-Linux behavior is unchanged."},
+  "downtime": {"status": "none", "detail": "Normal daemon rollout; no migration or projection rebuild."},
+  "manual": {"status": "none", "detail": "No automatic host, service or mount changes. PID-namespace launchers must mount procfs for that namespace, for example with unshare --pid --fork --mount-proc, rather than inherit an outer procfs mount."},
+  "recovery": {"status": "none", "detail": "Correct the namespace/procfs setup and retry. Do not delete session records to bypass refusal. Earlier binaries do not enforce this namespace precondition."}
+}

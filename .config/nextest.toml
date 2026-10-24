@@ -175,3 +175,8 @@ retries = 0
 filter = '(package(=fractal-store) and test(/^store::slo_breaches::tests::/)) or (package(=fractal-reconcile) and test(/^reconcile::tests::slo_breach_flow_tests::/))'
 retries = 0
 success-output = "immediate"
+
+# Retain the actual runner PID/procfs relationship without changing test selection.
+[[profile.ci.overrides]]
+filter = 'package(=fractal-runtime) and test(=process::tests::current_process_token_matches_proc_self)'
+success-output = "immediate"

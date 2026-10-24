@@ -39,6 +39,24 @@ st terminals peek agent/garden/worker
 
 The last terminal screen can explain a login, crash, or provider limit; the graph says whether the stop was requested, the owner ended, a suspension is active, or the runtime failed. A stopped agent can retain a historical terminal, and an agent with no recorded terminal may have nothing to peek.
 
+## Linux PID namespaces and procfs
+
+The runtime requires `/proc` to describe its own PID namespace. Entering a child
+PID namespace while inheriting the host's `/proc` mount is unsupported: a local
+PID can name a different host process, or no host process at all. Runtime launch
+and process observation refuse this configuration with the typed
+`ProcessNamespaceMismatch` error rather than guessing process identity or treating
+live work as exited. The launch refusal happens before creating a child or
+mutating launch state; PTY stop and cleanup also refuse mismatched procfs.
+
+Run the runtime with procfs mounted for the namespace it runs in. Container and
+test launchers that create a PID namespace must mount its `/proc` there as well
+(for example, `unshare --pid --fork --mount-proc`), rather than inherit an outer
+procfs mount. Correctly mounted namespace-local procfs remains supported. This
+does not change persisted PIDs or signal targets: both remain namespace-local.
+Do not work around the refusal by deleting session records or skipping process
+lifetime tests. No running service or procfs mount is changed automatically.
+
 ## Free heap and resident memory
 
 On Linux with glibc, the daemon checks free arena bytes every 30 seconds on a
