@@ -44,6 +44,24 @@ class ManifestTests(unittest.TestCase):
         for name in ('package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'pnpm-source-inputs.json'):
             self.assertIn(f'../{name}\n', derivation)
 
+    def test_pacquet_staging_cleanup_preserves_the_installed_package(self):
+        derivation = (root / 'nix/typescript-client.nix').read_text()
+        cleanup = next(line.strip() for line in derivation.splitlines()
+                       if "find . -type f -name 'package.json_pacquet-stage_*'" in line)
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / 'node_modules' / 'vite'
+            package.mkdir(parents=True)
+            installed = package / 'package.json'
+            installed.write_text('{"name":"vite"}\n')
+            unrelated = package / 'unrelated-stage-file'
+            unrelated.write_text('keep\n')
+            staged = package / 'package.json_pacquet-stage_8175_1792851585214105000_246'
+            staged.write_text('{"name":"vite"}\n')
+            subprocess.run(['sh', '-c', cleanup], cwd=directory, check=True)
+            self.assertFalse(staged.exists())
+            self.assertEqual(installed.read_text(), '{"name":"vite"}\n')
+            self.assertEqual(unrelated.read_text(), 'keep\n')
+
 
 class RefreshTests(unittest.TestCase):
     def run_refresh(self, stderr, returncode, system='x86_64-linux', eval_returncode=0, build_error=None):

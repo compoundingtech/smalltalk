@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh the effect-utils Nix and source-member pins to published revision 1e294f81aeec43c2e1f25ba25bb731c1c8336beb and remeasure the frozen TypeScript dependency installation.",
+  "replay": {"status": "none", "detail": "No claim or replay behavior change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint or fleet coordination change."},
+  "compatibility": {"status": "changed", "detail": "Nix consumers must resolve effect-utils to the refreshed cohort. The existing installation narHash guard continues to reject mismatched consumer overrides before building. As a packaging workaround, installation outputs discard pacquet's leftover package.json_pacquet-stage_* files, whose PID/time/counter names made successful Darwin installations nondeterministic."},
+  "downtime": {"status": "none", "detail": "The dependency pin refresh does not itself require a daemon restart."},
+  "manual": {"status": "changed", "detail": "Align consumer effect-utils inputs with revision 1e294f81aeec43c2e1f25ba25bb731c1c8336beb; refresh installation hashes using scripts/nix-typescript-client-deps-hash on supported systems."},
+  "recovery": {"status": "none", "detail": "Revert the input pins and dependency installation pin together to restore the previous packaging cohort."}
+}

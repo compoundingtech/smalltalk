@@ -69,6 +69,9 @@ let
     pnpm install --frozen-lockfile --store-dir "$TMPDIR/store"
     # Both name the install directory and the time; neither is needed to run the workspace.
     find . -name node_modules -prune -exec rm -f '{}/.modules.yaml' '{}/.pnpm-workspace-state-v1.json' ';'
+    # pacquet can leave atomic-write staging files with PID/time/counter names.
+    # They are not package inputs and make otherwise identical installations nondeterministic.
+    find . -type f -name 'package.json_pacquet-stage_*' -delete
     mkdir "$out"
     find . -name node_modules -prune -print | while IFS= read -r directory; do
       mkdir -p "$out/$(dirname "$directory")"
