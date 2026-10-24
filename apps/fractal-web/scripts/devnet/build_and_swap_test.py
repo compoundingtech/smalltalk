@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Networkless concurrency smoke for immutable build snapshot leases."""
+"""Networkless snapshot smoke with a stubbed sandbox boundary, not isolation."""
 import fcntl
 import json
 import os
@@ -8,11 +8,12 @@ import select
 import signal
 import shutil
 import subprocess
-import tempfile
 import sys
+import tempfile
 import unittest
 
 from dependency_cache import INSTALL_INPUTS, install_key
+from candidate_sandbox import DEPENDENCY_POLICY
 
 
 HELPER = Path(__file__).with_name('build-and-swap.sh').resolve()
@@ -30,6 +31,35 @@ class SnapshotLeaseTest(unittest.TestCase):
             cache = fixture / 'dependency-cache'
             binary = fixture / 'bin'
             binary.mkdir()
+            # Only the sandbox CLI is intercepted; host Python operations still
+            # use the real interpreter. Isolation itself is covered by runner tests.
+            python = binary / 'python3'
+            python.write_text(f'#!{sys.executable}\n' + '''
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if args and pathlib.Path(args[0]).name == 'candidate_sandbox.py':
+    args = args[1:]
+    root = pathlib.Path(os.environ['SNAPSHOT_LEASE_FIXTURE'])
+    with (root / 'sandbox-calls.jsonl').open('a') as stream:
+        stream.write(json.dumps(args) + '\\n')
+    if args == ['--check-config']:
+        raise SystemExit(0)
+    if args == ['--print-policy']:
+        print(os.environ['SNAPSHOT_LEASE_POLICY'])
+        raise SystemExit(0)
+    assert len(args) == 15, args
+    assert args[0] == '--worktree' and args[2:5] == ['--shell', 'web', '--output'], args
+    assert args[6:8] == ['--readonly-dependencies', '--directory'], args
+    assert args[9:12] == ['--', 'node', 'private/build-live.mjs'], args
+    worktree, output = pathlib.Path(args[1]), pathlib.Path(args[5])
+    assert worktree.is_absolute() and output.is_absolute(), args
+    assert args[8] == str(worktree / 'apps/fractal-web'), args
+    assert args[12] == str(output), args
+    os.chdir(args[8])
+    os.environ['SNAPSHOT_LEASE_SANDBOX'] = '1'
+    os.execvp(args[10], args[10:])
+'''+ f'\nos.execv({sys.executable!r}, [{sys.executable!r}, *args])\n')
+            python.chmod(0o755)
             for relative in ('apps/fractal-web/private/build-live.mjs',
                              'apps/fractal-web/vendor/utils/src/node/cli-build-identity.js',
                              'node_modules/fixture/index.js'):
@@ -38,6 +68,7 @@ class SnapshotLeaseTest(unittest.TestCase):
                 path.write_text('// synthetic fixture\n')
             for name in INSTALL_INPUTS:
                 (source / name).write_text(name + '\n')
+            (source / 'megarepo.lock').write_text('{"members": {}}')
             git = binary / 'git'
             git.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
@@ -59,6 +90,7 @@ else:
             node = binary / 'node'
             node.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
+assert os.environ.get('SNAPSHOT_LEASE_SANDBOX') == '1', 'builder bypassed sandbox CLI'
 if os.environ.get('SNAPSHOT_LEASE_HOLD') == '1':
     print('READY:' + os.getcwd(), flush=True)
     with pathlib.Path(os.environ['SNAPSHOT_LEASE_RELEASE']).open() as stream:
@@ -107,6 +139,7 @@ os.execv({shutil.which('mv')!r}, ["mv", *sys.argv[1:]])
                 'PATH': str(binary) + ':' + os.environ['PATH'],
                 'SNAPSHOT_LEASE_FIXTURE': str(fixture),
                 'SNAPSHOT_LEASE_RELEASE': str(release),
+                'SNAPSHOT_LEASE_POLICY': DEPENDENCY_POLICY,
                 'FRACTAL_BUILD_SNAPSHOT_ROOT': str(snapshot_root),
                 'FRACTAL_DEP_CACHE': str(cache),
                 'FRACTAL_BUILD_ADMISSION': 'fallback',
@@ -128,7 +161,8 @@ os.execv({shutil.which('mv')!r}, ["mv", *sys.argv[1:]])
                     with self.assertRaises(BlockingIOError):
                         fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 key = install_key(source)
-                generation = cache / key
+                generation = cache / DEPENDENCY_POLICY / key
+                self.assertFalse((cache / key).exists(), 'sandbox reused an unnamespaced parent generation')
                 dependency = generation / 'node_modules/fixture/index.js'
                 original_stat = dependency.stat()
                 self.assertNotEqual(original_stat.st_ino, (source / 'node_modules/fixture/index.js').stat().st_ino)
@@ -198,6 +232,16 @@ os.execv({shutil.which('mv')!r}, ["mv", *sys.argv[1:]])
                 self.assertEqual(failure_log['reason'], 'rollback-failed')
                 self.assertTrue(any('preserving failed build' in warning
                                     for warning in failure_log['cleanupWarnings']))
+                sandbox_calls = [json.loads(line) for line in
+                                 (fixture / 'sandbox-calls.jsonl').read_text().splitlines()]
+                self.assertEqual(sandbox_calls.count(['--check-config']), 4)
+                self.assertEqual(sandbox_calls.count(['--print-policy']), 4)
+                executions = [args for args in sandbox_calls if args not in (['--check-config'], ['--print-policy'])]
+                self.assertEqual(len(executions), 4)
+                self.assertEqual({args[5] for args in executions},
+                                 {str(fixture / 'build-root-a/shared/builds' / first_sha),
+                                  str(fixture / 'build-root-b/shared/builds' / second_sha),
+                                  str(relative_build), str(preserved)})
             finally:
                 if first.poll() is None:
                     os.killpg(first.pid, signal.SIGTERM)

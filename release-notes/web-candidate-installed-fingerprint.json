@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Align sandbox compatibility with installed-tree freshness identity and stable-cwd cleanup.",
+  "replay": { "status": "none", "detail": "No application-data replay." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "Developer-only tooling. The unchanged bwrap-v1 namespace now wraps the parent's v3 installed-tree fingerprint key; no child-specific generation algorithm is introduced." },
+  "downtime": { "status": "none", "detail": "No service activation or restart." },
+  "manual": { "status": "none", "detail": "No released-product manual step." },
+  "recovery": { "status": "none", "detail": "Parent stable-cwd EXIT cleanup and warning-only recoverable cleanup failures remain intact." }
+}

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Confine candidate web preparation and builds in a pinned, fail-closed Linux bubblewrap sandbox.",
+  "replay": { "status": "none", "detail": "No application-data replay." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "Developer-only deployment tooling. Explicit sandbox mode, bootstrap scratch and pnpm cache inputs are required; candidate-local members and a child-only bwrap-v1 cache namespace prevent reuse of pre-sandbox layouts while retaining the parent's public/private generation-key algorithm." },
+  "downtime": { "status": "none", "detail": "Publishing these scripts does not restart or activate a service." },
+  "manual": { "status": "none", "detail": "No released-product manual step. Deployment owners explicitly configure and activate the documented sandbox inputs." },
+  "recovery": { "status": "none", "detail": "Production state formats and current-plus-one rollback retention remain unchanged." }
+}

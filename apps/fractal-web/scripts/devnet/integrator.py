@@ -4,6 +4,7 @@
 Version 7: preserve main's derived changelog registry after every merge; retain PR entry files.
 """
 import datetime, fcntl, hashlib, json, os, pathlib, re, shutil, subprocess, time
+import candidate_sandbox
 def required_input(name):
     value = os.environ.get(name)
     if not value:
@@ -47,6 +48,7 @@ except (ValueError, TypeError) as error:
     raise SystemExit(f'invalid integrator trust configuration: {error}')
 PR_METADATA_FIELDS = 'number,headRefName,headRefOid,baseRefName,isDraft,author,isCrossRepository,headRepositoryOwner'
 INTEGRATOR_VERSION = 7
+DEPENDENCY_SANDBOX_VERSION = candidate_sandbox.DEPENDENCY_POLICY
 DRY_RUN = '--dry-run' in __import__('sys').argv
 if DRY_RUN:
     C = pathlib.Path(os.environ['FRACTAL_DRY_RUN_CLONE'])
@@ -97,6 +99,11 @@ def swap_server(cleanenv):
 
 def generated(path):
     return pathlib.PurePosixPath(path).name in ('pnpm-lock.yaml', 'licenses.json', 'pnpm-lock.sha256.json')
+
+def require_candidate_path(path):
+    if not path.resolve().is_relative_to(C.resolve()):
+        raise ValueError('candidate path resolves outside integration clone')
+    return path
 
 # This loop deploys only the web app, never the daemon it connects to.
 # A changed generated contract requires a coordinated deployment elsewhere.
@@ -240,7 +247,7 @@ def resolve_additive():
         stages = {n: git('show', f':{n}:{path}', capture=True, check=False) for n in (1, 2, 3)}
         if any(stages[n].returncode for n in (2, 3)):
             continue  # delete/modify needs a real decision
-        target = C/path
+        target = require_candidate_path(C/path)
         if path.endswith('.md'):
             import tempfile
             with tempfile.TemporaryDirectory(dir=L) as tmp:
@@ -269,7 +276,7 @@ def resolve_additive():
 
 def prepare_dependencies():
     # Materialize the candidate's locked members before regeneration or cache reuse.
-    member_inputs=hashlib.sha256()
+    member_inputs=hashlib.sha256(str(DEPENDENCY_SANDBOX_VERSION).encode())
     for path in ('megarepo.kdl', 'megarepo.lock'):
         member_inputs.update(path.encode()); member_inputs.update((C/path).read_bytes())
     member_key=member_inputs.hexdigest()
@@ -277,11 +284,16 @@ def prepare_dependencies():
     members=json.loads((C/'megarepo.lock').read_text())['members']
     if (not member_state.exists() or
             json.loads(member_state.read_text())['key'] != member_key or
-            any(not (C/'repos'/name).is_dir() for name in members)):
+            any(not (C/'repos'/name).is_dir() or
+                not (C/'repos'/name).resolve().is_relative_to(C.resolve()/'.devenv/candidate-members')
+                for name in members)):
         effect_rev=json.loads((C/'flake.lock').read_text())['nodes']['effect-utils']['locked']['rev']
-        run(['nice', '-n', '19', 'nix', 'run',
-             f'github:overengineeringstudio/effect-utils/{effect_rev}#megarepo', '--',
-             'apply', '--worktree-mode', 'commit', '--git-protocol', 'https'], cwd=C, timeout=1800)
+        # The runner fixes MEGAREPO_STORE inside C so member links survive scratch HOME.
+        run(['apply', '--worktree-mode', 'commit', '--git-protocol', 'https'],
+            cwd=C, timeout=1800, network=True,
+            package=(f'github:overengineeringstudio/effect-utils/{effect_rev}#megarepo', 'mr'))
+        # Rematerialized members invalidate installed workspace/source-input links.
+        (L/f'{C.name}-lockhash').unlink(missing_ok=True)
         atomic_json(member_state, {'key': member_key})
     # Cache only deterministic generated metadata, never source resolutions.
     paths=[p for p in text('ls-files').splitlines()
@@ -382,27 +394,39 @@ def regenerate():
     # Repo-owned generators: manifests first, pnpm lock next, then Buck archive
     # hashes and the license inventory. Once per candidate, never per PR merge.
     # prepare_dependencies materializes locked members; the genie shell no longer does.
-    run(['nice', '-n', '19', 'nix', 'develop', '.#genie', '-c', 'genie', '--defer-validation'], cwd=C, timeout=1800)
-    run(['nice', '-n', '19', 'pnpm', 'install', '--lockfile-only', '--no-frozen-lockfile'], cwd=C, timeout=900)
-    run(['nice', '-n', '19', 'nix', 'develop', '.#genie', '-c', 'genie'], cwd=C, timeout=1800)
+    run(['nice', '-n', '19', 'genie', '--defer-validation'], cwd=C,
+        timeout=1800, sandbox_shell='genie')
+    run(['nice', '-n', '19', 'pnpm', 'install', '--lockfile-only', '--no-frozen-lockfile'],
+        cwd=C, timeout=900, sandbox_shell='web', network=True)
+    run(['nice', '-n', '19', 'genie'], cwd=C, timeout=1800, sandbox_shell='genie')
     install()  # license generator requires the frozen installed manifests
-    run(['nice', '-n', '19', 'python3', 'scripts/ci-fractal-web-licenses'], cwd=C, timeout=900)
+    # Missing optional/platform manifests are fetched as lock-integrity-verified npm archives.
+    run(['nice', '-n', '19', 'python3', 'scripts/ci-fractal-web-licenses'],
+        cwd=C, timeout=900, sandbox_shell='web', network=True)
     git('add', '-u')
     if text('diff', '--cached', '--name-only'):
         git('commit', '-m', 'live-r3: regenerate merged dependency metadata')
 
-def run(args, cwd=None, capture=False, check=True, timeout=None):
+def run(args, cwd=None, capture=False, check=True, timeout=None, *,
+        sandbox_shell=None, network=False, package=None):
     started=time.monotonic()
     category = ('fetch' if 'fetch' in args else 'merge' if args[0]=='git' else
                 'install' if 'pnpm' in args else 'regenerate' if 'genie' in args or 'scripts/ci-fractal-web-licenses' in args else
                 'build' if args[0]=='bash' or 'node' in args else 'selection')
     try:
         log_capture=not capture and ('genie' in args or ('pnpm' in args and '--frozen-lockfile' in args))
-        result=subprocess.run([str(a) for a in args], cwd=cwd, text=True,
-                              stdout=subprocess.PIPE if capture or log_capture else None,
-                              stderr=subprocess.PIPE if capture or log_capture else None,
-                              check=check and not log_capture, timeout=timeout,
-                              env={**os.environ, 'CI':'1'})
+        command=[str(a) for a in args]
+        options=dict(text=True, stdout=subprocess.PIPE if capture or log_capture else None,
+                     stderr=subprocess.PIPE if capture or log_capture else None,
+                     check=check and not log_capture, timeout=timeout)
+        if package is not None:
+            result=candidate_sandbox.run_package(*package, command, worktree=cwd or C,
+                                                network=network, **options)
+        elif sandbox_shell is not None:
+            result=candidate_sandbox.run(command, worktree=cwd or C, shell=sandbox_shell,
+                                        network=network, **options)
+        else:
+            result=subprocess.run(command, cwd=cwd, env={**os.environ, 'CI':'1'}, **options)
         if log_capture:
             if result.stdout: print(result.stdout, end='', flush=True)
             if result.stderr: print(result.stderr, end='', file=__import__('sys').stderr, flush=True)
@@ -424,14 +448,16 @@ def digest(root):
 def stamp(private_hash):
     git('commit','--allow-empty','-m','live-r3: production integration','-m',f'Public client/private server; private overlay SHA256: {private_hash}')
 def install():
-    inputs=hashlib.sha256()
+    inputs=hashlib.sha256(str(DEPENDENCY_SANDBOX_VERSION).encode())
     for path in ('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'megarepo.kdl',
                  'megarepo.lock', 'pnpm-source-inputs.json'):
         inputs.update(path.encode()); inputs.update((C/path).read_bytes())
     lockhash=inputs.hexdigest()
     state=L/f'{C.name}-lockhash'
     if not (C/'node_modules').exists() or not state.exists() or state.read_text()!=lockhash:
-        run(['nice','-n','19','nix','develop','.#web','--option','builders','','-c','pnpm','install','--prefer-offline','--frozen-lockfile'],cwd=C,timeout=900); state.write_text(lockhash)
+        run(['nice','-n','19','pnpm','install','--prefer-offline','--frozen-lockfile'],
+            cwd=C, timeout=900, sandbox_shell='web', network=True)
+        state.write_text(lockhash)
 def build(name):
     return run(['bash',BUILD_SCRIPT,C,text('rev-parse','HEAD'),name],check=False)
 def recovery_select_build(sha):
@@ -593,6 +619,7 @@ def compatible_recorded_stack(stack, heads, row):
     return stack
 
 def tick():
+    candidate_sandbox.validate_configuration()
     global TIMINGS, REGISTRY_BASE
     start=time.monotonic(); row={'ts':datetime.datetime.now(datetime.timezone.utc).isoformat(),'sha':None,'main':None,'included':[],'skipped':[],'selection':[],'build':'failed','ms':0}
     row['integratorVersion']=INTEGRATOR_VERSION
@@ -682,15 +709,21 @@ def tick():
                 return
         git('checkout','-B','live-r3',base)
         overlay=C/'apps/fractal-web/private'
-        if not (C/'apps/fractal-web/vendor/utils/src/node/cli-build-identity.js').exists():
-            shutil.copytree(VENDOR,C/'apps/fractal-web/vendor',symlinks=True,dirs_exist_ok=True)
+        require_candidate_path(overlay)
+        vendor=require_candidate_path(C/'apps/fractal-web/vendor')
+        # copytree can follow pre-existing destination symlinks at any depth.
+        for root, dirs, files in os.walk(vendor):
+            for name in dirs + files:
+                require_candidate_path(pathlib.Path(root)/name)
+        if not require_candidate_path(vendor/'utils/src/node/cli-build-identity.js').exists():
+            shutil.copytree(VENDOR,vendor,symlinks=True,dirs_exist_ok=True)
         if overlay.exists(): shutil.rmtree(overlay)
         shutil.copytree(private,overlay,symlinks=True)
-        config=overlay/'vite.config.ts'
+        config=require_candidate_path(overlay/'vite.config.ts')
         if not any('private-annotations' in f.read_text() for f in (C/'apps/fractal-web/src').rglob('DevBar.tsx')):
             config.write_text(config.read_text().replace('privateAnnotations(),','').replace(', privateAnnotations()', '').replace('privateAnnotations()', ''))
         # Main has no private extension hooks: retain its unchanged public boundary.
-        builder=overlay/'build-live.mjs'
+        builder=require_candidate_path(overlay/'build-live.mjs')
         builder.write_text(builder.read_text().replace("configFile: resolve(app, 'private/vite.config.ts')","configFile: resolve(app, 'vite.config.ts')"))
         row['buildProfile']='public-client/private-server'
         if stack:

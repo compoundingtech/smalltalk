@@ -32,9 +32,38 @@ def prepare(source, snapshot, manifest_path, generation, expected):
     if install_key(source) != expected:
         raise ValueError('source install key differs from requested dependency cache key')
     inventory = verify_generation(generation, expected)
+    member_store = source / '.devenv/candidate-members'
+    if member_store.resolve() != member_store:
+        raise ValueError('candidate member store must not resolve outside its selected path')
+    members = json.loads((source / 'megarepo.lock').read_text())['members']
+    member_paths = []
+    member_copies = {}
+    for name in members:
+        relative = Path(name)
+        if (relative.is_absolute() or '..' in relative.parts or not relative.parts
+                or relative.as_posix() != name):
+            raise ValueError(f'invalid member path: {name}')
+        mount = source / 'repos' / relative
+        target = mount.resolve()
+        if (not mount.is_symlink() or not target.is_dir() or target == member_store
+                or not target.is_relative_to(member_store)):
+            raise ValueError(f'member must link beneath the candidate-local store: {name}')
+        dst = destination_path(snapshot, target.relative_to(source))
+        if dst.exists():
+            raise ValueError('snapshot member source destination already exists')
+        link = snapshot / mount.relative_to(source)
+        destination_path(snapshot, link.parent.relative_to(snapshot))
+        if link.exists() and not link.is_symlink():
+            raise ValueError(f'snapshot member mount is not a symlink: {name}')
+        member_copies[target] = dst
+        member_paths.append((link, dst))
     # Validate every destination before copying any overlay or dependency files.
-    dependencies = [(generation / relative, destination_path(snapshot, relative))
-                    for relative in inventory]
+    dependencies = [
+        (generation / relative, destination_path(snapshot, relative))
+        for relative in inventory
+        if not (source / relative).is_relative_to(member_store)
+        or any((source / relative).is_relative_to(target) for target in member_copies)
+    ]
     for _, destination in dependencies:
         if destination.exists():
             raise ValueError('snapshot dependency destination already exists')
@@ -55,6 +84,39 @@ def prepare(source, snapshot, manifest_path, generation, expected):
                     {'symlink': os.readlink(file)} if file.is_symlink()
                     else {'sha256': hashlib.sha256(file.read_bytes()).hexdigest()}
                 )
+
+    def redirect_workspace_links(dst):
+        for copied_root, copied_dirs, files in os.walk(dst):
+            # Only private snapshot directory inodes become writable; payload
+            # hardlinks keep the generation's read-only modes.
+            directory = Path(copied_root)
+            directory.chmod(stat.S_IMODE(directory.stat().st_mode) | stat.S_IWUSR)
+            for name in copied_dirs + files:
+                link = Path(copied_root) / name
+                if not link.is_symlink():
+                    continue
+                # Resolve relative links from their original source location,
+                # never from the immutable generation or the snapshot.
+                original = source / link.relative_to(snapshot)
+                target = Path(os.path.abspath(original.parent / os.readlink(link)))
+                if target.is_relative_to(source):
+                    replacement = snapshot / target.relative_to(source)
+                    link.unlink()
+                    link.symlink_to(os.path.relpath(replacement, link.parent))
+
+    for src, dst in member_copies.items():
+        # Mutable member sources are copied, not linked; dependency trees are
+        # installed separately and exclusively from the verified generation.
+        destination_path(snapshot, dst.relative_to(snapshot))
+        shutil.copytree(src, dst, symlinks=True, copy_function=shutil.copy2,
+                        ignore=shutil.ignore_patterns('.git', 'node_modules'))
+        redirect_workspace_links(dst)
+    for link, dst in member_paths:
+        destination_path(snapshot, link.parent.relative_to(snapshot))
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(os.path.relpath(dst, link.parent))
     dependency_files = {'linked': 0, 'copied': 0}
 
     def copy_dependency(src, dst):
@@ -76,21 +138,7 @@ def prepare(source, snapshot, manifest_path, generation, expected):
         # An overlay may have created destination parents; check again before copying.
         destination_path(snapshot, dst.relative_to(snapshot))
         shutil.copytree(src, dst, symlinks=True, copy_function=copy_dependency)
-        for copied_root, copied_dirs, files in os.walk(dst):
-            # copytree preserves generation modes; directory inodes are private
-            # to this snapshot and must allow link redirection and build output.
-            directory = Path(copied_root)
-            directory.chmod(stat.S_IMODE(directory.stat().st_mode) | stat.S_IWUSR)
-            for name in copied_dirs + files:
-                link = Path(copied_root) / name
-                if not link.is_symlink():
-                    continue
-                original = source / link.relative_to(snapshot)
-                target = Path(os.path.abspath(original.parent / os.readlink(link)))
-                if target.is_relative_to(source):
-                    replacement = snapshot / target.relative_to(source)
-                    link.unlink()
-                    link.symlink_to(os.path.relpath(replacement, link.parent))
+        redirect_workspace_links(dst)
 
     # Resolve only after every dependency tree and workspace redirection is in place:
     # a source-relative link can escape through a snapshot workspace ancestor.

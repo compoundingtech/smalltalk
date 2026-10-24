@@ -41,6 +41,7 @@ class PrepareDependenciesTest(unittest.TestCase):
         for name in ('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'megarepo.kdl',
                      'megarepo.lock', 'pnpm-source-inputs.json'):
             (self.source / name).write_text(name + '\n')
+        (self.source / 'megarepo.lock').write_text(json.dumps({'members': {}}))
         for root in (self.source, self.snapshot):
             workspace = root / 'packages/workspace'
             workspace.mkdir(parents=True)
@@ -332,6 +333,138 @@ else:
         self.assertNotIn('EXDEV', errors.getvalue())
         self.assertFalse(self.manifest.exists())
 
+
+    def populate_members(self, members):
+        (self.source / 'megarepo.lock').write_text(json.dumps({'members': members}))
+        self.key = install_key(self.source)
+        with (self.cache / '.cache.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            populate(self.source, self.cache, self.key)
+        self.generation = self.cache / self.key
+
+    def test_selected_member_sources_and_cached_dependencies_are_snapshot_local(self):
+        relative = Path('.devenv/candidate-members/github.com/example/member/refs/commits/pinned')
+        member = self.source / relative
+        self.write_source(relative / 'package.json', '{"name":"member"}')
+        self.write_source(relative / 'node_modules/dependency/index.js', 'cached member dependency\n')
+        self.write_source(relative / 'packages/workspace/node_modules/nested/index.js',
+                          'cached nested member dependency\n')
+        self.write_source(relative / 'packages/workspace/index.js', '// member workspace\n')
+        self.write_source(relative / 'packages/workspace/.git/config', 'must not copy\n')
+        (member / '.git').symlink_to(self.root / 'external-git-metadata')
+        (member / 'workspace').symlink_to(member / 'packages/workspace')
+        (member / 'node_modules/workspace').symlink_to('../packages/workspace')
+        (self.source / 'repos').mkdir()
+        (self.source / 'repos/member').symlink_to(member)
+        (self.source / 'node_modules/member').symlink_to(member)
+        (self.source / 'apps/fractal-web/node_modules/member').symlink_to('../../../repos/member')
+        unselected = Path('.devenv/candidate-members/unselected')
+        self.write_source(unselected / 'secret', 'not selected\n')
+        self.write_source(unselected / 'node_modules/secret/index.js', 'not selected dependency\n')
+        self.populate_members({'member': {}})
+        # Refreshed member installs invalidate the old fingerprint before any
+        # snapshot copying; the immutable old generation remains untouched.
+        old_generation, old_key = self.generation, self.key
+        self.write_source(relative / 'node_modules/dependency/index.js', 'changed source dependency\n')
+        self.write_source(relative / 'packages/late/node_modules/uncached/index.js', 'not cached\n')
+        with self.assertRaisesRegex(ValueError, 'source install key'):
+            self.prepare()
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual((old_generation / relative / 'node_modules/dependency/index.js').read_text(),
+                         'cached member dependency\n')
+        self.populate_members({'member': {}})
+        self.assertNotEqual(self.key, old_key)
+
+        self.prepare()
+
+        copied = self.snapshot / relative
+        source_package = member / 'package.json'
+        self.assertEqual((copied / 'package.json').read_text(), source_package.read_text())
+        self.assertFalse(os.path.samefile(copied / 'package.json', source_package))
+        for dependency, content in (
+                ('node_modules/dependency/index.js', 'changed source dependency\n'),
+                ('packages/workspace/node_modules/nested/index.js', 'cached nested member dependency\n')):
+            self.assertEqual((copied / dependency).read_text(), content)
+            self.assertTrue(os.path.samefile(copied / dependency, self.generation / relative / dependency))
+            self.assertFalse(os.path.samefile(copied / dependency, member / dependency))
+        self.assertEqual((copied / 'packages/late/node_modules/uncached/index.js').read_text(),
+                         'not cached\n')
+        self.assertTrue(os.path.samefile(
+            copied / 'packages/late/node_modules/uncached/index.js',
+            self.generation / relative / 'packages/late/node_modules/uncached/index.js'))
+        for git in (copied / '.git', copied / 'packages/workspace/.git'):
+            self.assertFalse(git.exists())
+            self.assertFalse(git.is_symlink())
+        self.assertFalse((self.snapshot / unselected).exists())
+        for relative_link, target in (
+                (Path('repos/member'), copied),
+                (Path('node_modules/member'), copied),
+                (Path('apps/fractal-web/node_modules/member'), copied),
+                (relative / 'workspace', copied / 'packages/workspace'),
+                (relative / 'node_modules/workspace', copied / 'packages/workspace')):
+            link = self.snapshot / relative_link
+            self.assertTrue(link.is_symlink())
+            self.assertFalse(os.path.isabs(os.readlink(link)))
+            self.assertEqual(link.resolve(), target)
+        report = json.loads(self.manifest.read_text())
+        self.assertEqual(report['dependencyKey'], self.key)
+        self.assertEqual(report['dependencyFiles'], {'linked': 6, 'copied': 0})
+        self.assertIn('apps/fractal-web/private/build-live.mjs', report['copiedIgnoredOverlayFiles'])
+
+    def test_external_member_is_rejected_before_copying(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'secret').write_text('must not copy\n')
+        (self.source / 'repos').mkdir()
+        (self.source / 'repos/member').symlink_to(outside)
+        self.populate_members({'member': {}})
+
+        with self.assertRaisesRegex(ValueError, 'candidate-local store'):
+            self.prepare()
+
+        self.assertFalse((self.snapshot / 'repos').exists())
+        self.assertFalse((self.snapshot / 'apps').exists())
+        self.assertFalse((self.snapshot / 'node_modules').exists())
+        self.assertFalse(self.manifest.exists())
+
+    def test_external_member_store_is_rejected_before_copying(self):
+        outside = self.root / 'outside'
+        (outside / 'member').mkdir(parents=True)
+        (outside / 'member/secret').write_text('must not copy\n')
+        (self.source / '.devenv').mkdir()
+        (self.source / '.devenv/candidate-members').symlink_to(outside)
+        (self.source / 'repos').mkdir()
+        (self.source / 'repos/member').symlink_to(self.source / '.devenv/candidate-members/member')
+        self.populate_members({'member': {}})
+
+        with self.assertRaisesRegex(ValueError, 'candidate member store'):
+            self.prepare()
+
+        self.assertFalse((self.snapshot / '.devenv').exists())
+        self.assertFalse((self.snapshot / 'apps').exists())
+        self.assertFalse((self.snapshot / 'node_modules').exists())
+        self.assertFalse(self.manifest.exists())
+
+    def test_rejects_member_path_escape_before_copying(self):
+        self.populate_members({'../outside': {}})
+        with self.assertRaisesRegex(ValueError, 'invalid member path'):
+            self.prepare()
+        self.assertFalse((self.snapshot / 'apps').exists())
+        self.assertFalse((self.snapshot / 'node_modules').exists())
+
+    def test_rejects_snapshot_member_store_symlink(self):
+        relative = Path('.devenv/candidate-members/member')
+        self.write_source(relative / 'package.json', '{"name":"member"}')
+        (self.source / 'repos').mkdir()
+        (self.source / 'repos/member').symlink_to(self.source / relative)
+        self.populate_members({'member': {}})
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.snapshot / '.devenv').symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, 'destination'):
+            self.prepare()
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.snapshot / 'node_modules').exists())
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

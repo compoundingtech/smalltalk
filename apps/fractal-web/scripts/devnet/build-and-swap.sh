@@ -10,6 +10,11 @@ requested=${2:?Usage: build-and-swap.sh SOURCE_DIR SHA NAME}
 name=${3:?Usage: build-and-swap.sh SOURCE_DIR SHA NAME}
 [[ $name =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ && $name != . && $name != .. ]] || { echo 'Invalid deployment name' >&2; exit 2; }
 SOURCE=$(realpath "$SOURCE")
+# Validate the security boundary before creating build roots or worktrees.
+python3 "$script_dir/candidate_sandbox.py" --check-config
+# A sandbox-policy namespace cannot reuse an immutable pre-sandbox layout.
+dependency_policy=$(python3 "$script_dir/candidate_sandbox.py" --print-policy)
+DEPCACHE=$DEPCACHE/$dependency_policy
 mkdir -p "$ROOT" "$SNAPSHOT_ROOT" "$DEPCACHE"
 ROOT=$(realpath -- "$ROOT")
 SNAPSHOT_ROOT=$(realpath -- "$SNAPSHOT_ROOT")
@@ -156,32 +161,41 @@ git -C "$SOURCE" worktree add --detach "$snapshot" "$sha"
 python3 "$script_dir/prepare-dependencies.py" "$SOURCE" "$snapshot" "$P/overlay-manifest-$$" "$generation" "$dependency_key"
 cd "$snapshot/apps/fractal-web"
 identity=$snapshot/apps/fractal-web/vendor/utils/src/node/cli-build-identity.js
+# Admission and activation stay on the host; the complete private builder and
+# its children run in the networkless sandbox, including resource fallbacks.
+sandbox_command=(python3 "$script_dir/candidate_sandbox.py"
+  --worktree "$snapshot" --shell web --output "$build" --readonly-dependencies
+  --directory "$snapshot/apps/fractal-web"
+  -- node private/build-live.mjs "$build" "$identity" "$sha")
 reason='build-failed'
 # A bisect caller may reuse this tick's observed admission timeout for later candidates.
 if [[ ${FRACTAL_BUILD_ADMISSION:-gate} == fallback ]]; then
   echo 'Caller reuses this tick admission timeout; building with plain nice -n 19' >&2
-  nice -n 19 node private/build-live.mjs "$build" "$identity" "$sha"
+  nice -n 19 "${sandbox_command[@]}"
   mode=caller-fallback-nice-19
 elif [[ ${FRACTAL_BUILD_ADMISSION:-gate} != gate ]]; then
   reason=invalid-admission-mode
   exit 2
-elif gate-slot --class gate --max-wait 600 -- nice -n 10 bash -c "touch \"\$1\"; exec node private/build-live.mjs \"\$2\" \"\$3\" \"\$4\"" -- "$P/admitted-$$" "$build" "$identity" "$sha"; then
+elif gate-slot --class gate --max-wait 600 -- nice -n 10 bash -c "touch \"\$1\"; shift; exec \"\$@\"" -- "$P/admitted-$$" "${sandbox_command[@]}"; then
   mode=gate-nice-10
 else
   status=$?
   if [[ ! -e $P/admitted-$$ && $status != 75 ]]; then
     echo 'Gate admission unavailable within 10 minutes; building with plain nice -n 19' >&2
-    nice -n 19 node private/build-live.mjs "$build" "$identity" "$sha"
+    nice -n 19 "${sandbox_command[@]}"
     mode=fallback-nice-19
   else exit "$status"; fi
 fi
 cp "$P/overlay-manifest-$$" "$build/overlay-snapshot.json"
 reason=receipt-invalid
-python3 - "$build/build-receipt.json" "$sha" "$build/overlay-snapshot.json" <<'PY'
+python3 - "$build/build-receipt.json" "$sha" "$build/overlay-snapshot.json" "$script_dir" "$snapshot" <<'PY'
 import json,sys
+sys.path.insert(0, sys.argv[4])
+import candidate_sandbox
 r=json.load(open(sys.argv[1])); assert r['buildIdentity']['rev']==sys.argv[2] and r['buildIdentity']['dirty'] is False and r['stackHead']==sys.argv[2]
 manifest=json.load(open(sys.argv[3]))
 r.update(dependencyKey=manifest['dependencyKey'],dependencyFiles=manifest['dependencyFiles'])
+r['devShell'] = candidate_sandbox.shell_provenance(sys.argv[5])
 with open(sys.argv[1],'w') as f: f.write(json.dumps(r,indent=2)+'\n')
 PY
 chmod +x "$build/launch.sh"

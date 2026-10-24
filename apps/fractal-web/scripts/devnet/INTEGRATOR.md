@@ -8,10 +8,19 @@ members with the effect-utils revision from `flake.lock`, and installs changed
 workspace dependencies in the web shell. Both scripts write JSONL operational
 logs. The follower includes failed install output in its log.
 
-The integrator runs frozen installs through
-`nix develop .#web --option builders "" -c pnpm install --prefer-offline --frozen-lockfile`
-so the web shell publishes `.devenv/pnpm-source-inputs` before installation.
-Its generated-metadata cache includes `pnpm-source-inputs.json`.
+The integrator resolves web/genie dev shells **only from its trusted, pinned main
+launcher checkout**, never from the candidate's flake. Candidate shell definitions
+and flake inputs are not evaluated on the host. All hooks, generators, installs,
+and application builds run inside bubblewrap. A candidate that needs a new
+toolchain builds with the old pinned main toolchain until that change is merged
+and the launcher pin is updated. `build-receipt.json` records `devShell.source`,
+SHA256 pairs for `flake.nix` and `flake.lock`, `candidateDiffers`, and an explicit
+toolchain-mismatch note. This divergence is informational, not a fallback to
+candidate evaluation.
+The trusted hook publishes `.devenv/pnpm-source-inputs` before
+`pnpm install --prefer-offline --frozen-lockfile`. The generated-metadata cache
+includes `pnpm-source-inputs.json`; the sandbox policy version invalidates old
+dependency caches when adopting this boundary.
 
 ## Integrator inputs
 
@@ -31,6 +40,9 @@ deployment-owned resources; scripts do not provision deployments or credentials.
 | `FRACTAL_INTEGRATOR_PRIORITY_JSON` | Ordered JSON array of required PR numbers; `[]` explicitly selects none |
 | `FRACTAL_INTEGRATOR_TRUST_MODE` | Required: `authors` or `collaborator-permission`; no default |
 | `FRACTAL_INTEGRATOR_TRUSTED_AUTHORS` | Conditional: explicit JSON array of trusted GitHub logins, required in `authors` mode; no built-in authors |
+| `FRACTAL_INTEGRATOR_SANDBOX` | Required: `bwrap`; no default or unsandboxed fallback |
+| `FRACTAL_INTEGRATOR_SANDBOX_STATE_ROOT` | Absolute, deployment-owned bootstrap scratch directory outside candidate clones and snapshots |
+| `FRACTAL_INTEGRATOR_PNPM_STORE` | Absolute, dedicated writable pnpm package cache outside candidate clones; must contain no credentials |
 
 Run `python3 apps/fractal-web/scripts/devnet/integrator.py` for the five-minute
 loop, or append `--once` for one tick. `--dry-run` additionally requires
@@ -139,6 +151,11 @@ restore all metadata; the sandbox boundary remains required for hostile code.
 Population checks the source key before copying, after copying, and after sealing/
 prune waits immediately before publication. Drift discards staging rather than
 publishing a generation selected from a stale fingerprint.
+The sandbox helper uses `<FRACTAL_DEP_CACHE>/bwrap-v1` as this effective cache root.
+`candidate_sandbox.py --print-policy` exposes the shared policy namespace without
+requiring deployment configuration. Generation basenames retain the parent's v3
+public/private/installed-tree key; the child-only namespace prevents pre-sandbox
+layout reuse.
 Under an exclusive `<cache>/.cache.lock`, initial population copies installed
 dependency trees from the mutable clone into a staging directory and atomically
 renames it into place. Source-to-cache copying never hardlinks mutable source files.
@@ -213,8 +230,9 @@ dangling production pointer; operator recovery must reconcile that state.
 
 The helper uses `gate-slot` admission by default; `FRACTAL_BUILD_ADMISSION=fallback`
 explicitly reuses a caller's admission timeout and builds with `nice -n 19`.
-The deployment supplies Git, GNU coreutils, `flock`, Python, Node and the private
-build entry point. These scripts do not provision the private build code.
+The deployment supplies Git, GNU coreutils, `flock`, Python and the private
+build entry point. Node comes from the candidate web shell inside the sandbox.
+These scripts do not provision the private build code.
 
 During an operator-approved cache rollout, any `snapshot-failed` or `build-failed`
 tick, or a first built tick above 400 MB of process `write_bytes`, requires reverting
@@ -251,8 +269,9 @@ Successful member and install input hashes persist beside the log as
 therefore retries on later ticks even with unchanged HEAD or after restart;
 JSONL records each failure's output. Keep these deployment-owned state files
 alongside the log when restarting the follower.
-The integrator's installed-input key covers the same five files and retains its
-existing `<clone-name>-lockhash` state filename; old lockfile-only keys invalidate.
+The integrator's installed-input key covers the same five files plus the sandbox
+policy and retains `<clone-name>-lockhash`; member-materialization keys include the
+same policy. These source-install invalidation keys do not alter generation keys.
 
 The deployment provides GitHub/Git access, Devnet and build credentials, and the
 `git`, `gh`, `nix`, `pnpm`, `node`, `curl`, Python and shell tooling needed by the
@@ -261,8 +280,54 @@ and GNU coreutils. Production state, credentials, private overlays and machine
 configuration stay outside this repository. Deployment owners review and activate
 new script revisions explicitly; committing these scripts does not restart a service.
 
-## Known gaps
+## Candidate sandbox and residual risks
 
-Candidate genie, install and build commands still inherit the agent environment.
-A separate follow-up PR allowlists the environment passed to candidate commands;
-the trust policy here does not provide environment isolation.
+The trusted launcher realizes bubblewrap, Bash, coreutils, Git and Python from the
+`nixpkgs` revision in its own `flake.lock`, not the candidate lock or host PATH.
+Linux user namespaces and the pinned tools are required; a configuration or
+sandbox failure stops the tick/build without an unsandboxed retry.
+
+Candidate genie/regeneration, member application, pnpm install/lifecycle scripts,
+license regeneration, Vite/SSR builds and precompression run in bubblewrap.
+The initial environment is an explicit allowlist: PATH, scratch HOME/TMPDIR,
+locale, CI, dedicated pnpm cache, candidate-local `MEGAREPO_STORE` and disabled
+global/system Git configuration. Dev-shell definitions and hooks execute inside
+the boundary; the final command receives the same runtime allowlist plus the
+dev-shell PATH. Agent credentials and agent-policy variables are not inherited.
+
+The filesystem exposes only the writable candidate clone/snapshot and dedicated
+pnpm cache, read-only `/nix/store`, read-only Git metadata, resolver/CA material,
+private `/proc` and `/dev`, and scratch `/tmp`/HOME. Host HOME, SSH agents,
+`/run/user`, agent sockets and the Nix daemon socket are not mounted. Locked
+members live beneath `<clone>/.devenv/candidate-members`; snapshots copy only selected
+member source trees, excluding Git metadata and node_modules, and rewrite workspace
+links locally. Every installed dependency tree comes from the verified immutable
+generation, including node_modules beneath the copied member store.
+Builds read-only bind every `node_modules` directory, the copied member store and
+the pnpm cache, so dependency hardlinks cannot write through via a writable alias.
+
+Build outputs are physically staged inside the snapshot and exposed at the
+requested output path only inside bubblewrap. After success, trusted orchestration
+rejects symlink artifacts and promotes the directory to the production build root.
+Candidate commands cannot write production state or activate Devnet. Control-plane
+Git/GitHub, admission, receipt checks, publication and retention remain outside.
+
+Genie and builds have a private network namespace. Member fetching, installation
+and license regeneration explicitly share the host network for dependency access.
+These networked commands can contact public endpoints and host-reachable services,
+including loopback: network egress filtering is not provided by this boundary.
+The writable package cache is shared across candidates and remains an integrity
+and availability surface; no agent credentials may be stored there.
+
+### Known gaps
+
+Candidate flake evaluation occurs outside bubblewrap with pure evaluation and a
+clean bootstrap environment. Any build output defined by that flake is realized
+by the trusted Nix daemon; those builds use the Nix build sandbox. The candidate
+never receives a daemon socket, including when the deployment account is a
+trusted Nix user. This is a residual Nix evaluation/build trust boundary, not a
+claim that arbitrary candidate flake realization is performed by bubblewrap.
+
+The production server runtime and follower are not changed by this build boundary.
+The deployment still owns private overlay review, production credentials and
+runtime service isolation. None of that state belongs in the public repository.

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Resolve candidate web builds with the trusted integrator toolchain without evaluating candidate flake inputs on the host.",
+  "replay": { "status": "none", "detail": "No application-data replay." },
+  "schema": { "status": "none", "detail": "No database or wire schema changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "Candidate flake changes use the pinned main launcher toolchain until merged; build receipts record flake divergence." },
+  "downtime": { "status": "none", "detail": "No service activation." },
+  "manual": { "status": "none", "detail": "No released-product manual step." },
+  "recovery": { "status": "none", "detail": "Production data and rollback state are unchanged." }
+}
